@@ -1,5 +1,85 @@
 # Emulator regression test debt
 
+## Sampled HTile owner rediscovery (2026-10-05; current runtime blocker)
+
+Native source06bfff66/SHA
+`05f4705d791c21484307ce74b9c3cf94c16f580fcc00864694b4887ce4879412`,
+run `yotei-integrated-20261005-000502-htile-layer-tracking-noval`,
+00:05:02–00:10:00UTC, exits321 with
+"sampled HTile import requires its metadata-aware lookup path"
+at textureCache.cpp:1624. VS73/PS91/CS478;460 completed compute pipelines.
+No timeout/DeviceLost; task-owned PID43356 gone and runner drained/disposed.
+Readback150–202 and verified task window black; menu/game entry PENDING.
+Corecache loaded118508765bytes, retained124091529bytes after this run.
+
+Before changing behavior, diagnose the exact imported owner/request mismatch
+through bounded, diagnostic-only logging, then reproduce the decoded semantics
+with a synthetic clear1 HTile owner and deliberately different raw-depth bytes.
+Check retained/native pixel or coherent backing results rather than merely passing
+lookup. Cover legal attachment/subview/layer reinterpretations only as justified
+by image/metadata contracts; retain mismatched metadata, unsupported compression,
+bounds and conflicting-owner admission errors. Current tests prove only exact
+single-layer promotion and single-layer extent expansion; a different input needs
+its own intended native RED and unchanged GREEN plus neighboring numerical tests.
+Record required fixture here once actual mismatch fields are captured. Do not
+remove the sampled-import guard or invent zero resources just to advance this run.
+
+Diagnostic-only run `yotei-integrated-20261005-001505-htile-import-owner-diagnostic-noval`
+00:15:05–00:17:47UTC exits at the same guard, shader counts74/92/497,
+478 pipeline completions, shown201 black. Exact diagnostic EXE SHA
+`0bc61e11dfd61e78e98ecb6f97be8620b32ea601a4be990f692931fd537a9a22`.
+Both descriptions are clean D32Sfloat/k32Float,128x128, pitch128, single-level,
+sample1, depth tile, same data and HTile bases and equal per-layer footprints.
+Owner is256 layers (depth16MiB/HTile8MiB); incoming depth target describes87-layer
+prefix (87*64KiB /87*32KiB), selecting only layer86. Current exact-owner promotion
+rejects the legitimate native array subview. No proprietary bytes needed for RED.
+Required fixture: import a synthetic65-layer clear1 array with contradictory raw
+0.25 depth; resolve hardware subviews0/31/32/63/64, retain the actual65-layer
+owner/allocation metadata, verify every selected and neighboring native pixel,
+then sample the full65-layer descriptor again. Cover multi-layer view and exact
+promotion; preserve mismatched metadata/stride/format/dirty-owner rejection.
+Do not shrink allocation metadata to the register-described prefix; that would
+break subsequent full-array sampling/whole-owner fills. Temporary diagnostic-only
+production logging removed after capture, source restored exactly to06bfff66.
+
+Synthetic original RED confirmed on06bfff66 before behavior changes:
+`imported-htile-depth-subviews-red-20261005.log`, test SHA
+`b524fa2b9cb5e47fe4e946775b10f7e6be911426d4fa5ed00509f89516641f29`,
+exit321/no timeout at the exact sampled-import owner guard, after a real65-layer
+native import and READY for hardware layer32. Shared allocation-prefix matching
+now compares complete depth/HTile layer strides plus geometry and preserves the
+full allocation metadata during final depth acquisition. Native normalized texture
+mip descriptions can hold linear mip-tail size/padded height while hardware depth
+uses physical allocation size/logical height; those scalar layouts cannot be
+compared as identical owners of this single depth mip. Smaller64x64 synthetic
+geometry independently exposed that difference; the oracle was not weakened.
+Unchanged original GREEN under GPUAV:
+`imported-htile-depth-subviews-physical-stride-green-gpuav-20261005.log`, SHA
+`0a0b8bfd58b95139de96d5e3f2a868f8244927399b180a223cb47ef12c7a10c7`,
+exit0/no timeout, all65 layers/all64x64 pixels across five hardware subviews,
+including full-array rediscovery after each selected clear. Additional clear0,
+128x128/no-tail and incompatible metadata/format/layer-bound admission controls
+are being validated before native emulator build/install/game retry.
+
+Imported-array correction validated (2026-10-05 00:44UTC): extended native
+GPUAV executable SHA
+`52acd1aa14e92acf8b090461dd4868fc3b8f8e605a9c1b989384ab2c4b5777f8`,
+`imported-htile-depth-subviews-final-green-gpuav-20261005.log` and
+`imported-htile-admission-final-green-gpuav-20261005.log`, exit0/no timeout.
+Original five-subview oracle retained, additional clear0 and128x128/no-tail cases
+pass. Every pixel in every65-layer native image checked after selected clears;
+full-array identity/range and repeated full descriptor sampling retained. Three
+bounded sequential children preserve specific guard rejection for mismatched
+metadata base, unsupported format reinterpretation and layers outside the owner.
+The two new CTests plus affected HTile-layer/native-subset/sample-array cases pass
+8/8 under GPUAV (7.57s). Existing single-layer promotion and extent expansion also
+pass (`imported-htile-neighbor-*-20261005.log`, same executable).
+No diagnostic logging remains in production; installed emulator is still the
+older diagnostic-only0bc61e11 image until the new native build/install. No other
+game tested; no full-suite/menu claim. Next commit this shared fix separately,
+serialize native build/install/hash verification, preserve pipeline cache and
+retry the actual game. Issue108 only actual menu/game entry; no push.
+
 ## HTile clear state beyond32 layers (2026-10-05; new runtime frontier)
 
 Native source30488f8d / installed SHA

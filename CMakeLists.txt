@@ -723,6 +723,12 @@ if(BUILD_TESTING)
 		add_test(NAME htile_host_layer_admission
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-host-admission-only)
 		set_tests_properties(htile_host_layer_admission PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+		add_test(NAME imported_htile_depth_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --imported-htile-admission-only)
+		set_tests_properties(imported_htile_depth_admission PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+		add_test(NAME imported_htile_depth_subviews
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --imported-htile-depth-subviews-only)
+		set_tests_properties(imported_htile_depth_subviews PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
 		add_test(NAME htile_layer_state
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-layer-state-only)
 		add_test(NAME htile_layer_views

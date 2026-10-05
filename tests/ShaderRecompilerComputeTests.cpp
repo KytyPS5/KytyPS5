@@ -12481,6 +12481,172 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckImportedHtileDepthSubviews(bool clear_one = true, const char* negative = nullptr,
+                                     uint32_t side = 64) {
+  constexpr const char* name = "ImportedHtileDepthSubviews";
+  constexpr uintptr_t base = 0x0000000205a00000ull;
+  const uint32_t width = side, height = side;
+  constexpr uint32_t layers = 65;
+  constexpr uint64_t slice_size = 0x10000, data_size = slice_size * layers;
+  constexpr uint64_t metadata_address = base + data_size;
+  constexpr uint64_t metadata_size = 0x8000 * layers;
+  constexpr uint64_t allocation_size = 0x640000;
+  constexpr std::array<std::array<uint32_t, 2>, 5> views{{
+      {32, 32}, {0, 0}, {31, 32}, {63, 64}, {0, 64}}};
+  EnsureRuntimeContext();
+  int64_t direct_offset = -1;
+  Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+      0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+      slice_size, 0, &direct_offset) == 0, "array fixture allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+      &mapped, allocation_size, 0x3, 0x10, direct_offset, slice_size) == 0 &&
+      mapped == reinterpret_cast<void*>(base), "array fixture mapping failed");
+  std::fill_n(static_cast<uint32_t*>(mapped), data_size / sizeof(uint32_t),
+              std::bit_cast<uint32_t>(0.25f));
+  std::fill_n(reinterpret_cast<uint32_t*>(metadata_address), metadata_size / sizeof(uint32_t),
+              clear_one ? 0xfffffff0u : 0u);
+  {
+    RenderContext context(m_runtime_context);
+    auto& scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, allocation_size);
+    auto& cache = context.GetTextureCache();
+    auto& executor = context.GetRenderExecutor();
+    ShaderTextureResource descriptor{};
+    descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+    descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+        (((width - 1u) & 3u) << 30u);
+    descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+    descriptor.fields[3] = DstSel(4, 4, 4, 4) |
+        (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+        (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
+    descriptor.fields[4] = layers - 1;
+    descriptor.fields[5] = 0x00700000u;
+    descriptor.fields[6] = 0x00280000u |
+        (static_cast<uint32_t>((metadata_address >> 8u) & 0xffu) << 24u);
+    descriptor.fields[7] = static_cast<uint32_t>(metadata_address >> 16u);
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    std::copy(std::begin(descriptor.fields), std::end(descriptor.fields), value.dwords.begin());
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+    resource.read = true;
+    resource.depth_compare = true;
+    const auto sampled = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+    const auto id = sampled.image_id;
+    Require(name, "materialized full array owner",
+        cache.GetImage(id).sampled_htile_clear_import &&
+            cache.GetImage(id).backing.layers == layers &&
+            cache.GetImage(id).info.data.size == data_size &&
+            cache.GetImage(id).info.metadata.range == GuestRange{metadata_address, metadata_size},
+        "fixture did not materialize the full imported HTile array");
+    const uint32_t texels = width * height;
+    auto readback = CreateHostBuffer(name, uint64_t(texels) * layers * sizeof(uint32_t) * views.size(),
+                                    vk::BufferUsageFlagBits::eTransferDst, {});
+    std::array<uint32_t, layers> expected{};
+    expected.fill(std::bit_cast<uint32_t>(clear_one ? 1.0f : 0.0f));
+    std::array<std::array<uint32_t, layers>, views.size()> snapshots{};
+    for (uint32_t pass = 0; pass < views.size(); ++pass) {
+      HW::DepthRenderTarget target{};
+      target.z_info.format = Prospero::DepthFormat::kZ32F;
+      target.z_info.texture_compatibility = Prospero::TextureCompatiblePlaneCompression::kEnable;
+      target.z_info.htile_acceleration = true;
+      target.z_read_base_addr = base;
+      target.z_write_base_addr = base;
+      target.htile_data_base_addr = metadata_address;
+      target.size = {static_cast<uint16_t>(width - 1), static_cast<uint16_t>(height - 1), true};
+      target.depth_view.slice_start = views[pass][0];
+      target.depth_view.slice_max = views[pass][1];
+      if (negative != nullptr && pass == 0) {
+        if (std::strcmp(negative, "metadata") == 0) target.htile_data_base_addr += 0x8000;
+        if (std::strcmp(negative, "format") == 0) target.z_info.format = Prospero::DepthFormat::kZ16;
+        if (std::strcmp(negative, "layers") == 0) target.depth_view.slice_max = layers;
+      }
+      registers.SetDepthRenderTarget(target);
+      HW::RenderControl render_control{};
+      render_control.depth_clear_enable = true;
+      registers.SetRenderControl(render_control);
+      const float clear = 0.125f * (pass + 1);
+      registers.SetDepthClearValue(clear);
+      std::printf("KYTY_IMPORTED_HTILE_SUBVIEW_READY pass=%u base=%u last=%u\n",
+                  pass, views[pass][0], views[pass][1]);
+      std::fflush(stdout);
+      if (negative != nullptr) {
+        std::printf("KYTY_IMPORTED_HTILE_NEGATIVE_READY %s\n", negative);
+        std::fflush(stdout);
+      }
+      RenderDepthInfo depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      if (negative != nullptr) {
+        std::printf("KYTY_IMPORTED_HTILE_NEGATIVE_RETURNED %s\n", negative);
+        std::fflush(stdout);
+        Require(name, "incompatible imported owner", false, "invalid owner/view passed admission");
+      }
+      Require(name, "hardware subview owner", depth.image_id == id &&
+          depth.desc.view_info.base_layer == views[pass][0] &&
+          depth.desc.view_info.layer_count == views[pass][1] - views[pass][0] + 1,
+          "hardware subview replaced the full imported array owner");
+      RenderColorInfo no_color{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth);
+      scheduler.BeginRendering(rendering);
+      scheduler.EndRendering();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      Require(name, "whole-owner allocation metadata", !cache.GetImage(id).sampled_htile_clear_import &&
+          cache.GetImage(id).info.resources.layers == layers &&
+          cache.GetImage(id).info.data.size == data_size &&
+          cache.GetImage(id).info.metadata.range == GuestRange{metadata_address, metadata_size},
+          "depth subview narrowed allocation ownership or retained virtual-clear ownership");
+      const auto rediscovered = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "full-array rediscovery", rediscovered.image_id == id &&
+          cache.FindTexture(id, rediscovered.desc) != nullptr,
+          "subview promotion broke subsequent full-array HTile sampling");
+      for (uint32_t layer = views[pass][0]; layer <= views[pass][1]; ++layer)
+        expected[layer] = std::bit_cast<uint32_t>(clear);
+      snapshots[pass] = expected;
+      const vk::BufferImageCopy copy{uint64_t(pass) * texels * layers * sizeof(uint32_t), 0, 0,
+          {vk::ImageAspectFlagBits::eDepth, 0, 0, layers}, {}, {width, height, 1}};
+      cache.GetImage(id).Download(std::span{&copy, 1}, readback.buffer, 0, readback.size);
+    }
+    vk::MemoryBarrier2 barrier{};
+    barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+    barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+    barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+    vk::DependencyInfo dependency{};
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    scheduler.Current().Handle().pipelineBarrier2(dependency);
+    scheduler.Finish();
+    const auto observed = ReadBuffer(name, readback, texels * layers * views.size());
+    for (uint32_t pass = 0; pass < views.size(); ++pass) {
+      for (uint32_t layer = 0; layer < layers; ++layer) {
+        const auto pixels = std::span{observed}.subspan((pass * layers + layer) * texels, texels);
+        Require(name, "materialized selected and neighboring pixels",
+            std::ranges::all_of(pixels, [&](uint32_t pixel) { return pixel == snapshots[pass][layer]; }),
+            "attachment subview lost imported pixels, read raw poison, or cleared neighbors");
+      }
+    }
+    DestroyBuffer(&readback);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+  }
+  Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+          "array fixture mapping release failed");
+  Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+      direct_offset, allocation_size) == 0, "array fixture allocation release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckSampledHtileDepthTargetPromotion(bool mismatched_metadata = false) {
   constexpr const char* name = "SampledHtileDepthTargetPromotion";
   constexpr uintptr_t base = 0x0000000204a00000ull;
@@ -46408,6 +46574,30 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 3 && std::strcmp(argv[1], "--imported-htile-negative") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImportedHtileDepthSubviews(true, argv[2]);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--imported-htile-admission-only") == 0) {
+    constexpr std::array cases {
+        RendererFailureCase{"metadata", "sampled HTile import requires its metadata-aware lookup path"},
+        RendererFailureCase{"format", "sampled HTile import requires its metadata-aware lookup path"},
+        RendererFailureCase{"layers", "sampled HTile import requires its metadata-aware lookup path"},
+    };
+    CheckRendererFailureCases("ImportedHtileDepthAdmission", "--imported-htile-negative",
+        "KYTY_IMPORTED_HTILE_NEGATIVE_READY ", "KYTY_IMPORTED_HTILE_NEGATIVE_RETURNED ", cases);
+    return 0;
+  }
+#endif
+  if (argc == 2 && std::strcmp(argv[1], "--imported-htile-depth-subviews-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImportedHtileDepthSubviews();
+    vulkan.CheckImportedHtileDepthSubviews(false);
+    vulkan.CheckImportedHtileDepthSubviews(true, nullptr, 128);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--htile-layer-state-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckHtileLayerState(true);

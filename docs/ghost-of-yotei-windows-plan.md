@@ -3,6 +3,70 @@
 
 
 
+Checkpoint **5 октября 2026 года, 00:44 UTC** (native Windows via WSL;
+source06bfff66 plus regression-proved imported-array subview correction):
+
+- Diagnostic-only run `yotei-integrated-20261005-001505-htile-import-owner-diagnostic-noval`
+  closes00:17:47UTC at the same guard. Captured fields prove a clean256-layer
+  128x128 D32/HTile owner and matching87-layer allocation prefix selecting layer86.
+  No timeout/DeviceLost; PID8904 gone; VS74/PS92/CS497,478 compute completions,
+  shown201/readbackblack. Temporary diagnostic logging removed after capture.
+- Synthetic65-layer native import with contradictory rawdepth0.25 reproduces the
+  exact hardware subview rejection before production behavior changes (REDb524fa2b).
+  Shared per-layer allocation-prefix matching now permits compatible attachment
+  subviews, keeps native pixels and full-owner metadata, and preserves guard errors.
+  Normalized texture mip-tail fields and hardware physical mip fields are compared
+  through actual depth/HTile strides plus geometry, not scalar layout equality.
+- Unchanged original GPUAV numerical test passes (SHA0a0b8bfd); extended final
+  SHA52acd1aa adds clear0/clear1,64/128 extents, single/multiple/full views,
+  every native pixel/neighbor and full-array rediscovery. Specific metadata,
+  format/layer-bound rejections preserved. Affected CTest8/8 and existing
+  single-layer promotion/extent expansion pass; details and hashes in test debt.
+- **Menu/game entry PENDING.** Installed EXE still diagnostic0bc61e11 (06+logging),
+  not the new fix. Next commit fix separately, native Windows build/install/hash,
+  bounded real game retry with preserved cache. No full-suite/cross-game claim.
+- Issue108 only verified menu then confirmed game entry, linked to PR497;
+  intermediate work local-only; no push authorization.
+
+Checkpoint **5 октября 2026 года, 00:10 UTC** (native Windows via WSL;
+installed source06bfff66, EXE SHA
+`05f4705d791c21484307ce74b9c3cf94c16f580fcc00864694b4887ce4879412`):
+
+- Bounded retry `yotei-integrated-20261005-000502-htile-layer-tracking-noval`
+  runs00:05:02–00:10:00UTC and exits321 at a sampled-HTile owner rediscovery guard:
+  "sampled HTile import requires its metadata-aware lookup path" (textureCache.cpp:1624).
+  VS73/PS91/CS478,460 completed compute pipelines; no timeout/DeviceLost.
+  PID43356 gone, runner streams drained/disposed. Cache124091529bytes retained.
+- Readback150–202 and verified task window black. **Menu/game entry PENDING.**
+  GPUAV regression proof of the shared layer correction remains separate from
+  runtime completion; no full-suite or working-game claim.
+- Next: bounded diagnostic-only retry to identify imported/requested descriptor
+  differences, synthetic regression for the exact shared image/metadata semantics,
+  unchanged GREEN and neighboring numerical checks, then actual game retry.
+  Required new fixture recorded first in test debt; preserve guard/unsupported errors.
+- Issue108 comments only after verified menu, then confirmed game entry, link PR497;
+  intermediate work local-only, no push.
+
+Checkpoint **5 октября 2026 года, 00:05 UTC** (native Windows via WSL;
+installed source06bfff66, EXE SHA
+`05f4705d791c21484307ce74b9c3cf94c16f580fcc00864694b4887ce4879412`):
+
+- Shared HTile correction/tests committed locally06bfff66; native Windows
+  build/install pass via windows-local.cmd, exact build/install hashes match.
+  Logs `htile-layer-emulator-{build,install}-20261005.log`; no push.
+- Bounded actual run `_Build/runs/yotei-integrated-20261005-000502-htile-layer-tracking-noval`
+  STARTED00:05:02UTC/PID43356; verify `run.json`/process before resuming. Corecache
+  loads118508765bytes across the source revision; compilation progresses, including
+  a96s completed pipeline. No runtime outcome beyond the old frontier claimed yet.
+  Total720s/progress480s/memory28GiB, game validation off, readback150+5000;
+  ContinueAfterColored keeps first pixels distinct from a menu milestone.
+- Readbacks150–202 and visually checked `window-before-htile-frontier.png` black;
+  **menu/game entry PENDING**. Do not overlap native builds/GPU tests while active;
+  stop only task-owned processes. Next: finish this bounded run, inspect visual
+  result and exact blocker/artifacts; follow regression-first for any new blocker.
+- Issue108 publication only after verified menu, then confirmed game entry, link
+  PR497. All intermediate work local-only; no push authorization.
+
 Checkpoint **5 октября 2026 года, 00:01 UTC** (native Windows via WSL;
 source30488f8d plus regression-proved HTile layer correction; commit/build pending):
 

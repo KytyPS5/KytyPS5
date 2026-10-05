@@ -37,6 +37,29 @@ namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
+// DB_DEPTH_VIEW describes the prefix needed to reach its last selected layer,
+// not the size of an existing array allocation. Both planes must have the same
+// independently tiled layer stride before that prefix can share an owner.
+[[nodiscard]] bool IsHtileAllocationPrefix(const ImageInfo& owner, const ImageInfo& requested) {
+	return owner.metadata.kind == ImageMetadataKind::Htile &&
+	       requested.metadata.kind == ImageMetadataKind::Htile &&
+	       owner.data.Valid() && requested.data.Valid() &&
+	       owner.metadata.range.Valid() && requested.metadata.range.Valid() &&
+	       owner.resources.levels == 1 && requested.resources.levels == 1 &&
+	       requested.resources.layers != 0 && owner.resources.layers >= requested.resources.layers &&
+	       owner.data.address == requested.data.address && owner.data.size >= requested.data.size &&
+	       owner.data.size % owner.resources.layers == 0 &&
+	       requested.data.size % requested.resources.layers == 0 &&
+	       owner.data.size / owner.resources.layers == requested.data.size / requested.resources.layers &&
+	       owner.metadata.range.address == requested.metadata.range.address &&
+	       owner.metadata.range.size >= requested.metadata.range.size &&
+	       owner.metadata.range.size % owner.resources.layers == 0 &&
+	       requested.metadata.range.size % requested.resources.layers == 0 &&
+	       owner.metadata.range.size / owner.resources.layers ==
+	           requested.metadata.range.size / requested.resources.layers;
+}
+
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -1352,21 +1375,9 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 			const bool exact_ranges = info.data == requested.data &&
 			    info.resources == requested.resources && info.metadata.range == metadata;
 			// Preserve existing native depth-array views of a prefix allocation.
-			// Imported clears themselves still require the exact single-layer owner.
+			// Imported clears themselves still require the exact allocation.
 			const bool native_prefix = !image.sampled_htile_clear_import &&
-			    info.data.Valid() && info.metadata.range.Valid() &&
-			    info.resources.levels == 1 && requested.resources.levels == 1 &&
-			    info.resources.layers >= requested.resources.layers && requested.resources.layers != 0 &&
-			    info.data.address == requested.data.address && info.data.size >= requested.data.size &&
-			    info.data.size % info.resources.layers == 0 &&
-			    requested.data.size % requested.resources.layers == 0 &&
-			    info.data.size / info.resources.layers ==
-			        requested.data.size / requested.resources.layers &&
-			    info.metadata.range.address == metadata.address && info.metadata.range.size >= metadata.size &&
-			    info.metadata.range.size % info.resources.layers == 0 &&
-			    metadata.size % requested.resources.layers == 0 &&
-			    info.metadata.range.size / info.resources.layers ==
-			        metadata.size / requested.resources.layers;
+			                           IsHtileAllocationPrefix(info, requested);
 			const bool matches = !image.depth_id && info.IsDepth() &&
 			    (exact_ranges || native_prefix) && info.extent == requested.extent &&
 			    info.type == requested.type && info.pitch == requested.pitch &&
@@ -1606,17 +1617,26 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				continue;
 			}
 			const auto& owner = imported.info;
-			// The HTile clear has already been materialized into this native D32
-			// image. An exact depth-attachment binding can take over that image
-			// without reading stale guest depth bytes or changing its pixels.
+			// The materialized D32 pixels belong to the whole allocation. An exact
+			// attachment or a compatible array-prefix subview can take over that
+			// native owner without rereading stale raw depth or losing other layers.
+			const bool prefix_layout = IsHtileAllocationPrefix(owner, desc.info) &&
+			    owner.extent == desc.info.extent && owner.type == desc.info.type &&
+			    owner.pixel_format == desc.info.pixel_format && owner.samples == desc.info.samples &&
+			    owner.bytes_per_block == desc.info.bytes_per_block && owner.tile_mode == desc.info.tile_mode &&
+			    owner.mip_layout[0].offset == 0 && desc.info.mip_layout[0].offset == 0;
+			// Texture mip descriptions can use a linear mip-tail size and padded
+			// height; depth registers use the physical plane size and logical height.
+			// Equal allocation layer strides and geometry identify this single mip.
 			const bool same_depth_owner = desc.type == BindingType::DepthTarget &&
 			    owner.IsDepth() && desc.info.IsDepth() &&
-			    SameBacking(owner, desc.info, true) && owner.resources == desc.info.resources &&
+			    ((SameBacking(owner, desc.info, true) && owner.resources == desc.info.resources &&
+			      owner.mip_layout == desc.info.mip_layout && owner.metadata.range == desc.info.metadata.range) ||
+			     prefix_layout) &&
 			    owner.guest_format == desc.info.guest_format && owner.pitch == desc.info.pitch &&
-			    owner.mip_layout == desc.info.mip_layout && owner.stencil == desc.info.stencil &&
+			    owner.stencil == desc.info.stencil &&
 			    owner.metadata.kind == ImageMetadataKind::Htile &&
 			    desc.info.metadata.kind == ImageMetadataKind::Htile &&
-			    owner.metadata.range == desc.info.metadata.range &&
 			    owner.metadata.compression == desc.info.metadata.compression &&
 			    owner.metadata.stencil_compressed == desc.info.metadata.stencil_compressed &&
 			    !imported.IsCpuDirty() && !imported.IsBufferModified();
@@ -1831,7 +1851,11 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
 	image.info.stencil = desc.info.stencil;
-	image.info.metadata = desc.info.metadata;
+	if (!IsHtileAllocationPrefix(image.info, desc.info)) {
+		image.info.metadata = desc.info.metadata;
+	}
+	// The view's register span can be shorter than the native owner. Keep its
+	// complete metadata range for later full-array sampling and metadata fills.
 	if (desc.info.HasMetadata()) {
 		auto [metadata, inserted] = m_surface_metas.try_emplace(
 		    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::HTile});

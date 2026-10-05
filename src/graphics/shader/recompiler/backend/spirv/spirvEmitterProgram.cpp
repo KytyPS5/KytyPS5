@@ -109,6 +109,19 @@ uint32_t GuardLoopCondition(ValueEmitContext& ctx, const IR::BlockInfo& info, ui
 	return guarded;
 }
 
+// A forced exit from an unconditional latch is a NEW edge into the exit block, so a phi
+// there would be left one incoming value short and the module fails validation. Those loops
+// keep whatever conditional exit they already had instead.
+bool BlockStartsWithPhi(const IR::Block* block) {
+	if (block == nullptr) {
+		return true;
+	}
+	for (const auto& inst: *block) {
+		return inst.GetOpcode() == IR::ValueOpcode::Phi;
+	}
+	return false;
+}
+
 const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 	const auto found = std::ranges::find_if(
 	    program.block_info, [&](const IR::BlockInfo& info) { return info.id == id; });
@@ -157,7 +170,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			if (const auto* exit = latch != ctx.state.loop_counter_variables.end()
 			                           ? TargetBlock(program, latch->second.second)
 			                           : nullptr;
-			    exit != nullptr) {
+			    exit != nullptr && !BlockStartsWithPhi(exit)) {
 				ctx.state.builder.AddFunction(spv::OpBranchConditional,
 				                              LoopCapReached(ctx, latch->second.first),
 				                              ctx.Label(exit), ctx.Label(target));

@@ -14928,6 +14928,25 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
     Check(CountSourceOccurrences(guarded_latch_source, "OpUGreaterThanEqual") == 1u &&
               CountSourceOccurrences(guarded_latch_source, "OpSelect") == 1u,
           "loop watchdog did not guard the direct conditional latch");
+    // The unconditional latch's forced exit is a new edge into the merge block. When that
+    // block starts with a Phi, the Phi has no value for the edge, so the latch keeps no exit.
+    const uint32_t phi_exit[] = {
+        EncodeSMovB32(2, 128),       // s2 = 0
+        EncodeSopc(0x0a, 0, 130),    // loop: s_cmp_lt_u32 s0, 2
+        EncodeSopp(0x04, 5),         // loop exit -> exit block
+        EncodeSMovB32(2, 129),       // s2 = 1
+        EncodeSopc(0x06, 1, 1),      // s_cmp_eq_u32 s1, s1
+        EncodeSopp(0x05, 2),         // break -> exit block
+        EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+        EncodeSopp(0x02, 0xfff9u),   // unconditional latch -> loop header
+        EncodeSopc(0x06, 2, 129),    // exit block: s_cmp_eq_u32 s2, 1 (reads the Phi of s2)
+        EncodeSopp(0x05, 1),         // skip the next instruction when equal
+        EncodeSMovB32(4, 129),
+        0xbf810000u,
+    };
+    const auto guarded_phi_exit = RecompileForTest(phi_exit, options);
+    CheckSpirvBinaryValidates(guarded_phi_exit.spirv);
+    CheckSpirvPhiParents(guarded_phi_exit.spirv);
     const auto guarded_dispatcher = RecompileForTest(dispatcher, options);
     CheckSpirvBinaryValidates(guarded_dispatcher.spirv);
     Check(SpirvInstructionOpcodeCount(guarded_dispatcher.spirv, 245u) == 3u,

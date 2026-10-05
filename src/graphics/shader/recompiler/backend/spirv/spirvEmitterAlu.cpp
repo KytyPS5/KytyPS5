@@ -340,6 +340,35 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	EXIT_IF(state.fpmad_function == 0);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeF32(state), result,
+	                          state.fpmad_function, a, b, c);
+	return result;
+}
+
+void DefineFPMadFunction(EmitterState& state) {
+	const bool needed = std::ranges::any_of(state.program.blocks, [](const IR::Block* block) {
+		return std::ranges::any_of(*block, [](const IR::Inst& inst) {
+			return inst.GetOpcode() == IR::ValueOpcode::FPMad32;
+		});
+	});
+	if (!needed) return;
+	const auto type = TypeF32(state);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, {type, type, type, type});
+	state.fpmad_function = state.builder.AllocateId();
+	auto a = state.builder.AllocateId();
+	auto b = state.builder.AllocateId();
+	auto c = state.builder.AllocateId();
+	state.builder.AddName(state.fpmad_function, "legacy_mad_f32");
+	// Keep the explicit FTZ arithmetic once per module. DontInline is a host
+	// compiler hint; correctness comes from the body, not from the hint.
+	state.builder.AddFunction(spv::OpFunction, type, state.fpmad_function,
+	                          spv::FunctionControlDontInlineMask, function_type);
+	state.builder.AddFunction(spv::OpFunctionParameter, type, a);
+	state.builder.AddFunction(spv::OpFunctionParameter, type, b);
+	state.builder.AddFunction(spv::OpFunctionParameter, type, c);
+	EmitLabel(state, state.builder.AllocateId());
 	// Legacy MAD/MAC round and flush between multiply and add, irrespective of SP_DENORM.
 	a = EmitFlushF32DenormToSignedZero(state, a);
 	b = EmitFlushF32DenormToSignedZero(state, b);
@@ -348,7 +377,8 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
 	const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	return EmitFlushF32DenormToSignedZero(state, sum);
+	state.builder.AddFunction(spv::OpReturnValue, EmitFlushF32DenormToSignedZero(state, sum));
+	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {

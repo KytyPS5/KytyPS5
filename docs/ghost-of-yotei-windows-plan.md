@@ -1,5 +1,83 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **5 октября 2026 года, 06:57 UTC** (shared MAD code-size correction
+completed; separate fix commit/native emulator build next):
+
+- Native validated-SPIR-V RED production1fd40efc: dependent128MAD47717words
+  exceeds8192; cooperative128lanes+barrier44153 exceeds32768, expected numeric0.
+  GPUAV no VUID/timeout; C0000409 is intended test Fail. testEXE1886a575.
+- Shared MAD body emitted once with DontInline hint (not correctness guarantee);
+  explicit five signed FTZ steps/product-add NoContraction preserved. Block-local
+  immutable bitcasts reused; cache cleared per label. No title/hash/address path.
+- Same budgets/inputs/oracle GREEN normal6453/cooperative2889words and numeric0;
+  both branches/join independent FP readbacks PASS with GPUAV. First outlining
+  attempt8485 remained RED; thresholds unchanged. Final testEXEb68a9c24250b5fb57b3c6256e7d962cd7360d0805e7973fd3ae1186c8362c770.
+- MAD/FTZ/fused/FP32 compare and FP64 arithmetic/conversion/cooperative BDA
+  GPUAV neighbors PASS, targeted colors+MAD CTest5/5 PASS06:56UTC. Logs
+  mad-code-size-{normal,cooperative}-red-gpuav, mad-code-size-final-green-gpuav,
+  mad-outlined-{final,neighbor-*}-gpuav/-ctest-gpuav-20261005. Full suite not green.
+- Previous run061159 only spinner/shown200 at bounded timeout; audio metadata
+  origin not captured. Installed emulator still1fd40efc/82d5ff35. New actual
+  color/menu/performance result PENDING; do not compare warm vs cold durations.
+  No issue108 comment or push; preserve game/save/cache and serialize builds.
+- Next separate completed fix commit, native windows-local emulator build/install,
+  verify exact hashes, targeted game color/metadata-origin retry within bounds.
+
+Checkpoint **5 октября 2026 года, 06:43 UTC** (run061159 ended by deadline;
+native MAD code-size regression build ACTIVE, production emitter still1fd40efc):
+
+- Run06:11:59-06:42:15UTC timedOut=true, gracefulCloseSucceeded=true/exit0.
+  Last shown200/completed compute pipelines356; only spinner visually verified,
+  no initial settings or menu/game entry. readback196 first10nonzero grayscale
+  pixels. run.json error=colored-proven is a helper label, not a menu result.
+- Metadata-origin recorder61820 ends0 via deadline/finally; its watch slots
+  restored and detached before game shutdown. No earlier writer/fault capture.
+  Game runner79234 ends0/streams drained; native CIM confirms no emulator,
+  regression, Ninja or MSBuild processes before serialized regression build.
+- New128-dependent-MAD fixtures normal/cooperative128lanes+barrier prepared,
+  cancellation0, module budgets32/128KiB; native RED build active. No generator
+  change before intended test failure. Full suite still not green.
+- Upstream/main refreshed72e4989b (trophy notification only new since1d552724);
+  no new audio/color correction. Current source1fd40efc and exact EXE82d5ff35
+  preserved; runtime docs and tests/CMake dirty. No issue108 update or push.
+- Next valid native size RED, shared compact MAD emission preserving all numeric
+  FTZ/rounding/FMA regressions, affected GPUAV/CTest, then actual game retry.
+  Earlier metadata source and calibrated color/main menu remain pending.
+
+Checkpoint **5 октября 2026 года, 06:29 UTC** (ACTIVE PID24900/source1fd40efc):
+
+- Actual captures157/167 black; main/title menu and corrected colors unverified.
+  Successful cold compute pipeline variants54904fb4 cost107-114seconds each;
+  SPIR-V965060words, laterfc6f8c56:975694. No proven GPU hang; unchanged
+  1800s deadline06:41:59UTC/480s watchdog/28GiB. No game input sent yet.
+- Metadata-origin watch61820 active, earlier producer capture still pending.
+  No audio production edits or verified word/byte API contract. Ordinary byte
+  configurations continue decoding in this run; preserve failure diagnostics.
+- New synthetic128-dependent-MAD fixture prepared in tests with independent
+  cancellation0 and32KiB engineering module budget; native RED pending until
+  game/recorder end. No emitter optimization made before valid RED.
+- Source inputs of installed emulator remain committed1fd40efc; later dirty
+  files are runtime/debt documentation and the prepared regression. No issue108
+  update or push. Next capture initial settings if reached, then bounded cleanup
+  and numerical/code-size proof before any shared emitter optimization.
+
+Checkpoint **5 октября 2026 года, 06:12 UTC** (ACTIVE new MAD color/origin retry
+PID24900; committed source1fd40efc89d77d9f7aa5c7e8b14a5f32c670520d):
+
+- Native emulator build/install PASS; installed/build EXEs same SHA256
+  82d5ff35fb40b1090ed393c6f10845d5a0c799d800235d3077531548fdfe3efd.
+  Logs fp32-mad-emulator-{build,install}-20261005.log, stderr inspected.
+- Run `yotei-integrated-20261005-061159-fp32-mad-color-and-audio-metadata-origin-noval`
+  started06:11:59UTC; bounded1800s/deadline06:41:59UTC,480s watchdog/28GiB,
+  Vulkan validationOFF/480x270 diagnostic guest. Game/save/cache preserved.
+- Temporary metadata-origin hardware watch at prior-proved metadata+0xc address
+  prepared/attached to own hash-guarded PID24900; actual earlier writer capture
+  PENDING. Watches restored after target capture or cleanup; guest bytes unchanged,
+  unrelated/fatal exceptions forwarded. This is diagnosis, not an audio fix.
+- First verified game color comparison and actual main/title menu/game entry
+  PENDING. Audio core unchanged. No issue108 comment/push; serialize native builds
+  and GPU tests while game/recorder active.
+
 Checkpoint **5 октября 2026 года, 06:08 UTC** (FP32 MAD/FMA shared correction
 completed; native synthetic RED/GREEN and affected GPUAV/CTest PASS):
 

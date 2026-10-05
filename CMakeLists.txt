@@ -693,6 +693,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_fp32_mad_rounding
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-only)
 	set_tests_properties(shader_fp32_mad_rounding PROPERTIES TIMEOUT 90)
+	add_test(NAME shader_fp32_mad_code_size
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-budget-only)
+	set_tests_properties(shader_fp32_mad_code_size PROPERTIES TIMEOUT 90)
 	add_test(NAME ajm_at9_configuration
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ajm-at9-config-only)
 	set_tests_properties(ajm_at9_configuration PROPERTIES TIMEOUT 30)

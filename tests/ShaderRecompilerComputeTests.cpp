@@ -1262,6 +1262,7 @@ struct TestCase {
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
   std::vector<std::pair<std::string, size_t>> spirv_counts;
+  size_t max_spirv_words = 0;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1731,6 +1732,14 @@ CompiledShader CompileCase(const TestCase &test,
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
+  if (test.max_spirv_words != 0) {
+    std::printf("[code-size] %s words=%zu budget=%zu\n", test.name,
+                result.spirv.size(), test.max_spirv_words);
+    Require(test.name, "SPIR-V code-size budget",
+            result.spirv.size() <= test.max_spirv_words,
+            "words=" + std::to_string(result.spirv.size()) +
+                ", budget=" + std::to_string(test.max_spirv_words));
+  }
   if (const auto *dump_path = std::getenv("KYTY_DUMP_COMPUTE_SPIRV");
       dump_path != nullptr) {
     std::fprintf(stderr, "KYTY_DUMP_COMPUTE_SPIRV test=%s path=%s\n", test.name, dump_path);
@@ -27456,6 +27465,102 @@ TestCase VectorMadF32FlushesDenorms() {
   return test;
 }
 
+TestCase MakeMadF32DependentChainBudget(bool cooperative) {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  if (cooperative) code.push_back(EncodeVop1(0x01, 31, Vgpr(0)));
+  for (u32 source = 0; source < 2; source++) {
+    AppendVMovU32(&code, 30, source * sizeof(u32));
+    AppendBufferLoadDword(&code, source, 30);
+  }
+  AppendVMovLiteral(&code, 10, 0xc3000000u); // -128
+  for (u32 operation = 0; operation < 128; operation++) {
+    AppendVop3(&code, 0x141, 10, Vgpr(0), Vgpr(1), Vgpr(10));
+  }
+  if (cooperative) {
+    code.push_back(EncodeSopp(0x0a));
+    AppendStoreVgprAtLaneDwordOffset(&code, 10, 31, 0);
+  } else {
+    AppendStoreVgpr(&code, 10, 0);
+  }
+  AppendEnd(&code);
+  TestCase test;
+  test.name = cooperative ? "VectorMadF32CooperativeChainBudget"
+                          : "VectorMadF32DependentChainBudget";
+  test.code = std::move(code);
+  test.initial = {0x3f800001u, 0x3f7ffffeu};
+  // Every rounded product is exactly 1. All integer partial sums are exact.
+  // A fused final operation would instead leave -2^-46.
+  test.expected.assign(cooperative ? 128u : 1u, 0u);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // Keep this small straight-line kernel within 32 KiB of SPIR-V. This is an
+  // engineering compilation budget, independent of how MAD is implemented.
+  test.max_spirv_words = cooperative ? 32768 : 8192;
+  if (cooperative) {
+    // Two complete guest waves and a guest barrier require cooperative lowering
+    // on native wave32 hardware. Allow 128 KiB for its scheduler and spills.
+    test.initial.resize(128);
+    test.compute_info.threads_num[0] = 128;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.wave_size = 64;
+    test.has_compute_info = true;
+    test.opcodes.push_back(O::S_BARRIER);
+    test.opcodes.push_back(O::V_LSHLREV_B32);
+  }
+  return test;
+}
+
+TestCase VectorMadF32DependentChainBudget() {
+  return MakeMadF32DependentChainBudget(false);
+}
+
+TestCase VectorMadF32CooperativeChainBudget() {
+  return MakeMadF32DependentChainBudget(true);
+}
+
+TestCase MakeFloatBitcastBranchScope(u32 branch_flag) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = branch_flag == 0 ? "FloatBitcastBranchScopeMultiply"
+                               : "FloatBitcastBranchScopeAdd";
+  auto &code = test.code;
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 1, 30);
+  code.push_back(EncodeSopc(0x06, 8, InlineU32(0)));
+  const auto branch = code.size();
+  code.push_back(0);
+  code.push_back(EncodeVop2(0x03, 10, Vgpr(1), 1));
+  const auto skip = code.size();
+  code.push_back(0);
+  const auto multiply = code.size();
+  code.push_back(EncodeVop2(0x08, 10, Vgpr(1), 1));
+  const auto merge = code.size();
+  // The same source must be cast separately in both arms and after the join.
+  code.push_back(EncodeVop2(0x03, 11, Vgpr(1), 10));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendEnd(&code);
+  code[branch] = EncodeSopp(0x05, multiply - branch - 1);
+  code[skip] = EncodeSopp(0x02, merge - skip - 1);
+  test.initial = {0x3fc00000u, 0u}; // 1.5
+  test.expected = branch_flag == 0 ? std::vector<u32>{0x40100000u, 0x40700000u}
+                                   : std::vector<u32>{0x40400000u, 0x40900000u};
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[2] = test.initial.size() * sizeof(u32);
+  test.user_data[8] = branch_flag;
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::S_CMP_EQ_U32,
+                  O::S_CBRANCH_SCC1, O::S_BRANCH, O::V_ADD_F32, O::V_MUL_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBranchConditional"};
+  return test;
+}
+
+TestCase FloatBitcastBranchScopeMultiply() { return MakeFloatBitcastBranchScope(0); }
+TestCase FloatBitcastBranchScopeAdd() { return MakeFloatBitcastBranchScope(1); }
+
 TestCase Vop3FmacF32NegatedSourceAccumulates() {
   using O = ShaderOpcode;
 
@@ -41083,6 +41188,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
+  AddCase(VectorMadF32DependentChainBudget);
+  AddCase(VectorMadF32CooperativeChainBudget);
+  AddCase(FloatBitcastBranchScopeMultiply);
+  AddCase(FloatBitcastBranchScopeAdd);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
@@ -47045,6 +47154,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorMadF32FlushesDenorms());
     RunCase(&vulkan, Vop3FmacF32NegatedSourceAccumulates());
     RunCase(&vulkan, VectorFloatArithmeticOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mad-f32-budget-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMadF32DependentChainBudget());
+    RunCase(&vulkan, VectorMadF32CooperativeChainBudget());
+    RunCase(&vulkan, FloatBitcastBranchScopeMultiply());
+    RunCase(&vulkan, FloatBitcastBranchScopeAdd());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--float-image-atomic-only") == 0) {

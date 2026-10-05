@@ -415,6 +415,8 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         fpmad_function          = 0;
+	std::unordered_map<uint64_t, uint32_t>            bitcast_values;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -479,6 +481,9 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;
+	// Reuse immutable casts only within their defining block. A cast emitted in
+	// another branch need not dominate this block, even if its input does.
+	state.bitcast_values.clear();
 	state.builder.AddFunction(spv::OpLabel, label);
 }
 
@@ -487,8 +492,18 @@ uint32_t TypeId(EmitterState& state, IR::Type type);
 // Shared instruction construction; typed aliases add no forwarding functions.
 template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
+	const auto result_type = TypeId(state, type);
+	uint64_t bitcast_key = 0;
+	if constexpr (opcode == spv::OpBitcast) {
+		static_assert(sizeof...(Args) == 1);
+		const uint32_t source = (static_cast<uint32_t>(args), ...);
+		bitcast_key = (uint64_t{result_type} << 32u) | source;
+		if (const auto cached = state.bitcast_values.find(bitcast_key);
+		    cached != state.bitcast_values.end()) return cached->second;
+	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(opcode, TypeId(state, type), result, args...);
+	state.builder.AddFunction(opcode, result_type, result, args...);
+	if constexpr (opcode == spv::OpBitcast) state.bitcast_values.emplace(bitcast_key, result);
 	if constexpr (type == IR::Type::F64 &&
 	              (opcode == spv::OpFMul || opcode == spv::OpFDiv || opcode == spv::OpExtInst)) {
 		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
@@ -711,6 +726,7 @@ uint32_t NormalizeWaveLaneTarget(EmitterState& state, uint32_t target);
 uint32_t EmitWaveReadLane(EmitterState& state, uint32_t source, uint32_t target);
 uint32_t EmitWaveFindFirst(EmitterState& state, uint32_t ballot);
 void DefineCooperativeWaveFunctions(EmitterState& state);
+void DefineFPMadFunction(EmitterState& state);
 
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 

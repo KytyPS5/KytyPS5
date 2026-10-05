@@ -1,5 +1,45 @@
 # Emulator regression test debt
 
+## Legacy MAD code-size and native pipeline cost (2026-10-05; native RED/GREEN and GPUAV neighbors proved)
+
+Native source1fd40efc retry061159 remains at black shown157 while creating
+compute pipeline54904fb419d79e49; emitted965060 SPIR-V words (later fc6f8c56eb7e168f:975694). Legacy MAD
+now explicitly flushes five values and rounds product/add; numerical contract
+tests pass, but inline expansion increases code and cold native compiler cost.
+This is not a proved GPU hang or a reason to remove denorm/rounding semantics.
+Required synthetic regression: bounded, dependent MAD chain with independent
+zero cancellation oracle and explicit module-size budget, fail on current
+emitter before optimizing shared emission. Retain all FTZ/FMA numeric cases,
+validate ordinary and cooperative native GPU execution after any outlining.
+Pipeline creation does complete:54904fb4 variants107-114seconds each.
+Previous run used warmed cache; elapsed-time comparison is not a controlled
+before/after cold performance proof. Cache preserved, new SPIR-V requires new keys.
+Native GPUAV RED06:43:53-06:44:20UTC on production1fd40efc/testEXE
+1886a57583aa57aaeefe3be6895785d369f1487eff2480b31a6222de7b3497e2:
+128-dependent-MAD module47717words exceeds8192; cooperative128lanes+barrier
+module44153words exceeds32768. SPIR-V validated before budget check; no VUID
+or timeout; C0000409 is intended test Fail, not unrelated crash/GPU hang.
+Numerical cancellation oracle0 and module budgets are unchanged for GREEN.
+Logs mad-code-size-{normal,cooperative}-red-gpuav-20261005.log/.stderr/.run.json.
+Shared MAD outlining applied only after RED. First attempt8485words still
+fails8192 budget (mad-code-size-green-gpuav log); budget/oracle unchanged.
+Block-local immutable bitcast reuse clears at every EmitLabel, preventing
+cross-branch dominance errors. Final GREEN normal6453/cooperative2889words,
+both numeric0 GPU readbacks, plus independent add/multiply arms and join GPU
+readbacks/validation PASS. Final testEXEb68a9c24250b5fb57b3c6256e7d962cd7360d0805e7973fd3ae1186c8362c770,
+06:55UTC mad-code-size-final-green-gpuav-20261005.log; no VUID/timeout.
+Legacy MAD rounding/FTZ and fused FMA cases PASS, affected FP32 compare5,
+FP64 arithmetic7/conversion10, cooperative BDA1 cases PASS under GPUAV.
+Final targeted CTest5/5 PASS06:56UTC mad-outlined-final-ctest-gpuav-20261005.log.
+A missing test helper argument caused final-build failure, corrected to nullptr
+in test harness; not counted as a regression. Full suite still not green.
+Actual emulator/game performance and corrected scene color pending new build.
+Khronos SPIR-V Function Control DontInline is only a performance hint:
+https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#_function_control .
+FTZ and product/add NoContraction remain in the function body; no global mode
+or title/hash/address handling change.
+Run061159 ended by1800s deadline/graceful close06:42:15UTC, exit0/shown200,\nonly spinner verified. Recorder detached/restored watches; no metadata-origin\nwrite captured, no input or menu. Color comparison/audio root remain pending.
+
 ## Audio metadata source directly proved (2026-10-05; contract RED pending)
 
 Run053914 on7f2a1c71/EXE1c5b8337 reaches Quality570 then C0000094, no main

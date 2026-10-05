@@ -182,7 +182,21 @@
        </layout>
       </widget>
      </item>
-     <item row="3" column="0" colspan="2">
+     <item row="3" column="0">
+      <widget class="QGroupBox" name="notifications_group">
+       <property name="title"><string>Notifications</string></property>
+       <layout class="QVBoxLayout" name="notificationsLayout">
+        <item>
+         <widget class="QCheckBox" name="checkBox_trophy_notifications">
+          <property name="toolTip"><string>Show trophy unlock toasts and play the optional notification sound</string></property>
+          <property name="text"><string>Show trophy earned notifications</string></property>
+          <property name="checked"><bool>true</bool></property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="4" column="0" colspan="2">
       <widget class="QGroupBox" name="debug_group">
        <property name="title">
         <string>Debugging &amp;&amp; logs</string>

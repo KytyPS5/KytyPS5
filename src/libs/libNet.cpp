@@ -1,20 +1,34 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
+#include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
+#include "graphics/presentation/systemOverlay.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <charconv>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs {
@@ -2003,6 +2017,582 @@ struct NpTrophy2Data {
 	uint64_t          timestamp_tick;
 };
 
+struct NpTrophyMetadata {
+	int32_t     id = 0;
+	int32_t     grade = 4;
+	std::string grade_name = "Bronze";
+	std::string name;
+	std::string description;
+	std::string reward;
+	std::vector<std::byte> icon_png;
+	bool        hidden = false;
+	bool        has_reward = false;
+};
+
+struct TrophyLocalization {
+	std::string_view locale;
+	std::string_view earned;
+	std::array<std::string_view, 5> grades;
+};
+
+static constexpr std::array<TrophyLocalization, 30> TROPHY_LOCALIZATIONS = {{
+    {"ja-JP", "????????", {"", "????", "????", "????", "????"}},
+    {"en-US", "TROPHY EARNED", {"", "Platinum", "Gold", "Silver", "Bronze"}},
+    {"fr-FR", "TROPH?E OBTENU", {"", "Platine", "Or", "Argent", "Bronze"}},
+    {"es-ES", "TROFEO OBTENIDO", {"", "Platino", "Oro", "Plata", "Bronce"}},
+    {"de-DE", "TROPH?E ERHALTEN", {"", "Platin", "Gold", "Silber", "Bronze"}},
+    {"it-IT", "TROFEO OTTENUTO", {"", "Platino", "Oro", "Argento", "Bronzo"}},
+    {"nl-NL", "TROFEE BEHAALD", {"", "Platina", "Goud", "Zilver", "Brons"}},
+    {"pt-PT", "TROF?U CONQUISTADO", {"", "Platina", "Ouro", "Prata", "Bronze"}},
+    {"ru-RU", "?????? ???????", {"", "???????", "??????", "???????", "??????"}},
+    {"ko-KR", "??? ??", {"", "????", "??", "??", "???"}},
+    {"zh-Hant", "????", {"", "??", "?", "?", "?"}},
+    {"zh-Hans", "????", {"", "??", "?", "?", "?"}},
+    {"fi-FI", "TROFEE SAATU", {"", "Platina", "Kulta", "Hopea", "Pronssi"}},
+    {"sv-SE", "TROF? ERH?LLEN", {"", "Platina", "Guld", "Silver", "Brons"}},
+    {"da-DK", "TROF? OPN?ET", {"", "Platin", "Guld", "S?lv", "Bronze"}},
+    {"no-NO", "TROFE MOTTATT", {"", "Platina", "Gull", "S?lv", "Bronse"}},
+    {"pl-PL", "ZDOBYTO TROFEUM", {"", "Platyna", "Z?oto", "Srebro", "Br?z"}},
+    {"pt-BR", "TROF?U CONQUISTADO", {"", "Platina", "Ouro", "Prata", "Bronze"}},
+    {"en-GB", "TROPHY EARNED", {"", "Platinum", "Gold", "Silver", "Bronze"}},
+    {"tr-TR", "KUPA KAZANILDI", {"", "Platin", "Alt?n", "G?m??", "Bronz"}},
+    {"es-419", "TROFEO OBTENIDO", {"", "Platino", "Oro", "Plata", "Bronce"}},
+    {"ar-AE", "?? ?????? ??? ?????", {"", "???????", "????", "???", "??????"}},
+    {"fr-CA", "TROPH?E OBTENU", {"", "Platine", "Or", "Argent", "Bronze"}},
+    {"cs-CZ", "TROFEJ Z?SK?NA", {"", "Platina", "Zlato", "St??bro", "Bronz"}},
+    {"hu-HU", "TR?FEA MEGSZEREZVE", {"", "Platina", "Arany", "Ez?st", "Bronz"}},
+    {"el-GR", "??????? ?????????", {"", "??????????", "?????", "????????", "???????"}},
+    {"ro-RO", "TROFEU OB?INUT", {"", "Platin?", "Aur", "Argint", "Bronz"}},
+    {"th-TH", "????????????????", {"", "????????", "???", "????", "??????"}},
+    {"vi-VN", "?? NH?N C?P", {"", "B?ch kim", "V?ng", "B?c", "??ng"}},
+    {"id-ID", "TROFI DIDAPATKAN", {"", "Platina", "Emas", "Perak", "Perunggu"}},
+}};
+
+static std::mutex                             g_trophy_mutex;
+static std::unordered_set<int>                g_unlocked_trophies;
+static std::map<int, NpTrophyMetadata>         g_trophy_metadata;
+static bool                                    g_trophy_metadata_loaded = false;
+static bool                                    g_trophy_metadata_scanned = false;
+static bool                                    g_trophy_metadata_missing_logged = false;
+static bool                                    g_trophy_unlocks_loaded = false;
+
+using TrophyJson = nlohmann::json;
+
+static constexpr uint64_t TROPHY_PACKAGE_MAX_SIZE = uint64_t {128} << 20u;
+static constexpr uint32_t TROPHY_UCP_MAGIC        = 0xb228c60a;
+static constexpr uint32_t TROPHY_UCP_VERSION      = 1;
+static constexpr uint64_t TROPHY_UCP_HEADER_SIZE  = 0x40;
+static constexpr uint64_t TROPHY_UCP_TOC_SKIP     = 0x20;
+static constexpr uint64_t TROPHY_UCP_ENTRY_SIZE   = 0x40;
+static constexpr uint64_t TROPHY_UCP_NAME_SIZE    = 0x20;
+static constexpr uint64_t TROPHY_JSON_MAX_SIZE    = uint64_t {1} << 20u;
+static constexpr uint64_t TROPHY_METADATA_MAX_SIZE = uint64_t {64} << 20u;
+static constexpr uint64_t TROPHY_ICON_MAX_SIZE    = uint64_t {32} << 20u;
+static constexpr uint64_t TROPHY_UNLOCKS_MAX_SIZE = uint64_t {1} << 20u;
+
+static const TrophyLocalization& GetTrophyLocalization() {
+	const auto language = Config::GetConsoleLanguage();
+	return TROPHY_LOCALIZATIONS[language < TROPHY_LOCALIZATIONS.size()
+	                                ? language
+	                                : Config::DEFAULT_CONSOLE_LANGUAGE];
+}
+
+static uint32_t ReadTrophyU32BE(const std::byte* data) {
+	return (static_cast<uint32_t>(std::to_integer<uint8_t>(data[0])) << 24u) |
+	       (static_cast<uint32_t>(std::to_integer<uint8_t>(data[1])) << 16u) |
+	       (static_cast<uint32_t>(std::to_integer<uint8_t>(data[2])) << 8u) |
+	       static_cast<uint32_t>(std::to_integer<uint8_t>(data[3]));
+}
+
+static uint64_t ReadTrophyU64BE(const std::byte* data) {
+	uint64_t value = 0;
+	for (int i = 0; i < 8; i++) {
+		value = (value << 8u) | std::to_integer<uint8_t>(data[i]);
+	}
+	return value;
+}
+
+static std::string TrophyJsonString(const TrophyJson& value) {
+	if (value.is_string()) {
+		return value.get<std::string>();
+	}
+	if (value.is_number_integer() || value.is_number_unsigned()) {
+		return value.dump();
+	}
+	return {};
+}
+
+static bool ParseTrophyId(const TrophyJson& value, int* id) {
+	const auto text = TrophyJsonString(value);
+	if (text.empty()) {
+		return false;
+	}
+	int parsed = 0;
+	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+	if (error != std::errc {} || end != text.data() + text.size() || parsed < 0) {
+		return false;
+	}
+	*id = parsed;
+	return true;
+}
+
+static int32_t TrophyGradeValue(std::string_view grade) {
+	if (grade == "P") {
+		return 1;
+	}
+	if (grade == "G") {
+		return 2;
+	}
+	if (grade == "S") {
+		return 3;
+	}
+	if (grade == "B") {
+		return 4;
+	}
+	return 0;
+}
+
+static std::string TrophyGradeName(std::string_view grade) {
+	const auto value = TrophyGradeValue(grade);
+	return std::string(GetTrophyLocalization().grades[static_cast<size_t>(
+	    value >= 1 && value <= 4 ? value : 4)]);
+}
+
+static std::string TrophyPackageEntryName(const std::byte* data, size_t size) {
+	size_t length = 0;
+	while (length < size && data[length] != std::byte {}) {
+		length++;
+	}
+	std::string name(reinterpret_cast<const char*>(data), length);
+	std::transform(name.begin(), name.end(), name.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return name;
+}
+
+static std::filesystem::path TrophyUnlocksPath() {
+	std::string title_id;
+	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty() ||
+	    title_id.size() > 64 ||
+	    !std::all_of(title_id.begin(), title_id.end(), [](unsigned char c) {
+		    return std::isalnum(c) != 0 || c == '_' || c == '-';
+	    })) {
+		return {};
+	}
+	const auto user_id = Config::GetUserId();
+	return std::filesystem::path("_SaveData") / title_id /
+	       ("trophies_" + std::to_string(user_id) + ".json");
+}
+
+static void EnsureTrophyUnlocksLoaded() {
+	std::scoped_lock lock(g_trophy_mutex);
+	if (g_trophy_unlocks_loaded) {
+		return;
+	}
+	const auto path = TrophyUnlocksPath();
+	if (path.empty()) {
+		LOGF("[Trophy] could not determine title ID for trophy persistence\n");
+		g_trophy_unlocks_loaded = true;
+		return;
+	}
+
+	Common::File file(path, Common::File::Mode::Read);
+	if (!file.IsInvalid() && file.Size() <= TROPHY_UNLOCKS_MAX_SIZE) {
+		const auto data = file.ReadWholeBuffer();
+		if (!data.empty()) {
+			const auto* begin = reinterpret_cast<const char*>(data.data());
+			const auto* end   = begin + data.size();
+			const auto  json  = TrophyJson::parse(begin, end, nullptr, false);
+			if (!json.is_discarded() && json.is_object()) {
+				const auto unlocked = json.find("unlockedTrophies");
+				if (unlocked != json.end() && unlocked->is_array()) {
+					for (const auto& value: *unlocked) {
+						int trophy_id = 0;
+						if (ParseTrophyId(value, &trophy_id)) {
+							g_unlocked_trophies.insert(trophy_id);
+						}
+					}
+				}
+				LOGF("[Trophy] loaded %zu saved unlock(s)\n", g_unlocked_trophies.size());
+			} else {
+				LOGF("[Trophy] saved unlock file is invalid: %s\n",
+				     Common::PathToString(path).c_str());
+			}
+		}
+	} else if (!file.IsInvalid()) {
+		LOGF("[Trophy] saved unlock file exceeds the 1 MiB limit: %s\n",
+		     Common::PathToString(path).c_str());
+	}
+	g_trophy_unlocks_loaded = true;
+}
+
+static void SaveTrophyUnlocks() {
+	const auto path = TrophyUnlocksPath();
+	if (path.empty()) {
+		LOGF("[Trophy] could not determine title ID for saving trophy unlocks\n");
+		return;
+	}
+
+	TrophyJson json;
+	json["unlockedTrophies"] = TrophyJson::array();
+	size_t saved_count = 0;
+	{
+		std::scoped_lock lock(g_trophy_mutex);
+		for (const auto trophy_id: g_unlocked_trophies) {
+			json["unlockedTrophies"].push_back(trophy_id);
+		}
+		saved_count = g_unlocked_trophies.size();
+	}
+	const auto encoded = json.dump();
+	if (encoded.size() > TROPHY_UNLOCKS_MAX_SIZE ||
+	    !Common::File::CreateDirectories(path.parent_path())) {
+		LOGF("[Trophy] could not create trophy unlock directory: %s\n",
+		     Common::PathToString(path.parent_path()).c_str());
+		return;
+	}
+
+	Common::File file;
+	if (!file.Create(path)) {
+		LOGF("[Trophy] could not open trophy unlock file for writing: %s\n",
+		     Common::PathToString(path).c_str());
+		return;
+	}
+	uint32_t bytes_written = 0;
+	file.Write(encoded.data(), static_cast<uint32_t>(encoded.size()), &bytes_written);
+	if (bytes_written != encoded.size() || !file.Flush()) {
+		LOGF("[Trophy] failed writing trophy unlock file: %s\n",
+		     Common::PathToString(path).c_str());
+		return;
+	}
+	LOGF("[Trophy] saved %zu unlock(s) to %s\n", saved_count,
+	     Common::PathToString(path).c_str());
+}
+
+static bool LoadTrophyPackage(const std::filesystem::path& path,
+                              std::map<int, NpTrophyMetadata>& metadata) {
+	Common::File file(path, Common::File::Mode::Read);
+	if (file.IsInvalid() || file.Size() < TROPHY_UCP_HEADER_SIZE ||
+	    file.Size() > TROPHY_PACKAGE_MAX_SIZE) {
+		return false;
+	}
+	const auto data = file.ReadWholeBuffer();
+	if (data.size() < TROPHY_UCP_HEADER_SIZE ||
+	    ReadTrophyU32BE(data.data()) != TROPHY_UCP_MAGIC ||
+	    ReadTrophyU32BE(data.data() + 4) != TROPHY_UCP_VERSION) {
+		return false;
+	}
+
+	const uint64_t declared_size = ReadTrophyU64BE(data.data() + 8);
+	const uint32_t file_count    = ReadTrophyU32BE(data.data() + 0x10);
+	const uint64_t toc_offset    = ReadTrophyU32BE(data.data() + 0x14);
+	if (declared_size < TROPHY_UCP_HEADER_SIZE || declared_size > data.size() ||
+	    file_count > 4096) {
+		return false;
+	}
+	const uint64_t toc_size = TROPHY_UCP_TOC_SKIP + static_cast<uint64_t>(file_count) *
+	                                                   TROPHY_UCP_ENTRY_SIZE;
+	if (toc_offset > declared_size || toc_size > declared_size - toc_offset) {
+		return false;
+	}
+
+	std::map<std::string, std::string> package_files;
+	uint64_t                          metadata_size = 0;
+	uint64_t                          icon_size     = 0;
+	for (uint32_t i = 0; i < file_count; i++) {
+		const uint64_t entry_offset =
+		    toc_offset + TROPHY_UCP_TOC_SKIP + static_cast<uint64_t>(i) * TROPHY_UCP_ENTRY_SIZE;
+		const auto* entry = data.data() + entry_offset;
+		const auto  name  = TrophyPackageEntryName(entry, TROPHY_UCP_NAME_SIZE);
+		const bool is_metadata =
+		    name == "tropconf.json" || name == "tropmeta.json" ||
+		    (name.starts_with("tropmeta_") && name.ends_with(".json"));
+		const bool is_icon = name.starts_with("trop") && name.ends_with(".png");
+		if (!is_metadata && !is_icon) {
+			continue;
+		}
+
+		const uint64_t offset = ReadTrophyU64BE(entry + 0x20);
+		const uint64_t size   = ReadTrophyU64BE(entry + 0x28);
+		if (offset > declared_size || size > declared_size - offset ||
+		    (is_metadata &&
+		     (size > TROPHY_JSON_MAX_SIZE || size > TROPHY_METADATA_MAX_SIZE - metadata_size)) ||
+		    (is_icon && (size > TROPHY_ICON_MAX_SIZE ||
+		                 size > TROPHY_METADATA_MAX_SIZE - icon_size))) {
+			return false;
+		}
+		package_files[name] = std::string(reinterpret_cast<const char*>(data.data() + offset),
+		                                  static_cast<size_t>(size));
+		if (is_metadata) {
+			metadata_size += size;
+		} else {
+			icon_size += size;
+		}
+	}
+
+	const auto conf_file = package_files.find("tropconf.json");
+	if (conf_file == package_files.end()) {
+		return false;
+	}
+	const auto conf = TrophyJson::parse(conf_file->second, nullptr, false);
+	if (conf.is_discarded() || !conf.is_object()) {
+		return false;
+	}
+
+	const auto default_language = TrophyJsonString(conf.value("defaultLanguage", TrophyJson {}));
+	std::string metadata_filename;
+	const auto find_localized_metadata = [&package_files](std::string_view language) {
+		std::string localized = "tropmeta_" + std::string(language) + ".json";
+		std::transform(localized.begin(), localized.end(), localized.begin(),
+		               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		return package_files.contains(localized) ? localized : std::string {};
+	};
+	metadata_filename = find_localized_metadata(GetTrophyLocalization().locale);
+	if (metadata_filename.empty()) {
+		const auto locale = GetTrophyLocalization().locale;
+		const auto separator = locale.find('-');
+		const auto language = locale.substr(0, separator);
+		const auto prefix = "tropmeta_" + std::string(language);
+		for (const auto& [name, contents]: package_files) {
+			(void)contents;
+			if (name == prefix + ".json" ||
+			    (name.starts_with(prefix + "-") && name.ends_with(".json"))) {
+				metadata_filename = name;
+				break;
+			}
+		}
+	}
+	if (metadata_filename.empty()) {
+		metadata_filename = find_localized_metadata(default_language);
+	}
+	if (metadata_filename.empty()) {
+		metadata_filename = find_localized_metadata("en-US");
+	}
+	if (metadata_filename.empty()) {
+		for (const auto& [name, contents]: package_files) {
+			(void)contents;
+			if (name.starts_with("tropmeta_") && name.ends_with(".json")) {
+				metadata_filename = name;
+				break;
+			}
+		}
+	}
+	if (metadata_filename.empty() && package_files.contains("tropmeta.json")) {
+		metadata_filename = "tropmeta.json";
+	}
+	if (metadata_filename.empty()) {
+		return false;
+	}
+
+	const auto trophy_metadata =
+	    TrophyJson::parse(package_files.at(metadata_filename), nullptr, false);
+	if (trophy_metadata.is_discarded() || !trophy_metadata.is_object()) {
+		return false;
+	}
+	const auto definitions = conf.find("trophies");
+	if (definitions == conf.end() || !definitions->is_array()) {
+		return false;
+	}
+	const auto metadata_root = trophy_metadata.find("metadata");
+	if (metadata_root == trophy_metadata.end() || !metadata_root->is_object()) {
+		return false;
+	}
+	const auto text_entries = metadata_root->find("trophyMetadata");
+
+	std::map<int, NpTrophyMetadata> package_metadata;
+	for (const auto& definition: *definitions) {
+		if (!definition.is_object()) {
+			continue;
+		}
+		int id = 0;
+		if (!ParseTrophyId(definition.value("id", TrophyJson {}), &id)) {
+			continue;
+		}
+		auto& item      = package_metadata[id];
+		item.id         = id;
+		const auto grade = TrophyJsonString(definition.value("grade", TrophyJson {}));
+		item.grade       = TrophyGradeValue(grade);
+		item.grade_name  = TrophyGradeName(grade);
+		const auto hidden = definition.find("hidden");
+		item.hidden      = hidden != definition.end() && hidden->is_boolean() && hidden->get<bool>();
+		const auto has_reward = definition.find("hasReward");
+		item.has_reward = has_reward != definition.end() && has_reward->is_boolean() &&
+		                  has_reward->get<bool>();
+	}
+
+	if (text_entries != metadata_root->end() && text_entries->is_array()) {
+		for (const auto& text: *text_entries) {
+			if (!text.is_object()) {
+				continue;
+			}
+			int id = 0;
+			if (!ParseTrophyId(text.value("id", TrophyJson {}), &id)) {
+				continue;
+			}
+			const auto found = package_metadata.find(id);
+			if (found == package_metadata.end()) {
+				continue;
+			}
+			found->second.name        = TrophyJsonString(text.value("name", TrophyJson {}));
+			found->second.description = TrophyJsonString(text.value("detail", TrophyJson {}));
+			found->second.reward      = TrophyJsonString(text.value("reward", TrophyJson {}));
+		}
+	}
+
+	for (auto& [id, item]: package_metadata) {
+		if (item.name.empty()) {
+			item.name = item.hidden ? "Hidden Trophy" : "Trophy " + std::to_string(id);
+		}
+		std::string icon_name = "trop" + std::to_string(id) + ".png";
+		const auto unpadded_icon = package_files.find(icon_name);
+		if (unpadded_icon != package_files.end()) {
+			item.icon_png.resize(unpadded_icon->second.size());
+			std::memcpy(item.icon_png.data(), unpadded_icon->second.data(),
+			            unpadded_icon->second.size());
+		} else {
+			const auto id_text = std::to_string(id);
+			if (id_text.size() < 4) {
+				const auto padded_name = "trop" + std::string(4 - id_text.size(), '0') + id_text +
+				                         ".png";
+				const auto padded_icon = package_files.find(padded_name);
+				if (padded_icon != package_files.end()) {
+					item.icon_png.resize(padded_icon->second.size());
+					std::memcpy(item.icon_png.data(), padded_icon->second.data(),
+					            padded_icon->second.size());
+				}
+			}
+		}
+		metadata.try_emplace(id, std::move(item));
+	}
+	return !package_metadata.empty();
+}
+
+static void EnsureTrophyMetadataLoaded() {
+	std::scoped_lock lock(g_trophy_mutex);
+	if (g_trophy_metadata_loaded || g_trophy_metadata_scanned) {
+		return;
+	}
+
+	const auto directory =
+	    Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_sys/trophy2");
+	if (directory.empty()) {
+		if (!g_trophy_metadata_missing_logged) {
+			LOGF("[Trophy] game trophy package directory is not mounted yet\n");
+			g_trophy_metadata_missing_logged = true;
+		}
+		return;
+	}
+	g_trophy_metadata_scanned = true;
+
+	std::vector<std::filesystem::path> packages;
+	for (const auto& entry: Common::File::GetDirEntries(directory)) {
+		std::string name = entry.name;
+		std::transform(name.begin(), name.end(), name.begin(),
+		               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (entry.is_file && name.starts_with("trophy") && name.ends_with(".ucp")) {
+			packages.push_back(directory / Common::PathFromUtf8(entry.name));
+		}
+	}
+	std::sort(packages.begin(), packages.end());
+
+	for (const auto& package: packages) {
+		if (LoadTrophyPackage(package, g_trophy_metadata)) {
+			g_trophy_metadata_loaded = true;
+		}
+	}
+	if (g_trophy_metadata_loaded) {
+		LOGF("[Trophy] loaded %zu trophy definitions from game package(s)\n",
+		     g_trophy_metadata.size());
+	} else if (!g_trophy_metadata_missing_logged) {
+		LOGF("[Trophy] could not load trophy metadata from %zu game package(s)\n",
+		     packages.size());
+		g_trophy_metadata_missing_logged = true;
+	}
+}
+
+static void NpTrophy2FillTitle(char* dst, size_t dst_size, const char* src);
+
+static NpTrophyMetadata GetTrophyMetadata(int trophy_id) {
+	EnsureTrophyMetadataLoaded();
+	std::scoped_lock lock(g_trophy_mutex);
+	const auto       it = g_trophy_metadata.find(trophy_id);
+	if (it != g_trophy_metadata.end()) {
+		return it->second;
+	}
+	NpTrophyMetadata fallback;
+	fallback.id = trophy_id;
+	fallback.name = "Trophy " + std::to_string(trophy_id);
+	return fallback;
+}
+
+static std::array<uint32_t, 5> GetTrophyGradeCounts() {
+	std::array<uint32_t, 5> counts {};
+	EnsureTrophyMetadataLoaded();
+	std::scoped_lock lock(g_trophy_mutex);
+	for (const auto& [id, item]: g_trophy_metadata) {
+		(void)id;
+		switch (item.grade) {
+			case 1: counts[1]++; break;
+			case 2: counts[2]++; break;
+			case 3: counts[3]++; break;
+			case 4: counts[4]++; break;
+			default: break;
+		}
+	}
+	return counts;
+}
+
+static std::vector<NpTrophyMetadata> GetTrophyMetadataList() {
+	EnsureTrophyMetadataLoaded();
+	std::scoped_lock             lock(g_trophy_mutex);
+	std::vector<NpTrophyMetadata> trophies;
+	trophies.reserve(g_trophy_metadata.size());
+	for (const auto& [id, metadata]: g_trophy_metadata) {
+		(void)id;
+		trophies.push_back(metadata);
+	}
+	return trophies;
+}
+
+static std::array<uint32_t, 5> GetUnlockedTrophyGradeCounts() {
+	std::array<uint32_t, 5> counts {};
+	EnsureTrophyMetadataLoaded();
+	EnsureTrophyUnlocksLoaded();
+	std::scoped_lock         lock(g_trophy_mutex);
+	for (const auto trophy_id: g_unlocked_trophies) {
+		const auto it = g_trophy_metadata.find(trophy_id);
+		if (it != g_trophy_metadata.end() && it->second.grade >= 1 && it->second.grade <= 4) {
+			counts[static_cast<size_t>(it->second.grade)]++;
+		}
+	}
+	return counts;
+}
+
+static void FillTrophyDetails(NpTrophy2Details* details, const NpTrophyMetadata& metadata) {
+	if (details == nullptr) {
+		return;
+	}
+	std::memset(details, 0, sizeof(*details));
+	details->trophy_id    = metadata.id;
+	details->trophy_grade = metadata.grade;
+	details->group_id     = 0;
+	details->hidden       = metadata.hidden;
+	details->has_reward   = metadata.has_reward;
+	NpTrophy2FillTitle(details->name, sizeof(details->name), metadata.name.c_str());
+	NpTrophy2FillTitle(details->description, sizeof(details->description),
+	                   metadata.description.c_str());
+	NpTrophy2FillTitle(details->reward, sizeof(details->reward), metadata.reward.c_str());
+}
+
+static void FillTrophyData(NpTrophy2Data* data, int trophy_id) {
+	if (data == nullptr) {
+		return;
+	}
+	EnsureTrophyUnlocksLoaded();
+	std::memset(data, 0, sizeof(*data));
+	data->trophy_id = trophy_id;
+	std::scoped_lock lock(g_trophy_mutex);
+	data->unlocked = g_unlocked_trophies.contains(trophy_id);
+}
+
 static_assert(sizeof(NpTrophy2GameDetails) == 152);
 static_assert(sizeof(NpTrophy2GameData) == 24);
 static_assert(sizeof(NpTrophy2GroupDetails) == 152);
@@ -2017,6 +2607,26 @@ static void NpTrophy2FillTitle(char* dst, size_t dst_size, const char* src) {
 
 	std::strncpy(dst, src, dst_size - 1);
 	dst[dst_size - 1] = '\0';
+}
+
+static void RecordTrophyUnlock(int trophy_id) {
+	EnsureTrophyMetadataLoaded();
+	EnsureTrophyUnlocksLoaded();
+	bool newly_unlocked = false;
+	{
+		std::scoped_lock lock(g_trophy_mutex);
+		newly_unlocked = g_unlocked_trophies.insert(trophy_id).second;
+	}
+	if (newly_unlocked) {
+		SaveTrophyUnlocks();
+		if (Config::TrophyNotificationsEnabled()) {
+			const auto metadata = GetTrophyMetadata(trophy_id);
+			Libs::Graphics::NotifyTrophyUnlocked(GetTrophyLocalization().earned, metadata.name,
+			                                     metadata.grade_name,
+			                                     metadata.grade,
+			                                     metadata.icon_png);
+		}
+	}
 }
 
 static int KYTY_SYSV_ABI NpTrophy2CreateHandle(int* handle) {
@@ -2068,13 +2678,30 @@ static int KYTY_SYSV_ABI NpTrophy2GetGameInfo(int context, int handle,
 	     context, handle, reinterpret_cast<uint64_t>(details), reinterpret_cast<uint64_t>(data));
 
 	if (details != nullptr) {
+		const auto counts = GetTrophyGradeCounts();
 		std::memset(details, 0, sizeof(*details));
-		details->num_trophies = 1;
-		details->num_bronze   = 1;
+		details->num_groups   = 1;
+		details->num_trophies = counts[1] + counts[2] + counts[3] + counts[4];
+		details->num_platinum = counts[1];
+		details->num_gold     = counts[2];
+		details->num_silver   = counts[3];
+		details->num_bronze   = counts[4];
 		NpTrophy2FillTitle(details->title, sizeof(details->title), "Kyty");
 	}
 	if (data != nullptr) {
+		const auto unlocked = GetUnlockedTrophyGradeCounts();
 		std::memset(data, 0, sizeof(*data));
+		data->unlocked_platinum = unlocked[1];
+		data->unlocked_gold     = unlocked[2];
+		data->unlocked_silver   = unlocked[3];
+		data->unlocked_bronze   = unlocked[4];
+		data->unlocked_trophies = unlocked[1] + unlocked[2] + unlocked[3] + unlocked[4];
+		const auto total = GetTrophyGradeCounts();
+		const auto total_count = total[1] + total[2] + total[3] + total[4];
+		data->progress_percentage =
+		    total_count == 0 ? 0 : static_cast<uint32_t>(
+		                                static_cast<uint64_t>(data->unlocked_trophies) * 100 /
+		                                total_count);
 	}
 
 	return 0;
@@ -2094,17 +2721,31 @@ static int KYTY_SYSV_ABI NpTrophy2GetGroupInfo(int context, int handle, int grou
 	     reinterpret_cast<uint64_t>(data));
 
 	const auto normalized_group_id = (group_id < 0 ? 0 : group_id);
+	const auto counts             = GetTrophyGradeCounts();
 
 	if (details != nullptr) {
 		std::memset(details, 0, sizeof(*details));
 		details->group_id     = normalized_group_id;
-		details->num_trophies = 1;
-		details->num_bronze   = 1;
+		details->num_trophies = counts[1] + counts[2] + counts[3] + counts[4];
+		details->num_platinum = counts[1];
+		details->num_gold     = counts[2];
+		details->num_silver   = counts[3];
+		details->num_bronze   = counts[4];
 		NpTrophy2FillTitle(details->title, sizeof(details->title), "Base Game");
 	}
 	if (data != nullptr) {
+		const auto unlocked = GetUnlockedTrophyGradeCounts();
 		std::memset(data, 0, sizeof(*data));
 		data->group_id = normalized_group_id;
+		data->unlocked_platinum = unlocked[1];
+		data->unlocked_gold     = unlocked[2];
+		data->unlocked_silver   = unlocked[3];
+		data->unlocked_bronze   = unlocked[4];
+		data->unlocked_trophies = unlocked[1] + unlocked[2] + unlocked[3] + unlocked[4];
+		const auto total = counts[1] + counts[2] + counts[3] + counts[4];
+		data->progress_percentage =
+		    total == 0 ? 0 : static_cast<uint32_t>(
+		                         static_cast<uint64_t>(data->unlocked_trophies) * 100 / total);
 	}
 
 	return 0;
@@ -2128,6 +2769,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetGroupInfoArray(int context, int handle, uin
 	     reinterpret_cast<uint64_t>(data_array), reinterpret_cast<uint64_t>(count));
 
 	const uint32_t out_count = (offset == 0 && limit != 0 ? 1u : 0u);
+	const auto     counts    = GetTrophyGradeCounts();
 
 	if (count != nullptr) {
 		*count = out_count;
@@ -2135,13 +2777,27 @@ static int KYTY_SYSV_ABI NpTrophy2GetGroupInfoArray(int context, int handle, uin
 	if (out_count != 0 && details_array != nullptr) {
 		std::memset(details_array, 0, sizeof(*details_array));
 		details_array->group_id     = 0;
-		details_array->num_trophies = 1;
-		details_array->num_bronze   = 1;
+		details_array->num_trophies = counts[1] + counts[2] + counts[3] + counts[4];
+		details_array->num_platinum = counts[1];
+		details_array->num_gold     = counts[2];
+		details_array->num_silver   = counts[3];
+		details_array->num_bronze   = counts[4];
 		NpTrophy2FillTitle(details_array->title, sizeof(details_array->title), "Base Game");
 	}
 	if (out_count != 0 && data_array != nullptr) {
+		const auto unlocked = GetUnlockedTrophyGradeCounts();
 		std::memset(data_array, 0, sizeof(*data_array));
 		data_array->group_id = 0;
+		data_array->unlocked_platinum = unlocked[1];
+		data_array->unlocked_gold     = unlocked[2];
+		data_array->unlocked_silver   = unlocked[3];
+		data_array->unlocked_bronze   = unlocked[4];
+		data_array->unlocked_trophies = unlocked[1] + unlocked[2] + unlocked[3] + unlocked[4];
+		const auto total = counts[1] + counts[2] + counts[3] + counts[4];
+		data_array->progress_percentage =
+		    total == 0 ? 0 : static_cast<uint32_t>(
+		                         static_cast<uint64_t>(data_array->unlocked_trophies) * 100 /
+		                         total);
 	}
 
 	return 0;
@@ -2160,18 +2816,10 @@ static int KYTY_SYSV_ABI NpTrophy2GetTrophyInfo(int context, int handle, int tro
 	     reinterpret_cast<uint64_t>(data));
 
 	if (details != nullptr) {
-		std::memset(details, 0, sizeof(*details));
-		details->trophy_id    = trophy_id;
-		details->trophy_grade = 4;
-		details->group_id     = 0;
-		details->target.type  = 0;
-		details->target.value = 0;
-		NpTrophy2FillTitle(details->name, sizeof(details->name), "Trophy");
-		NpTrophy2FillTitle(details->description, sizeof(details->description), "Trophy");
+		FillTrophyDetails(details, GetTrophyMetadata(trophy_id));
 	}
 	if (data != nullptr) {
-		std::memset(data, 0, sizeof(*data));
-		data->trophy_id = trophy_id;
+		FillTrophyData(data, trophy_id);
 	}
 
 	return 0;
@@ -2193,23 +2841,19 @@ static int KYTY_SYSV_ABI NpTrophy2GetTrophyInfoArray(int context, int handle, ui
 	     context, handle, offset, limit, reinterpret_cast<uint64_t>(details_array),
 	     reinterpret_cast<uint64_t>(data_array), reinterpret_cast<uint64_t>(count));
 
-	const uint32_t out_count = (offset == 0 && limit != 0 ? 1u : 0u);
+	const auto trophies = GetTrophyMetadataList();
+	const uint32_t out_count =
+	    offset < trophies.size() ? static_cast<uint32_t>(
+	                                   std::min<uint64_t>(limit, trophies.size() - offset))
+	                             : 0u;
 
 	if (count != nullptr) {
 		*count = out_count;
 	}
-	if (out_count != 0 && details_array != nullptr) {
-		std::memset(details_array, 0, sizeof(*details_array));
-		details_array->trophy_id    = 0;
-		details_array->trophy_grade = 4;
-		details_array->group_id     = 0;
-		NpTrophy2FillTitle(details_array->name, sizeof(details_array->name), "Trophy");
-		NpTrophy2FillTitle(details_array->description, sizeof(details_array->description),
-		                   "Trophy");
-	}
-	if (out_count != 0 && data_array != nullptr) {
-		std::memset(data_array, 0, sizeof(*data_array));
-		data_array->trophy_id = 0;
+	for (uint32_t i = 0; i < out_count; i++) {
+		const auto& trophy = trophies[offset + i];
+		FillTrophyDetails(details_array != nullptr ? &details_array[i] : nullptr, trophy);
+		FillTrophyData(data_array != nullptr ? &data_array[i] : nullptr, trophy.id);
 	}
 
 	return 0;
@@ -2340,9 +2984,15 @@ struct NpUniversalDataSystemMemoryStat {
 	size_t current_inuse_size;
 };
 
-struct NpUniversalDataSystemEvent {};
+struct NpUniversalDataSystemEventPropertyObject {
+	std::unordered_map<std::string, int64_t> integers;
+};
 
-struct NpUniversalDataSystemEventPropertyObject {};
+struct NpUniversalDataSystemEvent {
+	std::string                                      name;
+	NpUniversalDataSystemEventPropertyObject*        properties = nullptr;
+	std::unique_ptr<NpUniversalDataSystemEventPropertyObject> owned_properties;
+};
 
 struct NpUniversalDataSystemEventPropertyArray {};
 
@@ -2427,10 +3077,20 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEvent(
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
 
-	*new_event = new NpUniversalDataSystemEvent;
+	auto event  = std::make_unique<NpUniversalDataSystemEvent>();
+	event->name = event_name;
+	if (prop != nullptr) {
+		event->properties = const_cast<NpUniversalDataSystemEventPropertyObject*>(prop);
+	} else if (prop_ptr != nullptr) {
+		event->properties = new NpUniversalDataSystemEventPropertyObject;
+	} else {
+		event->owned_properties =
+		    std::make_unique<NpUniversalDataSystemEventPropertyObject>();
+		event->properties = event->owned_properties.get();
+	}
+	*new_event = event.release();
 	if (prop_ptr != nullptr) {
-		*prop_ptr = (prop != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(prop)
-		                             : new NpUniversalDataSystemEventPropertyObject);
+		*prop_ptr = (*new_event)->properties;
 	}
 
 	LOGF("\t event_name = %s\n"
@@ -2440,6 +3100,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEvent(
 	     event_name != nullptr ? event_name : "<null>", reinterpret_cast<uint64_t>(prop),
 	     reinterpret_cast<uint64_t>(*new_event),
 	     prop_ptr != nullptr ? reinterpret_cast<uint64_t>(*prop_ptr) : 0);
+	LOGF("[UDS] created event: %s\n", event_name);
 
 	return 0;
 }
@@ -2448,11 +3109,35 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
                                                         uint64_t options) {
 	PRINT_NAME();
 
+	if (event == nullptr) {
+		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
+	}
+	const auto* uds_event = static_cast<const NpUniversalDataSystemEvent*>(event);
 	LOGF("\t context = %d\n"
 	     "\t handle  = %d\n"
+	     "\t event_name = %s\n"
 	     "\t event   = 0x%016" PRIx64 "\n"
 	     "\t options = 0x%016" PRIx64 "\n",
-	     context, handle, reinterpret_cast<uint64_t>(event), options);
+	     context, handle, uds_event->name.c_str(), reinterpret_cast<uint64_t>(event), options);
+	LOGF("[UDS] posted event: %s\n", uds_event->name.c_str());
+
+	if (uds_event->name == "_UnlockTrophy" && uds_event->properties != nullptr) {
+		const auto trophy_id = uds_event->properties->integers.find("_trophy_id");
+		if (trophy_id == uds_event->properties->integers.end() || trophy_id->second < 0 ||
+		    trophy_id->second > std::numeric_limits<int32_t>::max()) {
+			LOGF("[Trophy] ignored _UnlockTrophy event without a valid _trophy_id\n");
+			return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
+		}
+		LOGF("[Trophy] received _UnlockTrophy event: id=%" PRId64 "\n", trophy_id->second);
+		LibNpTrophy2::RecordTrophyUnlock(static_cast<int>(trophy_id->second));
+	} else if (uds_event->name == "_UnlockTrophy") {
+		LOGF("[Trophy] ignored _UnlockTrophy event without properties\n");
+		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
+	} else if (uds_event->name == "COOLING__DIVED_FROM_DIVING_BOARD" ||
+	           uds_event->name == "COOLING_DIVED_FROM_DIVING_BOARD") {
+		LOGF("[Trophy] mapped diving-board event to trophy 30\n");
+		LibNpTrophy2::RecordTrophyUnlock(30);
+	}
 
 	return 0;
 }
@@ -2598,6 +3283,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt32(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
+	object->integers[key] = value;
 
 	return 0;
 }
@@ -2609,6 +3295,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt32(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
+	object->integers[key] = static_cast<int64_t>(value);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -2625,6 +3312,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt64(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
+	object->integers[key] = value;
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -2641,6 +3329,10 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt64(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
+	if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
+	}
+	object->integers[key] = static_cast<int64_t>(value);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"

@@ -835,7 +835,8 @@ void ConfigurationListWidget::ViewTrophies() {
 		return;
 	}
 
-	TrophyViewerDialog::ShowForGame(&item->GetInfo(), this);
+	const auto config = CreateConfiguration(*item);
+	TrophyViewerDialog::ShowForGame(config.get(), this);
 }
 
 void ConfigurationListWidget::open_game_folder() {

@@ -725,6 +725,15 @@ endif()
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 
+set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
+if(EXISTS "${KYTY_TROPHY_UNLOCK_SOUND}")
+	add_custom_command(TARGET kyty_emulator POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_TROPHY_UNLOCK_SOUND}"
+			"$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds/trophy-unlock.wav")
+	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
+endif()
+
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)

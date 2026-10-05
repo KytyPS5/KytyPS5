@@ -7,12 +7,14 @@
 #include <QAbstractItemView>
 #include <QBrush>
 #include <QByteArray>
+#include <QCoreApplication>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileInfo>
 #include <QFont>
 #include <QHeaderView>
 #include <QIcon>
+#include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -214,6 +216,43 @@ static const QByteArray* FindFirstTrophyMetadataFile(const QMap<QString, QByteAr
 	return FindFile(files, QStringLiteral("tropmeta.json"));
 }
 
+static const QByteArray* FindMetadataForLanguage(const QMap<QString, QByteArray>& files,
+                                                 const QString& locale) {
+	const auto normalize_locale = [](QString value) {
+		value = value.trimmed().toCaseFolded();
+		value.replace(QLatin1Char('_'), QLatin1Char('-'));
+		return value;
+	};
+	const auto desired_locale = normalize_locale(locale);
+	const auto separator = desired_locale.indexOf(QLatin1Char('-'));
+	const auto language = separator < 0 ? desired_locale : desired_locale.left(separator);
+	const QByteArray* language_match = nullptr;
+	for (auto it = files.constBegin(); it != files.constEnd(); ++it) {
+		if (!it.key().startsWith(QStringLiteral("tropmeta_")) ||
+		    !it.key().endsWith(QStringLiteral(".json"))) {
+			continue;
+		}
+		const auto file_locale =
+		    normalize_locale(it.key().mid(9, it.key().size() - 14));
+		if (file_locale == desired_locale) {
+			return &it.value();
+		}
+		const auto file_separator = file_locale.indexOf(QLatin1Char('-'));
+		const auto file_language =
+		    file_separator < 0 ? file_locale : file_locale.left(file_separator);
+		if (language_match == nullptr && file_language == language) {
+			language_match = &it.value();
+		}
+	}
+	return language_match;
+}
+
+static QString CanonicalTrophyId(const QString& id) {
+	bool        valid = false;
+	const auto numeric_id = id.trimmed().toULongLong(&valid);
+	return valid ? QString::number(numeric_id) : id.trimmed();
+}
+
 static bool ReadJsonObject(const QByteArray& data, const QString& file_name, QJsonObject& object,
                            QString& error) {
 	QJsonParseError parse_error;
@@ -342,7 +381,25 @@ static QString TrophyTabTitle(const QString& file_name) {
 	return QFileInfo(file_name).completeBaseName();
 }
 
-static bool BuildTrophySet(const QString& ucp_file, TrophySet& set, QString& error) {
+static QString ConsoleLanguageLocale(int language) {
+	static const QStringList locales = {
+	    QStringLiteral("ja-JP"), QStringLiteral("en-US"), QStringLiteral("fr-FR"),
+	    QStringLiteral("es-ES"), QStringLiteral("de-DE"), QStringLiteral("it-IT"),
+	    QStringLiteral("nl-NL"), QStringLiteral("pt-PT"), QStringLiteral("ru-RU"),
+	    QStringLiteral("ko-KR"), QStringLiteral("zh-Hant"), QStringLiteral("zh-Hans"),
+	    QStringLiteral("fi-FI"), QStringLiteral("sv-SE"), QStringLiteral("da-DK"),
+	    QStringLiteral("no-NO"), QStringLiteral("pl-PL"), QStringLiteral("pt-BR"),
+	    QStringLiteral("en-GB"), QStringLiteral("tr-TR"), QStringLiteral("es-419"),
+	    QStringLiteral("ar-AE"), QStringLiteral("fr-CA"), QStringLiteral("cs-CZ"),
+	    QStringLiteral("hu-HU"), QStringLiteral("el-GR"), QStringLiteral("ro-RO"),
+	    QStringLiteral("th-TH"), QStringLiteral("vi-VN"), QStringLiteral("id-ID"),
+	};
+	return language >= 0 && language < locales.size() ? locales.at(language)
+	                                                  : QStringLiteral("en-US");
+}
+
+static bool BuildTrophySet(const QString& ucp_file, int console_language, TrophySet& set,
+                           QString& error) {
 	QMap<QString, QByteArray> files;
 	if (!ReadUcp(ucp_file, files, error)) {
 		return false;
@@ -362,9 +419,15 @@ static bool BuildTrophySet(const QString& ucp_file, TrophySet& set, QString& err
 
 	const auto default_language =
 	    JsonString(tropconf.value(QStringLiteral("defaultLanguage"))).trimmed();
-	const QByteArray* meta_data = nullptr;
+	const auto locale = ConsoleLanguageLocale(console_language);
+	const QByteArray* meta_data = FindMetadataForLanguage(files, locale);
 	if (!default_language.isEmpty()) {
-		meta_data = FindFile(files, QStringLiteral("tropmeta_%1.json").arg(default_language));
+		if (meta_data == nullptr) {
+			meta_data = FindMetadataForLanguage(files, default_language);
+		}
+	}
+	if (meta_data == nullptr) {
+		meta_data = FindMetadataForLanguage(files, QStringLiteral("en-US"));
 	}
 	if (meta_data == nullptr) {
 		meta_data = FindFirstTrophyMetadataFile(files);
@@ -449,16 +512,79 @@ static QStringList FindTrophyFiles(const Configuration* info) {
 	return trophy_files;
 }
 
+static QSet<QString> LoadUnlockedTrophies(const Configuration& info) {
+	QSet<QString> unlocked;
+	const auto title_id = info.title_id.trimmed();
+	if (title_id.isEmpty() ||
+	    !std::all_of(title_id.begin(), title_id.end(), [](QChar c) {
+		    return c.isLetterOrNumber() || c == QLatin1Char('_') || c == QLatin1Char('-');
+	    })) {
+		return unlocked;
+	}
+
+	QStringList roots {QDir::currentPath(), QCoreApplication::applicationDirPath()};
+	QDir current_parent(QDir::currentPath());
+	if (current_parent.cdUp()) {
+		roots.append(current_parent.absolutePath());
+	}
+	QDir application_parent(QCoreApplication::applicationDirPath());
+	if (application_parent.cdUp()) {
+		roots.append(application_parent.absolutePath());
+	}
+
+	for (const auto& root: roots) {
+		const auto path = QDir(root).filePath(
+		    QStringLiteral("_SaveData/%1/trophies_%2.json").arg(title_id).arg(info.user_id));
+		const auto bytes = GameContent::ReadPath(GameContent::ToPath(path), uint64_t {1} << 20u);
+		if (bytes.isEmpty()) {
+			continue;
+		}
+		QJsonParseError parse_error;
+		const auto document = QJsonDocument::fromJson(bytes, &parse_error);
+		if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+			qWarning("Could not parse saved trophy unlocks from %s: %s",
+			         QDir::toNativeSeparators(path).toUtf8().constData(),
+			         parse_error.errorString().toUtf8().constData());
+			continue;
+		}
+		const auto entries = document.object().value(QStringLiteral("unlockedTrophies")).toArray();
+		for (const auto& entry: entries) {
+			const auto id = entry.isString()
+			                    ? entry.toString().trimmed()
+			                    : (entry.isDouble() ? QString::number(entry.toInt()) : QString {});
+			if (!id.isEmpty()) {
+				unlocked.insert(CanonicalTrophyId(id));
+			}
+		}
+		return unlocked;
+	}
+	return unlocked;
+}
+
 static void PrepareTable(QTableWidget* table) {
+	table->setObjectName(QStringLiteral("trophy_table"));
 	table->setColumnCount(4);
 	table->setHorizontalHeaderLabels({QObject::tr("Unlocked"), QObject::tr("Trophy"),
 	                                  QObject::tr("Name"), QObject::tr("Description")});
-	table->setAlternatingRowColors(true);
+	table->setAlternatingRowColors(false);
 	table->setEditTriggers(QAbstractItemView::NoEditTriggers);
 	table->setSelectionBehavior(QAbstractItemView::SelectRows);
 	table->setSelectionMode(QAbstractItemView::SingleSelection);
+	table->setMouseTracking(false);
+	table->viewport()->setMouseTracking(false);
+	table->setAttribute(Qt::WA_Hover, false);
+	table->viewport()->setAttribute(Qt::WA_Hover, false);
+	table->setIconSize(QSize(96, 96));
 	table->setShowGrid(false);
 	table->setWordWrap(true);
+	table->setStyleSheet(QStringLiteral(
+	    "QTableWidget#trophy_table::item:selected {"
+	    " background-color: #0878d1; color: #ffffff;"
+	    " border-top: 1px solid #8bd5ff; border-bottom: 1px solid #8bd5ff;"
+	    "}"
+	    "QTableWidget#trophy_table::item:focus {"
+	    " border: 2px solid #ffd34e;"
+	    "}"));
 	table->verticalHeader()->setVisible(false);
 	table->verticalHeader()->setDefaultSectionSize(112);
 	table->horizontalHeader()->setStretchLastSection(true);
@@ -543,11 +669,12 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, QString& error) {
 		return false;
 	}
 
+	const auto unlocked_trophies = LoadUnlockedTrophies(info);
 	QStringList errors;
 	for (const auto& file: trophy_files) {
 		TrophySet set;
 		QString   set_error;
-		if (!BuildTrophySet(file, set, set_error)) {
+		if (!BuildTrophySet(file, info.console_language, set, set_error)) {
 			errors.append(set_error);
 			continue;
 		}
@@ -559,31 +686,53 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, QString& error) {
 			const auto& row = set.trophies.at(row_index);
 			table->setRowHeight(row_index, 112);
 
-			auto* status = CreateItem(tr("locked"));
+			const bool trophy_unlocked =
+			    unlocked_trophies.contains(CanonicalTrophyId(row.id));
+			const QString state_label =
+			    trophy_unlocked ? tr("?  UNLOCKED") : tr("?  LOCKED");
+			auto* status = CreateItem(state_label);
 			status->setTextAlignment(Qt::AlignCenter);
-			if (row.hidden) {
-				status->setForeground(QBrush(Qt::gray));
+			auto status_font = status->font();
+			status_font.setBold(true);
+			status->setFont(status_font);
+			if (trophy_unlocked) {
+				status->setForeground(QBrush(QColor(115, 255, 175)));
+				status->setBackground(QBrush(QColor(20, 83, 55)));
+			} else if (row.hidden) {
+				status->setForeground(QBrush(QColor(185, 190, 200)));
+				status->setBackground(QBrush(QColor(56, 58, 64)));
+			} else {
+				status->setForeground(QBrush(QColor(205, 210, 220)));
+				status->setBackground(QBrush(QColor(50, 53, 60)));
 			}
 			table->setItem(row_index, 0, status);
 
-			auto* icon_label = new QLabel(table);
-			icon_label->setAlignment(Qt::AlignCenter);
-			icon_label->setMinimumSize(QSize(108, 108));
+			auto* icon_item = CreateItem({});
+			icon_item->setTextAlignment(Qt::AlignCenter);
 			if (!row.icon.isNull()) {
-				icon_label->setPixmap(
-				    row.icon.scaled(QSize(96, 96), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+				auto trophy_icon = row.icon;
+				if (!trophy_unlocked) {
+					trophy_icon = QPixmap::fromImage(
+					    trophy_icon.toImage().convertToFormat(QImage::Format_Grayscale8));
+				}
+				icon_item->setIcon(QIcon(trophy_icon));
 			}
-			table->setCellWidget(row_index, 1, icon_label);
+			table->setItem(row_index, 1, icon_item);
 
 			auto* name = CreateItem(row.name);
 			auto  font = name->font();
 			font.setBold(true);
 			name->setFont(font);
 			name->setToolTip(TrophyTooltip(row));
-			table->setItem(row_index, 2, name);
-
 			auto* detail = CreateItem(row.detail);
 			detail->setToolTip(TrophyTooltip(row));
+
+			const QBrush row_background(trophy_unlocked ? QColor(27, 54, 45)
+			                                            : QColor(37, 39, 44));
+			for (auto* item: {icon_item, name, detail}) {
+				item->setBackground(row_background);
+			}
+			table->setItem(row_index, 2, name);
 			table->setItem(row_index, 3, detail);
 		}
 

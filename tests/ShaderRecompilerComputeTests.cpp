@@ -175,6 +175,10 @@ struct BufferCacheTestAccess {
     return owner == nullptr ? BufferId{} : *owner;
   }
 
+  static Buffer &BdaPageTable(BufferCache &cache) {
+    return cache.m_bda_pagetable_buffer;
+  }
+
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
@@ -4955,6 +4959,105 @@ public:
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A zero BDA page-table entry means "unmapped" to shaders, and device memory is not
+  // zero-initialized, so the production table must be cleared before its first use. The
+  // whole table is poisoned before the first production use, which comes either from a
+  // buffer registration or from a consumer asking for the table.
+  void CheckBdaPageTableInitialization() {
+    constexpr const char *name = "BdaPageTableInitialization";
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t low = 0x0000000209000000ull;
+    constexpr uint64_t extended = LibKernel::Memory::kExtendedMemoryBase + low;
+    constexpr uint64_t unrelated = 0x0000004000000000ull;
+    constexpr uint32_t poison_word = 0xdeadbeefu;
+    constexpr uint64_t poison = 0xdeadbeefdeadbeefull;
+
+    for (const bool registration : {true, false}) {
+      const char *label = registration ? "registration" : "consumer";
+      EnsureRuntimeContext();
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      auto &cache = context.GetBufferCache();
+      auto &table = BufferCacheTestAccess::BdaPageTable(cache);
+
+      // Reads entries straight from the table buffer, without any production access.
+      const auto ReadTable = [&](const std::vector<uint64_t> &addresses) {
+        const uint64_t bytes = addresses.size() * sizeof(uint64_t);
+        auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst,
+                                         std::vector<u32>(addresses.size() * 2, 0));
+        std::vector<vk::BufferCopy> copies;
+        for (size_t index = 0; index < addresses.size(); ++index) {
+          copies.push_back({BufferCache::PageIndex(addresses[index]) * sizeof(uint64_t),
+                            index * sizeof(uint64_t), sizeof(uint64_t)});
+        }
+        scheduler.Current().EndRendering();
+        scheduler.Current().Handle().copyBuffer(table.Handle(), readback.buffer,
+                                                static_cast<uint32_t>(copies.size()),
+                                                copies.data());
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+            nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        const auto words = ReadBuffer(name, readback, addresses.size() * 2);
+        DestroyBuffer(&readback);
+        std::vector<uint64_t> entries;
+        for (size_t index = 0; index < addresses.size(); ++index) {
+          entries.push_back(uint64_t{words[2 * index]} | uint64_t{words[2 * index + 1]} << 32);
+        }
+        return entries;
+      };
+      // Never-owned slots: below and above the buffers, in low, extended and far memory.
+      const std::vector<uint64_t> unowned{low - page,      low + 4 * page,  extended - page,
+                                          extended + 4 * page, unrelated};
+
+      table.Fill(0, table.Size(), poison_word);
+      Require(label, "table is poisoned before first use",
+              ReadTable(unowned) == std::vector<uint64_t>(unowned.size(), poison),
+              "the poison did not reach the production table");
+
+      if (registration) {
+        const auto low_id = cache.FindBuffer(low, 4 * page);
+        const auto extended_id = cache.FindBuffer(extended, 4 * page);
+        const auto &low_owner = cache.GetBuffer(low_id);
+        const auto &extended_owner = cache.GetBuffer(extended_id);
+        std::vector<uint64_t> owned_addresses;
+        std::vector<uint64_t> owned_expected;
+        for (uint64_t index = 0; index < 4; ++index) {
+          owned_addresses.push_back(low + index * page);
+          owned_expected.push_back(low_owner.BufferDeviceAddress() + index * page);
+        }
+        for (uint64_t index = 0; index < 4; ++index) {
+          owned_addresses.push_back(extended + index * page);
+          owned_expected.push_back(extended_owner.BufferDeviceAddress() + index * page);
+        }
+        Require(label, "registration publishes owner entries",
+                ReadTable(owned_addresses) == owned_expected,
+                "registering buffers did not publish their device addresses");
+      } else {
+        (void)cache.GetBdaPageTableBuffer();
+      }
+      Require(label, "never-owned entries are unmapped",
+              ReadTable(unowned) == std::vector<uint64_t>(unowned.size(), 0),
+              "a never-published BDA page-table entry kept uninitialized contents");
+      scheduler.Finish();
+      context.ShutdownGpu();
+      std::printf("[host]    %-32s %-13s ok\n", name, label);
+    }
   }
 
   void CheckComputeMetaClearClassification() {
@@ -40559,6 +40662,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-init-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaPageTableInitialization();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -40752,6 +40860,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckBdaPageTableInitialization();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

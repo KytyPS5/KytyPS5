@@ -104,12 +104,12 @@
         </property>
         <item row="0" column="0">
          <widget class="QLabel" name="label_screen_resolution">
-          <property name="text"><string>Screen resolution:</string></property>
+          <property name="text"><string>Output resolution:</string></property>
          </widget>
         </item>
         <item row="0" column="1">
          <widget class="QComboBox" name="comboBox_screen_resolution">
-          <property name="toolTip"><string>Window resolution</string></property>
+          <property name="toolTip"><string>Target resolution after upscaling. Also sets the initial window size.</string></property>
          </widget>
         </item>
         <item row="1" column="0">
@@ -180,7 +180,34 @@
         </item>
         <item row="9" column="1">
          <widget class="QComboBox" name="comboBox_dlss">
-          <property name="toolTip"><string>Experimental DLSS Super Resolution / DLAA for the emulator's final frame. Requires a supported NVIDIA RTX GPU. Processes the game image and its HUD; artifacts are possible. Adds GPU work without reducing the game's rendering cost.</string></property>
+          <property name="toolTip"><string>Reconstruct the rendered image to the output resolution. Requires a supported NVIDIA RTX GPU. Includes the game's HUD; artifacts are possible.</string></property>
+         </widget>
+        </item>
+        <item row="10" column="0">
+         <widget class="QLabel" name="label_render_scale">
+          <property name="text"><string>Render scale:</string></property>
+         </widget>
+        </item>
+        <item row="10" column="1">
+         <widget class="QSpinBox" name="spinBox_render_scale">
+          <property name="toolTip"><string>Rasterize supported game passes at this percentage of their native dimensions, then reconstruct to the output resolution. Lower values reduce detail and can reduce GPU rendering cost.</string></property>
+          <property name="suffix"><string>%</string></property>
+          <property name="minimum"><number>25</number></property>
+          <property name="maximum"><number>100</number></property>
+          <property name="singleStep"><number>5</number></property>
+          <property name="value"><number>100</number></property>
+         </widget>
+        </item>
+        <item row="11" column="0" colspan="2">
+         <widget class="QLabel" name="label_upscale_summary">
+          <property name="wordWrap"><bool>true</bool></property>
+          <property name="text"><string>Native rendering</string></property>
+         </widget>
+        </item>
+        <item row="12" column="1">
+         <widget class="QCheckBox" name="checkBox_dlss_frame_generation">
+          <property name="text"><string>DLSS Frame Generation</string></property>
+          <property name="toolTip"><string>Generate intermediate display frames. Requires supported NVIDIA RTX hardware and the Frame Generation runtime, with Vulkan validation off. Does not increase game simulation FPS.</string></property>
          </widget>
         </item>
         <item row="8" column="1">

@@ -236,6 +236,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	args << "--dlss" << EnumToText(info.dlss_mode);
+	args << "--render-scale" << QString::number(info.render_scale_percent);
+	args << "--dlss-frame-generation" << BoolArg(info.dlss_frame_generation);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}

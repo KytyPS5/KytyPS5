@@ -22,6 +22,9 @@ add_executable(launcher WIN32
 if(KYTY_ENABLE_DLSS)
 	target_compile_definitions(launcher PRIVATE KYTY_HAS_DLSS=1)
 endif()
+if(KYTY_ENABLE_DLSS_FG)
+	target_compile_definitions(launcher PRIVATE KYTY_HAS_DLSS_FG=1)
+endif()
 deploy_kyty_dlss(launcher)
 
 
@@ -46,11 +49,29 @@ if(BUILD_TESTING)
 	set_target_properties(dlss_settings_tests PROPERTIES AUTOMOC ON)
 	target_link_libraries(dlss_settings_tests PRIVATE Qt6::Gui common)
 	add_test(NAME dlss_settings COMMAND dlss_settings_tests)
+	add_executable(upscale_menu_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/UpscaleMenuTests.cpp"
+		src/configurationEditDialog.cpp src/mandatoryLineEdit.cpp
+		include/configurationEditDialog.h include/mandatoryLineEdit.h include/configuration.h
+		forms/configuration_edit_dialog.ui)
+	set_target_properties(upscale_menu_tests PROPERTIES AUTOMOC ON AUTOUIC ON)
+	target_include_directories(upscale_menu_tests PRIVATE include)
+	target_link_libraries(upscale_menu_tests PRIVATE Qt6::Widgets common SDL3::SDL3-static Vulkan::Headers)
+	if(KYTY_ENABLE_DLSS)
+		target_compile_definitions(upscale_menu_tests PRIVATE KYTY_HAS_DLSS=1)
+	endif()
+	if(KYTY_ENABLE_DLSS_FG)
+		target_compile_definitions(upscale_menu_tests PRIVATE KYTY_HAS_DLSS_FG=1)
+	endif()
+	add_test(NAME upscale_menu COMMAND upscale_menu_tests)
+	set_tests_properties(upscale_menu PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 	if(TARGET kyty_tests)
-		add_dependencies(kyty_tests dlss_settings_tests)
+		add_dependencies(kyty_tests dlss_settings_tests upscale_menu_tests)
 	endif()
 	if(WIN32)
 		set_tests_properties(dlss_settings PROPERTIES ENVIRONMENT "PATH=$<TARGET_FILE_DIR:Qt6::Core>")
+		set_tests_properties(upscale_menu PROPERTIES ENVIRONMENT
+			"QT_QPA_PLATFORM=offscreen;PATH=$<TARGET_FILE_DIR:Qt6::Core>")
 	endif()
 endif()
 
@@ -76,6 +97,19 @@ if(WIN32)
     if(NOT QT_WINDEPLOYQT)
     	message(FATAL_ERROR "Could not find windeployqt")
     endif()
+	if(TARGET upscale_menu_tests)
+		add_custom_command(TARGET upscale_menu_tests POST_BUILD
+			COMMAND ${QT_WINDEPLOYQT} $<TARGET_FILE:upscale_menu_tests>
+				--include-plugins qoffscreen
+				--no-compiler-runtime
+				--no-system-d3d-compiler
+				--no-system-dxc-compiler
+				--no-opengl-sw
+				--no-translations
+			COMMENT "Deploying Qt runtime and offscreen plugin for menu tests"
+			VERBATIM
+		)
+	endif()
 	add_custom_command(TARGET launcher POST_BUILD
 		COMMAND ${QT_WINDEPLOYQT} $<TARGET_FILE:launcher>
 			--no-compiler-runtime

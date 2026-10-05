@@ -129,6 +129,12 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
+	connect(m_ui->comboBox_screen_resolution, &QComboBox::currentTextChanged, this,
+	        &ConfigurationEditDialog::UpdateUpscaleSummary);
+	connect(m_ui->comboBox_dlss, &QComboBox::currentTextChanged, this,
+	        &ConfigurationEditDialog::UpdateUpscaleSummary);
+	connect(m_ui->spinBox_render_scale, &QSpinBox::valueChanged, this,
+	        &ConfigurationEditDialog::UpdateUpscaleSummary);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
 	connect(m_ui->button_controller_color, &QPushButton::clicked, this, [this]() {
 		const auto current = m_ui->button_controller_color->property("controllerColor").toString();
@@ -239,6 +245,13 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	ListInit(m_ui->comboBox_dlss, info.dlss_mode);
+	m_ui->spinBox_render_scale->setValue(info.render_scale_percent);
+	m_ui->checkBox_dlss_frame_generation->setChecked(info.dlss_frame_generation);
+#if !defined(KYTY_HAS_DLSS_FG)
+	m_ui->checkBox_dlss_frame_generation->setEnabled(false);
+	m_ui->checkBox_dlss_frame_generation->setToolTip(tr("Frame Generation is unavailable in this build."));
+#endif
+	UpdateUpscaleSummary();
 #if !defined(KYTY_HAS_DLSS)
 	m_ui->comboBox_dlss->setEnabled(false);
 	m_ui->comboBox_dlss->setToolTip(tr("DLSS is unavailable in this build. Build with KYTY_ENABLE_DLSS=ON."));
@@ -312,6 +325,17 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
 	m_ui->checkBox_profiler->setChecked(info.profiler_enabled);
+}
+
+void ConfigurationEditDialog::UpdateUpscaleSummary() {
+	const auto resolution = m_ui->comboBox_screen_resolution->currentText();
+	const auto mode = TextToEnum<Configuration::DlssMode>(m_ui->comboBox_dlss->currentText());
+	const int scale = m_ui->spinBox_render_scale->value();
+	m_ui->label_upscale_summary->setText(
+	    mode == Configuration::DlssMode::Off
+	        ? tr("%1% render scale → %2 output (spatial scaling)").arg(scale).arg(resolution)
+	        : tr("%1% render scale → %2 output (DLSS %3)")
+	              .arg(scale).arg(resolution).arg(m_ui->comboBox_dlss->currentText()));
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -429,6 +453,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
 	info.dlss_mode = TextToEnum<Configuration::DlssMode>(ui.comboBox_dlss->currentText());
+	info.render_scale_percent = ui.spinBox_render_scale->value();
+	info.dlss_frame_generation = ui.checkBox_dlss_frame_generation->isChecked();
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();

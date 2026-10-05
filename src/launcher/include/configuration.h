@@ -121,6 +121,8 @@ public:
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	DlssMode               dlss_mode                   = DlssMode::Off;
+	int                    render_scale_percent        = 100;
+	bool                   dlss_frame_generation       = false;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
@@ -155,6 +157,8 @@ public:
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
 		dlss_mode                   = other.dlss_mode;
+		render_scale_percent        = other.render_scale_percent;
+		dlss_frame_generation       = other.dlss_frame_generation;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
@@ -204,6 +208,8 @@ public:
 		KYTY_CFG_SET(audio_input_device);
 		KYTY_CFG_SET(present_mode);
 		KYTY_CFG_SET(dlss_mode);
+		KYTY_CFG_SET(render_scale_percent);
+		KYTY_CFG_SET(dlss_frame_generation);
 		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(hide_cursor_enabled);
@@ -248,6 +254,10 @@ public:
 		// Older settings and invalid values must keep DLSS disabled.
 		const auto saved_dlss = TextToEnum<DlssMode>(s->value("dlss_mode", "Off").toString());
 		dlss_mode = EnumToText(saved_dlss).isEmpty() ? DlssMode::Off : saved_dlss;
+		bool scale_ok = false;
+		const auto scale = s->value("render_scale_percent", 100).toInt(&scale_ok);
+		render_scale_percent = scale_ok && scale >= 25 && scale <= 100 ? scale : 100;
+		dlss_frame_generation = s->value("dlss_frame_generation", false).toBool();
 		gpu_index = s->value("gpu_index", -1).toInt();
 		if (EnumToText(present_mode).isEmpty()) {
 			present_mode = PresentMode::Mailbox;

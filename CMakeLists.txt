@@ -681,6 +681,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+	add_test(NAME graphics_logical_alpha_blending
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --logical-alpha-only)
+	set_tests_properties(graphics_logical_alpha_blending PROPERTIES TIMEOUT 90)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets

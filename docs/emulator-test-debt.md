@@ -1,5 +1,96 @@
 # Emulator regression test debt
 
+## Color pipeline comparison with upstream (2026-10-05; regressions pending)
+
+User requests comparison against andsouzam/main and useful integration, plus
+investigation of very dark Yōtei colors. Fetched exact fork719e0257 and upstream
+af3011cd; fork is upstream ancestor, 27 newer upstream commits, no fork-only
+commits. Local branch diverges at8e61798b; do not infer absent behavior solely
+from missing commit IDs. No merge/reset/push performed.
+
+Candidates: upstream5940e623 packed10/11/11 floating color upload/download,
+96c067d0 filterable8-bit UScaled textures, and logical-alpha blend support
+73615c31 +0bef3fc0 +94e7d239. Some require older shared-mechanism dependencies
+and manual adaptation to preserve local fixes. Required before production port:
+synthetic native RED on existing implementation and unchanged GREEN for affected
+color contracts, including independent channel values, linear/tiled roundtrip,
+swizzle constants and alpha equations. Keep unsupported equations/aliases guarded.
+
+Additional required neighbor before final port: native MIN/MAX on all four mappings
+with deliberately different/unused color and alpha factors. These operations ignore
+factors per Vulkan basic blend contract; imported classification must not reject
+a previously valid MIN/MAX draw. Record intended guard RED then numerical GREEN.
+
+Synthetic numerical test added to existing native raster harness with selector
+`--logical-alpha-only`: four RGBA component mappings and three alpha source
+factors, independent source-over oracle for every native pixel/channel, nonzero
+destination clear. Production unchanged; native build/RED NOT RUN while bounded
+GPU game diagnostic is active. Do not claim tested integration yet.
+
+The captured setup UI is legible but scene very dark at diagnostic480x270 guest
+resolution. Runtime source is10-bitUNORM, actual guest colorimetry remains to be
+captured. HDR warning code exists but no PQ warning found in the failed run;
+do not assume HDR or change gamma/brightness to conceal an unproved defect.
+Read-only comparison and bounded fault capture continue; main menu/game entry
+pending and issue108 unchanged under user's milestone rule.
+
+Selective upstream logical-alpha integration verified (installed game still old):
+- Production baseline f708edc1, native RED `logical-alpha-capability-red-gpuav-20261005.log`,
+  EXE b0ade25b9548c403507907b5e7399dae857cd9006c2e0fc8de2f36a4fbccc3b2:
+  mapping27/SrcAlpha expected0.4 actual0.46, no timeout/VUID. Initial harness
+  depthClamp/dualSrcBlend omissions corrected before this RED. IndependentBlend
+  omission exposed only by later existing MRT neighbor and corrected in harness.
+- Adapted upstream73615c31/0bef3fc0/94e7d239 to local FP/resource/parameter linking;
+  broadcast logical alpha before output mapping, distinct static shader keys,
+  remapped shared blend factors. Unsupported cases explicitly fail; upstream
+  disabling blending/warning fallback was NOT imported.
+- Additional synthetic MIN/MAX RED `logical-alpha-minmax-red-gpuav-20261005.log`,
+  EXE f6057477ca78eee9eb02a2ecd289155708c588977906359734bb7f7e0b1fc3b8,
+  exit321 at newly imported classification for a valid ignored-factor MIN draw,
+  no VUID. Classifier now preserves identical MIN/MAX color/alpha equations.
+- Unchanged numerical oracle covers12 alpha variants plus8 MIN/MAX mapping cases,
+  every pixel/channel. Final GPUAV CTest3/3 PASS, EXE
+  c13ddb6350fca25d1360933285ddbfb053edf02d84488848f606bae36bd2b51b:
+  `logical-alpha-minmax-dynamic-state-final-ctest-gpuav-20261005.log`. Previous
+  extended run exposed missing vkCmdSetBlendConstants only in the harness;
+  production renderDraw already sets it. Corrected fixture state, same oracle. (new blending, existing
+  rasterization including packed vertex color/wave32/wave64/cache/masked MRT,
+  draw offsets). Full suite remains unproved/not green; no other game installed.
+- Contract: https://docs.vulkan.org/spec/latest/chapters/framebuffer.html basic
+  blend factors/operations. Native emulator build/install/game colors comparison
+  still pending; don't claim Yōtei darkness resolved from synthetic readback.
+
+## Integer divide exception during initial setup (2026-10-05; diagnosis pending)
+
+Native production/tests source `f708edc1`, installed EXE SHA
+`c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`.
+Run `yotei-integrated-20261005-015124-imported-htile-saved-setup-continuation-noval`
+ends 02:19:33UTC with exit -1073741676 / 0xC0000094 (integer divide by zero),
+not the 1800s deadline. Windows Application event1000 records guest-mapped fault
+address `0x9003502d2`, unknown module. stderr empty; no DeviceLost/watchdog.
+Task-owned PID45544 ended and runner streams drained/disposed.
+
+Brightness, Medium difficulty, Standard experience and Quality setup screens are
+visually verified. Normal native SendInput J/Cross confirms Quality at02:19:04UTC;
+no post-confirm screen captured before the crash. Correlation does not identify
+its cause. Main menu/game entry remain pending; no issue108 update.
+
+Further diagnostic run023451/PID17812 repeats C0000094 after Quality at02:55:49,
+ends02:56:02UTC; read-only recorder saved first/second-chance registers/object.
+Codec ATRAC9, object block bytes0; configuration order is a lead requiring its own
+synthetic metadata/decoder contract regression. Own processes gone and recorder
+closed; local proprietary bytes remain ignored, not fixtures/public evidence.
+
+Required regression BEFORE any behavior fix: determine the faulting instruction,
+operand/register state and upstream guest API/ABI contract through crash evidence
+or bounded diagnostic-only capture. Reproduce the responsible emulator behavior
+with synthetic inputs and an independent observable oracle, then demonstrate the
+intended native RED and unchanged GREEN plus neighboring boundary cases. If this
+is unsupported guest signal delivery, establish that contract rather than ignoring
+the exception. Do not skip the divide, alter guest registers, fabricate a nonzero
+result, or select behavior by the recorded address/title. Existing WER temp dump
+was already removed; archived Report.wer retains exception/address evidence.
+
 ## Sampled HTile owner rediscovery (2026-10-05; regression proved, runtime guard passed)
 
 Native source06bfff66/SHA

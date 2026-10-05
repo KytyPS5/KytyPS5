@@ -176,6 +176,8 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
+enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
+
 struct ShaderPixelInputInfo {
 	ShaderFloatingPointState initial_fp_state;
 	uint32_t                                       interpolator_settings[32]    = {0};
@@ -200,6 +202,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
+	ShaderAlphaBlendSource                         alpha_blend_source           = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;

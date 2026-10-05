@@ -327,6 +327,8 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 }
 
 void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, ShaderInfo& info) {
+	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
+	                         input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
@@ -386,8 +388,14 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 					          export_info.index, fmt::format("out_param_{}", export_info.index));
 					break;
 				case ExportTargetKind::Mrt:
+					if (alpha_remap && export_info.index != 0) {
+						break;
+					}
 					AddOutput(info, StageOutputKind::Mrt, export_info.index, export_info.index,
 					          fmt::format("out_mrt_{}", export_info.index));
+					if (alpha_remap) {
+						AddOutput(info, StageOutputKind::Mrt, 1, 1, "out_mrt_1");
+					}
 					break;
 				default: break;
 			}

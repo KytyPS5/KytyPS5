@@ -18134,7 +18134,8 @@ void CheckSampledHtileArrayClearDiscovery() {
           PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
     };
     auto &filled = pipeline(true, 2, 2);
-    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3) {
+    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
+                          std::array<u32, 4> clear_value = {}) {
       RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
       if (depth.image_id) {
         RenderExecutorTestAccess::BindRenderTarget(executor, depth.image_id);
@@ -18161,9 +18162,12 @@ void CheckSampledHtileArrayClearDiscovery() {
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], *bindings.pixel);
       rendering.color_attachments[0].is_clear = true;
+      rendering.color_attachments[0].clear_value = clear_value;
       command.BeginRendering(rendering);
       auto cmd = command.Handle();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
+      const std::array<float, 4> blend_constants{0.7f, 0.2f, 0.9f, 0.4f};
+      cmd.setBlendConstants(blend_constants.data());
       const vk::Viewport viewport{0, 0, static_cast<float>(extent),
                                   static_cast<float>(extent), 0, 1};
       const vk::Rect2D scissor{{0, 0}, {extent, extent}};
@@ -18492,6 +18496,109 @@ void CheckSampledHtileArrayClearDiscovery() {
       Require(name, "pixel wave cache distinction",
               wave_ids[0] != wave_ids[1] && wave_keys[0] != wave_keys[1],
               "wave32 and wave64 pixel programs shared a cache key");
+
+      // Independent source-over oracle: Sa remains logical alpha even when
+      // the export mapping moves it to another physical component. Derived
+      // from upstream 0bef3fc0/94e7d239, with multiple mappings and equations.
+      static const auto blend_pixel = [] {
+        std::vector<u32> code;
+        constexpr std::array<float, 4> source{0.8f, 0.6f, 0.4f, 0.5f};
+        for (u32 component = 0; component < source.size(); component++) {
+          AppendVMovLiteral(&code, component, std::bit_cast<u32>(source[component]));
+        }
+        code.push_back(EncodeExp0(0, 0xf));
+        code.push_back(EncodeExp1(0, 1, 2, 3));
+        AppendEnd(&code);
+        return code;
+      }();
+      native_pixel_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(blend_pixel.data());
+      ShaderMapUserData(native_pixel_regs.ps_regs.data_addr,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<uint32_t>(blend_pixel.size() * sizeof(u32))});
+      const auto saved_blend = registers.GetBlendControl(0);
+      const auto saved_target_info = registers.GetRenderTarget(0).info;
+      const auto saved_output_mode = registers.GetShaderRegisters().target_output_mode[0];
+      registers.SetTargetOutputMode(0, 4);
+      auto blend_target_info = saved_target_info;
+      blend_target_info.blend_bypass = false;
+      registers.SetColorInfo(0, blend_target_info);
+      registers.SetPsInControl(0x8008);
+      constexpr std::array<float, 4> source{0.8f, 0.6f, 0.4f, 0.5f};
+      constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
+      for (const auto mapping : {Prospero::ColorMappingAbgr, Prospero::ColorMappingArgb,
+                                 Prospero::ColorMappingBgra, Prospero::ColorMappingRgba}) {
+        export_mapping[0] = color.export_mapping = mapping;
+        for (const auto alpha_factor : {Prospero::BlendFactor::kSrcAlpha,
+                                        Prospero::BlendFactor::kOne,
+                                        Prospero::BlendFactor::kZero}) {
+          HW::BlendControl alpha_blend{};
+          alpha_blend.enable = true;
+          alpha_blend.separate_alpha_blend = true;
+          alpha_blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha);
+          alpha_blend.alpha_srcblend = static_cast<uint8_t>(alpha_factor);
+          alpha_blend.color_destblend = alpha_blend.alpha_destblend =
+              static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrcAlpha);
+          registers.SetBlendControl(0, alpha_blend);
+          const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+              native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+              registers, user_config, export_mapping, true, native_vertex_info, pixel);
+          vertex_shader = programs.vertex[0];
+          pixel_shader = programs.pixel;
+          vertex = native_vertex_info[0];
+          draw(pipeline(true, 2, 2), 3, std::bit_cast<std::array<u32, 4>>(destination));
+          const auto blend_pixels = read_color();
+          std::array<float, 4> expected{};
+          for (u32 physical = 0; physical < 4; ++physical) {
+            const auto logical = mapping.Map(physical);
+            const float factor = logical != 3 || alpha_factor == Prospero::BlendFactor::kSrcAlpha
+                ? source[3] : alpha_factor == Prospero::BlendFactor::kOne ? 1.f : 0.f;
+            expected[physical] = source[logical] * factor + destination[physical] * (1.f - source[3]);
+          }
+          for (size_t component = 0; component < blend_pixels.size(); component++) {
+            const float actual = std::bit_cast<float>(blend_pixels[component]);
+            if (std::abs(actual - expected[component % 4]) >= 0.00001f) {
+              Fail(name, "logical alpha blend readback", "mapping=" + std::to_string(mapping.packed) +
+                   " alpha_factor=" + std::to_string(static_cast<u32>(alpha_factor)) +
+                   " component=" + std::to_string(component) + " expected=" +
+                   std::to_string(expected[component % 4]) + " actual=" + std::to_string(actual));
+            }
+          }
+        }
+        // MIN/MAX compare unscaled components; differing blend factors are ignored.
+        // They must remain valid after adding mapping admission checks.
+        for (const auto op : {Prospero::BlendOp::kMin, Prospero::BlendOp::kMax}) {
+          HW::BlendControl extrema{};
+          extrema.enable = extrema.separate_alpha_blend = true;
+          extrema.color_comb_fcn = extrema.alpha_comb_fcn = static_cast<uint8_t>(op);
+          extrema.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kConstantColor);
+          extrema.color_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlphaSaturate);
+          extrema.alpha_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kZero);
+          extrema.alpha_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kDstAlpha);
+          registers.SetBlendControl(0, extrema);
+          const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+              native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+              registers, user_config, export_mapping, true, native_vertex_info, pixel);
+          vertex_shader = programs.vertex[0];
+          pixel_shader = programs.pixel;
+          vertex = native_vertex_info[0];
+          draw(pipeline(true, 2, 2), 3, std::bit_cast<std::array<u32, 4>>(destination));
+          const auto values = read_color();
+          for (size_t component = 0; component < values.size(); ++component) {
+            const auto physical = component % 4;
+            const auto src = source[mapping.Map(physical)];
+            const auto expected = op == Prospero::BlendOp::kMin
+                ? std::min(src, destination[physical]) : std::max(src, destination[physical]);
+            Require(name, "mapped MIN/MAX readback",
+                    std::abs(std::bit_cast<float>(values[component]) - expected) < 0.00001f,
+                    "ignored factors changed MIN/MAX component values");
+          }
+        }
+      }
+      native_pixel_regs.ps_regs.data_addr = pixel_address;
+      export_mapping[0] = color.export_mapping = {};
+      registers.SetBlendControl(0, saved_blend);
+      registers.SetColorInfo(0, saved_target_info);
+      registers.SetTargetOutputMode(0, saved_output_mode);
 
       // Captured Playroom strips contain the fullscreen triangle followed by an
       // out-of-bounds fetch exporting (0,0,0,0). Additive color reveals any extra triangle.
@@ -20561,6 +20668,8 @@ private:
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
+                available_features.depthClamp && available_features.dualSrcBlend &&
+                available_features.independentBlend &&
                 available_features.tessellationShader &&
                 available_features.shaderClipDistance &&
                 available_features.vertexPipelineStoresAndAtomics &&
@@ -20632,6 +20741,9 @@ private:
     device_features.shaderInt64 = true;
     device_features.shaderFloat64 = available_features.shaderFloat64;
     device_features.fillModeNonSolid = true;
+    device_features.depthClamp = true;
+    device_features.dualSrcBlend = true;
+    device_features.independentBlend = true;
     device_features.tessellationShader = true;
     device_features.shaderClipDistance = true;
     device_features.vertexPipelineStoresAndAtomics = true;
@@ -47344,6 +47456,11 @@ if (argc == 1) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--logical-alpha-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRasterization(false);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {

@@ -1,5 +1,140 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **5 октября 2026 года, 03:12 UTC** (native Windows tests;
+installed game executable still source `f708edc1`/c73cc32e):
+
+- Run023451 ends02:56:02UTC before deadline, repeated integer divide after Quality.
+  External recorder captured exact registers/audio object, no exception suppression;
+  no main menu observed. Game/recorder streams drained and disposed, own PID17812 gone.
+- Selective upstream logical-alpha port passes independent native numerical checks:
+  baseline RED expected0.4 actual0.46; unchanged12 alpha variants GREEN. Added8
+  MIN/MAX neighbors expose a valid-draw rejection in upstream classifier (RED321);
+  shared ignored-factor classification corrected, unchanged numerical GREEN20 cases.
+  Final affected GPUAV CTest3/3 PASS, EXEc13ddb6350fc; test harness now enables
+  production capabilities and sets blend constants, preserving its numeric oracle.
+- Color port preserves local FP/resource/parameter-linking fixes and explicit
+  unsupported errors; no blending-disable fallback. Test debt holds logs/hashes.
+  Packed10/11/11 and scaled8 candidates still pending their own RED/integration.
+- Installed EXE unchanged; no runtime claim for new color fix yet. Next commit
+  shared correction separately, diagnose ATRAC9 configuration contract with a
+  synthetic regression, native Windows build/install/hash then bounded retry.
+  Main menu/game entry PENDING; issue108 unchanged, no push, save/cache preserved.
+
+Checkpoint **5 октября 2026 года, 02:54 UTC** (ACTIVE native Windows diagnostic run;
+installed production source `f708edc1`, EXE SHA
+`c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`):
+
+- Bounded1800s run `yotei-integrated-20261005-023451-initial-setup-integer-fault-capture-noval`
+  started02:34:51UTC/PID17812, deadline03:04:51UTC. External read-only, bounded
+  task-PID/hash-guarded integer-fault recorder attached02:35:10; no capture yet.
+  Verify processes before next native build/GPU test; no driver reset.
+- Earlier PID45544 own dump found/copied to ignored analysis. Fault is `div esi`,
+  ESI0; guest code loads divisor from an audio/codec object. ATRAC9 metadata helper
+  is a diagnosis lead; actual object/codec/config unavailable in small dump, so no
+  behavior fix inferred. New recorder captures registers/object/stack if repeated;
+  exceptions forwarded normally, no register/code modification.
+- Current window658 visibly Standard after Medium confirmation; native Cross5s
+  at02:53:14 gives transitional background693. Next Quality/main menu pending.
+  Very dark colors still visible; guest480x270 diagnostic rendering upscaled.
+- Comparison fetched andsouzam/main719e0257 and upstream/mainaf3011cd: fork is
+  ancestor,27 newer upstream commits, no fork-only commits. Color/alpha candidates
+  reviewed; no production integration yet. New synthetic logical-alpha numerical
+  regression added BEFORE production change, NOT BUILT/RUN yet. Production src/
+  CMake unchanged; installed tests are old. Runner sourceChanges/docs-only string
+  is now stale for tracked test edits; installed executable hash is unchanged.
+- Main menu/game entry PENDING; issue108 unchanged, linkPR497 when milestone proven.
+  Preserve cache/save/artifacts; no push. Earlier affected GPUAV8/8 remains proven;
+  full suite not green. Next capture setup/fault, then native RED and selective port.
+
+Checkpoint **5 октября 2026 года, 02:19 UTC** (native Windows run ENDED;
+production/tests source `f708edc1`, installed EXE SHA
+`c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`):
+
+- Saved-setup continuation `yotei-integrated-20261005-015124-imported-htile-saved-setup-continuation-noval`
+  runs01:51:24–02:19:33UTC, exits -1073741676 /0xC0000094 before1800s deadline.
+  Windows event1000 records integer divide fault at guest address0x9003502d2,
+  moduleunknown; stderr empty, no DeviceLost/watchdog. PID45544 gone, drained/disposed.
+- Brightness, Medium, Standard and Quality setup menus rendered again; existence
+  of save files did not prove completed setup persistence. Native SendInput J/Cross
+  at02:19:04 confirms Quality; its resulting screen is unverified before the crash.
+  Intermittent PostMessage taps are not claimed accepted without screen evidence.
+- **Main menu/game entry PENDING.** No issue108 update under user's milestone rule.
+  Required synthetic regression recorded in test debt; first determine operand/API
+  cause from crash evidence or bounded diagnostic-only capture. No production fix
+  inferred and no exception suppression. WER temp dump missing; archive available.
+  Later found own Local/CrashDumps dump; next checkpoint records analysis.
+- No native build/test/game active after cleanup. Preserve save data/cache/artifacts;
+  no push. Earlier GPUAV affected8/8 remains proven, full suite still not green.
+
+Checkpoint **5 октября 2026 года, 01:49 UTC** (native Windows;
+installed production/tests source `f708edc1`, exact EXE SHA
+`c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`):
+
+- Long observation `yotei-integrated-20261005-011835-imported-htile-long-observation-noval`
+  runs01:18:35–01:48:39UTC, total1800s deadline, graceful close/exit0, PID41536 gone;
+  runner streams drained/disposed. No fatal/DeviceLost/memory or progress watchdog.
+  Runner642 completed compute pipelines, shown840;60fps window loop is not gamefps.
+- Exact task-window captures verify legible initial setup menus: brightness,
+  difficultyMedium, experienceStandard, graphicsQuality. Ordinary keyboardJ/Cross
+  accepts brightness/difficulty/experience, defaults preserved, foreground restored.
+  Quality confirm at01:48:24 is sent but its resulting screen is unverified before
+  timeout; all events in `interactions.json`. These are actual rendered/interactive
+  setup screens, not an inference from shader/frame counts. Initial menu performance
+  is slow and image quality is not claimed correct; game validation off in this run.
+- **Main menu/game entry PENDING.** User's publication criterion is "menu", then
+  game entry. Optional clarification whether initial setup qualifies is unanswered;
+  current conservative assumption waits for main menu. No new issue108 comment.
+- Existing save data preserved. Native sce_sdmemory/memory.dat and param.bin exist
+  with fresh timestamps; don't erase/reset them. Next same-EXE bounded observation
+  verifies whether saved preferences skip initial setup and reach the main menu.
+  Source/tests unchanged; no additional behavior fix inferred. Earlier affected
+  GPUAV CTest8/8 stays proven; known baseline failures remain open. No push.
+
+Checkpoint **5 октября 2026 года, 01:39 UTC** (ACTIVE native Windows run;
+installed source `f708edc1`, EXE SHA
+`c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`):
+
+- Current run `yotei-integrated-20261005-011835-imported-htile-long-observation-noval`
+  started01:18:35UTC/PID41536, total1800s/progress480s/memory28GiB; verify process
+  and newest run.json before any build/GPU work. Same source/config/corecache;
+  optimizationNone and game validation off; production/tests unchanged, docs only.
+- Nonzero readback204 onward progresses past earlier shown210. Actual window240
+  shows a recognizable mask in smoke. Window304 shows legible brightness calibration
+  text, slider and Cross prompt (`window-after-brightening.png`). **Visible UI and
+  normal host input verified; main menu/game entry still PENDING.**
+- Confirmed the existing brightness value through normal keyboardJ/Cross at
+  01:38:34UTC,900ms, exact task window/PID/hash, foreground restored. After-confirm
+  window400 shows transition into sky/trees; no main-menu milestone claimed.
+  Input event/provenance saved in `interactions.json`; artifacts remain local.
+- Next observe the resulting scene/menu or next actual blocker in the bounded run.
+  Issue108 ONLY visually verified main menu then confirmed game entry, linkedPR497;
+  intermediate setup/rendering/tests local-only. No push/full-suite/cross-game claim.
+
+Checkpoint **5 октября 2026 года, 01:17 UTC** (native Windows via WSL;
+installed source `f708edc1`, exact SHA `c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`;
+HEAD `cf1fde7d` differs only by documentation):
+
+- Same-EXE warm retry `yotei-integrated-20261005-010504-imported-htile-depth-subviews-warm-noval`
+  runs01:05:04–01:17:22UTC, reaches VS114/PS97/CS560,529 completed compute
+  pipelines, shown210. Cached variants complete in milliseconds, but newly emitted
+  resource variants have different SPIR-V and require cold compilation up to147103ms.
+  Comparison of the captured CS8457 modules confirms actual unseen binaries.
+- Readback203–209 is nonzero but still dark; maximum RGB67/67/66 in10-bit format.
+  Exact task-window `window-before-deadline.png` inspected: **menu/game entry PENDING**.
+  No fatal/DeviceLost;720s total deadline, unsuccessful15s graceful-close attempt
+  followed by task-owned kill/exit-1. Streams drained/disposed, PID37692 gone.
+  Corecache payload141330856bytes (file141331041) retained. No GPU reset.
+- Read-only native CPU optimizer audit143729→128151 words,6.83s/exit0:
+  `imported-htile-large-regular-optimizer-audit-20261005.log`, CFG EXE86b415cd.
+  This is not numerical GPU proof or a measured driver-speed improvement; runtime
+  optimization remains None. Earlier affected synthetic GPUAV CTest8/8 stays proven;
+  known unrelated baseline failures remain open and no full-suite claim is made.
+- Next same-EXE bounded1800s observation, informed by measured cold completion
+  times; progress watchdog480s and memory28GiB unchanged. Verify actual image and
+  next blocker; do not infer an emulator fix from compilation latency alone.
+- Issue108 only verified menu then confirmed game entry, link PR497; intermediate
+  results local-only. No push authorization.
+
 Checkpoint **5 октября 2026 года, 01:03 UTC** (native Windows via WSL;
 installed source `f708edc1`, EXE SHA
 `c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`):

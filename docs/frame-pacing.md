@@ -49,7 +49,10 @@ With a requested DLSS mode the title also displays `DLSS: active` or
 `DLSS: inactive`, according to the presented frame. The emulator-wide path now
 generates temporal inputs from the main VideoOut color, so a supported surface
 can activate reconstruction without a game-specific adapter. This stage adds
-GPU work and does not reduce guest rendering cost. See [dlss.md](dlss.md).
+GPU work. The separate render-scale option reduces supported raster passes and
+adds attachment copies; measure total cost separately. Frame Generation inserts
+display frames, which the guest-submission CSV and title FPS do not count.
+See [dlss.md](dlss.md).
 
 ## Reproducible DLSS comparisons
 
@@ -80,6 +83,13 @@ For multiple runs, divide the total counted frame intervals by their total
 elapsed time and also report individual means/range. Do not average reciprocal
 per-frame intervals or mix Off and active frames into one mean.
 
+Interval statistics exclude the first selected row: its `frame_ms` begins before
+the selected window. The row still establishes the elapsed-time boundary and
+contributes its own `present_ms`, which measures the presentation call itself.
+This prevents a preceding area transition from becoming a steady-scene stall.
+`frame_timing_analysis` checks both an excluded preceding transition and a
+retained stall inside the window when a Python interpreter is available.
+
 Report interval median/P95/P99 and long intervals alongside mean FPS.
 `present_ms` excludes the earlier producer-side input generation and NGX
 evaluation; it cannot isolate DLSS GPU cost. Verify that Off has zero successful
@@ -98,8 +108,8 @@ or an image-quality improvement.
 ## Focused checks
 
 ```powershell
-cmake --build _Build/windows --target dlss_gpu_tests dlss_settings_tests frame_pacer_tests
-ctest --test-dir _Build/windows -R '^(dlss_|presentation_)' --output-on-failure
+cmake --build _Build/windows --target dlss_gpu_tests dlss_settings_tests upscale_menu_tests shader_cfg_tests frame_pacer_tests
+ctest --test-dir _Build/windows -R '^(dlss_|presentation_|frame_timing_analysis$|shader_cfg$|upscale_menu$)' --output-on-failure
 ```
 
 The pacer test covers fractional cadence at 360 Hz, a 100 ms stall, ordinary

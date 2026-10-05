@@ -42,7 +42,7 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void UpdateTitle(bool dlss_active = false);
+	void UpdateTitle(bool dlss_active = false, bool new_guest_frame = true);
 	void                                                    Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
@@ -56,6 +56,8 @@ struct WindowContext {
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
+	uint64_t title_fps_start = 0, title_frame_number = 0, title_fps_frames = 0;
+	bool title_initialized = false;
 
 	Common::Mutex mutex;
 };

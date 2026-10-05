@@ -13,6 +13,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/dlss.h"
 #include "graphics/presentation/emulatorDlssInputs.h"
+#include "graphics/presentation/frameTiming.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -350,7 +351,7 @@ struct Presenter::Impl {
 		cache.UpdateImage(image_id);
 		return image;
 	}
-	void Present();
+	void Present(bool new_frame = true);
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -366,6 +367,7 @@ struct Presenter::Impl {
 	Config::DlssMode      dlss_mode = Config::DlssMode::Off;
 	std::optional<vk::Extent2D> dlss_input_size;
 	bool                  emulator_dlss_logged = false;
+	FrameTimingRecorder   timing;
 };
 
 void Swapchain::Create() {
@@ -907,6 +909,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 	frame->dlss_evaluated = false;
+	frame->guest_frame = true;
 	std::optional<DlssFrameInputs> generated_inputs;
 	if (process_dlss && m_impl->dlss.Available()) {
 		const vk::Extent2D output_size {Config::GetScreenWidth(), Config::GetScreenHeight()};
@@ -977,6 +980,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
 	frame->dlss_evaluated = false;
+	frame->guest_frame = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
@@ -997,7 +1001,7 @@ bool Presenter::PresentLastFrame() {
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
-	m_impl->Present();
+	m_impl->Present(false);
 	return true;
 }
 
@@ -1046,8 +1050,9 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
-void Presenter::Impl::Present() {
+void Presenter::Impl::Present(bool new_frame) {
 	KYTY_PROFILER_FUNCTION();
+	const auto timing_begin = timing.Enabled() ? Common::Timer::QueryPerformanceCounter() : 0;
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Some window systems keep presenting an old swapchain after a resize.
@@ -1081,7 +1086,13 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle(layers[0].frame != nullptr && layers[0].frame->dlss_evaluated);
+		const bool new_guest_frame = new_frame &&
+		    std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
+			    return layer.frame != nullptr && layer.frame->guest_frame;
+		    });
+		window.UpdateTitle(layers[0].frame != nullptr && layers[0].frame->dlss_evaluated, new_guest_frame);
+		timing.Record(timing_begin, new_guest_frame,
+		              layers[0].frame != nullptr && layers[0].frame->dlss_evaluated);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

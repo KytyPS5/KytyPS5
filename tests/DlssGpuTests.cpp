@@ -417,6 +417,51 @@ int main(int argc, char** argv) {
 	}
 	Config::Load(config);
 	subsystems.Initialize<Log::Lifecycle>();
+	if (argc == 2 && std::strcmp(argv[1], "--window-title-timing") == 0) {
+		Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video initialization");
+		WindowContext window;
+		window.window = SDL_CreateWindow("title timing", 64, 64, SDL_WINDOW_HIDDEN);
+		Check(window.window != nullptr, "hidden title-test window");
+		window.UpdateTitle();
+		const std::string first_title = SDL_GetWindowTitle(window.window);
+		std::atomic<bool> finished = false;
+		std::thread producer([&] {
+			for (int i = 0; i < 120; ++i) window.UpdateTitle();
+			finished.store(true, std::memory_order_release);
+		});
+		// Reproduce the presentation worker while the UI thread is busy.
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		const bool finished_without_ui = finished.load(std::memory_order_acquire);
+		while (!finished.load(std::memory_order_acquire)) {
+			SDL_Event event {};
+			(void)SDL_WaitEventTimeout(&event, 10);
+		}
+		producer.join();
+		SDL_Event event {};
+		while (SDL_PollEvent(&event)) {}
+		Check(finished_without_ui, "frame title updates block on the UI thread");
+		Check(first_title == SDL_GetWindowTitle(window.window), "title is changed on every frame");
+		for (int i = 0; i < 20; ++i) window.UpdateTitle(false, false);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+		finished.store(false, std::memory_order_release);
+		std::thread due_update([&] {
+			window.UpdateTitle();
+			finished.store(true, std::memory_order_release);
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		const bool due_finished_without_ui = finished.load(std::memory_order_acquire);
+		while (!finished.load(std::memory_order_acquire)) (void)SDL_WaitEventTimeout(&event, 10);
+		due_update.join();
+		while (SDL_PollEvent(&event)) {}
+		Check(due_finished_without_ui, "periodic FPS refresh still waits for the UI thread");
+		Check(first_title != SDL_GetWindowTitle(window.window), "title is not refreshed after FPS interval");
+		Check(std::strstr(SDL_GetWindowTitle(window.window), "frame: 122,") != nullptr,
+		      "cached/host frames inflate the gameplay FPS counter");
+		Check(std::strstr(SDL_GetWindowTitle(window.window), "DLSS: inactive") != nullptr,
+		      "a requested DLSS mode is incorrectly shown as evaluated");
+		std::puts("Window title timing tests passed");
+		return 0;
+	}
 	if (window_device) {
 		subsystems.Initialize<Loader::Timer::Lifecycle>();
 		subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();

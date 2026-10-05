@@ -48,6 +48,12 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 include("${KYTY_SOURCE_DIR}/utils.cmake")
 include(CTest)
 
+if(BUILD_TESTING)
+	add_executable(frame_pacer_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FramePacerTests.cpp")
+	target_include_directories(frame_pacer_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME presentation_frame_pacer COMMAND frame_pacer_tests)
+endif()
+
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
 
 set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
@@ -415,6 +421,8 @@ if(KYTY_ENABLE_DLSS)
 	add_test(NAME dlss_window_device COMMAND dlss_gpu_tests --window-device)
 	add_test(NAME dlss_window_device_off COMMAND dlss_gpu_tests --window-device-off)
 	add_test(NAME dlss_emulator_presentation COMMAND dlss_gpu_tests --emulator-presentation)
+	add_test(NAME presentation_window_title COMMAND dlss_gpu_tests --window-title-timing)
+	set_tests_properties(presentation_window_title PROPERTIES TIMEOUT 15)
 	set_tests_properties(dlss_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss")
 	set_tests_properties(dlss_window_device dlss_window_device_off dlss_emulator_presentation PROPERTIES LABELS "gpu;dlss")
 endif()
@@ -703,6 +711,7 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		frame_pacer_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

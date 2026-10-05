@@ -913,7 +913,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle(bool dlss_active) {
+void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -923,10 +923,7 @@ void WindowContext::UpdateTitle(bool dlss_active) {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	double current_fps = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -938,34 +935,48 @@ void WindowContext::UpdateTitle(bool dlss_active) {
 
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	frame_num++;
-	fps_frames++;
-	if (now - fps_start >= frequency) {
-		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
-		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
+	if (!title_initialized) title_fps_start = now;
+	if (new_guest_frame) {
+		++title_frame_number;
+		++title_fps_frames;
 	}
+	if (now - title_fps_start >= frequency) {
+		current_fps = static_cast<double>(title_fps_frames) * static_cast<double>(frequency) /
+		              static_cast<double>(now - title_fps_start);
+		title_fps_start = now;
+		title_fps_frames = 0;
+	} else if (title_initialized) {
+		return;
+	}
+	title_initialized = true;
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}{}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps,
+	    device_name, processor_name, title_frame_number, current_fps,
 	    Config::GetDlssMode() == Config::DlssMode::Off ? "" :
 	        (dlss_active ? " [DLSS: active]" : " [DLSS: inactive]"));
 
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
+		SDL_WindowID window_id;
+		std::string text;
+	};
+	// Presentation must not wait for the UI event loop. Own the text until the
+	// callback runs, and resolve the window on the UI thread in case it closed.
+	auto* update = new TitleUpdate {SDL_GetWindowID(window), std::move(text)};
+	if (!SDL_RunOnMainThread(
 	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
+		    std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		    if (auto* target = SDL_GetWindowFromID(title->window_id); target != nullptr) {
+			    SDL_SetWindowTitle(target, title->text.c_str());
+		    }
 	    },
-	    &update, true));
+	    update, false)) {
+		delete update;
+		EXIT("Could not schedule window title update: %s\n", SDL_GetError());
+	}
 }
 
 } // namespace Libs::Graphics

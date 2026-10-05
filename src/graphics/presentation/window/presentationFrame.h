@@ -11,6 +11,7 @@ struct Presenter::Frame {
 	uint64_t present_tick = 0;
 	bool busy = false;
 	bool dlss_evaluated = false;
+	bool guest_frame = false;
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format, bool storage = false);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);

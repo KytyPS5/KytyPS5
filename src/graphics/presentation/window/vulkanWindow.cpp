@@ -495,6 +495,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+#if defined(__APPLE__)
+	Log::WriteToConsoleAndLog(
+	    "WARNING: image view minLod is unavailable; texture min-LOD clamps are ignored.\n");
+	// The shader recompiler has no fallback for these.
+	if (!supported_features12.shaderBufferInt64Atomics) {
+		Log::WriteToConsoleAndLog("WARNING: shaderBufferInt64Atomics is unavailable; shaders "
+		                          "using 64-bit buffer atomics may fail pipeline creation.\n");
+	}
+	if (!supported_features2.features.shaderCullDistance) {
+		Log::WriteToConsoleAndLog("WARNING: shaderCullDistance is unavailable; shaders exporting "
+		                          "cull distances may fail pipeline creation.\n");
+	}
+#endif
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;

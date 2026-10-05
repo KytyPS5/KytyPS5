@@ -162,9 +162,9 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	}
 
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = AjmAt9InitDecoder(handle, static_cast<const uint8_t*>(config_data));
-	const int       info_result =
-	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
+	uint32_t mono_channels = 0;
+	const int info_result = AjmAt9InitConfiguration(handle, static_cast<const uint8_t*>(config_data),
+	                                               &codec_info, &mono_channels);
 	Atrac9ReleaseHandle(handle);
 
 	if (info_result != 0 || codec_info.channels <= 0 || codec_info.samplingRate <= 0 ||

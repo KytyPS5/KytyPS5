@@ -702,6 +702,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_snorm_buffer_store_endpoints
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --snorm-buffer-store-endpoints-only)
 	set_tests_properties(shader_snorm_buffer_store_endpoints PROPERTIES TIMEOUT 90)
+	add_test(NAME ajm_at9_multistream
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ajm-at9-multistream-only)
+	set_tests_properties(ajm_at9_multistream PROPERTIES TIMEOUT 30)
 	add_test(NAME ajm_at9_configuration
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ajm-at9-config-only)
 	set_tests_properties(ajm_at9_configuration PROPERTIES TIMEOUT 30)

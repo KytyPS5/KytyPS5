@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <vector>
 
 extern "C" {
@@ -29,6 +30,51 @@ inline int AjmAt9InitDecoder(void* handle, const uint8_t* config_data) {
 		config[1] -= 6u << 1u;
 	}
 	return Atrac9InitDecoder(handle, config);
+}
+
+inline bool AjmAt9ResolveConfig(const uint8_t* raw, uint8_t* decoder_config,
+                               uint32_t* mono_channels) {
+	std::memcpy(decoder_config, raw, ATRAC9_CONFIG_DATA_SIZE);
+	*mono_channels = 0;
+	if (raw[0] != 0x30) {
+		return true;
+	}
+	// Extended ATRAC9 multiplexes independent mono substreams in frame order.
+	// Interoperability reference: PS5PCEM baa718235a37d310d91ac001f4d92cdc8099a69c,
+	// src/hle/ajm_codec.zig. Keep ordinary FE configurations and haptics separate.
+	const uint32_t channels = 2u * ((((raw[1] & 15u) << 1u) | (raw[2] >> 7u)) + 1u);
+	if ((raw[2] & 0x7fu) != 0x40u || channels > 36u) {
+		return false;
+	}
+	const uint32_t word = (0xfeu << 24u) | (static_cast<uint32_t>(raw[1] >> 4u) << 20u) |
+	                      (static_cast<uint32_t>(raw[3] >> 2u) << 5u) |
+	                      (static_cast<uint32_t>(raw[3] & 3u) << 3u);
+	for (uint32_t byte = 0; byte < ATRAC9_CONFIG_DATA_SIZE; ++byte) {
+		decoder_config[byte] = static_cast<uint8_t>(word >> (24u - byte * 8u));
+	}
+	*mono_channels = channels;
+	return true;
+}
+
+inline int AjmAt9InitConfiguration(void* handle, const uint8_t* raw, Atrac9CodecInfo* info,
+                                  uint32_t* mono_channels) {
+	uint8_t config[ATRAC9_CONFIG_DATA_SIZE];
+	if (!AjmAt9ResolveConfig(raw, config, mono_channels)) {
+		return -1;
+	}
+	const int initialized = AjmAt9InitDecoder(handle, config);
+	if (initialized != 0) {
+		return initialized;
+	}
+	const int status = Atrac9GetCodecInfo(handle, info);
+	if (status == 0 && *mono_channels != 0) {
+		if (info->channels != 1 || info->superframeSize <= 0) {
+			return -1;
+		}
+		info->channels = static_cast<int>(*mono_channels);
+		info->superframeSize *= static_cast<int>(*mono_channels);
+	}
+	return status;
 }
 
 struct AjmDecAt9InitializeParameters {
@@ -92,6 +138,7 @@ public:
 	}
 
 	void Reset() override {
+		m_substream_handles.clear();
 		if (m_handle != nullptr) {
 			Atrac9ReleaseHandle(m_handle);
 		}
@@ -168,7 +215,7 @@ public:
 			}
 
 			int       bytes_used = 0;
-			const int ret        = DecodeFrame(input_bytes + input_offset, &bytes_used);
+			const int ret        = DecodeFrame(input_bytes + input_offset, remaining_input, &bytes_used);
 			if (ret != 0) {
 				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 				result.internal_result = ret;
@@ -291,7 +338,11 @@ private:
 		std::memcpy(m_config_data, config_data, ATRAC9_CONFIG_DATA_SIZE);
 		m_has_config = true;
 
-		const int init_ret = AjmAt9InitDecoder(m_handle, m_config_data);
+		m_substream_handles.clear();
+		m_substream_used.clear();
+		uint32_t mono_channels = 0;
+		const int init_ret = AjmAt9InitConfiguration(m_handle, m_config_data, &m_codec_info,
+		                                            &mono_channels);
 		if (init_ret != 0) {
 			m_is_initialized        = false;
 			result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
@@ -299,13 +350,30 @@ private:
 			return false;
 		}
 
-		const int info_ret = Atrac9GetCodecInfo(m_handle, &m_codec_info);
-		if (info_ret != 0 || m_codec_info.channels <= 0 || m_codec_info.frameSamples <= 0 ||
+		if (m_codec_info.channels <= 0 || m_codec_info.frameSamples <= 0 ||
 		    m_codec_info.superframeSize <= 0 || m_codec_info.framesInSuperframe <= 0) {
 			m_is_initialized        = false;
 			result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
-			result->internal_result = info_ret;
+			result->internal_result = -1;
 			return false;
+		}
+		if (mono_channels != 0) {
+			uint8_t mono_config[ATRAC9_CONFIG_DATA_SIZE];
+			uint32_t channels = 0;
+			(void)AjmAt9ResolveConfig(m_config_data, mono_config, &channels);
+			for (uint32_t channel = 1; channel < mono_channels; ++channel) {
+				m_substream_handles.emplace_back(Atrac9GetHandle(), Atrac9ReleaseHandle);
+				if (!m_substream_handles.back() ||
+				    AjmAt9InitDecoder(m_substream_handles.back().get(), mono_config) != 0) {
+					m_is_initialized = false;
+					result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
+					return false;
+				}
+			}
+			m_substream_used.assign(mono_channels, 0);
+			m_substream_size = static_cast<uint32_t>(m_codec_info.superframeSize) / mono_channels;
+			m_mono_pcm_buffer.resize(static_cast<size_t>(m_codec_info.frameSamples) *
+			                         AjmBytesPerSample(m_sample_encoding));
 		}
 
 		m_is_initialized          = true;
@@ -324,23 +392,52 @@ private:
 		return true;
 	}
 
-	int DecodeFrame(const uint8_t* input, int* bytes_used) {
+	int DecodeHandle(void* handle, const uint8_t* input, uint8_t* pcm, int* bytes_used) {
 		switch (m_sample_encoding) {
 			case AjmSampleEncoding::S16:
-				return Atrac9Decode(m_handle, input,
-				                    reinterpret_cast<int16_t*>(m_pcm_buffer.data()), bytes_used, 0);
+				return Atrac9Decode(handle, input, reinterpret_cast<int16_t*>(pcm), bytes_used, 0);
 			case AjmSampleEncoding::S32:
-				return Atrac9DecodeS32(m_handle, input,
-				                       reinterpret_cast<int32_t*>(m_pcm_buffer.data()), bytes_used,
-				                       0);
+				return Atrac9DecodeS32(handle, input, reinterpret_cast<int32_t*>(pcm), bytes_used, 0);
 			case AjmSampleEncoding::Float:
-				return Atrac9DecodeF32(
-				    m_handle, input, reinterpret_cast<float*>(m_pcm_buffer.data()), bytes_used, 0);
+				return Atrac9DecodeF32(handle, input, reinterpret_cast<float*>(pcm), bytes_used, 0);
 			default:
 				EXIT("unsupported AJM PCM sample encoding %u\n",
 				     static_cast<uint32_t>(m_sample_encoding));
 		}
 		return -1;
+	}
+
+	int DecodeFrame(const uint8_t* input, size_t input_size, int* bytes_used) {
+		if (m_substream_used.empty()) {
+			return DecodeHandle(m_handle, input, m_pcm_buffer.data(), bytes_used);
+		}
+		const size_t channels = m_substream_used.size();
+		const size_t sample_bytes = AjmBytesPerSample(m_sample_encoding);
+		const bool last = m_num_frames + 1u == static_cast<uint32_t>(m_codec_info.framesInSuperframe);
+		size_t offset = 0;
+		for (size_t channel = 0; channel < channels; ++channel) {
+			if (m_substream_used[channel] >= m_substream_size) {
+				return -1;
+			}
+			const auto remaining = m_substream_size - m_substream_used[channel];
+			if (offset > input_size || remaining > input_size - offset) {
+				return -1;
+			}
+			void* handle = channel == 0 ? m_handle : m_substream_handles[channel - 1].get();
+			int used = 0;
+			const int status = DecodeHandle(handle, input + offset, m_mono_pcm_buffer.data(), &used);
+			if (status != 0 || used <= 0 || static_cast<uint32_t>(used) > remaining) {
+				return status != 0 ? status : -1;
+			}
+			offset += last ? remaining : static_cast<uint32_t>(used);
+			m_substream_used[channel] += static_cast<uint32_t>(used);
+			for (size_t sample = 0; sample < static_cast<size_t>(m_codec_info.frameSamples); ++sample) {
+				std::memcpy(m_pcm_buffer.data() + (sample * channels + channel) * sample_bytes,
+				            m_mono_pcm_buffer.data() + sample * sample_bytes, sample_bytes);
+			}
+		}
+		*bytes_used = static_cast<int>(offset);
+		return 0;
 	}
 
 	uint64_t CopyDecodedFrame(uint8_t* output, size_t output_size, size_t* output_written,
@@ -422,6 +519,7 @@ private:
 
 		m_superframe_bytes_remain = static_cast<uint32_t>(m_codec_info.superframeSize);
 		m_num_frames              = 0;
+		std::fill(m_substream_used.begin(), m_substream_used.end(), 0);
 	}
 
 	void DrainSuperframe(const uint8_t* input, size_t input_size, size_t* input_offset,
@@ -438,7 +536,7 @@ private:
 			}
 
 			int       bytes_used = 0;
-			const int ret        = DecodeFrame(input + *input_offset, &bytes_used);
+			const int ret        = DecodeFrame(input + *input_offset, remaining_input, &bytes_used);
 			if (ret != 0) {
 				result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 				result->internal_result = ret;
@@ -541,6 +639,10 @@ private:
 	uint32_t             m_num_frames              = 0;
 	Atrac9CodecInfo      m_codec_info {};
 	std::vector<uint8_t> m_pcm_buffer;
+	std::vector<std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>> m_substream_handles;
+	std::vector<uint32_t> m_substream_used;
+	uint32_t m_substream_size = 0;
+	std::vector<uint8_t> m_mono_pcm_buffer;
 };
 
 } // namespace Libs::Audio::Ajm

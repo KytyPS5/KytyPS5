@@ -47333,11 +47333,247 @@ void CheckAjmAt9Configuration() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// Independent interoperability format: PS5PCEM baa718235a37d310d91ac001f4d92cdc8099a69c.
+// Synthetic mono packets and direct LibAtrac9 references; no captured game input.
+void CheckAjmAt9Multistream() {
+  using namespace Libs::Audio::Ajm;
+  using Libs::Graphics::Require;
+  constexpr const char* name = "AjmAt9Multistream";
+  const auto configuration = [](uint32_t channels, uint32_t rate, uint32_t bytes, uint32_t exponent) {
+    const uint32_t pairs = channels / 2 - 1;
+    return std::array<uint8_t, 4>{0x30, static_cast<uint8_t>((rate << 4) | (pairs >> 1)),
+        static_cast<uint8_t>(0x40 | ((pairs & 1) << 7)),
+        static_cast<uint8_t>(((bytes - 1) << 2) | exponent)};
+  };
+  std::string errors;
+  struct MetadataCase { uint32_t channels, rate_index, bytes, exponent, rate, samples; };
+  for (const auto test : {MetadataCase{2,7,64,0,48000,256}, {6,7,48,1,48000,256},
+                         {12,7,64,2,48000,256}, {36,7,64,3,48000,256},
+                         {4,12,40,1,96000,128}}) {
+    auto config = configuration(test.channels, test.rate_index, test.bytes, test.exponent);
+    struct Guarded { AjmDecAt9ConfigDataInfo info; uint32_t sentinel; } output{};
+    output.sentinel = 0x1234abcd;
+    const int status = AjmDecAt9ParseConfigData(config.data(), &output.info);
+    const uint32_t frames = 1u << test.exponent;
+    if (status != 0 || output.info.channels != test.channels || output.info.sample_rate != test.rate ||
+        output.info.frame_samples_per_channel != test.samples ||
+        output.info.superframe_samples_per_channel != frames * test.samples ||
+        output.info.superframe_size != test.channels * test.bytes * frames ||
+        output.sentinel != 0x1234abcd ||
+        config != configuration(test.channels, test.rate_index, test.bytes, test.exponent)) {
+      errors += "metadata channels=" + std::to_string(test.channels) + " status=" + std::to_string(status) + "; ";
+    }
+  }
+  AjmDecAt9ConfigDataInfo invalid_info;
+  std::memset(&invalid_info, 0x5a, sizeof(invalid_info));
+  const auto original_info = invalid_info;
+  auto bad_signature = configuration(12,7,64,2); bad_signature[0] = 0x31;
+  auto bad_reserved = configuration(12,7,64,2); bad_reserved[2] |= 1;
+  for (const auto config : {bad_signature, bad_reserved, configuration(38,7,64,2), configuration(64,7,64,2)}) {
+    Require(name, "invalid extension", AjmDecAt9ParseConfigData(config.data(), &invalid_info) != 0 &&
+        std::memcmp(&invalid_info, &original_info, sizeof(invalid_info)) == 0,
+        "invalid multistream geometry accepted or output changed");
+  }
+
+  struct DecodeCase { uint32_t channels, exponent; };
+  for (const auto test : {DecodeCase{2,0}, {2,1}, {6,3}, {12,2}, {36,2}}) {
+    constexpr uint32_t samples = 256, frame_bytes = 64, block_bytes = 36, superframes = 2;
+    const uint32_t frames = 1u << test.exponent;
+    const uint32_t share = frame_bytes * frames;
+    const auto config = configuration(test.channels, 7, frame_bytes, test.exponent);
+    auto canonical = std::array<uint8_t,4>{0xfe,0x70,0x07,static_cast<uint8_t>(0xe0 | (test.exponent << 3))};
+    std::vector<uint8_t> encoded;
+    std::vector<float> expected(static_cast<size_t>(superframes) * frames * samples * test.channels);
+    using Handle = std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>;
+    std::vector<Handle> references;
+    for (uint32_t channel = 0; channel < test.channels; ++channel) {
+      references.emplace_back(Atrac9GetHandle(), Atrac9ReleaseHandle);
+      Require(name, "independent mono config", references.back() &&
+          Atrac9InitDecoder(references.back().get(), canonical.data()) == 0,
+          "canonical reference config failed");
+    }
+    for (uint32_t sf = 0; sf < superframes; ++sf) {
+      for (uint32_t frame = 0; frame < frames; ++frame) {
+        for (uint32_t channel = 0; channel < test.channels; ++channel) {
+          std::array<uint8_t,512> block{0,0,0x04,0x20,0x04,0xc0,0,0,0,0xc0};
+          block[8] = static_cast<uint8_t>(channel * 4);
+          if (frame != 0) block[0] |= 0x80;
+          std::array<float,samples> mono{};
+          int used = 0;
+          Require(name, "synthetic mono reference", Atrac9DecodeF32(references[channel].get(),
+              block.data(), mono.data(), &used, 0) == 0 && used == block_bytes,
+              "synthetic mono reference failed");
+          for (uint32_t sample = 0; sample < samples; ++sample) {
+            expected[((sf * frames + frame) * samples + sample) * test.channels + channel] = mono[sample];
+          }
+          const uint32_t packet_bytes = frame + 1 == frames ? share - frame * block_bytes : block_bytes;
+          encoded.insert(encoded.end(), block.begin(), block.begin() + packet_bytes);
+        }
+      }
+    }
+    Require(name, "independent nonzero channel ordering oracle",
+        std::ranges::any_of(expected, [](float value) { return std::abs(value) > 0.000001f; }) &&
+        expected[128 * test.channels] != expected[128 * test.channels + 1],
+        "synthetic reference is silent or adjacent channels indistinguishable");
+    Require(name, "encoded geometry", encoded.size() == superframes * share * test.channels,
+            "synthetic multiplexed input size incorrect");
+    AjmAt9Decoder decoder(1, 48000, AjmSampleEncoding::Float, 0);
+    const auto initialized = decoder.Initialize(config.data(), config.size());
+    if (initialized.result != 0) {
+      errors += "initialize channels=" + std::to_string(test.channels) + " result=" +
+                std::to_string(initialized.result) + "; ";
+      continue;
+    }
+    std::vector<float> actual(expected.size() + 2, -1234.0f);
+    const auto compare = [&](const char* stage, size_t first, size_t count) {
+      bool equal = actual.front() == -1234.0f && actual.back() == -1234.0f;
+      for (size_t sample = 0; sample < count; ++sample) {
+        equal = equal && std::isfinite(actual[sample + 1]) &&
+                std::abs(actual[sample + 1] - expected[first + sample]) < 0.000001f;
+      }
+      Require(name, stage, equal, "interleaved PCM or output sentinel mismatch");
+    };
+    // Neither boundary may advance decoder state; the following full decode is the oracle.
+    const auto partial = decoder.Decode(encoded.data(), share * test.channels - 1,
+        actual.data() + 1, expected.size() * sizeof(float), true, nullptr);
+    const auto short_output = decoder.Decode(encoded.data(), encoded.size(), actual.data() + 1,
+        samples * test.channels * sizeof(float) - 1, true, nullptr);
+    Require(name, "retryable input/output boundaries", partial.result == AJM_RESULT_PARTIAL_INPUT &&
+        short_output.result == AJM_RESULT_NOT_ENOUGH_ROOM && partial.input_consumed == 0 &&
+        partial.output_written == 0 && partial.frames == 0 && short_output.input_consumed == 0 &&
+        short_output.output_written == 0 && short_output.frames == 0 &&
+        std::ranges::all_of(actual, [](float value) { return value == -1234.0f; }),
+        "partial input/output consumed state or wrote output");
+    const auto all = decoder.Decode(encoded.data(), encoded.size(), actual.data() + 1,
+        expected.size() * sizeof(float), true, nullptr);
+    Require(name, "complete multistream decode", all.result == 0 && all.input_consumed == encoded.size() &&
+        all.output_written == expected.size() * sizeof(float) && all.frames == superframes * frames &&
+        all.total_decoded_samples == superframes * frames * samples &&
+        all.format.channel_num == test.channels && all.format.sampling_frequency == 48000,
+        "multistream decode counters/geometry failed");
+    compare("nonzero interleaved PCM", 0, expected.size());
+
+    const auto integer_pcm = [&]<typename Sample>(AjmSampleEncoding encoding) {
+      std::vector<Sample> reference_pcm(expected.size());
+      std::vector<Handle> handles;
+      for (uint32_t channel = 0; channel < test.channels; ++channel) {
+        handles.emplace_back(Atrac9GetHandle(), Atrac9ReleaseHandle);
+        Require(name, "integer mono reference config", handles.back() &&
+            Atrac9InitDecoder(handles.back().get(), canonical.data()) == 0, "integer reference config failed");
+      }
+      for (uint32_t sf = 0; sf < superframes; ++sf) {
+        for (uint32_t frame = 0; frame < frames; ++frame) {
+          for (uint32_t channel = 0; channel < test.channels; ++channel) {
+            std::array<uint8_t,512> block{0,0,0x04,0x20,0x04,0xc0,0,0,0,0xc0};
+            block[8] = static_cast<uint8_t>(channel * 4);
+            if (frame != 0) block[0] |= 0x80;
+            std::array<Sample,samples> mono{};
+            int used = 0, status = 0;
+            if constexpr (sizeof(Sample) == 2) {
+              status = Atrac9Decode(handles[channel].get(), block.data(), mono.data(), &used, 0);
+            } else {
+              status = Atrac9DecodeS32(handles[channel].get(), block.data(), mono.data(), &used, 0);
+            }
+            Require(name, "integer mono reference PCM", status == 0 && used == block_bytes,
+                    "integer reference decode failed");
+            for (uint32_t sample = 0; sample < samples; ++sample) {
+              reference_pcm[((sf * frames + frame) * samples + sample) * test.channels + channel] = mono[sample];
+            }
+          }
+        }
+      }
+      AjmAt9Decoder integer_decoder(1,48000,encoding,0);
+      Require(name, "integer multistream init", integer_decoder.Initialize(config.data(), config.size()).result == 0,
+              "integer multistream config rejected");
+      std::vector<Sample> pcm(reference_pcm.size() + 2, static_cast<Sample>(-1234));
+      const auto result = integer_decoder.Decode(encoded.data(), encoded.size(), pcm.data() + 1,
+          reference_pcm.size() * sizeof(Sample), true, nullptr);
+      Require(name, "integer interleaved PCM", result.result == 0 && result.input_consumed == encoded.size() &&
+          result.output_written == reference_pcm.size() * sizeof(Sample) &&
+          pcm.front() == -1234 && pcm.back() == -1234 &&
+          std::equal(reference_pcm.begin(), reference_pcm.end(), pcm.begin() + 1) &&
+          std::ranges::any_of(reference_pcm, [](Sample value) { return value != 0; }),
+          "integer PCM encoding/interleaving mismatch or silent oracle");
+    };
+    integer_pcm.operator()<int16_t>(AjmSampleEncoding::S16);
+    integer_pcm.operator()<int32_t>(AjmSampleEncoding::S32);
+
+    decoder.Reset();
+    std::fill(actual.begin(), actual.end(), -1234.0f);
+    size_t input_offset = 0, output_offset = 0;
+    for (uint32_t frame = 0; frame < superframes * frames; ++frame) {
+      const auto one = decoder.Decode(encoded.data() + input_offset, encoded.size() - input_offset,
+          actual.data() + 1 + output_offset, (expected.size() - output_offset) * sizeof(float), false, nullptr);
+      Require(name, "single frame continuation", one.result == 0 && one.frames == 1 &&
+          one.output_written == samples * test.channels * sizeof(float), "single frame continuation failed");
+      input_offset += one.input_consumed;
+      output_offset += one.output_written / sizeof(float);
+    }
+    Require(name, "per-channel superframe padding", input_offset == encoded.size() && output_offset == expected.size(),
+        "per-channel padding crossed a superframe boundary incorrectly");
+    compare("reset and continuation PCM", 0, expected.size());
+    if (frames >= 4) {
+      decoder.Reset();
+      std::fill(actual.begin(), actual.end(), -1234.0f);
+      AjmGaplessState gapless;
+      gapless.Set({137,257,0}, true);
+      const auto limited = decoder.Decode(encoded.data(), share * test.channels, actual.data() + 1,
+          137 * test.channels * sizeof(float), true, &gapless);
+      Require(name, "multichannel gapless drain", limited.result == 0 &&
+          limited.input_consumed == share * test.channels && limited.frames == frames &&
+          limited.output_written == 137 * test.channels * sizeof(float) &&
+          limited.total_decoded_samples == 137 && gapless.IsEnd(), "gapless skip/limit/drain failed");
+      compare("gapless interleaved PCM", 257 * test.channels, 137 * test.channels);
+      Require(name, "gapless output extent",
+          std::ranges::all_of(actual.begin() + 1 + 137 * test.channels, actual.end(),
+              [](float value) { return value == -1234.0f; }), "gapless decoder wrote beyond requested extent");
+    }
+    if (test.channels == 12 && test.exponent == 2) {
+      uint32_t context = 0, instance = 0;
+      Require(name, "multistream batch create", AjmInitialize(0, &context) == 0 &&
+          AjmInstanceCreate(context, 1, 12u | (2u << 7), &instance) == 0, "AJM create failed");
+      alignas(void*) std::array<std::byte,64> info_storage{};
+      auto* batch_info = reinterpret_cast<AjmBatchInfo*>(info_storage.data());
+      std::array<std::byte,4096> batch_storage{};
+      Require(name, "multistream batch storage", AjmBatchInitialize(batch_storage.data(), batch_storage.size(), batch_info) == 0,
+              "AJM batch storage failed");
+      struct Params { std::array<uint8_t,4> config; uint32_t reserved; } params{config,0};
+      std::array<uint32_t,16> sideband{};
+      const int control = AjmBatchJobControl(batch_info, instance, (1ull << 14) | (1ull << 11),
+          &params, sizeof(params), sideband.data(), 24);
+      const bool initialized_batch = control == 0 && sideband[0] == 0 && sideband[2] == share * test.channels &&
+          sideband[3] == frames && sideband[4] == share * test.channels && sideband[5] == samples;
+      sideband.fill(0);
+      std::vector<float> pcm(expected.size() + 2, -1234.0f);
+      const int run = AjmBatchJobRun(batch_info, instance,
+          (1ull << 11) | (1ull << 12) | (1ull << 46) | (1ull << 47), encoded.data(), encoded.size(),
+          pcm.data() + 1, expected.size() * sizeof(float), sideband.data(), sizeof(sideband));
+      const bool stream = run == 0 && sideband[0] == 0 && sideband[6] == test.channels &&
+          sideband[8] == 48000 && sideband[9] == 2 && sideband[12] == encoded.size() &&
+          sideband[13] == expected.size() * sizeof(float) && sideband[14] == superframes * frames * samples && sideband[15] == 0;
+      bool equal = pcm.front() == -1234.0f && pcm.back() == -1234.0f;
+      for (size_t sample = 0; sample < expected.size(); ++sample) {
+        equal = equal && std::isfinite(pcm[sample+1]) && std::abs(pcm[sample+1] - expected[sample]) < 0.000001f;
+      }
+      Require(name, "multistream batch cleanup", AjmInstanceDestroy(context, instance) == 0 &&
+          AjmFinalize(context) == 0, "AJM cleanup failed");
+      Require(name, "multistream batch metadata/PCM", initialized_batch && stream && equal,
+              "AJM batch control/run geometry or interleaved PCM failed");
+    }
+  }
+  Require(name, "extended metadata and decoder", errors.empty(), errors);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--ajm-at9-multistream-only") == 0) {
+    CheckAjmAt9Multistream();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--ajm-at9-config-only") == 0) {
     CheckAjmAt9Configuration();
     return 0;

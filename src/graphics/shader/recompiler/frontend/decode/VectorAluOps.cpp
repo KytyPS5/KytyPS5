@@ -1303,11 +1303,16 @@ bool IsVopc16BitCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMPX_GE_F16:
 		case Opcode::V_CMPX_NGT_F16:
 		case Opcode::V_CMPX_NEQ_F16:
+		case Opcode::V_CMPX_NLT_F16:
+		case Opcode::V_CMP_CLASS_F16:
+		case Opcode::V_CMPX_CLASS_F16: return true;
 		default: return false;
 	}
 }
 
 VopcSdwaSource VopcSdwaSourceClass(Opcode opcode, bool second) {
+	if (second && (opcode == Opcode::V_CMP_CLASS_F32 || opcode == Opcode::V_CMPX_CLASS_F32 ||
+	               opcode == Opcode::V_CMP_CLASS_F16 || opcode == Opcode::V_CMPX_CLASS_F16)) {
 		return VopcSdwaSource::Integer32;
 	}
 	const bool half = IsVopc16BitCompareOpcode(opcode);

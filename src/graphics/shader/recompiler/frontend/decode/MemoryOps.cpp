@@ -478,6 +478,11 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	     inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
 		SetUnsupported(inst, Family::DS, opcode, "DS lane operation is available only for LDS");
 	}
+	if (inst.gds &&
+	    (inst.opcode == Opcode::DS_MAX_RTN_U64 || inst.opcode == Opcode::DS_CMPST_RTN_B64)) {
+		// A 64-bit atomic needs an eight-byte typed view of the storage, and only LDS has one.
+		SetUnsupported(inst, Family::DS, opcode, "DS 64-bit atomic is available only for LDS");
+	}
 	if (inst.opcode == Opcode::DS_WRITE_ADDTID_B32 && data1 != 0u) {
 		SetUnsupported(inst, Family::DS, opcode,
 		               "DS write addtid data1 operand is not implemented");

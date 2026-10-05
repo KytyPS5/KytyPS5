@@ -1293,6 +1293,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
 				                      entry_ir.ShiftLeftLogical(third, u32(2)));
+				// GS_VGPR_COMP_CNT: VGPR2 = primitive ID, VGPR3 = GS invocation ID.
+				if (mesh.gs_vgpr_component_count >= 2u) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
+					                      entry_ir.IAdd(primitive_chunk, local));
+				}
+				if (mesh.gs_vgpr_component_count >= 3u) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), u32(0));
+				}
 				const auto index_bytes  = draw(3);
 				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
 				const auto index_low    = draw(4);
@@ -1312,6 +1320,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				    IR::ValueOpcode::BitFieldUExtract,
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
 				     entry_ir.IMul(index_bytes, u32(8))}));
+				// The merged wave's ES half: VGPR5 = vertex index, VGPR8 = instance index.
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(

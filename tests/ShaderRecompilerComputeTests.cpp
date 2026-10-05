@@ -41351,6 +41351,114 @@ TestCase DsReadWriteVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// The 64-bit max takes its data from data0 and returns the value it replaced.
+TestCase DsMaxRtnU64UsesDataOperand() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 8);
+  AppendVMovLiteral(&code, 2, 0x00000010u);
+  AppendVMovLiteral(&code, 3, 0x00000005u);
+  code.push_back(EncodeDs0(0x4d, 0));
+  code.push_back(EncodeDs1(0, 2, 1));
+  AppendVMovLiteral(&code, 4, 0x00000001u);
+  AppendVMovLiteral(&code, 5, 0x00000007u);
+  code.push_back(EncodeDs0(0x68, 0));
+  code.push_back(EncodeDs1(6, 4, 1));
+  code.push_back(EncodeDs0(0x76, 0));
+  code.push_back(EncodeDs1(8, 0, 1));
+  AppendVMovLiteral(&code, 10, 0xffffffffu);
+  AppendVMovLiteral(&code, 11, 0x00000004u);
+  code.push_back(EncodeDs0(0x68, 0));
+  code.push_back(EncodeDs1(12, 10, 1));
+  code.push_back(EncodeDs0(0x76, 0));
+  code.push_back(EncodeDs1(14, 0, 1));
+
+  const u32 results[] = {6, 7, 8, 9, 12, 13, 14, 15};
+  for (u32 i = 0; i < static_cast<u32>(std::size(results)); i++) {
+    AppendStoreVgpr(&code, results[i], i);
+  }
+  AppendEnd(&code);
+
+  return {"DsMaxRtnU64UsesDataOperand",
+          code,
+          std::vector<u32>(8, 0),
+          {0x00000010u, 0x00000005u, 0x00000001u, 0x00000007u, 0x00000001u, 0x00000007u,
+           0x00000001u, 0x00000007u},
+          {O::V_MOV_B32, O::DS_WRITE_B64, O::DS_MAX_RTN_U64, O::DS_READ_B64,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+// SH2 Nanite raster: s_orn2_saveexec re-enables every lane inside an execz region.
+TestCase WholeWaveReadlaneCase(u32 groups) {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 7, 0));                  // v7 = s0 (workgroup)
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(5), 7));    // v7 <<= 5
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(0), 7));         // v7 += lane
+  code.push_back(EncodeVop2(0x1a, 8, InlineU32(2), 7));    // v8 = byte address
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(5), 0));    // v1 = lane + 5
+  code.push_back(EncodeSop2(0x0e, 2, 0, InlineU32(31)));   // s2 = s0 & 31
+  code.push_back(EncodeVopc(0xd4, 2, 0));                  // v_cmpx_gt_u32 exec, s2, v0
+  const size_t skip = code.size();
+  code.push_back(0);                                       // s_cbranch_execz
+  code.push_back(EncodeSop1(0x40, 106, 126));              // s_orn2_saveexec_b32 vcc_lo, exec_lo
+  code.push_back(EncodeVop2(0x01, 5, 193, 1));             // v_cndmask_b32 v5, -1, v1, vcc
+  AppendVop3(&code, 0x360, 3, Vgpr(5), InlineU32(31));    // v_readlane_b32 s3, v5, 31
+  code.push_back(EncodeSMovB32(126, 106));                 // s_mov_b32 exec_lo, vcc_lo
+  code.push_back(EncodeVop1(0x01, 6, 3));                  // v6 = s3
+  AppendBufferStoreDword(&code, 6, 8);
+  code[skip] = EncodeSopp(0x08, static_cast<u32>(code.size() - skip - 1));
+  code.push_back(EncodeSMovB32(126, 193));                 // s_mov_b32 exec_lo, -1
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "WholeWaveReadlaneInRegion";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::S_AND_B32,
+                  O::V_CMPX_GT_U32, O::S_CBRANCH_EXECZ, O::S_ORN2_SAVEEXEC_B32,
+                  O::V_CNDMASK_B32, O::V_READLANE_B32, O::S_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.dispatch_x = groups;
+  test.initial.assign(groups * 32u, 0xdeadbeefu);
+  test.expected = test.initial;
+  for (u32 g = 0; g < groups; g++) {
+    for (u32 lane = 0; lane < (g & 31u); lane++) {
+      test.expected[g * 32u + lane] = 0xffffffffu;
+    }
+  }
+  return test;
+}
+
+void CheckWholeWaveReadlane(VulkanHarness *vulkan) {
+  constexpr const char *name = "WholeWaveReadlaneInRegion";
+  if (vulkan->SubgroupSize() != 32u) {
+    std::printf("[gpu]     %-32s skipped (host subgroup %u)\n", name, vulkan->SubgroupSize());
+    return;
+  }
+  constexpr u32 groups = 1024;
+  auto test = WholeWaveReadlaneCase(groups);
+  auto compiled = CompileCase(test, vulkan->SubgroupSize());
+  auto buffer = vulkan->CreateStorageBuffer(name, test.initial, test.initial.size());
+  vulkan->Dispatch(test, compiled, buffer);
+  const auto actual = vulkan->ReadBuffer(name, buffer, test.expected.size());
+  vulkan->DestroyBuffer(&buffer);
+  uint64_t wrong = 0;
+  for (size_t i = 0; i < actual.size(); i++) {
+    wrong += actual[i] != test.expected[i] ? 1u : 0u;
+  }
+  Require(name, "readback", wrong == 0,
+          "a lane a guest wave re-enabled inside a skipped region was not running");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 TestCase DsReadWriteFullRegionAddress(u32 wave_size, bool gds) {
   using O = ShaderOpcode;
   TestCase test;
@@ -50394,6 +50502,7 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsReadWriteVariants);
+  AddCase(DsMaxRtnU64UsesDataOperand);
   for (u32 wave_size : {32u, 64u})
     for (bool gds : {false, true})
       cases.push_back(DsReadWriteFullRegionAddress(wave_size, gds));
@@ -57895,6 +58004,7 @@ int main(int argc, char **argv) {
   vulkan.CheckThreadDispatchRecords();
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
+  CheckWholeWaveReadlane(&vulkan);
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();

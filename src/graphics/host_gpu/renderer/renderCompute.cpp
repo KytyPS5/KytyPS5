@@ -446,13 +446,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	const bool dump_dispatch_buffers = DispatchBufferDumpWanted(program.shader_hash);
+	if (dump_dispatch_buffers) {
+		// Snapshot right after FindBuffers populated buffer_sources, before RebindBuffers
+		// uploads/synchronizes this dispatch's bindings.
+		DumpDispatchBuffers(m_context, program.shader_hash, bindings, "before");
+	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
-	const bool dump_dispatch_buffers = DispatchBufferDumpWanted(program.shader_hash);
-	if (dump_dispatch_buffers) {
-		DumpDispatchBuffers(m_context, program.shader_hash, bindings, "before");
-	}
 
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -534,12 +536,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+
+	// The removed host fence also ordered read-only dispatches before later writers.
+	// Record the barrier before the after-dispatch snapshot: DumpDispatchBuffers calls
+	// FlushAndWait, which submits the current command buffer and begins a new one, so a
+	// barrier recorded afterwards would land on the already-submitted buffer.
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (dump_dispatch_buffers) {
 		DumpDispatchBuffers(m_context, program.shader_hash, bindings, "after");
 	}
-
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
 

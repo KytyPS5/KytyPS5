@@ -1,0 +1,227 @@
+name: Deploy KytyPS5 (playable builds)
+
+# Release builds for playing, not for testing: no unit tests, no profiling switches.
+# Produces a Windows .zip and a Linux .tar.gz and publishes them as a GitHub Release
+# in this repository (the upstream build.yml only releases from KytyPS5/KytyPS5).
+#
+# Run it from Actions -> "Deploy KytyPS5 (playable builds)" -> Run workflow,
+# or push a tag such as v0.3.1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build (empty = the selected branch)
+        required: false
+        default: ""
+      prerelease:
+        description: Mark the release as a pre-release
+        type: boolean
+        default: false
+  push:
+    tags: [ "v*" ]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  KYTY_BUILD_ORIGIN: Fork
+  KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+
+jobs:
+  metadata:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.meta.outputs.ref }}
+      sha: ${{ steps.meta.outputs.sha }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - id: meta
+        shell: bash
+        run: |
+          sha="$(git rev-parse HEAD)"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && -z "${{ inputs.ref }}" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="KytyPS5-$(date -u +'%Y-%m-%d')-${sha::7}"
+          fi
+          echo "ref=$sha" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows x64 (Release)
+    needs: metadata
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.ref }}
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "port_hash=$($portHash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Cache glslang
+        id: glslang_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
+          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
+            vcpkg install glslang[tools,opt]:x64-windows
+          }
+          "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cmake -S . -B _Build/windows -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
+            -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
+            -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.tag }} ^
+            -DCMAKE_C_COMPILER=clang-cl ^
+            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+
+      - name: Build
+        shell: cmd
+        run: cmake --build _Build/windows --target kyty_emulator launcher --parallel
+
+      - name: Install and package
+        shell: pwsh
+        run: |
+          cmake --install _Build/windows --prefix _Build/windows/install
+          if (-not (Test-Path _Build/windows/install/kyty_emulator.exe)) { throw "kyty_emulator.exe missing" }
+          Compress-Archive -Path _Build/windows/install/* `
+            -DestinationPath "${{ needs.metadata.outputs.tag }}-Windows-x64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows-x64
+          path: ${{ needs.metadata.outputs.tag }}-Windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64 (Release)
+    needs: metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.ref }}
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            clang glslang-tools lld pkg-config wayland-protocols \
+            libasound2-dev libdbus-1-dev libgl1-mesa-dev libpulse-dev libudev-dev \
+            libwayland-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev libxi-dev \
+            libxkbcommon-dev libxrandr-dev libxss-dev libxtst-dev
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Configure
+        run: |
+          cmake -S . -B _Build/linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
+            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
+            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.tag }}" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_PREFIX_PATH="$Qt6_DIR"
+
+      - name: Build
+        run: cmake --build _Build/linux --target kyty_emulator launcher --parallel
+
+      - name: Install and package
+        run: |
+          install_dir=_Build/linux/install
+          cmake --install _Build/linux --prefix "$install_dir"
+          chmod a+x "$install_dir/launcher" "$install_dir/kyty_emulator"
+          "$install_dir/kyty_emulator" --help > /dev/null
+          tar -C "$install_dir" -czf "${{ needs.metadata.outputs.tag }}-Linux-x86_64.tar.gz" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Linux-x86_64
+          path: ${{ needs.metadata.outputs.tag }}-Linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: always() && (needs.windows.result == 'success' || needs.linux.result == 'success')
+    needs: [metadata, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          SHA: ${{ needs.metadata.outputs.sha }}
+          PRERELEASE: ${{ inputs.prerelease && '--prerelease' || '' }}
+        run: |
+          ls -la dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* $PRERELEASE \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SHA" \
+              --title "$TAG" \
+              --notes "Playable Release build of ${SHA::7}. Windows: unzip and run launcher.exe (or kyty_emulator.exe). Linux: tar -xzf and run ./launcher."
+          fi

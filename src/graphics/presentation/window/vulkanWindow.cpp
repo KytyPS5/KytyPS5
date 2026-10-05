@@ -60,7 +60,10 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputLayer         = VK_TRUE;
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
+#if !defined(__APPLE__)
+	// MoltenVK does not expose 64-bit buffer atomics.
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+#endif
 	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	return features;
@@ -250,7 +253,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #else
 		check_feature(color_write_ext.colorWriteEnable, "colorWriteEnable");
 #endif
+#if !defined(__APPLE__)
 		check_feature(image_view_min_lod.minLod, "image view minLod");
+#endif
 
 		check_feature(depth_clip_control.depthClipControl, "depthClipControl");
 #if defined(__APPLE__)
@@ -292,7 +297,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");
+#if !defined(__APPLE__)
 		check_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
+#endif
 		check_feature(device_features2.features.largePoints, "largePoints");
 		check_feature(device_features2.features.multiViewport, "multiViewport");
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
@@ -429,11 +436,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
 	vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
 	image_view_min_lod.minLod = VK_TRUE;
-	depth_clip_control.pNext  = &image_view_min_lod;
-	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
-	// feature structs from the chain on macOS (the renderer falls back to default depth
-	// clipping and static color-write masks).
+	// MoltenVK lacks VK_EXT_image_view_min_lod, VK_EXT_depth_clip_enable and
+	// VK_EXT_color_write_enable, so drop those feature structs from the chain on macOS (the
+	// renderer falls back to unclamped view LODs, default depth clipping and static
+	// color-write masks).
 #if !defined(__APPLE__)
+	depth_clip_control.pNext = &image_view_min_lod;
 	image_view_min_lod.pNext = &depth_clip_enable;
 #endif
 	depth_clip_control.depthClipControl = VK_TRUE;
@@ -572,7 +580,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
+#if !defined(__APPLE__)
+	// MoltenVK does not expose cull distances.
 	device_features.shaderCullDistance                   = VK_TRUE;
+#endif
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
@@ -937,15 +948,16 @@ void WindowContext::CreateVulkan() {
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    "VK_KHR_maintenance1"};
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
-	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
-	// falls back to default depth clipping and static color-write masks on macOS. It also
-	// requires VK_KHR_portability_subset per the Vulkan portability spec.
+	// MoltenVK lacks VK_EXT_image_view_min_lod, VK_EXT_depth_clip_enable and
+	// VK_EXT_color_write_enable; the renderer falls back to unclamped view LODs, default depth
+	// clipping and static color-write masks on macOS. It also requires
+	// VK_KHR_portability_subset per the Vulkan portability spec.
 	device_extensions.push_back("VK_KHR_portability_subset");
 #else
+	device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);

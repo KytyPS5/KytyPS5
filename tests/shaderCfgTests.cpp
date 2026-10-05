@@ -12077,11 +12077,22 @@ void TestWave32MaskProjection() {
     const auto mixed_select = thread_bit(e, e.Select(selected, active_mask, raw));
     const auto different_lane = thread_bit(e, active_mask, false);
     const auto high_half = thread_bit(e, ballot(e, active, 1u));
+#if defined(__APPLE__)
+    const auto empty_mask = thread_bit(e, zero);
+    const auto full_mask = thread_bit(e, U32(Value(UINT32_MAX)));
+    const auto alternating_mask = thread_bit(e, U32(Value(0xaaaaaaaau)));
+#endif
     const auto initial_mask = e.BitwiseAnd(active_mask, ballot(e, selected));
     const auto raw_consumer = e.Emit(ValueOpcode::IAdd32, {initial_mask, Value(3u)});
     const auto initial_predicate = e.LogicalAnd(active, selected);
     const auto entry_size = entry->Instructions().size();
     ConstantPropagationPass({entry}, wave_size);
+#if defined(__APPLE__)
+    Check(empty_mask.Resolve() == Value(false) && full_mask.Resolve() == Value(true),
+          "uniform mask projection retained a lane dependency");
+    Check(!alternating_mask.Resolve().IsImmediate(),
+          "nonuniform mask projection lost its lane dependency");
+#endif
     Check(entry->Instructions().size() == entry_size,
           "rejected mixed mask graph left unused projected instructions");
     const auto combined_mask = e.BitwiseOr(active_mask, ballot(e, selected));

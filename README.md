@@ -272,8 +272,9 @@ guest code; no manual signing step is required. When the launcher is built, the 
 also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
 A flat `kyty_emulator` is kept for CLI usage.
 
-Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
-[MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
+Vulkan comes from MoltenVK. **MoltenVK 1.4.2 is the validated baseline** for Dead Cells
+on Apple M4 Pro; 1.4.0 and 1.4.1 are also supported. Download `MoltenVK-macos.tar` from the
+[1.4.2 release](https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.2), then copy
 `MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
 (and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and ad-hoc sign it:
 

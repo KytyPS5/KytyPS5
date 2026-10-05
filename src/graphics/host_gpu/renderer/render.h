@@ -72,14 +72,14 @@ struct DrawAutoArgs {
 
 // Guest indirect records share the layouts of Vulkan's indirect commands.
 struct IndirectDrawArgs {
-	uint64_t args_addr                  = 0;
-	uint32_t max_count                  = 1;
-	uint32_t stride                     = 0;
+	uint64_t args_addr = 0;
+	uint32_t max_count = 1;
+	uint32_t stride    = 0;
 	// Guest dword that caps the record count at execution time, or 0.
-	uint64_t count_addr                 = 0;
-	bool     indexed                    = false;
-	uint32_t index_type_and_size        = 0;
-	uint64_t index_base_addr            = 0;
+	uint64_t count_addr          = 0;
+	bool     indexed             = false;
+	uint32_t index_type_and_size = 0;
+	uint64_t index_base_addr     = 0;
 	// In elements; the whole buffer is bound because the first index is only known on the GPU.
 	uint32_t index_buffer_size          = 0;
 	uint32_t render_target_slice_offset = 0;
@@ -202,15 +202,14 @@ public:
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
-
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void                           FindBuffers(std::span<PreparedBindings* const> stages);
-	void                           RebindBuffers(PreparedBindings& bindings);
-	void                           RebindImages(PreparedBindings& bindings);
-	bool                           ResolveStageImages(PreparedBindings& bindings);
-	void                           AcquireStageImageViews(PreparedBindings& bindings);
-	bool                           ResolveColorTargets(std::span<RenderColorInfo> colors);
-	void                           PrepareBindlessTables(std::span<PreparedBindings* const> stages);
+	void FindBuffers(std::span<PreparedBindings* const> stages);
+	void RebindBuffers(PreparedBindings& bindings);
+	void RebindImages(PreparedBindings& bindings);
+	bool ResolveStageImages(PreparedBindings& bindings);
+	void AcquireStageImageViews(PreparedBindings& bindings);
+	bool ResolveColorTargets(std::span<RenderColorInfo> colors);
+	void PrepareBindlessTables(std::span<PreparedBindings* const> stages);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
@@ -229,46 +228,50 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	void                         PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
+	                                                     std::span<RenderColorInfo>         colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
-	void               ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target,
-	                                            uint8_t stencil_export_bits = 0);
-	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target,
+	                              uint8_t stencil_export_bits = 0);
+	[[nodiscard]] bool        DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] static bool IsDepthStencilCopy(const CommandBuffer& buffer);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
-	                                          const DrawCallInfo& draw,
-	                                          uint32_t            render_target_slice_offset,
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                          uint32_t         render_target_slice_offset,
 	                                          DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                      uint32_t render_target_slice_offset,
+	                                      uint32_t         render_target_slice_offset,
 	                                      DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable,
+	                         bool                    primitive_restart_enable,
 	                         const IndirectDrawArgs* indirect = nullptr);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
-	                                              uint32_t render_target_slice_offset);
+	                                              uint32_t       render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        TryConsumeComputeRecordFill(const ShaderComputeInputInfo& input,
+	                                                      CommandBuffer& command, uint32_t group_x,
+	                                                      uint32_t group_y, uint32_t group_z,
+	                                                      uint32_t mode);
+	[[nodiscard]] bool        TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
+	                                                      CommandBuffer& command, uint32_t group_x,
+	                                                      uint32_t group_y, uint32_t group_z,
+	                                                      uint32_t mode);
 	[[nodiscard]] ThreadDispatcher& ThreadDispatch();
 
 	RenderContext&                        m_context;
-	GraphicsBindings                     m_graphics_bindings;
-	PreparedBindings                     m_compute_bindings;
+	GraphicsBindings                      m_graphics_bindings;
+	PreparedBindings                      m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
@@ -285,6 +288,12 @@ private:
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);
+// A constant store into every record of a buffer whose stride is wider than the element.
+[[nodiscard]] bool ResolveComputeRecordFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                            uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                            ShaderBufferResource&    descriptor,
+                                            std::array<uint32_t, 4>& pattern,
+                                            uint32_t& pattern_words, uint64_t& size);
 
 } // namespace Libs::Graphics
 

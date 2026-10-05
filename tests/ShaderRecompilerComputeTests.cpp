@@ -45102,6 +45102,48 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "a scalar without a clean reader was replaced by a fill");
+
+  // SILENT HILL 2's water normal clear: one 32_32 element per 256-byte record.
+  user_data = {0x00010000u, 256u << 16u, 512u,
+               (static_cast<u32>(Prospero::BufferFormat::k32_32UInt) << 12u) | 0x22cu,
+               0u, 0x3c003c00u, 0x3c003c00u, 0x3c003c00u};
+  compute.workgroup_register = 8;
+  compute.dispatch_thread_dimensions = false;
+  runtime_resources = Compile(code);
+  std::array<u32, 4> pattern{};
+  u32 pattern_words = 0;
+  Require("Ps5GameExampleImageClear", "record fill",
+          ResolveComputeRecordFill(compute, 8, 1, 1, 0x41u, descriptor, pattern,
+                                   pattern_words, size) &&
+              descriptor.Base48() == 0x10000u && size == 512u * 256u &&
+              pattern_words == 2 && pattern[0] == 0u && pattern[1] == 0x3c003c00u,
+          "a whole-record clear did not resolve to its element pattern");
+  Require("Ps5GameExampleImageClear", "record fill coverage",
+          !ResolveComputeRecordFill(compute, 7, 1, 1, 0x41u, descriptor, pattern,
+                                    pattern_words, size) &&
+              !ResolveComputeRecordFill(compute, 9, 1, 1, 0x41u, descriptor, pattern,
+                                        pattern_words, size),
+          "a dispatch missing or overrunning records was taken as a record fill");
+  user_data[1] = 8u << 16u;
+  runtime_resources = Compile(code);
+  Require("Ps5GameExampleImageClear", "dense stride",
+          !ResolveComputeRecordFill(compute, 8, 1, 1, 0x41u, descriptor, pattern,
+                                    pattern_words, size),
+          "a record no wider than its element was widened");
+  user_data[1] = 12u << 16u;
+  runtime_resources = Compile(code);
+  Require("Ps5GameExampleImageClear", "ragged stride",
+          !ResolveComputeRecordFill(compute, 8, 1, 1, 0x41u, descriptor, pattern,
+                                    pattern_words, size),
+          "a stride that is not a whole number of elements was filled");
+  user_data[1] = 256u << 16u;
+  user_data[3] =
+      (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u) | 0x22cu;
+  runtime_resources = Compile(code);
+  Require("Ps5GameExampleImageClear", "converted format",
+          !ResolveComputeRecordFill(compute, 8, 1, 1, 0x41u, descriptor, pattern,
+                                    pattern_words, size),
+          "a format that converts the stored value was taken as a raw fill");
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 

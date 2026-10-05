@@ -2135,12 +2135,16 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 	const auto              words = fill.fill.words;
 	std::array<uint32_t, 4> stored {};
 	bool                    uniform_fill = words != 0;
+	bool                    words_agree  = true;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+		uniform_fill = clean.Evaluate(fill.values[i], stored[i]);
+		words_agree  = words_agree && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
-		snapshot.uniform_fill       = fill.fill;
-		snapshot.uniform_fill.value = stored[0];
+		snapshot.uniform_fill             = fill.fill;
+		snapshot.uniform_fill.value       = stored[0];
+		snapshot.uniform_fill.word_values = stored;
+		snapshot.uniform_fill.words_agree = words_agree;
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {

@@ -20,14 +20,17 @@ struct DescriptorValue {
 enum class UniformFillKind { None, Buffer, Image };
 
 struct UniformFill {
-	UniformFillKind          kind         = UniformFillKind::None;
-	uint32_t                 resource     = 0;
+	UniformFillKind         kind     = UniformFillKind::None;
+	uint32_t                resource = 0;
 	std::array<uint32_t, 3> group_stride {};
-	uint32_t                 words        = 0;
-	uint32_t                 value        = 0;
+	uint32_t                words = 0;
+	uint32_t                value = 0;
+	// value names the whole fill only when the stored words agree.
+	std::array<uint32_t, 4> word_values {};
+	bool                    words_agree = true;
 	// Elements each invocation writes, one per store. The stores tile the workgroup's range, so
 	// group_stride[0] == local_size_x * stores. One store per invocation is the common shape.
-	uint32_t                 stores       = 1;
+	uint32_t stores = 1;
 
 	static constexpr uint32_t MaxStores = 64;
 

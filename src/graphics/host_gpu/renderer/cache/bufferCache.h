@@ -27,11 +27,11 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
-	static constexpr uint32_t CACHING_PAGEBITS  = 14;
-	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
-	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	static constexpr uint32_t CACHING_PAGEBITS = 14;
+	static constexpr uint64_t CACHING_PAGESIZE = uint64_t {1} << CACHING_PAGEBITS;
+	static constexpr uint64_t CACHING_NUMPAGES =
+	    (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	static constexpr uint64_t BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 	// Device addresses stay below bit 63, which tags pages whose BDA stores the host owns.
 	static constexpr uint64_t BDA_STORE_TRACKED_BIT = uint64_t {1} << 63;
 
@@ -52,13 +52,13 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
-	[[nodiscard]] Buffer&  GetBuffer(BufferId id) {
+	void                  InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void                  ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	[[nodiscard]] Buffer& GetBuffer(BufferId id) {
 		EnsureDeviceStateCleared();
 		return m_slot_buffers[id];
 	}
-	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] BufferId                     FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -73,7 +73,7 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() {
+	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() {
 		EnsureDeviceStateCleared();
 		return &m_bda_pagetable_buffer;
 	}
@@ -83,6 +83,8 @@ public:
 	}
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Repeats a pattern of `words` dwords over the range; size is a multiple of the pattern.
+	void FillBufferPattern(uint64_t vaddr, uint64_t size, const uint32_t* pattern, uint32_t words);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -95,25 +97,23 @@ public:
 	[[nodiscard]] bool IsMetadataClassified(uint64_t vaddr, uint64_t size, uint32_t codes) const;
 	void               ProcessFaultBuffer();
 	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
-	void               ResolveBdaFault(uint64_t vaddr, uint64_t size);
-	void               PrefetchBda(uint64_t vaddr, uint64_t size, bool store);
-	void               ForgetBdaResidency(uint64_t vaddr, uint64_t size);
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void ResolveBdaFault(uint64_t vaddr, uint64_t size);
+	void PrefetchBda(uint64_t vaddr, uint64_t size, bool store);
+	void ForgetBdaResidency(uint64_t vaddr, uint64_t size);
+	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void BeginUploadBatch();
+	void EndUploadBatch();
 	// Marks the tracked pages a BDA store can reach GPU-written, restricted to mapped memory.
-	void               MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked);
+	void MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked);
 	// The BDA synchronise set, kept by the memory tracker. PrepareBda drains it instead of
 	// rediscovering the same obligation by walking every mapped range on every DMA draw.
-	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
-		m_memory_tracker.QueueBdaSync(vaddr, size);
-	}
-	void                   DropBdaSync(uint64_t vaddr, uint64_t size) {
-		m_memory_tracker.DropBdaSync(vaddr, size);
-	}
+	void QueueBdaSync(uint64_t vaddr, uint64_t size) { m_memory_tracker.QueueBdaSync(vaddr, size); }
+	void DropBdaSync(uint64_t vaddr, uint64_t size) { m_memory_tracker.DropBdaSync(vaddr, size); }
 	[[nodiscard]] RangeSet TakeBdaSync() { return m_memory_tracker.TakeBdaSync(); }
 	[[nodiscard]] bool     HasBdaSync() const { return m_memory_tracker.HasBdaSync(); }
-	[[nodiscard]] bool HasUnmarkedBdaStores() const { return !m_bda_unmarked_ranges.Empty(); }
-	void               ClearUnmarkedBdaStores() { m_bda_unmarked_ranges.Clear(); }
-	void               RunGarbageCollector();
+	[[nodiscard]] bool     HasUnmarkedBdaStores() const { return !m_bda_unmarked_ranges.Empty(); }
+	void                   ClearUnmarkedBdaStores() { m_bda_unmarked_ranges.Clear(); }
+	void                   RunGarbageCollector();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -144,28 +144,28 @@ private:
 			ClearDeviceState();
 		}
 	}
-	void ClearDeviceState();
-	void TouchBuffer(const Buffer& buffer);
+	void                        ClearDeviceState();
+	void                        TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
-	void Unregister(BufferId id);
+	void                   Unregister(BufferId id);
 	template <bool insert>
-	void ChangeRegister(BufferId id);
-	void DeleteBuffer(BufferId id);
-	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	void                     ChangeRegister(BufferId id);
+	void                     DeleteBuffer(BufferId id);
+	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                           bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	void MarkBdaStores(uint64_t vaddr, uint64_t size);
-	void RecordBdaEviction(const Buffer& buffer);
+	void               MarkBdaStores(uint64_t vaddr, uint64_t size);
+	void               RecordBdaEviction(const Buffer& buffer);
 	void               MakePageTableResident(uint64_t table_offset, uint64_t size);
-	void ForgetClassifiedMetadata(uint64_t vaddr, uint64_t size);
+	void               ForgetClassifiedMetadata(uint64_t vaddr, uint64_t size);
 
 	// The tick of the recording that last wrote a range, kept until that tick completes.
 	struct GpuWriteMark {
@@ -184,43 +184,43 @@ private:
 		uint32_t codes = 0;
 	};
 
-	GraphicContext&                                   m_graphics;
-	CommandScheduler&                                 m_scheduler;
-	FaultManager                                      m_fault_manager;
-	bool                                              m_device_state_cleared = false;
-	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
+	GraphicContext&                                    m_graphics;
+	CommandScheduler&                                  m_scheduler;
+	FaultManager                                       m_fault_manager;
+	bool                                               m_device_state_cleared = false;
+	Buffer                                             m_gds_buffer;
+	Buffer                                             m_bda_pagetable_buffer;
 	uint64_t                                           m_bda_table_chunk        = 0;
 	uint32_t                                           m_bda_table_memory_types = 0;
 	std::vector<VmaAllocation>                         m_bda_table_chunks;
 	vk::Fence                                          m_bda_table_fence = nullptr;
-	Common::SlotVector<Buffer>                        m_slot_buffers;
+	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	BufferMap                                         m_buffers;
-	PageTable                                         m_page_table;
-	RangeSet                                          m_gpu_modified_ranges;
-	RangeSet                                          m_bda_tracked_ranges;
+	BufferMap                                          m_buffers;
+	PageTable                                          m_page_table;
+	RangeSet                                           m_gpu_modified_ranges;
+	RangeSet                                           m_bda_tracked_ranges;
 	// Tracked since the last mark, so stores that ran before tracking are owned without a rerun.
-	RangeSet                                          m_bda_unmarked_ranges;
-	RangeSet                                          m_bda_resolved_ranges;
-	RangeSet                                          m_bda_evicted_ranges;
-	RangeSet                                          m_bda_pinned_ranges;
-	std::map<uint64_t, ClassifiedMetadata>            m_classified_metadata;
-	uint64_t                                          m_classified_span = 0;
+	RangeSet                               m_bda_unmarked_ranges;
+	RangeSet                               m_bda_resolved_ranges;
+	RangeSet                               m_bda_evicted_ranges;
+	RangeSet                               m_bda_pinned_ranges;
+	std::map<uint64_t, ClassifiedMetadata> m_classified_metadata;
+	uint64_t                               m_classified_span = 0;
 	// Disjoint; a mark whose tick has completed no longer constrains anything and is pruned.
-	std::map<uint64_t, GpuWriteMark>                  m_gpu_write_marks;
+	std::map<uint64_t, GpuWriteMark> m_gpu_write_marks;
 	// A BDA store can reach any page, including ones no mark names yet.
-	uint64_t                                          m_bda_store_tick = 0;
-	MemoryTracker                                     m_memory_tracker;
-	StreamBuffer                                      m_staging_buffer;
-	StreamBuffer                                      m_stream_buffer;
-	StreamBuffer                                      m_download_buffer;
-	StreamBuffer                                      m_device_buffer;
-	TextureCache&                                     m_texture_cache;
-	uint64_t                                          m_total_used_memory  = 0;
-	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
-	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
-	uint64_t m_gc_tick            = 0;
+	uint64_t      m_bda_store_tick = 0;
+	MemoryTracker m_memory_tracker;
+	StreamBuffer  m_staging_buffer;
+	StreamBuffer  m_stream_buffer;
+	StreamBuffer  m_download_buffer;
+	StreamBuffer  m_device_buffer;
+	TextureCache& m_texture_cache;
+	uint64_t      m_total_used_memory  = 0;
+	uint64_t      m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+	uint64_t      m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	uint64_t      m_gc_tick            = 0;
 };
 
 } // namespace Libs::Graphics

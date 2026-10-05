@@ -3951,6 +3951,7 @@ public:
     constexpr uint32_t remap_value = 0xd5e6f708u;
     constexpr uint32_t partial_unmap_value = 0x62738495u;
     constexpr uint32_t partial_unmap_survivor_value = 0xa6b7c8d9u;
+    constexpr uint32_t partial_unmap_stale = 0x2d4e6f80u;
     constexpr uint32_t ring_fault_first_value = 0x0a1b2c3du;
     constexpr uint32_t ring_fault_second_value = 0x4e5f6071u;
 
@@ -4607,16 +4608,26 @@ public:
       Require(name, "partial-invalidation allocation",
               partial_unmap_allocation.first != nullptr,
               "cross-page cached buffer allocation failed");
+      Libs::LibKernel::Memory::WriteBacking(base + partial_unmap_offset,
+                                            &partial_unmap_stale,
+                                            sizeof(partial_unmap_stale));
+      Libs::LibKernel::Memory::WriteBacking(base + partial_unmap_survivor_offset,
+                                            &partial_unmap_stale,
+                                            sizeof(partial_unmap_stale));
       cache.FillBuffer(base + partial_unmap_offset, sizeof(partial_unmap_value),
                        partial_unmap_value, false);
       cache.FillBuffer(base + partial_unmap_survivor_offset,
                        sizeof(partial_unmap_survivor_value),
                        partial_unmap_survivor_value, false);
       resources.UnmapMemory(base + 0x8000, 0x4000);
+      uint32_t partial_unmap_backing = 0;
       uint32_t partial_unmap_survivor_backing = 0;
-      std::memcpy(&partial_unmap_survivor_backing,
-                  memory + partial_unmap_survivor_offset,
-                  sizeof(partial_unmap_survivor_backing));
+      Libs::LibKernel::Memory::TryReadBacking(base + partial_unmap_offset,
+                                              &partial_unmap_backing,
+                                              sizeof(partial_unmap_backing));
+      Libs::LibKernel::Memory::TryReadBacking(base + partial_unmap_survivor_offset,
+                                              &partial_unmap_survivor_backing,
+                                              sizeof(partial_unmap_survivor_backing));
       Require(
           name, "partial-invalidation ownership",
           !resources.IsMapped(base + 0x8000, 0x4000) &&
@@ -4627,11 +4638,21 @@ public:
                   sizeof(partial_unmap_survivor_value)) &&
               !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
                                       sizeof(partial_unmap_value)) &&
-              !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
-                                      sizeof(partial_unmap_survivor_value)) &&
-              partial_unmap_survivor_backing == partial_unmap_survivor_value,
-          "widened partial invalidation mishandled ownership or backing");
+              !cache.IsRegionGpuModified(base + partial_unmap_offset,
+                                         sizeof(partial_unmap_value)) &&
+              cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
+                                     sizeof(partial_unmap_survivor_value)) &&
+              cache.IsRegionGpuModified(base + partial_unmap_survivor_offset,
+                                        sizeof(partial_unmap_survivor_value)) &&
+              partial_unmap_backing == partial_unmap_value &&
+              partial_unmap_survivor_backing == partial_unmap_stale,
+          "partial invalidation published bytes outside its requested pages");
       resources.MapMemory(base + 0x8000, 0x4000);
+      cache.ReadMemory(base + partial_unmap_survivor_offset,
+                       sizeof(partial_unmap_survivor_value));
+      Libs::LibKernel::Memory::TryReadBacking(base + partial_unmap_survivor_offset,
+                                              &partial_unmap_survivor_backing,
+                                              sizeof(partial_unmap_survivor_backing));
       auto survivor =
           cache.ObtainBuffer(base + partial_unmap_survivor_offset,
                              sizeof(partial_unmap_survivor_value), false);
@@ -4639,8 +4660,13 @@ public:
               "cached-buffer remainder was not retained");
       Require(name, "partial-invalidation survivor contents",
               ReadNativeValue(*survivor.first, survivor.second) ==
-                  partial_unmap_survivor_value,
-              "partial invalidation lost disjoint native bytes");
+                  partial_unmap_survivor_value &&
+                  partial_unmap_survivor_backing == partial_unmap_survivor_value &&
+                  !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
+                                          sizeof(partial_unmap_survivor_value)) &&
+                  !cache.IsRegionGpuModified(base + partial_unmap_survivor_offset,
+                                             sizeof(partial_unmap_survivor_value)),
+              "a remapped survivor did not publish its retained native bytes");
 
       for (const uint64_t large_size : {64ull << 20, 68ull << 20}) {
         constexpr uint64_t large_offset = 0x10000;

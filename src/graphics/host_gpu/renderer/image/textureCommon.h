@@ -15,6 +15,7 @@ struct RenderTargetFormatInfo {
 	vk::Format                      format            = vk::Format::eUndefined;
 	uint32_t                        bytes_per_element = 0;
 	Prospero::ColorComponentMapping export_mapping;
+	Prospero::BufferFormat          guest_format = Prospero::BufferFormat::kInvalid;
 };
 
 struct SurfaceFormatInfo {

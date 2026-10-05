@@ -1,5 +1,53 @@
 # Emulator regression test debt
 
+## Packed-float sampling harness boundary (2026-10-05)
+
+Expanded neighbors pass numeric values but GPUAV rejects the fixture's sampled
+image descriptor left in TRANSFER_SRC_OPTIMAL by the earlier host byte probe
+(VUID-VkWriteDescriptorSet-descriptorType-04149). This is not a production
+color defect RED: caller must transition the image to a sampled-read layout.
+Fixture sampled-read transition corrected without changing numeric/component/alias
+oracles. Expanded regression and packed/BGRA16/tiler/image-transition neighbors
+now PASS under GPUAV (final-neighbor logs); no validation errors.
+
+## Audio descriptor provenance correction (2026-10-05; diagnosis only)
+
+Read-only guest producer/callback analysis proves source descriptor+0/+8 are
+linked-list fields, not an original stream-header pointer. Earlier NULL-header
+statements were an interpretation error; no original header was captured. The
+source configuration remains inline in the descriptor and is copied unchanged
+to AJM control initialization. Original source metadata/header must be captured
+independently before asserting an endian/ABI/audio fix. Guest RIFF callback copies
+its four ATRAC9 configuration bytes individually; ordinary AJM initializations
+continue to pass. Producer analysis artifacts stay ignored under _Build/analysis.
+
+## Packed-float render-target transfer (2026-10-05; native RED/GREEN proved)
+
+Selective upstream5940e623 shared correction preserves unequal guest 10/11/11
+unsigned-float component widths through linear and RenderTarget64KB transfers.
+Native --packed-float-rt-only uses independent numeric values and exact downloaded
+bytes, real RT register discovery/cache transfers, and four different texels.
+Baseline567663de GPUAV RED: unsupported RT layout7/type7/order2, exit321,
+no timeout/VUID; testEXE37dd5b5aeff3f8506d3e87f8ab3b2921fd3825ae911d0c72197bd8f03c905c2b,
+`logs/packed-float-rt-red-gpuav-20261005.log` (04:49:41UTC).
+Same linear/tiled numeric/exact-byte oracle GREEN, testEXE8076e671be29cd6b76d1ea21845674416f3413eb5d5ff3bed692771d544984d7,
+`logs/packed-float-rt-green-gpuav-20261005.log`.
+Expanded sampled component/constant and incompatible same-native-format alias
+neighbors PASS; final packed-float, packed textures, BGRA16, image transitions,
+tiled sampled-format and tiler selectors PASS; affected CTest5/5 PASS. Extra
+BGRA16 upload and SNorm/1555 physical-width probes PASS05:11UTC, testEXE
+22ca9b32e663bf8182a1045159f75bb77c6c2d0d11ab2d9ba7e76816607bdd7d,
+`logs/packed-float-final-bgra-neighbor-gpuav-20261005.log`.
+Per-tick scratch lifetime, stream-wrap ordering and local HTile/depth behavior
+preserved. No production audio change, full-suite success, other-game compatibility
+or actual dark-scene correction claimed. Native emulator install/game comparison
+still pending; useful upstream port is supported by synthetic numeric GPU evidence.
+
+Run042814 source567663de ended04:43:23UTC/C0000094 after Quality; Medium/
+Standard/Quality visually proved, scene still dark, main menu/game entry pending.
+Expanded fault has same invalid audio config/control result, no new root proof.
+Game/recorder ended and own native processes cleaned before test build.
+
 ## Filterable scaled 8-bit textures (2026-10-05; reproduction pending)
 
 Upstream96c067d0 is a useful candidate, not yet a verified local fix. Before any

@@ -259,7 +259,7 @@ set(gpu_tiler_shader_names
 	depth
 	promote_d16
 	demote_d16
-	swap_bgra16
+	color_transform
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
@@ -687,6 +687,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_scaled_texture_filtering
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scaled-texture-only)
 	set_tests_properties(shader_scaled_texture_filtering PROPERTIES TIMEOUT 90)
+	add_test(NAME graphics_packed_float_roundtrip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --packed-float-rt-only)
+	set_tests_properties(graphics_packed_float_roundtrip PROPERTIES TIMEOUT 90)
 	add_test(NAME ajm_at9_configuration
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ajm-at9-config-only)
 	set_tests_properties(ajm_at9_configuration PROPERTIES TIMEOUT 30)

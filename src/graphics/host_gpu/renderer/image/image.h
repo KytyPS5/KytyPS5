@@ -18,6 +18,7 @@ namespace Libs::Graphics {
 
 class Buffer;
 class CommandScheduler;
+class TileManager;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
@@ -66,7 +67,7 @@ public:
 	void CopyImage(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
-	void CopyImageWithBuffer(Image& source, Buffer& buffer);
+	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {

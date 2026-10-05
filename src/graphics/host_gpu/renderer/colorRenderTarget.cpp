@@ -280,7 +280,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.type              = TextureCache::BindingType::RenderTarget;
 	desc.info.data         = {rt.base.addr, backing_size};
 	desc.info.pixel_format = target_format.format;
-	desc.info.guest_format = transfer_format;
+	desc.info.guest_format = target_format.guest_format;
 	desc.info.type         = image_type;
 	desc.info.extent       = {width, height, depth};
 	desc.info.resources    = {levels, volume ? 1u : view.image_layers};

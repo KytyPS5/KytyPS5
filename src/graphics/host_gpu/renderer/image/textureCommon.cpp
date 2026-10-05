@@ -35,6 +35,9 @@ struct HostFormatInfo {
 
 HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
                                  Prospero::ChannelOrder order) {
+	if (guest_format == Prospero::BufferFormat::k10_11_11Float) {
+		return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
+	}
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k8_8_8_8UNorm:
@@ -131,7 +134,8 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
 		if (host_format.format != vk::Format::eUndefined && bytes != 0) {
 			const auto order_mapping =
 			    kRenderTargetColorMappings[static_cast<size_t>(order)][encoding.components - 1u];
-			return {host_format.format, bytes, host_format.host_to_storage.Then(order_mapping)};
+			return {host_format.format, bytes, host_format.host_to_storage.Then(order_mapping),
+			        encoding.buffer_format};
 		}
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n",

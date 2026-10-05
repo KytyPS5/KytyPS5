@@ -15,6 +15,8 @@
 
 namespace Libs::Graphics {
 
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
+
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
@@ -70,6 +72,14 @@ struct ImageInfo {
 	bool                         bgra16          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
 
+	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
+		if (bgra16) return ColorTransform::SwapBgra16;
+		switch (guest_format) {
+			case Prospero::BufferFormat::k10_11_11Float:
+				return ColorTransform::Reverse10_11_11;
+			default: return ColorTransform::None;
+		}
+	}
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
 		return metadata.kind != ImageMetadataKind::None;
@@ -91,7 +101,8 @@ struct ImageInfo {
 	}
 	[[nodiscard]] bool IsCompatible(const ImageInfo& other) const noexcept {
 		return pixel_format == other.pixel_format && samples == other.samples &&
-		       bytes_per_block == other.bytes_per_block;
+		       bytes_per_block == other.bytes_per_block &&
+		       GetColorTransform() == other.GetColorTransform();
 	}
 	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
 		if (container.resources.levels > container.mip_layout.size()) {

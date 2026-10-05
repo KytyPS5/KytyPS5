@@ -1,5 +1,65 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **5 октября 2026 года, 05:12 UTC** (packed-float native RED/GREEN
+and affected GPUAV neighbors PASS; installed game still567663de/ffc6bfdb):
+
+- Selective upstream5940e623 shared packed-float transfer correction: baseline
+  native RED unsupported RT layout7/type7/order2, exit321; unchanged independent
+  numeric/exact-byte linear/tiled upload/download oracle GREEN. Expanded sampled
+  component/constant and same-native-format incompatible alias probes PASS.
+- GPUAV final packed-float/packed-texture/BGRA16/image-transition/tiled-sampled-
+  format/tiler neighbors PASS; affected CTest5/5 PASS. Extra BGRA16 upload and
+  SNorm/1555 physical-pitch probes PASS05:11UTC, testEXE22ca9b32e663bf8182a1045159f75bb77c6c2d0d11ab2d9ba7e76816607bdd7d.
+  Logs `packed-float-final-neighbor-*-gpuav-20261005.log`,
+  `packed-float-final-bgra-neighbor-gpuav-20261005.log`,
+  `packed-float-colors-final-ctest-gpuav-20261005.log`; no validation errors.
+- One expanded fixture initially left a sampled image in TRANSFER_SRC_OPTIMAL;
+  corrected its layout transition without changing expected values. That aborted
+  run is fixture diagnosis, not production defect evidence. Full suite not green.
+- Local scheduler-lived scratch allocation, stream-wrap ordering and depth/HTile
+  changes preserved. Completed packed-float fix ready for separate commit/native
+  emulator build; actual dark-scene improvement still unverified.
+- Audio provenance correction: descriptor+0/+8 are list fields, not header pointer.
+  Read-only producer/callback analysis locates original header+0x10 configuration
+  copy; original source header/asset and responsible contract still need proof.
+  Production audio unchanged. Prior scaled run ended after Quality/C0000094;
+  main/title menu and game entry PENDING, issue108 unchanged, no push.
+
+Checkpoint **5 октября 2026 года, 04:45 UTC** (native scaled-texture retry ENDED;
+source567663de, installed EXEffc6bfdb25b397c34368579d9d0a81f669d96e9d71a6003ef01cb602893b384a):
+
+- Run042814 ended04:43:23UTC with C0000094 after Quality; shown533, completed
+  compute624. Medium207/211, Standard421 and Quality501 visually verified; Cross
+  inputs45s/5s/5s recorded in interactions.json. Actual main/title menu/game entry
+  remain PENDING. Scene still dark; no runtime color-correctness claim.
+- Expanded read-only capture records same integer fault04:43:11 and same inline
+  source descriptor/configuration. Decoder control rejects its config before
+  metadata; descriptor next-list link NULL, block byte count0. Audio cause still unproved;
+  no production audio modification or ignored exception. Do not repeat unchanged
+  launches merely to reproduce this known fault.
+- Runner/recorder finished and streams drained/disposed; CIM shows no emulator,
+  shader test, Ninja, MSBuild or clang-cl left. Cache/save/game files preserved.
+  Synthetic scaled/alpha GPUAV tests passed before runtime; full suite not green.
+- Next trace descriptor producer/ABI, require independent native audio RED before
+  any fix; assess remaining upstream packed-float color mechanism with its own
+  regression. Issue108 unchanged, linkPR497 only after menu/entry; no push.
+
+Checkpoint **5 октября 2026 года, 04:29 UTC** (ACTIVE native game PID41868;
+source567663de, installed EXEffc6bfdb25b397c34368579d9d0a81f669d96e9d71a6003ef01cb602893b384a):
+
+- Scaled texture correction committed separately567663de; native emulator build/
+  install PASS, exact build/install hashes match. GPUAV numeric RED/GREEN and
+  integer/packed neighbors/CTest4/4 verified before runtime. No push.
+- New1800s retry `yotei-integrated-20261005-042814-scaled-texture-color-and-audio-source-capture-noval`
+  started04:28:14UTC/PID41868, deadline04:58:14UTC; watchdog480s/28GiB, validation
+  off,480x270 guest diagnostic render, cache/save preserved. Task-hash-guarded
+  expanded read-only exception recorder active1750s; no guest code/register edits.
+- Actual game colors/main menu/game entry PENDING. Audio still unchanged/unproved
+  cause; prior run033835 ended after Quality. Correct faulting frame-chain return
+  is350d58 at saved RBP+8; discarded stale stack slot350bb1 is not direct caller.
+- No native build/GPU regression until game/recorder ends and own cleanup checked.
+  Issue108 unchanged under menu/game-entry milestones; linkPR497 once proven.
+
 Checkpoint **5 октября 2026 года, 04:25 UTC** (native scaled-texture regression
 proved; installed game still source2b8e95b0/EXE7d31c527):
 
@@ -15,7 +75,7 @@ proved; installed game still source2b8e95b0/EXE7d31c527):
 - Original run033835 ENDED04:03:15UTC/C0000094 after Quality; captures prove
   Medium/Standard/Quality, no main/title menu or game entry. Shown396/compute663,
   scene remains dark; no game color-correctness claim. Expanded source capture has
-  NULL header pointer plus configuration field/input/stack; audio root unproved.
+  NULL next-list link plus configuration field/input/stack; audio root unproved.
 - Next commit completed texture correction separately, build/install native target
   and record hash, bounded game color comparison; continue audio source/contract
   diagnosis. No active game/test/build now. Issue108 unchanged, no push; preserve
@@ -32,9 +92,8 @@ installed source2b8e95b0, EXE7d31c527 exact):
   text/fire; scene still dark, no game color-correctness claim from synthetic tests.
   Game Vulkan validation off, diagnostic480x270, cache/save preserved.
 - Expanded read-only recorder captures first/second chance integer fault04:03:03,
-  object/source descriptor/input/stack in `integer-source-fault/`. Header pointer
-  is null (no header capture possible); configuration is an independent descriptor
-  field. Same codec/divisor0; required responsible source/ABI reproduction pending.
+  object/source descriptor/input/stack in `integer-source-fault/`. Original header was not captured; descriptor+8 is a list link (corrected04:58).
+  Configuration is an independent descriptor field. Same codec/divisor0; required responsible source/ABI reproduction pending.
   Exceptions forwarded, no guest code/register mutation. Both runners complete,
   streams drained/disposed; current CIM shows no emulator/tests/native build left.
 - New scaled-texture test-only fixture/CMake/debt edits ready; native RED build

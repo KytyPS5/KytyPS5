@@ -530,11 +530,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (!graphics.image_view_min_lod_enabled) {
 		LOGF("image view minLod is unavailable; PS5 texture min-LOD will be approximated.\n");
 	}
+	// Note: no shader fallback is implemented yet for either of these. Shaders that
+	// emit 64-bit storage-buffer atomics require shaderBufferInt64Atomics at pipeline
+	// creation (VUID RuntimeSpirv-None-06278), and shaders exporting cull distance
+	// declare CapabilityCullDistance; both will fail on devices without the feature.
+	// Dropping cull-distance outputs and emulating 64-bit buffer atomics remain
+	// follow-up work.
 	if (!graphics.shader_buffer_int64_atomics_enabled) {
-		LOGF("shaderBufferInt64Atomics is unavailable; 64-bit buffer atomics will use a fallback.\n");
+		LOGF("shaderBufferInt64Atomics is unavailable; shaders using 64-bit buffer atomics "
+		     "may fail pipeline creation.\n");
 	}
 	if (!graphics.shader_cull_distance_enabled) {
-		LOGF("shaderCullDistance is unavailable; cull-distance outputs will be dropped.\n");
+		LOGF("shaderCullDistance is unavailable; shaders exporting cull distance may fail "
+		     "pipeline creation.\n");
 	}
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
@@ -1069,6 +1077,13 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+#if defined(__APPLE__)
+		// VK_EXT_image_view_min_lod is required on other platforms but optional here;
+		// enable it when a (newer) MoltenVK advertises it so the feature gets used.
+		if (HasExtension(available_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+		}
+#endif
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);

@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -360,9 +362,17 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
+	// Without VK_EXT_image_view_min_lod there is no fractional clamp. Approximate the
+	// integer part of the U4.8 min-LOD (relative to base_level) by trimming whole mip
+	// levels; any fractional remainder cannot be expressed and is dropped.
+	if (normalized.min_lod != 0 && !m_graphics.image_view_min_lod_enabled &&
+	    normalized.level_count > 1) {
+		const uint32_t whole = std::min(normalized.min_lod >> 8u, normalized.level_count - 1u);
+		normalized.base_level += whole;
+		normalized.level_count -= whole;
+		normalized.min_lod = 0;
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
-	// MoltenVK has no VK_EXT_image_view_min_lod; skip the chain when the device did not
-	// enable it (PS5 min-LOD is then approximated by the base level).
 	if (normalized.min_lod != 0 && m_graphics.image_view_min_lod_enabled) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;

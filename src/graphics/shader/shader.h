@@ -89,6 +89,10 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	// SPI_SHADER_PGM_RSRC1_GS.GS_VGPR_COMP_CNT / SPI_SHADER_PGM_RSRC2_GS.ES_VGPR_COMP_CNT: the
+	// index of the last VGPR the SPI pre-loads for each half of the merged ES/GS wave.
+	uint32_t gs_vgpr_component_count = 0;
+	uint32_t es_vgpr_component_count = 0;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {

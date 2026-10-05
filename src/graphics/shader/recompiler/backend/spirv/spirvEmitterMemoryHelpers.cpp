@@ -190,6 +190,14 @@ void EnsureLdsStorage(EmitterState& state) {
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
+uint32_t EmitLdsQwordPointer(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypeU64ElementPointer(state, spv::StorageClassWorkgroup), pointer,
+	                          state.lds_u64_variable, ConstantU32(state, 0), index);
+	return pointer;
+}
+
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          BufferDefinition& buffer) {

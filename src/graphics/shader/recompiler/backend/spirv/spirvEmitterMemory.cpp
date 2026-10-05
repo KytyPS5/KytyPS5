@@ -1562,6 +1562,51 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.Define(inst, value);
 }
 
+// The 64-bit LDS atomics of the RDNA 2 ISA (DS_MAX_RTN_U64, DS_CMPST_RTN_B64): one indivisible
+// eight-byte read-modify-write that returns the pre-op value. Wave size never enters them - the
+// operand is an LDS byte address, not a lane index - so wave32 and wave64 emit the same thing.
+uint32_t EmitSharedAtomic64Returning(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&       state = ctx.state;
+	const auto& mem   = ctx.Memory(inst);
+	EXIT_IF(mem.kind != IR::ResourceKind::Lds);
+	const bool compare = inst.GetOpcode() == IR::ValueOpcode::SharedAtomicCmpSwap64;
+	return EmitValueOrDefaultIfCondition(
+	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
+		    const auto resource = PrepareMemoryResourceAccess(state, mem);
+		    const auto index    = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                                 DwordIndex(ctx, inst, mem), ConstantU32(state, 1));
+		    const auto qwords   = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                                 resource.length, ConstantU32(state, 1));
+		    const auto in_bounds =
+		        Binary(state, spv::OpULessThan, TypeBool(state), index, qwords);
+		    return EmitValueOrDefaultIfCondition(
+		        state, in_bounds, TypeU64(state), ConstantU64(state, 0), [&]() {
+			        const auto scalar  = TypeU64(state);
+			        const auto pointer = EmitLdsQwordPointer(state, index);
+			        const auto scope   = ConstantU32(state, spv::ScopeWorkgroup);
+			        const auto old     = state.builder.AllocateId();
+			        if (compare) {
+				        const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+				        const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+				        // An unequal compare-exchange performs no store, so it carries no release.
+				        state.builder.AddFunction(
+				            spv::OpAtomicCompareExchange, scalar, old, pointer, scope,
+				            ConstantU32(state, AtomicSemantics(mem)),
+				            ConstantU32(state, spv::MemorySemanticsMaskNone), desired, comparator);
+			        } else {
+				        const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+				        state.builder.AddFunction(spv::OpAtomicUMax, scalar, old, pointer, scope,
+				                                  ConstantU32(state, AtomicSemantics(mem)), value);
+			        }
+			        state.builder.AddFunction(
+			            spv::OpMemoryBarrier, scope,
+			            ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+			                                   spv::MemorySemanticsWorkgroupMemoryMask));
+			        return old;
+		        });
+	    });
+}
+
 void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op                = inst.GetOpcode();
 	const auto& mem               = ctx.Memory(inst);

@@ -36,7 +36,7 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x05u, Opcode::V_SUBREV_F32},
     {0x08u, Opcode::V_MUL_F32, Vop2SdwaProfile::Float32},
     {0x09u, Opcode::V_MUL_I32_I24, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x0bu, Opcode::V_MUL_U32_U24, Vop2SdwaProfile::IntegerFullDestination},
+    {0x0bu, Opcode::V_MUL_U32_U24, Vop2SdwaProfile::IntegerPartialDestination},
     {0x0fu, Opcode::V_MIN_F32},
     {0x10u, Opcode::V_MAX_F32},
     {0x11u, Opcode::V_MIN_I32, Vop2SdwaProfile::IntegerFullDestination},
@@ -260,7 +260,8 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0x88u, Opcode::V_CMP_CLASS_F32},      {0x89u, Opcode::V_CMP_LT_I16},
     {0x8au, Opcode::V_CMP_EQ_I16},         {0x8bu, Opcode::V_CMP_LE_I16},
     {0x8cu, Opcode::V_CMP_GT_I16},         {0x8du, Opcode::V_CMP_NE_I16},
-    {0x8eu, Opcode::V_CMP_GE_I16},         {0x91u, Opcode::V_CMPX_LT_I32},
+    {0x8eu, Opcode::V_CMP_GE_I16},         {0x8fu, Opcode::V_CMP_CLASS_F16, false},
+    {0x91u, Opcode::V_CMPX_LT_I32},
     {0x92u, Opcode::V_CMPX_EQ_I32},        {0x93u, Opcode::V_CMPX_LE_I32},
     {0x94u, Opcode::V_CMPX_GT_I32},        {0x95u, Opcode::V_CMPX_NE_I32},
     {0x96u, Opcode::V_CMPX_GE_I32},        {0x98u, Opcode::V_CMPX_CLASS_F32},
@@ -593,8 +594,8 @@ struct Vop1SdwaRule {
 };
 
 constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
-    {Opcode::V_MOV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
-     SdwaSelWords() | SdwaSelFull(), false},
+    {Opcode::V_MOV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(),
+     SdwaSelBytes() | SdwaSelWords(), SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_CVT_F32_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_UBYTE0, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
@@ -974,8 +975,9 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMPX_NEQ_F16:
 		case Opcode::V_CMPX_NLT_F16:
 		case Opcode::V_CMP_CLASS_F32:
-		case Opcode::V_CMPX_CLASS_F16:
-		case Opcode::V_CMPX_CLASS_F32: return true;
+		case Opcode::V_CMPX_CLASS_F32:
+		case Opcode::V_CMP_CLASS_F16:
+		case Opcode::V_CMPX_CLASS_F16: return true;
 		default: return false;
 	}
 }
@@ -1302,7 +1304,9 @@ bool IsVopc16BitCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMPX_GE_F16:
 		case Opcode::V_CMPX_NGT_F16:
 		case Opcode::V_CMPX_NEQ_F16:
-		case Opcode::V_CMPX_NLT_F16: return true;
+		case Opcode::V_CMPX_NLT_F16:
+		case Opcode::V_CMP_CLASS_F16:
+		case Opcode::V_CMPX_CLASS_F16: return true;
 		default: return false;
 	}
 }
@@ -1311,7 +1315,8 @@ VopcSdwaSource VopcSdwaSourceClass(Opcode opcode, bool second) {
 	if (IsVopc64BitCompareOpcode(opcode)) {
 		return VopcSdwaSource::Unavailable;
 	}
-	if (second && (opcode == Opcode::V_CMP_CLASS_F32 || opcode == Opcode::V_CMPX_CLASS_F32)) {
+	if (second && (opcode == Opcode::V_CMP_CLASS_F32 || opcode == Opcode::V_CMPX_CLASS_F32 ||
+	               opcode == Opcode::V_CMP_CLASS_F16 || opcode == Opcode::V_CMPX_CLASS_F16)) {
 		return VopcSdwaSource::Integer32;
 	}
 	const bool half = IsVopc16BitCompareOpcode(opcode);

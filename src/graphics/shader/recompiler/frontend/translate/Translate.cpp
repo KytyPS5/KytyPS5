@@ -960,6 +960,11 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
+			case Decoder::Opcode::DS_CMPST_RTN_B64:
+				include_vector(inst.src1, inst.data_dwords);
+				include_vector(inst.src2, inst.data_dwords);
+				break;
+			case Decoder::Opcode::DS_MAX_RTN_U64:
 			case Decoder::Opcode::DS_ADD_U64:
 			case Decoder::Opcode::DS_OR_B64:
 			case Decoder::Opcode::DS_WRITE_B64:
@@ -1296,6 +1301,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
 				                      entry_ir.ShiftLeftLogical(third, u32(2)));
+				// GS_VGPR_COMP_CNT names the last GS VGPR the SPI pre-loads: VGPR0 and VGPR1 carry the
+				// ES vertex offsets, VGPR2 the primitive ID and VGPR3 the GS invocation ID. Supply the
+				// ones this stage was told to expect; the lowering runs one invocation per primitive.
+				if (mesh.gs_vgpr_component_count >= 2u) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
+					                      entry_ir.IAdd(primitive_chunk, local));
+				}
+				if (mesh.gs_vgpr_component_count >= 3u) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), u32(0));
+				}
 				const auto index_bytes  = draw(3);
 				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
 				const auto index_low    = draw(4);
@@ -1315,6 +1330,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				    IR::ValueOpcode::BitFieldUExtract,
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
 				     entry_ir.IMul(index_bytes, u32(8))}));
+				// The ES half of the merged wave always starts at VGPR5 whatever GS_VGPR_COMP_CNT is:
+				// VGPR5 is the vertex index and VGPR8 the instance index. Both are written even when
+				// ES_VGPR_COMP_CNT says the SPI would stop short, so a stage that reads further than
+				// it declared still sees the right values.
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(
@@ -1365,9 +1384,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg + 1u), builtin(kind, 1));
 				}
 			};
-			// No sample-rate barycentric builtin exists; BaryCoordKHR already interpolates at the
-			// sample when sample shading is on, which is exactly when PERSP_SAMPLE is enabled.
-			barycentric_pair(ps->ps_perspective_sample_vgpr, IR::StageInputKind::BaryCoordSmooth);
 			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
 			barycentric_pair(ps->ps_perspective_sample_vgpr,
 			                 IR::StageInputKind::BaryCoordSmoothSample);

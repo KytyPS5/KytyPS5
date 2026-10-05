@@ -178,6 +178,10 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 	return TypePointer(state, storage_class, TypeU32(state));
 }
 
+uint32_t TypeU64ElementPointer(EmitterState& state, spv::StorageClass storage_class) {
+	return TypePointer(state, storage_class, TypeU64(state));
+}
+
 namespace {
 
 uint32_t PushConstantArrayType(EmitterState& state) {
@@ -216,12 +220,20 @@ void DefineDescriptors(EmitterState& state) {
 	auto& bindings     = state.program.bindings;
 	auto& counts       = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
+	// MaxBuffers caps what a shader TRACKS; an expanded table materializes up to MaxDenseBuffers.
 	for (uint32_t index = 0; index < info.buffers.size(); ++index) {
-		info.buffers[index].descriptor_index = (info.live_buffers & (uint64_t{1} << index)) != 0
-		                                          ? buffer_count++ : UINT32_MAX;
+		info.buffers[index].descriptor_index =
+		    info.live_buffers.test(index) ? buffer_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
+	std::array<bool, IR::ImageBindingCount>                     indexed {};
 	for (auto& image: info.images) {
+		// A bindless image is sampled from the global heap arrays, never from a native binding.
+		if (image.bindless) {
+			image.descriptor_index = UINT32_MAX;
+			bindings.uses_bindless = true;
+			continue;
+		}
 		const auto kind = IR::DescriptorBindingForImage(image);
 		if (!kind.has_value() || image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
@@ -231,24 +243,54 @@ void DefineDescriptors(EmitterState& state) {
 		image.descriptor_index = count;
 		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
 		count += image.mip_count;
+		indexed[IR::ImageBindingIndex(*kind)] |=
+		    image.indirect_root != IR::ImageResource::NoIndirectImage;
 	}
+	// A binding holding an indirect table's candidates has a fixed length, so neither the module
+	// nor the layout moves with the heap; the host binds its first element past the images.
+	for (uint32_t group = 0; group < IR::ImageBindingCount; group++) {
+		auto& count = counts[IR::FirstImageBinding + group];
+		if (indexed[group]) {
+			if (count > IR::IndexedImageBindingElements) {
+				EXIT("an indexed image binding holds more images than it can be padded to");
+			}
+			count = IR::IndexedImageBindingElements;
+		}
+	}
+	// An uncompared gather keeps a record's numeric class, as a read does.
+	bindings.bindless_integer =
+	    bindings.uses_bindless &&
+	    std::ranges::any_of(state.program.blocks, [&](const IR::Block* block) {
+		    return std::ranges::any_of(*block, [&](const IR::Inst& inst) {
+			    if (inst.GetOpcode() != IR::ValueOpcode::ImageRead &&
+			        inst.GetOpcode() != IR::ValueOpcode::ImageGatherRaw) {
+				    return false;
+			    }
+			    const auto& memory =
+			        state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+			    return info.images.at(memory.resource).bindless &&
+			           (inst.GetOpcode() == IR::ValueOpcode::ImageRead ||
+			            (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) == 0u);
+		    });
+	    });
 	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
 	counts[static_cast<size_t>(Kind::Gds)]      = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
+	counts[static_cast<size_t>(Kind::FaultBuffer)]  = info.uses_dma;
+	// A bindless image samples the heap through the flattened SRT's arena records.
+	counts[static_cast<size_t>(Kind::FlattenedSrt)] =
+	    info.uses_flattened_srt || bindings.uses_bindless;
+	// The dispatch extent is converted on the GPU before the dispatch, so no shader reads it and
+	// dispatch_thread_dword stays NoStart.
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
-	if (info.uses_dispatch_threads) {
-		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
-		bindings.memory_offset_dword += 3u;
-	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	    state.requirements.dispatch_thread_limit) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);

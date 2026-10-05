@@ -38140,6 +38140,45 @@ TestCase DsReadWriteVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// RE9's strand k-buffer: the 64-bit max takes its data from data0, not from the address
+// register, and returns the value it replaced.
+TestCase DsMaxRtnU64UsesDataOperand() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 8);
+  AppendVMovLiteral(&code, 2, 0x00000010u);
+  AppendVMovLiteral(&code, 3, 0x00000005u);
+  code.push_back(EncodeDs0(0x4d, 0));
+  code.push_back(EncodeDs1(0, 2, 1));
+  AppendVMovLiteral(&code, 4, 0x00000001u);
+  AppendVMovLiteral(&code, 5, 0x00000007u);
+  code.push_back(EncodeDs0(0x68, 0));
+  code.push_back(EncodeDs1(6, 4, 1));
+  code.push_back(EncodeDs0(0x76, 0));
+  code.push_back(EncodeDs1(8, 0, 1));
+  AppendVMovLiteral(&code, 10, 0xffffffffu);
+  AppendVMovLiteral(&code, 11, 0x00000004u);
+  code.push_back(EncodeDs0(0x68, 0));
+  code.push_back(EncodeDs1(12, 10, 1));
+  code.push_back(EncodeDs0(0x76, 0));
+  code.push_back(EncodeDs1(14, 0, 1));
+
+  const u32 results[] = {6, 7, 8, 9, 12, 13, 14, 15};
+  for (u32 i = 0; i < static_cast<u32>(std::size(results)); i++) {
+    AppendStoreVgpr(&code, results[i], i);
+  }
+  AppendEnd(&code);
+
+  return {"DsMaxRtnU64UsesDataOperand",
+          code,
+          std::vector<u32>(8, 0),
+          {0x00000010u, 0x00000005u, 0x00000001u, 0x00000007u, 0x00000001u, 0x00000007u,
+           0x00000001u, 0x00000007u},
+          {O::V_MOV_B32, O::DS_WRITE_B64, O::DS_MAX_RTN_U64, O::DS_READ_B64,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 // SH2's Nanite raster: s_orn2_saveexec re-enables every lane inside an execz region and
 // v_readlane reads one of them.
 TestCase WholeWaveReadlaneCase(u32 groups) {
@@ -44694,6 +44733,7 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsReadWriteVariants);
+  AddCase(DsMaxRtnU64UsesDataOperand);
   AddCase(DsWriteB16D16HiCapturedUsesHighHalf);
   AddCase(DsWriteB8D16HiWritesByteTwo);
   AddCase(DsReadU16D16CapturedPreservesHighHalf);

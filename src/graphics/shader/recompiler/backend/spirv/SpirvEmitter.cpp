@@ -516,6 +516,16 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
 				}
+				if (shared_access == IR::SharedAccess::Atomic &&
+				    inst.GetType() == IR::Type::U64) {
+					// The aliased 64-bit view of LDS is a Workgroup block, and only a
+					// compute shader keeps LDS in the Workgroup storage class.
+					if (program.stage != ShaderType::Compute ||
+					    kind != IR::ResourceKind::Lds) {
+						refuse(inst, "64-bit shared atomic is only supported on compute LDS");
+					}
+					requirements.shared_int64_atomics = true;
+				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
 					requirements.subgroup_ballot              = true;

@@ -116,6 +116,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x3fu, Opcode::DS_ORDERED_COUNT, 1, 32},
     {0x40u, Opcode::DS_ADD_U64, 2, 32},         {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
+    {0x68u, Opcode::DS_MAX_RTN_U64, 2, 32},   {0x70u, Opcode::DS_CMPST_RTN_B64, 2, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
     {0xa0u, Opcode::DS_WRITE_B8_D16_HI, 1, 8},
@@ -192,6 +193,8 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_MIN_RTN_U32:
 		case Opcode::DS_MAX_U32:
 		case Opcode::DS_MAX_RTN_U32:
+		case Opcode::DS_MAX_RTN_U64:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:
@@ -211,6 +214,7 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
 		case Opcode::DS_WRITE2ST64_B64:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_MSKOR_B32: return 3u;
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
@@ -468,6 +472,11 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	     inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
 	     inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
 		SetUnsupported(inst, Family::DS, opcode, "DS lane operation is available only for LDS");
+	}
+	if (inst.gds && (inst.opcode == Opcode::DS_MAX_RTN_U64 ||
+	                 inst.opcode == Opcode::DS_CMPST_RTN_B64)) {
+		// A 64-bit atomic needs an eight-byte typed view of the storage, and only LDS has one.
+		SetUnsupported(inst, Family::DS, opcode, "DS 64-bit atomic is available only for LDS");
 	}
 	if (inst.opcode == Opcode::DS_WRITE_ADDTID_B32 && data1 != 0u) {
 		SetUnsupported(inst, Family::DS, opcode,

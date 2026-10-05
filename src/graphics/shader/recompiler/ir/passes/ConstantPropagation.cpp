@@ -775,6 +775,68 @@ private:
 
 } // namespace
 
+void FoldVertexBranchSelects(Program& program) {
+	// Native vertex control flow is per invocation (no emulated workgroup halves).
+	// On a uniquely reached conditional edge, the branch predicate is already known.
+	// Folding repeated EXEC selects can make their inactive WriteLane chains dead.
+	// Workgroup stages must retain the inactive values used by wave-wide execution.
+	if (program.stage != ShaderType::Vertex || program.dispatcher_fallback ||
+	    program.block_info.size() != program.blocks.size())
+		return;
+	// Do not infer invocation predicates when live operations exchange wave data.
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::Ballot:
+				case ValueOpcode::ReadLane:
+				case ValueOpcode::ReadFirstLane:
+				case ValueOpcode::LaneId:
+				case ValueOpcode::DppMoveU32:
+				case ValueOpcode::DppUpdateU32:
+				case ValueOpcode::Permlane16U32:
+				case ValueOpcode::SwizzleU32:
+				case ValueOpcode::PermuteU32:
+				case ValueOpcode::BpermuteU32:
+				case ValueOpcode::StoreCompletion: return;
+				default: break;
+			}
+			if (SharedAccessOf(inst.GetOpcode()) != SharedAccess::None) return;
+		}
+	}
+	for (size_t index = 0; index < program.blocks.size(); ++index) {
+		auto* block = program.blocks[index];
+		if (block->ImmPredecessors().size() != 1u) continue;
+		const auto predecessor = std::ranges::find(program.blocks, block->ImmPredecessors()[0]);
+		if (predecessor == program.blocks.end()) continue;
+		const auto& source = program.block_info[predecessor - program.blocks.begin()];
+		const auto& term   = source.terminator;
+		const auto  target = program.block_info[index].id;
+		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    (term.true_block == target) == (term.false_block == target))
+			continue;
+		auto                      predicate = source.condition.Resolve();
+		bool                      positive  = term.true_block == target;
+		std::unordered_set<Inst*> seen;
+		while (auto* inst = predicate.TryInstruction()) {
+			if (!seen.insert(inst).second) break;
+			if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
+				positive = !positive;
+			} else if (inst->GetOpcode() != ValueOpcode::ConditionRef) {
+				break;
+			}
+			predicate = inst->Arg(0).Resolve();
+		}
+		if (predicate.IsEmpty()) continue;
+		for (auto& inst: *block) {
+			if ((inst.GetOpcode() == ValueOpcode::SelectU32 ||
+			     inst.GetOpcode() == ValueOpcode::SelectF32) &&
+			    Arg(inst, 0) == predicate) {
+				Replace(inst, Arg(inst, positive ? 1 : 2));
+			}
+		}
+	}
+}
+
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	std::unordered_set<Inst*> lowered_ancillary;
 	LaneMaskProjection mask_projection(lowered_ancillary);

@@ -10436,6 +10436,9 @@ public:
         FillCase{0x40404040u, {0, 0x3c000000u}, false, false, true},
         FillCase{.fill = 0x20202020u, .texel = {0x7bff7bffu},
                  .layout = Prospero::ChannelLayout::k16, .clear_word = 0x7bff7bffu},
+        // PS5 DCC register clears fill the keys with 0x10 (GTA V's R16_FLOAT particle depth).
+        FillCase{.fill = 0x10101010u, .texel = {0x7bff7bffu},
+                 .layout = Prospero::ChannelLayout::k16, .clear_word = 0x7bff7bffu},
         FillCase{.fill = 0x20202020u, .texel = {0xbc003c00u},
                  .layout = Prospero::ChannelLayout::k16_16, .clear_word = 0xbc003c00u},
         FillCase{.fill = 0x20202020u, .texel = {0x80008000u},

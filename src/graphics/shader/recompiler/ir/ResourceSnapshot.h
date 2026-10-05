@@ -26,7 +26,11 @@ struct UniformFill {
 	std::array<uint32_t, 3> group_stride {};
 	uint32_t                 words        = 0;
 	uint32_t                 value        = 0;
+	// value names the whole fill only when the stored words agree.
+	std::array<uint32_t, 4> word_values {};
+	bool                    words_agree = true;
 	// Elements each invocation writes; group_stride[0] == local_size_x * stores.
+	uint32_t                 stores           = 1;
 	uint32_t                 bounded_elements = 0;
 
 	static constexpr uint32_t MaxStores = 64;

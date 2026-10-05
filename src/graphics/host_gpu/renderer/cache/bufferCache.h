@@ -28,11 +28,11 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
-	static constexpr uint32_t CACHING_PAGEBITS  = 14;
-	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
-	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	static constexpr uint32_t CACHING_PAGEBITS = 14;
+	static constexpr uint64_t CACHING_PAGESIZE = uint64_t {1} << CACHING_PAGEBITS;
+	static constexpr uint64_t CACHING_NUMPAGES =
+	    (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	static constexpr uint64_t BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 	// Device addresses stay below bit 63, which tags pages whose BDA stores the host owns.
 	static constexpr uint64_t BDA_STORE_TRACKED_BIT = uint64_t {1} << 63;
 
@@ -75,6 +75,9 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Repeats a pattern of `words` dwords over the range; size is a multiple of the pattern.
+	void FillBufferPattern(uint64_t vaddr, uint64_t size, const uint32_t* pattern, uint32_t words);
+	void WriteMemory(uint64_t vaddr, const void* data, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -118,7 +121,6 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
-	void TouchBuffer(const Buffer& buffer);
 	void ReadMemoryAttempt(uint64_t vaddr, uint64_t size, bool is_write, uint32_t attempt);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -126,11 +128,9 @@ private:
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
 	template <bool insert>
-	void ChangeRegister(BufferId id);
-	void DeleteBuffer(BufferId id);
-	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
-	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void                     ChangeRegister(BufferId id);
+	void                     DeleteBuffer(BufferId id);
+	void                     SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -141,12 +141,6 @@ private:
 	void               MakePageTableResident(uint64_t table_offset, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 
-	GraphicContext&                                   m_graphics;
-	CommandScheduler&                                 m_scheduler;
-	FaultManager                                      m_fault_manager;
-	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
-	Common::SlotVector<Buffer>                        m_slot_buffers;
 	// The tick of the recording that last wrote a range, kept until that tick completes.
 	struct GpuWriteMark {
 		uint64_t end  = 0;
@@ -159,25 +153,21 @@ private:
 	// Downloads without submitting the recording in progress; false leaves all state unchanged.
 	[[nodiscard]] bool TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
+	GraphicContext&                                    m_graphics;
+	CommandScheduler&                                  m_scheduler;
+	FaultManager                                       m_fault_manager;
+	Buffer                                             m_gds_buffer;
+	Buffer                                             m_bda_pagetable_buffer;
 	uint64_t                                           m_bda_table_chunk        = 0;
 	uint32_t                                           m_bda_table_memory_types = 0;
 	std::vector<VmaAllocation>                         m_bda_table_chunks;
 	vk::Fence                                          m_bda_table_fence = nullptr;
+	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
-	MemoryTracker                                     m_memory_tracker;
-	StreamBuffer                                      m_staging_buffer;
-	StreamBuffer                                      m_stream_buffer;
-	StreamBuffer                                      m_download_buffer;
-	StreamBuffer                                      m_device_buffer;
-	TextureCache&                                     m_texture_cache;
-	uint64_t                                          m_total_used_memory  = 0;
-	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
-	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
-	uint64_t m_gc_tick            = 0;
 	std::array<RangeSet, 8> m_checked_color_metadata;
 	RangeSet                m_bda_tracked_ranges;
 	// Tracked since the last mark, so stores that ran before tracking are owned without a rerun.
@@ -187,6 +177,16 @@ private:
 	std::map<uint64_t, GpuWriteMark>          m_gpu_write_marks;
 	// A BDA store can reach any page, including ones no mark names yet.
 	uint64_t      m_bda_store_tick = 0;
+	MemoryTracker m_memory_tracker;
+	StreamBuffer  m_staging_buffer;
+	StreamBuffer  m_stream_buffer;
+	StreamBuffer  m_download_buffer;
+	StreamBuffer  m_device_buffer;
+	TextureCache& m_texture_cache;
+	uint64_t      m_total_used_memory  = 0;
+	uint64_t      m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+	uint64_t      m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	uint64_t      m_gc_tick            = 0;
 };
 
 } // namespace Libs::Graphics

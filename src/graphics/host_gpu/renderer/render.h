@@ -198,6 +198,12 @@ public:
 	bool                           ResolveStageImages(PreparedBindings& bindings);
 	void                           AcquireStageImageViews(PreparedBindings& bindings);
 	bool                           ResolveColorTargets(std::span<RenderColorInfo> colors);
+	[[nodiscard]] const char*      ScalarReadConflict(std::span<PreparedBindings* const> bindings);
+	// False, with nothing bound, when the draw or dispatch must be dropped.
+	[[nodiscard]] bool CommitBindings(CommandBuffer&                     buffer,
+	                                  vk::PipelineBindPoint              pipeline_bind_point,
+	                                  const PipelineCache::Pipeline&     pipeline,
+	                                  std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
@@ -248,6 +254,10 @@ private:
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
+	[[nodiscard]] bool        TryConsumeComputeRecordFill(const ShaderComputeInputInfo& input,
+	                                                      CommandBuffer& command, uint32_t group_x,
+	                                                      uint32_t group_y, uint32_t group_z,
+	                                                      uint32_t mode);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -270,6 +280,12 @@ private:
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);
+// A constant store into every record of a buffer whose stride is wider than the element.
+[[nodiscard]] bool ResolveComputeRecordFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                            uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                            ShaderBufferResource&    descriptor,
+                                            std::array<uint32_t, 4>& pattern,
+                                            uint32_t& pattern_words, uint64_t& size);
 
 } // namespace Libs::Graphics
 

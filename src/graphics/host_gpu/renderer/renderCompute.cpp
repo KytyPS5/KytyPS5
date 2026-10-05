@@ -121,7 +121,7 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
                               uint64_t& resolved_size) {
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
-	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer || !fill.words_agree) {
 		return false;
 	}
 	const auto element_size = fill.words * sizeof(uint32_t);
@@ -165,6 +165,71 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
+	return true;
+}
+
+bool ResolveComputeRecordFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                              uint32_t group_y, uint32_t group_z, uint32_t mode,
+                              ShaderBufferResource&    resolved_descriptor,
+                              std::array<uint32_t, 4>& pattern, uint32_t& pattern_words,
+                              uint64_t& resolved_size) {
+	const auto& resources = *input.stage.resources;
+	const auto& fill      = resources.uniform_fill;
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer || fill.stores != 1 ||
+	    mode != 0x41u || input.dispatch_thread_dimensions) {
+		return false;
+	}
+	const auto descriptor =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
+	uint32_t words = 0;
+	switch (descriptor.Format()) {
+		case Prospero::BufferFormat::k32UInt: words = 1; break;
+		case Prospero::BufferFormat::k32_32UInt: words = 2; break;
+		case Prospero::BufferFormat::k32_32_32UInt: words = 3; break;
+		case Prospero::BufferFormat::k32_32_32_32UInt: words = 4; break;
+		default: return false;
+	}
+	const uint64_t element = words * sizeof(uint32_t);
+	const uint64_t stride  = descriptor.Stride();
+	// Console clear helpers store one element per record and mean the whole record cleared.
+	if (words > fill.words || stride <= element || stride % element != 0 ||
+	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    descriptor.Base48() == 0) {
+		return false;
+	}
+	const uint64_t threads = input.threads_num[0];
+	const uint64_t records = descriptor.NumRecords();
+	if (threads == 0 || threads != fill.group_stride[0] || input.threads_num[1] != 1 ||
+	    input.threads_num[2] != 1 || group_y != 1 || group_z != 1 || records == 0 ||
+	    group_x != (records + threads - 1) / threads) {
+		return false;
+	}
+	const uint64_t size = records * stride;
+	if (size > 0x10000000u ||
+	    !FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), size}, fill.resource)) {
+		return false;
+	}
+	resolved_descriptor = descriptor;
+	pattern             = fill.word_values;
+	pattern_words       = words;
+	resolved_size       = size;
+	return true;
+}
+
+bool RenderExecutor::TryConsumeComputeRecordFill(const ShaderComputeInputInfo& input,
+                                                 CommandBuffer& command, uint32_t group_x,
+                                                 uint32_t group_y, uint32_t group_z,
+                                                 uint32_t mode) {
+	ShaderBufferResource    descriptor;
+	std::array<uint32_t, 4> pattern {};
+	uint32_t                words = 0;
+	uint64_t                size  = 0;
+	if (!ResolveComputeRecordFill(input, group_x, group_y, group_z, mode, descriptor, pattern,
+	                              words, size)) {
+		return false;
+	}
+	command.GetContext().GetBufferCache().FillBufferPattern(descriptor.Base48(), size,
+	                                                        pattern.data(), words);
 	return true;
 }
 
@@ -386,8 +451,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
-	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
+	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y, thread_group_z,
+	                           mode) ||
+	     TryConsumeComputeRecordFill(input_info, buffer, thread_group_x, thread_group_y,
+	                                 thread_group_z, mode) ||
 		ResetBindings();
 		return;
 	}

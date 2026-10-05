@@ -152,8 +152,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 		m_bda_tracked_ranges.ForEachInRange(
 		    buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
 			    for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
@@ -162,6 +160,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 			    }
 		    });
 		MakePageTableResident(table_offset, addresses.size() * sizeof(vk::DeviceAddress));
+		WriteDataBuffer(m_bda_pagetable_buffer, table_offset, addresses.data(),
+		                addresses.size() * sizeof(vk::DeviceAddress));
 		// Queue after the registration, so a drain racing this sees the buffer it must fill.
 		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
@@ -342,8 +342,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
 	// The copy consuming the reservation is recorded; a synchronous wait must not carry it on.
 	hold.reset();
 	uint64_t write_begin = UINT64_MAX;
@@ -352,6 +350,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		write_begin = std::min(write_begin, copy.srcOffset);
 		write_end   = std::max(write_end, copy.srcOffset + copy.size);
 	}
+	auto publish = [this, mapped, offset, total_size, buffer_address, copies = std::move(copies),
+	                owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
@@ -731,28 +731,20 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
-		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 		                       vk::AccessFlagBits::eTransferRead |
 		                       vk::AccessFlagBits::eTransferWrite;
-		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
 		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.buffer              = buffer.Handle();
 		before.offset              = 0;
 		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
 		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
 		                  copies.data());
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -874,6 +866,50 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+void BufferCache::FillBufferPattern(uint64_t vaddr, uint64_t size, const uint32_t* pattern,
+                                    uint32_t words) {
+	const uint64_t pattern_size = uint64_t {words} * sizeof(uint32_t);
+	if (pattern == nullptr || words == 0 || words > 4 || vaddr == 0 || (vaddr & 3u) != 0 ||
+	    size == 0 || size % pattern_size != 0 || size > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: invalid pattern fill\n");
+	}
+	if (std::all_of(pattern, pattern + words, [&](uint32_t word) { return word == pattern[0]; })) {
+		FillBuffer(vaddr, size, pattern[0], false);
+		return;
+	}
+	std::vector<uint32_t> data(size / sizeof(uint32_t));
+	for (size_t i = 0; i < data.size(); i++) {
+		data[i] = pattern[i % words];
+	}
+	WriteMemory(vaddr, data.data(), size);
+}
+
+void BufferCache::WriteMemory(uint64_t vaddr, const void* data, uint64_t size) {
+	if (data == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: invalid memory write\n");
+	}
+	if (!GuestRange {vaddr, size}.Valid() || !IsRegionGpuModified(vaddr, size)) {
+		// Access the guest mapping so write faults invalidate cached buffers and images.
+		if (((vaddr | size) & 3u) != 0) {
+			std::memcpy(reinterpret_cast<void*>(vaddr), data, size);
+			return;
+		}
+		// Completion labels can be reused immediately; memcpy may write a destination twice.
+		auto*       output = reinterpret_cast<volatile uint32_t*>(vaddr);
+		const auto* input  = static_cast<const uint8_t*>(data);
+		for (uint64_t offset = 0; offset < size; offset += sizeof(uint32_t)) {
+			uint32_t word = 0;
+			std::memcpy(&word, input + offset, sizeof(word));
+			*output++ = word;
+		}
+		return;
+	}
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	(void)dst_offset;
+	WriteDataBuffer(*dst, vaddr, data, size);
+}
+
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	const bool dst_memory = !dst_gds;
@@ -987,7 +1023,8 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
+			EXIT_NOT_IMPLEMENTED(
+			    !DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
@@ -1077,6 +1114,8 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 			const vk::DeviceAddress entry =
 			    (buffer.BufferDeviceAddress() + (page - buffer.CpuAddress())) |
 			    BDA_STORE_TRACKED_BIT;
+			WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(page) * sizeof(vk::DeviceAddress),
+			                &entry, sizeof(entry));
 		}
 	});
 }

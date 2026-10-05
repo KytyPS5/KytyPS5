@@ -1711,8 +1711,6 @@ std::string_view LastMaterializeFailure() {
 
 		}
 	}
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
-		snapshot.uniform_fill.value = stored[0];
 // Drops captured reads no write can precede; true when a refusable branch condition read remains.
 static bool CapturedReadsOverlapWrites(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                        std::vector<uint8_t>& conditions) {
@@ -1862,6 +1860,13 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 	const auto& fill = program.uniform_fill;
 	auto words = fill.fill.words;
 	bool uniform_fill = words != 0;
+	bool                    words_agree  = true;
+		uniform_fill = clean.Evaluate(fill.values[i], stored[i]);
+		words_agree  = words_agree && stored[i] == stored[0];
+		snapshot.uniform_fill = fill.fill;
+		snapshot.uniform_fill.value = stored[0];
+		snapshot.uniform_fill.word_values      = stored;
+		snapshot.uniform_fill.words_agree      = words_agree;
 			return SpecializationFail(fmt::format("descriptor source {} is missing", source));
 			auto& evaluator = capture_reads && written ? clean : walker;
 			return evaluator.EvaluateDescriptor(source, value) ||

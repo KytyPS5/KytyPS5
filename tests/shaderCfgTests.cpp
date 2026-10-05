@@ -15921,7 +15921,7 @@ void TestPatternFill() {
       Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
             "pattern fill did not materialize");
       const auto &fill = snapshot.uniform_fill;
-      Check((fill.kind == UniformFillKind::Buffer) == expected,
+      Check((fill.kind == UniformFillKind::Buffer && fill.words_agree) == expected,
             "pattern fill used inactive words or retained a stale result");
       if (expected)
         Check(fill.value == userdata[4] && fill.words == 1 &&

@@ -125,7 +125,7 @@
             </size>
            </property>
            <property name="toolTip">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Edit configuration&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>Edit game config</string>
            </property>
            <property name="text">
             <string/>
@@ -150,7 +150,7 @@
             </size>
            </property>
            <property name="toolTip">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Delete configuration&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>Clear game config</string>
            </property>
            <property name="styleSheet">
             <string notr="true"/>

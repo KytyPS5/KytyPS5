@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>840</width>
+    <width>900</width>
     <height>620</height>
    </rect>
   </property>
@@ -398,6 +398,13 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
        <property name="text"><string>Reset</string></property>
        <property name="toolTip"><string>Restore default settings</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="settings_button">
+       <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
+       <property name="text"><string>Game Configs</string></property>
+       <property name="toolTip"><string>Import or export game configs</string></property>
       </widget>
      </item>
      <item>

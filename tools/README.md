@@ -11,7 +11,7 @@ without a build or test cycle.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\run-native-game.ps1 `
-  -GameDirectory "C:\path\to\game" -ScreenWidth 2560 -ScreenHeight 1440
+  -GameDirectory "C:\path\to\game" -ScreenWidth 2560 -ScreenHeight 1440 -Background
 ```
 
 Choose the game's graphics mode in its own menu. Window dimensions do not determine
@@ -19,7 +19,9 @@ its internal rendering resolution, and the launcher preserves the game files.
 `-DryRun` prints the exact executable/game hashes and arguments. Each owned session
 has a 3600-second and 28-GiB working-set bound by default, set through
 `-TimeoutSeconds` and `-MaxWorkingSetGiB`. A fresh `_Build/runs/game-*` directory
-records the launch and final output; concurrent native game/build/test work is rejected.
+records the launch and streams both logs as output arrives; concurrent native
+game/build/test work is rejected. `-Background` starts a hidden native Windows
+supervisor with the same bounds, so the game can outlive its WSL command session.
 
 ## Focused native iteration
 

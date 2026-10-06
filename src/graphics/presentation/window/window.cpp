@@ -24,6 +24,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -954,16 +955,32 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
+	// Never block the presenting thread on the main thread. A synchronous
+	// SDL_RunOnMainThread here stalls every frame until the main thread's
+	// SDL_WaitEventTimeout() returns, and where SDL's wakeup does not reach it
+	// (observed on X11 under Xwayland) that only happens on real input: the
+	// game then runs at a few FPS unless the mouse keeps moving. Queue the
+	// update asynchronously instead, with at most one pending at a time.
+	static std::atomic<bool> title_pending {false};
+	if (title_pending.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+		SDL_Window* window;
+		std::string text;
+	};
+	auto* update = new TitleUpdate {window, std::move(text)};
+	if (!SDL_RunOnMainThread(
+	        [](void* data) {
+		        const std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		        SDL_SetWindowTitle(title->window, title->text.c_str());
+		        title_pending.store(false, std::memory_order_release);
+	        },
+	        update, false)) {
+		delete update;
+		title_pending.store(false, std::memory_order_release);
+	}
 }
 
 } // namespace Libs::Graphics

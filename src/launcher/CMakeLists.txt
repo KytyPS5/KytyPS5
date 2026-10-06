@@ -76,6 +76,12 @@ endif()
 
 set_target_properties(launcher PROPERTIES OUTPUT_NAME ${launcher_name})
 
+# Trophy language files are read from next to the launcher.
+add_custom_command(TARGET launcher POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${KYTY_LOCALIZATION_DIR}"
+		"$<TARGET_FILE_DIR:launcher>/assets/localization"
+	VERBATIM)
+
 if(APPLE)
 	# macOS bundle: KytyPS5.app with launcher as main executable and
 	# kyty_emulator as helper inside Contents/MacOS. MoltenVK is found
@@ -97,6 +103,7 @@ install(TARGETS launcher
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
+	install(DIRECTORY "${KYTY_LOCALIZATION_DIR}/" DESTINATION "KytyPS5.app/Contents/Resources/assets/localization")
 	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
 	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
 	if(NOT KYTY_MACDEPLOYQT)

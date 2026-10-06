@@ -1,6 +1,7 @@
 #include "common/trophies.h"
 
 #include "common/file.h"
+#include "common/trophyStrings.h"
 
 #include <algorithm>
 #include <array>
@@ -105,13 +106,7 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 	    !conf["defaultLanguage"].is_string()) {
 		return {};
 	}
-	static constexpr std::array<std::string_view, 30> locales = {
-	    "ja-JP", "en-US", "fr-FR",   "es-ES",   "de-DE",  "it-IT", "nl-NL", "pt-PT",
-	    "ru-RU", "ko-KR", "zh-Hant", "zh-Hans", "fi-FI",  "sv-SE", "da-DK", "no-NO",
-	    "pl-PL", "pt-BR", "en-GB",   "tr-TR",   "es-419", "ar-AE", "fr-CA", "cs-CZ",
-	    "hu-HU", "el-GR", "ro-RO",   "th-TH",   "vi-VN",  "id-ID"};
-	const auto locale =
-	    locales[console_language >= 0 && console_language < locales.size() ? console_language : 1];
+	const auto locale = LocaleName(console_language);
 	auto meta = ReadJson(files, fmt::format("tropmeta_{}.json", locale));
 	if (meta.is_null()) {
 		meta = ReadJson(files, fmt::format("tropmeta_{}.json",

@@ -746,6 +746,15 @@ add_custom_target(kyty_trophy_sound
 add_dependencies(kyty_emulator kyty_trophy_sound)
 install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
 
+# Editable language files (see docs/trophy-localization.md).
+set(KYTY_LOCALIZATION_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets/localization")
+add_custom_target(kyty_trophy_localization
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${KYTY_LOCALIZATION_DIR}"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/localization"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_trophy_localization)
+install(DIRECTORY "${KYTY_LOCALIZATION_DIR}/" DESTINATION assets/localization)
+
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)

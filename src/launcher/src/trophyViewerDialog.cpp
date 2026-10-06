@@ -2,10 +2,13 @@
 
 #include "common/archive.h"
 #include "common/trophies.h"
+#include "common/trophyStrings.h"
 #include "configuration.h"
 #include "gameContent.h"
 
 #include <QAbstractItemView>
+#include <QCoreApplication>
+#include <QDir>
 #include <QDateTime>
 #include <QDialogButtonBox>
 #include <QFileInfo>
@@ -17,7 +20,9 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QGridLayout>
 #include <QProgressBar>
+#include <QPushButton>
 #include <QRegularExpression>
 #include <QSize>
 #include <QStringList>
@@ -25,7 +30,21 @@
 #include <QTabWidget>
 #include <QVBoxLayout>
 
+#include <memory>
+
 namespace {
+// Format_Grayscale8 has no alpha channel, so gray the RGB values in an ARGB image instead.
+QImage GrayscaleKeepingAlpha(const QImage& source) {
+	auto image = source.convertToFormat(QImage::Format_ARGB32);
+	for (int y = 0; y < image.height(); ++y) {
+		auto* line = reinterpret_cast<QRgb*>(image.scanLine(y));
+		for (int x = 0; x < image.width(); ++x) {
+			const int gray = qGray(line[x]);
+			line[x]        = qRgba(gray, gray, gray, qAlpha(line[x]));
+		}
+	}
+	return image;
+}
 
 static const QRegularExpression TrophyFilePattern(QStringLiteral("^trophy(\\d+)\\.ucp$"));
 
@@ -44,33 +63,46 @@ static QStringList FindTrophyFiles(const Configuration* info) {
 	return files;
 }
 
-static QString GradeToText(int grade) {
-	switch (grade) {
-		case 1: return QObject::tr("Platinum");
-		case 2: return QObject::tr("Gold");
-		case 3: return QObject::tr("Silver");
-		case 4: return QObject::tr("Bronze");
-		default: return {};
+Common::Trophies::Strings g_strings;
+
+// Language files sit next to the launcher, or in the app bundle resources on macOS.
+void LoadStrings(int console_language) {
+	QDir dir(QCoreApplication::applicationDirPath());
+	if (!dir.exists(QString::fromLatin1(Common::Trophies::StringsDirectory))) {
+		const QDir bundle(QCoreApplication::applicationDirPath() + QStringLiteral("/../Resources"));
+		if (bundle.exists(QString::fromLatin1(Common::Trophies::StringsDirectory))) {
+			dir = bundle;
+		}
 	}
+	g_strings = Common::Trophies::Strings::Load(
+	    GameContent::ToPath(dir.filePath(QString::fromLatin1(Common::Trophies::StringsDirectory))),
+	    console_language);
 }
 
-static QString TrophyTooltip(const Common::Trophies::Trophy& trophy) {
-	QStringList lines {QString::fromStdString(trophy.name),
-	                   QString::fromStdString(trophy.description),
-	                   QObject::tr("Grade: %1").arg(GradeToText(trophy.grade))};
-	if (trophy.hidden) {
-		lines.append(QObject::tr("Hidden trophy"));
+QString S(std::string_view key, std::initializer_list<QString> args = {}) {
+	std::vector<std::string> utf8;
+	for (const auto& arg: args) {
+		utf8.push_back(arg.toStdString());
 	}
-	if (trophy.has_reward && !trophy.reward.empty()) {
-		lines.append(QObject::tr("Reward: %1").arg(QString::fromStdString(trophy.reward)));
+	std::vector<std::string_view> views(utf8.begin(), utf8.end());
+	const auto text = g_strings.Format(key, views);
+	return QString::fromStdString(text);
+}
+
+static QString GradeToText(int grade) {
+	switch (grade) {
+		case 1: return S("trophy.grade.platinum");
+		case 2: return S("trophy.grade.gold");
+		case 3: return S("trophy.grade.silver");
+		case 4: return S("trophy.grade.bronze");
+		default: return {};
 	}
-	return lines.join(QLatin1Char('\n'));
 }
 
 } // namespace
 
 TrophyViewerDialog::TrophyViewerDialog(QWidget* parent): QDialog(parent) {
-	setWindowTitle(tr("Trophy Viewer"));
+	setWindowTitle(S("trophy.viewer.window_title"));
 	resize(1000, 640);
 
 	auto* layout = new QVBoxLayout(this);
@@ -181,8 +213,9 @@ QPixmap LoadGameArt(const Configuration* game, int height) {
 
 void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& games,
                                       const QString& runtime_directory, QWidget* parent) {
+	LoadStrings(games.empty() || games.front() == nullptr ? 1 : games.front()->console_language);
 	QDialog dialog(parent);
-	dialog.setWindowTitle(QObject::tr("Trophies"));
+	dialog.setWindowTitle(S("trophy.overview.title"));
 	dialog.resize(820, 640);
 	dialog.setStyleSheet(QStringLiteral(
 	    "QDialog { background: palette(window); }"
@@ -214,11 +247,11 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 	}
 
 	auto* header = new QHBoxLayout;
-	auto* title  = new QLabel(QObject::tr("Trophies"), &dialog);
+	auto* title  = new QLabel(S("trophy.overview.title"), &dialog);
 	title->setStyleSheet(QStringLiteral("font-size: 30px;"));
 	header->addWidget(title);
 	header->addStretch(1);
-	auto* total = new QLabel(QObject::tr("Total %1").arg(totals.earned), &dialog);
+	auto* total = new QLabel(S("trophy.overview.total", {QString::number(totals.earned)}), &dialog);
 	total->setAlignment(Qt::AlignCenter);
 	total->setStyleSheet(QStringLiteral("font-size: 16px;"));
 	header->addWidget(total);
@@ -264,7 +297,7 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 		percent->setStyleSheet(QStringLiteral("font-size: 24px;"));
 		percent->setMinimumHeight(34);
 		auto* earned = new QLabel(
-		    QObject::tr("Earned %1/%2").arg(progress.earned).arg(progress.total), row_widget);
+		    S("trophy.overview.earned", {QString::number(progress.earned), QString::number(progress.total)}), row_widget);
 		earned->setAlignment(Qt::AlignRight);
 		earned->setMinimumHeight(18);
 		auto* bar = new QProgressBar(row_widget);
@@ -286,7 +319,7 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 	}
 	if (trophy_games.empty()) {
 		auto* empty =
-		    new QLabel(QObject::tr("No games with trophies found in the game folders."), &dialog);
+		    new QLabel(S("trophy.overview.empty"), &dialog);
 		empty->setAlignment(Qt::AlignCenter);
 		layout->insertWidget(1, empty);
 		list->hide();
@@ -312,18 +345,104 @@ void TrophyViewerDialog::ShowForGame(const Configuration* info, const QString& r
 		return;
 	}
 
+	LoadStrings(info->console_language);
 	TrophyViewerDialog dlg(parent);
 	if (!info->name.isEmpty()) {
-		dlg.setWindowTitle(tr("Trophy Viewer - %1").arg(info->name));
+		dlg.setWindowTitle(S("trophy.viewer.window_title_game", {info->name}));
 	}
 
 	QString error;
 	if (!dlg.LoadGame(*info, runtime_directory, error)) {
-		QMessageBox::warning(parent, tr("Trophy Viewer"), error);
+		QMessageBox::warning(parent, S("trophy.viewer.window_title"), error);
 		return;
 	}
 
 	dlg.exec();
+}
+
+static void ShowTrophyInspector(QWidget* parent, int id, const Common::Trophies::Trophy& trophy,
+                                bool unlocked, const QString& date_text) {
+	QDialog dialog(parent);
+	dialog.setWindowTitle(S("trophy.inspector.title"));
+	dialog.resize(640, 380);
+	auto* layout = new QVBoxLayout(&dialog);
+	auto* top    = new QHBoxLayout;
+	auto* icon   = new QLabel(&dialog);
+	icon->setFixedSize(148, 148);
+	icon->setAlignment(Qt::AlignCenter);
+	auto* text_box = new QVBoxLayout;
+	auto* name     = new QLabel(&dialog);
+	name->setStyleSheet(QStringLiteral("font-size: 26px;"));
+	name->setWordWrap(true);
+	auto* subtitle = new QLabel(&dialog);
+	subtitle->setStyleSheet(QStringLiteral("font-size: 16px; color: #aab0c0;"));
+	auto* reveal = new QPushButton(S("trophy.inspector.show_hidden"), &dialog);
+	text_box->addWidget(name);
+	text_box->addWidget(subtitle);
+	text_box->addWidget(reveal, 0, Qt::AlignLeft);
+	text_box->addStretch(1);
+	top->addWidget(icon);
+	top->addSpacing(16);
+	top->addLayout(text_box, 1);
+	layout->addLayout(top);
+
+	auto* grid = new QGridLayout;
+	grid->setColumnStretch(1, 1);
+	const auto make_row = [&](int row, const QString& label) {
+		auto* key = new QLabel(label, &dialog);
+		key->setStyleSheet(QStringLiteral("font-size: 17px; color: #aab0c0;"));
+		auto* value = new QLabel(&dialog);
+		value->setStyleSheet(QStringLiteral("font-size: 17px;"));
+		value->setWordWrap(true);
+		grid->addWidget(key, row, 0);
+		grid->addWidget(value, row, 1);
+		return value;
+	};
+	auto* grade_value  = make_row(0, S("trophy.inspector.grade"));
+	auto* status_value = make_row(1, S("trophy.inspector.status"));
+	auto* date_value   = make_row(2, S("trophy.inspector.earned_date"));
+	auto* detail_value = make_row(3, S("trophy.inspector.details"));
+	layout->addLayout(grid);
+	layout->addStretch(1);
+	auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+	QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+	layout->addWidget(buttons);
+
+	const bool hidden_locked = trophy.hidden && !unlocked;
+	bool       revealed      = false;
+	const auto refresh       = [&] {
+		const bool masked = hidden_locked && !revealed;
+		QPixmap    pixmap;
+		if (masked) {
+			pixmap = QPixmap(QStringLiteral(":/icons/hidden-trophy.png"));
+		} else if (pixmap.loadFromData(reinterpret_cast<const uchar*>(trophy.icon_png.data()),
+		                               static_cast<uint>(trophy.icon_png.size())) &&
+		           !unlocked) {
+			pixmap = QPixmap::fromImage(GrayscaleKeepingAlpha(pixmap.toImage()));
+		}
+		icon->setPixmap(pixmap.isNull() ? pixmap
+		                                : pixmap.scaled(148, 148, Qt::KeepAspectRatio,
+		                                                Qt::SmoothTransformation));
+		name->setText(masked ? S("trophy.hidden")
+		              : trophy.name.empty()
+		                  ? S("trophy.numbered", {QString::number(id)})
+		                  : QString::fromStdString(trophy.name));
+		subtitle->setText(trophy.hidden && !masked ? S("trophy.hidden") : QString {});
+		subtitle->setVisible(!subtitle->text().isEmpty());
+		reveal->setVisible(masked);
+		grade_value->setText(masked ? S("trophy.hidden") : GradeToText(trophy.grade));
+		status_value->setText(unlocked ? S("trophy.inspector.status_earned") : S("trophy.inspector.status_not_earned"));
+		date_value->setText(unlocked && !date_text.isEmpty() ? date_text : QStringLiteral("-"));
+		detail_value->setText(masked || trophy.description.empty()
+		                          ? QStringLiteral("-")
+		                          : QString::fromStdString(trophy.description));
+	};
+	QObject::connect(reveal, &QPushButton::clicked, &dialog, [&] {
+		revealed = true;
+		refresh();
+	});
+	refresh();
+	dialog.exec();
 }
 
 bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runtime_directory,
@@ -331,8 +450,7 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 	const auto reader       = Common::OpenArchive(GameContent::ToPath(info.basedir));
 	const auto trophy_files = FindTrophyFiles(&info);
 	if (trophy_files.isEmpty()) {
-		error = tr("No trophy package found in %1.")
-		            .arg(QString::fromLatin1(Common::Trophies::PackageDirectory));
+		error = S("trophy.viewer.no_package", {QString::fromLatin1(Common::Trophies::PackageDirectory)});
 		return false;
 	}
 	QStringList errors;
@@ -340,7 +458,7 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 		const auto package =
 		    Common::Trophies::LoadPackage(GameContent::ToPath(file), info.console_language);
 		if (package.trophies.empty()) {
-			errors.append(tr("Could not read trophy package %1.").arg(QFileInfo(file).fileName()));
+			errors.append(S("trophy.viewer.unreadable_package", {QFileInfo(file).fileName()}));
 			continue;
 		}
 		const auto unlocks     = LoadUnlocks(info, runtime_directory, file);
@@ -368,9 +486,9 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			return box;
 		};
 		header->addLayout(
-		    make_stat(tr("Progress"), QStringLiteral("%1%").arg(counts.Percentage())));
+		    make_stat(S("trophy.viewer.progress"), QStringLiteral("%1%").arg(counts.Percentage())));
 		header->addLayout(
-		    make_stat(tr("Earned"), QStringLiteral("%1/%2").arg(counts.earned).arg(counts.total)));
+		    make_stat(S("trophy.viewer.earned"), QStringLiteral("%1/%2").arg(counts.earned).arg(counts.total)));
 		for (int grade = 1; grade <= 4; ++grade) {
 			if (counts.total_grade[grade] > 0) {
 				header->addWidget(MakeGradeCount(page, grade, counts.earned_grade[grade], 30, 20));
@@ -382,7 +500,7 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 		progress->setValue(counts.Percentage());
 		progress->setTextVisible(false);
 		page_layout->addWidget(progress);
-		auto* count_label = new QLabel(tr("All trophies: %1").arg(counts.total), page);
+		auto* count_label = new QLabel(S("trophy.viewer.all_trophies", {QString::number(counts.total)}), page);
 		page_layout->addWidget(count_label);
 
 		auto* list = new QListWidget(page);
@@ -390,13 +508,16 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 		list->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
 		list->setSpacing(4);
 		page_layout->addWidget(list, 1);
+		QMap<int, QString> dates;
 		for (const auto& [id, trophy]: package.trophies) {
 			const bool trophy_unlocked = unlocks.unlocked.contains(id);
 			const auto hidden_locked   = trophy.hidden && !trophy_unlocked;
 			auto*      item            = new QListWidgetItem(list);
 			item->setSizeHint(QSize(900, 96));
+			item->setData(Qt::UserRole, id);
 
 			auto* card = new QWidget(list);
+			card->setAttribute(Qt::WA_TransparentForMouseEvents);
 			card->setStyleSheet(
 			    QStringLiteral("QWidget#card { background: palette(base); border-radius: 12px; }"));
 			card->setObjectName(QStringLiteral("card"));
@@ -410,8 +531,7 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			} else if (pixmap.loadFromData(reinterpret_cast<const uchar*>(trophy.icon_png.data()),
 			                               static_cast<uint>(trophy.icon_png.size())) &&
 			           !trophy_unlocked) {
-				pixmap =
-				    QPixmap::fromImage(pixmap.toImage().convertToFormat(QImage::Format_Grayscale8));
+				pixmap = QPixmap::fromImage(GrayscaleKeepingAlpha(pixmap.toImage()));
 			}
 			if (!pixmap.isNull()) {
 				icon->setPixmap(
@@ -420,8 +540,8 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			row->addWidget(icon);
 
 			auto*      left      = new QVBoxLayout;
-			const auto name_text = hidden_locked         ? tr("Hidden trophy")
-			                       : trophy.name.empty() ? tr("Trophy %1").arg(id)
+			const auto name_text = hidden_locked         ? S("trophy.hidden")
+			                       : trophy.name.empty() ? S("trophy.numbered", {QString::number(id)})
 			                                             : QString::fromStdString(trophy.name);
 			auto*      name      = new QLabel(name_text, card);
 			name->setStyleSheet(QStringLiteral("font-size: 20px; font-weight: bold;"));
@@ -449,8 +569,9 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 				                .toLocalTime()
 				                .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
 			} else if (trophy_unlocked) {
-				date_text = tr("Earned");
+				date_text = S("trophy.viewer.earned");
 			}
+			dates.insert(id, date_text);
 			auto* date = new QLabel(date_text, card);
 			date->setAlignment(Qt::AlignRight);
 			date->setStyleSheet(QStringLiteral("font-size: 15px;"));
@@ -462,9 +583,20 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			right->addWidget(date);
 			right->addWidget(detail, 1);
 			row->addLayout(right, 3);
-			card->setToolTip(hidden_locked ? name_text : TrophyTooltip(trophy));
 			list->setItemWidget(item, card);
 		}
+		const auto shared_package = std::make_shared<Common::Trophies::Package>(package);
+		const auto shared_unlocks = std::make_shared<Common::Trophies::UnlockData>(unlocks);
+		connect(list, &QListWidget::itemClicked, this,
+		        [this, list, shared_package, shared_unlocks, dates](QListWidgetItem* item) {
+			        const int  id    = item->data(Qt::UserRole).toInt();
+			        const auto found = shared_package->trophies.find(id);
+			        if (found == shared_package->trophies.end()) {
+				        return;
+			        }
+			        ShowTrophyInspector(this, id, found->second, shared_unlocks->unlocked.contains(id),
+			                            dates.value(id));
+		        });
 		m_tabs->addTab(page, QString::fromStdString(package.title));
 	}
 	m_tabs->tabBar()->setVisible(m_tabs->count() > 1);

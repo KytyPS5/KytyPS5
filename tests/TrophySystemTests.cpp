@@ -1,11 +1,13 @@
 #include "common/file.h"
 #include "common/trophies.h"
+#include "common/trophyStrings.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -249,13 +251,54 @@ void TestUnlockPersistence(const std::filesystem::path &directory) {
   Check(!std::filesystem::exists(directory / "blocked.json.tmp"),
         "failed replacement removes temporary file");
 }
-} // namespace
+void WriteText(const std::filesystem::path &path, const std::string &text) {
+  std::ofstream file(path, std::ios::binary);
+  file << text;
+}
+
+void TestStrings(const std::filesystem::path &directory) {
+  const auto dir = directory / "strings";
+  std::filesystem::create_directories(dir);
+
+  const Trophies::Strings defaults;
+  Check(defaults.Get("trophy.toast.earned") == "Trophy earned!", "built-in toast text");
+  Check(defaults.Get("unknown.key") == "unknown.key", "unknown key returns the key");
+  Check(defaults.Format("trophy.overview.earned", {"3", "10"}) == "Earned 3/10",
+        "placeholders are replaced");
+  Check(defaults.Format("trophy.overview.earned", {"3"}) == "Earned 3/{1}",
+        "missing argument keeps the placeholder");
+
+  Check(Trophies::LocaleName(3) == "es-ES", "locale name of index 3");
+  Check(Trophies::LocaleName(-1) == "en-US" && Trophies::LocaleName(999) == "en-US",
+        "out of range language uses en-US");
+
+  // Spanish file is partial and has a BOM, a comment key and a non-string value.
+  WriteText(dir / "es-ES.json",
+            "\xEF\xBB\xBF{\"_comment\":\"x\",\"trophy.toast.earned\":\"\xC2\xA1Ganaste!\","
+            "\"trophy.hidden\":5}");
+  auto spanish = Trophies::Strings::Load(dir, 3);
+  Check(spanish.Get("trophy.toast.earned") == "\xC2\xA1Ganaste!", "translated text is used");
+  Check(spanish.Get("trophy.hidden") == "Hidden trophy", "non-string value is ignored");
+  Check(spanish.Get("_comment") == "_comment", "underscore keys are ignored");
+  Check(spanish.Get("trophy.grade.gold") == "Gold", "missing key falls back to English");
+
+  // en-US file overrides the built-in text and is the fallback for other languages.
+  WriteText(dir / "en-US.json", "{\"trophy.grade.gold\":\"GOLD\"}");
+  Check(Trophies::Strings::Load(dir, 3).Get("trophy.grade.gold") == "GOLD",
+        "en-US file is the fallback");
+
+  WriteText(dir / "fr-FR.json", "{ not json");
+  Check(Trophies::Strings::Load(dir, 2).Get("trophy.toast.earned") == "Trophy earned!",
+        "invalid file is skipped");
+  Check(!Trophies::Strings().Merge(dir / "missing.json"), "missing file is reported");
+}} // namespace
 
 int main() {
   TempDirectory directory;
   TestEventExtraction(directory.Path());
   TestProgress(directory.Path());
   TestUnlockPersistence(directory.Path());
+  TestStrings(directory.Path());
   std::printf("TrophySystemTests: all cases passed\n");
   return 0;
 }

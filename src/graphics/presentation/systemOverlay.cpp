@@ -4,7 +4,9 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/emulatorConfig.h"
 #include "common/stringUtils.h"
+#include "common/trophyStrings.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -23,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -188,6 +191,7 @@ OverlaySession               g_session;
 SDL_Window*                  g_input_window               = nullptr;
 struct TrophyNotification {
 	std::string            name;
+	std::string            subtitle;
 	int32_t                grade;
 	std::vector<std::byte> icon_png;
 };
@@ -618,9 +622,15 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 
 void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                           std::span<const std::byte> icon_png) {
+	static const Common::Trophies::Strings strings = [] {
+		const char* base = SDL_GetBasePath();
+		return Common::Trophies::Strings::Load(std::filesystem::path(base != nullptr ? base : "") /
+		                                           Common::Trophies::StringsDirectory,
+		                                       Config::GetConsoleLanguage());
+	}();
 	std::scoped_lock lock(g_trophy_notification_mutex);
-	g_trophy_notifications.push_back(
-	    {std::string(name), grade, std::vector<std::byte>(icon_png.begin(), icon_png.end())});
+	g_trophy_notifications.push_back({std::string(name), strings.Get("trophy.toast.earned"), grade,
+	                                 std::vector<std::byte>(icon_png.begin(), icon_png.end())});
 	g_trophy_notification_active.store(true, std::memory_order_release);
 }
 
@@ -1101,7 +1111,55 @@ struct SystemOverlay::Impl {
 		               0.65f, 1.25f);
 		const float width = std::max(
 		    0.0f, std::min(520.0f * screen_scale, static_cast<float>(frame_extent.width) - 32.0f));
-		const float  height   = 104.0f * screen_scale;
+		const float  pad       = 10.0f * screen_scale;
+		const float  base_h    = 104.0f * screen_scale;
+		const float  icon_size = base_h - 2.0f * pad;
+		const int    grade     = trophy_notification->grade;
+		const float  title_fs  = 26.0f * screen_scale;
+		const float  line_h    = 30.0f * screen_scale;
+		const float  sub_fs    = 20.0f * screen_scale;
+		const float  text_pad  = 16.0f * screen_scale;
+		const float  title_off = (grade > 0 && grade <= 4) ? 30.0f * screen_scale : 0.0f;
+		const float  text_x0   = (trophy_notification_image != nullptr)
+		                             ? 2.0f * pad + icon_size - pad + 18.0f * screen_scale
+		                             : 20.0f * screen_scale;
+		const float  wrap_w    = std::max(40.0f, width - text_x0 - title_off - text_pad);
+		// Greedy word wrap: lines only break at spaces so words are never split.
+		std::vector<std::string> title_lines;
+		{
+			auto*       font = ImGui::GetFont();
+			std::string line;
+			std::string word;
+			const auto  fits = [&](const std::string& s) {
+                return font->CalcTextSizeA(title_fs, FLT_MAX, 0.0f, s.c_str()).x <= wrap_w;
+			};
+			const auto flush_word = [&] {
+				if (word.empty()) {
+					return;
+				}
+				const auto candidate = line.empty() ? word : line + " " + word;
+				if (line.empty() || fits(candidate)) {
+					line = candidate;
+				} else {
+					title_lines.push_back(line);
+					line = word;
+				}
+				word.clear();
+			};
+			for (const char ch : trophy_notification->name) {
+				if (ch == ' ') {
+					flush_word();
+				} else {
+					word += ch;
+				}
+			}
+			flush_word();
+			if (!line.empty() || title_lines.empty()) {
+				title_lines.push_back(line);
+			}
+		}
+		const float  block_h  = static_cast<float>(title_lines.size()) * line_h + 28.0f * screen_scale;
+		const float  height   = std::max(base_h, block_h + 2.0f * 16.0f * screen_scale);
 		const float  rounding = 14.0f * screen_scale;
 		const float  fade_in  = std::clamp(age / 0.22f, 0.0f, 1.0f);
 		const float  fade_out = std::clamp((TOAST_LIFETIME - age) / 0.4f, 0.0f, 1.0f);
@@ -1121,11 +1179,9 @@ struct SystemOverlay::Impl {
 		draw->AddRect(top_left, bottom_right, fade(255, 255, 255, 28), rounding,
 		              ImDrawFlags_RoundCornersAll, 1.0f);
 
-		const float pad       = 10.0f * screen_scale;
-		const float icon_size = height - 2.0f * pad;
 		float       text_left = top_left.x + 20.0f * screen_scale;
 		if (trophy_notification_image != nullptr) {
-			const ImVec2 icon_min {top_left.x + pad, top_left.y + pad};
+			const ImVec2 icon_min {top_left.x + pad, top_left.y + (height - icon_size) * 0.5f};
 			const ImVec2 icon_max {icon_min.x + icon_size, icon_min.y + icon_size};
 			draw->AddImageRounded(trophy_notification_image->GetTexRef(), icon_min, icon_max,
 			                      {0, 0}, {1, 1}, fade(255, 255, 255, 255), 8.0f * screen_scale);
@@ -1137,8 +1193,7 @@ struct SystemOverlay::Impl {
 		constexpr std::array GRADE_COLORS {IM_COL32(161, 225, 245, 255), IM_COL32(255, 207, 82, 255),
 		                                   IM_COL32(211, 220, 232, 255),
 		                                   IM_COL32(211, 142, 91, 255)};
-		const int            grade     = trophy_notification->grade;
-		const float          title_y   = top_left.y + height * 0.5f - 25.0f * screen_scale;
+		const float          title_y   = top_left.y + (height - block_h) * 0.5f;
 		float                title_x   = text_left;
 		if (grade > 0 && grade <= static_cast<int>(GRADE_COLORS.size())) {
 			// Small cup glyph tinted with the trophy grade.
@@ -1158,10 +1213,14 @@ struct SystemOverlay::Impl {
 			title_x += 30.0f * u;
 		}
 		draw->PushClipRect(top_left, {bottom_right.x - 16.0f * screen_scale, bottom_right.y}, true);
-		draw->AddText(nullptr, 26.0f * screen_scale, {title_x, title_y},
-		              fade(255, 255, 255, 255), trophy_notification->name.c_str());
-		draw->AddText(nullptr, 20.0f * screen_scale, {text_left, title_y + 38.0f * screen_scale},
-		              fade(176, 180, 192, 255), "Trophy earned!");
+		float line_y = title_y;
+		for (const auto& line : title_lines) {
+			draw->AddText(nullptr, title_fs, {title_x, line_y}, fade(255, 255, 255, 255),
+			              line.c_str());
+			line_y += line_h;
+		}
+		draw->AddText(nullptr, sub_fs, {text_left, line_y + 8.0f * screen_scale},
+		              fade(176, 180, 192, 255), trophy_notification->subtitle.c_str());
 		draw->PopClipRect();
 	}
 

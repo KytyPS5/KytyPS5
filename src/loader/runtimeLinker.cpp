@@ -451,6 +451,34 @@ bool TestMainEntryUsesGuestStack() {
 	return state.called && rsp_ok && root_ok && teb_ok && freed;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static KYTY_SYSV_ABI void TestDebugPrintCallback(EntryParams* params,
+                                                 atexit_func_t /*atexit_func*/) {
+	auto* returned = reinterpret_cast<bool*>(const_cast<char*>(params->argv[0]));
+	// Host libraries (SDL, loaders, drivers) call these from HLE code that runs on
+	// guest stacks; both raise informational exceptions internally.
+	OutputDebugStringW(L"kyty guest-stack debug print (wide)\n");
+	OutputDebugStringA("kyty guest-stack debug print (ansi)\n");
+	*returned = true;
+}
+
+bool TestDebugPrintOnGuestStack() {
+	constexpr uint64_t stack_size = 0x10000;
+	const auto         stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "debug_print_stack_test");
+	if (stack_base == 0) {
+		return false;
+	}
+	bool        returned = false;
+	EntryParams params {};
+	params.argv[0] = reinterpret_cast<const char*>(&returned);
+	RunEntry(reinterpret_cast<uint64_t>(TestDebugPrintCallback), &params, nullptr,
+	         reinterpret_cast<void*>(stack_base + stack_size));
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size);
+	return returned && freed;
+}
+#endif
+
 bool TestModuleRelocationUsesWritableHostMapping() {
 	constexpr uint64_t page_size = 0x4000;
 	constexpr uint64_t value     = 0x4b59545950415443;

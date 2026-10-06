@@ -87,6 +87,15 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
 	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
+		// OutputDebugString raises these inside its own __try. Guest code runs with
+		// zeroed TEB stack bounds, so frame-based dispatch cannot reach that handler
+		// and the informational exception would terminate the process (seen with SDL
+		// logging from AudioOutOpen on a guest thread). Resume the raiser there; on
+		// host stacks keep searching so the normal DBWIN fallback still runs.
+		const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+		if (tib->StackBase == nullptr && tib->StackLimit == nullptr) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 

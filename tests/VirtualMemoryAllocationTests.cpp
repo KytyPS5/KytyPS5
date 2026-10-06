@@ -1,5 +1,6 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -915,6 +916,22 @@ void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Runs only in its own process (--guest-stack-debug-print-only): it installs the
+// production vectored handler, which never claims faults here, so unrelated
+// exceptions keep their default behavior.
+void TestGuestStackDebugPrint() {
+	const char* test = "GuestStackDebugPrint";
+	Check(test,
+	      Common::HostException::InstallHandler(
+	          [](const Common::HostException::ExceptionInfo&) { return false; }),
+	      "install the production host exception filter");
+	Check(test, Loader::TestDebugPrintOnGuestStack(),
+	      "OutputDebugString on a guest stack did not return to the guest");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
 
 void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
 	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
@@ -4203,6 +4220,12 @@ int main(int argc, char** argv) {
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--guest-stack-debug-print-only") == 0) {
+		RunTest(TestGuestStackDebugPrint);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif

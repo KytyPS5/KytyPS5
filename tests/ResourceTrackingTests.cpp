@@ -5998,6 +5998,73 @@ void TestInlineImageResourceLimits() {
 // Two independent live-key tables may contain the same typed image descriptors
 // in different orders. Admission must count dense images, preserving each root's
 // ordinal lookup and all eight descriptor words.
+void TestCombinedNativeImageCapacity() {
+  constexpr uint32_t rows = 256u;
+  constexpr uint32_t stride = 440u;
+  auto fixture = MakeInlineDescriptorFixture(true, false, true, true);
+  for (auto& inst : *fixture->program.blocks[1]) {
+    if (inst.GetOpcode() == ValueOpcode::ULessThan32) inst.SetArg(1u, Value(rows));
+  }
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  LinearTestMemory memory;
+  memory.words.resize(rows * stride / 4u);
+  std::array<std::vector<DescriptorValue>, 2> expected;
+  for (uint32_t root = 0; root < 2u; ++root) {
+    expected[root].resize(rows);
+    for (uint32_t row = 0; row < rows; ++row) {
+      auto& image = expected[root][row];
+      image.dword_count = 8u;
+      image.dwords[0] = 0x100u + root * rows + row;
+      image.dwords[1] = static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+      image.dwords[2] = 3u | (3u << 14u);
+      image.dwords[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.dwords.begin(), 8u,
+                  memory.words.begin() + (row * stride + root * 32u) / 4u);
+    }
+  }
+  std::array<uint32_t, 8> user_data{
+      0x1000u, stride << 16u, rows, 0u, 0x400000u, 0u, 16u, 0u};
+  constexpr uint32_t native_count = rows * 2u + 2u;
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory,
+                     .max_dense_images = native_count};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "host-supported combined native image count beyond 512 was rejected");
+  Check(snapshot.images.size() == native_count && specialization.images.size() == native_count &&
+            specialization.sampled_pairs.size() == native_count,
+        "combined native image count omitted a descriptor or null root");
+  for (uint32_t root = 0; root < 2u; ++root) {
+    for (uint32_t row = 0; row < rows; ++row) {
+      const auto selected = InlineCandidateForKey(snapshot, specialization, row * stride, root);
+      Check(selected >= 2u && snapshot.images[selected] == expected[root][row],
+            "combined native table changed a descriptor or its root mapping");
+    }
+    Check(InlineCandidateForKey(snapshot, specialization, UINT32_MAX - 7u, root) == root,
+          "combined native image table lost its bounded null root");
+  }
+  const auto previous = snapshot;
+  const auto previous_specialization = specialization;
+  for (const auto capacity : {native_count - 1u, 512u, 1u, 0u}) {
+    runtime.max_dense_images = capacity;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+              SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+          "combined native image budget overflow was accepted or partially committed");
+  }
+  ApplyResourceSpecialization(fixture->program, previous_specialization);
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture->program, {.compute = &compute});
+  AllocateBindings(fixture->program);
+  const auto kind = DescriptorBindingForImage(fixture->program.info.images[0]);
+  const auto* binding = kind ? FindBinding(fixture->program.bindings, *kind) : nullptr;
+  Check(binding != nullptr && binding->resources.size() == native_count,
+        "combined native image specialization or binding allocation truncated candidates");
+}
+
 void TestSharedInlineImageCandidates(bool pair_domain_regression = false) {
   constexpr uint32_t rows = 260u;
   auto fixture = MakeInlineDescriptorFixture(true, false, true, true);
@@ -8749,6 +8816,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_SHARED_INLINE_IMAGES_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--combined-native-image-capacity-only") == 0) {
+      TestCombinedNativeImageCapacity();
+      std::cout << "KYTY_COMBINED_NATIVE_IMAGE_CAPACITY_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--inline-native-sampler-capacity-only") == 0) {
       TestInlineNativeSamplerCapacity();
       TestNativeSamplerClassCapacity();
@@ -8961,6 +9033,7 @@ int main(int argc, char** argv) {
     Run("sampled pair materialization", [] { TestSharedInlineImageCandidates(true); });
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
     Run("inline native sampler capacity", TestInlineNativeSamplerCapacity);
+    Run("combined native image capacity", TestCombinedNativeImageCapacity);
     Run("native sampler class capacity", TestNativeSamplerClassCapacity);
     Run("inline SCC selector guard", TestInlineBufferSccConditionRefGuard);
     Run("inline sampled SCC guard", TestInlineSampledSccConditionRefGuard);

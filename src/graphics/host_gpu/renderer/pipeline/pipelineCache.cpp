@@ -809,6 +809,7 @@ struct PipelineCache::ProgramCache {
 		    .clamp_memory_range         = ClampShaderGuestMemory,
 		    .max_dense_buffers          = dense_buffer_capacity,
 		    .max_native_samplers        = native_sampler_capacity,
+		    .max_dense_images           = dense_image_capacity,
 		};
 		const auto refresh_indirect_grid = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
 			if (runtime.compute_workgroups_trusted || indirect_args_addr == 0 ||
@@ -1033,6 +1034,7 @@ struct PipelineCache::ProgramCache {
 		const auto& limits                       = graphics.GetPhysicalDeviceProperties().limits;
 		dense_buffer_capacity = StorageBufferDescriptorCeiling(limits);
 		native_sampler_capacity = SamplerDescriptorCeiling(limits);
+		dense_image_capacity = ImageDescriptorCeiling(limits);
 		compute_workgroup_limits.max_size        = {limits.maxComputeWorkGroupSize[0],
 		                                            limits.maxComputeWorkGroupSize[1],
 		                                            limits.maxComputeWorkGroupSize[2]};
@@ -1060,6 +1062,7 @@ struct PipelineCache::ProgramCache {
 	ShaderRecompiler::ComputeWorkgroupLimits compute_workgroup_limits;
 	uint32_t dense_buffer_capacity = 0;
 	uint32_t native_sampler_capacity = 0;
+	uint32_t dense_image_capacity = 0;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;

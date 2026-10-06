@@ -1574,7 +1574,8 @@ CompiledShader CompileCase(const TestCase &test,
     const ShaderRecompiler::ComputeWorkgroupLimits& workgroup_limits = {},
     const ShaderRecompiler::ShaderHostProfile& host_profile = {},
     u32 max_dense_buffers = ShaderRecompiler::IR::ShaderInfo::MaxBuffers,
-    u32 max_native_samplers = ShaderRecompiler::IR::ShaderInfo::MaxSamplers) {
+    u32 max_native_samplers = ShaderRecompiler::IR::ShaderInfo::MaxSamplers,
+    u32 max_dense_images = ShaderRecompiler::IR::ShaderInfo::MaxImages) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1622,6 +1623,7 @@ CompiledShader CompileCase(const TestCase &test,
       .compute_workgroups = std::array{test.dispatch_x, test.dispatch_y, test.dispatch_z},
       .max_dense_buffers = max_dense_buffers,
       .max_native_samplers = max_native_samplers,
+      .max_dense_images = max_dense_images,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -2108,6 +2110,9 @@ public:
   }
   [[nodiscard]] u32 NativeSamplerCapacity() const {
     return SamplerDescriptorCeiling(m_physical_device.getProperties().limits);
+  }
+  [[nodiscard]] u32 DenseImageCapacity() const {
+    return ImageDescriptorCeiling(m_physical_device.getProperties().limits);
   }
   void CheckDescriptorCapacity(const TestCase& test, const CompiledShader& compiled) const {
     std::vector<DescriptorBudgetBinding> bindings;
@@ -21753,7 +21758,7 @@ void CompareGraphicsWords(const GraphicsCase &test,
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   if (test.companion_check != nullptr) test.companion_check();
-  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->WorkgroupLimits() : ShaderRecompiler::ComputeWorkgroupLimits{}, vulkan != nullptr ? vulkan->HostProfile() : ShaderRecompiler::ShaderHostProfile{}, vulkan != nullptr ? vulkan->DenseBufferCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxBuffers, vulkan != nullptr ? vulkan->NativeSamplerCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxSamplers);
+  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->WorkgroupLimits() : ShaderRecompiler::ComputeWorkgroupLimits{}, vulkan != nullptr ? vulkan->HostProfile() : ShaderRecompiler::ShaderHostProfile{}, vulkan != nullptr ? vulkan->DenseBufferCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxBuffers, vulkan != nullptr ? vulkan->NativeSamplerCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxSamplers, vulkan != nullptr ? vulkan->DenseImageCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxImages);
   if (test.check_shader_swizzle && test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -38604,7 +38609,8 @@ enum class MaterialImageSampleMode {
 };
 
 TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
-                                         bool expanded_samplers = false) {
+                                         bool expanded_samplers = false,
+                                         u32 selector_limit = 0u) {
   using O = ShaderOpcode;
   constexpr u32 material_base = 128u;
   constexpr u32 index_base = 64u;
@@ -38749,6 +38755,13 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(2)));
   code.push_back(EncodeSmem0(0x08, 60, 4));
   code.push_back(EncodeSmem1(0, 33));
+  size_t bound_branch = 0u;
+  if (selector_limit != 0u) {
+    code.push_back(EncodeSopc(0x0a, 60, 255u));
+    code.push_back(selector_limit);
+    bound_branch = code.size();
+    code.push_back(EncodeSopp(0x04, 0u));
+  }
   code.push_back(EncodeSop2(0x26, 61, 60, 255u));
   code.push_back(material_stride);
   if (image_table) {
@@ -38792,6 +38805,10 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
     code.push_back(EncodeVop1(0x01, 30, 34));
     AppendBufferStoreDword(&code, 1, 30);
   }
+  if (selector_limit != 0u) {
+    code[bound_branch] = EncodeSopp(0x04, static_cast<u32>(
+        static_cast<int64_t>(code.size()) - static_cast<int64_t>(bound_branch + 1u)));
+  }
   code.push_back(EncodeSop2(0x00, 32, 32, InlineU32(1)));
   code.push_back(EncodeSopc(0x0a, 32, InlineU32(iteration_count)));
   const auto branch = code.size();
@@ -38807,6 +38824,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
                   O::IMAGE_SAMPLE,
                   O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
                   O::S_CBRANCH_SCC1, O::S_ENDPGM};
+  if (selector_limit != 0u) test.opcodes.push_back(O::S_CBRANCH_SCC0);
   test.decoded_counts = {{"r128=1", image_table || full_inline ? 0u : 1u}};
   if (image_table) {
     test.opcodes.push_back(O::S_AND_B32);
@@ -38817,6 +38835,49 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   if (!dynamic_sampler) {
     test.decoded_counts.push_back({"image_sample_lz ", full_inline ? 2u : 1u});
     test.forbidden_spirv = {"Grad"};
+  }
+  return test;
+}
+
+TestCase CombinedNativeImageCapacity() {
+  constexpr u32 rows = 256u;
+  auto test = MakeImageSampleDynamicMaterials(
+      MaterialImageSampleMode::FullStaticSampler, false, rows);
+  test.name = "Combined514NativeImages";
+  constexpr u32 stride = 440u;
+  constexpr u32 material_base = 128u;
+  constexpr u32 index_base = 64u;
+  test.initial.assign((material_base + rows * stride) / sizeof(u32), 0u);
+  constexpr std::array keys{0u, 254u, 255u, 257u};
+  std::copy(keys.begin(), keys.end(), test.initial.begin() + index_base / sizeof(u32));
+  test.user_data[6] = rows;
+  test.expected = {std::bit_cast<u32>(1.0f), std::bit_cast<u32>(255.0f),
+                   std::bit_cast<u32>(256.0f), 0xdeadbeefu,
+                   std::bit_cast<u32>(1001.0f), std::bit_cast<u32>(1255.0f),
+                   std::bit_cast<u32>(1256.0f), 0xdeadbeefu, 0xfeed1234u};
+  test.initial[3] = test.initial[7] = 0xdeadbeefu;
+  test.initial[8] = 0xfeed1234u;
+  // The fourth key is explicitly predicated out, leaving its output sentinels.
+  // Each table has 256 bounded candidates; only their union exceeds 512.
+  test.expected_dense_images = rows * 2u + 2u;
+  test.expected_sampled_pairs = rows * 2u + 2u;
+  test.sampled_image_fixtures = {{0u, MakeRgbaImage(4, 4)}};
+  for (u32 root = 0; root < 2u; ++root) {
+    for (u32 row = 0; row < rows; ++row) {
+      const uint64_t address = (1ull + root * rows + row) * 0x10000ull;
+      const std::array<u32, 8> descriptor{
+          static_cast<u32>(address >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) | (3u << 30u),
+          3u << 14u,
+          DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0u, 0x00700000u, 0u, 0u};
+      std::copy(descriptor.begin(), descriptor.end(),
+                 test.initial.begin() + (material_base + row * stride + root * 32u) / sizeof(u32));
+      auto rgba = MakeRgbaImage(4, 4);
+      SetRgbaPixel(&rgba, 4, 3, 1,
+                    std::bit_cast<u32>(static_cast<float>(1u + root * 1000u + row)), 0u, 0u, 0u);
+      test.sampled_image_fixtures.push_back({address, std::move(rgba)});
+    }
   }
   return test;
 }
@@ -49134,6 +49195,13 @@ if (argc == 1) {
     VulkanHarness vulkan;
     RunCase(&vulkan, SampledPairOperandDomain());
     std::puts("KYTY_SAMPLED_PAIR_OPERAND_DOMAIN_GPU_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--combined-native-image-capacity-only") == 0) {
+    VulkanHarness vulkan;
+    std::printf("native combined image descriptor ceiling=%u\n", vulkan.DenseImageCapacity());
+    RunCase(&vulkan, CombinedNativeImageCapacity());
+    std::puts("KYTY_COMBINED_NATIVE_IMAGE_CAPACITY_GPU_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--inline-native-sampler-capacity-only") == 0) {

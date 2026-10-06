@@ -40,6 +40,9 @@ struct SrtRuntime {
 	// Expanded sampler candidates and numeric-class variants consume native
 	// descriptors independently of the original logical guest sampler count.
 	uint32_t max_native_samplers = ShaderInfo::MaxSamplers;
+	// Combined native image operands from independently bounded tables. Logical
+	// guest admission and each table's probe/candidate work budget stay separate.
+	uint32_t max_dense_images = ShaderInfo::MaxImages;
 };
 
 // A raw scalar read bounded by a loop guard or one actual dispatch axis.

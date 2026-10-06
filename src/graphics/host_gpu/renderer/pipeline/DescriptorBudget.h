@@ -23,6 +23,17 @@ inline uint32_t SamplerDescriptorCeiling(const VkPhysicalDeviceLimits& limits) {
 	return std::min(limits.maxPerStageDescriptorSamplers, limits.maxDescriptorSetSamplers);
 }
 
+// A ceiling for combined sampled/storage image operands from finite tables.
+// Final layout validation charges their separate typed budgets, storage mips,
+// other descriptors and shared stages; this ceiling does not replace it.
+inline uint32_t ImageDescriptorCeiling(const VkPhysicalDeviceLimits& limits) {
+	const uint64_t sampled = std::min(limits.maxPerStageDescriptorSampledImages,
+	                                 limits.maxDescriptorSetSampledImages);
+	const uint64_t storage = std::min(limits.maxPerStageDescriptorStorageImages,
+	                                 limits.maxDescriptorSetStorageImages);
+	return static_cast<uint32_t>(std::min<uint64_t>(limits.maxPerStageResources, sampled + storage));
+}
+
 struct DescriptorBudgetBinding {
 	VkDescriptorType   type;
 	uint32_t           count;

@@ -1985,7 +1985,8 @@ struct SamplerPlan {
 struct ImageRemap {
 	explicit ImageRemap(const ResourceSpecialization& specialization)
 	    : source_count(static_cast<uint32_t>(specialization.images.size())) {
-		EXIT_IF(specialization.images.size() > indices.size());
+		EXIT_IF(specialization.images.size() > UINT32_MAX);
+		indices.resize(specialization.images.size());
 		for (uint32_t index = 0; index < source_count; index++) {
 			indices[index] = specialization.images[index].fmask ? UINT32_MAX : count++;
 		}
@@ -2011,7 +2012,7 @@ struct ImageRemap {
 	}
 
 private:
-	std::array<uint32_t, ShaderInfo::MaxImages> indices;
+	std::vector<uint32_t>                      indices;
 	uint32_t                                    source_count;
 	uint32_t                                    count = 0;
 };
@@ -2034,13 +2035,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	next_specialization.sampler_origins.resize(program.info.samplers.size());
 	std::iota(next_specialization.sampler_origins.begin(),
 	          next_specialization.sampler_origins.end(), 0u);
+	if (program.info.images.size() > runtime.max_dense_images) {
+		return SpecializationFail("logical images exceed the native image operand ceiling");
+	}
 	size_t image_capacity = program.info.images.size();
 	size_t mapping_words = 0;
 	for (const auto& table: snapshot.indirect_images) {
 		if (table.resource >= program.info.images.size() || table.descriptors.size() < 2u) {
 			return SpecializationFail("indirect image candidates have an invalid root or extent");
 		}
-		image_capacity = std::min<size_t>(ShaderInfo::MaxImages,
+		image_capacity = std::min<size_t>(runtime.max_dense_images,
 		                                 image_capacity + table.descriptors.size() - 1u);
 		mapping_words += 1u + table.keys.size() * 2u;
 	}
@@ -2129,12 +2133,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				}
 			}
 			if (resource == next_specialization.images.size()) {
-				if (resource >= ShaderInfo::MaxImages) {
+				if (resource >= runtime.max_dense_images) {
 					return SpecializationFail(fmt::format(
 					    "indirect image candidates exceed the dense image resource limit "
-					    "(size={} stride={} probes={} pairs={} images={})",
+					    "(size={} stride={} probes={} pairs={} images={} limit={})",
 					    table.buffer_size, table.selector_stride, table.probe_count,
-					    table.descriptors.size(), resource + 1u));
+					    table.descriptors.size(), resource + 1u, runtime.max_dense_images));
 				}
 				auto image = root_image;
 				image.indirect_root = table.resource;

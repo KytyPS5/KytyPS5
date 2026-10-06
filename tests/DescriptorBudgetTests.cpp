@@ -127,6 +127,34 @@ void TestNativeSamplerCeiling() {
   Check(SamplerDescriptorCeiling(limits) == 0u, "zero sampler ceiling was ignored");
 }
 
+void TestCombinedNativeImageCeiling() {
+  auto limits = GenerousLimits();
+  limits.maxPerStageDescriptorSampledImages = 520u;
+  limits.maxDescriptorSetSampledImages = 1024u;
+  limits.maxPerStageDescriptorStorageImages = 16u;
+  limits.maxDescriptorSetStorageImages = 8u;
+  limits.maxPerStageResources = 527u;
+  Check(ImageDescriptorCeiling(limits) == 527u, "native images ignored the stage resource ceiling");
+  limits.maxPerStageResources = 528u;
+  Check(ImageDescriptorCeiling(limits) == 528u, "native images lost a typed stage/layout ceiling");
+  std::vector<DescriptorBudgetBinding> bindings{
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 520u, VK_SHADER_STAGE_COMPUTE_BIT},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8u, VK_SHADER_STAGE_COMPUTE_BIT}};
+  Check(!ValidateDescriptorBudget(bindings, limits), "exact mixed native image budget rejected");
+  bindings.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u, VK_SHADER_STAGE_COMPUTE_BIT});
+  ExpectFailure(bindings, limits, "maxPerStageResources", 529u, 528u, VK_SHADER_STAGE_COMPUTE_BIT);
+  bindings.pop_back();
+  bindings[1].count = 9u; // Additional storage-mip descriptor.
+  limits.maxPerStageResources = 529u;
+  ExpectFailure(bindings, limits, "maxDescriptorSetStorageImages", 9u, 8u, 0u);
+  limits.maxDescriptorSetSampledImages = 256u;
+  Check(ImageDescriptorCeiling(limits) == 264u, "sampled image layout ceiling was ignored");
+  limits = GenerousLimits();
+  Check(ImageDescriptorCeiling(limits) == UINT32_MAX, "typed native image sum overflowed");
+  limits.maxPerStageResources = 0u;
+  Check(ImageDescriptorCeiling(limits) == 0u, "zero native image budget was ignored");
+}
+
 void TestSeparateSampledOperandBudget() {
 	// 257 images x two samplers describe 514 uses, but only 259 descriptors.
 	auto limits = GenerousLimits();
@@ -251,6 +279,7 @@ int main() {
 	TestGraphicsStagesAndSharedVisibility();
 	TestSamplersAndCombinedImages();
 	TestNativeSamplerCeiling();
+	TestCombinedNativeImageCeiling();
 	TestSeparateSampledOperandBudget();
 	TestTexelBufferAndInputTypes();
 	TestDynamicBuffers();

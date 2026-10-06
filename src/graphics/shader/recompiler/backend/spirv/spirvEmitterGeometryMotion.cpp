@@ -61,13 +61,14 @@ void EmitVertex(EmitterState& s) {
 		const auto record = Binary(s, spv::OpIAdd, TypeU32(s), vertex,
 		                           Binary(s, spv::OpIMul, TypeU32(s), instance, capacity));
 		const auto current = Address(s, 0);
-		// A cleared record is claimed once. Indexed draws may invoke the same
-		// vertex more than once; only the winner writes its position.
+		// Records are tagged with the frame that wrote them, so buffers need no
+		// per-draw clearing. Indexed draws may invoke the same vertex more than
+		// once; only the first invocation this frame writes its position.
+		const auto tag = Binary(s, spv::OpShiftRightLogical, TypeU32(s), Push(s, 7), ConstantU32(s, 2));
 		const auto claimed = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(s), claimed,
-		                      Pointer(s, current, record, 4), ConstantU32(s, 1),
-		                      ConstantU32(s, 0), ConstantU32(s, 0), ConstantU32(s, 1), ConstantU32(s, 0));
-		EmitIfCondition(s, Binary(s, spv::OpIEqual, TypeBool(s), claimed, ConstantU32(s, 0)), [&] {
+		s.builder.AddFunction(spv::OpAtomicUMax, TypeU32(s), claimed,
+		                      Pointer(s, current, record, 4), ConstantU32(s, 1), ConstantU32(s, 0), tag);
+		EmitIfCondition(s, Binary(s, spv::OpULessThan, TypeBool(s), claimed, tag), [&] {
 			const auto ptr = s.builder.AllocateId();
 			s.builder.AddFunction(spv::OpAccessChain, TypePointer(s, spv::StorageClassOutput, TypeF32Vector(s, 4)),
 			                      ptr, s.per_vertex_variable, ConstantU32(s, 0));
@@ -81,8 +82,11 @@ void EmitVertex(EmitterState& s) {
 		EmitIfCondition(s, Binary(s, spv::OpINotEqual, TypeBool(s),
 		                          Binary(s, spv::OpBitwiseAnd, TypeU32(s), Push(s, 7), ConstantU32(s, 1)), ConstantU32(s, 0)), [&] {
 			const auto previous = Address(s, 2);
+			const auto previous_tag = Binary(s, spv::OpBitwiseAnd, TypeU32(s),
+			                                 Binary(s, spv::OpISub, TypeU32(s), tag, ConstantU32(s, 1)),
+			                                 ConstantU32(s, 0x3fffffffu));
 			EmitIfCondition(s, Binary(s, spv::OpIEqual, TypeBool(s),
-			                          LoadWord(s, Pointer(s, previous, record, 4)), ConstantU32(s, 1)), [&] {
+			                          LoadWord(s, Pointer(s, previous, record, 4)), previous_tag), [&] {
 				uint32_t components[4];
 				for (uint32_t i = 0; i < 4; ++i) {
 					components[i] = Unary(s, spv::OpBitcast, TypeF32(s), LoadWord(s, Pointer(s, previous, record, i)));

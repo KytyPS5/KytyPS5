@@ -10,7 +10,8 @@ namespace Libs::Graphics {
 struct GeometryMotion::Impl {
 	GraphicContext& graphics;
 	CommandScheduler& scheduler;
-	uint64_t frame = 1, bytes = 0, guide_bytes = 0;
+	uint64_t frame = 1, bytes = 0, guide_bytes = 0, barrier_frame = 0;
+	bool pending_clear = false;
 	static constexpr uint64_t Budget = 64 * 1024 * 1024;
 	static constexpr uint64_t GuideBudget = 128 * 1024 * 1024;
 	struct History {
@@ -67,22 +68,27 @@ std::array<uint32_t, 14> GeometryMotion::PrepareDraw(CommandBuffer& command, std
 		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst |
 		    vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
 		s.bytes += size;
+		// Records carry the frame that wrote them, so only a new buffer needs zeroing.
+		entry.current->Fill(0, size, 0);
 	}
-	entry.current->Fill(0, size, 0);
-	command.EndRendering();
-	// A previous frame can still be in flight on the same queue. Make its
-	// completed vertex stores visible to this draw's vertex loads.
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
-	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader,
-	    vk::PipelineStageFlagBits::eVertexShader, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	if (s.barrier_frame != s.frame) {
+		// Once per frame, not per draw: earlier frames' vertex stores become
+		// visible to this frame's loads, and their loads finish before reuse.
+		command.EndRendering();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eShaderRead;
+		barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+		command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader,
+		    vk::PipelineStageFlagBits::eVertexShader, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		s.barrier_frame = s.frame;
+	}
 	const auto current = entry.current->BufferDeviceAddress();
 	const auto previous = entry.previous ? entry.previous->BufferDeviceAddress() : 0;
 	push[0] = uint32_t(current); push[1] = uint32_t(current >> 32);
 	push[2] = uint32_t(previous); push[3] = uint32_t(previous >> 32);
 	push[4] = capacity; push[5] = first_instance; push[6] = instances;
-	push[7] = history && previous != 0;
+	// Bit 0: history, bit 1: inverted depth (set by the caller), bits 2+: frame tag.
+	push[7] = uint32_t(history && previous != 0) | uint32_t(s.frame & 0x3fffffffu) << 2;
 	return push;
 }
 bool GeometryMotion::SupportsSurface(const Image& color, vk::Extent2D extent) const {
@@ -99,7 +105,6 @@ bool GeometryMotion::Attach(CommandBuffer& command, RenderState& state) {
 	if (!color || state.num_layers != 1 || state.color_attachments[0].mip_level != 0 ||
 	    state.color_attachments[0].base_layer != 0 || color->backing.samples != 1 ||
 	    state.color_attachments[7].image_view || !SupportsSurface(*color, {state.width, state.height})) return false;
-	command.EndRendering();
 	auto& surface = s.surfaces[color->ContentVersion().first];
 	if (!surface.guide || surface.guide->backing.extent.width != state.width || surface.guide->backing.extent.height != state.height) {
 		s.guide_bytes -= surface.bytes;
@@ -113,15 +118,14 @@ bool GeometryMotion::Attach(CommandBuffer& command, RenderState& state) {
 		surface.frame = 0;
 	}
 	// A non-instrumented write invalidates all prior coverage of this surface.
-	if (surface.frame != s.frame || !surface.valid || surface.version.second + 1 != color->ContentVersion().second ||
-	    color->IsCpuDirty() || color->IsBufferModified()) {
-		auto& guide = *surface.guide;
-		guide.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command.Handle());
-		vk::ClearColorValue clear {};
-		vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		command.Handle().clearColorImage(guide.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
-	}
+	// The clear is recorded inside the pass (BeginPass), so it does not split it.
+	s.pending_clear = surface.frame != s.frame || !surface.valid ||
+	    surface.version.second + 1 != color->ContentVersion().second ||
+	    color->IsCpuDirty() || color->IsBufferModified();
 	surface.frame = s.frame;
+	surface.valid = true;
+	// Consecutive instrumented draws continue one pass; each acquire adds one version.
+	surface.version = color->ContentVersion();
 	auto& guide = *surface.guide;
 	guide.Transit(vk::ImageLayout::eColorAttachmentOptimal,
 	    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
@@ -134,6 +138,15 @@ bool GeometryMotion::Attach(CommandBuffer& command, RenderState& state) {
 	state.num_color_attachments = 8;
 	state.geometry_motion_attachment = true;
 	return true;
+}
+void GeometryMotion::BeginPass(CommandBuffer& command) {
+	auto& s = *m_impl;
+	if (!s.pending_clear) return;
+	s.pending_clear = false;
+	const auto& effective = command.EffectiveRenderState();
+	vk::ClearAttachment clear {vk::ImageAspectFlagBits::eColor, 7, vk::ClearValue {}};
+	vk::ClearRect rect {vk::Rect2D {{0, 0}, {effective.width, effective.height}}, 0, 1};
+	command.Handle().clearAttachments(1, &clear, 1, &rect);
 }
 void GeometryMotion::EndPass(const RenderState& state) {
 	auto& s = *m_impl;

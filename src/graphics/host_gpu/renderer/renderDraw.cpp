@@ -1126,7 +1126,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.programs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto interrupted = buffer.ActiveRenderState();
-	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) buffer.EndRendering();
 	auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
@@ -1218,6 +1217,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	buffer.BeginRendering(rendering, interrupted && guest_state(*interrupted) == guest_state(rendering));
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
 	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) {
+		m_context.GetGeometryMotion().BeginPass(buffer);
 		const auto& effective = buffer.EffectiveRenderState();
 		const float reciprocal_extent[] {1.f / effective.width, 1.f / effective.height};
 		std::memcpy(motion_push.data() + 12, reciprocal_extent, sizeof(reciprocal_extent));

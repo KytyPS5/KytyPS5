@@ -20,6 +20,8 @@ public:
 	std::array<uint32_t, 14> PrepareDraw(CommandBuffer& command, std::span<const uint64_t> key,
 	                                  uint32_t capacity, uint32_t first_instance, uint32_t instances);
 	bool Attach(CommandBuffer& command, RenderState& state);
+	// Call right after BeginRendering for an attached draw; clears a reset guide in-pass.
+	void BeginPass(CommandBuffer& command);
 	bool SupportsSurface(const Image& color, vk::Extent2D extent) const;
 	void EndPass(const RenderState& state);
 	Image* Source(const Image& color) const;

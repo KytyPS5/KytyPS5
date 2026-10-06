@@ -555,6 +555,7 @@ void GeometryMotionCase(GraphicContext& graphics, RenderContext& renderer) {
 		const uint32_t index_data[] {0, 1, 2, 0, 1, 2};
 		std::memcpy(indices.Mapped().data(), index_data, sizeof(index_data)); indices.Flush(0, sizeof(index_data));
 		command.BeginRendering(state, preserve);
+		if (pipeline == 0) motion.BeginPass(command);
 		const auto& effective = command.EffectiveRenderState();
 		const float viewport_data[] {0, negative_height ? 1.f : 0.f, 1, negative_height ? -1.f : 1.f,
 		    1.f / effective.width, 1.f / effective.height};
@@ -615,7 +616,7 @@ void GeometryMotionCase(GraphicContext& graphics, RenderContext& renderer) {
 	// previous guide must stop being available and next frame must reset it.
 	Check(motion.PrepareDraw(scheduler.Current(), key, 3, 4, 2)[4] == 0 && motion.Source(color) == nullptr, "ambiguous duplicate draw reused geometry history");
 	motion.AdvanceFrame();
-	Check(motion.PrepareDraw(scheduler.Current(), key, 3, 4, 2)[7] == 0, "ambiguous previous frame remained valid");
+	Check((motion.PrepareDraw(scheduler.Current(), key, 3, 4, 2)[7] & 1) == 0, "ambiguous previous frame remained valid");
 	for (uint32_t scale : {100u, 50u}) {
 		render(1, 0, false, scale, false);
 		render(1, 0, false, scale, false, 3, false, .4f, true);

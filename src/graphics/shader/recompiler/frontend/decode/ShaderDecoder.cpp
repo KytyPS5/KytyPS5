@@ -417,10 +417,19 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
-			if (branch_targets.empty()) {
-				branch_targets.resize(code.size());
+			if (target_index > code.size()) {
+				// A branch past the end of the code cannot be resolved to a
+				// block. Reject it instead of indexing past branch_targets.
+				// A target exactly at the end is a jump off the code (such as
+				// a structured exit) and needs no marker.
+				SetUnsupported(program.instructions.back(), inst.family,
+				               inst.opcode_id, "branch target outside shader code");
+			} else if (target_index < code.size()) {
+				if (branch_targets.empty()) {
+					branch_targets.resize(code.size());
+				}
+				branch_targets[target_index] = true;
 			}
-			branch_targets[target_index] = true;
 		}
 		if (inst.opcode == Opcode::S_ENDPGM &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {

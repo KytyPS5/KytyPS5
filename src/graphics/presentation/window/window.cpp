@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -959,27 +960,40 @@ void WindowContext::UpdateTitle() {
 	// SDL_RunOnMainThread here stalls every frame until the main thread's
 	// SDL_WaitEventTimeout() returns, and where SDL's wakeup does not reach it
 	// (observed on X11 under Xwayland) that only happens on real input: the
-	// game then runs at a few FPS unless the mouse keeps moving. Queue the
-	// update asynchronously instead, with at most one pending at a time.
-	static std::atomic<bool> title_pending {false};
-	if (title_pending.exchange(true, std::memory_order_acq_rel)) {
+	// game then runs at a few FPS unless the mouse keeps moving. Store the
+	// newest title in a mailbox and post at most one asynchronous update;
+	// the callback applies whatever title is newest when it runs.
+	struct TitleMailbox {
+		std::mutex        mutex;
+		std::string       text;
+		SDL_Window*       window = nullptr;
+		std::atomic<bool> pending {false};
+	};
+	static TitleMailbox mailbox;
+	{
+		std::lock_guard lock(mailbox.mutex);
+		mailbox.text   = std::move(text);
+		mailbox.window = window;
+	}
+	if (mailbox.pending.exchange(true, std::memory_order_acq_rel)) {
 		return;
 	}
-
-	struct TitleUpdate {
-		SDL_Window* window;
-		std::string text;
-	};
-	auto* update = new TitleUpdate {window, std::move(text)};
 	if (!SDL_RunOnMainThread(
-	        [](void* data) {
-		        const std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
-		        SDL_SetWindowTitle(title->window, title->text.c_str());
-		        title_pending.store(false, std::memory_order_release);
+	        [](void* /*data*/) {
+		        std::string title;
+		        SDL_Window* target = nullptr;
+		        {
+			        std::lock_guard lock(mailbox.mutex);
+			        // Cleared under the lock: a title stored after this point
+			        // posts its own update.
+			        mailbox.pending.store(false, std::memory_order_release);
+			        title  = mailbox.text;
+			        target = mailbox.window;
+		        }
+		        SDL_SetWindowTitle(target, title.c_str());
 	        },
-	        update, false)) {
-		delete update;
-		title_pending.store(false, std::memory_order_release);
+	        nullptr, false)) {
+		mailbox.pending.store(false, std::memory_order_release);
 	}
 }
 

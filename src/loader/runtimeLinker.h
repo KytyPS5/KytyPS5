@@ -48,10 +48,11 @@ struct LibraryId {
 
 struct ThreadLocalStorage {
 	struct Block {
-		uint8_t*                     ptr        = nullptr;
-		application_heap_free_func_t free_func  = nullptr;
-		bool                         vm_alloc   = false;
-		uint64_t                     alloc_size = 0;
+		uint8_t*                     ptr             = nullptr;
+		application_heap_free_func_t free_func       = nullptr;
+		bool                         vm_alloc        = false;
+		uint64_t                     alloc_size      = 0;
+		int                          owner_thread_id = 0;
 	};
 
 	~ThreadLocalStorage();
@@ -174,6 +175,11 @@ public:
 
 	static uint8_t* TlsGetAddr(Program* program);
 	static void     DeleteTls(Program* program, int thread_id);
+
+	// Populate this host thread's guest TCB slot before entering guest code. On
+	// Windows the guest FS base cannot be programmed, so patched fs:[disp] reads
+	// resolve the guest TCB through this host TLS slot instead.
+	static void InitializeMainTlsForCurrentThread();
 
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 

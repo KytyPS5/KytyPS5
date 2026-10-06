@@ -31,6 +31,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -58,33 +59,115 @@ Program::Program() = default;
 
 Program::~Program() = default;
 
-static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
+// Per-thread guest TCB cache. TlsMainGetAddr() keys it on the main Program pointer, so it
+// must be invalidated whenever the block holding that TCB is released, including a block
+// released after its program was already destroyed.
+static Program*              g_tls_main_program        = nullptr;
+static thread_local Program* g_tls_cached_main_program = nullptr;
+static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Process-lifetime slot holding each host thread's guest TCB pointer. Allocated once
+// because the patched guest code reads it directly from the host TEB.
+static const DWORD g_tls_main_tcb_key = [] {
+	const auto key = TlsAlloc();
+	EXIT_IF(key == TLS_OUT_OF_INDEXES);
+	return key;
+}();
+#endif
+
+// Drop the cached TCB for the calling thread. A block that is about to be released may still
+// back it, and a later Program allocated at the same address would otherwise match the stale
+// cache key and hand the freed TCB back to guest code.
+static void InvalidateCachedMainTcb() {
+	g_tls_cached_main_program = nullptr;
+	g_tls_cached_main_tcb     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(TlsSetValue(g_tls_main_tcb_key, nullptr) == 0);
+#endif
+}
+
+// The backing allocation of a TLS block is guest memory for TLS blocks, so releasing a
+// block that has outlived its image can legitimately fail. Deferred release reports that
+// instead of aborting, because there is no remaining owner to fail against.
+static bool ReleaseTlsBlockMemory(ThreadLocalStorage::Block* block) {
 	if (block == nullptr || block->ptr == nullptr) {
-		return;
+		return true;
 	}
 
 	if (block->free_func != nullptr) {
 		block->free_func(block->ptr);
 	} else if (block->vm_alloc) {
-		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(reinterpret_cast<uint64_t>(block->ptr),
-		                                                  block->alloc_size));
+		if (!Libs::LibKernel::Memory::FreeGuestMemory(reinterpret_cast<uint64_t>(block->ptr),
+		                                              block->alloc_size)) {
+			return false;
+		}
 	} else {
 		delete[] block->ptr;
 	}
 
-	block->ptr        = nullptr;
-	block->free_func  = nullptr;
-	block->vm_alloc   = false;
-	block->alloc_size = 0;
+	*block = {};
+	return true;
 }
 
 static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value;
 }
 
+// A program owns one TLS block per thread that used it. Destroying a program used to release
+// every block at once, including blocks still reachable from a live thread: that thread's
+// cached guest TCB pointer, and on Windows the patched guest code, read the guest TCB
+// through the thread's own TLS slot. A block is therefore only released by the thread that
+// owns it. Blocks owned by other threads are parked here until they stop, so the guest TCB
+// stays valid for as long as any thread can still reach it.
+static std::mutex                             g_deferred_tls_mutex;
+static std::vector<ThreadLocalStorage::Block> g_deferred_tls_blocks;
+
+// Release every parked block owned by the calling thread. Only its owner may release a
+// block, so this is the one safe place to do it.
+static void ReleaseDeferredTlsBlocks() {
+	const int thread_id = Common::Thread::GetThreadIdUnique();
+
+	std::vector<ThreadLocalStorage::Block> mine;
+	{
+		std::lock_guard<std::mutex> lock(g_deferred_tls_mutex);
+		for (auto it = g_deferred_tls_blocks.begin(); it != g_deferred_tls_blocks.end();) {
+			if (it->owner_thread_id == thread_id) {
+				mine.push_back(*it);
+				it = g_deferred_tls_blocks.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+
+	if (!mine.empty()) {
+		InvalidateCachedMainTcb();
+	}
+
+	for (auto& block: mine) {
+		if (!ReleaseTlsBlockMemory(&block)) {
+			LOGF("Deferred TLS block [%p] size=%" PRIu64 " could not be released\n",
+			     static_cast<void*>(block.ptr), block.alloc_size);
+		}
+	}
+}
+
+static void ReleaseTlsBlock(ThreadLocalStorage::Block* block) {
+	if (block == nullptr || block->ptr == nullptr) {
+		return;
+	}
+	if (block->owner_thread_id == Common::Thread::GetThreadIdUnique()) {
+		EXIT_IF(!ReleaseTlsBlockMemory(block));
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_deferred_tls_mutex);
+	g_deferred_tls_blocks.push_back(*block);
+	*block = {};
+}
+
 ThreadLocalStorage::~ThreadLocalStorage() {
 	for (auto& [_, block]: tlss) {
-		FreeTlsBlock(&block);
+		ReleaseTlsBlock(&block);
 	}
 }
 
@@ -227,13 +310,13 @@ constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
 static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 static uint64_t g_invalid_memory    = 0;
 
-static Program*              g_tls_main_program        = nullptr;
-static thread_local Program* g_tls_cached_main_program = nullptr;
-static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
-
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
+	// This thread is about to run guest code again, so any block it parked for a program
+	// that has since been destroyed is no longer reachable.
+	ReleaseDeferredTlsBlocks();
+	RuntimeLinker::InitializeMainTlsForCurrentThread();
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
 	if (stack_top != nullptr) {
@@ -934,7 +1017,18 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 	g_tls_cached_main_program = g_tls_main_program;
 	g_tls_cached_main_tcb =
 	    RuntimeLinker::TlsGetAddr(g_tls_main_program) + g_tls_main_program->tls.tcb_offset;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(TlsSetValue(g_tls_main_tcb_key, g_tls_cached_main_tcb) == 0);
+#endif
 	return g_tls_cached_main_tcb;
+}
+
+void RuntimeLinker::InitializeMainTlsForCurrentThread() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_tls_main_program != nullptr) {
+		(void)TlsMainGetAddr();
+	}
+#endif
 }
 
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
@@ -1317,9 +1411,8 @@ void RuntimeLinker::Clear() {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
 		g_invalid_memory = 0;
 	}
-	g_tls_main_program        = nullptr;
-	g_tls_cached_main_program = nullptr;
-	g_tls_cached_main_tcb     = nullptr;
+	g_tls_main_program = nullptr;
+	InvalidateCachedMainTcb();
 	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
 }
@@ -1553,6 +1646,7 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
+	InitializeMainTlsForCurrentThread();
 	return reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
 	                                                program->base_vaddr)(args, argp, func);
 }
@@ -1568,6 +1662,7 @@ int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, m
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Stop module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
+	InitializeMainTlsForCurrentThread();
 	int result = reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->fini_vaddr +
 	                                                      program->base_vaddr)(args, argp, func);
 
@@ -1595,6 +1690,9 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 		tls.free_func  = nullptr;
 		tls.vm_alloc   = true;
 		tls.alloc_size = alloc_size;
+		// The TCB lives in this block and is reachable from this thread's host TLS slot, so
+		// the block may only be released by the thread that owns it.
+		tls.owner_thread_id = Common::Thread::GetThreadIdUnique();
 
 		EXIT_IF(tls.ptr == nullptr);
 
@@ -1618,14 +1716,13 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	EXIT_IF(program == nullptr);
 
 	if (thread_id == Common::Thread::GetThreadIdUnique() && g_tls_cached_main_program == program) {
-		g_tls_cached_main_program = nullptr;
-		g_tls_cached_main_tcb     = nullptr;
+		InvalidateCachedMainTcb();
 	}
 
 	Common::LockGuard lock(program->tls.mutex);
 
 	if (auto it = program->tls.tlss.find(thread_id); it != program->tls.tlss.end()) {
-		FreeTlsBlock(&it->second);
+		ReleaseTlsBlock(&it->second);
 		program->tls.tlss.erase(it);
 	}
 }
@@ -1677,10 +1774,16 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
+	// Guest code reaches its TCB through an absolute fs:[disp] read. Windows cannot host
+	// the guest FS base, so those reads are rewritten to resolve the guest TCB from the
+	// host TLS slot set up below.
+	const bool patch_tcb_accesses = true;
 #else
 	const bool protect_memory_faults = false;
+	const bool patch_tcb_accesses    = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const bool patch_guest_instructions =
+	    protect_memory_faults || emulate_amd || patch_tcb_accesses;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1797,14 +1900,23 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
+			    fmt::format("Guest instruction patching: {} not patched (function boundaries "
+			                "unavailable)\n",
 			                module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			const auto result =
+			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                           protect_memory_faults, emulate_amd,
+			                           GetGuestInstructionHostFeatures(), patch_tcb_accesses,
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			                           g_tls_main_tcb_key
+#else
+			                           0
+#endif
+			    );
+			totals.tcb += result.tcb;
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
@@ -1822,6 +1934,14 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (patch_tcb_accesses && have_function_starts) {
+			const char* status = totals.tcb.found == 0       ? "no matching instructions"
+			                     : totals.tcb.Skipped() != 0 ? "partially patched"
+			                                                 : "patched";
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Guest TCB access: {} {} (native={}, skipped={})\n", module_name,
+			                status, totals.tcb.native, totals.tcb.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};
@@ -1860,8 +1980,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		g_tls_main_program = nullptr;
 	}
 	if (g_tls_cached_main_program == program.get()) {
-		g_tls_cached_main_program = nullptr;
-		g_tls_cached_main_tcb     = nullptr;
+		InvalidateCachedMainTcb();
 	}
 	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr >= program->base_vaddr &&
@@ -2158,6 +2277,10 @@ void RuntimeLinker::DeleteTlss(int thread_id) {
 	for (auto* p: m_programs) {
 		DeleteTls(p, thread_id);
 	}
+
+	// The calling thread is stopping or leaving guest code, so it is the last owner of any
+	// block that outlived a program destroyed while the thread was blocked.
+	ReleaseDeferredTlsBlocks();
 }
 
 void RuntimeLinker::SetApplicationHeapApi(void* const api[10]) {

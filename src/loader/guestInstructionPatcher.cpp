@@ -138,7 +138,10 @@ enum class InstructionReplacement {
 	ExtractQ,
 	InsertQ,
 	ReadProcessorId,
-	CacheLineWriteBack
+	CacheLineWriteBack,
+	TcbMove,
+	TcbExclusiveOr,
+	TcbCompare
 };
 
 struct InstructionRewrite {
@@ -155,12 +158,18 @@ InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
 		case InstructionReplacement::ExtractQ: return result.extrq;
 		case InstructionReplacement::InsertQ: return result.insertq;
 		case InstructionReplacement::ReadProcessorId: return result.rdpid;
-		default: return result.clwb;
+		case InstructionReplacement::CacheLineWriteBack: return result.clwb;
+		default: return result.tcb;
 	}
 }
 
+bool IsAmdReplacement(InstructionReplacement replacement) {
+	return replacement >= InstructionReplacement::ReciprocalSquareRoot &&
+	       replacement <= InstructionReplacement::CacheLineWriteBack;
+}
+
 bool UsesInstructionTrap(InstructionReplacement replacement, bool trap_replacements) {
-	return replacement != InstructionReplacement::None &&
+	return IsAmdReplacement(replacement) &&
 	       (trap_replacements || replacement == InstructionReplacement::InsertQ ||
 	        replacement == InstructionReplacement::ReadProcessorId);
 }
@@ -956,6 +965,104 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 	}
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr s64 GuestTcbSize = 0x40;
+
+struct GuestTcbAccess {
+	Xbyak::Reg64 destination {0};
+	s64          offset {};
+};
+
+// A guest TCB access is a 64-bit absolute read from the FS segment inside the TCB window,
+// with a general-purpose destination register. Zydis numbers RAX..R15 consecutively, which
+// makes that register index directly usable as the Xbyak register index.
+std::optional<GuestTcbAccess> MatchGuestTcbAccess(const DecodedCodeInstruction& decoded) {
+	if (decoded.instruction.operand_count_visible != 2) {
+		return std::nullopt;
+	}
+	const auto& destination = decoded.operands[0];
+	const auto& source      = decoded.operands[1];
+	if (destination.type != ZYDIS_OPERAND_TYPE_REGISTER || destination.size != 64 ||
+	    destination.reg.value < ZYDIS_REGISTER_RAX ||
+	    destination.reg.value > ZYDIS_REGISTER_R15 ||
+	    destination.reg.value == ZYDIS_REGISTER_RSP ||
+	    source.type != ZYDIS_OPERAND_TYPE_MEMORY || source.size != 64 ||
+	    source.mem.segment != ZYDIS_REGISTER_FS ||
+	    source.mem.base != ZYDIS_REGISTER_NONE || source.mem.index != ZYDIS_REGISTER_NONE ||
+	    source.mem.disp.value < 0 || source.mem.disp.value >= GuestTcbSize) {
+		return std::nullopt;
+	}
+	return GuestTcbAccess {.destination = Xbyak::Reg64(destination.reg.value - ZYDIS_REGISTER_RAX),
+	                       .offset      = source.mem.disp.value};
+}
+
+void CollectTcbInstructions(const DecodedFunction&                   function,
+                            std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                            GuestInstructionPatchResult&             result) {
+	for (const auto& [address, decoded]: function.instructions) {
+		InstructionReplacement replacement {};
+		switch (decoded.instruction.mnemonic) {
+			case ZYDIS_MNEMONIC_MOV: replacement = InstructionReplacement::TcbMove; break;
+			case ZYDIS_MNEMONIC_XOR:
+				replacement = InstructionReplacement::TcbExclusiveOr;
+				break;
+			case ZYDIS_MNEMONIC_CMP: replacement = InstructionReplacement::TcbCompare; break;
+			default: continue;
+		}
+		if (!MatchGuestTcbAccess(decoded).has_value()) {
+			continue;
+		}
+		++result.tcb.found;
+		rewrite_sites[address].replacement = replacement;
+	}
+}
+
+void RetrieveTcbValue(Xbyak::Reg64 destination, Xbyak::CodeGenerator& generator, u32 tcb_key,
+                      s64 offset) {
+	constexpr u32 TlsSlotsOffset          = 0x1480;
+	constexpr u32 TlsExpansionSlotsOffset = 0x1780;
+	constexpr u32 TlsMinimumAvailable     = 64;
+
+	generator.putSeg(gs);
+	if (tcb_key < TlsMinimumAvailable) {
+		generator.mov(destination,
+		              ptr[reinterpret_cast<void*>(TlsSlotsOffset + tcb_key * sizeof(void*))]);
+	} else {
+		generator.mov(destination, ptr[reinterpret_cast<void*>(TlsExpansionSlotsOffset)]);
+		generator.mov(destination,
+		              qword[destination + (tcb_key - TlsMinimumAvailable) * sizeof(void*)]);
+	}
+	if (offset != 0) {
+		generator.mov(destination, qword[destination + offset]);
+	}
+}
+
+void GenerateTcbAccess(const DecodedCodeInstruction& decoded, InstructionReplacement replacement,
+                       Xbyak::CodeGenerator& generator, u32 tcb_key) {
+	const auto access      = MatchGuestTcbAccess(decoded);
+	ASSERT(access.has_value());
+	const auto destination = access->destination;
+	const auto offset      = access->offset;
+	if (replacement == InstructionReplacement::TcbMove) {
+		RetrieveTcbValue(destination, generator, tcb_key, offset);
+		return;
+	}
+
+	const Xbyak::Reg64 scratch = destination.getIdx() == rax.getIdx() ? rbx : rax;
+	// Host exception delivery may overwrite the guest SysV red zone on Windows.
+	generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+	generator.push(scratch);
+	RetrieveTcbValue(scratch, generator, tcb_key, offset);
+	if (replacement == InstructionReplacement::TcbExclusiveOr) {
+		generator.xor_(destination, scratch);
+	} else {
+		generator.cmp(destination, scratch);
+	}
+	generator.pop(scratch);
+	generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+}
+#endif
+
 void MarkInstructionTrap(u8* code, const ZydisDecodedInstruction& instruction,
                          InstructionReplacement replacement) {
 	if (replacement == InstructionReplacement::ReciprocalSquareRoot) {
@@ -991,7 +1098,7 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
                                  const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                                  GuestInstructionPatchResult&                   result) {
 	for (const auto& [address, rewrite]: rewrite_sites) {
-		if (rewrite.replacement == InstructionReplacement::None ||
+		if (!IsAmdReplacement(rewrite.replacement) ||
 		    module.patched.contains(reinterpret_cast<u8*>(address))) {
 			continue;
 		}
@@ -1014,7 +1121,7 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 
 void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& function,
                                const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                               GuestInstructionPatchResult&                   result) {
+                               GuestInstructionPatchResult&                   result, u32 tcb_key) {
 	struct RelocationSpan {
 		std::vector<const DecodedCodeInstruction*> instructions;
 		uintptr_t                                  patch_start {};
@@ -1053,7 +1160,14 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 					generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
 				}
 				if (replacement != InstructionReplacement::None) {
-					if (uses_trap) {
+					if (replacement >= InstructionReplacement::TcbMove &&
+					    replacement <= InstructionReplacement::TcbCompare) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+						GenerateTcbAccess(*decoded, replacement, generator, tcb_key);
+#else
+						encoded = false;
+#endif
+					} else if (uses_trap) {
 						encoded = GenerateInstructionTrap(*decoded, replacement, generator,
 						                                  protect_red_zone ? GuestRedZoneSize : 0);
 					} else if (replacement == InstructionReplacement::ReciprocalSquareRoot) {
@@ -1503,9 +1617,10 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
-                                                   GuestInstructionHostFeatures host_features) {
+                                                   GuestInstructionHostFeatures host_features,
+                                                   bool patch_tcb, u32 tcb_key) {
 	GuestInstructionPatchResult result {};
-	if (!protect_memory && !emulate_amd) {
+	if (!protect_memory && !emulate_amd && !patch_tcb) {
 		return result;
 	}
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
@@ -1558,8 +1673,16 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		if (emulate_amd) {
 			CollectAmdInstructions(function, rewrite_sites, result, host_features);
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (patch_tcb) {
+			CollectTcbInstructions(function, rewrite_sites, result);
+		}
+#else
+		(void)patch_tcb;
+		(void)tcb_key;
+#endif
 		if (!rewrite_sites.empty()) {
-			RelocateGuestInstructions(module, function, rewrite_sites, result);
+			RelocateGuestInstructions(module, function, rewrite_sites, result, tcb_key);
 			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
 		}
 	}
@@ -1580,7 +1703,7 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 }
 
 GuestInstructionPatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool,
-                                                   GuestInstructionHostFeatures) {
+                                                   GuestInstructionHostFeatures, bool, u32) {
 	return {};
 }
 

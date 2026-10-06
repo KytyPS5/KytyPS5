@@ -885,13 +885,27 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
-	// Wave-launch ordering is not emulated: a plain GDS atomic still gives every wave a
-	// unique result. The ADDR VGPR carries the value; the counter sits at M0 + index * 4.
+	// One GDS atomic per wave, issued by the first active lane with its ADDR value, and the
+	// pre-op value broadcast to every lane. Wave-launch ordering is not emulated: results
+	// stay unique per wave, which is what append-style users need.
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto opcode = inst.secondary_offset == 1u ? IR::ValueOpcode::SharedAtomicSwap32
 	                                                : IR::ValueOpcode::SharedAtomicIAdd32;
-	WriteOperand(inst.dst, ir.Emit(opcode, {IR::U32(IR::Value(0u)), ReadU32(inst.src0), ir.GetExec()},
-	                               AddMemoryInfo(memory, inst.pc)));
+	const auto exec   = ir.GetExec();
+	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {exec});
+	const auto low  = IR::U32(ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {ballot, IR::Value(0u)}));
+	const auto high = IR::U32(ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {ballot, IR::Value(1u)}));
+	const auto first = ir.Select(
+	    IR::U1(ir.Emit(IR::ValueOpcode::INotEqual32, {low, IR::Value(0u)})),
+	    IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {low})),
+	    ir.IAdd(IR::U32(IR::Value(32u)), IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {high}))));
+	const auto lane     = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	const auto is_first = IR::U1(ir.Emit(
+	    IR::ValueOpcode::LogicalAnd, {exec, IR::U1(ir.Emit(IR::ValueOpcode::IEqual32, {lane, first}))}));
+	const auto value  = IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane, {ReadU32(inst.src0), exec}));
+	const auto result = ir.Emit(opcode, {IR::U32(IR::Value(0u)), value, is_first},
+	                            AddMemoryInfo(memory, inst.pc));
+	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ReadFirstLane, {result, is_first}));
 }
 
 void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {

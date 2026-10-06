@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -54,6 +55,8 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// BDA synchronisation mode; GPU thread only, safe to switch at any consumer boundary.
+	void               SetBdaSyncMode(Config::BdaSyncMode mode) noexcept { m_bda_sync_mode = mode; }
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -61,6 +64,8 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	friend struct RenderContextTestAccess;
+
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;
@@ -82,6 +87,9 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	Config::BdaSyncMode       m_bda_sync_mode        = Config::BdaSyncMode::Selective;
+	// Set once a selective pass failed closed; PrepareBda then stays on the legacy walk.
+	bool                      m_bda_selective_failed = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

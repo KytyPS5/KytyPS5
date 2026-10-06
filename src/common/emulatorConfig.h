@@ -27,6 +27,11 @@ enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
+// How PrepareBda finds CPU-dirty buffers. Selective visits only owners of dirty pages in hinted
+// regions; Legacy walks every mapped owner; SelectiveChecked adds a full invariant check after
+// every selective pass and aborts on a violation.
+enum class BdaSyncMode { Selective, Legacy, SelectiveChecked };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -51,6 +56,7 @@ struct ConfigOptions {
 	uint32_t               controller_speaker_volume      = 50;
 	uint32_t               controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	BdaSyncMode            bda_sync_mode               = BdaSyncMode::Selective;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
@@ -93,6 +99,7 @@ const std::optional<ControllerColor>& GetControllerColor();
 uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();
 PresentMode GetPresentMode();
+BdaSyncMode GetBdaSyncMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HideCursorEnabled();

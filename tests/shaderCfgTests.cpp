@@ -1681,6 +1681,47 @@ void TestNewShaderRecompilerSMovB32() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// Wave64 emulated as two 32-lane halves per host thread: v_mov_b32 v1, v0 with a DPP control,
+// stored to a buffer so that dead-code elimination keeps it.
+std::vector<uint32_t> CompileWave64DppMove(uint32_t dpp_ctrl) {
+  static ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  compute.wave_size = 64;
+  compute.host_subgroup_size = 32;
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 1, 250), // v_mov_b32 v1, v0 dpp
+      EncodeVop1Dpp(0, dpp_ctrl),
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(1, 12, 0),
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64;
+  options.input_info.compute = &compute;
+  return RecompileForTest(shader, options).spirv;
+}
+
+// row_share:N must read lane N of the caller's row; before the fix it compiled to the same
+// SPIR-V as an identity move.
+void TestWave64DppRowShare() {
+  const auto row_share = CompileWave64DppMove(0x155);
+  // 0x1ff is not a DPP16 control; it takes the identity fallthrough row_share used to hit.
+  const auto identity = CompileWave64DppMove(0x1ff);
+  CheckSpirvBinaryValidates(row_share);
+  CheckSpirvBinaryValidates(identity);
+  Check(SpirvInstructionOpcodeCount(row_share, 345) >= 2,
+        "wave64 DPP row_share lost its subgroup shuffles");
+  Check(row_share != identity,
+        "DPP row_share:5 compiled to the same SPIR-V as an identity move");
+  // Rows 2 and 3 live in the second half: the target lane keeps the caller's row, so the
+  // module has to contain the 0xfffffff0 row mask.
+  Check(std::find(row_share.begin(), row_share.end(), 0xfffffff0u) !=
+            row_share.end(),
+        "DPP row_share target lane does not keep the caller's row");
+}
+
 void TestShaderStageBarriers() {
   const uint32_t shader[] = {
       EncodeSopp(0x0a, 0),    // s_barrier
@@ -14906,6 +14947,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestWave64DppRowShare();
   TestShaderStageBarriers();
   TestVertexBufferGrouping();
   TestNggVertexEntryState();

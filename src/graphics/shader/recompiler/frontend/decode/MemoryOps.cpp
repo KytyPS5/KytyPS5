@@ -409,8 +409,9 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
-	if (lds != 0 || inst.glc || (inst.slc && !IsFlatStoreOpcode(inst.opcode)) || seg == 3u) {
-		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
+	// With no FLAT atomics decoded, GLC/SLC/DLC are only cache policy.
+	if (lds != 0 || seg == 3u) {
+		SetUnsupported(inst, Family::FLAT, opcode, "FLAT LDS or segment is not implemented");
 		return;
 	}
 	if (inst.opcode == Opcode::UNSUPPORTED) {

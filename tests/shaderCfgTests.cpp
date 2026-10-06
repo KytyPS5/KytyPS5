@@ -7994,6 +7994,46 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// A FLAT load carrying only the DLC cache hint, and s_sext_i32_i16 into vcc_lo.
+void TestNewShaderRecompilerFlatCachePolicyAndScalarSext() {
+  const uint32_t shader[] = {
+      0xdc341000u, 0x007d0004u,          // flat_load_dwordx2 v[0:1], v[4:5] dlc
+      EncodeFlat0(0x0c, 2, 0) | (1u << 16u),
+      EncodeFlat1(2, 0x7d, 0, 4),        // global_load_dword v2, v[4:5], off glc
+      0xbeea1a0bu,                       // s_sext_i32_i16 vcc_lo, s11
+      EncodeSop1(0x19, 3, 1),            // s_sext_i32_i8 s3, s1
+      EncodeVop1(0x01, 6, 3),            // v_mov_b32 v6, s3
+      EncodeVop1(0x01, 7, 106),          // v_mov_b32 v7, vcc_lo
+      EncodeFlat0(0x1c, 2, 0),
+      EncodeFlat1(0, 0x7d, 6, 4),        // global_store_dword v[4:5], v6, off
+      EncodeFlat0(0x1c, 2, 4),
+      EncodeFlat1(0, 0x7d, 7, 4),        // global_store_dword v[4:5], v7, off offset:4
+      EncodeFlat0(0x1d, 2, 8),
+      EncodeFlat1(0, 0x7d, 0, 4),        // global_store_dwordx2 v[4:5], v[0:1], off offset:8
+      EncodeFlat0(0x1c, 2, 16),
+      EncodeFlat1(0, 0x7d, 2, 4),        // global_store_dword v[4:5], v2, off offset:16
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("unsupported") == std::string::npos,
+        "FLAT cache-policy bits or S_SEXT were still refused");
+  Check(result.decoded_dump.find("S_SEXT_I32_I16 vcc_lo, s11") != std::string::npos,
+        "new decoder did not decode S_SEXT_I32_I16");
+  Check(result.decoded_dump.find("S_SEXT_I32_I8 s3, s1") != std::string::npos,
+        "new decoder did not decode S_SEXT_I32_I8");
+  Check(result.ir_dump.find("BitFieldSExtract %2, 0x00000000, 0x00000010") != std::string::npos,
+        "S_SEXT_I32_I16 did not lower to a 16-bit sign extract");
+  Check(result.ir_dump.find("BitFieldSExtract %1, 0x00000000, 0x00000008") != std::string::npos,
+        "S_SEXT_I32_I8 did not lower to an 8-bit sign extract");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract for S_SEXT");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerUnbasedFlatUsesBda() {
   const uint32_t shader[] = {
       EncodeFlat0(0x0c, 0, 0),
@@ -18166,6 +18206,7 @@ int main() {
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
+  TestNewShaderRecompilerFlatCachePolicyAndScalarSext();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();
   TestNewShaderRecompilerCfgStraightLine();

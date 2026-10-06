@@ -663,7 +663,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				// conversion format strict because those change SPIR-V types/operations.
 				if (image.numeric_class == image_class.numeric_class &&
 				    (same_coordinates || (is_2d(image.dimension) && is_2d(image_class.dimension))) &&
-				    image.conversion_format == image_class.conversion_format) {
+				    image.conversion_format == image_class.conversion_format && swizzle_compatible) {
 					if (program.info.images[root_index].mip_mode == ImageMipMode::None) {
 						image.mip_count = image_class.mip_count;
 					}

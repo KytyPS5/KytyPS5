@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/spscQueue.h"
@@ -382,6 +383,23 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
+void BufferCache::CacheFaultedMemory(uint64_t vaddr, uint64_t size) {
+	for (size_t i = 0; i < StaleRingSize; i++) {
+		const auto address = m_stale_ring[i * 2].load(std::memory_order_relaxed);
+		const auto length  = m_stale_ring[i * 2 + 1].load(std::memory_order_relaxed);
+		if (length != 0 && address < vaddr + size && vaddr < address + length) {
+			Common::HackNotice::Report(
+			    "buffer released by age reached again by a device-address fault",
+			    "BufferCache::CacheFaultedMemory", 0, 0,
+			    "a shader read that memory before the buffer existed again (first read may be zero)");
+			break;
+		}
+	}
+	if (const auto id = FindBuffer(vaddr, size)) {
+		m_slot_buffers[id].device_address_pinned = true;
+	}
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
 	static constexpr int      StreamLeapThreshold = 16;
 	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
@@ -441,6 +459,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.device_address_pinned |= overlap.device_address_pinned;
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	NoteWrite(overlap.CpuAddress(), overlap.Size());
@@ -1269,8 +1288,52 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+void BufferCache::CollectStaleBuffers(uint64_t tick) {
+	// Buffers outlive the draws that created them, and once the guest moves elsewhere the memory
+	// they cover is reused for other data. Every device-address synchronization keeps uploading the
+	// guest's writes there and protecting the pages again, so the guest takes write faults on
+	// memory no draw reads, more of it the longer the session runs (the collection under memory
+	// pressure below rarely runs). Release the buffers no lookup used for a long time; the next use
+	// creates them again. Buffers with GPU writes stay, and so do the ones shaders reached through
+	// device addresses the host could not see coming.
+	static constexpr uint64_t StaleAge      = 2048; // garbage-collection ticks: about half a minute
+	static constexpr uint64_t StalePeriod   = 8;
+	static constexpr size_t   StaleVisitMax = 64;
+	static constexpr size_t   StaleFreeMax  = 16;
+	if (tick < StaleAge || tick % StalePeriod != 0) {
+		return;
+	}
+	std::vector<BufferId> stale;
+	std::vector<BufferId> kept;
+	m_lru_cache.ForEachItemBelow(tick - StaleAge, [&](BufferId id) {
+		const auto& buffer = m_slot_buffers[id];
+		const bool  keep   = buffer.device_address_pinned ||
+		                  m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) ||
+		                  m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
+		(keep ? kept : stale).push_back(id);
+		return stale.size() == StaleFreeMax || stale.size() + kept.size() == StaleVisitMax;
+	});
+	// The buffers that stay move to the back of the queue, so the next passes reach the others.
+	for (const auto id: kept) {
+		m_lru_cache.Touch(m_slot_buffers[id].lru_id, tick);
+	}
+	for (const auto id: stale) {
+		const auto& buffer = m_slot_buffers[id];
+		const auto slot =
+		    (m_stale_ring_next.fetch_add(1, std::memory_order_relaxed) % StaleRingSize) * 2;
+		m_stale_ring[slot].store(buffer.CpuAddress(), std::memory_order_relaxed);
+		m_stale_ring[slot + 1].store(buffer.Size(), std::memory_order_relaxed);
+		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
+		if (m_record_released) {
+			m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());
+		}
+		DeleteBuffer(id);
+	}
+}
+
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -1327,6 +1390,17 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::ProcessUseBuffer() {
+	m_fault_manager.ProcessUseBuffer([this](std::span<const uint64_t> pages) {
+		for (const auto page: pages) {
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner != nullptr && *owner) {
+				TouchBuffer(m_slot_buffers[*owner]);
+			}
+		}
+	});
 }
 
 void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {

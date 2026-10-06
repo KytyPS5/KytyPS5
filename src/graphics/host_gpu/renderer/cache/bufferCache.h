@@ -37,10 +37,12 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
-	// The fault buffer holds two bitmaps of CACHING_NUMPAGES bits: pages that device-address
-	// accesses found without a cached buffer, then pages that V#-table stores wrote.
+	// The fault buffer holds three bitmaps of CACHING_NUMPAGES bits: pages that device-address
+	// accesses found without a cached buffer, pages that V#-table stores wrote, and pages that
+	// device-address accesses found cached (their buffers are in use).
 	static constexpr uint64_t WRITE_BITMAP_OFFSET = CACHING_NUMPAGES / 8;
-	static constexpr uint64_t FAULT_BUFFER_SIZE   = 2 * WRITE_BITMAP_OFFSET;
+	static constexpr uint64_t USE_BITMAP_OFFSET   = 2 * WRITE_BITMAP_OFFSET;
+	static constexpr uint64_t FAULT_BUFFER_SIZE   = 3 * WRITE_BITMAP_OFFSET;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -68,6 +70,8 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// Caches memory a shader reached through a device address the host did not know beforehand.
+	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -111,6 +115,9 @@ public:
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
+	// Counts the buffers that shaders reached through device addresses since the last call as
+	// used, once the GPU work recorded so far completes: the age collection keeps them.
+	void               ProcessUseBuffer();
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
@@ -222,6 +229,7 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	void CollectStaleBuffers(uint64_t tick);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -281,6 +289,11 @@ private:
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
+	// The last buffers CollectStaleBuffers() released ([address, size] pairs, a ring): a device
+	// address fault inside one of them means a shader reached memory the age release dropped.
+	static constexpr size_t                           StaleRingSize = 32;
+	std::array<std::atomic<uint64_t>, StaleRingSize * 2> m_stale_ring {};
+	std::atomic<uint32_t>                             m_stale_ring_next {0};
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
 	WriteTicks                                        m_write_ticks;

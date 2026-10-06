@@ -6792,6 +6792,98 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBufferCacheStaleCollection() {
+    constexpr const char *name = "BufferCacheStaleCollection";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    // Larger than a caching page, so read-only acquisitions cache instead of
+    // streaming.
+    constexpr uint64_t range = 0x10000;
+    constexpr uint64_t stale_offset = 0x000000;
+    constexpr uint64_t used_offset = 0x100000;
+    constexpr uint64_t written_offset = 0x200000;
+    constexpr uint64_t faulted_offset = 0x300000;
+    // Longer than the age after which unused buffers are collected.
+    constexpr uint32_t ticks = 4096;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "stale-GC direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "stale-GC fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      // No memory pressure: only the age collection can release buffers.
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+
+      const auto stale = cache.ObtainBuffer(base + stale_offset, range, false);
+      const auto used = cache.ObtainBuffer(base + used_offset, range, false);
+      const auto written =
+          cache.ObtainBuffer(base + written_offset, range, true, false);
+      cache.CacheFaultedMemory(base + faulted_offset, range);
+      Require(name, "cached buffers",
+              stale.first != nullptr && used.first != nullptr &&
+                  written.first != nullptr &&
+                  cache.IsRegionRegistered(base + stale_offset, range) &&
+                  cache.IsRegionRegistered(base + faulted_offset, range) &&
+                  !cache.IsRegionCpuModified(base + stale_offset, range),
+              "buffers were not cached and synchronized");
+
+      for (uint32_t tick = 0; tick < ticks; tick++) {
+        // A lookup is a use.
+        (void)cache.FindBuffer(base + used_offset, range);
+        cache.RunGarbageCollector();
+      }
+      Require(name, "unused buffer released",
+              !cache.IsRegionRegistered(base + stale_offset, range) &&
+                  cache.IsRegionCpuModified(base + stale_offset, range),
+              "an unused clean buffer outlived the age collection or left "
+              "its pages protected");
+      Require(name, "used, GPU-written and faulted buffers kept",
+              cache.IsRegionRegistered(base + used_offset, range) &&
+                  cache.IsRegionRegistered(base + written_offset, range) &&
+                  cache.IsRegionGpuModified(base + written_offset, range) &&
+                  cache.IsRegionRegistered(base + faulted_offset, range),
+              "the age collection released a buffer still in use, holding "
+              "GPU writes or reached through a device-address fault");
+
+      cache.ReadMemory(base + written_offset, range);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "stale-GC direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "stale-GC direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckIndirectWriteTables() {
     constexpr const char *name = "IndirectWriteTables";
     constexpr uintptr_t base = 0x0000000206000000ull;
@@ -58554,6 +58646,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-stale-gc-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCacheStaleCollection();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-write-tables-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckIndirectWriteTables();
@@ -58843,6 +58940,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheStaleCollection();
     vulkan.CheckIndirectWriteTables();
   } else {
     skipped_device_checks = true;

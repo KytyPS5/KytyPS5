@@ -183,16 +183,13 @@ uint32_t BdaPageIndex(EmitterState& state, uint32_t address) {
 	return Unary(state, spv::OpUConvert, TypeU32(state), page64);
 }
 
-// Sets the page's bit in the write bitmap, so the host learns which pages V#-table stores wrote.
-// Most stores find the bit set already; only the first store to a page pays for the atomic.
-void RecordBdaWrite(EmitterState& state, uint32_t page) {
-	static_assert(BufferCache::WRITE_BITMAP_OFFSET % sizeof(uint32_t) == 0 &&
-	              BufferCache::WRITE_BITMAP_OFFSET / sizeof(uint32_t) <= UINT32_MAX);
+// Sets the page's bit in the fault buffer bitmap at `bitmap_offset`. Most accesses find the bit
+// set already; only the first one to a page since the host last read the bitmap pays the atomic.
+void RecordBdaPageBit(EmitterState& state, uint32_t page, uint64_t bitmap_offset) {
 	const auto word = Binary(
 	    state, spv::OpIAdd, TypeU32(state),
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5)),
-	    ConstantU32(state,
-	                static_cast<uint32_t>(BufferCache::WRITE_BITMAP_OFFSET / sizeof(uint32_t))));
+	    ConstantU32(state, static_cast<uint32_t>(bitmap_offset / sizeof(uint32_t))));
 	const auto bit =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
@@ -208,6 +205,13 @@ void RecordBdaWrite(EmitterState& state, uint32_t page) {
 		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
 		                          pointer, scope, relaxed, bit);
 	});
+}
+
+// The host learns which pages V#-table stores wrote.
+void RecordBdaWrite(EmitterState& state, uint32_t page) {
+	static_assert(BufferCache::WRITE_BITMAP_OFFSET % sizeof(uint32_t) == 0 &&
+	              BufferCache::WRITE_BITMAP_OFFSET / sizeof(uint32_t) <= UINT32_MAX);
+	RecordBdaPageBit(state, page, BufferCache::WRITE_BITMAP_OFFSET);
 }
 
 void RecordBdaFault(EmitterState& state, uint32_t page) {
@@ -1464,6 +1468,11 @@ void DefineGetBdaPointer(EmitterState& state) {
 	                          page);
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	// The host releases cached buffers no access used for a long time: record the access (a page
+	// without a buffer has no owner to keep).
+	static_assert(BufferCache::USE_BITMAP_OFFSET % sizeof(uint32_t) == 0 &&
+	              BufferCache::USE_BITMAP_OFFSET / sizeof(uint32_t) <= UINT32_MAX);
+	RecordBdaPageBit(state, page, BufferCache::USE_BITMAP_OFFSET);
 	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
 	const auto fault_label     = state.builder.AllocateId();
 	const auto available_label = state.builder.AllocateId();

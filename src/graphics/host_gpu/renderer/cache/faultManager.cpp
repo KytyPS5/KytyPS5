@@ -23,6 +23,8 @@ namespace {
 constexpr size_t MaxPageFaults = 1024;
 // Pages V#-table stores may write between two reads; more stay in the bitmap for the next read.
 constexpr size_t MaxPageWrites = 16384;
+// Pages device-address accesses found cached between two reads; more stay for the next read.
+constexpr size_t MaxPageUses = 65536;
 
 } // namespace
 
@@ -37,7 +39,8 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                      BufferCache::FAULT_BUFFER_SIZE),
-      m_faults(graphics, scheduler, MaxPageFaults), m_writes(graphics, scheduler, MaxPageWrites) {
+      m_faults(graphics, scheduler, MaxPageFaults), m_writes(graphics, scheduler, MaxPageWrites),
+      m_uses(graphics, scheduler, MaxPageUses) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
@@ -75,7 +78,7 @@ FaultManager::~FaultManager() {
 
 void FaultManager::PrepareFaultBuffer() {
 	if (!m_cleared) {
-		// Shaders only set bits: both bitmaps must start clear.
+		// Shaders only set bits: the bitmaps must start clear.
 		m_fault_buffer.Fill(0, m_fault_buffer.Size(), 0);
 		m_cleared = true;
 	}
@@ -93,7 +96,7 @@ void FaultManager::ProcessFaultBuffer() {
 			// The guest may have unmapped the range since the GPU accessed it: an unmap does not
 			// wait for this completion.
 			if (m_scheduler.Context().IsMapped(start, end - start)) {
-				(void)m_buffer_cache.FindBuffer(start, end - start);
+				m_buffer_cache.CacheFaultedMemory(start, end - start);
 			}
 		});
 	});
@@ -101,6 +104,10 @@ void FaultManager::ProcessFaultBuffer() {
 
 void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
 	Process(m_writes, BufferCache::WRITE_BITMAP_OFFSET, std::move(handler));
+}
+
+void FaultManager::ProcessUseBuffer(PagesHandler&& handler) {
+	Process(m_uses, BufferCache::USE_BITMAP_OFFSET, std::move(handler));
 }
 
 void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&& handler) {

@@ -13,9 +13,10 @@ namespace Libs::Graphics {
 
 class BufferCache;
 
-// The fault buffer holds two page bitmaps (one bit per BufferCache caching page): shaders record
-// device-address accesses that found no cached buffer in the first, and pages that V#-table
-// stores wrote in the second. Both are read back asynchronously.
+// The fault buffer holds three page bitmaps (one bit per BufferCache caching page): shaders record
+// device-address accesses that found no cached buffer in the first, pages that V#-table stores
+// wrote in the second, and device-address accesses that found a cached buffer in the third. All
+// are read back asynchronously.
 class FaultManager {
 	static constexpr size_t MaxPendingFaults = 8;
 
@@ -33,6 +34,8 @@ public:
 	// Clears the write bitmap and, once the GPU work recorded so far completes, passes the guest
 	// addresses of the written caching pages to `handler`.
 	void                  ProcessWriteBuffer(PagesHandler&& handler);
+	// The same for the pages that device-address accesses found cached.
+	void                  ProcessUseBuffer(PagesHandler&& handler);
 
 private:
 	struct Reader {
@@ -52,6 +55,7 @@ private:
 	Buffer                  m_fault_buffer;
 	Reader                  m_faults;
 	Reader                  m_writes;
+	Reader                  m_uses;
 	vk::DescriptorSetLayout m_fault_process_desc_layout     = nullptr;
 	vk::Pipeline            m_fault_process_pipeline        = nullptr;
 	vk::PipelineLayout      m_fault_process_pipeline_layout = nullptr;

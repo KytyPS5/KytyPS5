@@ -73,6 +73,9 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Shaders reached the buffer's memory through device addresses the host did not know
+	// beforehand (a device-address fault): the age collection keeps it.
+	bool device_address_pinned = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

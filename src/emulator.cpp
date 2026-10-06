@@ -26,8 +26,13 @@
 #include "loader/timer.h"
 
 #include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <thread>
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <Windows.h>
+#undef DeleteFile
+#endif
 
 namespace Emulator {
 
@@ -177,6 +182,18 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (Config::DlssFrameGenerationEnabled()) {
+		// Guest and SDK threads are still running on this fast-exit path.
+		// ExitProcess's DLL detach callbacks can race FG work. Preserve the
+		// existing emergency persistence, then let Windows reclaim resources
+		// without invoking DLL teardown on these live threads.
+		Common::Subsystems::EmergencyShutdownActive();
+		std::fflush(nullptr);
+		TerminateProcess(GetCurrentProcess(), 0);
+		std::_Exit(0);
+	}
+#endif
 	std::quick_exit(0);
 }
 

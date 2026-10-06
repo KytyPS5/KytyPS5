@@ -18,7 +18,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
 		case O::S_SETREG_B32: EmitControlNop(); return;
-		case O::S_WAITCNT: EmitWaitcnt(); return;
+		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
+		case O::S_WAITCNT: return;
 
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
@@ -164,9 +165,16 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BCNT1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitCount32, IR::Type::U32, false, false,
 			                     true);
-		case O::S_BCNT1_I32_B64:
-			return SimpleInteger(inst, IR::ValueOpcode::BitCount64, IR::Type::U64, false, false,
-			                     true);
+		case O::S_BCNT1_I32_B64: {
+			// Vulkan bit counts operate on 32-bit words; avoid packing only to split again.
+			const auto value  = ReadU32Pair(inst.src0);
+			const auto low    = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[0]}));
+			const auto high   = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[1]}));
+			const auto result = ir.IAdd(low, high);
+			WriteOperand(inst.dst, result);
+			ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
+			return;
+		}
 		case O::S_FF1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::FindILsb32, IR::Type::U32, false, false,
 			                     false);
@@ -224,7 +232,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
 		case O::S_TRAP: EmitControlNop(); return;
-		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return;
+		case O::S_WAITCNT_DEPCTR: return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
 		case O::S_TTRACEDATA: S_TTRACEDATA(); return;

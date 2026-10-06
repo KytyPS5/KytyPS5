@@ -3,7 +3,7 @@ TestCase FlatStackApertures(u32 wave_size) {
   test.name = wave_size == 32 ? "FlatStackApertures32" : "FlatStackApertures64";
   auto &code = test.code;
   code = {EncodeSop1(0x04, 8, 237), // private base
-          EncodeSop1(0x04, 10, 235), // shared base
+          EncodeSop1(0x0b, 11, InlineU32(1)), // S_BREV_B32 shared aperture, as in GTA.
           EncodeVop2(0x1a, 20, InlineU32(2), 0),
           EncodeVop2(0x1b, 22, InlineU32(1), 0),
           EncodeVop2(0x1a, 22, InlineU32(31), 22)};
@@ -77,17 +77,21 @@ TestCase FlatStackApertures(u32 wave_size) {
   test.compute_info.scratch_size_dwords = wave_size;
   test.compute_info.lds_size_dwords = wave_size;
   test.has_compute_info = true;
+  test.decoded_counts = {{"S_BREV_B32", 1}};
+  test.ir_counts = {{" = BitReverse32 ", 0}};
   test.forbidden_spirv = {"get_bda_pointer"};
   return test;
 }
 
-TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0) {
+TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wide = false) {
   TestCase test;
   test.name = barycentrics ? (sorted ? "BvhBarycentricSorted" : "BvhBarycentricUnsorted")
                           : (sorted ? "BvhTriangleIdSorted" : "BvhTriangleIdUnsorted");
   if (grow != 0) test.name = "BvhBoxExitGrowth";
+  if (wide) test.name = "Bvh64HighNodePointers";
   constexpr u32 NodeStart = 1024, OutputStart = 512, LaneCount = 32;
   constexpr uint64_t GuestBase = 0x10000;
+  const u32 node_base = wide ? 1u << 29 : 0;
   const auto bits = [](float value) { return std::bit_cast<u32>(value); };
   constexpr u32 Infinity = 0x7f800000, Invalid = UINT32_MAX, Flag = 0x04040404;
   test.initial.resize(NodeStart + 258 * 16);
@@ -181,6 +185,19 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0) {
     } else if (lane == 29) {
       data[input] = (255 << 3) | 5;
     }
+    if (wide) {
+      // Keep the same small backing while placing nodes beyond the 32-bit pointer range.
+      std::copy_backward(data.begin() + input + 1, data.begin() + input + 11,
+                         data.begin() + input + 12);
+      data[input + 1] = 1;
+      if (lane == 14 || lane == 15) {
+        data[input] = lane == 14 ? 0 : 5;
+        // Neither an oversized index nor a shifted-address wrap may read node zero.
+        data[input + 1] = lane == 14 ? 0x00001000 : 0x20000000;
+        expected[lane] = lane == 14 ? std::array<u32, 4>{Infinity, bits(1), Invalid, 0}
+                                    : std::array<u32, 4>{Invalid, Invalid, Invalid, Invalid};
+      }
+    }
   }
   test.expected = test.initial;
   for (u32 lane = 0; lane < LaneCount; ++lane) {
@@ -196,29 +213,31 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0) {
   // The resource is a GPU value, not a materialized host image descriptor.
   AppendSMovLiteral(&code, 8, GuestBase >> 8);
   AppendSMovLiteral(&code, 9, (sorted ? 0x80000000 : 0) | (grow << 23));
-  AppendSMovLiteral(&code, 10, 256);
+  AppendSMovLiteral(&code, 10, node_base + 256);
   AppendSMovLiteral(&code, 11, barycentrics ? 0x81000000 : 0x80000000);
   code.push_back(EncodeVop2(0x1a, 1, InlineU32(6), 0));
   for (u32 offset : {0u, 4u, 8u}) {
-    code.insert(code.end(), {EncodeMubuf0(offset == 8 ? 0x0f : 0x0e, offset * 4),
+    code.insert(code.end(), {EncodeMubuf0(offset == 8 && !wide ? 0x0f : 0x0e, offset * 4),
                              EncodeMubuf1(4 + offset, 0, 1)});
   }
-  code.insert(code.end(), {EncodeMimg0(0xe6, 15, 0, false, 0, true),
+  code.insert(code.end(), {EncodeMimg0(wide ? 0xe7 : 0xe6, 15, 0, false, 0, true),
                            EncodeMimg1(20, 4, 2)});
   code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0));
   for (u32 i = 0; i < 4; ++i) AppendStoreVgprAtLaneDwordOffset(&code, 20 + i, 2, OutputStart + i);
   // NSA addressing, the FP32 second-block bound, and inactive destination lanes.
-  AppendSMovLiteral(&code, 10, 2);
+  AppendSMovLiteral(&code, 10, node_base + 2);
   for (u32 i = 0; i < 4; ++i) AppendVMovLiteral(&code, 24 + i, 0x12345678 + i);
   AppendSMovLiteral(&code, 126, 0x000fffff);
-  code.insert(code.end(), {EncodeMimg0(0xe6, 15, 3, false, 0, true),
-                           EncodeMimg1(24, 4, 2), 0x08070605, 0x0c0b0a09, 0x00000e0d});
+  code.insert(code.end(), {EncodeMimg0(wide ? 0xe7 : 0xe6, 15, 3, false, 0, true),
+                           EncodeMimg1(24, 4, 2), 0x08070605, 0x0c0b0a09,
+                           wide ? 0x000f0e0du : 0x00000e0du});
   code.push_back(EncodeSop1(0x04, 126, 193));
   for (u32 i = 0; i < 4; ++i)
     AppendStoreVgprAtLaneDwordOffset(&code, 24 + i, 2, OutputStart + LaneCount * 4 + i);
   AppendEnd(&code);
-  test.bda_mappings = {{GuestBase, NodeStart * sizeof(u32)},
-                       {GuestBase + 0x4000, (NodeStart + 257 * 16) * sizeof(u32)}};
+  const auto nodes_address = GuestBase + (uint64_t{node_base} << 6);
+  test.bda_mappings = {{nodes_address, NodeStart * sizeof(u32)},
+                       {nodes_address + 0x4000, (NodeStart + 257 * 16) * sizeof(u32)}};
   test.compute_info.wave_size = LaneCount;
   test.compute_info.threads_num[0] = LaneCount;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;

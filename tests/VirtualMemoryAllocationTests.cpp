@@ -1967,6 +1967,122 @@ void TestDirectMapUnmapReusesHostAddress() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if defined(__linux__)
+void TestFixedDirectReplacementPreservesAccess() {
+	using namespace Libs::LibKernel::Memory;
+	using Common::VirtualMemory::Mode;
+	const char* test = "FixedDirectReplacementPreservesAccess";
+	constexpr uint64_t page = SceKernelPageSize;
+	int64_t physical = 0;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), page * 4, page,
+	                                        SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* alias = nullptr;
+	void* address = nullptr;
+	CheckOk(test, KernelMapNamedDirectMemory(&alias, page * 4, SceKernelProtCpuRw, 0, physical,
+	                                        page, "replacement_alias"),
+	        "KernelMapNamedDirectMemory(alias)");
+	CheckOk(test, KernelMapNamedDirectMemory(&address, page * 3, SceKernelProtCpuRw, 0, physical,
+	                                        page, "replacement_original"),
+	        "KernelMapNamedDirectMemory(original)");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	const auto alias_base = reinterpret_cast<uint64_t>(alias);
+	for (uint64_t i = 0; i < 4; ++i) {
+		*reinterpret_cast<uint64_t*>(alias_base + i * page) = (i + 1) * 0x11;
+	}
+	const auto replace = [&](uint64_t offset, uint64_t size, int protection, const char* name) {
+		void* middle = reinterpret_cast<void*>(base + page);
+		const int result = KernelMapNamedDirectMemory(&middle, size, protection, SceKernelMapFixed,
+		                                             physical + offset, page, name);
+		if (result == OK) {
+			Check(test, reinterpret_cast<uint64_t>(middle) == base + page,
+			      "fixed replacement moved the destination");
+		}
+		return result;
+	};
+	static unsigned observations = 0;
+	observations = 0;
+	const auto observe_old_mapping = [](uintptr_t start, size_t size) {
+		++observations;
+		uint64_t value = 0;
+		ssize_t bytes = -1;
+		std::thread reader([&] {
+			iovec local {&value, sizeof(value)};
+			iovec remote {reinterpret_cast<void*>(start), sizeof(value)};
+			bytes = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+		});
+		reader.join();
+		Check("FixedDirectReplacementPreservesAccess",
+		      size == SceKernelPageSize && bytes == sizeof(value) && value == 0x22,
+		      "fixed replacement exposed an inaccessible or changed old mapping before mmap");
+	};
+	Check(test, ProtectGuestHostMemory(base, page, Mode::Read) &&
+	                ProtectGuestHostMemory(base + page * 2, page, Mode::NoAccess),
+	      "could not protect neighboring pages");
+	TestBeforeNextBackingMap(observe_old_mapping);
+	CheckOk(test, replace(page, page, SceKernelProtCpuRead, "replacement_same"),
+	        "KernelMapNamedDirectMemory(same backing)");
+	ExpectRange(test, Query(test, base + page), base + page, base + page * 2,
+	            SceKernelProtCpuRead, 0, 1, 0, 1, "replacement_same", physical + page);
+	TestBeforeNextBackingMap(observe_old_mapping);
+	CheckOk(test, replace(page * 3, page, SceKernelProtCpuRw, "replacement_changed"),
+	        "KernelMapNamedDirectMemory(different backing)");
+	Check(test, observations == 2, "pre-map observations did not execute");
+	Check(test, *reinterpret_cast<uint64_t*>(base + page) == 0x44,
+	      "replacement did not select the new physical offset");
+	*reinterpret_cast<uint64_t*>(base + page) = 0x45;
+	Check(test, *reinterpret_cast<uint64_t*>(alias_base + page * 3) == 0x45 &&
+	                *reinterpret_cast<uint64_t*>(alias_base + page) == 0x22,
+	      "replacement lost aliasing or changed the previous backing");
+	uint64_t value = 0;
+	iovec local {&value, sizeof(value)};
+	iovec left {reinterpret_cast<void*>(base), sizeof(value)};
+	iovec right {reinterpret_cast<void*>(base + page * 2), sizeof(value)};
+	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value) &&
+	                value == 0x11 && process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1 &&
+	                process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
+	      "middle replacement changed a neighboring page's bytes or host protection");
+	Check(test, ProtectGuestHostMemory(base, page * 3, Mode::ReadWrite),
+	      "could not restore neighboring permissions");
+	const auto check_preserved = [&] {
+		Check(test, *reinterpret_cast<uint64_t*>(base) == 0x11 &&
+		                *reinterpret_cast<uint64_t*>(base + page) == 0x45 &&
+		                *reinterpret_cast<uint64_t*>(base + page * 2) == 0x33,
+		      "failed replacement changed bytes");
+		for (uint64_t i = 0; i < 3; ++i) {
+			Check(test, !TestPlaceholderRangeIsFree(base + i * page, page),
+			      "failed replacement released part of the owned mapping");
+		}
+		ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRw,
+		            0, 1, 0, 1, "replacement_original", physical);
+		ExpectRange(test, Query(test, base + page), base + page, base + page * 2,
+		            SceKernelProtCpuRw, 0, 1, 0, 1, "replacement_changed", physical + page * 3);
+		ExpectRange(test, Query(test, base + page * 2), base + page * 2, base + page * 3,
+		            SceKernelProtCpuRw, 0, 1, 0, 1, "replacement_original", physical + page * 2);
+	};
+	TestFailPhysicalMemoryUnmapAfter(1);
+	CheckFailed(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
+	            "KernelMapNamedDirectMemory(second-view removal failure)");
+	check_preserved();
+	TestFailNextVirtualRangeReplacement();
+	CheckFailed(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
+	            "KernelMapNamedDirectMemory(publication failure)");
+	check_preserved();
+	CheckOk(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
+	        "KernelMapNamedDirectMemory(multiple backing views)");
+	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x11 &&
+	                *reinterpret_cast<uint64_t*>(base + page) == 0x22 &&
+	                *reinterpret_cast<uint64_t*>(base + page * 2) == 0x33,
+	      "multi-view replacement changed the prefix or chose incorrect backing offsets");
+	ExpectRange(test, Query(test, base + page), base + page, base + page * 3,
+	            SceKernelProtCpuRead, 0, 1, 0, 1, "replacement_span", physical + page);
+	CheckOk(test, KernelMunmap(base, page * 3), "KernelMunmap(replacement)");
+	CheckOk(test, KernelMunmap(alias_base, page * 4), "KernelMunmap(alias)");
+	CheckOk(test, KernelReleaseDirectMemory(physical, page * 4), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestFixedReserveReplacesPartialDirectMapping() {
 	const char*        test         = "FixedReserveReplacesPartialDirectMapping";
 	constexpr uint64_t page_count   = 13;
@@ -4062,6 +4178,12 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+#if defined(__linux__)
+	if (argc == 2 && std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
+		RunTest(TestFixedDirectReplacementPreservesAccess);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
 		RunTest(TestSmallFiberStacksAndMigration);
@@ -4139,6 +4261,9 @@ int main(int argc, char** argv) {
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
+#if defined(__linux__)
+	RunTest(TestFixedDirectReplacementPreservesAccess);
+#endif
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);

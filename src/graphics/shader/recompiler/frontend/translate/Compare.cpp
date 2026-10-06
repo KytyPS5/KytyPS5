@@ -31,6 +31,7 @@ void Translator::EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueO
 	const bool signed_64 = opcode == IR::ValueOpcode::SLessThan64 ||
 	                       opcode == IR::ValueOpcode::SLessThanEqual64 ||
 	                       inst.opcode == Decoder::Opcode::V_CMP_EQ_I64 ||
+	                       inst.opcode == Decoder::Opcode::V_CMP_NE_I64 ||
 	                       inst.opcode == Decoder::Opcode::V_CMPX_NE_I64;
 	const auto read = [&](const Decoder::Operand& operand) {
 		// RDNA2 expands signed 64-bit integer literals by sign extension.
@@ -71,11 +72,13 @@ void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool 
 	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false, cmpx);
 }
 
-void Translator::EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx) {
-	const auto value = ReadOperand(inst.src0, IR::Type::F32);
-	const auto mask  = ReadOperand(inst.src1, IR::Type::U32);
-	EmitCompareResult(inst, IR::U1(ir.Emit(IR::ValueOpcode::FPCmpClass32, {value, mask})), false,
-	                  cmpx);
+void Translator::EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx, bool half) {
+	const auto value = half ? IR::Value(Read16LaneBits(inst.src0, false))
+	                        : ReadOperand(inst.src0, IR::Type::F32);
+	const auto mask = half ? IR::Value(Read16LaneBits(inst.src1, false))
+	                      : ReadOperand(inst.src1, IR::Type::U32);
+	const auto opcode = half ? IR::ValueOpcode::FPCmpClass16 : IR::ValueOpcode::FPCmpClass32;
+	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {value, mask})), false, cmpx);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

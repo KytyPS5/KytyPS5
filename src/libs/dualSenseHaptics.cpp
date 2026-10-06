@@ -178,7 +178,11 @@ SDL_AudioDeviceID FindDevice() {
 	for (int i = 0; i < count; i++) {
 		const char*   name = SDL_GetAudioDeviceName(devices[i]);
 		SDL_AudioSpec spec {};
-		if (name != nullptr && SDL_strcasestr(name, "DualSense") != nullptr &&
+		const bool is_dualsense_name =
+		    name != nullptr &&
+		    (SDL_strcasestr(name, "DualSense") != nullptr ||
+		     SDL_strcasestr(name, "Wireless Controller") != nullptr);
+		if (is_dualsense_name &&
 		    SDL_GetAudioDeviceFormat(devices[i], &spec, nullptr) && spec.channels == 4) {
 			if (device != 0) {
 				device = 0; // Multiple matching endpoints cannot be associated reliably either.

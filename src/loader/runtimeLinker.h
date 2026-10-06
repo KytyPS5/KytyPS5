@@ -102,11 +102,10 @@ struct DynamicInfo {
 
 	const char* so_name = nullptr;
 
-	std::vector<const char*> needed;
-	std::vector<ModuleId>    export_modules;
-	std::vector<ModuleId>    import_modules;
-	std::vector<LibraryId>   export_libs;
-	std::vector<LibraryId>   import_libs;
+	std::vector<ModuleId>  export_modules;
+	std::vector<ModuleId>  import_modules;
+	std::vector<LibraryId> export_libs;
+	std::vector<LibraryId> import_libs;
 };
 
 struct Program {
@@ -157,7 +156,6 @@ public:
 	void  Execute(const std::filesystem::path& game_patch = {});
 	int   StartModule(Program* program, size_t args, const void* argp, module_func_t func);
 	int   StopModule(Program* program, size_t args, const void* argp, module_func_t func);
-	void  StartAllModules();
 	void  StopAllModules();
 	void  DeleteTlss(int thread_id);
 	void  SetApplicationHeapApi(void* const api[10]);
@@ -186,7 +184,6 @@ private:
 	static void Relocate(Program* program);
 	static void DeleteProgram(Program* program);
 	static void SetupTlsHandler(Program* program);
-	void        PreloadAdjacentPrograms();
 
 	static const ModuleId*  FindModule(const Program& program, const std::string& id);
 	static const LibraryId* FindLibrary(const Program& program, const std::string& id);

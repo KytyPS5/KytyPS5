@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>760</width>
+    <width>840</width>
     <height>620</height>
    </rect>
   </property>
@@ -182,7 +182,22 @@
        </layout>
       </widget>
      </item>
-     <item row="3" column="0" colspan="2">
+     <item row="3" column="0">
+      <widget class="QGroupBox" name="notifications_group">
+       <property name="title"><string>Notifications</string></property>
+       <layout class="QVBoxLayout" name="notificationsLayout">
+        <item>
+         <widget class="QCheckBox" name="checkBox_trophy_notifications">
+          <property name="toolTip"><string>Show trophy unlock notifications and play their sound.
+To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav with a WAV file and restart the game.</string></property>
+          <property name="text"><string>Enable trophy notifications</string></property>
+          <property name="checked"><bool>true</bool></property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="4" column="0" colspan="2">
       <widget class="QGroupBox" name="debug_group">
        <property name="title">
         <string>Debugging &amp;&amp; logs</string>
@@ -359,16 +374,16 @@
        <layout class="QHBoxLayout" name="controllerVolumeLayout">
         <item>
          <widget class="QSlider" name="slider_controller_volume">
-          <property name="toolTip"><string>Scale the DualSense controller speaker over USB and Bluetooth</string></property>
+          <property name="toolTip"><string>Scale the DualSense speaker over USB and Bluetooth. 50% is the previous default; 100% adds 6 dB of gain.</string></property>
           <property name="maximum"><number>100</number></property>
-          <property name="value"><number>100</number></property>
+          <property name="value"><number>50</number></property>
           <property name="orientation"><enum>Qt::Horizontal</enum></property>
          </widget>
         </item>
         <item>
          <widget class="QLabel" name="label_controller_volume_value">
           <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
-          <property name="text"><string>100%</string></property>
+          <property name="text"><string>50%</string></property>
          </widget>
         </item>
        </layout>

@@ -68,7 +68,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
-		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::ShaderData:
+		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -130,7 +131,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	if (adjustment >= 256 || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
@@ -779,6 +780,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
+	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
@@ -805,30 +807,52 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
-void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-	const auto& program  = *prepared.runtime->program;
-	const auto& snapshot = *prepared.runtime->resources;
-	auto&       cache    = m_context.GetBufferCache();
-
-	prepared.buffer_sources.clear();
-	const auto& layout = program.bindings;
-	if (layout.memory_offset_count == 0) {
-		return;
-	}
-	const auto& resources = layout.descriptors.front().resources;
-	prepared.buffer_sources.reserve(resources.size());
-	for (const auto resource: resources) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
-		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
-		if (address == 0 || requested_size == 0) {
-			prepared.buffer_sources.push_back({});
+	auto& cache = m_context.GetBufferCache();
+	for (auto* stage: stages) {
+		auto& prepared = *stage;
+		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+		const auto& program  = *prepared.runtime->program;
+		const auto& snapshot = *prepared.runtime->resources;
+		prepared.buffer_sources.clear();
+		const auto& layout = program.bindings;
+		if (layout.memory_offset_count == 0) {
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
-		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		const auto& resources = layout.descriptors.front().resources;
+		prepared.buffer_sources.reserve(resources.size());
+		for (const auto resource: resources) {
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
+			const auto address = descriptor.Base48();
+			auto size = descriptor.GetSize();
+			if (address == 0 || size == 0) {
+				prepared.buffer_sources.push_back({});
+				continue;
+			}
+			if (descriptor.NumRecords() == UINT32_MAX) {
+				if (program.info.buffers[resource].written) {
+					// Sentinel write ranges end before tables captured by any bound stage.
+					for (const auto* reader: stages) {
+						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
+							if (read_size == 0) continue;
+							if (read_address > address) {
+								size = std::min(size, read_address - address);
+							} else if (address - read_address < read_size) {
+								EXIT("scalar resource reads overlap a shader buffer write\n");
+							}
+						}
+					}
+				} else {
+					const auto& graphics = m_context.GetGraphics();
+					const auto limit = uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+					                   (graphics.StorageMinAlignment() - 1);
+					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
+				}
+			}
+			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		}
 	}
 }
 
@@ -876,6 +900,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -887,8 +912,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
-	}
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
@@ -918,8 +941,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
+	FindBuffers(stages);
 	for (auto* stage: stages) {
-		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
 	if (uses_dma) {
@@ -1121,12 +1144,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 					case BindingKind::FlattenedSrt:
 					case BindingKind::ShaderData:
+					case BindingKind::SharedMemory:
 					case BindingKind::Gds: {
 						const vk::DescriptorBufferInfo* view = &descriptors.gds;
 						if (binding.kind == BindingKind::FlattenedSrt) {
 							view = &descriptors.flattened_srt;
 						} else if (binding.kind == BindingKind::ShaderData) {
 							view = &descriptors.shader_data_buffer;
+						} else if (binding.kind == BindingKind::SharedMemory) {
+							view = &descriptors.shared_memory;
 						}
 						EXIT_IF(view->buffer == nullptr);
 						m_descriptor_buffers.push_back(*view);

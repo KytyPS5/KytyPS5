@@ -1,8 +1,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 
 namespace {
@@ -117,6 +119,11 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   const auto image1 = AddSource(8);
   const auto sampler0 = AddSource(4);
   const auto sampler1 = AddSource(4);
+  program.descriptor_sources[image1].dwords[0] = Value(1u);
+  program.descriptor_sources[image1].dwords[1] = Value(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k11_11_10UInt) << 20u);
+  program.descriptor_sources[image1].dwords[3] = Value(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   for (uint32_t index = 0; index < 2; ++index) {
     auto &value = block.AppendNewInst(
         ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))});
@@ -133,9 +140,7 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
        .resource_class = ImageResourceClass::Sampled,
        .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
        .dimension =
-           Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
-       .conversion_format =
-           Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm});
+           Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
   program.info.samplers.push_back({.source = sampler0});
   program.info.samplers.push_back({.source = sampler1});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
@@ -212,6 +217,113 @@ void TestIntegerRuntimeValueFollowsSrtReads() {
         "cyclic SRT read-first-lane dependency was accepted");
 }
 
+void TestUniformVectorDescriptorRead() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &handle = block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {Value(0x1000u), Value(4u << 16u), Value(1u), Value(0x16204u)});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer});
+  auto &count = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {Value(&handle), Value(0u), Value(0u), Value(0u), Value(true)});
+  count.SetFlags(MemoryFlags{.index = 0});
+  // The captured indirect kernel shares one read across sibling scalar lane reads,
+  // enclosed by a different EXEC mask. Its resource plan must share that read too.
+  auto &lane = block.AppendNewInst(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  auto &active = block.AppendNewInst(ValueOpcode::ULessThan32, {Value(&lane), Value(32u)});
+  auto &first = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&count), Value(true)});
+  auto &next = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&count), Value(1u)});
+  auto &second = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&next), Value(true)});
+  auto &sum = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&first), Value(&second)});
+  auto &small = block.AppendNewInst(ValueOpcode::ULessThanEqual32, {Value(&count), Value(72u)});
+  auto &selected = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&small), Value(&sum), Value(&count)});
+  auto &masked = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&active), Value(&selected), Value(0u)});
+  auto &records = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&masked), Value(&active)});
+  DescriptorSource source;
+  source.dword_count = 4;
+  source.dwords = {Value(0x2000u), Value(4u << 16u), Value(&records), Value(0x16204u)};
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  Check(ValidateRuntimeValue(program, Value(&count)), "uniform DWORD count was rejected");
+  struct Reads { uint32_t value = 72; uint32_t strict = 0; uint32_t ordinary = 0; bool clean = true; } reads;
+  const SrtRuntime runtime{
+      .read_memory = [](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        words[0] = 999;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = [](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (!reads.clean || address != 0x1000u || words.size() != 1) return false;
+        words[0] = reads.value;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const bool written : {false, true}) {
+    program.info.buffers[0].written = written;
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.control_flow.empty() && plan.requires_specialization_memory &&
+              plan.capture_specialization_reads,
+          "vector descriptor read depended on incidental control-flow capture");
+    reads = {};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers[0].dwords[2] == 145 && reads.strict == 1 && reads.ordinary == 0 &&
+              snapshot.specialization_reads ==
+                  std::vector<std::pair<uint64_t, uint64_t>>{{0x1000u, 4u}},
+          "vector descriptor input was not read and captured exactly once");
+    reads.clean = false;
+    reads.strict = 0;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+              reads.strict == 1 && reads.ordinary == 0,
+          "dirty vector descriptor input fell back to an ordinary memory read");
+  }
+  count.SetArg(4, Value(false));
+  auto &inactive = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&count), Value(false)});
+  reads.strict = 0;
+  uint32_t result = 99;
+  Check(SrtWalker(program, runtime).Evaluate(Value(&inactive), result) &&
+            result == 0 && reads.strict == 0 && reads.ordinary == 0,
+        "literal false EXEC read vector memory");
+  count.SetArg(4, Value(true));
+  handle.SetArg(3, Value(0x204u));
+  Check(SrtWalker(program, runtime).Evaluate(Value(&count), result) &&
+            result == 0 && reads.strict == 0 && reads.ordinary == 0,
+        "invalid vector buffer format read memory");
+  handle.SetArg(3, Value(0x16204u));
+  count.SetArg(1, Value(&lane));
+  Check(!ValidateRuntimeValue(program, Value(&count)),
+        "varying vector address was treated as a uniform descriptor read");
+}
+
+void TestExactReciprocalDescriptorArithmetic() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  auto &block = AddValueBlock(program);
+  for (const float divisor : {64.f, 128.f, 256.f, 512.f,
+                              std::numeric_limits<float>::min(),
+                              std::bit_cast<float>(253u << 23u)}) {
+    auto &reciprocal = block.AppendNewInst(ValueOpcode::FPRecipIFlag32, {Value::F32(divisor)});
+    uint32_t result = 0;
+    Check(SrtWalker(program, {}).Evaluate(Value(&reciprocal), result) &&
+              result == std::bit_cast<uint32_t>(1.f / divisor),
+          "power-of-two reciprocal was not exact");
+  }
+  for (const float divisor : {0.f, 3.f, -64.f, std::numeric_limits<float>::infinity(),
+                              std::numeric_limits<float>::denorm_min(),
+                              std::bit_cast<float>(254u << 23u)}) {
+    auto &reciprocal = block.AppendNewInst(ValueOpcode::FPRecipIFlag32, {Value::F32(divisor)});
+    uint32_t result = 0;
+    Check(!SrtWalker(program, {}).Evaluate(Value(&reciprocal), result),
+          "unsupported reciprocal rounding or exceptional input was accepted");
+  }
+}
+
 void TestUnbasedFlatCacheHitMaterializes() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UnbasedFlatPlan();
@@ -227,6 +339,7 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 1;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   auto &block = AddValueBlock(program);
@@ -243,7 +356,32 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0, .written = true});
+  // A host-evaluable branch captures resource reads and needs the writable
+  // descriptor's clean provenance for the renderer's disjointness proof.
+  auto &condition = block.AppendNewInst(ValueOpcode::IEqual32,
+                                        {Value(&offset), Value(4u)});
+  auto &store_block = AddValueBlock(program);
+  AddValueBlock(program);
+  program.block_info[0].condition = Value(&condition);
+  program.block_info[0].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  program.block_info[0].terminator.true_block = 1;
+  program.block_info[0].terminator.false_block = 2;
+  program.block_info[1].id = 1;
+  program.block_info[1].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  program.block_info[2].id = 2;
+  program.block_info[2].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  store_block.AppendNewInst(ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 1});
   auto plan = ExtractResourcePlan(program);
+  Check(plan.capture_specialization_reads,
+        "conditional writable descriptor lost its alias proof");
   struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
   const std::array<uint32_t, 1> user_data{4u};
   const SrtRuntime runtime{
@@ -269,7 +407,9 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   reads.clean = true;
   reads.strict = 0;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u,
+            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u &&
+            snapshot.specialization_reads ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}},
         "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
 }
 
@@ -313,7 +453,7 @@ void TestFiniteImageRefreshReusesScalarReads() {
   DescriptorSource root;
   root.dword_count = 8;
   root.dwords.fill(Value(0u));
-  root.indirect_image.emplace(DescriptorSource::IndirectImage{}).sources = {0, 1, 2, 1};
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1, 2, 1};
   program.descriptor_sources.push_back(root);
   program.info.images.push_back({
       .source = 3,
@@ -427,6 +567,8 @@ void DbgExit(int) { std::abort(); }
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
+  TestUniformVectorDescriptorRead();
+  TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();

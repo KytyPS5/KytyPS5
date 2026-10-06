@@ -1,87 +1,67 @@
-void TestRayTracingDispatchDetection() {
+void TestRayTracingInstructions() {
   namespace D = ShaderRecompiler::Decoder;
-  const auto check_decoded = [](std::span<const uint32_t> code, bool expected,
-                                const char *message) {
-    D::Program decoded;
-    D::DecodeProgram(code, decoded);
-    Check(decoded.has_bvh == expected, message);
-    if (expected) {
-      const auto &last = decoded.instructions.back();
-      Check(last.family == D::Family::MIMG &&
-                (last.opcode_id == 0xe6u || last.opcode_id == 0xe7u),
-            "decoder continued past the first BVH instruction");
-      const auto result = ShaderRecompiler::TranslateProgram(
-          code, MakeCompileOptions(ShaderType::Compute));
-      Check(result.skip_dispatch && result.program.blocks.empty() && result.cfg_dump.empty(),
-            "BVH compute shader reached IR translation");
+  const std::array code{
+      0xf1989f01u, 0x00081014u,
+      EncodeMubuf0(0x1e, 0, false), EncodeMubuf1(16, 0, 0),
+      0xf1989f07u, 0x00071001u, 0x3d3e3c15u, 0x38095851u, 0x00003a39u,
+      EncodeMubuf0(0x1e, 16, false), EncodeMubuf1(16, 0, 0),
+      0xf19c9f01u, 0x00081014u,
+      EncodeMubuf0(0x1e, 32, false), EncodeMubuf1(16, 0, 0),
+      // Captured 016c1ab44ee6a526: pointer v2:v7 and final inverse component v5.
+      0xf19c9f07u, 0x00090202u, 0x28263607u, 0x221f1e29u, 0x00050403u,
+      EncodeMubuf0(0x1e, 48, false), EncodeMubuf1(2, 0, 0),
+      EncodeSopp(0x01)};
+  D::Program decoded;
+  D::DecodeProgram(code, decoded);
+  Check(decoded.instructions.size() == 9 &&
+            decoded.instructions.back().opcode == D::Opcode::S_ENDPGM,
+        "decoder stopped before instructions following BVH intersections");
+  for (const auto index : {0u, 2u}) {
+    const auto &inst = decoded.instructions[index];
+    Check(inst.opcode == D::Opcode::IMAGE_BVH_INTERSECT_RAY &&
+              inst.image_address_components == 11 && inst.data_dwords == 4 && inst.image_r128,
+          "BVH32 instruction lost its ray or descriptor width");
+  }
+  for (const auto index : {4u, 6u}) {
+    const auto &inst = decoded.instructions[index];
+    Check(inst.opcode == D::Opcode::IMAGE_BVH_INTERSECT_RAY && inst.opcode_id == 0xe7 &&
+              inst.image_address_components == 12 && inst.data_dwords == 4 && inst.image_r128,
+          "BVH64 instruction lost its full node pointer or ray width");
+  }
+  Check(decoded.instructions[6].word_count == 5 &&
+            decoded.instructions[6].image_nsa_addr[0] == 7 &&
+            decoded.instructions[6].image_nsa_addr[10] == 5,
+        "captured BVH64 NSA pointer or final ray component was not decoded");
+  Check(decoded.instructions[2].image_nsa_addr[9] == 58,
+        "BVH NSA ray components were not decoded");
+  const auto result = RecompileForTest(code, MakeCompileOptions(ShaderType::Compute));
+  Check(CountSourceOccurrences(result.ir_dump, "BvhIntersect") == 4 &&
+            result.program.info.uses_dma && result.program.info.images.empty() &&
+            result.program.info.samplers.empty(),
+        "BVH intersections did not use GPU descriptors and raw guest memory");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const std::array literal{EncodeSMovB32(0, 255), 0xf1989f01u, EncodeSopp(0x01)};
+  D::DecodeProgram(literal, decoded);
+  Check(decoded.instructions.size() == 2 && decoded.instructions[0].opcode == D::Opcode::S_MOV_B32,
+        "BVH-shaped scalar literal was decoded as an instruction");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  for (const auto words : {std::array{0xf19c9f01u, 0x40081014u}, // BVH64 A16
+                           std::array{0xf1989f01u, 0x40081014u}, // BVH32 A16
+                           std::array{0xf1981f01u, 0x00081014u}, // not R128
+                           std::array{0xf1989f01u, 0x80081014u}}) { // D16
+    const std::array unsupported{words[0], words[1], EncodeSopp(0x01)};
+    ExpectFatal([&]() { (void)RecompileForTest(unsupported, MakeCompileOptions(ShaderType::Compute)); },
+                "unsupported BVH encoding was silently accepted");
+  }
+  for (const auto encoding : {0xf1989f01u, 0xf19c9f01u}) {
+    for (const auto nsa : {1u, 2u}) {
+      std::array<uint32_t, 5> truncated{encoding | (nsa << 1), 0x00081014u};
+      truncated[2 + nsa] = EncodeSopp(0x01);
+      ExpectFatal([&]() {
+        (void)RecompileForTest(std::span(truncated).first(3 + nsa), MakeCompileOptions(ShaderType::Compute));
+      }, "BVH NSA instruction accepted an incomplete ray address");
     }
-  };
-  const auto check = [&](std::initializer_list<uint32_t> code, bool expected,
-                         const char *message) {
-    check_decoded(std::span<const uint32_t>{code.begin(), code.size()}, expected, message);
-  };
-
-  check({0xf1989f01u, 0x00081014u, EncodeSopp(0x01)}, true,
-        "captured contiguous BVH instruction did not skip dispatch");
-  check({0xf1989f07u, 0x00071001u, 0x3d3e3c15u, 0x38095851u, 0x00003a39u,
-         EncodeSopp(0x01)}, true,
-        "captured NSA BVH instruction did not skip dispatch");
-  check({0xf19c9f01u, 0x00081014u, EncodeSopp(0x01)}, true,
-        "RDNA2 BVH64 instruction did not skip dispatch");
-  check({0xbe8e210eu, 0xf1989f01u, 0x00081014u, EncodeSopp(0x01)}, true,
-        "unsupported SWAPPC before BVH prevented dispatch detection");
-  check({0xf1989f01u, 0x00081014u, 0xc0000000u, EncodeSopp(0x01)}, true,
-        "unknown instruction after BVH prevented dispatch skipping");
-
-  for (uint32_t opcode : {0xe6u, 0xe7u}) {
-    for (uint32_t nsa = 0; nsa < 4; ++nsa) {
-      for (uint32_t slc = 0; slc < 2; ++slc) {
-        std::array<uint32_t, 6> code{
-            EncodeMimg0(opcode, 0xf, true) | (nsa << 1u) | (slc << 25u),
-            EncodeMimg1(0, 0, 0, 0)};
-        code[2 + nsa] = EncodeSopp(0x01);
-        check_decoded(std::span(code).first(3 + nsa), true,
-                      "BVH cache flags or NSA length prevented dispatch detection");
-      }
-    }
   }
-  for (uint32_t opcode : {0x66u, 0x67u, 0xe4u, 0xe5u, 0xe8u, 0xe9u}) {
-    check({EncodeMimg0(opcode, 0xf), EncodeMimg1(0, 0, 0, 0), EncodeSopp(0x01)},
-          false, "non-BVH image opcode was incorrectly skipped");
-  }
-
-  check({EncodeSMovB32(0, 255), 0xf1989f01u, EncodeSopp(0x01)}, false,
-        "scalar literal was mistaken for a BVH instruction");
-  check({EncodeMimg0(0x20, 0xf) | 6u, EncodeMimg1(0, 0, 0, 0),
-         0xf1989f01u, 0xf19c9f01u, 0u, EncodeSopp(0x01)}, false,
-        "NSA address words were mistaken for BVH instructions");
-  check({EncodeMimg0(0x20, 0xf), 0xf1989f01u, EncodeSopp(0x01)}, false,
-        "MIMG operand word was mistaken for a BVH instruction");
-  check({EncodeSopp(0x01), 0xf1989f01u, 0x00081014u}, false,
-        "data after the shader end was mistaken for a BVH instruction");
-  check({EncodeMimg0(0x20, 0xf), EncodeMimg1(0, 0, 0, 0), EncodeSopp(0x01)},
-        false, "ordinary image shader was incorrectly skipped");
-
-  // An end instruction on one branch does not end another branch's code.
-  check({EncodeSopp(0x04, 1), EncodeSopp(0x01), 0xf1989f01u, 0x00081014u,
-         EncodeSopp(0x01)}, true,
-        "BVH at a branch target after an early end was not detected");
-
-  const std::array bvh_code{0xf1989f01u, 0x00081014u, 0xf19c9f01u, 0x00081014u,
-                            EncodeSopp(0x01)};
-  const std::array ordinary_code{EncodeSMovB32(0, 255), 0xf1989f01u, EncodeSopp(0x01)};
-  D::Program reused;
-  D::DecodeProgram(bvh_code, reused);
-  Check(reused.has_bvh && reused.instructions.size() == 1,
-        "decoder did not stop at the first BVH instruction");
-  D::DecodeProgram(ordinary_code, reused);
-  Check(!reused.has_bvh, "decoder retained stale BVH metadata");
-  for (const auto stage : {ShaderType::Compute, ShaderType::Vertex, ShaderType::Pixel}) {
-    const auto options = MakeCompileOptions(stage);
-    Check(!ShaderRecompiler::TranslateProgram(ordinary_code, options).skip_dispatch,
-          "BVH-shaped literal marked an ordinary shader for skipping");
-    const auto compiled = RecompileForTest(ordinary_code, options);
-    Check(!compiled.spirv.empty(), "ordinary shader did not compile");
-    CheckSpirvBinaryValidates(compiled.spirv);
-  }
+#endif
 }

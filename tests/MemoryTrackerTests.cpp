@@ -238,14 +238,31 @@ struct TrackerHarness {
   MemoryTracker tracker;
 };
 
+uint8_t *AllocateFixedGuestRange(uint64_t size, uintptr_t offset) {
+  // Keep the mapping inside the tracker's guest address space and preserve the
+  // requested region alignment. A fixed address can be occupied by the host
+  // process (notably by the macOS runner's ASLR layout).
+  constexpr uintptr_t first_base = 0x0000000200000000ull;
+  constexpr uintptr_t stride = 0x0000000100000000ull;
+  for (uintptr_t attempt = 0; attempt < 256; attempt++) {
+    auto *wanted = reinterpret_cast<void *>(first_base + offset + attempt * stride);
+    auto *memory = static_cast<uint8_t *>(
+        VirtualAlloc(wanted, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (memory == wanted) {
+      return memory;
+    }
+    if (memory != nullptr) {
+      Check(VirtualFree(memory, 0, MEM_RELEASE) != 0,
+            "release unexpected fixed allocation failed");
+    }
+  }
+  Check(false, "no free fixed guest address found");
+  return nullptr;
+}
+
 uint8_t *Allocate(PageManager &manager, uint64_t pages) {
-  constexpr uintptr_t base = 0x0000000200010000ull;
   const auto size = manager.GetPageSize() * pages;
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  return memory;
+  return AllocateFixedGuestRange(size, 0x10000);
 }
 
 void Release(uint8_t *memory) {
@@ -385,17 +402,105 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
-void TestRangeInvalidation() {
-  constexpr uintptr_t base = 0x0000000201000000ull;
+void TestCleanUploadPreservesOwnership() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
+  auto *memory = AllocateFixedGuestRange(region_size * 2, region_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, region_size * 2, false,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+
+  for (const auto start : {address + 63 * page_size,
+                           address + region_size - page_size}) {
+    const auto before = start - page_size;
+    const auto after = start + 2 * page_size;
+    tracker.MarkRegionAsCpuModified(before, page_size);
+    tracker.MarkRegionAsCpuModified(after, page_size);
+    uint32_t ranges = 0;
+    uint32_t completions = 0;
+    ResetProtectionLog();
+    tracker.ForEachUploadRange(
+        start, 2 * page_size, false,
+        [&](uint64_t, uint64_t) noexcept { ranges++; },
+        [&]() noexcept { completions++; });
+    Check(ranges == 0 && completions == 1 && g_protection_calls == 0 &&
+              !tracker.IsRegionCpuModified(start, 2 * page_size),
+          "clean read-only upload changed dirty state or protection");
+
+    tracker.ForEachUploadRange(
+        start, 2 * page_size, true,
+        [&](uint64_t, uint64_t) noexcept { ranges++; },
+        [&]() noexcept { completions++; });
+    Check(ranges == 0 && completions == 2 &&
+              tracker.IsRegionGpuModified(start, page_size) &&
+              tracker.IsRegionGpuModified(start + page_size, page_size) &&
+              Protection(reinterpret_cast<void *>(start)) == PAGE_NOACCESS &&
+              Protection(reinterpret_cast<void *>(start + page_size)) ==
+                  PAGE_NOACCESS &&
+              tracker.IsRegionCpuModified(before, page_size) &&
+              tracker.IsRegionCpuModified(after, page_size) &&
+              !tracker.IsRegionGpuModified(before, page_size) &&
+              !tracker.IsRegionGpuModified(after, page_size) &&
+              IsWritable(reinterpret_cast<void *>(before)) &&
+              IsWritable(reinterpret_cast<void *>(after)),
+          "clean written upload lost GPU ownership or changed dirty neighbors");
+    tracker.UnmarkRegionAsGpuModified(start, 2 * page_size);
+  }
+  tracker.UntrackMemory(address, region_size * 2);
+  Release(memory);
+}
+
+void BenchmarkCleanUploads() {
+  constexpr uint64_t size = 256ull * 1024 * 1024;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = AllocateFixedGuestRange(size, 0);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, size, false,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  std::puts("chunk_bytes,sweeps,calls,elapsed_ns,ns_per_sweep,ns_per_call");
+  for (const uint64_t chunk : {size, Libs::Graphics::TRACKER_REGION_SIZE,
+                               uint64_t{64 * 1024}}) {
+    uint64_t ranges = 0;
+    uint64_t completions = 0;
+    uint64_t sweeps = 0;
+    ResetProtectionLog();
+    const auto start = std::chrono::steady_clock::now();
+    std::chrono::nanoseconds elapsed{};
+    do {
+      for (uint64_t offset = 0; offset < size; offset += chunk) {
+        tracker.ForEachUploadRange(
+            address + offset, chunk, false,
+            [&](uint64_t, uint64_t) noexcept { ranges++; },
+            [&]() noexcept { completions++; });
+      }
+      sweeps++;
+      elapsed = std::chrono::steady_clock::now() - start;
+    } while (elapsed < std::chrono::milliseconds(250));
+    Check(ranges == 0 && completions == sweeps * (size / chunk) &&
+              g_protection_calls == 0,
+          "clean upload benchmark changed ranges, completion, or protection");
+    std::printf("%llu,%llu,%llu,%lld,%.2f,%.2f\n",
+                static_cast<unsigned long long>(chunk),
+                static_cast<unsigned long long>(sweeps),
+                static_cast<unsigned long long>(completions),
+                static_cast<long long>(elapsed.count()),
+                static_cast<double>(elapsed.count()) / sweeps,
+                static_cast<double>(elapsed.count()) / completions);
+  }
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+void TestRangeInvalidation() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
   constexpr uint64_t size = Libs::Graphics::TRACKER_REGION_SIZE * 2;
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base),
-        "range invalidation allocation failed");
+  auto *memory = AllocateFixedGuestRange(size, 0x1000000);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
@@ -614,16 +719,12 @@ void TestGpuDownloadProtectionMirrors() {
 }
 
 void TestCrossRegionUpload() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
   const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  auto *memory = AllocateFixedGuestRange(region_size * 2, 0x10000);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto boundary = (address + region_size - 1) & ~(region_size - 1);
   uint32_t ranges = 0;
@@ -871,6 +972,15 @@ void TestFullRegionGpuUnmarkBatching() {
         [&]() noexcept {
           (void)tracker.IsRegionCpuModified(address, page_size);
         });
+  } else if (std::strcmp(name, "recursive-tracking-lock") == 0) {
+    Libs::Graphics::TrackingSpinLock lock;
+    lock.lock();
+    lock.lock();
+  } else if (std::strcmp(name, "non-owner-tracking-unlock") == 0) {
+    Libs::Graphics::TrackingSpinLock lock;
+    lock.lock();
+    std::thread worker([&] { lock.unlock(); });
+    worker.join();
   }
   std::_Exit(0x7f);
 }
@@ -928,7 +1038,8 @@ void CheckDeathCase(const char *name) {
 }
 
 void TestFatalPaths() {
-  for (const char *name : {"gpu-dirty-explicit-cpu", "reentrant-upload"}) {
+  for (const char *name : {"gpu-dirty-explicit-cpu", "reentrant-upload",
+                           "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
     CheckDeathCase(name);
   }
 }
@@ -1010,11 +1121,16 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-clean-upload") == 0) {
+    BenchmarkCleanUploads();
+    return 0;
+  }
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();

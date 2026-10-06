@@ -2529,7 +2529,6 @@ static uint64_t decode_indirect_modifier_patch_offsets(uint64_t modifier, bool i
 	if (indexed && (low & 0x2u) != 0) {
 		base_vtx_loc |= static_cast<uint64_t>(sgpr_base + extract_modifier_bits(low, 14u, 5u))
 		                << 16u;
-		base_vtx_loc |= 1ull << 59u;
 	}
 
 	return base_vtx_loc | (start_inst_loc << 32u);
@@ -2787,13 +2786,15 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true);
+	// Single indexed draws store the index-offset enable in word 3, bit 28.
+	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true) |
+	                           ((modifier & 0x2ull) << 59u);
 
 	cmd[0] = KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0u);
 	cmd[1] = data_offset_in_bytes;
 	cmd[2] = static_cast<uint32_t>(patch_offsets);
 	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
-	cmd[4] = decode_indirect_draw_initiator(modifier);
+	cmd[4] = decode_draw_index_initiator(modifier);
 
 	return cmd;
 }
@@ -2914,19 +2915,30 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
+	const auto low           = static_cast<uint32_t>(modifier);
+	const auto sgpr_base     = indirect_modifier_sgpr_base(low);
 	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true);
 	const auto count_vaddr   = reinterpret_cast<uint64_t>(count_addr);
+
+	uint32_t draw_index_location = 0x280u;
+	if ((low & 0x8u) != 0) {
+		draw_index_location = sgpr_base + extract_modifier_bits(low, 24u, 5u);
+	}
+	// Multi indexed draws store the index-offset enable in word 4, bit 28.
+	const auto draw_control = draw_index_location | ((low & 0x10u) << 23u) |
+	                          ((low & 0x2u) << 27u) | ((count_indirect & 0x1u) << 30u) |
+	                          ((low & 0x8u) << 28u);
 
 	cmd[0] = KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0u);
 	cmd[1] = data_offset_in_bytes;
 	cmd[2] = static_cast<uint32_t>(patch_offsets);
 	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
-	cmd[4] = (count_indirect & 1u) << 30u;
+	cmd[4] = draw_control;
 	cmd[5] = max_count_or_count;
 	cmd[6] = static_cast<uint32_t>(count_vaddr) & ~0x3u;
 	cmd[7] = static_cast<uint32_t>(count_vaddr >> 32u);
 	cmd[8] = stride_in_bytes;
-	cmd[9] = decode_indirect_draw_initiator(modifier);
+	cmd[9] = decode_draw_index_initiator(modifier);
 
 	return cmd;
 }

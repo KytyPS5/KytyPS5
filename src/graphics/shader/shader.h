@@ -88,6 +88,7 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_vertices         = 0;
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
+	bool     fast_launch          = false;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -147,13 +148,17 @@ struct ShaderVertexInputInfo {
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
+	uint32_t           workgroup_counts[3]        = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	bool               lds_storage                = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
 	ShaderStageRuntime stage;
 };
+
+enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
 
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
@@ -178,8 +183,8 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
-	// Export logical alpha through MRT1 for blending after channel swizzling.
-	bool                                           alpha_blend_source_remap     = false;
+	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
+	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;

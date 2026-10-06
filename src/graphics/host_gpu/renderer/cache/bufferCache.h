@@ -117,7 +117,8 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
+	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
+	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;

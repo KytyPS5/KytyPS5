@@ -8,7 +8,6 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -18,6 +17,13 @@
 #include <vector>
 
 namespace Libs {
+
+namespace LibNpTrophy2 {
+void InitNet_1_NpTrophy2(Loader::SymbolDatabase* s);
+}
+namespace LibNpUniversalDataSystem {
+void InitNet_1_NpUniversalDataSystem(Loader::SymbolDatabase* s);
+}
 
 namespace Network::Net {
 struct NetEtherAddr;
@@ -109,6 +115,10 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 
 int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 	return FinishNetCall(Net::NetResolverDestroy(rid));
+}
+
+int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
+	return FinishNetCall(Net::NetResolverAbort(rid, flags));
 }
 
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
@@ -203,6 +213,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
+	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
@@ -588,34 +599,66 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	std::string uri;
-	if (src_element->scheme != nullptr) {
-		uri.append(src_element->scheme);
-		uri.push_back(':');
-	}
+	constexpr uint32_t BUILD_WITH_SCHEME   = 0x01;
+	constexpr uint32_t BUILD_WITH_HOSTNAME = 0x02;
+	constexpr uint32_t BUILD_WITH_PORT     = 0x04;
+	constexpr uint32_t BUILD_WITH_PATH     = 0x08;
+	constexpr uint32_t BUILD_WITH_USERNAME = 0x10;
+	constexpr uint32_t BUILD_WITH_PASSWORD = 0x20;
+	constexpr uint32_t BUILD_WITH_QUERY    = 0x40;
+	constexpr uint32_t BUILD_WITH_FRAGMENT = 0x80;
+	constexpr uint32_t BUILD_WITH_ALL      = 0xff;
 
-	if (src_element->opaque == 0) {
-		if (src_element->hostname != nullptr) {
+	// No component bits preserves the legacy full-URI build.
+	const uint32_t parts         = (option & BUILD_WITH_ALL) == 0 ? BUILD_WITH_ALL : option;
+	const bool     hierarchical  = src_element->opaque == 0 && src_element->hostname != nullptr;
+	const bool     with_hostname = (parts & BUILD_WITH_HOSTNAME) != 0 && hierarchical;
+
+	std::string uri;
+	if ((parts & BUILD_WITH_SCHEME) != 0) {
+		if (src_element->scheme != nullptr) {
+			uri.append(src_element->scheme);
+			uri.push_back(':');
+		}
+		// Scheme-only builds include the authority marker.
+		if (hierarchical) {
 			uri.append("//");
-			if (src_element->username != nullptr) {
-				uri.append(src_element->username);
-				if (src_element->password != nullptr) {
-					uri.push_back(':');
-					uri.append(src_element->password);
-				}
-				uri.push_back('@');
-			}
-			uri.append(src_element->hostname);
-			if (src_element->port != 0) {
-				uri.push_back(':');
-				uri.append(std::to_string(src_element->port));
-			}
 		}
 	}
 
-	AppendUriPart(&uri, src_element->path);
-	AppendUriPart(&uri, src_element->query);
-	AppendUriPart(&uri, src_element->fragment);
+	const bool with_username = (parts & BUILD_WITH_USERNAME) != 0 && src_element->username != nullptr;
+	const bool with_password = (parts & BUILD_WITH_PASSWORD) != 0 && src_element->password != nullptr;
+	if (with_username) {
+		uri.append(src_element->username);
+	}
+	if (with_password) {
+		if (with_username) {
+			uri.push_back(':');
+		}
+		uri.append(src_element->password);
+	}
+	if (with_hostname) {
+		if (with_username || with_password) {
+			uri.push_back('@');
+		}
+		uri.append(src_element->hostname);
+	}
+	if ((parts & BUILD_WITH_PORT) != 0 && hierarchical && src_element->port != 0) {
+		if (with_hostname) {
+			uri.push_back(':');
+		}
+		uri.append(std::to_string(src_element->port));
+	}
+
+	if ((parts & BUILD_WITH_PATH) != 0) {
+		AppendUriPart(&uri, src_element->path);
+	}
+	if ((parts & BUILD_WITH_QUERY) != 0) {
+		AppendUriPart(&uri, src_element->query);
+	}
+	if ((parts & BUILD_WITH_FRAGMENT) != 0) {
+		AppendUriPart(&uri, src_element->fragment);
+	}
 
 	const auto needed = uri.size() + 1;
 	if (require != nullptr) {
@@ -1925,1123 +1968,6 @@ LIB_DEFINE(InitNet_1_NpAuth) {
 
 } // namespace LibNpAuth
 
-namespace LibNpTrophy2 {
-
-LIB_VERSION("NpTrophy2", 1, "NpTrophy2", 1, 1);
-
-constexpr int NP_TROPHY2_ERROR_ICON_FILE_NOT_FOUND = -2141898479; /* 0x80553911 */
-
-struct NpTrophy2Progress {
-	int32_t  type;
-	uint8_t  reserved[4];
-	uint64_t value;
-};
-
-struct NpTrophy2GameDetails {
-	uint32_t num_groups;
-	uint32_t num_trophies;
-	uint32_t num_platinum;
-	uint32_t num_gold;
-	uint32_t num_silver;
-	uint32_t num_bronze;
-	char     title[128];
-};
-
-struct NpTrophy2GameData {
-	uint32_t unlocked_trophies;
-	uint32_t unlocked_platinum;
-	uint32_t unlocked_gold;
-	uint32_t unlocked_silver;
-	uint32_t unlocked_bronze;
-	uint32_t progress_percentage;
-};
-
-struct NpTrophy2GroupDetails {
-	int32_t  group_id;
-	uint32_t num_trophies;
-	uint32_t num_platinum;
-	uint32_t num_gold;
-	uint32_t num_silver;
-	uint32_t num_bronze;
-	char     title[128];
-};
-
-struct NpTrophy2GroupData {
-	int32_t  group_id;
-	uint32_t unlocked_trophies;
-	uint32_t unlocked_platinum;
-	uint32_t unlocked_gold;
-	uint32_t unlocked_silver;
-	uint32_t unlocked_bronze;
-	uint32_t progress_percentage;
-	uint8_t  reserved[4];
-};
-
-struct NpTrophy2Details {
-	int32_t           trophy_id;
-	int32_t           trophy_grade;
-	int32_t           group_id;
-	bool              hidden;
-	bool              has_reward;
-	uint8_t           reserved2[2];
-	NpTrophy2Progress target;
-	char              name[128];
-	char              description[1024];
-	char              reward[128];
-};
-
-struct NpTrophy2Data {
-	int32_t           trophy_id;
-	bool              unlocked;
-	uint8_t           reserved[3];
-	NpTrophy2Progress progress;
-	uint64_t          timestamp_tick;
-};
-
-static_assert(sizeof(NpTrophy2GameDetails) == 152);
-static_assert(sizeof(NpTrophy2GameData) == 24);
-static_assert(sizeof(NpTrophy2GroupDetails) == 152);
-static_assert(sizeof(NpTrophy2GroupData) == 32);
-static_assert(sizeof(NpTrophy2Details) == 1312);
-static_assert(sizeof(NpTrophy2Data) == 32);
-
-static void NpTrophy2FillTitle(char* dst, size_t dst_size, const char* src) {
-	if (dst == nullptr || dst_size == 0) {
-		return;
-	}
-
-	std::strncpy(dst, src, dst_size - 1);
-	dst[dst_size - 1] = '\0';
-}
-
-static int KYTY_SYSV_ABI NpTrophy2CreateHandle(int* handle) {
-	PRINT_NAME();
-
-	if (handle != nullptr) {
-		*handle = 1;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2CreateContext(int* context, int user_id, uint32_t service_label,
-                                                uint64_t options) {
-	PRINT_NAME();
-
-	if (context != nullptr) {
-		*context = 1;
-	}
-
-	LOGF("\t user_id       = %d\n"
-	     "\t service_label = %u\n"
-	     "\t options       = 0x%016" PRIx64 "\n",
-	     user_id, service_label, options);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2RegisterContext(int context, int handle, uint64_t options) {
-	PRINT_NAME();
-
-	LOGF("\t context = %d\n"
-	     "\t handle  = %d\n"
-	     "\t options = 0x%016" PRIx64 "\n",
-	     context, handle, options);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2GetGameInfo(int context, int handle,
-                                              NpTrophy2GameDetails* details,
-                                              NpTrophy2GameData*    data) {
-	PRINT_NAME();
-
-	LOGF("\t context = %d\n"
-	     "\t handle  = %d\n"
-	     "\t details = 0x%016" PRIx64 "\n"
-	     "\t data    = 0x%016" PRIx64 "\n",
-	     context, handle, reinterpret_cast<uint64_t>(details), reinterpret_cast<uint64_t>(data));
-
-	if (details != nullptr) {
-		std::memset(details, 0, sizeof(*details));
-		details->num_trophies = 1;
-		details->num_bronze   = 1;
-		NpTrophy2FillTitle(details->title, sizeof(details->title), "Kyty");
-	}
-	if (data != nullptr) {
-		std::memset(data, 0, sizeof(*data));
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2GetGroupInfo(int context, int handle, int group_id,
-                                               NpTrophy2GroupDetails* details,
-                                               NpTrophy2GroupData*    data) {
-	PRINT_NAME();
-
-	LOGF("\t context  = %d\n"
-	     "\t handle   = %d\n"
-	     "\t group_id = %d\n"
-	     "\t details  = 0x%016" PRIx64 "\n"
-	     "\t data     = 0x%016" PRIx64 "\n",
-	     context, handle, group_id, reinterpret_cast<uint64_t>(details),
-	     reinterpret_cast<uint64_t>(data));
-
-	const auto normalized_group_id = (group_id < 0 ? 0 : group_id);
-
-	if (details != nullptr) {
-		std::memset(details, 0, sizeof(*details));
-		details->group_id     = normalized_group_id;
-		details->num_trophies = 1;
-		details->num_bronze   = 1;
-		NpTrophy2FillTitle(details->title, sizeof(details->title), "Base Game");
-	}
-	if (data != nullptr) {
-		std::memset(data, 0, sizeof(*data));
-		data->group_id = normalized_group_id;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2GetGroupInfoArray(int context, int handle, uint32_t offset,
-                                                    uint32_t               limit,
-                                                    NpTrophy2GroupDetails* details_array,
-                                                    NpTrophy2GroupData*    data_array,
-                                                    uint32_t*              count) {
-	PRINT_NAME();
-
-	LOGF("\t context       = %d\n"
-	     "\t handle        = %d\n"
-	     "\t offset        = %" PRIu32 "\n"
-	     "\t limit         = %" PRIu32 "\n"
-	     "\t details_array = 0x%016" PRIx64 "\n"
-	     "\t data_array    = 0x%016" PRIx64 "\n"
-	     "\t count         = 0x%016" PRIx64 "\n",
-	     context, handle, offset, limit, reinterpret_cast<uint64_t>(details_array),
-	     reinterpret_cast<uint64_t>(data_array), reinterpret_cast<uint64_t>(count));
-
-	const uint32_t out_count = (offset == 0 && limit != 0 ? 1u : 0u);
-
-	if (count != nullptr) {
-		*count = out_count;
-	}
-	if (out_count != 0 && details_array != nullptr) {
-		std::memset(details_array, 0, sizeof(*details_array));
-		details_array->group_id     = 0;
-		details_array->num_trophies = 1;
-		details_array->num_bronze   = 1;
-		NpTrophy2FillTitle(details_array->title, sizeof(details_array->title), "Base Game");
-	}
-	if (out_count != 0 && data_array != nullptr) {
-		std::memset(data_array, 0, sizeof(*data_array));
-		data_array->group_id = 0;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2GetTrophyInfo(int context, int handle, int trophy_id,
-                                                NpTrophy2Details* details, NpTrophy2Data* data) {
-	PRINT_NAME();
-
-	LOGF("\t context   = %d\n"
-	     "\t handle    = %d\n"
-	     "\t trophy_id = %d\n"
-	     "\t details   = 0x%016" PRIx64 "\n"
-	     "\t data      = 0x%016" PRIx64 "\n",
-	     context, handle, trophy_id, reinterpret_cast<uint64_t>(details),
-	     reinterpret_cast<uint64_t>(data));
-
-	if (details != nullptr) {
-		std::memset(details, 0, sizeof(*details));
-		details->trophy_id    = trophy_id;
-		details->trophy_grade = 4;
-		details->group_id     = 0;
-		details->target.type  = 0;
-		details->target.value = 0;
-		NpTrophy2FillTitle(details->name, sizeof(details->name), "Trophy");
-		NpTrophy2FillTitle(details->description, sizeof(details->description), "Trophy");
-	}
-	if (data != nullptr) {
-		std::memset(data, 0, sizeof(*data));
-		data->trophy_id = trophy_id;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2GetTrophyInfoArray(int context, int handle, uint32_t offset,
-                                                     uint32_t          limit,
-                                                     NpTrophy2Details* details_array,
-                                                     NpTrophy2Data* data_array, uint32_t* count) {
-	PRINT_NAME();
-
-	LOGF("\t context       = %d\n"
-	     "\t handle        = %d\n"
-	     "\t offset        = %" PRIu32 "\n"
-	     "\t limit         = %" PRIu32 "\n"
-	     "\t details_array = 0x%016" PRIx64 "\n"
-	     "\t data_array    = 0x%016" PRIx64 "\n"
-	     "\t count         = 0x%016" PRIx64 "\n",
-	     context, handle, offset, limit, reinterpret_cast<uint64_t>(details_array),
-	     reinterpret_cast<uint64_t>(data_array), reinterpret_cast<uint64_t>(count));
-
-	const uint32_t out_count = (offset == 0 && limit != 0 ? 1u : 0u);
-
-	if (count != nullptr) {
-		*count = out_count;
-	}
-	if (out_count != 0 && details_array != nullptr) {
-		std::memset(details_array, 0, sizeof(*details_array));
-		details_array->trophy_id    = 0;
-		details_array->trophy_grade = 4;
-		details_array->group_id     = 0;
-		NpTrophy2FillTitle(details_array->name, sizeof(details_array->name), "Trophy");
-		NpTrophy2FillTitle(details_array->description, sizeof(details_array->description),
-		                   "Trophy");
-	}
-	if (out_count != 0 && data_array != nullptr) {
-		std::memset(data_array, 0, sizeof(*data_array));
-		data_array->trophy_id = 0;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2GetGameIcon(int context, int handle, void* buffer, size_t* size) {
-	PRINT_NAME();
-
-	LOGF("\t context = %d\n"
-	     "\t handle  = %d\n"
-	     "\t buffer  = 0x%016" PRIx64 "\n"
-	     "\t size    = 0x%016" PRIx64 "\n",
-	     context, handle, reinterpret_cast<uint64_t>(buffer), reinterpret_cast<uint64_t>(size));
-
-	if (size != nullptr) {
-		*size = 0;
-	}
-
-	return NP_TROPHY2_ERROR_ICON_FILE_NOT_FOUND;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2GetGroupIcon(int context, int handle, int group_id, void* buffer,
-                                               size_t* size) {
-	PRINT_NAME();
-
-	LOGF("\t context  = %d\n"
-	     "\t handle   = %d\n"
-	     "\t group_id = %d\n"
-	     "\t buffer   = 0x%016" PRIx64 "\n"
-	     "\t size     = 0x%016" PRIx64 "\n",
-	     context, handle, group_id, reinterpret_cast<uint64_t>(buffer),
-	     reinterpret_cast<uint64_t>(size));
-
-	if (size != nullptr) {
-		*size = 0;
-	}
-
-	return NP_TROPHY2_ERROR_ICON_FILE_NOT_FOUND;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2GetTrophyIcon(int context, int handle, int trophy_id,
-                                                void* buffer, size_t* size) {
-	PRINT_NAME();
-
-	LOGF("\t context   = %d\n"
-	     "\t handle    = %d\n"
-	     "\t trophy_id = %d\n"
-	     "\t buffer    = 0x%016" PRIx64 "\n"
-	     "\t size      = 0x%016" PRIx64 "\n",
-	     context, handle, trophy_id, reinterpret_cast<uint64_t>(buffer),
-	     reinterpret_cast<uint64_t>(size));
-
-	if (size != nullptr) {
-		*size = 0;
-	}
-
-	return NP_TROPHY2_ERROR_ICON_FILE_NOT_FOUND;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2RegisterUnlockCallback(void* callback, void* userdata) {
-	PRINT_NAME();
-
-	LOGF("\t callback = 0x%016" PRIx64 "\n"
-	     "\t userdata = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(callback), reinterpret_cast<uint64_t>(userdata));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2AbortHandle(int handle) {
-	PRINT_NAME();
-
-	LOGF("\t handle = %d\n", handle);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2DestroyHandle(int handle) {
-	PRINT_NAME();
-
-	LOGF("\t handle = %d\n", handle);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpTrophy2DestroyContext(int context) {
-	PRINT_NAME();
-
-	LOGF("\t context = %d\n", context);
-
-	return 0;
-}
-
-LIB_DEFINE(InitNet_1_NpTrophy2) {
-	LIB_FUNC("Bagshr7OQ6Q", LibNpTrophy2::NpTrophy2CreateContext);
-	LIB_FUNC("Gz1rmUZpROM", LibNpTrophy2::NpTrophy2CreateHandle);
-	LIB_FUNC("bIDov3wBu5Q", LibNpTrophy2::NpTrophy2RegisterContext);
-	LIB_FUNC("4IzqhhUQ3nk", LibNpTrophy2::NpTrophy2GetGameInfo);
-	LIB_FUNC("DoZWauG8mu0", LibNpTrophy2::NpTrophy2GetGroupInfo);
-	LIB_FUNC("+PDSI6WgPRc", LibNpTrophy2::NpTrophy2GetGroupInfoArray);
-	LIB_FUNC("EwNylPdWUTM", LibNpTrophy2::NpTrophy2GetTrophyInfo);
-	LIB_FUNC("y3zHpdZO6ME", LibNpTrophy2::NpTrophy2GetTrophyInfoArray);
-	LIB_FUNC("2QgUy+xJqS0", LibNpTrophy2::NpTrophy2GetGameIcon);
-	LIB_FUNC("6IjXJUy6ZnA", LibNpTrophy2::NpTrophy2GetGroupIcon);
-	LIB_FUNC("-9LLVU0uvs8", LibNpTrophy2::NpTrophy2GetTrophyIcon);
-	LIB_FUNC("sUXGfNMalIo", LibNpTrophy2::NpTrophy2RegisterUnlockCallback);
-	LIB_FUNC("fYapWA9xVmA", LibNpTrophy2::NpTrophy2AbortHandle);
-	LIB_FUNC("d8P11CI40KE", LibNpTrophy2::NpTrophy2DestroyHandle);
-	LIB_FUNC("sysY2FHYff4", LibNpTrophy2::NpTrophy2DestroyContext);
-}
-
-} // namespace LibNpTrophy2
-
-namespace LibNpUniversalDataSystem {
-
-LIB_VERSION("NpUniversalDataSystem", 1, "NpUniversalDataSystem", 1, 1);
-
-constexpr int NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT = -2141900542; /* 0x80553102 */
-
-struct NpUniversalDataSystemInitParam {
-	size_t size;
-	size_t pool_size;
-};
-
-struct NpUniversalDataSystemMemoryStat {
-	size_t pool_size;
-	size_t max_inuse_size;
-	size_t current_inuse_size;
-};
-
-struct NpUniversalDataSystemEvent {};
-
-struct NpUniversalDataSystemEventPropertyObject {};
-
-struct NpUniversalDataSystemEventPropertyArray {};
-
-struct NpUniversalDataSystemStorageStat {
-	size_t in_events;
-	size_t out_events;
-	size_t lost_events;
-	size_t max_inuse_size;
-	size_t current_events;
-	size_t current_inuse_size;
-	size_t current_free_size;
-};
-
-static int KYTY_SYSV_ABI
-NpUniversalDataSystemInitialize(const NpUniversalDataSystemInitParam* param) {
-	PRINT_NAME();
-
-	if (param == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	LOGF("\t size      = %" PRIu64 "\n"
-	     "\t pool_size = %" PRIu64 "\n",
-	     static_cast<uint64_t>(param->size), static_cast<uint64_t>(param->pool_size));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemCreateContext(int* context, int user_id,
-                                                            uint32_t service_label,
-                                                            uint64_t options) {
-	PRINT_NAME();
-
-	if (context != nullptr) {
-		*context = 1;
-	}
-
-	LOGF("\t user_id       = %d\n"
-	     "\t service_label = %u\n"
-	     "\t options       = 0x%016" PRIx64 "\n",
-	     user_id, service_label, options);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemCreateHandle(int* handle) {
-	PRINT_NAME();
-
-	if (handle == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	if (handle != nullptr) {
-		*handle = 1;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyHandle(int handle) {
-	PRINT_NAME();
-
-	LOGF("\t handle = %d\n", handle);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemAbortHandle(int handle) {
-	PRINT_NAME();
-
-	LOGF("\t handle = %d\n", handle);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEvent(
-    const char* event_name, const NpUniversalDataSystemEventPropertyObject* prop,
-    NpUniversalDataSystemEvent** new_event, NpUniversalDataSystemEventPropertyObject** prop_ptr) {
-	PRINT_NAME();
-
-	if (event_name == nullptr || new_event == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	*new_event = new NpUniversalDataSystemEvent;
-	if (prop_ptr != nullptr) {
-		*prop_ptr = (prop != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(prop)
-		                             : new NpUniversalDataSystemEventPropertyObject);
-	}
-
-	LOGF("\t event_name = %s\n"
-	     "\t prop       = 0x%016" PRIx64 "\n"
-	     "\t new_event  = 0x%016" PRIx64 "\n"
-	     "\t prop_ptr   = 0x%016" PRIx64 "\n",
-	     event_name != nullptr ? event_name : "<null>", reinterpret_cast<uint64_t>(prop),
-	     reinterpret_cast<uint64_t>(*new_event),
-	     prop_ptr != nullptr ? reinterpret_cast<uint64_t>(*prop_ptr) : 0);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle, const void* event,
-                                                        uint64_t options) {
-	PRINT_NAME();
-
-	LOGF("\t context = %d\n"
-	     "\t handle  = %d\n"
-	     "\t event   = 0x%016" PRIx64 "\n"
-	     "\t options = 0x%016" PRIx64 "\n",
-	     context, handle, reinterpret_cast<uint64_t>(event), options);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI
-NpUniversalDataSystemEventEstimateSize(const NpUniversalDataSystemEvent* event, size_t* size) {
-	PRINT_NAME();
-
-	LOGF("\t event = 0x%016" PRIx64 "\n"
-	     "\t size  = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(event), reinterpret_cast<uint64_t>(size));
-
-	if (event == nullptr || size == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	*size = 3;
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventToString(const NpUniversalDataSystemEvent* event,
-                                                            char* buf, size_t buf_size,
-                                                            size_t* string_size) {
-	PRINT_NAME();
-
-	LOGF("\t event       = 0x%016" PRIx64 "\n"
-	     "\t buf         = 0x%016" PRIx64 "\n"
-	     "\t buf_size    = %" PRIu64 "\n"
-	     "\t string_size = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(event), reinterpret_cast<uint64_t>(buf),
-	     static_cast<uint64_t>(buf_size), reinterpret_cast<uint64_t>(string_size));
-
-	if (event == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	const char* json = "{}";
-	if (string_size != nullptr) {
-		*string_size = std::strlen(json) + 1;
-	}
-	if (buf != nullptr && buf_size > 0) {
-		std::snprintf(buf, buf_size, "%s", json);
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyEvent(NpUniversalDataSystemEvent* event) {
-	PRINT_NAME();
-
-	LOGF("\t event = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(event));
-
-	delete event;
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemRegisterContext(int context, int handle,
-                                                              uint64_t options) {
-	PRINT_NAME();
-
-	LOGF("\t context = %d\n"
-	     "\t handle  = %d\n"
-	     "\t options = 0x%016" PRIx64 "\n",
-	     context, handle, options);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemDestroyContext(int context) {
-	PRINT_NAME();
-
-	LOGF("\t context = %d\n", context);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemGetMemoryStat(NpUniversalDataSystemMemoryStat* stat) {
-	PRINT_NAME();
-
-	if (stat == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	*stat = {};
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEventPropertyObject(
-    NpUniversalDataSystemEventPropertyObject** new_object) {
-	PRINT_NAME();
-
-	if (new_object == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	*new_object = new NpUniversalDataSystemEventPropertyObject;
-
-	LOGF("\t new_object = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(*new_object));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI
-NpUniversalDataSystemDestroyEventPropertyObject(NpUniversalDataSystemEventPropertyObject* object) {
-	PRINT_NAME();
-
-	LOGF("\t object = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(object));
-
-	delete object;
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetString(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, const char* value) {
-	PRINT_NAME();
-
-	LOGF("\t object = 0x%016" PRIx64 "\n"
-	     "\t key    = %s\n"
-	     "\t value  = %s\n",
-	     reinterpret_cast<uint64_t>(object), key != nullptr ? key : "<null>",
-	     value != nullptr ? value : "<null>");
-
-	if (object == nullptr || key == nullptr || value == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt32(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, int32_t value) {
-	PRINT_NAME();
-
-	LOGF("\t object = 0x%016" PRIx64 "\n"
-	     "\t key    = %s\n"
-	     "\t value  = %" PRId32 "\n",
-	     reinterpret_cast<uint64_t>(object), key != nullptr ? key : "<null>", value);
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt32(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, uint32_t value) {
-	PRINT_NAME();
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	LOGF("\t object = 0x%016" PRIx64 "\n"
-	     "\t key    = %s\n"
-	     "\t value  = %" PRIu32 "\n",
-	     reinterpret_cast<uint64_t>(object), key, value);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt64(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, int64_t value) {
-	PRINT_NAME();
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	LOGF("\t object = 0x%016" PRIx64 "\n"
-	     "\t key    = %s\n"
-	     "\t value  = %" PRId64 "\n",
-	     reinterpret_cast<uint64_t>(object), key, value);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt64(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, uint64_t value) {
-	PRINT_NAME();
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	LOGF("\t object = 0x%016" PRIx64 "\n"
-	     "\t key    = %s\n"
-	     "\t value  = %" PRIu64 "\n",
-	     reinterpret_cast<uint64_t>(object), key, value);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetFloat32(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, float value) {
-	PRINT_NAME();
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	LOGF("\t object = 0x%016" PRIx64 "\n"
-	     "\t key    = %s\n"
-	     "\t value  = %f\n",
-	     reinterpret_cast<uint64_t>(object), key, static_cast<double>(value));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetFloat64(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, double value) {
-	PRINT_NAME();
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	LOGF("\t object = 0x%016" PRIx64 "\n"
-	     "\t key    = %s\n"
-	     "\t value  = %f\n",
-	     reinterpret_cast<uint64_t>(object), key, value);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetBool(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, bool value) {
-	PRINT_NAME();
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	LOGF("\t object = 0x%016" PRIx64 "\n"
-	     "\t key    = %s\n"
-	     "\t value  = %d\n",
-	     reinterpret_cast<uint64_t>(object), key, value ? 1 : 0);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetBinary(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key, const void* value,
-    size_t value_size) {
-	PRINT_NAME();
-
-	if (object == nullptr || key == nullptr || (value == nullptr && value_size != 0)) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	LOGF("\t object     = 0x%016" PRIx64 "\n"
-	     "\t key        = %s\n"
-	     "\t value      = 0x%016" PRIx64 "\n"
-	     "\t value_size = %" PRIu64 "\n",
-	     reinterpret_cast<uint64_t>(object), key, reinterpret_cast<uint64_t>(value),
-	     static_cast<uint64_t>(value_size));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetObject(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key,
-    const NpUniversalDataSystemEventPropertyObject* value,
-    NpUniversalDataSystemEventPropertyObject**      value_ptr) {
-	PRINT_NAME();
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	if (value_ptr != nullptr) {
-		*value_ptr =
-		    (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(value)
-		                      : new NpUniversalDataSystemEventPropertyObject);
-	}
-
-	LOGF("\t object    = 0x%016" PRIx64 "\n"
-	     "\t key       = %s\n"
-	     "\t value     = 0x%016" PRIx64 "\n"
-	     "\t value_ptr = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(object), key, reinterpret_cast<uint64_t>(value),
-	     value_ptr != nullptr ? reinterpret_cast<uint64_t>(*value_ptr) : 0);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetArray(
-    NpUniversalDataSystemEventPropertyObject* object, const char* key,
-    const NpUniversalDataSystemEventPropertyArray* value,
-    NpUniversalDataSystemEventPropertyArray**      value_ptr) {
-	PRINT_NAME();
-
-	LOGF("\t object    = 0x%016" PRIx64 "\n"
-	     "\t key       = %s\n"
-	     "\t value     = 0x%016" PRIx64 "\n"
-	     "\t value_ptr = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(object), key != nullptr ? key : "<null>",
-	     reinterpret_cast<uint64_t>(value), reinterpret_cast<uint64_t>(value_ptr));
-
-	if (object == nullptr || key == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	if (value_ptr != nullptr) {
-		*value_ptr = (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyArray*>(value)
-		                               : new NpUniversalDataSystemEventPropertyArray);
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI
-NpUniversalDataSystemCreateEventPropertyArray(NpUniversalDataSystemEventPropertyArray** new_array) {
-	PRINT_NAME();
-
-	if (new_array == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	*new_array = new NpUniversalDataSystemEventPropertyArray;
-
-	LOGF("\t new_array = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(*new_array));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI
-NpUniversalDataSystemDestroyEventPropertyArray(NpUniversalDataSystemEventPropertyArray* array) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(array));
-
-	delete array;
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetString(
-    NpUniversalDataSystemEventPropertyArray* array, const char* value) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n"
-	     "\t value = %s\n",
-	     reinterpret_cast<uint64_t>(array), value != nullptr ? value : "<null>");
-
-	if (array == nullptr || value == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetInt32(
-    NpUniversalDataSystemEventPropertyArray* array, int32_t value) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n"
-	     "\t value = %" PRId32 "\n",
-	     reinterpret_cast<uint64_t>(array), value);
-
-	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetUInt32(
-    NpUniversalDataSystemEventPropertyArray* array, uint32_t value) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n"
-	     "\t value = %" PRIu32 "\n",
-	     reinterpret_cast<uint64_t>(array), value);
-
-	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetInt64(
-    NpUniversalDataSystemEventPropertyArray* array, int64_t value) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n"
-	     "\t value = %" PRId64 "\n",
-	     reinterpret_cast<uint64_t>(array), value);
-
-	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetUInt64(
-    NpUniversalDataSystemEventPropertyArray* array, uint64_t value) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n"
-	     "\t value = %" PRIu64 "\n",
-	     reinterpret_cast<uint64_t>(array), value);
-
-	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetFloat32(
-    NpUniversalDataSystemEventPropertyArray* array, float value) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n"
-	     "\t value = %f\n",
-	     reinterpret_cast<uint64_t>(array), static_cast<double>(value));
-
-	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetFloat64(
-    NpUniversalDataSystemEventPropertyArray* array, double value) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n"
-	     "\t value = %f\n",
-	     reinterpret_cast<uint64_t>(array), value);
-
-	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetBool(
-    NpUniversalDataSystemEventPropertyArray* array, bool value) {
-	PRINT_NAME();
-
-	LOGF("\t array = 0x%016" PRIx64 "\n"
-	     "\t value = %d\n",
-	     reinterpret_cast<uint64_t>(array), value ? 1 : 0);
-
-	return (array != nullptr ? 0 : NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT);
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetBinary(
-    NpUniversalDataSystemEventPropertyArray* array, const void* value, size_t value_size) {
-	PRINT_NAME();
-
-	LOGF("\t array      = 0x%016" PRIx64 "\n"
-	     "\t value      = 0x%016" PRIx64 "\n"
-	     "\t value_size = %" PRIu64 "\n",
-	     reinterpret_cast<uint64_t>(array), reinterpret_cast<uint64_t>(value),
-	     static_cast<uint64_t>(value_size));
-
-	if (array == nullptr || (value == nullptr && value_size != 0)) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetObject(
-    NpUniversalDataSystemEventPropertyArray*        array,
-    const NpUniversalDataSystemEventPropertyObject* value,
-    NpUniversalDataSystemEventPropertyObject**      value_ptr) {
-	PRINT_NAME();
-
-	if (array == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	if (value_ptr != nullptr) {
-		*value_ptr =
-		    (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyObject*>(value)
-		                      : new NpUniversalDataSystemEventPropertyObject);
-	}
-
-	LOGF("\t array     = 0x%016" PRIx64 "\n"
-	     "\t value     = 0x%016" PRIx64 "\n"
-	     "\t value_ptr = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(array), reinterpret_cast<uint64_t>(value),
-	     value_ptr != nullptr ? reinterpret_cast<uint64_t>(*value_ptr) : 0);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyArraySetArray(
-    NpUniversalDataSystemEventPropertyArray*       array,
-    const NpUniversalDataSystemEventPropertyArray* value,
-    NpUniversalDataSystemEventPropertyArray**      value_ptr) {
-	PRINT_NAME();
-
-	if (array == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	if (value_ptr != nullptr) {
-		*value_ptr = (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyArray*>(value)
-		                               : new NpUniversalDataSystemEventPropertyArray);
-	}
-
-	LOGF("\t array     = 0x%016" PRIx64 "\n"
-	     "\t value     = 0x%016" PRIx64 "\n"
-	     "\t value_ptr = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(array), reinterpret_cast<uint64_t>(value),
-	     value_ptr != nullptr ? reinterpret_cast<uint64_t>(*value_ptr) : 0);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI
-NpUniversalDataSystemGetStorageStat(int context, NpUniversalDataSystemStorageStat* stat) {
-	PRINT_NAME();
-
-	LOGF("\t context = %d\n"
-	     "\t stat    = 0x%016" PRIx64 "\n",
-	     context, reinterpret_cast<uint64_t>(stat));
-
-	if (stat == nullptr) {
-		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-	}
-
-	*stat = {};
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpUniversalDataSystemTerminate() {
-	PRINT_NAME();
-
-	return 0;
-}
-
-LIB_DEFINE(InitNet_1_NpUniversalDataSystem) {
-	LIB_FUNC("sjaobBgqeB4", LibNpUniversalDataSystem::NpUniversalDataSystemInitialize);
-	LIB_FUNC("5zBnau1uIEo", LibNpUniversalDataSystem::NpUniversalDataSystemCreateContext);
-	LIB_FUNC("hT0IAEvN+M0", LibNpUniversalDataSystem::NpUniversalDataSystemCreateHandle);
-	LIB_FUNC("p+GcLqwpL9M", LibNpUniversalDataSystem::NpUniversalDataSystemCreateEvent);
-	LIB_FUNC("CzkKf7ahIyU", LibNpUniversalDataSystem::NpUniversalDataSystemPostEvent);
-	LIB_FUNC("AUIHb7jUX3I", LibNpUniversalDataSystem::NpUniversalDataSystemDestroyHandle);
-	LIB_FUNC("jZCqWFgMehE", LibNpUniversalDataSystem::NpUniversalDataSystemAbortHandle);
-	LIB_FUNC("wB7IWzGp2v0", LibNpUniversalDataSystem::NpUniversalDataSystemDestroyContext);
-	LIB_FUNC("su7jW3VDDb4", LibNpUniversalDataSystem::NpUniversalDataSystemGetMemoryStat);
-	LIB_FUNC("+s14jq-KGYw", LibNpUniversalDataSystem::NpUniversalDataSystemEventEstimateSize);
-	LIB_FUNC("vj6CQGWtEBg", LibNpUniversalDataSystem::NpUniversalDataSystemEventToString);
-	LIB_FUNC("wG+84pnNIuo", LibNpUniversalDataSystem::NpUniversalDataSystemDestroyEvent);
-	LIB_FUNC("tpFJ8LIKvPw", LibNpUniversalDataSystem::NpUniversalDataSystemRegisterContext);
-	LIB_FUNC("s6W4Zl4Slgk",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemCreateEventPropertyObject);
-	LIB_FUNC("kKUH0Viib3c",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemDestroyEventPropertyObject);
-	LIB_FUNC("MfDb+4Nln64",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetString);
-	LIB_FUNC("YE4dbtbz6OE",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetInt32);
-	LIB_FUNC("AzD4irAcKE4",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetUInt32);
-	LIB_FUNC("56QLTqx911s",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetInt64);
-	LIB_FUNC("xvsP5Yz6FmY",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetUInt64);
-	LIB_FUNC("lbPlT4+QVcE",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetFloat32);
-	LIB_FUNC("4Fu8tHW+u-k",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetFloat64);
-	LIB_FUNC("Fidd8vWgyVE",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetBool);
-	LIB_FUNC("wAcxBDLHj1M",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetBinary);
-	LIB_FUNC("74ASEqxSnkM",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetObject);
-	LIB_FUNC("Wxbg5x3pTXA",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyObjectSetArray);
-	LIB_FUNC("Hm7qubT3b70",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemCreateEventPropertyArray);
-	LIB_FUNC("W-0xwY0ZMjw",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemDestroyEventPropertyArray);
-	LIB_FUNC("4llLk7YJRTE",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetString);
-	LIB_FUNC("BypQuF113-k",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetInt32);
-	LIB_FUNC("yMi0xAOpmXM",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetUInt32);
-	LIB_FUNC("viVXAwmmYrY",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetInt64);
-	LIB_FUNC("Qo9qR7v5zO4",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetUInt64);
-	LIB_FUNC("JmgwKm96Lq4",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetFloat32);
-	LIB_FUNC("sbSYZLR5AiE",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetFloat64);
-	LIB_FUNC("0+l4QSWCM4E",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetBool);
-	LIB_FUNC("IEdUCV9j2Cw",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetBinary);
-	LIB_FUNC("XY14n3jNIpE",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetObject);
-	LIB_FUNC("rdi9BAfDLq8",
-	         LibNpUniversalDataSystem::NpUniversalDataSystemEventPropertyArraySetArray);
-	LIB_FUNC("KmN62tT4U8A", LibNpUniversalDataSystem::NpUniversalDataSystemGetStorageStat);
-	LIB_FUNC("47UAEuQl+iI", LibNpUniversalDataSystem::NpUniversalDataSystemTerminate);
-}
-
-} // namespace LibNpUniversalDataSystem
-
 namespace LibNpGameIntent {
 
 LIB_VERSION("NpGameIntent", 1, "NpGameIntent", 1, 1);
@@ -3133,9 +2059,21 @@ namespace LibNpWebApi2 {
 
 LIB_VERSION("NpWebApi2", 1, "NpWebApi2", 1, 1);
 
-constexpr int NP_WEBAPI2_ERROR_INVALID_ARGUMENT  = -2141899774; /* 0x80553402 */
-constexpr int NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND = -2141899770; /* 0x80553406 */
-constexpr int NP_WEBAPI2_ERROR_NOT_SIGNED_IN     = -2141899769; /* 0x80553407 */
+constexpr int NP_WEBAPI2_ERROR_INVALID_ARGUMENT       = -2141899774; /* 0x80553402 */
+constexpr int NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID = -2141899773; /* 0x80553403 */
+constexpr int NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND  = -2141899772; /* 0x80553404 */
+constexpr int NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND      = -2141899770; /* 0x80553406 */
+constexpr int NP_WEBAPI2_ERROR_NOT_SIGNED_IN          = -2141899769; /* 0x80553407 */
+
+struct NpWebApi2MemoryPoolStats {
+	size_t  pool_size;
+	size_t  max_inuse_size;
+	size_t  current_inuse_size;
+	int32_t reserved;
+};
+
+static std::mutex            g_np_webapi2_context_mutex;
+static std::map<int, size_t> g_np_webapi2_contexts;
 
 struct NpWebApi2ResponseInformationOption {
 	int32_t http_status;
@@ -3166,7 +2104,30 @@ static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_si
 
 	static int id = 0;
 
-	return ++id;
+	if (pool_size > std::numeric_limits<size_t>::max() - 0x3fff) {
+		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
+	}
+	std::lock_guard lock(g_np_webapi2_context_mutex);
+	g_np_webapi2_contexts[++id] = (pool_size + 0x3fff) & ~size_t {0x3fff};
+	return id;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
+                                                   NpWebApi2MemoryPoolStats* stats) {
+	if (stats == nullptr) {
+		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
+	}
+	if (lib_ctx_id <= 0) {
+		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
+	}
+	std::lock_guard lock(g_np_webapi2_context_mutex);
+	const auto context = g_np_webapi2_contexts.find(lib_ctx_id);
+	if (context == g_np_webapi2_contexts.end()) {
+		return NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
+	}
+	// Requests currently use host storage, not allocations from the library pool.
+	*stats = {context->second, 0, 0, 0};
+	return OK;
 }
 
 static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
@@ -3433,11 +2394,16 @@ static int KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
 
-	return 0;
+	if (lib_ctx_id <= 0) {
+		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
+	}
+	std::lock_guard lock(g_np_webapi2_context_mutex);
+	return g_np_webapi2_contexts.erase(lib_ctx_id) != 0 ? OK : NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
 }
 
 LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("+o9816YQhqQ", LibNpWebApi2::NpWebApi2Initialize);
+	LIB_FUNC("Xweb+naPZ8Y", LibNpWebApi2::NpWebApi2GetMemoryPoolStats);
 	LIB_FUNC("WV1GwM32NgY", LibNpWebApi2::NpWebApi2PushEventCreateHandle);
 	LIB_FUNC("sk54bi6FtYM", LibNpWebApi2::NpWebApi2CreateUserContext);
 	LIB_FUNC("9X9+cneTGUU", LibNpWebApi2::NpWebApi2DeleteUserContext);

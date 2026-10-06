@@ -12,6 +12,7 @@
 #include "common/threads.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
@@ -27,14 +28,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase *symbols);
 }
 
 namespace Libs::LibAmpr {
@@ -43,6 +50,10 @@ void InitAmpr_1(Loader::SymbolDatabase *symbols);
 
 namespace Libs::LibNet {
 void InitNet_1_Net(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNpWebApi2 {
+void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -132,6 +143,119 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
+void TestAioBatches() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "AIO exports resolve");
+    return symbol->vaddr;
+  };
+  struct Result { int64_t return_value; uint32_t state; };
+  struct Request {
+    int64_t offset;
+    size_t size;
+    void *buffer;
+    Result *result;
+    int32_t fd;
+  };
+  using Submit = int (KYTY_SYSV_ABI *)(Request *, int32_t, int32_t, int32_t *);
+  using Batch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *);
+  using Single = int (KYTY_SYSV_ABI *)(int32_t, int32_t *);
+  using Wait = int (KYTY_SYSV_ABI *)(int32_t, int32_t *, uint32_t *);
+  const auto submit = reinterpret_cast<Submit>(find("HgX7+AORI58"));
+  const auto poll = reinterpret_cast<Batch>(find("o7O4z3jwKzo"));
+  const auto erase = reinterpret_cast<Batch>(find("Ft3EtsZzAoY"));
+  const auto poll_one = reinterpret_cast<Single>(find("2pOuoWoCxdk"));
+  const auto erase_one = reinterpret_cast<Single>(find("5TgME6AYty4"));
+  const auto wait = reinterpret_cast<Wait>(find("KOF-oJbQVvc"));
+  constexpr char Payload[] = "AIO payload";
+  const int fd = FileSystem::KernelOpen("/savedata0/aio.dat", 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload)) == sizeof(Payload),
+        "create AIO read fixture");
+  std::array<int32_t, 3> ids {};
+  std::array<char, 4> buffer {};
+  Result result {};
+  Request request {2, buffer.size(), buffer.data(), &result, fd};
+  for (int i = 0; i < 2; ++i) {
+    Check(submit(&request, 1, 2, &ids[i]) == OK &&
+              result.return_value == buffer.size() && result.state == 3 &&
+              std::memcmp(buffer.data(), Payload + 2, buffer.size()) == 0,
+          "AIO submission reads bytes at the requested offset");
+  }
+  ids[2] = -1;
+  std::array<int32_t, 3> states {-1, -1, -1};
+  Check(poll(ids.data(), ids.size(), states.data()) == OK &&
+            states[0] == 3 && states[1] == 3 && states[2] == Kernel::KERNEL_ERROR_ESRCH,
+        "batch poll writes every state and per-request invalid-ID error");
+  Check(poll_one(ids[0], &states[0]) == OK && states[0] == (3 | 0x10000) &&
+            poll(ids.data(), 2, states.data()) == OK &&
+            states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
+            wait(ids[0], &states[0], nullptr) == OK && states[0] == (3 | 0x10000),
+        "single and batch polls and waits share completion notification state");
+  Check(erase(ids.data(), ids.size(), states.data()) == OK &&
+            states[0] == OK && states[1] == OK && states[2] == Kernel::KERNEL_ERROR_ESRCH,
+        "batch deletion writes per-request results");
+  Check(poll_one(ids[0], &states[0]) == OK && states[0] == Kernel::KERNEL_ERROR_ESRCH &&
+            erase_one(ids[1], &states[1]) == OK && states[1] == Kernel::KERNEL_ERROR_ESRCH,
+        "deleted AIO IDs are invalid for single-request APIs");
+  for (const auto batch : {poll, erase}) {
+    states.fill(42);
+    Check(batch(nullptr, 1, states.data()) == Kernel::KERNEL_ERROR_EFAULT &&
+              batch(ids.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
+              batch(ids.data(), 0, states.data()) == Kernel::KERNEL_ERROR_EINVAL &&
+              batch(ids.data(), 129, states.data()) == Kernel::KERNEL_ERROR_EINVAL &&
+              states == std::array<int32_t, 3> {42, 42, 42},
+          "invalid batch arguments do not modify outputs");
+    std::array<int32_t, 128> invalid_ids {};
+    std::array<int32_t, 128> errors {};
+    Check(batch(invalid_ids.data(), invalid_ids.size(), errors.data()) == OK &&
+              std::all_of(errors.begin(), errors.end(), [](int32_t error) {
+                return error == Kernel::KERNEL_ERROR_ESRCH;
+              }),
+          "maximum-sized batch returns all invalid-ID errors");
+  }
+  Check(FileSystem::KernelClose(fd) == OK, "close AIO read fixture");
+}
+
+void TestNpWebApi2Memory() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibNpWebApi2::InitNet_1_NpWebApi2(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "NpWebApi2 library and memory exports resolve");
+    return symbol->vaddr;
+  };
+  struct Stats { size_t pool, maximum, current; int32_t reserved; };
+  static_assert(sizeof(Stats) == 32 && offsetof(Stats, reserved) == 24);
+  using Initialize = int (KYTY_SYSV_ABI *)(int, size_t);
+  using GetStats = int (KYTY_SYSV_ABI *)(int, Stats *);
+  using Terminate = int (KYTY_SYSV_ABI *)(int);
+  const auto initialize = reinterpret_cast<Initialize>(find("+o9816YQhqQ"));
+  const auto get_stats = reinterpret_cast<GetStats>(find("Xweb+naPZ8Y"));
+  const auto terminate = reinterpret_cast<Terminate>(find("bEvXpcEk200"));
+  const int first = initialize(1, 65537);
+  const int second = initialize(1, 16384);
+  Stats stats {1, 2, 3, 4};
+  Check(first > 0 && second > 0 && first != second &&
+            get_stats(first, &stats) == OK && stats.pool == 81920 &&
+            stats.maximum == 0 && stats.current == 0 && stats.reserved == 0 &&
+            get_stats(second, &stats) == OK && stats.pool == 16384,
+        "NpWebApi2 statistics retain each context's rounded pool capacity");
+  Check(get_stats(first, nullptr) == static_cast<int32_t>(0x80553402) &&
+            get_stats(0, &stats) == static_cast<int32_t>(0x80553403) &&
+            initialize(1, std::numeric_limits<size_t>::max()) == static_cast<int32_t>(0x80553402),
+        "NpWebApi2 statistics validate output, context ID, and pool rounding");
+  Check(terminate(first) == OK &&
+            get_stats(first, &stats) == static_cast<int32_t>(0x80553404) &&
+            terminate(first) == static_cast<int32_t>(0x80553404) &&
+            terminate(-1) == static_cast<int32_t>(0x80553403) &&
+            get_stats(second, &stats) == OK && stats.pool == 16384 &&
+            terminate(second) == OK,
+        "NpWebApi2 termination removes only the selected library context");
 }
 
 void CheckMountRoot(const std::filesystem::path &root) {
@@ -519,6 +643,8 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
   using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
                                        void *, uint64_t, uint64_t);
+  using WriteKernelEvent = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint64_t,
+                                               uint64_t, uint64_t);
   struct Result { int32_t result; uint32_t error_offset; };
   using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
   using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
@@ -532,6 +658,7 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
   const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
   const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
+  const auto write_event = reinterpret_cast<WriteKernelEvent>(find("H896Pt-yB4I"));
   const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
   const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
   const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
@@ -554,7 +681,7 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
             "initialize AMPR command buffer");
     }
   };
-  // SDK WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
+  // WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
   struct Comparison { uint8_t compare; uint64_t blocked, reference, released; };
   constexpr std::array comparisons {
       Comparison{0, 1, 2, 2}, Comparison{1, 0x40000000000019c3, 0x40000000000019c3,
@@ -602,6 +729,42 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
             "submission wait observes the completed result");
     }
   }
+  reset(1);
+  namespace EventQueue = Libs::LibKernel::EventQueue;
+  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+  uint64_t ampr_user_data = 1, user_data = 2;
+  Check(EventQueue::KernelCreateEqueue(&queue, "apr-completion") == OK &&
+            EventQueue::KernelAddAmprEvent(queue, 42, &ampr_user_data) == OK &&
+            EventQueue::KernelAddUserEventEdge(queue, 42) == OK,
+        "AMPR and user events can share an identifier");
+  std::array<char, 3> output {};
+  Result event_result {1234, 5678};
+  uint32_t event_submission = 0;
+  auto *reader = buffers[0].header.data();
+  Check(read_file(reader, reinterpret_cast<uint64_t>(&buffers[0].header[3]),
+                  reinterpret_cast<uint64_t>(&buffers[0].header[4]), file_id,
+                  output.data(), output.size(), 0) == OK &&
+            write_event(reader, queue, 42, 0x123456789abc, 0, 0) == OK &&
+            submit_apr(reader, 3, &event_result, &event_submission) == OK &&
+            wait_apr(event_submission) == OK && event_result.result == OK,
+        "APR read submits its completion event");
+  std::array<EventQueue::KernelEvent, 2> events {};
+  int event_count = 0;
+  const Libs::LibKernel::KernelUseconds poll = 0;
+  Check(EventQueue::KernelWaitEqueue(queue, events.data(), 2, &event_count, &poll) == OK &&
+            event_count == 1 && events[0].ident == 42 && events[0].filter == -25 &&
+            events[0].data == 0x123456789abc && events[0].udata == &ampr_user_data &&
+            std::memcmp(output.data(), "APR", 3) == 0,
+        "APR completion reports the AMPR filter, payload and registration user data");
+  Check(EventQueue::KernelDeleteAmprEvent(queue, 42) == OK &&
+            EventQueue::KernelTriggerEvent(queue, 42, -25, nullptr) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            EventQueue::KernelTriggerUserEvent(queue, 42, &user_data) == OK &&
+            EventQueue::KernelWaitEqueue(queue, events.data(), 2, &event_count, &poll) == OK &&
+            event_count == 1 && events[0].filter == EventQueue::KERNEL_EVFILT_USER &&
+            events[0].udata == &user_data,
+        "deleting AMPR leaves the user event with the same identifier intact");
+  Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete APR completion queue");
   reset(0);
   uint64_t cpu_fence = 0, amm_done = 0, lower_done = 0;
   std::array<uint32_t, 2> ids {};
@@ -692,6 +855,210 @@ void CheckAprPaths(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
+std::array<int, 2> CreateTcpPair() {
+  namespace Net = Libs::Network::Net;
+  // Guest sockaddr_in: length, family, network-order port/address, padding.
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  const int listener = Net::Socket(2, 1, 0);
+  Check(listener >= 0, "create loopback listener");
+  Check(Net::Bind(listener, address.data(), address.size()) == 0, "bind loopback");
+  Check(Net::Listen(listener, 1) == 0, "listen on loopback");
+  uint32_t address_size = address.size();
+  Check(Net::Getsockname(listener, address.data(), &address_size) == 0,
+        "get assigned loopback port");
+  const int writer = Net::Socket(2, 1, 0);
+  Check(writer >= 0 && Net::Connect(writer, address.data(), address_size) == 0,
+        "connect wake socket");
+  const int reader = Net::Accept(listener, nullptr, nullptr);
+  Check(reader >= 0, "accept wake socket");
+  Check(Net::SocketClose(listener) == 0, "close listener");
+  return {reader, writer};
+}
+
+#if defined(_WIN32)
+void CheckSocketReceiveConcurrency() {
+  namespace Net = Libs::Network::Net;
+  const auto [reader, writer] = CreateTcpPair();
+  const int timeout_ms = 3000;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
+        "bound the blocked receive concurrency fixture");
+  std::promise<void> entered;
+  std::promise<int64_t> completed;
+  auto entered_future = entered.get_future();
+  auto completed_future = completed.get_future();
+  std::jthread receiver([&] {
+    char byte = 0;
+    entered.set_value();
+    completed.set_value(Net::Recv(reader, &byte, 1, 0x42));
+  });
+  Check(entered_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+        "start blocked reader");
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  char byte = 0;
+  const auto before_nonblocking = std::chrono::steady_clock::now();
+  Check(Net::Recv(reader, &byte, 1, 0x80) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
+            std::chrono::steady_clock::now() - before_nonblocking < std::chrono::milliseconds(500) &&
+            completed_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout,
+        "DONTWAIT does not wait behind another blocked reader");
+  const auto before_close = std::chrono::steady_clock::now();
+  Check(Net::SocketClose(reader) == 0, "close succeeds while another thread receives");
+  Check(std::chrono::steady_clock::now() - before_close < std::chrono::seconds(1),
+        "close does not wait for the blocked receive timeout");
+  Check(completed_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+        "close wakes the blocked receive within one second");
+  Check(completed_future.get() <= 0, "closed receive reports EOF or error");
+  Check(std::chrono::steady_clock::now() - before_close < std::chrono::seconds(1),
+        "closing a socket wakes its blocked receive before the receive timeout");
+  receiver.join();
+  Check(Net::SocketClose(writer) == 0, "close blocked receive writer");
+
+  const auto [shutdown_reader, shutdown_writer] = CreateTcpPair();
+  Check(Net::Setsockopt(shutdown_reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
+            Net::Send(shutdown_writer, "x", 1, 0) == 1 &&
+            Net::Recv(shutdown_reader, &byte, 1, 0x42) == 1 && byte == 'x' &&
+            Net::Shutdown(shutdown_reader, 0) == 0 &&
+            Net::Recv(shutdown_reader, &byte, 1, 0) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ESHUTDOWN,
+        "receive shutdown rejects bytes retained by an earlier peek");
+  Check(Net::SocketClose(shutdown_reader) == 0 && Net::SocketClose(shutdown_writer) == 0,
+        "close receive shutdown fixture");
+}
+
+void CheckSocketReceiveBuffer(int reader, int writer) {
+  namespace Net = Libs::Network::Net;
+  constexpr int PeekWaitAll = 0x42;
+  constexpr char Payload[] = "abcdef";
+  const int timeout_ms = 2000;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
+        "bound blocking receive regressions with SO_RCVTIMEO");
+  Check(Net::Send(writer, Payload, 2, 0) == 2, "send first TCP fragment");
+  std::jthread sender([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Check(Net::Send(writer, Payload + 2, 4, 0) == 4, "send second TCP fragment");
+  });
+  std::array<char, 8> received {};
+  Check(Net::Recv(reader, received.data(), 6, PeekWaitAll) == 6 &&
+            std::memcmp(received.data(), Payload, 6) == 0,
+        "combined peek waits for fragmented TCP bytes");
+  sender.join();
+  received.fill(0);
+  Check(Net::Recv(reader, received.data(), 6, PeekWaitAll) == 6 &&
+            std::memcmp(received.data(), Payload, 6) == 0,
+        "repeated combined peek preserves all bytes");
+
+  const int epoll = Net::EpollCreate("buffered receive", 0);
+  Net::NetEpollEvent registration {};
+  registration.events = 1;
+  registration.data.u64 = 0x12345678;
+  Check(epoll >= 0 && Net::EpollControl(epoll, 1, reader, &registration) == 0,
+        "register buffered socket readability");
+  const auto check_readable = [&](bool expected) {
+    std::array<uint64_t, 16> readable {};
+    const auto bit = uint64_t {1} << (reader % 64);
+    readable[reader / 64] = bit;
+    const std::array<int64_t, 2> timeout {expected ? 1 : 0, 0};
+    Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr, timeout.data()) ==
+              (expected ? 1 : 0) && readable[reader / 64] == (expected ? bit : 0),
+          "select reflects buffered bytes and their removal");
+    if (expected) {
+      auto writable = readable;
+      Check(Net::Select(reader + 1, readable.data(), writable.data(), nullptr,
+                        timeout.data()) == 2 && readable[reader / 64] == bit &&
+                writable[reader / 64] == bit,
+            "select counts readable and writable bits once each");
+    }
+    Net::NetEpollEvent event {};
+    Check(Net::EpollWait(epoll, &event, 1, expected ? 1000000 : 0) ==
+              (expected ? 1 : 0) &&
+              (!expected || (event.events == 1 && event.data.u64 == registration.data.u64)),
+          "epoll reflects buffered bytes and preserves registration data");
+  };
+  check_readable(true);
+  std::array<uint8_t, 16> peer {}, expected_peer {};
+  uint32_t peer_size = peer.size(), expected_peer_size = expected_peer.size();
+  Check(Net::Getsockname(writer, expected_peer.data(), &expected_peer_size) == 0 &&
+            Net::Recv(reader, received.data(), 0, PeekWaitAll) == 0 &&
+            Net::Recvfrom(reader, received.data(), 2, 0, peer.data(), &peer_size) == 2 &&
+            peer_size == expected_peer_size && peer == expected_peer &&
+            std::memcmp(received.data(), Payload, 2) == 0 &&
+            FileSystem::KernelRead(reader, received.data(), 2) == 2 &&
+            std::memcmp(received.data(), Payload + 2, 2) == 0,
+        "zero-length peek preserves bytes; recvfrom returns peer and shares kernel read buffer");
+  check_readable(true);
+  Check(Net::Send(writer, "gh", 2, 0) == 2 &&
+            Net::Recv(reader, received.data(), 4, 0x40) == 4 &&
+            std::memcmp(received.data(), "efgh", 4) == 0,
+        "waitall joins buffered bytes with newly received bytes");
+  check_readable(false);
+  Check(Net::Send(writer, "mn", 2, 0) == 2, "send plain peek fixture");
+  const auto before_peek = std::chrono::steady_clock::now();
+  Check(Net::Recv(reader, received.data(), 4, 2) == 2 &&
+            std::memcmp(received.data(), "mn", 2) == 0 &&
+            std::chrono::steady_clock::now() - before_peek < std::chrono::milliseconds(500) &&
+            Net::Recv(reader, received.data(), 4, 0) == 2 &&
+            std::memcmp(received.data(), "mn", 2) == 0,
+        "plain peek returns available bytes promptly and preserves them for ordinary receive");
+
+  const int enabled = 1, disabled = 0;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Recv(reader, received.data(), 4, PeekWaitAll) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "empty nonblocking combined peek returns would-block");
+  Check(Net::Send(writer, "ij", 2, 0) == 2, "send nonblocking receive fixture");
+  check_readable(true);
+  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+  for (int i = 0; i < 2; ++i) {
+    Check(Net::Recv(reader, received.data(), 4, PeekWaitAll) == 2 &&
+              std::memcmp(received.data(), "ij", 2) == 0 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+          "nonblocking combined peek preserves a short result and successful errno");
+  }
+  Check(Net::Recv(reader, received.data(), 4, 0) == 2 &&
+            std::memcmp(received.data(), "ij", 2) == 0,
+        "ordinary receive consumes a short buffered result");
+  check_readable(false);
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &disabled, sizeof(disabled)) == 0 &&
+            Net::EpollDestroy(epoll) == 0,
+        "restore blocking receives and destroy epoll");
+  Check(Net::Recv(reader, received.data(), 4, PeekWaitAll | 0x80) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "per-call nonblocking combined peek returns would-block on a blocking socket");
+  Check(Net::Send(writer, "kl", 2, 0) == 2 && Net::Shutdown(writer, 1) == 0,
+        "send a final partial payload and EOF");
+  for (int i = 0; i < 2; ++i) {
+    Check(Net::Recv(reader, received.data(), 4, PeekWaitAll) == 2 &&
+              std::memcmp(received.data(), "kl", 2) == 0,
+          "EOF ends waitall while repeated peeks preserve the short payload");
+  }
+  Check(Net::Recv(reader, received.data(), 4, 0x40) == 2 &&
+            std::memcmp(received.data(), "kl", 2) == 0 &&
+            Net::Recv(reader, received.data(), 4, PeekWaitAll) == 0,
+        "draining the final buffered payload exposes EOF");
+
+  const int datagram = Net::Socket(2, 2, 0);
+  const int datagram_writer = Net::Socket(2, 2, 0);
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  uint32_t address_size = address.size();
+  Check(datagram >= 0 && datagram_writer >= 0 &&
+            Net::Bind(datagram, address.data(), address.size()) == 0 &&
+            Net::Getsockname(datagram, address.data(), &address_size) == 0 &&
+            Net::Setsockopt(datagram, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
+            Net::Sendto(datagram_writer, Payload, 6, 0, address.data(), address_size) == 6,
+        "create bounded UDP truncation fixture");
+  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+  Check(Net::Recvfrom(datagram, received.data(), 2, 0, nullptr, nullptr) == 2 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL &&
+            std::memcmp(received.data(), Payload, 2) == 0 &&
+            Net::Setsockopt(datagram, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Recv(datagram, received.data(), received.size(), 0) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "UDP truncation returns its prefix and discards the rest of the datagram");
+  Check(Net::SocketClose(datagram) == 0 && Net::SocketClose(datagram_writer) == 0,
+        "close UDP truncation fixture");
+}
+#endif
+
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
@@ -710,21 +1077,7 @@ void CheckSocketWakeup() {
   const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
   const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
   auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
-  // Guest sockaddr_in: length, family, network-order port/address, padding.
-  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
-  const int listener = Net::Socket(2, 1, 0);
-  Check(listener >= 0, "create loopback listener");
-  Check(Net::Bind(listener, address.data(), address.size()) == 0, "bind loopback");
-  Check(Net::Listen(listener, 1) == 0, "listen on loopback");
-  uint32_t address_size = address.size();
-  Check(Net::Getsockname(listener, address.data(), &address_size) == 0,
-        "get assigned loopback port");
-  const int writer = Net::Socket(2, 1, 0);
-  Check(writer >= 0 && Net::Connect(writer, address.data(), address_size) == 0,
-        "connect wake socket");
-  const int reader = Net::Accept(listener, nullptr, nullptr);
-  Check(reader >= 0, "accept wake socket");
-  Check(Net::SocketClose(listener) == 0, "close listener");
+  const auto [reader, writer] = CreateTcpPair();
   const int enabled = 1;
   Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
         "enable TCP_NODELAY");
@@ -793,6 +1146,10 @@ void CheckSocketWakeup() {
         "Net send reports a broken pipe without raising host SIGPIPE");
   Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
 #endif
+#if defined(_WIN32)
+  CheckSocketReceiveBuffer(reader, writer);
+  CheckSocketReceiveConcurrency();
+#endif
   Check(Net::SocketClose(writer) == 0, "close wake writer");
   *net_errno = Libs::Posix::POSIX_EINVAL;
   Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
@@ -838,10 +1195,12 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
+  TestNpWebApi2Memory();
   graphics.reset();
   subsystems.Destroy();
 

@@ -1797,6 +1797,12 @@ int KYTY_SYSV_ABI KernelRtldThreadAtexitDecrement(uint64_t* /*c*/) {
 	return 0;
 }
 
+static uint64_t KYTY_SYSV_ABI KernelGetAvailableCpumask() {
+	PRINT_NAME();
+
+	return 0x1fff;
+}
+
 static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
 	PRINT_NAME();
 
@@ -2183,6 +2189,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("wtkt-teR1so", Posix::pthread_attr_init);
 	LIB_FUNC("zHchY8ft5pk", Posix::pthread_attr_destroy);
 	LIB_FUNC("vQm4fDEsWi8", Posix::pthread_attr_getstack);
+	LIB_FUNC("-SrbXpGR1f0", Posix::pthread_attr_setstack);
 	LIB_FUNC("2Q0z6rnBrTE", Posix::pthread_attr_setstacksize);
 	LIB_FUNC("Ucsu-OK+els", Posix::pthread_attr_get_np);
 	LIB_FUNC("RtLRV-pBTTY", Posix::pthread_attr_getschedpolicy);
@@ -2821,6 +2828,7 @@ constexpr int32_t KERNEL_AIO_STATE_SUBMITTED  = 1;
 constexpr int32_t KERNEL_AIO_STATE_PROCESSING = 2;
 constexpr int32_t KERNEL_AIO_STATE_COMPLETED  = 3;
 constexpr int32_t KERNEL_AIO_STATE_ABORTED    = 4;
+constexpr int32_t KERNEL_AIO_STATE_NOTIFIED   = 0x10000;
 constexpr int32_t KERNEL_AIO_MAX_QUEUE        = 512;
 constexpr int32_t KERNEL_AIO_MAX_REQUESTS     = 128;
 
@@ -2933,10 +2941,31 @@ int KYTY_SYSV_ABI KernelAioPollRequest(int32_t id, int32_t* state) {
 	}
 
 	if (!kernel_aio_is_valid_id(id)) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
+		*state = LibKernel::KERNEL_ERROR_ESRCH;
+		return OK;
 	}
 
-	*state = g_kernel_aio_state[id].load(std::memory_order_acquire);
+	auto current = g_kernel_aio_state[id].load(std::memory_order_acquire);
+	while (current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED) {
+		if (g_kernel_aio_state[id].compare_exchange_weak(current, current | KERNEL_AIO_STATE_NOTIFIED,
+		                                                std::memory_order_acq_rel)) {
+			break;
+		}
+	}
+	*state = current == 0 ? LibKernel::KERNEL_ERROR_ESRCH : current;
+	return OK;
+}
+
+int KYTY_SYSV_ABI KernelAioPollRequests(int32_t* ids, int32_t num, int32_t* states) {
+	if (ids == nullptr || states == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (num <= 0 || num > KERNEL_AIO_MAX_REQUESTS) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	for (int32_t i = 0; i < num; i++) {
+		KernelAioPollRequest(ids[i], &states[i]);
+	}
 	return OK;
 }
 
@@ -2948,7 +2977,7 @@ int KYTY_SYSV_ABI KernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* use
 	}
 
 	if (!kernel_aio_is_valid_id(id)) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
+		return KernelAioPollRequest(id, state);
 	}
 
 	uint32_t waited  = 0;
@@ -2964,8 +2993,7 @@ int KYTY_SYSV_ABI KernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* use
 		current = g_kernel_aio_state[id].load(std::memory_order_acquire);
 	}
 
-	*state = current;
-	return OK;
+	return KernelAioPollRequest(id, state);
 }
 
 int KYTY_SYSV_ABI KernelAioDeleteRequest(int32_t id, int32_t* ret) {
@@ -2976,12 +3004,35 @@ int KYTY_SYSV_ABI KernelAioDeleteRequest(int32_t id, int32_t* ret) {
 	}
 
 	if (!kernel_aio_is_valid_id(id)) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
+		*ret = LibKernel::KERNEL_ERROR_ESRCH;
+		return OK;
 	}
 
-	g_kernel_aio_state[id].store(KERNEL_AIO_STATE_ABORTED, std::memory_order_release);
-	*ret = OK;
+	auto current = g_kernel_aio_state[id].load(std::memory_order_acquire);
+	for (;;) {
+		const auto state = current & ~KERNEL_AIO_STATE_NOTIFIED;
+		if (state != KERNEL_AIO_STATE_COMPLETED && state != KERNEL_AIO_STATE_ABORTED) {
+			*ret = current == 0 ? LibKernel::KERNEL_ERROR_ESRCH : LibKernel::KERNEL_ERROR_EBUSY;
+			break;
+		}
+		if (g_kernel_aio_state[id].compare_exchange_weak(current, 0, std::memory_order_acq_rel)) {
+			*ret = OK;
+			break;
+		}
+	}
+	return OK;
+}
 
+int KYTY_SYSV_ABI KernelAioDeleteRequests(int32_t* ids, int32_t num, int32_t* rets) {
+	if (ids == nullptr || rets == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (num <= 0 || num > KERNEL_AIO_MAX_REQUESTS) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	for (int32_t i = 0; i < num; i++) {
+		KernelAioDeleteRequest(ids[i], &rets[i]);
+	}
 	return OK;
 }
 
@@ -3097,6 +3148,7 @@ LIB_DEFINE(InitLibKernel_1_Equeue) {
 	LIB_FUNC("WDszmSbWuDk", EventQueue::KernelAddUserEventEdge);
 	LIB_FUNC("F6e0kwo4cnk", EventQueue::KernelTriggerUserEvent);
 	LIB_FUNC("LJDwdSNTnDg", EventQueue::KernelDeleteUserEvent);
+	LIB_FUNC("57ZK+ODEXWY", EventQueue::KernelAddTimerEvent);
 	LIB_FUNC("R74tt43xP6k", EventQueue::KernelAddHRTimerEvent);
 	LIB_FUNC("J+LF6LwObXU", EventQueue::KernelDeleteHRTimerEvent);
 	LIB_FUNC("bBfz7kMF2Ho", EventQueue::KernelAddAmprEvent);
@@ -3319,8 +3371,10 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("kbw4UHHSYy0", LibKernel::pthread_cxa_finalize);
 	LIB_FUNC("lLMT9vJAck0", LibKernel::clock_gettime);
 	LIB_FUNC("5TgME6AYty4", KernelAioDeleteRequest);
+	LIB_FUNC("Ft3EtsZzAoY", KernelAioDeleteRequests);
 	LIB_FUNC("HgX7+AORI58", KernelAioSubmitReadCommands);
 	LIB_FUNC("2pOuoWoCxdk", KernelAioPollRequest);
+	LIB_FUNC("o7O4z3jwKzo", KernelAioPollRequests);
 	LIB_FUNC("KOF-oJbQVvc", KernelAioWaitRequest);
 	LIB_FUNC("XQ8C8y+de+E", KernelAioSubmitWriteCommands);
 	LIB_FUNC("nu4a0-arQis", KernelAioInitializeParam);
@@ -3340,6 +3394,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("vYU8P9Td2Zo", KernelAioInitializeImpl);
 	LIB_FUNC("WhCc1w3EhSI", LibKernel::KernelSetThreadAtexitReport);
 	LIB_FUNC("WkwEd3N7w0Y", LibKernel::KernelInstallExceptionHandler);
+	LIB_FUNC("La9uyZv4Kvw", LibKernel::KernelGetAvailableCpumask);
 	LIB_FUNC("g0VTBxfJyu0", LibKernel::KernelGetCurrentCpu);
 	LIB_FUNC("wzvqT4UqKX8", LibKernel::KernelLoadStartModule);
 	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
@@ -59,6 +60,21 @@ constexpr uint8_t kInsertqXmm10Xmm9Len16Index8[] = {
 	0xf2, 0x45, 0x0f, 0x78, 0xd1, 0x10, 0x08, // insertq xmm10, xmm9, 16, 8
 	0xf3, 0x44, 0x0f, 0x7f, 0x17,             // movdqu %xmm10, (%rdi)
 	0xc3,                                     // ret
+};
+
+constexpr uint8_t kInsertqXmm10Xmm9[] = {
+	0xf3, 0x44, 0x0f, 0x6f, 0x0e, // movdqu (%rsi), %xmm9
+	0xf3, 0x44, 0x0f, 0x6f, 0x12, // movdqu (%rdx), %xmm10
+	0xf2, 0x45, 0x0f, 0x79, 0xd1, // insertq xmm10, xmm9
+	0xf3, 0x44, 0x0f, 0x7f, 0x17, // movdqu %xmm10, (%rdi)
+	0xc3,
+};
+
+constexpr uint8_t kInsertqXmm9Xmm9[] = {
+	0xf3, 0x44, 0x0f, 0x6f, 0x0e, // movdqu (%rsi), %xmm9
+	0xf2, 0x45, 0x0f, 0x79, 0xc9, // insertq xmm9, xmm9
+	0xf3, 0x44, 0x0f, 0x7f, 0x0f, // movdqu %xmm9, (%rdi)
+	0xc3,
 };
 
 constexpr uint8_t kUd2[] = {
@@ -192,6 +208,31 @@ void TestRexHighRegisterInsertqWithIndex() {
 	Check(out[1] == 0xbbbbbbbbbbbbbbbbull, "insertq xmm10, xmm9, 16, 8 leaves the upper 64 bits untouched");
 }
 
+void TestInsertqRegister() {
+	const auto separate = MapCode<PairBlobFn>(kInsertqXmm10Xmm9);
+	const auto aliased  = MapCode<PairBlobFn>(kInsertqXmm9Xmm9);
+	for (const auto fn: {separate, aliased}) {
+		for (const uint64_t controls: {0xc4c8ull, 0xc0c0ull, 0xffc1ull}) {
+			const uint64_t source[2] {0x0123456789abcdefull, 0xdeadbeef00000000ull | controls};
+			const uint64_t destination[2] {0x8877665544332211ull, 0xfedcba9876543210ull};
+			const auto*    initial  = fn == aliased ? source : destination;
+			uint64_t       expected = initial[0];
+			const auto     length   = (controls & 63) == 0 ? 64 : controls & 63;
+			const auto     index    = (controls >> 8) & 63;
+			for (uint64_t bit = 0; bit < length && index + bit < 64; ++bit) {
+				const uint64_t mask = uint64_t {1} << (index + bit);
+				expected = (expected & ~mask) | (((source[0] >> bit) & 1) << (index + bit));
+			}
+			uint64_t  out[2] {};
+			const int before = IllegalHits();
+			fn(out, source, destination);
+			Check(IllegalHits() == before + 1, "register INSERTQ raises one SIGILL");
+			Check(out[0] == expected && out[1] == initial[1],
+			      "register INSERTQ uses upper source controls and preserves upper destination");
+		}
+	}
+}
+
 void TestUnknownInstructionRefused() {
 	g_refused.store(false, std::memory_order_relaxed);
 	g_refuse_skip.store(2, std::memory_order_relaxed);
@@ -213,6 +254,7 @@ int main() {
 	TestInsertqImmediate();
 	TestRexHighRegisterExtrq();
 	TestRexHighRegisterInsertqWithIndex();
+	TestInsertqRegister();
 	TestUnknownInstructionRefused();
 	std::printf("macosSse4aTests: all passed\n");
 	return 0;

@@ -109,6 +109,7 @@ private:
 	void DS_ADDTID(const Decoder::Instruction& inst, bool write);
 	void DS_SWIZZLE_B32(const Decoder::Instruction& inst);
 	void DS_PERMUTE(const Decoder::Instruction& inst, bool backward);
+	void DS_ORDERED_COUNT(const Decoder::Instruction& inst);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
 	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,

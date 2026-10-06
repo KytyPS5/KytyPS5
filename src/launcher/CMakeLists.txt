@@ -77,10 +77,11 @@ endif()
 set_target_properties(launcher PROPERTIES OUTPUT_NAME ${launcher_name})
 
 # Trophy language files are read from next to the launcher.
-add_custom_command(TARGET launcher POST_BUILD
+add_custom_target(launcher_localization ALL
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${KYTY_LOCALIZATION_DIR}"
 		"$<TARGET_FILE_DIR:launcher>/assets/localization"
 	VERBATIM)
+add_dependencies(launcher launcher_localization)
 
 if(APPLE)
 	# macOS bundle: KytyPS5.app with launcher as main executable and

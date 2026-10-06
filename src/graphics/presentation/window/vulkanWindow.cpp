@@ -408,14 +408,15 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
-// SteamOS Streaming LXC: global priority of the emulator's GPU queue. The
-// emulator shares the GPU with the desktop compositor and the stream
-// capture/encoder; at the default (medium) priority a GPU-saturating game
-// starves them and the stream stutters. LOW lets every other client go
-// first. KYTY_GPU_QUEUE_PRIORITY=low|medium|default (default = upstream
-// behaviour, no request). Set by VulkanCreate before device creation.
-static bool                    g_queue_priority_enabled = false;
-static vk::QueueGlobalPriority g_queue_priority         = vk::QueueGlobalPriority::eLow;
+// Global priority of the emulator's GPU queue. When the emulator shares the
+// GPU with a desktop compositor or a stream capture/encoder, a GPU-saturating
+// game at the default (medium) priority competes with them on equal terms;
+// LOW lets the other clients go first. KYTY_GPU_QUEUE_PRIORITY selects
+// low (the default), medium, or default (no request, the previous behaviour).
+struct QueuePriorityRequest {
+	bool                    enabled  = false;
+	vk::QueueGlobalPriority priority = vk::QueueGlobalPriority::eLow;
+};
 
 static bool QueuePriorityFromEnv(vk::QueueGlobalPriority* priority) {
 	const char*       env   = std::getenv("KYTY_GPU_QUEUE_PRIORITY");
@@ -434,8 +435,9 @@ static bool QueuePriorityFromEnv(vk::QueueGlobalPriority* priority) {
 	return false;
 }
 
-static vk::Device VulkanCreateDevice(GraphicContext& graphics,
-	                                 const std::vector<const char*>& device_extensions) {
+static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
+                                     const std::vector<const char*>& device_extensions,
+                                     QueuePriorityRequest            queue_priority_request) {
 	const auto physical_device = graphics.physical_device;
 	const auto queue_family    = graphics.queue_family;
 	EXIT_IF(physical_device == nullptr);
@@ -448,8 +450,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	queue_create_info.pQueuePriorities = &queue_priority;
 
 	vk::DeviceQueueGlobalPriorityCreateInfo global_priority_info {};
-	global_priority_info.globalPriority = g_queue_priority;
-	if (g_queue_priority_enabled) {
+	global_priority_info.globalPriority = queue_priority_request.priority;
+	if (queue_priority_request.enabled) {
 		queue_create_info.pNext = &global_priority_info;
 	}
 
@@ -461,7 +463,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// default-priority queue on another family so the context exists.
 	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, {}};
 	uint32_t                                 queue_create_info_count = 1;
-	if (g_queue_priority_enabled && g_queue_priority != vk::QueueGlobalPriority::eMedium) {
+	if (queue_priority_request.enabled &&
+	    queue_priority_request.priority != vk::QueueGlobalPriority::eMedium) {
 		const auto families = physical_device.getQueueFamilyProperties();
 		for (uint32_t family = 0; family < static_cast<uint32_t>(families.size()); family++) {
 			if (family != queue_family && families[family].queueCount > 0) {
@@ -703,11 +706,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::Device device = nullptr;
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
-	if (g_queue_priority_enabled && (result == vk::Result::eErrorNotPermitted ||
-	                                 result == vk::Result::eErrorInitializationFailed)) {
+	if (queue_priority_request.enabled && (result == vk::Result::eErrorNotPermitted ||
+	                                       result == vk::Result::eErrorInitializationFailed)) {
 		LOGF("GPU queue global priority refused (%s); using the default priority\n",
 		     vk::to_string(result).c_str());
-		g_queue_priority_enabled         = false;
+		queue_priority_request.enabled   = false;
 		queue_create_infos[0].pNext      = nullptr;
 		create_info.queueCreateInfoCount = 1;
 		result = physical_device.createDevice(&create_info, nullptr, &device);
@@ -1054,6 +1057,8 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
 	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
 
+	// Chosen per device creation; nothing carries over between calls.
+	QueuePriorityRequest queue_priority_request {};
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",
@@ -1062,18 +1067,19 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
-		if (QueuePriorityFromEnv(&g_queue_priority)) {
+		if (QueuePriorityFromEnv(&queue_priority_request.priority)) {
 			for (const auto* extension:
 			     {VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME}) {
 				if (HasExtension(available_extensions, extension)) {
 					device_extensions.push_back(extension);
-					g_queue_priority_enabled = true;
+					queue_priority_request.enabled = true;
 					break;
 				}
 			}
-			LOGF("GPU queue global priority: %s\n", g_queue_priority_enabled
-			                                            ? vk::to_string(g_queue_priority).c_str()
-			                                            : "unsupported by the driver");
+			LOGF("GPU queue global priority: %s\n",
+			     queue_priority_request.enabled
+			         ? vk::to_string(queue_priority_request.priority).c_str()
+			         : "unsupported by the driver");
 		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
@@ -1096,7 +1102,7 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
-	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
+	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions, queue_priority_request);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");
 	}

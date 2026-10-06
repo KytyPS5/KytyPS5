@@ -29,8 +29,6 @@ struct RenderDepthInfo {
 	bool                        depth_write_enable       = false;
 	vk::CompareOp               depth_compare_op         = vk::CompareOp::eNever;
 	bool                        depth_bounds_test_enable = false;
-	float                       depth_min_bounds         = 0.0f;
-	float                       depth_max_bounds         = 0.0f;
 	bool                        stencil_clear_enable     = false;
 	uint8_t                     stencil_clear_value      = 0;
 	bool                        stencil_test_enable      = false;

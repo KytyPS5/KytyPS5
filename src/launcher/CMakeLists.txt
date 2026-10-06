@@ -21,6 +21,10 @@ add_executable(launcher WIN32
 
 
 target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static kyty_git_version common)
+if(LINUX)
+	find_package(Qt6 COMPONENTS DBus REQUIRED)
+	target_link_libraries(launcher Qt6::DBus)
+endif()
 if(WIN32)
 target_link_libraries(launcher setupapi)
 endif()
@@ -92,6 +96,7 @@ install(TARGETS launcher
 
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
+	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
 	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
 	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
 	if(NOT KYTY_MACDEPLOYQT)

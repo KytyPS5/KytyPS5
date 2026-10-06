@@ -19,7 +19,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
@@ -523,20 +522,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
-	// Temporary workaround for games that compile ray-tracing shaders before
-	// the player can select a mode without ray tracing.
-	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
-		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-		if (!warned.test_and_set(std::memory_order_relaxed)) {
-			const auto& bvh = decoded.instructions.back();
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Warning: ray tracing is not implemented; skipping compute dispatches containing "
-			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
-			    options.shader_hash, bvh.pc, bvh.opcode_id));
-		}
-		return {.skip_dispatch = true};
-	}
-
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
@@ -610,7 +595,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
-	IR::ConstantPropagationPass(ir.blocks);
+	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
@@ -618,7 +603,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
-		IR::ConstantPropagationPass(ir.blocks);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
@@ -633,7 +618,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg);
-	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
@@ -646,7 +630,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
-	EXIT_IF(translated.skip_dispatch);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
@@ -666,6 +649,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				})) {
 					continue;
 				}
+				const auto resource = inst.Flags<uint32_t>();
+				first               = resource < ir.info.buffers.size() &&
+				                              ir.info.buffers[resource].indirect_root == resource
+				                          ? 1u
+				                          : 0u;
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&
@@ -683,7 +671,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
-	IR::AllocateBindings(ir, push_data_start_dword);
+	IR::AllocateBindings(ir, push_data_start_dword,
+	                     ir.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
+	                         options.input_info.compute->lds_storage);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

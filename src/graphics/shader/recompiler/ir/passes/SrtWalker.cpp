@@ -525,15 +525,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			return false;
 		}
 	} else {
-		if (vector) return false;
-		// Without an ordinary reader, a checked specialization reader still beats a raw
+		// Without an ordinary reader a checked specialization reader still beats a raw
 		// dereference: a table the guest never set (null base) must fail, not fault the host.
-		if (m_runtime.read_specialization_memory != nullptr) {
-			if (!m_runtime.read_specialization_memory(m_runtime.userdata, address, {&word, 1})) {
-				return false;
-			}
-		} else {
-			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		if (vector || m_runtime.read_specialization_memory == nullptr ||
+		    !m_runtime.read_specialization_memory(m_runtime.userdata, address, {&word, 1})) {
+			return false;
 		}
 	}
 	result = word;

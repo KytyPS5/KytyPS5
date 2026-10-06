@@ -3141,7 +3141,8 @@ void TestConditionalBufferMaterialization() {
 void TestGuardedScalarDescriptorReads() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   for (const bool shared : {false, true}) {
-    for (const bool exec : {false, true}) {
+    for (const bool exec : {false, true})
+    for (const bool ordinary : {true, false}) {  // false: only the checked reader
       Fixture fixture;
       auto *entry = fixture.block;
       auto *optional = fixture.AddBlock();
@@ -3205,19 +3206,22 @@ void TestGuardedScalarDescriptorReads() {
         return ReadLinearTestMemory(&memory.data, address, words);
       };
       const std::array<uint32_t, 5> user_data{0x1000u, 0u, 64u, 0u, 0x1040u};
-      const SrtRuntime runtime{.user_data = user_data, .read_memory = Read,
+      const SrtRuntime runtime{.user_data = user_data, .read_memory = ordinary ? Read : nullptr,
                                .userdata = &memory, .read_specialization_memory = Read};
       memory.data.words[0xa8 / 4] = 0x2000u;
       memory.data.words[0xb0 / 4] = 4u;
       ResourceSnapshot snapshot;
       ResourceSpecialization specialization;
+      uint32_t active_reads = 0;
       if (!shared) {
         Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 0 &&
                   std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
               "disabled feature speculatively dereferenced its null BVH table");
         memory.data.words[7] = 1;
-        Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1,
+        // The flattened and the specialization evaluators may each probe the null table once.
+        Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads >= 1,
               "active feature accepted an unreadable BVH table");
+        active_reads = memory.null_reads;
       }
       memory.data.words[0x40 / 4] = 0x1080u;
       memory.data.watched_address = 0x10a8u;
@@ -3232,7 +3236,7 @@ void TestGuardedScalarDescriptorReads() {
       if (!shared) {
         memory.data.words[7] = 0;
         memory.data.words[0x40 / 4] = 0;
-        Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1 &&
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == active_reads &&
                   std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
               "cached plan retained reads after the feature was disabled");
       }

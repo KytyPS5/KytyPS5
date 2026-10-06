@@ -34,6 +34,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
@@ -1065,6 +1070,8 @@ void CheckSocketWakeup() {
       {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *getsockopt_symbol = symbols.Find(
       {"xphrZusl78E", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *setsockopt_symbol = symbols.Find(
+      {"2mKX2Spso7I", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *send_symbol = symbols.Find(
       {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *sendto_symbol = symbols.Find(
@@ -1075,11 +1082,12 @@ void CheckSocketWakeup() {
       {"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
       {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  Check(connect_symbol && getsockopt_symbol && send_symbol && sendto_symbol &&
+  Check(connect_symbol && getsockopt_symbol && setsockopt_symbol && send_symbol && sendto_symbol &&
             recv_symbol && recvfrom_symbol && errno_symbol,
         "Net socket and errno exports resolve with the guest ABI versions");
   using Connect = int (KYTY_SYSV_ABI *)(int, const void *, uint32_t);
   using Getsockopt = int (KYTY_SYSV_ABI *)(int, int, int, void *, uint32_t *);
+  using Setsockopt = int (KYTY_SYSV_ABI *)(int, int, int, const void *, uint32_t);
   using Send = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int);
   using Sendto = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int, const void *, uint32_t);
   using Recv = int (KYTY_SYSV_ABI *)(int, void *, size_t, int);
@@ -1087,6 +1095,7 @@ void CheckSocketWakeup() {
   using Errno = int *(KYTY_SYSV_ABI *)();
   const auto net_connect = reinterpret_cast<Connect>(connect_symbol->vaddr);
   const auto net_getsockopt = reinterpret_cast<Getsockopt>(getsockopt_symbol->vaddr);
+  const auto net_setsockopt = reinterpret_cast<Setsockopt>(setsockopt_symbol->vaddr);
   const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
   const auto net_sendto = reinterpret_cast<Sendto>(sendto_symbol->vaddr);
   const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
@@ -1157,6 +1166,86 @@ void CheckSocketWakeup() {
             Net::Getsockname(datagram_writer, expected_peer.data(), &expected_peer_size) == 0 &&
             Net::Setsockopt(datagram, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0,
         "create nonblocking loopback datagrams for Net ABI verification");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+  for (const int option : {0x1001, 0x1002}) {
+    constexpr int requested = 16384;
+    int actual = 0;
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(datagram, 0xffff, option, &requested, sizeof(requested)) == 0 &&
+              net_getsockopt(datagram, 0xffff, option, &actual, &size) == 0 &&
+              actual >= requested && size == sizeof(actual),
+          "Net UDP send and receive buffers accept guest option numbers");
+  }
+  for (const int value : {1, 0}) {
+    int actual = -1;
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(datagram, 0xffff, 0x20, &value, sizeof(value)) == 0 &&
+              net_getsockopt(datagram, 0xffff, 0x20, &actual, &size) == 0 &&
+              actual == value && size == sizeof(actual),
+          "Net UDP broadcast option can be enabled and disabled");
+  }
+  int timeout = 0;
+  int *timeout_value = &timeout;
+#if defined(__linux__)
+  int broadcast = -1;
+  uint32_t broadcast_size = sizeof(broadcast);
+  Check(net_setsockopt(datagram, 0xffff, 0x10000, &enabled, sizeof(enabled)) == 0 &&
+            net_getsockopt(datagram, 0xffff, 0x20, &broadcast, &broadcast_size) == 0 &&
+            broadcast == 0,
+        "preserving the all-ones destination does not enable broadcast permission");
+  const long page_size = sysconf(_SC_PAGESIZE);
+  Check(page_size > 0, "get host page size for socket timeout boundary");
+  void *timeout_pages = mmap(nullptr, page_size * 2, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  Check(timeout_pages != MAP_FAILED &&
+            mprotect(static_cast<char *>(timeout_pages) + page_size, page_size,
+                     PROT_NONE) == 0,
+        "guard memory after the four-byte socket timeout");
+  timeout_value = reinterpret_cast<int *>(static_cast<char *>(timeout_pages) +
+                                           page_size - sizeof(int));
+#endif
+  for (const int value : {1500000, 0, -1}) {
+    *timeout_value = value;
+    Check(net_setsockopt(datagram, 0xffff, 0x1105, timeout_value, sizeof(int)) == 0,
+          "Net send timeout reads a four-byte microsecond value");
+    *timeout_value = -2;
+    uint32_t size = sizeof(int);
+    Check(net_getsockopt(datagram, 0xffff, 0x1105, timeout_value, &size) == 0 &&
+              *timeout_value == std::max(value, 0) && size == sizeof(int),
+          "Net send timeout returns four-byte microseconds and disables nonpositive values");
+  }
+#if defined(__linux__)
+  Check(munmap(timeout_pages, page_size * 2) == 0, "free socket timeout guard pages");
+#endif
+  Check(*net_errno == Libs::Posix::POSIX_EINVAL &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "successful Net socket option calls preserve both guest errno values");
+  Check(net_setsockopt(datagram, 0xffff, 0x1105, nullptr, sizeof(timeout)) ==
+            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT &&
+            net_getsockopt(datagram, 0xffff, 0x1105, &timeout, nullptr) ==
+            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT,
+        "Net socket options reject null value and length pointers");
+  uint32_t short_size = sizeof(timeout) - 1;
+  Check(net_setsockopt(datagram, 0xffff, 0x1105, &timeout, short_size) ==
+            Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL &&
+            net_getsockopt(datagram, 0xffff, 0x1105, &timeout, &short_size) ==
+            Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net send timeout rejects undersized values");
+  uint32_t option_size = sizeof(timeout);
+  Check(net_setsockopt(datagram, 0xffff, 0x7fffffff, &timeout, option_size) ==
+            Libs::Network::NET_ERROR_ENOPROTOOPT &&
+            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
+            net_getsockopt(datagram, 0xffff, 0x7fffffff, &timeout, &option_size) ==
+            Libs::Network::NET_ERROR_ENOPROTOOPT &&
+            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
+        "Net unknown socket options return protocol-option errors");
+#if defined(__linux__)
+  Check(net_setsockopt(datagram, 0xffff, 0x1007, &timeout, option_size) ==
+            Libs::Network::NET_ERROR_ENOPROTOOPT &&
+            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
+        "Net native protocol-option errors retain their guest error code");
+#endif
   received.fill(0);
   *net_errno = Libs::Posix::POSIX_EINVAL;
   Check(net_sendto(datagram_writer, payload, sizeof(payload), 0,

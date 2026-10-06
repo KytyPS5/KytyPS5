@@ -176,6 +176,8 @@ private:
 	[[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                          ImageId cached);
 	[[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId source);
+	// Copies in the newest GPU write of a same-layout image whose format cannot share the backing.
+	void SyncLayoutAlias(ImageId id, const ImageIds& candidates);
 	void RefreshImage(ImageId id);
 	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
 	void InitializeImage(ImageId id);
@@ -185,6 +187,8 @@ private:
 	                                 uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void               DownloadColorRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
+	                                        ColorTransform transform, Buffer& destination,
+	                                        uint64_t destination_offset, uint64_t destination_size);
 	void               DownloadDepthRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
 	                                        Buffer& destination, uint64_t destination_offset,
 	                                        uint64_t destination_size);

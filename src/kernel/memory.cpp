@@ -95,6 +95,32 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 	GetGpuResources().UnmapMemory(vaddr, size);
 }
 
+// Games such as Hades II stream textures into large direct-memory pools and stage them faster
+// than the host can demand-fault fresh 4 KiB pages, which exhausts their upload pools. Back large
+// writable mappings with huge pages and fault them in up front, as console memory already is.
+// Set KYTY_NO_PREFAULT to skip this and save host RAM.
+static void PrefaultDirectMapping(uint64_t vaddr, uint64_t size, int prot) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	constexpr uint64_t MIN_PREFAULT_SIZE = 0x4000000;
+#ifndef MADV_POPULATE_WRITE
+	constexpr int MADV_POPULATE_WRITE = 23;
+#endif
+	if (size < MIN_PREFAULT_SIZE || (prot & PROT_CPU_WRITE) == 0 ||
+	    std::getenv("KYTY_NO_PREFAULT") != nullptr) {
+		return;
+	}
+	auto* addr = reinterpret_cast<void*>(vaddr);
+	madvise(addr, size, MADV_HUGEPAGE);
+	if (madvise(addr, size, MADV_POPULATE_WRITE) != 0) {
+		LOGF("\t prefault failed: errno = %d\n", errno);
+	}
+#else
+	(void)vaddr;
+	(void)size;
+	(void)prot;
+#endif
+}
+
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
 	EXIT_IF(mode == nullptr);
 	EXIT_IF(gpu_mode == nullptr);
@@ -3206,6 +3232,8 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
 	}
+
+	PrefaultDirectMapping(out_addr, len, prot);
 
 	LOGF_COLOR(Log::Color::Green, "\t [Ok]\n");
 

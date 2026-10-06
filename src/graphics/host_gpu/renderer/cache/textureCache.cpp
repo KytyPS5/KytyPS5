@@ -20,9 +20,11 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -30,6 +32,15 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// Keep the upstream collection policy unless this experiment is explicitly enabled.
+bool Rev3TextureRetentionEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_REV3_TEXTURE_RETENTION");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
@@ -160,6 +171,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		if (Rev3TextureRetentionEnabled()) {
+			m_trigger_gc_memory = m_pressure_gc_memory;
+		}
 	}
 }
 
@@ -1993,16 +2007,34 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
+	std::optional<MemoryPressurePolicy::Level> live_pressure;
+	if (!Rev3TextureRetentionEnabled() && m_graphics.CanReportMemoryUsage())
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	if (Rev3TextureRetentionEnabled() && m_graphics.CanReportMemoryUsage()) {
+		const auto budget   = m_graphics.GetMemoryBudget();
+		m_total_used_memory = budget.usage;
+		if (budget.budget != 0)
+			live_pressure = m_pressure_policy.Update(budget.usage, budget.budget);
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (live_pressure ? *live_pressure == MemoryPressurePolicy::Level::None
+	                  : m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		bool pressured  = live_pressure ? *live_pressure >= MemoryPressurePolicy::Level::Pressure
+		                                : m_total_used_memory >= m_pressure_gc_memory;
+		bool aggressive = allow_aggressive &&
+		                  (live_pressure ? *live_pressure == MemoryPressurePolicy::Level::Critical
+		                                 : m_total_used_memory >= m_critical_gc_memory);
+		const auto           level = aggressive  ? MemoryPressurePolicy::Level::Critical
+		                             : pressured ? MemoryPressurePolicy::Level::Pressure
+		                                         : MemoryPressurePolicy::Level::Collect;
+		const uint64_t       age = std::min<uint64_t>(Rev3TextureRetentionEnabled()
+		                                                  ? MemoryPressurePolicy::TextureAge(level)
+		                                                  : (aggressive  ? 160
+		                                                     : pressured ? 80
+		                                                                 : 16),
+		                                              tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -2034,18 +2066,19 @@ void TextureCache::RunGarbageCollector() {
 				}
 			}
 			FreeImage(id);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			if (!live_pressure && m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+			if (!live_pressure && m_total_used_memory < m_pressure_gc_memory && pressured) {
 				deletions >>= 1;
 				pressured = false;
 			}
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (live_pressure ? *live_pressure == MemoryPressurePolicy::Level::Critical
+	                  : m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
 }

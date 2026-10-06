@@ -300,6 +300,12 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        </property>
        <layout class="QVBoxLayout" name="compatibilityLayout">
         <item>
+         <widget class="QCheckBox" name="checkBox_rev3_texture_retention">
+          <property name="toolTip"><string>Retain cached textures longer while GPU memory pressure is low. May reduce repeated image recreation but increases memory use. Restart the game after changing this setting.</string></property>
+          <property name="text"><string>Rev3 texture retention (experimental)</string></property>
+         </widget>
+        </item>
+        <item>
          <widget class="QCheckBox" name="checkBox_amd_cpu">
           <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
           <property name="text"><string>AMD CPU patch (experimental)</string></property>

@@ -137,6 +137,7 @@ public:
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   rev3_texture_retention_enabled = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -170,6 +171,7 @@ public:
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
+		rev3_texture_retention_enabled = other.rev3_texture_retention_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -218,6 +220,7 @@ public:
 		KYTY_CFG_SET(profiler_enabled);
 		KYTY_CFG_SET(renderdoc_enabled);
 		KYTY_CFG_SET(amd_cpu_enabled);
+		KYTY_CFG_SET(rev3_texture_retention_enabled);
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -265,6 +268,7 @@ public:
 		KYTY_CFG_GET(profiler_enabled);
 		KYTY_CFG_GET(renderdoc_enabled);
 		amd_cpu_enabled = s->value("amd_cpu_enabled", false).toBool();
+		rev3_texture_retention_enabled = s->value("rev3_texture_retention_enabled", false).toBool();
 #if defined(_WIN32)
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();

@@ -2,6 +2,25 @@
 
 The corpus tools inspect shader code and compiler failures without executing shaders on a GPU. The compute fixture runner below executes the existing synthetic GPU tests. Run the Windows commands in PowerShell from the repository root, after following the [Windows build setup](../README.md#build-requirements-windows).
 
+## Normal native game launch
+
+Launch the installed Windows emulator with fullscreen presentation, silent logs and
+Windows guest stack protection. Shader dumps, profiling and validation stay disabled;
+compatible pipeline caches remain available. This launches the existing executable
+without a build or test cycle.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\run-native-game.ps1 `
+  -GameDirectory "C:\path\to\game" -ScreenWidth 2560 -ScreenHeight 1440
+```
+
+Choose the game's graphics mode in its own menu. Window dimensions do not determine
+its internal rendering resolution, and the launcher preserves the game files.
+`-DryRun` prints the exact executable/game hashes and arguments. Each owned session
+has a 3600-second and 28-GiB working-set bound by default, set through
+`-TimeoutSeconds` and `-MaxWorkingSetGiB`. A fresh `_Build/runs/game-*` directory
+records the launch and final output; concurrent native game/build/test work is rejected.
+
 ## Focused native iteration
 
 Use one incremental build and an explicitly selected regression while editing a fix:

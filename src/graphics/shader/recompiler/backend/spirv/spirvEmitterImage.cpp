@@ -398,8 +398,8 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	EXIT_IF(Prospero::RemapTextureFormat(format) == format || info.component_count == 0u ||
 	        info.component_count > 4u);
 	EXIT_IF(info.type != Format::ComponentType::Uscaled &&
-	        (info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
-	         info.byte_size != sizeof(uint32_t)));
+	        ((info.type != Format::ComponentType::Uint && info.type != Format::ComponentType::Unorm) ||
+	         !info.packed_bitfield || info.byte_size != sizeof(uint32_t)));
 	return info;
 }
 
@@ -419,6 +419,7 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 
 	const auto numeric_class = ctx.state.program.info.images[mem.resource].numeric_class;
 	const auto scalar_type   = ImageScalarType(ctx.state, numeric_class);
+	const bool normalized = info.type == Format::ComponentType::Unorm;
 	uint32_t   packed        = 0;
 	if (info.packed_bitfield) {
 		packed = ctx.state.builder.AllocateId();
@@ -432,6 +433,15 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 			                              components[component], packed,
 			                              ConstantU32(ctx.state, info.component_bit_offset[component]),
 			                              ConstantU32(ctx.state, info.component_bits[component]));
+			if (normalized) {
+				const auto floating = Unary(ctx.state, spv::OpConvertUToF, TypeF32(ctx.state),
+				                            components[component]);
+				const auto maximum = (1u << info.component_bits[component]) - 1u;
+				const auto value = Binary(ctx.state, spv::OpFDiv, TypeF32(ctx.state), floating,
+				                          ConstantF32Value(ctx.state, static_cast<float>(maximum)));
+				// The native image is integer; guest registers retain the normalized FP32 bits.
+				components[component] = Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state), value);
+			}
 		} else {
 			ctx.state.builder.AddFunction(spv::OpCompositeExtract, scalar_type,
 			                              components[component], texel, component);
@@ -441,7 +451,9 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 		}
 	}
 	for (uint32_t component = info.component_count; component < 4u; component++) {
-		components[component] = components[component % info.component_count];
+		components[component] =
+		    normalized ? ConstantU32(ctx.state, component == 3u ? 0x3f800000u : 0u)
+		               : components[component % info.component_count];
 	}
 
 	const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
@@ -449,8 +461,9 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 	for (uint32_t component = 0; component < 4u; component++) {
 		const auto selector = (swizzle >> (component * 3u)) & 7u;
 		if (selector == 1u) {
-			selected[component] = info.packed_bitfield ? ConstantU32(ctx.state, 1u)
-			                                          : ConstantF32Value(ctx.state, 1.0f);
+			selected[component] =
+			    info.packed_bitfield ? ConstantU32(ctx.state, normalized ? 0x3f800000u : 1u)
+			                         : ConstantF32Value(ctx.state, 1.0f);
 		} else if (selector >= 4u) {
 			selected[component] = components[selector - 4u];
 		} else {

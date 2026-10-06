@@ -2363,6 +2363,21 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			}
 		}
 		image.conversion_format = ImageConversionFormat(format);
+		const bool packed_unorm =
+		    image.conversion_format != Prospero::BufferFormat::kInvalid &&
+		    Format::GetFormatInfo(format).type == Format::ComponentType::Unorm;
+		if (packed_unorm &&
+		    (storage || base.atomic || base.depth_compare ||
+		     std::ranges::any_of(program.memory_info, [&](const auto& memory) {
+			     return memory.kind == ResourceKind::Image && memory.resource == base_index &&
+			            memory.data_bits != 32u;
+		     }) ||
+		     std::ranges::any_of(program.info.sampled_pairs,
+		                        [&](const auto& pair) { return pair.image == base_index; }))) {
+			// A raw integer backing cannot implement normalized filtering or float stores.
+			// Preserve rejection until those operations have their own semantic proof.
+			return SpecializationFail("packed UNorm image format supports raw image loads only");
+		}
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}

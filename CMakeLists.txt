@@ -664,6 +664,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME packed_unorm_image_admission
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --packed-unorm-image-only)
+	set_tests_properties(packed_unorm_image_admission PROPERTIES TIMEOUT 30)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
@@ -710,6 +713,9 @@ if(BUILD_TESTING)
 	add_test(NAME graphics_packed_float_roundtrip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --packed-float-rt-only)
 	set_tests_properties(graphics_packed_float_roundtrip PROPERTIES TIMEOUT 90)
+	add_test(NAME shader_packed_unorm_loads
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --packed-unorm-load-only)
+	set_tests_properties(shader_packed_unorm_loads PROPERTIES TIMEOUT 90)
 	add_test(NAME shader_fp32_mad_rounding
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-only)
 	set_tests_properties(shader_fp32_mad_rounding PROPERTIES TIMEOUT 90)

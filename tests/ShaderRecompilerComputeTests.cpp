@@ -1301,6 +1301,7 @@ struct TestCase {
   u32 expected_sampler_resources = 0;
   u32 expected_sampled_pairs = 0;
   bool expected_shader_data_storage = false;
+  std::optional<Prospero::BufferFormat> expected_image_format;
   std::vector<ReadbackBitInterval> readback_intervals;
   void (*companion_check)() = nullptr;
 };
@@ -1631,6 +1632,15 @@ CompiledShader CompileCase(const TestCase &test,
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
+  if (test.expected_image_format) {
+    Require(test.name, "image descriptor format", resources.images.size() == 1u,
+            "fixture did not retain exactly one image descriptor");
+    const auto actual = (resources.images[0].dwords[1] >> 20u) & 0x1ffu;
+    Require(test.name, "image descriptor format",
+            actual == static_cast<u32>(*test.expected_image_format),
+            "expected=" + std::to_string(static_cast<u32>(*test.expected_image_format)) +
+                " actual=" + std::to_string(actual));
+  }
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   const auto CheckResourceOrigins = [&](const auto &resources, u32 expected,
@@ -10399,6 +10409,88 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "captured scene allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckPackedUnormTextureBacking() {
+    constexpr const char *name = "PackedUnormTextureBacking";
+    constexpr uintptr_t base = 0x0000000204f00000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr std::array<u32, 4> words{0u, 0xffffffffu, 0x00400801u, 0xaae2b321u};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation", LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_size, 0, &direct_offset) == 0, "direct allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping", LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base), "direct mapping failed");
+    for (const auto format : {Prospero::BufferFormat::k11_11_10UNorm,
+                              Prospero::BufferFormat::k10_11_11UNorm}) {
+      std::memset(mapped, 0xa5, allocation_size);
+      std::memcpy(mapped, words.data(), sizeof(words));
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+          (static_cast<u32>(format) << 20u) | (3u << 30u), 0,
+          DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Uint;
+      resource.conversion_format = format;
+      resource.shader_swizzle = DstSel(4, 5, 6, 7);
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      (void)cache.FindTexture(binding.image_id, binding.desc);
+      Require(name, "same-width native backing",
+              binding.desc.info.pixel_format == vk::Format::eR32Uint &&
+                  binding.desc.info.guest_format == format &&
+                  ReadCachedTexel(name, context, binding.image_id, {}, {4, 1, 1}) ==
+                      std::vector<u32>(words.begin(), words.end()),
+              "raw backing widened, converted or dropped packed image bytes");
+      auto &image = cache.GetImage(binding.image_id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                    {}, scheduler.Current().Handle());
+      vk::ClearColorValue raw_clear{};
+      raw_clear.uint32[0] = 0x00400801u;
+      scheduler.Current().Handle().clearColorImage(image.backing.image,
+          vk::ImageLayout::eTransferDstOptimal,
+          raw_clear,
+          vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+      cache.MarkGpuWritten(binding.image_id);
+      Require(name, "download", TextureCacheTestAccess::TryDownload(cache, binding.image_id),
+              "raw normalized image download failed");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::array<u32, 5> observed{};
+      Require(name, "guest bytes", LibKernel::Memory::TryReadBacking(
+                  base, observed.data(), sizeof(observed)) &&
+                  observed == std::array<u32, 5>{0x00400801u, 0x00400801u, 0x00400801u,
+                                                 0x00400801u, 0xa5a5a5a5u},
+              "download changed packed bits or the adjacent guest sentinel");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0, "release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -37805,6 +37897,67 @@ TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   return test;
 }
 
+template <bool ReverseWidths, bool Swizzled>
+TestCase ImageLoadPackedUnormExactComponents() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = ReverseWidths
+      ? (Swizzled ? "ImageLoadPackedUnorm10_11_11Swizzled"
+                  : "ImageLoadPackedUnorm10_11_11Components")
+      : (Swizzled ? "ImageLoadPackedUnorm11_11_10Swizzled"
+                  : "ImageLoadPackedUnorm11_11_10Components");
+  // Independent fixed-point oracle: field / (2^width - 1), rounded to f32.
+  // These encodings include zero, all maxima, one LSB and unequal RGB fields.
+  constexpr std::array<u32, 4> words = ReverseWidths
+      ? std::array<u32, 4>{0u, 0xffffffffu, 0x00200401u, 0x55715b21u}
+      : std::array<u32, 4>{0u, 0xffffffffu, 0x00400801u, 0xaae2b321u};
+  constexpr std::array<std::array<u32, 4>, 4> values = ReverseWidths
+      ? std::array<std::array<u32, 4>, 4>{{
+          {0u, 0u, 0u, 0x3f800000u},
+          {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
+          {0x3a802008u, 0x3a001002u, 0x3a001002u, 0x3f800000u},
+          {0x3f48721du, 0x3f0ad15au, 0x3eaad55bu, 0x3f800000u}}}
+      : std::array<std::array<u32, 4>, 4>{{
+          {0u, 0u, 0u, 0x3f800000u},
+          {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
+          {0x3a001002u, 0x3a001002u, 0x3a802008u, 0x3f800000u},
+          {0x3ec8590bu, 0x3f0ad15au, 0x3f2aeabbu, 0x3f800000u}}};
+  constexpr std::array<u32, 4> selected = Swizzled
+      ? std::array<u32, 4>{6u, 0u, 4u, 1u}
+      : std::array<u32, 4>{4u, 5u, 6u, 7u};
+  for (u32 pixel = 0; pixel < words.size(); ++pixel) {
+    AppendVMovU32(&test.code, 20, pixel);
+    AppendVMovU32(&test.code, 21, 0);
+    test.code.push_back(EncodeMimg0(0x00, 0xf));
+    test.code.push_back(EncodeMimg1(0, 20));
+    for (u32 component = 0; component < selected.size(); ++component) {
+      AppendStoreVgpr(&test.code, component, pixel * 4u + component);
+      test.expected.push_back(selected[component] == 0u ? 0u
+          : selected[component] == 1u ? 0x3f800000u
+          : values[pixel][selected[component] - 4u]);
+    }
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba.assign(16, 0xdeadbeefu);
+  std::copy(words.begin(), words.end(), test.sampled_image_rgba.begin());
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(ReverseWidths
+      ? Prospero::BufferFormat::k10_11_11UNorm
+      : Prospero::BufferFormat::k11_11_10UNorm);
+  // The guest descriptor and bound synthetic image both describe 4x4 texels.
+  test.user_data[1] |= 3u << 30u;
+  test.user_data[2] = 3u << 14u;
+  test.has_user_data = true;
+  test.expected_image_format = ReverseWidths
+      ? Prospero::BufferFormat::k10_11_11UNorm
+      : Prospero::BufferFormat::k11_11_10UNorm;
+  test.image_descriptor_swizzle = DstSel(
+      selected[0], selected[1], selected[2], selected[3]);
+  return test;
+}
+
 TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   using O = ShaderOpcode;
 
@@ -42197,6 +42350,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
+  AddCase(ImageLoadPackedUnormExactComponents<false, false>);
+  AddCase(ImageLoadPackedUnormExactComponents<false, true>);
+  AddCase(ImageLoadPackedUnormExactComponents<true, false>);
+  AddCase(ImageLoadPackedUnormExactComponents<true, true>);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageSampleUScaled8<false>);
   AddCase(ImageSampleUScaled8<true>);
@@ -48572,6 +48729,15 @@ if (argc == 1) {
     for (const auto &test : MakeCases()) {
       std::printf("KYTY_COMPUTE_CASE %s\n", test.name);
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--packed-unorm-load-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageLoadPackedUnormExactComponents<false, false>());
+    RunCase(&vulkan, ImageLoadPackedUnormExactComponents<false, true>());
+    RunCase(&vulkan, ImageLoadPackedUnormExactComponents<true, false>());
+    RunCase(&vulkan, ImageLoadPackedUnormExactComponents<true, true>());
+    vulkan.CheckPackedUnormTextureBacking();
     return 0;
   }
   if (argc == 3 && std::strcmp(argv[1], "--compute-case") == 0) {

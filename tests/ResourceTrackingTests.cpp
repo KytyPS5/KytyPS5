@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -178,6 +179,77 @@ struct Fixture {
     TrackResources(program, {}, {});
   }
 };
+
+void TestPackedUnormImageAdmission() {
+  namespace P = Libs::Graphics::Prospero;
+  for (const auto format : {P::BufferFormat::k11_11_10UNorm,
+                            P::BufferFormat::k10_11_11UNorm}) {
+    Check(P::NumBytesPerElement(format) == 4u &&
+              P::RemapTextureFormat(format) == P::BufferFormat::k32UInt &&
+              P::RenderTargetBytesPerElement(format) == 0u,
+          "packed normalized load widened storage or admitted an unproved CB format");
+    for (uint32_t mode = 0; mode < 4u; ++mode) {
+      const auto operation = mode < 2u ? ValueOpcode::ImageRead
+          : mode == 2u ? ValueOpcode::ImageSampleRaw : ValueOpcode::ImageWrite;
+      Fixture fixture;
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < words.size(); ++word)
+        words[word] = fixture.UserData(word);
+      const auto image = fixture.Image(words, 0x40u);
+      MemoryInfo access;
+      access.kind = ResourceKind::Image;
+      access.image_dimension = Decoder::ImageDimension::Dim2D;
+      access.data_bits = mode == 1u ? 16u : 32u;
+      access.data_dwords = 4u;
+      access.dmask = 0xfu;
+      const auto address = fixture.ImageAddress();
+      if (operation == ValueOpcode::ImageWrite) {
+        const auto data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+            {Value(0u), Value(0u), Value(0u), Value(0u)});
+        fixture.Emit(operation, {image, address, data, Value(true)},
+                     fixture.AddMemory(access, 0x44u));
+      } else {
+        const auto loaded = operation == ValueOpcode::ImageRead
+            ? fixture.Emit(operation, {image, address, Value(true)},
+                           fixture.AddMemory(access, 0x44u))
+            : fixture.Emit(operation,
+                {image, fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}), address},
+                fixture.AddMemory(access, 0x44u));
+        const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                                              {loaded, Value(0u)});
+        fixture.Emit(ValueOpcode::ReferenceU32, {component});
+      }
+      fixture.PlanAndTrack();
+      const auto plan = ExtractResourcePlan(fixture.program);
+      std::array<uint32_t, 64> user_data{};
+      user_data[0] = 0x1000u;
+      user_data[1] = (static_cast<uint32_t>(format) << 20u) | (3u << 30u);
+      user_data[2] = 3u << 14u;
+      user_data[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+                    (static_cast<uint32_t>(P::ImageType::kColor2D) << 28u);
+      ResourceSnapshot snapshot;
+      snapshot.user_data.push_back(0xa5a5a5a5u);
+      ResourceSpecialization specialization;
+      const auto before = snapshot;
+      const auto before_specialization = specialization;
+      const bool admitted = MaterializeResources(
+          plan, {.user_data = user_data}, snapshot, specialization);
+      if (mode == 0u) {
+        Check(admitted && snapshot.images.size() == 1u &&
+                  snapshot.images[0].dwords[1] == user_data[1] &&
+                  specialization.images[0].conversion_format == format &&
+                  specialization.images[0].numeric_class == P::TextureNumericClass::Uint,
+              "raw normalized load lost its genuine descriptor or integer backing");
+      } else {
+        Check(!admitted && LastResourceSpecializationError().find("raw image loads only") !=
+                                std::string_view::npos &&
+                  SameResourceSnapshot(snapshot, before) &&
+                  specialization == before_specialization,
+              "normalized sampling/storage was admitted or rejection changed prior state");
+      }
+    }
+  }
+}
 
 struct TestMemory {
   uint64_t base = 0x1000;
@@ -9078,6 +9150,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_INVALID_SAMPLED_FORMAT_HOLE_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--packed-unorm-image-only") == 0) {
+      TestPackedUnormImageAdmission();
+      std::cout << "KYTY_PACKED_UNORM_IMAGE_ADMISSION_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--bounded-write-alias-only") == 0) {
       TestBoundedMaterializationRejectsWritableAliases();
       std::cout << "KYTY_BOUNDED_WRITE_ALIAS_PASS\n";
@@ -9214,6 +9291,7 @@ int main(int argc, char** argv) {
     Run("sampled pair operand domain", TestSampledPairOperandDomain);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("packed UNorm image admission", TestPackedUnormImageAdmission);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

@@ -149,23 +149,53 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   return program;
 }
 
-void TestMappedSrtUsesDirectReaderByDefault() {
+struct CheckedMemory {
+  uint64_t address = 0;
+  uint32_t value = 0;
+  uint32_t reads = 0;
+};
+
+bool ReadCheckedMemory(void *userdata, uint64_t address,
+                       std::span<uint32_t> words) {
+  auto &memory = *static_cast<CheckedMemory *>(userdata);
+  ++memory.reads;
+  if (address != memory.address || words.size() != 1) {
+    return false;
+  }
+  words[0] = memory.value;
+  return true;
+}
+
+// Without an ordinary reader the walker reads through the checked reader and never dereferences
+// the guest address itself, so a table the guest never set cannot fault the host.
+void TestMappedSrtUsesCheckedReaderWithoutOrdinary() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
-  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&dword));
-  uint32_t specialization_reads = 0;
-  const SrtRuntime runtime{.userdata = &specialization_reads,
-                           .read_specialization_memory =
-                               RejectSpecializationRead};
+  CheckedMemory memory{.address = reinterpret_cast<uint64_t>(&dword),
+                       .value = dword};
+  auto plan = SrtPlan(memory.address);
+  const SrtRuntime runtime{.userdata = &memory,
+                           .read_specialization_memory = ReadCheckedMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "mapped SRT stage materialization failed");
-  Check(specialization_reads == 0,
-        "ordinary SRT read used the specialization reader");
+  Check(memory.reads != 0, "SRT read bypassed the checked reader");
   Check(snapshot.flattened_srt.size() == 1 &&
             snapshot.flattened_srt[0] == dword,
-        "cache rematerialization did not use the direct reader by default");
+        "cache rematerialization did not use the checked reader");
+
+  uint32_t rejected = 0;
+  auto null_plan = SrtPlan(0);
+  const SrtRuntime rejecting{.userdata = &rejected,
+                             .read_specialization_memory =
+                                 RejectSpecializationRead};
+  Check(!MaterializeResources(null_plan, rejecting, snapshot, specialization) &&
+            rejected != 0,
+        "unreadable SRT table was not rejected by the checked reader");
+  const SrtRuntime no_reader{};
+  Check(!MaterializeResources(null_plan, no_reader, snapshot, specialization),
+        "SRT read without any reader did not fail");
 }
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
@@ -565,7 +595,7 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
-  TestMappedSrtUsesDirectReaderByDefault();
+  TestMappedSrtUsesCheckedReaderWithoutOrdinary();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();

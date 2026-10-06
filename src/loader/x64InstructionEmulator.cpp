@@ -12,6 +12,7 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
+#include <sched.h>
 #include <sys/ucontext.h>
 #else
 #include <sched.h>
@@ -468,6 +469,16 @@ struct Context {
 			default: return nullptr;
 		}
 	}
+	// The kernel hands AVX threads the longer context that carries YMM[255:128]; a plain SSE
+	// context has no such state to clear.
+	void ClearUpperYmm(uint8_t index) const {
+		if (index >= 16 || native->uc_mcsize < sizeof(_STRUCT_MCONTEXT_AVX64)) {
+			return;
+		}
+		auto* avx = reinterpret_cast<_STRUCT_MCONTEXT_AVX64*>(native->uc_mcontext);
+		auto* ymmh = &avx->__fs.__fpu_ymmh0;
+		ymmh[index] = {};
+	}
 #else
 	ucontext_t* native;
 
@@ -703,7 +714,6 @@ static bool TryEmulateCpuExtensions(Context& context) {
 	return true;
 }
 
-#if !defined(__APPLE__)
 
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -790,7 +800,6 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	return true;
 }
 
-#endif
 
 bool TryEmulate(void* native_context) {
 	if (native_context == nullptr) {
@@ -807,11 +816,13 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
+	// VRSQRTPS is trapped by the guest instruction patcher on every host, so Rosetta needs it too.
 #if !defined(__APPLE__)
 	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
 	       TryEmulateSse4a(context) || TryEmulateShaNi(context) || TryEmulateCpuExtensions(context);
 #else
-	return TryEmulateSse4a(context) || TryEmulateCpuExtensions(context);
+	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
+	       TryEmulateSse4a(context) || TryEmulateCpuExtensions(context);
 #endif
 }
 

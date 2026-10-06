@@ -84,6 +84,24 @@ constexpr uint8_t kUd2[] = {
 	0xc3,       // ret
 };
 
+// VRSQRTPS xmm1, xmm0 as the AMD CPU patcher leaves it when it cannot relocate the instruction: a
+// reserved VEX.vvvv bit is cleared (c5 f8 -> c5 f0), which raises #UD on every host. Rosetta aborted
+// the guest on exactly this encoding until the emulator handled it there too.
+constexpr uint8_t kTrappedVrsqrtpsXmm1Xmm0[] = {
+	0x0f, 0x10, 0x06,                         // movups (%rsi), %xmm0
+	0xc5, 0xfc, 0x10, 0x0e,                   // vmovups ymm1, [rsi]: dirty the upper half of ymm1
+	0xc5, 0xf0, 0x52, 0xc8,                   // vrsqrtps xmm1, xmm0 with the vvvv trap mark
+	0x0f, 0x11, 0x0f,                         // movups %xmm1, (%rdi)
+	0xc4, 0xe3, 0x7d, 0x19, 0x4f, 0x10, 0x01, // vextractf128 [rdi + 16], ymm1, 1
+	0xc5, 0xf8, 0x77,                         // vzeroupper
+	0xc3,                                     // ret
+};
+
+constexpr uint8_t kMwaitx[] = {
+	0x0f, 0x01, 0xfb, // mwaitx
+	0xc3,             // ret
+};
+
 constexpr size_t kPageSize = 4096;
 
 std::atomic<int>    g_illegal_hits {0};
@@ -235,6 +253,29 @@ void TestInsertqRegister() {
 	}
 }
 
+void TestTrappedReciprocalSquareRoot() {
+	auto           fn = MapCode<LoadBlobFn>(kTrappedVrsqrtpsXmm1Xmm0);
+	const uint32_t in_bits[8] {std::bit_cast<uint32_t>(4.0f), 0x00000000u, 0xbf800000u, 0x7f800000u,
+	                           0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+	uint32_t       out_bits[8] {};
+	const int      before = IllegalHits();
+	fn(reinterpret_cast<uint64_t *>(out_bits), reinterpret_cast<const uint64_t *>(in_bits));
+	Check(IllegalHits() > before, "host raises SIGILL for the trapped VRSQRTPS");
+	Check(std::bit_cast<float>(out_bits[0]) == 0.5f, "vrsqrtps of 4.0 is 0.5");
+	Check(out_bits[1] == 0x7f800000u, "vrsqrtps of +0 is +infinity");
+	Check(out_bits[2] == 0xffc00000u, "vrsqrtps of a negative number is the default NaN");
+	Check(out_bits[3] == 0, "vrsqrtps of +infinity is +0");
+	Check(out_bits[4] == 0 && out_bits[5] == 0 && out_bits[6] == 0 && out_bits[7] == 0,
+	      "the VEX.128 form zeroes the upper half of ymm1");
+}
+
+void TestMwaitxEmulated() {
+	auto      fn     = MapCode<VoidBlobFn>(kMwaitx);
+	const int before = IllegalHits();
+	fn();
+	Check(IllegalHits() > before, "host raises SIGILL for MWAITX");
+}
+
 void TestUnknownInstructionRefused() {
 	g_refused.store(false, std::memory_order_relaxed);
 	g_refuse_skip.store(2, std::memory_order_relaxed);
@@ -367,6 +408,8 @@ int main() {
 	TestRexHighRegisterExtrq();
 	TestRexHighRegisterInsertqWithIndex();
 	TestInsertqRegister();
+	TestTrappedReciprocalSquareRoot();
+	TestMwaitxEmulated();
 	TestUnknownInstructionRefused();
 	TestPatchedExtrqImmediate();
 	TestPatchedExtrqRexHigh();

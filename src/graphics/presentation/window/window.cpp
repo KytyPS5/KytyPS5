@@ -914,7 +914,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame) {
+void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dlss_bypassed) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -968,7 +968,8 @@ void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame) {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, title_frame_number, fg_enabled ? display_fps : current_fps,
 	    Config::GetDlssMode() == Config::DlssMode::Off ? "" :
-	        (dlss_active ? " [DLSS: active]" : " [DLSS: inactive]"), fg_enabled ? " [FG]" : "");
+	        (dlss_active ? " [DLSS: active]" : dlss_bypassed ? " [DLSS: bypassed, source >= output]" : " [DLSS: inactive]"),
+	    fg_enabled ? " [FG]" : "");
 
 	struct TitleUpdate {
 		SDL_WindowID window_id;

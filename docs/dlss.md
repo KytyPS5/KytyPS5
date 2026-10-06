@@ -98,6 +98,10 @@ by GPU execution. A vblank-capped run can hide that cost in its average FPS.
 
 When a mode is requested, the title displays `DLSS: active` only for frames with
 a successfully evaluated DLSS output; fallback frames display `DLSS: inactive`.
+When the current source (after render scale) already covers the output
+resolution, Super Resolution has nothing to upscale and the title shows
+`DLSS: bypassed, source >= output`; raise the output resolution or lower the
+render scale below the output size to reconstruct.
 Opt-in CSV traces record actual evaluations and presentation intervals; see
 [frame-pacing.md](frame-pacing.md). SDK availability alone does not mean DLSS
 is affecting gameplay.

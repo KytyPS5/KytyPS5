@@ -43,7 +43,7 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void UpdateTitle(bool dlss_active = false, bool new_guest_frame = true);
+	void UpdateTitle(bool dlss_active = false, bool new_guest_frame = true, bool dlss_bypassed = false);
 	void                                                    Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);

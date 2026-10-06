@@ -14,6 +14,7 @@ struct Presenter::Frame {
 	uint64_t producer_tick = 0;
 	bool busy = false;
 	bool dlss_evaluated = false;
+	bool dlss_bypassed = false; // SR skipped because the source already covers the output.
 	bool guest_frame = false;
 	FramePreparationTiming preparation;
 	std::unique_ptr<DlssFgInputs> fg_inputs;

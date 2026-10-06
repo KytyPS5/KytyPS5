@@ -405,6 +405,7 @@ struct Presenter::Impl {
 	vk::Extent2D          dlss_source_size {};
 	uint32_t              dlss_render_scale = 100;
 	bool                  dlss_reduced_source = false;
+	bool                  dlss_bypassed = false;
 	std::optional<vk::Extent2D> dlss_input_size;
 	bool                  emulator_dlss_logged = false;
 	FrameTimingRecorder   timing;
@@ -992,8 +993,17 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			    m_impl->dlss_reduced_source != reduced_source) {
 				// Read the actual last raster color when its content is still current.
 				// Materialized surfaces without that proof retain ordinary input sizing.
-				m_impl->dlss_input_size = m_impl->dlss.OptimalInputExtent(output_size,
-				    reduced_source || Config::GetRenderScalePercent() == 100 ? source_size : vk::Extent2D {});
+				const auto hint = reduced_source || Config::GetRenderScalePercent() == 100 ? source_size : vk::Extent2D {};
+				m_impl->dlss_input_size = m_impl->dlss.OptimalInputExtent(output_size, hint);
+				// Not a failure: the guest already renders at least the output size.
+				m_impl->dlss_bypassed = !m_impl->dlss_input_size && m_impl->dlss.Available() &&
+				    Config::GetDlssMode() != Config::DlssMode::DLAA && hint.width >= output_size.width &&
+				    hint.height >= output_size.height;
+				if (m_impl->dlss_bypassed) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "DLSS Super Resolution bypassed: source {}x{} already covers output {}x{}; raise the output resolution to reconstruct\n",
+					    source_size.width, source_size.height, output_size.width, output_size.height));
+				}
 				m_impl->dlss_target_size = output_size;
 				m_impl->dlss_source_size = source_size;
 				m_impl->dlss_render_scale = Config::GetRenderScalePercent();
@@ -1026,6 +1036,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	    output_size.height <= graphics.physical_device_properties.limits.maxImageDimension2D;
 	const vk::Extent2D source_size {image.backing.extent.width, image.backing.extent.height};
 	frame->dlss_evaluated = false;
+	frame->dlss_bypassed = process_dlss && m_impl->dlss_bypassed;
 	frame->guest_frame = true;
 	frame->producer_tick = m_impl->renderer.GetCommandScheduler().CurrentTick();
 	const bool fg_captured = process_dlss && fg_available && dlss_inputs &&
@@ -1088,6 +1099,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
 	frame->dlss_evaluated = false;
+	frame->dlss_bypassed = false;
 	frame->guest_frame = false;
 	frame->preparation = {};
 	frame->producer_tick = producer ? m_impl->renderer.GetCommandScheduler().CurrentTick() : 0;
@@ -1235,7 +1247,8 @@ void Presenter::Impl::Present(bool new_frame) {
 		    std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
 			    return layer.frame != nullptr && layer.frame->guest_frame;
 		    });
-		window.UpdateTitle(layers[0].frame != nullptr && layers[0].frame->dlss_evaluated, new_guest_frame);
+		window.UpdateTitle(layers[0].frame != nullptr && layers[0].frame->dlss_evaluated, new_guest_frame,
+		                   layers[0].frame != nullptr && layers[0].frame->dlss_bypassed);
 		const auto* main_frame = layers[0].frame;
 		const auto preparation = new_guest_frame && main_frame && main_frame->guest_frame ?
 		    main_frame->preparation : FramePreparationTiming {};

@@ -104,6 +104,27 @@ bool ReplaceBinaryIdentity(Inst& inst, Type type, uint64_t identity) {
 	return false;
 }
 
+bool FoldLowBitOfLogicalShift(Inst& inst) {
+	const auto lhs = Arg(inst, 0);
+	const auto rhs = Arg(inst, 1);
+	const auto is_low_bit_mask = [](Value value) {
+		return IsImmediate(value, Type::U32) && value.U32() == 1u;
+	};
+	const auto is_all_ones_logical_shift = [](Value value) {
+		auto* shift = value.TryInstruction();
+		return shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
+		       IsImmediate(Arg(*shift, 0), Type::U32) && Arg(*shift, 0).U32() == UINT32_MAX;
+	};
+	if ((is_low_bit_mask(lhs) && is_all_ones_logical_shift(rhs)) ||
+	    (is_low_bit_mask(rhs) && is_all_ones_logical_shift(lhs))) {
+		// The low bit of UINT32_MAX >> (n & 31) is always set. This commonly occurs
+		// when testing a lane against a statically full guest execution mask.
+		Replace(inst, Value(1u));
+		return true;
+	}
+	return false;
+}
+
 bool FoldSelect(Inst& inst) {
 	const auto condition   = Arg(inst, 0);
 	const auto true_value  = Arg(inst, 1);
@@ -493,7 +514,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::BitwiseAnd32:
 			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
+				if (!FoldLowBitOfLogicalShift(inst)) {
+					ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
+				}
 			}
 			return;
 		case ValueOpcode::BitwiseAnd64:

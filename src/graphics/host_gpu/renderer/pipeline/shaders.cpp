@@ -189,11 +189,19 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+#if defined(__APPLE__)
+	// MoltenVK 1.4.2 does not refresh its implicit buffer-size data for push descriptors,
+	// causing OpArrayLength to return zero for otherwise valid storage buffers. Use the
+	// existing descriptor-set path on macOS until that driver fix is available.
+	// Upstream fix: https://github.com/KhronosGroup/MoltenVK/pull/2827
+	pipeline.uses_push_descriptors = false;
+#else
 	uint32_t descriptor_count = 0;
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+#endif
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors

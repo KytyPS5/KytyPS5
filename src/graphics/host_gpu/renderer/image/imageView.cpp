@@ -360,11 +360,21 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
+#if !defined(__APPLE__)
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
+#endif
 	if (normalized.min_lod != 0) {
+#if defined(__APPLE__)
+		// MoltenVK does not expose VK_EXT_image_view_min_lod. Preserve the requested
+		// clamp in the view-cache key, but create an unclamped host view. This can
+		// select a lower mip than the guest requested, which is preferable to making
+		// all macOS devices unusable at startup.
+		LOGF("temporary: ignoring image view minimum LOD %u on macOS\n", normalized.min_lod);
+#else
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;
+#endif
 	}
 	vk::ImageViewCreateInfo create {};
 	create.pNext                           = &usage;

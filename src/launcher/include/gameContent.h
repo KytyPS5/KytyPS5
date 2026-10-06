@@ -12,7 +12,6 @@ namespace GameContent {
 
 inline constexpr uint64_t MaxMetadataSize      = uint64_t {1} << 20u;
 inline constexpr uint64_t MaxImageSize         = uint64_t {32} << 20u;
-inline constexpr uint64_t MaxTrophyPackageSize = uint64_t {128} << 20u;
 
 [[nodiscard]] std::filesystem::path ToPath(const QString& path);
 [[nodiscard]] QString               FromPath(const std::filesystem::path& path);

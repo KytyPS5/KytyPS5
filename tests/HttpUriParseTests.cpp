@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace Libs::LibHttp {
 void InitNet_1_Http(Loader::SymbolDatabase *symbols);
@@ -40,14 +41,14 @@ int failures = 0;
 using HttpUriParse = int(KYTY_SYSV_ABI *)(SceHttpUriElement *, const char *,
                                           void *, size_t *, size_t);
 
-HttpUriParse GetHttpUriParse() {
-  Loader::SymbolDatabase symbols;
-  Libs::LibHttp::InitNet_1_Http(&symbols);
-  const auto *record =
-      symbols.FindByNid("IWalAn-guFs", Loader::SymbolType::Func);
+using HttpUriBuild = int(KYTY_SYSV_ABI *)(char *, size_t *, size_t,
+                                          const SceHttpUriElement *, uint32_t);
+
+template <typename T>
+T GetHttpFunction(const Loader::SymbolDatabase &symbols, const char *nid) {
+  const auto *record = symbols.FindByNid(nid, Loader::SymbolType::Func);
   CHECK(record != nullptr);
-  return record != nullptr ? reinterpret_cast<HttpUriParse>(record->vaddr)
-                           : nullptr;
+  return record != nullptr ? reinterpret_cast<T>(record->vaddr) : nullptr;
 }
 
 template <size_t N>
@@ -117,13 +118,61 @@ void TestPresentQuery(HttpUriParse parse) {
   }
 }
 
+std::string BuildWith(HttpUriBuild build, const SceHttpUriElement &element,
+                      uint32_t option) {
+  size_t required = 0;
+  CHECK(build(nullptr, &required, 0, &element, option) == 0);
+  std::array<char, 256> out{};
+  size_t filled = 0;
+  CHECK(required <= out.size());
+  CHECK(build(out.data(), &filled, required, &element, option) == 0);
+  CHECK(filled == required);
+  return std::string(out.data());
+}
+
+void TestBuildHonoursOption(HttpUriParse parse, HttpUriBuild build) {
+  constexpr char url[] =
+      "https://user:pw@gssdk1.gamesci.com.cn:8443/VersionServerImpl?x=1#frag";
+  size_t required = 0;
+  CHECK(parse(nullptr, url, nullptr, &required, 0) == 0);
+  std::array<char, 256> pool{};
+  SceHttpUriElement element{};
+  CHECK(parse(&element, url, pool.data(), &required, required) == 0);
+
+  constexpr uint32_t scheme = 0x01, hostname = 0x02, port = 0x04, path = 0x08,
+                     username = 0x10, password = 0x20, query = 0x40,
+                     fragment = 0x80;
+
+  CHECK(BuildWith(build, element, scheme) == "https://");
+  CHECK(BuildWith(build, element, hostname) == "gssdk1.gamesci.com.cn");
+  CHECK(BuildWith(build, element, port) == "8443");
+  CHECK(BuildWith(build, element, path) == "/VersionServerImpl");
+  CHECK(BuildWith(build, element, username) == "user");
+  CHECK(BuildWith(build, element, password) == "pw");
+  CHECK(BuildWith(build, element, query) == "?x=1");
+  CHECK(BuildWith(build, element, fragment) == "#frag");
+  CHECK(BuildWith(build, element, scheme | hostname) ==
+        "https://gssdk1.gamesci.com.cn");
+  CHECK(BuildWith(build, element, hostname | path) ==
+        "gssdk1.gamesci.com.cn/VersionServerImpl");
+  CHECK(BuildWith(build, element, hostname | port) ==
+        "gssdk1.gamesci.com.cn:8443");
+
+  CHECK(BuildWith(build, element, 0xff) == url);
+  CHECK(BuildWith(build, element, 0) == url);
+}
+
 } // namespace
 
 int main() {
-  const auto parse = GetHttpUriParse();
-  if (parse == nullptr) {
+  Loader::SymbolDatabase symbols;
+  Libs::LibHttp::InitNet_1_Http(&symbols);
+  const auto parse = GetHttpFunction<HttpUriParse>(symbols, "IWalAn-guFs");
+  const auto build = GetHttpFunction<HttpUriBuild>(symbols, "5LZA+KPISVA");
+  if (parse == nullptr || build == nullptr) {
     return 1;
   }
+  TestBuildHonoursOption(parse, build);
   TestAbsentQuery(parse);
   TestEmptyUri(parse);
   TestPresentQuery(parse);

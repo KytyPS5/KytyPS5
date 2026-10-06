@@ -165,7 +165,6 @@ Value InitialValue(M0Tag) {
 
 enum class ReadStep { Start, SetValue, PushPhiArgument };
 
-template <typename T>
 struct ReadState {
 	Block*   block = nullptr;
 	Value    result;
@@ -183,8 +182,8 @@ public:
 
 	template <typename T>
 	Value Read(T variable, Block* root) {
-		std::vector<ReadState<T>> stack {{}, {.block = root}};
-		const auto                prepare_phi = [&]() {
+		stack.assign({{}, {.block = root}});
+		const auto prepare_phi = [&]() {
 			auto&      state        = stack.back();
 			const auto predecessors = state.block->ImmPredecessors();
 			if (state.pred == predecessors.size()) {
@@ -290,6 +289,7 @@ private:
 
 	std::unordered_map<Block*, std::map<Variable, Inst*>> incomplete_phis;
 	DefTable                                              definitions;
+	std::vector<ReadState>                               stack;
 };
 
 void VisitInstruction(Pass& pass, Block* block, Inst& inst) {

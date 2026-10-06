@@ -13,6 +13,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <span>
 #include <thread>
 
@@ -32,11 +33,14 @@ public:
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
-	void              Submit(std::span<const uint32_t> draw_commands,
-	                         std::span<const uint32_t> constant_commands);
-	void              SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
-	void              SubmitFlipPreparation(uint64_t request_id);
-	void              Done();
+	void Submit(std::span<const uint32_t> draw_commands,
+	            std::span<const uint32_t> constant_commands);
+	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
+	void SubmitFlipPreparation(uint64_t request_id);
+	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
+	void SuspendPoint();
+	// Wait for guest command processing, including all compute queues (not native GPU completion).
+	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -48,7 +52,7 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
 
 	struct Submission {
 		SubmissionType            type     = SubmissionType::Graphics;
@@ -57,7 +61,6 @@ private:
 		std::span<const uint32_t> constant_commands;
 		Pm4Execution              command_execution;
 		Pm4Execution              constant_execution;
-		bool                      reset_processor   = false;
 		bool                      started           = false;
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
@@ -66,14 +69,12 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
-	void              WaitForIdle();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
 	RenderContext&                                 m_renderer;
-	Common::Mutex                                  m_submission_mutex;
 	Common::Mutex                                  m_queue_mutex;
 	std::mutex                                     m_shutdown_mutex;
 	Common::CondVar                                m_work_available;
@@ -84,10 +85,12 @@ private:
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
-	bool                                           m_graphics_done     = true;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
+	// Completion callbacks can outlive GuestGpu during renderer shutdown.
+	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
+	    std::make_shared<std::binary_semaphore>(1);
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

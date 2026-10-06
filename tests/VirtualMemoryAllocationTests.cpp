@@ -7,7 +7,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
-#include "loader/redZonePatcher.h"
+#include "loader/guestInstructionPatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
@@ -20,20 +20,31 @@
 #include <cmath>
 #include <cinttypes>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <csignal>
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#include <Zydis/Zydis.h>
 #include <xbyak/xbyak.h>
+#include <xbyak/xbyak_util.h>
 #endif
 
 #if defined(__linux__)
+#include <asm/prctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -196,30 +207,6 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_patcher_test");
 	Check(test, mapping != 0, "failed to allocate patch test code");
 
-	std::vector<uint8_t> code;
-	const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
-		code.insert(code.end(), bytes.begin(), bytes.end());
-	};
-	const auto emit64 = [&code](uint64_t value) {
-		const auto offset = code.size();
-		code.resize(offset + sizeof(value));
-		std::memcpy(code.data() + offset, &value, sizeof(value));
-	};
-	emit({0x48, 0xb8});
-	emit64(SENTINEL);                         // movabs rax, sentinel
-	emit({0x48, 0x89, 0x44, 0x24, 0xe8});     // mov [rsp-0x18], rax
-	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
-	emit({0x48, 0x8b, 0x44, 0x24, 0xe8});     // mov rax, [rsp-0x18]
-	emit({0x48, 0xb9});
-	emit64(SENTINEL);                         // movabs rcx, sentinel
-	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
-	emit({0x0f, 0x94, 0xc0});                 // sete al
-	emit({0x0f, 0xb6, 0xc0, 0xc3});           // movzx eax, al; ret
-	Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
-	std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
-	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
-	      "failed to flush generated test code");
-
 	g_red_zone_fault_page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
 	Check(test, g_red_zone_fault_page != nullptr, "failed to allocate fault page");
 	auto* handler = AddVectoredExceptionHandler(1, RedZoneFaultHandler);
@@ -227,31 +214,73 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 
 	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(const uint64_t*);
 	const auto function = reinterpret_cast<GuestFunction>(mapping);
-	const bool unpatched_was_corrupted = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 0;
-
-	DWORD old_protection = 0;
-	Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
-	      "failed to reset fault page protection");
-	Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
-	                                   reinterpret_cast<void*>(mapping + CODE_SIZE),
-	                                   TRAMPOLINE_SIZE);
 	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
-	const auto result = Loader::PatchGuestInstructions(
-	    mapping, code.size(), function_starts, true, false);
-	const bool patched_preserved = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
+	const auto run_fault = [&] {
+		DWORD old_protection = 0;
+		Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+		return function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
+	};
+	bool reproduced = true;
+	bool covered = true;
+	bool preserved = true;
+	// The partial excursions discard opposite halves of [rsp-24, rsp-16). Repair
+	// only the retained half before moving RSP, leaving the discarded half live
+	// across the fault. The zero excursion retains the original fixed-stack case.
+	for (const auto [excursion, live]: {std::pair {0, true}, {0, false}, {8, true}, {20, true},
+	                                    {128, true}, {256, true}, {-108, true}, {-128, true},
+	                                    {-256, true}}) {
+		Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping));
+		code.mov(code.rax, SENTINEL);
+		code.mov(code.qword[code.rsp - 24], code.rax);
+		code.mov(code.rax, code.ptr[code.rdi]); // Faultable three-byte instruction.
+		if (!live) {
+			code.mov(code.rax, SENTINEL);
+			code.mov(code.qword[code.rsp - 24], code.rax);
+		} else if (excursion < 0) {
+			code.mov(code.dword[code.rsp - 20], static_cast<uint32_t>(SENTINEL >> 32));
+		} else if (excursion > 0) {
+			code.mov(code.dword[code.rsp - 24], static_cast<uint32_t>(SENTINEL));
+		}
+		if (excursion != 0) {
+			code.lea(code.rsp, code.ptr[code.rsp - excursion]);
+			code.lea(code.rsp, code.ptr[code.rsp + excursion]);
+		}
+		code.mov(code.rax, code.qword[code.rsp - 24]);
+		code.mov(code.rcx, SENTINEL);
+		code.cmp(code.rax, code.rcx);
+		code.sete(code.al);
+		code.movzx(code.eax, code.al);
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate red-zone patch fixture");
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush generated test code");
+		reproduced &= run_fault() == !live;
+		Loader::RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(mapping), CODE_SIZE, reinterpret_cast<void*>(mapping + CODE_SIZE),
+		    TRAMPOLINE_SIZE);
+		const auto result = Loader::PatchGuestInstructions(
+		    mapping, code.getSize(), function_starts, true, false);
+		const bool intact = run_fault();
+		const uint64_t expected_patches = live ? 1 : 0;
+		covered &= result.red_zone_function_count == 1 &&
+		           result.memory_instruction_count == expected_patches &&
+		           result.patched_memory_instruction_count == expected_patches &&
+		           result.unrelocatable_memory_instruction_count == 0;
+		preserved &= intact;
+		std::printf("[host]    red-zone excursion=%d live=%d patched=%llu preserved=%d\n", excursion, live,
+		            static_cast<unsigned long long>(result.patched_memory_instruction_count), intact);
+	}
 
-	Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
 	RemoveVectoredExceptionHandler(handler);
 	VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);
 	g_red_zone_fault_page = nullptr;
 	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
 
-	Check(test, unpatched_was_corrupted, "test harness did not reproduce red-zone corruption");
-	Check(test, result.red_zone_function_count == 1 && result.memory_instruction_count >= 1 &&
-	                result.patched_memory_instruction_count >= 1 &&
-	                result.unrelocatable_memory_instruction_count == 0,
-	      "static patcher did not cover the faultable instruction");
-	Check(test, patched_preserved, "patched fault still corrupted the guest red zone");
+	Check(test, reproduced, "test harness did not reproduce red-zone corruption");
+	Check(test, covered, "static patcher did not cover the faultable instruction");
+	Check(test, preserved, "patched fault still corrupted the guest red zone");
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -1938,6 +1967,122 @@ void TestDirectMapUnmapReusesHostAddress() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if defined(__linux__)
+void TestFixedDirectReplacementPreservesAccess() {
+	using namespace Libs::LibKernel::Memory;
+	using Common::VirtualMemory::Mode;
+	const char* test = "FixedDirectReplacementPreservesAccess";
+	constexpr uint64_t page = SceKernelPageSize;
+	int64_t physical = 0;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), page * 4, page,
+	                                        SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* alias = nullptr;
+	void* address = nullptr;
+	CheckOk(test, KernelMapNamedDirectMemory(&alias, page * 4, SceKernelProtCpuRw, 0, physical,
+	                                        page, "replacement_alias"),
+	        "KernelMapNamedDirectMemory(alias)");
+	CheckOk(test, KernelMapNamedDirectMemory(&address, page * 3, SceKernelProtCpuRw, 0, physical,
+	                                        page, "replacement_original"),
+	        "KernelMapNamedDirectMemory(original)");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	const auto alias_base = reinterpret_cast<uint64_t>(alias);
+	for (uint64_t i = 0; i < 4; ++i) {
+		*reinterpret_cast<uint64_t*>(alias_base + i * page) = (i + 1) * 0x11;
+	}
+	const auto replace = [&](uint64_t offset, uint64_t size, int protection, const char* name) {
+		void* middle = reinterpret_cast<void*>(base + page);
+		const int result = KernelMapNamedDirectMemory(&middle, size, protection, SceKernelMapFixed,
+		                                             physical + offset, page, name);
+		if (result == OK) {
+			Check(test, reinterpret_cast<uint64_t>(middle) == base + page,
+			      "fixed replacement moved the destination");
+		}
+		return result;
+	};
+	static unsigned observations = 0;
+	observations = 0;
+	const auto observe_old_mapping = [](uintptr_t start, size_t size) {
+		++observations;
+		uint64_t value = 0;
+		ssize_t bytes = -1;
+		std::thread reader([&] {
+			iovec local {&value, sizeof(value)};
+			iovec remote {reinterpret_cast<void*>(start), sizeof(value)};
+			bytes = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+		});
+		reader.join();
+		Check("FixedDirectReplacementPreservesAccess",
+		      size == SceKernelPageSize && bytes == sizeof(value) && value == 0x22,
+		      "fixed replacement exposed an inaccessible or changed old mapping before mmap");
+	};
+	Check(test, ProtectGuestHostMemory(base, page, Mode::Read) &&
+	                ProtectGuestHostMemory(base + page * 2, page, Mode::NoAccess),
+	      "could not protect neighboring pages");
+	TestBeforeNextBackingMap(observe_old_mapping);
+	CheckOk(test, replace(page, page, SceKernelProtCpuRead, "replacement_same"),
+	        "KernelMapNamedDirectMemory(same backing)");
+	ExpectRange(test, Query(test, base + page), base + page, base + page * 2,
+	            SceKernelProtCpuRead, 0, 1, 0, 1, "replacement_same", physical + page);
+	TestBeforeNextBackingMap(observe_old_mapping);
+	CheckOk(test, replace(page * 3, page, SceKernelProtCpuRw, "replacement_changed"),
+	        "KernelMapNamedDirectMemory(different backing)");
+	Check(test, observations == 2, "pre-map observations did not execute");
+	Check(test, *reinterpret_cast<uint64_t*>(base + page) == 0x44,
+	      "replacement did not select the new physical offset");
+	*reinterpret_cast<uint64_t*>(base + page) = 0x45;
+	Check(test, *reinterpret_cast<uint64_t*>(alias_base + page * 3) == 0x45 &&
+	                *reinterpret_cast<uint64_t*>(alias_base + page) == 0x22,
+	      "replacement lost aliasing or changed the previous backing");
+	uint64_t value = 0;
+	iovec local {&value, sizeof(value)};
+	iovec left {reinterpret_cast<void*>(base), sizeof(value)};
+	iovec right {reinterpret_cast<void*>(base + page * 2), sizeof(value)};
+	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value) &&
+	                value == 0x11 && process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1 &&
+	                process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
+	      "middle replacement changed a neighboring page's bytes or host protection");
+	Check(test, ProtectGuestHostMemory(base, page * 3, Mode::ReadWrite),
+	      "could not restore neighboring permissions");
+	const auto check_preserved = [&] {
+		Check(test, *reinterpret_cast<uint64_t*>(base) == 0x11 &&
+		                *reinterpret_cast<uint64_t*>(base + page) == 0x45 &&
+		                *reinterpret_cast<uint64_t*>(base + page * 2) == 0x33,
+		      "failed replacement changed bytes");
+		for (uint64_t i = 0; i < 3; ++i) {
+			Check(test, !TestPlaceholderRangeIsFree(base + i * page, page),
+			      "failed replacement released part of the owned mapping");
+		}
+		ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRw,
+		            0, 1, 0, 1, "replacement_original", physical);
+		ExpectRange(test, Query(test, base + page), base + page, base + page * 2,
+		            SceKernelProtCpuRw, 0, 1, 0, 1, "replacement_changed", physical + page * 3);
+		ExpectRange(test, Query(test, base + page * 2), base + page * 2, base + page * 3,
+		            SceKernelProtCpuRw, 0, 1, 0, 1, "replacement_original", physical + page * 2);
+	};
+	TestFailPhysicalMemoryUnmapAfter(1);
+	CheckFailed(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
+	            "KernelMapNamedDirectMemory(second-view removal failure)");
+	check_preserved();
+	TestFailNextVirtualRangeReplacement();
+	CheckFailed(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
+	            "KernelMapNamedDirectMemory(publication failure)");
+	check_preserved();
+	CheckOk(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
+	        "KernelMapNamedDirectMemory(multiple backing views)");
+	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x11 &&
+	                *reinterpret_cast<uint64_t*>(base + page) == 0x22 &&
+	                *reinterpret_cast<uint64_t*>(base + page * 2) == 0x33,
+	      "multi-view replacement changed the prefix or chose incorrect backing offsets");
+	ExpectRange(test, Query(test, base + page), base + page, base + page * 3,
+	            SceKernelProtCpuRead, 0, 1, 0, 1, "replacement_span", physical + page);
+	CheckOk(test, KernelMunmap(base, page * 3), "KernelMunmap(replacement)");
+	CheckOk(test, KernelMunmap(alias_base, page * 4), "KernelMunmap(alias)");
+	CheckOk(test, KernelReleaseDirectMemory(physical, page * 4), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestFixedReserveReplacesPartialDirectMapping() {
 	const char*        test         = "FixedReserveReplacesPartialDirectMapping";
 	constexpr uint64_t page_count   = 13;
@@ -2827,9 +2972,9 @@ void TestModuleRelocationUsesWritableHostMapping() {
 }
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-volatile sig_atomic_t g_rsqrt_traps = 0;
+volatile sig_atomic_t g_instruction_traps = 0;
 
-bool EmulateReciprocalSquareRootContext(void* context) {
+bool EmulateInstructionContext(void* context) {
 	const auto host_mxcsr = _mm_getcsr();
 	_mm_setcsr(0x7fe1); // Exercise the handler under a distinct rounding mode and raised flags.
 	const bool emulated        = Loader::X64InstructionEmulator::TryEmulate(context);
@@ -2838,83 +2983,226 @@ bool EmulateReciprocalSquareRootContext(void* context) {
 	if (!emulated || !preserved_mxcsr) {
 		return false;
 	}
-	g_rsqrt_traps = g_rsqrt_traps + 1;
+	g_instruction_traps = g_instruction_traps + 1;
 	return true;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-LONG CALLBACK ReciprocalSquareRootHandler(EXCEPTION_POINTERS* exception) {
+LONG CALLBACK InstructionHandler(EXCEPTION_POINTERS* exception) {
 	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION ||
-	    !EmulateReciprocalSquareRootContext(exception->ContextRecord)) {
+	    !EmulateInstructionContext(exception->ContextRecord)) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
 #else
-void ReciprocalSquareRootHandler(int, siginfo_t*, void* context) {
-	if (!EmulateReciprocalSquareRootContext(context)) {
+void InstructionHandler(int, siginfo_t*, void* context) {
+	if (!EmulateInstructionContext(context)) {
 		_exit(190);
 	}
 }
 #endif
 
+struct InstructionTestScope {
+	uint64_t mapping;
+	uint64_t size;
+	uint32_t mxcsr = _mm_getcsr();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void* handler = nullptr;
+#else
+	struct sigaction previous {};
+	bool             installed = false;
+#endif
+	~InstructionTestScope() {
+		_mm_setcsr(mxcsr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (handler != nullptr) {
+			RemoveVectoredExceptionHandler(handler);
+		}
+#else
+		if (installed) {
+			sigaction(SIGILL, &previous, nullptr);
+		}
+#endif
+		Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+		Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
+	}
+
+	void InstallHandler(const char* test) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		handler = AddVectoredExceptionHandler(1, InstructionHandler);
+		Check(test, handler != nullptr, "failed to install instruction handler");
+#else
+		struct sigaction action {};
+		action.sa_sigaction = InstructionHandler;
+		action.sa_flags     = SA_SIGINFO;
+		sigemptyset(&action.sa_mask);
+		installed = sigaction(SIGILL, &action, &previous) == 0;
+		Check(test, installed, "failed to install instruction handler");
+#endif
+	}
+};
+
+struct SavedInstructionContext {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	CONTEXT native {};
+	auto&   Gpr(size_t index) {
+		const std::array registers {&native.Rax, &native.Rcx, &native.Rdx, &native.Rbx,
+		                            &native.Rsp, &native.Rbp, &native.Rsi, &native.Rdi,
+		                            &native.R8,  &native.R9,  &native.R10, &native.R11,
+		                            &native.R12, &native.R13, &native.R14, &native.R15};
+		return *registers[index];
+	}
+	auto& Rip() { return native.Rip; }
+	auto& Flags() { return native.EFlags; }
+	void* Xmm() { return &native.Xmm0; }
+#else
+	ucontext_t    native {};
+	_libc_fpstate fpstate {};
+	SavedInstructionContext() { native.uc_mcontext.fpregs = &fpstate; }
+	auto& Gpr(size_t index) {
+		constexpr std::array registers {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP,
+		                                REG_RSI, REG_RDI, REG_R8,  REG_R9,  REG_R10, REG_R11,
+		                                REG_R12, REG_R13, REG_R14, REG_R15};
+		return native.uc_mcontext.gregs[registers[index]];
+	}
+	auto& Rip() { return native.uc_mcontext.gregs[REG_RIP]; }
+	auto& Flags() { return native.uc_mcontext.gregs[REG_EFL]; }
+	void* Xmm() { return fpstate._xmm; }
+#endif
+};
+
+void TestCpuExtensionContexts() {
+	const char*              test = "CpuExtensionContexts";
+	SavedInstructionContext  context;
+	constexpr uint64_t       sentinel = 0x8192a3b4c5d6e700ull;
+	std::array<uint8_t, 256> xmm;
+	for (size_t i = 0; i < xmm.size(); ++i) {
+		xmm[i] = static_cast<uint8_t>(i);
+	}
+	std::memcpy(context.Xmm(), xmm.data(), xmm.size());
+	const auto check_state = [&](const std::array<uint64_t, 16>& expected) {
+		for (size_t reg = 0; reg < expected.size(); ++reg) {
+			Check(test, static_cast<uint64_t>(context.Gpr(reg)) == expected[reg],
+			      "CPU extension changed an unexpected GPR");
+		}
+		Check(test,
+		      context.Flags() == 0x897 && std::memcmp(context.Xmm(), xmm.data(), xmm.size()) == 0,
+		      "CPU extension changed RFLAGS or XMM state");
+	};
+	for (uint8_t encoding = 0; encoding < 32; ++encoding) {
+		const uint8_t destination = encoding & 15;
+		bool          checked     = false;
+		for (size_t attempt = 0; attempt < 100 && !checked; ++attempt) {
+			std::array<uint64_t, 16> expected;
+			for (size_t reg = 0; reg < expected.size(); ++reg) {
+				context.Gpr(reg) = expected[reg] = sentinel | reg;
+			}
+			context.Flags() = 0x897;
+			std::array<uint8_t, 16> instruction {
+			    0xf3, static_cast<uint8_t>(0x40 | ((encoding >> 4) << 3) | (destination >> 3)),
+			    0x0f, 0xc7, static_cast<uint8_t>(0xf8 | (destination & 7))};
+			context.Rip()   = reinterpret_cast<uintptr_t>(instruction.data());
+			uint32_t before = 0;
+			uint32_t after  = 0;
+			__rdtscp(&before);
+			Check(test, EmulateInstructionContext(&context.native), "RDPID fallback was rejected");
+			__rdtscp(&after);
+			Check(test, context.Rip() == reinterpret_cast<uintptr_t>(instruction.data() + 5),
+			      "RDPID advanced RIP incorrectly");
+			if (before == after) {
+				expected[destination] = before;
+				check_state(expected);
+				checked = true;
+			}
+		}
+		Check(test, checked, "thread migrated repeatedly during RDPID comparison");
+	}
+
+	constexpr uint64_t size    = 0x4000;
+	const auto         mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x30000000, size, Common::VirtualMemory::Mode::ReadWrite, "clwb_context_test");
+	Check(test, mapping != 0 && mapping + size <= UINT32_MAX,
+	      "failed to allocate low CLWB fixture");
+	InstructionTestScope restore {mapping, size};
+	auto*                instruction = reinterpret_cast<uint8_t*>(mapping);
+	auto*                data        = instruction + 0x200;
+	std::memset(data, 0xa5, 64);
+	const auto flush = [&](std::initializer_list<uint8_t> bytes, int base, uint64_t value,
+	                       int index = -1, uint64_t index_value = 0) {
+		std::array<uint64_t, 16> expected;
+		for (size_t reg = 0; reg < expected.size(); ++reg) {
+			context.Gpr(reg) = expected[reg] = sentinel | reg;
+		}
+		if (base >= 0) {
+			context.Gpr(base) = expected[base] = value;
+		}
+		if (index >= 0) {
+			context.Gpr(index) = expected[index] = index_value;
+		}
+		context.Flags() = 0x897;
+		std::fill_n(instruction, 16, 0);
+		std::copy(bytes.begin(), bytes.end(), instruction);
+		context.Rip() = mapping;
+		Check(test, EmulateInstructionContext(&context.native), "CLWB fallback was rejected");
+		Check(test, static_cast<uint64_t>(context.Rip()) == mapping + bytes.size(),
+		      "CLWB advanced RIP incorrectly");
+		check_state(expected);
+		Check(test, std::all_of(data, data + 64, [](uint8_t byte) { return byte == 0xa5; }),
+		      "CLWB changed guest memory");
+	};
+	const auto address = reinterpret_cast<uintptr_t>(data);
+	flush({0x66, 0x0f, 0xae, 0x37}, 7, address);                 // [rdi]
+	flush({0x66, 0x0f, 0xae, 0x74, 0x24, 0xf8}, 4, address + 8); // [rsp-8]
+	flush({0x66, 0x41, 0x0f, 0xae, 0x34, 0x24}, 12, address);    // [r12]
+	flush({0x66, 0x43, 0x0f, 0xae, 0x74, 0xac, 0x20}, 12, address - 0x20 - 12, 13,
+	      3);                                                    // [r12+r13*4+32]
+	flush({0x66, 0x41, 0x0f, 0xae, 0x35, 0xf7, 1, 0, 0}, -1, 0); // RIP+503; REX.B ignored
+	flush({0x67, 0x66, 0x0f, 0xae, 0x37}, 7, address | (uint64_t {1} << 32)); // [edi]
+	const auto byte = [&](int shift) { return static_cast<uint8_t>(address >> shift); };
+	flush({0x67, 0x66, 0x0f, 0xae, 0x35, 0xf7, 1, 0, 0}, -1, 0); // EIP+503
+	flush({0x66, 0x41, 0x0f, 0xae, 0x34, 0x25, byte(0), byte(8), byte(16), byte(24)}, -1,
+	      0); // SIB absolute; REX.B ignored
+#if defined(__linux__)
+	for (const auto segment:
+	     {std::pair {ARCH_GET_FS, uint8_t {0x64}}, std::pair {ARCH_GET_GS, uint8_t {0x65}}}) {
+		unsigned long base = 0;
+		Check(test, syscall(SYS_arch_prctl, segment.first, &base) == 0,
+		      "failed to read segment base");
+		flush({segment.second, 0x66, 0x0f, 0xae, 0x37}, 7, address - base);
+	}
+#else
+	flush({0x65, 0x66, 0x0f, 0xae, 0x37}, 7, address - reinterpret_cast<uintptr_t>(NtCurrentTeb()));
+#endif
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestPackedReciprocalSquareRoot() {
 	const char* test = "PackedReciprocalSquareRoot";
 	constexpr uint64_t code_size = 0x4000;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	constexpr uint64_t allocation_size = code_size * 2;
-#else
-	constexpr uint64_t allocation_size = code_size;
-#endif
 	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_test");
 	Check(test, mapping != 0, "failed to allocate instruction test code");
-	struct RestoreState {
-		uint64_t mapping;
-		uint64_t size;
-		uint32_t mxcsr;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		void* handler = nullptr;
-#else
-		struct sigaction previous {};
-		bool installed = false;
-#endif
-		~RestoreState() {
-			_mm_setcsr(mxcsr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (handler != nullptr) {
-				RemoveVectoredExceptionHandler(handler);
-			}
-			Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
-#else
-			if (installed) {
-				sigaction(SIGILL, &previous, nullptr);
-			}
-#endif
-			Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
-		}
-	} restore {mapping, allocation_size, _mm_getcsr()};
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	restore.handler = AddVectoredExceptionHandler(1, ReciprocalSquareRootHandler);
-	Check(test, restore.handler != nullptr, "failed to install instruction handler");
-#else
-	struct sigaction action {};
-	action.sa_sigaction = ReciprocalSquareRootHandler;
-	action.sa_flags = SA_SIGINFO;
-	sigemptyset(&action.sa_mask);
-	restore.installed = sigaction(SIGILL, &action, &restore.previous) == 0;
-	Check(test, restore.installed, "failed to install instruction handler");
-#endif
+	InstructionTestScope restore {mapping, allocation_size};
+	restore.InstallHandler(test);
 	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint32_t*, uint32_t*);
 	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const std::array<uintptr_t, 1> function_starts {mapping};
+	const auto register_module = [&](uint64_t trampoline_size) {
+		Loader::RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(mapping), code_size,
+		    reinterpret_cast<void*>(mapping + code_size), trampoline_size);
+	};
 	const auto refine = [](float estimate) {
 		return (estimate * 0.5f) * std::fma(-estimate, estimate, 3.0f);
 	};
 	constexpr uint64_t red_zone_sentinel = 0x1122334455667788ull;
 	std::array<uint32_t, 16> input {};
-	std::array<uint32_t, 48> output {};
+	std::array<uint32_t, 74> output {};
 	input.fill(0x3f800000);
-	for (const auto registers: {std::array {2, 1}, std::array {10, 9}, std::array {1, 1}}) {
+	for (const auto registers: {std::array {2, 1}, std::array {10, 9}, std::array {1, 1},
+	                            std::array {0, 1}, std::array {2, 0}, std::array {0, 0}}) {
 		const auto destination = registers[0];
 		const auto source = registers[1];
 		input[0] = 0x3f800000;
@@ -2924,8 +3212,8 @@ void TestPackedReciprocalSquareRoot() {
 			expected = 0x3f000000;
 		}
 		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
-		if (source == 9) {
-			code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi + 32]);
+		for (int reg = 0; reg < 3; ++reg) {
+			code.vmovups(Xbyak::Ymm(reg), code.ptr[code.rdi + 32]);
 		}
 		code.vmovups(Xbyak::Ymm(source), code.ptr[code.rdi]);
 		if (destination != source) {
@@ -2935,18 +3223,32 @@ void TestPackedReciprocalSquareRoot() {
 			code.mov(code.rax, red_zone_sentinel ^ offset);
 			code.mov(code.qword[code.rsp - offset], code.rax);
 		}
+		code.cmp(code.rdi, code.rdi);
+		code.stc();
 		code.vrsqrtps(Xbyak::Xmm(destination), Xbyak::Xmm(source));
+		const uint64_t instruction_count = destination == 2 && source == 1 ? 2 : 1;
+		if (instruction_count == 2) {
+			// Adjacent four-byte instructions share one relocation span.
+			code.vrsqrtps(Xbyak::Xmm(destination), Xbyak::Xmm(source));
+		}
+		code.lea(code.rsp, code.ptr[code.rsp - 128]);
+		code.pushfq();
+		code.pop(code.rax);
+		code.lea(code.rsp, code.ptr[code.rsp + 128]);
+		code.mov(code.qword[code.rsi + 288], code.rax);
 		for (uint32_t offset = 8; offset <= 128; offset += 8) {
 			code.mov(code.rax, code.qword[code.rsp - offset]);
 			code.mov(code.qword[code.rsi + 64 + offset - 8], code.rax);
 		}
 		code.vmovups(code.ptr[code.rsi], Xbyak::Ymm(destination));
 		code.vmovups(code.ptr[code.rsi + 32], Xbyak::Ymm(source));
+		for (int reg = 0; reg < 3; ++reg) {
+			code.vmovups(code.ptr[code.rsi + 192 + reg * 32], Xbyak::Ymm(reg));
+		}
 		code.vzeroupper();
 		code.ret();
-#if defined(__linux__)
+		Check(test, Xbyak::GetError() == 0, "failed to generate reciprocal-root fixture");
 		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
-#endif
 		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
 		      "failed to flush generated instruction test code");
 		function(input.data(), output.data());
@@ -2965,88 +3267,193 @@ void TestPackedReciprocalSquareRoot() {
 		Check(test, red_zone_intact(), "native instruction corrupted the guest red zone");
 		Check(test, std::isfinite(native) && std::abs(native - std::bit_cast<float>(expected)) < 0.001f,
 		      "native reciprocal root is outside its error bound");
+		register_module(code_size);
+		const std::vector<uint8_t> original_trampoline(code.getCode() + code_size,
+		                                              code.getCode() + allocation_size);
+		const auto disabled = Loader::PatchGuestInstructions(
+		    mapping, code.getSize(), function_starts, false, false);
+		Check(test, Xbyak::GetError() == 0 && disabled.reciprocal_sqrt.found == 0 &&
+		                disabled.reciprocal_sqrt.native == 0 &&
+		                disabled.reciprocal_sqrt.trapped == 0 &&
+		                std::equal(original.begin(), original.end(), code.getCode()) &&
+		                std::equal(original_trampoline.begin(), original_trampoline.end(),
+		                           code.getCode() + code_size),
+		      "disabled instruction patching modified executable code or trampolines");
+		if (destination == 2 && source == 1) {
+			// Fail initially, after the RIP-relative constant reference, and inside its literal.
+			for (const uint64_t capacity: {1, 48, 80}) {
+				register_module(capacity);
+				const auto exhausted = Loader::PatchGuestInstructions(
+				    mapping, code.getSize(), function_starts, false, true);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), code_size,
-		                                   reinterpret_cast<void*>(mapping + code_size), code_size);
-		const std::array<uintptr_t, 1> function_starts {mapping};
-		// The extended-register case also relocates ordinary memory accesses while
-		// red-zone data is live, exercising both enabled patchers in one function.
-		const bool protect_memory = source == 9;
-		const auto patched = Loader::PatchGuestInstructions(
-		    mapping, code.getSize(), function_starts, protect_memory, true);
-		Check(test, patched.reciprocal_sqrt_instruction_count == 1 &&
-		                patched.unrelocatable_memory_instruction_count == 0 &&
-		                (protect_memory ? patched.patched_memory_instruction_count > 0
-		                                : patched.patched_memory_instruction_count == 0),
-		      "instruction pass lost reciprocal root or memory patch coverage");
+				const uint64_t expected_traps = capacity == 1 ? 0 : instruction_count;
 #else
-		Check(test, Loader::X64InstructionEmulator::PatchReciprocalSquareRoots(mapping, code.getSize()) == 1,
-		      "instruction pass did not patch exactly one packed reciprocal root");
-		const auto* patched = reinterpret_cast<const uint8_t*>(mapping);
-		size_t changed = 0;
-		for (size_t i = 0; i < original.size(); ++i) {
-			changed += original[i] != patched[i];
-		}
-		Check(test, changed == 1, "instruction pass changed unrelated code bytes");
-		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
-		      "failed to flush patched instruction test code");
+				const uint64_t expected_traps = instruction_count;
 #endif
-		const auto before = g_rsqrt_traps;
-		function(input.data(), output.data());
-		Check(test, g_rsqrt_traps == before + 1, "patched instruction did not execute its handler");
-		Check(test, red_zone_intact(), "patched instruction corrupted the guest red zone");
-		Check(test, output[0] == expected, "patched instruction read or wrote the wrong register");
-		if (destination != source) {
-			Check(test, std::equal(input.begin(), input.begin() + 4, output.begin() + 8),
-			      "source lower XMM lanes were corrupted");
-		}
-		if (source != 9) {
-			Check(test, refine(refine(std::bit_cast<float>(output[0]))) == 1.0f,
-			      "identity quaternion normalization drifted below one");
-		}
-		for (size_t i = 0; i < 4; ++i) {
-			Check(test, output[4 + i] == 0, "128-bit VEX destination retained upper YMM lanes");
-			const auto expected_upper = destination == source ? 0u : input[4 + i];
-			Check(test, output[12 + i] == expected_upper, "source upper YMM lanes were corrupted");
-		}
-		std::printf("[host]    rsqrt xmm%d,xmm%d native=%08x patched=%08x\n",
-		            destination, source, std::bit_cast<uint32_t>(native), output[0]);
-		if (destination != 2) {
-			continue;
-		}
-		constexpr std::array<std::array<uint32_t, 8>, 4> cases {{
-		    {0x00000000, 0x80000000, 0x00000001, 0x80000001,
-		     0x7f800000, 0xff800000, 0x7f800000, 0xff800000},
-		    {0x7f800000, 0xff800000, 0xbf800000, 0x7fc12345,
-		     0x00000000, 0xffc00000, 0xffc00000, 0x7fc12345},
-		    {0x7f812345, 0xff812345, 0x40800000, 0x40000000,
-		     0x7fc12345, 0xffc12345, 0x3f000000, 0x3f3504f3},
-		    {0x00800000, 0x7f7fffff, 0x3f800000, 0x41800000,
-		     0x5f000000, 0x1f800000, 0x3f800000, 0x3e800000},
-		}};
-		for (const auto& values: cases) {
-			std::copy_n(values.begin(), 4, input.begin());
-			for (uint32_t controls = 0; controls < 8; ++controls) {
-				const uint32_t mxcsr = 0x1fa1u | ((controls & 3u) << 13u) | ((controls & 4u) << 4u);
-				_mm_setcsr(mxcsr);
+				Check(test, exhausted.reciprocal_sqrt.found == instruction_count &&
+				                exhausted.reciprocal_sqrt.native == 0 &&
+				                exhausted.reciprocal_sqrt.trapped == expected_traps,
+				      "exhausted reciprocal-root generation lost fallback coverage");
+				Check(test, Xbyak::GetError() == 0,
+				      "failed trampoline generation leaked Xbyak's thread-local error");
+				if (expected_traps == 0) {
+					Check(test, std::equal(original.begin(), original.end(), code.getCode()),
+					      "unsafe fallback modified a live guest red zone site");
+				}
+				const auto traps_before = g_instruction_traps;
 				function(input.data(), output.data());
-				const auto result_mxcsr = _mm_getcsr();
-				_mm_setcsr(restore.mxcsr);
-				Check(test, red_zone_intact(), "special-value trap corrupted the guest red zone");
-				Check(test, result_mxcsr == mxcsr, "instruction changed MXCSR controls or exception flags");
-				Check(test, std::equal(output.begin(), output.begin() + 4, values.begin() + 4),
-				      "special values or round-independent reciprocal roots differ from ISA semantics");
+				Check(test, static_cast<uint64_t>(g_instruction_traps - traps_before) == expected_traps &&
+				                red_zone_intact() &&
+				                output[0] == (expected_traps ? expected : std::bit_cast<uint32_t>(native)),
+				      "exhaustion fallback changed guest state or failed to execute");
+				std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
 			}
+			register_module(code_size);
 		}
-		input.fill(0x3f800000);
+		// Memory protection alone must retain the host's original reciprocal-root result.
+		const bool protect_memory = source == 9;
+		if (protect_memory) {
+			const auto memory_only = Loader::PatchGuestInstructions(
+			    mapping, code.getSize(), function_starts, true, false);
+			Check(test, Xbyak::GetError() == 0 &&
+			                memory_only.reciprocal_sqrt.found == 0 &&
+			                memory_only.reciprocal_sqrt.native == 0 &&
+			                memory_only.reciprocal_sqrt.trapped == 0 &&
+			                memory_only.patched_memory_instruction_count > 0,
+			      "memory protection enabled reciprocal-root replacement");
+			function(input.data(), output.data());
+			Check(test, output[0] == std::bit_cast<uint32_t>(native) && red_zone_intact(),
+			      "memory protection changed native reciprocal-root behavior");
+			std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
+			register_module(code_size);
+		}
+		for (const bool trap_fallback: {false, true}) {
+			if (trap_fallback) {
+				std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
+				register_module(48);
+			}
+			const bool protect_memory_sites = protect_memory && !trap_fallback;
+			const auto patched = Loader::PatchGuestInstructions(
+			    mapping, code.getSize(), function_starts, protect_memory_sites, true);
+			Check(test, Xbyak::GetError() == 0 &&
+			                patched.reciprocal_sqrt.found == instruction_count &&
+			                patched.reciprocal_sqrt.native ==
+			                    (trap_fallback ? 0 : instruction_count) &&
+			                patched.reciprocal_sqrt.trapped ==
+			                    (trap_fallback ? instruction_count : 0) &&
+			                patched.unrelocatable_memory_instruction_count == 0 &&
+			                (protect_memory_sites ? patched.patched_memory_instruction_count > 0
+			                                      : patched.patched_memory_instruction_count == 0),
+			      "instruction pass lost reciprocal root or memory patch coverage");
+			const auto traps_before = g_instruction_traps;
+			function(input.data(), output.data());
+			Check(test, static_cast<uint64_t>(g_instruction_traps - traps_before) ==
+			                (trap_fallback ? instruction_count : 0),
+			      "reciprocal-root execution did not match its native/fallback patch count");
+			Check(test, (output[72] & 0x8d5u) == 0x45u, "patched instruction corrupted RFLAGS");
+			for (int reg = 0; reg < 3; ++reg) {
+				if (reg != destination && reg != source) {
+					Check(test, std::equal(input.begin() + 8, input.end(), output.begin() + 48 + reg * 8),
+					      "patched instruction corrupted an unrelated YMM register");
+				}
+			}
+			Check(test, red_zone_intact(), "patched instruction corrupted the guest red zone");
+			Check(test, output[0] == expected, "patched instruction read or wrote the wrong register");
+			if (destination != source) {
+				Check(test, std::equal(input.begin(), input.begin() + 4, output.begin() + 8),
+				      "source lower XMM lanes were corrupted");
+			}
+			if (source != 9) {
+				Check(test, refine(refine(std::bit_cast<float>(output[0]))) == 1.0f,
+				      "identity quaternion normalization drifted below one");
+			}
+			for (size_t i = 0; i < 4; ++i) {
+				Check(test, output[4 + i] == 0, "128-bit VEX destination retained upper YMM lanes");
+				const auto expected_upper = destination == source ? 0u : input[4 + i];
+				Check(test, output[12 + i] == expected_upper, "source upper YMM lanes were corrupted");
+			}
+			std::printf("[host]    rsqrt xmm%d,xmm%d %s native=%08x patched=%08x\n",
+			            destination, source, trap_fallback ? "fallback" : "replacement",
+			            std::bit_cast<uint32_t>(native), output[0]);
+			if (destination != 2) {
+				continue;
+			}
+			constexpr std::array<std::array<uint32_t, 8>, 4> cases {{
+			    {0x00000000, 0x80000000, 0x00000001, 0x80000001,
+			     0x7f800000, 0xff800000, 0x7f800000, 0xff800000},
+			    {0x7f800000, 0xff800000, 0xbf800000, 0x7fc12345,
+			     0x00000000, 0xffc00000, 0xffc00000, 0x7fc12345},
+			    {0x7f812345, 0xff812345, 0x40800000, 0x40000000,
+			     0x7fc12345, 0xffc12345, 0x3f000000, 0x3f3504f3},
+			    {0x00800000, 0x7f7fffff, 0x3f800000, 0x41800000,
+			     0x5f000000, 0x1f800000, 0x3f800000, 0x3e800000},
+			}};
+			for (const auto& values: cases) {
+				std::copy_n(values.begin(), 4, input.begin());
+				for (uint32_t controls = 0; controls < 8; ++controls) {
+					const uint32_t mxcsr = 0x1fa1u | ((controls & 3u) << 13u) | ((controls & 4u) << 4u);
+					_mm_setcsr(mxcsr);
+					function(input.data(), output.data());
+					const auto result_mxcsr = _mm_getcsr();
+					_mm_setcsr(restore.mxcsr);
+					Check(test, red_zone_intact(), "special-value replacement corrupted the guest red zone");
+					Check(test, result_mxcsr == mxcsr, "instruction changed MXCSR controls or exception flags");
+					Check(test, std::equal(output.begin(), output.begin() + 4, values.begin() + 4),
+					      "special values or round-independent reciprocal roots differ from ISA semantics");
+				}
+			}
+			input.fill(0x3f800000);
+		}
 	}
-#if defined(__linux__)
-	std::array<uint8_t, 16> unknown {0x0f, 0x0b};
+	// An indirect branch prevents borrowing neighboring bytes for this four-byte site.
+	Xbyak::CodeGenerator unsupported_code(code_size, reinterpret_cast<void*>(mapping));
+	Xbyak::Label continuation;
+	unsupported_code.vmovups(unsupported_code.ymm1, unsupported_code.ptr[unsupported_code.rdi]);
+	unsupported_code.lea(unsupported_code.rax,
+	                     unsupported_code.ptr[unsupported_code.rip + continuation]);
+	const auto trap_offset = unsupported_code.getSize();
+	unsupported_code.vrsqrtps(unsupported_code.xmm1, unsupported_code.xmm1);
+	unsupported_code.jmp(unsupported_code.rax);
+	unsupported_code.L(continuation);
+	unsupported_code.vmovups(unsupported_code.ptr[unsupported_code.rsi], unsupported_code.ymm1);
+	unsupported_code.vzeroupper();
+	unsupported_code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate unsupported-relocation fixture");
+	std::vector<uint8_t> expected_fallback(unsupported_code.getCode(), unsupported_code.getCurr());
+	expected_fallback[trap_offset + 1] &= ~0x08u;
+	register_module(code_size);
+	const auto unsupported = Loader::PatchGuestInstructions(
+	    mapping, unsupported_code.getSize(), function_starts, false, true);
+	Check(test, Xbyak::GetError() == 0 && unsupported.reciprocal_sqrt.found == 1 &&
+	                unsupported.reciprocal_sqrt.native == 0 &&
+	                unsupported.reciprocal_sqrt.trapped == 1 &&
+	                std::equal(expected_fallback.begin(), expected_fallback.end(),
+	                           unsupported_code.getCode()),
+	      "unsafe native relocation did not select the in-place trap fallback");
+	const auto traps_before = g_instruction_traps;
+	function(input.data(), output.data());
+	Check(test, g_instruction_traps == traps_before + 1 && output[0] == 0x3f800000 &&
+	                std::all_of(output.begin() + 4, output.begin() + 8,
+	                            [](uint32_t lane) { return lane == 0; }),
+	      "unsafe native relocation fallback did not execute correctly");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	CONTEXT context {};
+	auto& instruction_pointer = context.Rip;
+#else
 	ucontext_t context {};
-	context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(unknown.data());
-	Check(test, !Loader::X64InstructionEmulator::TryEmulate(&context), "unrecognized UD2 was swallowed");
 	_libc_fpstate fpstate {};
 	context.uc_mcontext.fpregs = &fpstate;
+	auto& instruction_pointer = context.uc_mcontext.gregs[REG_RIP];
+#endif
+	std::array<uint8_t, 16> unknown {0x0f, 0x0b};
+	instruction_pointer = reinterpret_cast<uintptr_t>(unknown.data());
+	Check(test, !Loader::X64InstructionEmulator::TryEmulate(&context), "unrecognized UD2 was swallowed");
+	std::array<uint8_t, 16> unmarked_rsqrt {0xc5, 0xf8, 0x52, 0xd1};
+	instruction_pointer = reinterpret_cast<uintptr_t>(unmarked_rsqrt.data());
+	Check(test, !Loader::X64InstructionEmulator::TryEmulate(&context) &&
+	                instruction_pointer == reinterpret_cast<uintptr_t>(unmarked_rsqrt.data()),
+	      "unmarked native reciprocal root was incorrectly emulated");
+#if defined(__linux__)
 	const auto emulate = [&](std::array<uint8_t, 16> instruction, size_t length) {
 		context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(instruction.data());
 		Check(test, Loader::X64InstructionEmulator::TryEmulate(&context), "existing instruction emulation was rejected");
@@ -3098,6 +3505,510 @@ void TestPackedReciprocalSquareRoot() {
 #endif
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+void TestPackedBitField(bool insert) {
+	const char*        test      = insert ? "PackedBitFieldInsert" : "PackedBitFieldExtract";
+	constexpr uint64_t code_size = 0x80000;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x904000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, "bitfield_test");
+	Check(test, mapping != 0, "failed to allocate SSE4a bitfield test code");
+	InstructionTestScope restore {mapping, code_size * 2};
+	restore.InstallHandler(test);
+	const bool host_sse4a      = Xbyak::util::Cpu().has(Xbyak::util::Cpu::tSSE4a);
+	const auto register_module = [&](uint64_t capacity) {
+		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                            reinterpret_cast<void*>(mapping + code_size),
+		                                            capacity);
+	};
+	// Xbyak has no SSE4a bitfield mnemonics. A negative source selects the immediate form.
+	const auto emit_bit_field = [insert](Xbyak::CodeGenerator& code, int destination, int source,
+	                                     uint8_t length = 0, uint8_t index = 0) {
+		const bool immediate = source < 0;
+		if (insert && immediate) {
+			source = 9;
+		}
+		code.db(insert ? 0xf2 : 0x66);
+		const int rex = source < 0 ? (destination >> 3) : ((destination >> 3) << 2) | (source >> 3);
+		if (rex != 0) {
+			code.db(0x40 | rex);
+		}
+		code.db(0x0f);
+		code.db(immediate ? 0x78 : 0x79);
+		code.db(source < 0 ? 0xc0 | (destination & 7)
+		                   : 0xc0 | ((destination & 7) << 3) | (source & 7));
+		if (immediate) {
+			code.db(length);
+			code.db(index);
+		}
+	};
+	// Copy individual source bits so the oracle is independent of the emitter's shift/mask.
+	const auto extract = [](uint64_t value, uint32_t length, uint32_t index) {
+		const uint32_t count  = (length & 63u) == 0 ? 64 : length & 63u;
+		const uint32_t first  = index & 63u;
+		uint64_t       result = 0;
+		for (uint32_t bit = 0; bit < count && first + bit < 64; ++bit) {
+			result |= ((value >> (first + bit)) & 1u) << bit;
+		}
+		return result;
+	};
+	const auto insert_bits = [](uint64_t destination, uint64_t source, uint32_t length,
+	                            uint32_t index) {
+		const uint32_t count = (length & 63u) == 0 ? 64 : length & 63u;
+		const uint32_t first = index & 63u;
+		for (uint32_t bit = 0; bit < count && first + bit < 64; ++bit) {
+			const uint64_t mask = uint64_t {1} << (first + bit);
+			destination         = (destination & ~mask) | (((source >> bit) & 1u) << (first + bit));
+		}
+		return destination;
+	};
+	struct Result {
+		std::array<uint64_t, 4>  destination;
+		std::array<uint64_t, 4>  source;
+		std::array<uint64_t, 13> gprs;
+		uint64_t                 flags;
+		uint64_t                 stack_before;
+		uint64_t                 stack_after;
+		std::array<uint64_t, 16> red_zone;
+	};
+	constexpr uint64_t             gpr_sentinel      = 0x8192a3b4c5d6e700ull;
+	constexpr uint64_t             red_zone_sentinel = 0xa1b2c3d4e5f60000ull;
+	std::array<uint64_t, 12>       input {0,
+	                                      0xdeadbeef12345678,
+	                                      0x8877665544332211,
+	                                      0x1122334455667788,
+	                                      0,
+	                                      0x123456789abcdef0,
+	                                      0x13579bdf2468ace0,
+	                                      0xfdb97531eca86420,
+	                                      0x3f8000003f800000,
+	                                      0x3f8000003f800000,
+	                                      0x3f8000003f800000,
+	                                      0x3f8000003f800000};
+	const std::array<uintptr_t, 1> function_starts {mapping};
+	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint64_t*, void*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	for (const auto registers: {std::array {1, 8}, std::array {8, 9}, std::array {3, 3},
+	                            std::array {15, 0}, std::array {8, -1}}) {
+		const auto           destination = registers[0];
+		const auto           source      = insert && registers[1] < 0 ? 9 : registers[1];
+		const bool           immediate   = registers[1] < 0;
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		const std::array     saved {code.rbx, code.rbp, code.r12, code.r13, code.r14, code.r15};
+		const std::array gprs {code.rax, code.rcx, code.rdx, code.rbx, code.rbp, code.r8, code.r9,
+		                       code.r10, code.r11, code.r12, code.r13, code.r14, code.r15};
+		for (const auto& reg: saved) {
+			code.push(reg);
+		}
+		code.vmovups(Xbyak::Ymm(destination), code.ptr[code.rdi]);
+		if (source >= 0 && source != destination) {
+			code.vmovups(Xbyak::Ymm(source), code.ptr[code.rdi + 32]);
+		}
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, red_zone_sentinel | offset);
+			code.mov(code.qword[code.rsp - offset], code.rax);
+		}
+		code.mov(code.eax, 0x7fffffff);
+		code.add(code.eax, 1);
+		code.stc(); // CF, PF, AF, SF and OF set; ZF clear.
+		for (size_t index = 0; index < gprs.size(); ++index) {
+			code.mov(gprs[index], gpr_sentinel | index);
+		}
+		code.mov(code.qword[code.rsi + offsetof(Result, stack_before)], code.rsp);
+		emit_bit_field(code, destination, registers[1], 0xc8, 0xc4);
+		code.mov(code.qword[code.rsi + offsetof(Result, stack_after)], code.rsp);
+		for (size_t index = 0; index < gprs.size(); ++index) {
+			code.mov(code.qword[code.rsi + offsetof(Result, gprs) + index * 8], gprs[index]);
+		}
+		code.lea(code.rsp, code.ptr[code.rsp - 128]);
+		code.pushfq();
+		code.pop(code.rax);
+		code.lea(code.rsp, code.ptr[code.rsp + 128]);
+		code.mov(code.qword[code.rsi + offsetof(Result, flags)], code.rax);
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, code.qword[code.rsp - offset]);
+			code.mov(code.qword[code.rsi + offsetof(Result, red_zone) + offset - 8], code.rax);
+		}
+		code.vmovups(code.ptr[code.rsi + offsetof(Result, destination)], Xbyak::Ymm(destination));
+		code.vmovups(code.ptr[code.rsi + offsetof(Result, source)],
+		             Xbyak::Ymm(source < 0 ? destination : source));
+		code.vzeroupper();
+		for (auto reg = saved.rbegin(); reg != saved.rend(); ++reg) {
+			code.pop(*reg);
+		}
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate SSE4a bitfield state fixture");
+		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+		register_module(code_size);
+		const std::vector<uint8_t> trampoline(code.getCode() + code_size,
+		                                      code.getCode() + code_size * 2);
+		const auto                 disabled =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, false);
+		Check(test,
+		      disabled.extrq.found == 0 && disabled.insertq.found == 0 &&
+		          std::equal(original.begin(), original.end(), code.getCode()) &&
+		          std::equal(trampoline.begin(), trampoline.end(), code.getCode() + code_size),
+		      "disabled AMD patching changed SSE4a bitfield code or trampolines");
+		for (const bool fallback: {false, true}) {
+			if (insert && fallback) {
+				continue; // INSERTQ always uses the trap path.
+			}
+			std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
+			register_module(fallback ? 32 : code_size);
+			const auto patched = Loader::PatchGuestInstructions(mapping, code.getSize(),
+			                                                    function_starts, false, true);
+			const auto counts  = insert ? patched.insertq : patched.extrq;
+			if (host_sse4a) {
+				Check(test,
+				      counts.found == 0 &&
+				          std::equal(original.begin(), original.end(), code.getCode()),
+				      "SSE4a host received unnecessary SSE4a bitfield patches");
+				std::printf("[host]    %-48s skipped (native SSE4a host)\n", test);
+				return;
+			}
+			std::printf("[host]    bitfield xmm%d,%d %s found=%" PRIu64 " native=%" PRIu64
+			            " trapped=%" PRIu64 "\n",
+			            destination, source, fallback ? "fallback" : "replacement", counts.found,
+			            counts.native, counts.trapped);
+			Check(test,
+			      Xbyak::GetError() == 0 && counts.found == 1 && counts.Skipped() == 0 &&
+			          counts.native == (fallback || insert ? 0u : 1u) &&
+			          counts.trapped == (fallback || insert ? 1u : 0u),
+			      "SSE4a bitfield native/fallback patch counts differ");
+			const auto traps_before = g_instruction_traps;
+			uint64_t   calls        = 0;
+			for (uint32_t length = 0; length < 64; ++length) {
+				for (uint32_t index = 0; index < 64; ++index) {
+					if (immediate && (length != 8 || index != 4)) {
+						continue;
+					}
+					for (const uint64_t pattern: {UINT64_MAX, uint64_t {0x0123456789abcdef}}) {
+						const uint64_t controls = (pattern & ~uint64_t {0xffff}) |
+						                          ((index | 0xc0u) << 8) | (length | 0xc0u);
+						input[0] = !insert && source == destination ? controls : pattern;
+						input[4] = insert ? ~pattern : controls;
+						if (insert) {
+							input[source == destination ? 1 : 5] = controls;
+						}
+						Result output {};
+						_mm_setcsr(0x5fa5);
+						function(input.data(), &output);
+						const auto mxcsr = _mm_getcsr();
+						_mm_setcsr(restore.mxcsr);
+						++calls;
+						Check(test,
+						      output.destination[0] ==
+						              (insert ? insert_bits(input[0],
+						                                    input[source == destination ? 0 : 4],
+						                                    length, index)
+						                      : extract(input[0], length, index)) &&
+						          output.destination[1] == (insert ? input[1] : 0) &&
+						          output.destination[2] == input[2] &&
+						          output.destination[3] == input[3],
+						      "SSE4a bitfield result or destination lanes differ");
+						Check(test,
+						      source < 0 || source == destination
+						          ? output.source == output.destination
+						          : std::equal(output.source.begin(), output.source.end(),
+						                       input.begin() + 4),
+						      "SSE4a bitfield changed its separate source register");
+						Check(test,
+						      mxcsr == 0x5fa5 && (output.flags & 0x8d5u) == 0x895u &&
+						          output.stack_before == output.stack_after,
+						      "SSE4a bitfield changed MXCSR, RFLAGS or RSP");
+						for (size_t reg = 0; reg < output.gprs.size(); ++reg) {
+							Check(test, output.gprs[reg] == (gpr_sentinel | reg),
+							      "SSE4a bitfield corrupted a guest GPR");
+						}
+						for (size_t slot = 0; slot < output.red_zone.size(); ++slot) {
+							Check(test,
+							      output.red_zone[slot] == (red_zone_sentinel | ((slot + 1) * 8)),
+							      "SSE4a bitfield corrupted the guest red zone");
+						}
+					}
+				}
+			}
+			Check(test,
+			      static_cast<uint64_t>(g_instruction_traps - traps_before) ==
+			          (fallback || insert ? calls : 0),
+			      "SSE4a bitfield execution did not match native/fallback selection");
+		}
+	}
+	if (insert) {
+		std::printf("[host]    %-48s ok (all 4096 length/index pairs)\n", test);
+		return;
+	}
+
+	// Cover every immediate length/index pair without re-decoding thousands of large fixtures.
+	Xbyak::CodeGenerator   code(code_size, reinterpret_cast<void*>(mapping));
+	std::vector<uintptr_t> starts;
+	for (uint32_t length = 0; length < 64; ++length) {
+		for (uint32_t index = 0; index < 64; ++index) {
+			starts.push_back(mapping + code.getSize());
+			code.vmovups(code.ymm8, code.ptr[code.rdi]);
+			emit_bit_field(code, 8, -1, length | 0xc0, index | 0xc0);
+			code.vmovups(code.ptr[code.rsi], code.ymm8);
+			code.vzeroupper();
+			code.ret();
+		}
+	}
+	Check(test, Xbyak::GetError() == 0, "failed to generate exhaustive immediate EXTRQ fixture");
+	const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+	for (const bool fallback: {false, true}) {
+		std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
+		register_module(fallback ? 1 : code_size);
+		const auto counts =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true).extrq;
+		Check(test,
+		      Xbyak::GetError() == 0 && counts.found == starts.size() && counts.Skipped() == 0 &&
+		          counts.native == (fallback ? 0 : starts.size()) &&
+		          counts.trapped == (fallback ? starts.size() : 0),
+		      "immediate EXTRQ coverage was lost");
+		const auto traps_before = g_instruction_traps;
+		for (size_t entry = 0; entry < starts.size(); ++entry) {
+			for (const uint64_t pattern: {UINT64_MAX, uint64_t {0x0123456789abcdef}}) {
+				input[0] = pattern;
+				std::array<uint64_t, 4> output {};
+				reinterpret_cast<GuestFunction>(starts[entry])(input.data(), output.data());
+				Check(test,
+				      output[0] == extract(pattern, entry / 64, entry % 64) && output[1] == 0 &&
+				          output[2] == input[2] && output[3] == input[3],
+				      "immediate EXTRQ bit slice differs");
+			}
+		}
+		Check(test,
+		      static_cast<uint64_t>(g_instruction_traps - traps_before) ==
+		          (fallback ? starts.size() * 2 : 0),
+		      "immediate EXTRQ did not execute its selected path");
+	}
+
+	// An indirect branch prevents relocating this four-byte register form; retain its natural trap.
+	code.reset();
+	Xbyak::Label continuation;
+	code.vmovups(code.ymm1, code.ptr[code.rdi]);
+	code.vmovups(code.ymm2, code.ptr[code.rdi + 32]);
+	code.lea(code.rax, code.ptr[code.rip + continuation]);
+	emit_bit_field(code, 1, 2);
+	code.jmp(code.rax);
+	code.L(continuation);
+	code.vmovups(code.ptr[code.rsi], code.ymm1);
+	code.vzeroupper();
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate unrelocatable EXTRQ fixture");
+	const std::vector<uint8_t> unsafe_original(code.getCode(), code.getCurr());
+	register_module(code_size);
+	const auto unsafe =
+	    Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, true).extrq;
+	Check(test,
+	      unsafe.found == 1 && unsafe.native == 0 && unsafe.trapped == 1 &&
+	          std::equal(unsafe_original.begin(), unsafe_original.end(), code.getCode()),
+	      "unrelocatable EXTRQ did not retain its natural trap");
+	input[0] = 0x0123456789abcdef;
+	input[4] = 0xffffc4c8;
+	std::array<uint64_t, 8> output {};
+	const auto              traps_before = g_instruction_traps;
+	function(input.data(), output.data());
+	Check(test, g_instruction_traps == traps_before + 1 && output[0] == extract(input[0], 8, 4),
+	      "unrelocatable EXTRQ fallback did not execute");
+
+	// Neighboring replacement kinds must share the same relocation/fallback span safely.
+	code.reset();
+	code.vmovups(code.ymm1, code.ptr[code.rdi]);
+	code.vmovups(code.ymm2, code.ptr[code.rdi + 32]);
+	code.vmovups(code.ymm3, code.ptr[code.rdi + 64]);
+	emit_bit_field(code, 1, 2);
+	code.vrsqrtps(code.xmm4, code.xmm3);
+	code.vmovups(code.ptr[code.rsi], code.ymm1);
+	code.vmovups(code.ptr[code.rsi + 32], code.ymm4);
+	code.vzeroupper();
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate mixed AMD instruction fixture");
+	const std::vector<uint8_t> mixed_original(code.getCode(), code.getCurr());
+	for (const bool fallback: {false, true}) {
+		std::memcpy(reinterpret_cast<void*>(mapping), mixed_original.data(), mixed_original.size());
+		register_module(fallback ? 48 : code_size);
+		const auto mixed =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, true);
+		for (const auto counts: {mixed.extrq, mixed.reciprocal_sqrt}) {
+			Check(test,
+			      counts.found == 1 && counts.native == (fallback ? 0u : 1u) &&
+			          counts.trapped == (fallback ? 1u : 0u),
+			      "mixed AMD instruction counts differ");
+		}
+		const auto before = g_instruction_traps;
+		function(input.data(), output.data());
+		Check(test,
+		      g_instruction_traps == before + (fallback ? 2 : 0) &&
+		          output[0] == extract(input[0], 8, 4) && output[4] == 0x3f8000003f800000 &&
+		          output[5] == 0x3f8000003f800000 && output[6] == 0 && output[7] == 0,
+		      "mixed native/fallback AMD instructions lost their results");
+	}
+	std::printf("[host]    %-48s ok (all 4096 length/index pairs)\n", test);
+}
+
+void TestPackedBitFieldExtract() {
+	TestPackedBitField(false);
+}
+
+void TestPackedBitFieldInsert() {
+	TestPackedBitField(true);
+}
+
+void TestCpuExtensionPatches() {
+	const char*        test      = "CpuExtensionPatches";
+	constexpr uint64_t code_size = 0x4000;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x906000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "cpu_extension_test");
+	Check(test, mapping != 0, "failed to allocate CPU extension fixture");
+	InstructionTestScope restore {mapping, code_size * 2};
+	restore.InstallHandler(test);
+	const auto                     host = Loader::GetGuestInstructionHostFeatures();
+	const std::array<uintptr_t, 1> starts {mapping};
+	const auto                     register_module = [&](uint64_t capacity) {
+		std::memset(reinterpret_cast<void*>(mapping + code_size), 0, code_size);
+		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                            reinterpret_cast<void*>(mapping + code_size),
+		                                            capacity);
+	};
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint64_t*, uint64_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	for (const bool writes_rsp: {false, true}) {
+		code.reset();
+		code.push(code.r12);
+		code.mov(code.r12, code.rsp);
+		code.vmovups(code.ymm8, code.ptr[code.rdi]);
+		code.vmovups(code.ymm9, code.ptr[code.rdi + 32]);
+		code.mov(code.r10, 0x123456789abcdef0ull);
+		code.mov(code.qword[code.rsp - 8], code.r10);
+		code.clwb(code.ptr[code.rsp - 8]);
+		for (const uint8_t byte: {0xf2, 0x45, 0x0f, 0x79, 0xc1}) {
+			code.db(byte); // INSERTQ xmm8,xmm9
+		}
+		code.db(0xf3); // RDPID rax/rsp
+		code.db(0x48);
+		code.db(0x0f);
+		code.db(0xc7);
+		code.db(writes_rsp ? 0xfc : 0xf8);
+		if (writes_rsp) {
+			code.mov(code.rax, code.rsp);
+			code.mov(code.rsp, code.r12);
+		}
+		code.mov(code.qword[code.rsi], code.rax);
+		code.mov(code.rax, code.qword[code.rsp - 8]);
+		code.mov(code.qword[code.rsi + 8], code.rax);
+		code.vmovups(code.ptr[code.rsi + 16], code.ymm8);
+		code.vzeroupper();
+		code.pop(code.r12);
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate mixed CPU extension fixture");
+		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+		register_module(code_size);
+		const auto disabled =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, false, {});
+		Check(test,
+		      disabled.insertq.found == 0 && disabled.rdpid.found == 0 &&
+		          disabled.clwb.found == 0 &&
+		          std::equal(original.begin(), original.end(), code.getCode()) &&
+		          std::all_of(code.getCode() + code_size, code.getCode() + code_size * 2,
+		                      [](uint8_t byte) { return byte == 0; }),
+		      "disabled AMD option changed CPU extension code or trampolines");
+		const auto supported = Loader::PatchGuestInstructions(mapping, code.getSize(), starts,
+		                                                      false, true, {true, true, true});
+		Check(test,
+		      supported.insertq.found == 0 && supported.rdpid.found == 0 &&
+		          supported.clwb.found == 0 &&
+		          std::equal(original.begin(), original.end(), code.getCode()),
+		      "available host CPU extensions were unnecessarily patched");
+		const auto enabled =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true, {});
+		Check(test,
+		      enabled.clwb.found == 1 && enabled.clwb.native == 1 && enabled.clwb.trapped == 0 &&
+		          enabled.insertq.found == 1 && enabled.insertq.native == 0 &&
+		          enabled.insertq.trapped == 1 && enabled.rdpid.found == 1 &&
+		          enabled.rdpid.native == 0 && enabled.rdpid.trapped == 1,
+		      "mixed native CLWB and trapped INSERTQ/RDPID counts differ");
+		// Verify the actual stack-relative CLFLUSH operand, since flushing the wrong mapped
+		// cache line would otherwise leave the sentinel unchanged too.
+		ZydisDecoder decoder {};
+		Check(test,
+		      ZYAN_SUCCESS(
+		          ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)),
+		      "failed to initialize decoder");
+		bool found_flush = false;
+		for (size_t offset = 0; offset < 512 && !found_flush;) {
+			ZydisDecodedInstruction instruction {};
+			ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+			Check(test,
+			      ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, code.getCode() + code_size + offset,
+			                                          code_size - offset, &instruction, operands)),
+			      "failed to decode CPU extension trampoline");
+			if (instruction.mnemonic == ZYDIS_MNEMONIC_CLFLUSH) {
+				found_flush = true;
+				Check(test,
+				      operands[0].mem.base == ZYDIS_REGISTER_RSP &&
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				          operands[0].mem.disp.value == 120,
+#else
+				          operands[0].mem.disp.value == -8,
+#endif
+				      "CLWB replacement did not preserve its guest stack address");
+			}
+			offset += instruction.length;
+		}
+		Check(test, found_flush, "CLWB native replacement did not emit CLFLUSH");
+		const std::array<uint64_t, 8> input {0x1111, 0xdeadbeef, 0x12345678, 0x87654321,
+		                                     0xab,   0xffffc4c8, 0,          0};
+		std::array<uint64_t, 6>       output {};
+		bool                          checked_aux = false;
+		for (size_t attempt = 0; attempt < 100 && !checked_aux; ++attempt) {
+			uint32_t   before = 0;
+			uint32_t   after  = 0;
+			const auto traps  = g_instruction_traps;
+			__rdtscp(&before);
+			function(input.data(), output.data());
+			__rdtscp(&after);
+			Check(test, g_instruction_traps == traps + !host.sse4a + !host.rdpid,
+			      "mixed CPU extension fixture used an unexpected trap path");
+			Check(test,
+			      output[1] == 0x123456789abcdef0ull && output[2] == 0x1ab1 &&
+			          (host.sse4a || output[3] == input[1]) &&
+			          std::equal(output.begin() + 4, output.end(), input.begin() + 2),
+			      "mixed CPU extensions corrupted INSERTQ state or the guest red zone");
+			if (before == after) {
+				Check(test, output[0] == before,
+				      "RDPID patch lost TSC_AUX or adjusted its RSP destination");
+				checked_aux = true;
+			}
+		}
+		Check(test, checked_aux, "thread migrated repeatedly during patched RDPID comparison");
+	}
+
+	code.reset();
+	code.clwb(code.ptr[code.rdi]);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate exhausted CLWB fixture");
+	const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+	register_module(1);
+	const auto exhausted =
+	    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true, {}).clwb;
+	Check(test,
+	      exhausted.found == 1 && exhausted.native == 0 && exhausted.trapped == 1 &&
+	          std::equal(original.begin(), original.end(), code.getCode()) &&
+	          Xbyak::GetError() == 0,
+	      "exhausted CLWB replacement did not retain its natural trap fallback");
+	std::array<uint64_t, 8> data;
+	data.fill(0x123456789abcdef0ull);
+	const auto traps = g_instruction_traps;
+	function(data.data(), nullptr);
+	Check(test,
+	      g_instruction_traps == traps + !host.clwb &&
+	          std::all_of(data.begin(), data.end(),
+	                      [](uint64_t value) { return value == 0x123456789abcdef0ull; }),
+	      "CLWB direct fallback changed memory or used an unexpected trap path");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -3267,6 +4178,12 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+#if defined(__linux__)
+	if (argc == 2 && std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
+		RunTest(TestFixedDirectReplacementPreservesAccess);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
 		RunTest(TestSmallFiberStacksAndMigration);
@@ -3274,6 +4191,16 @@ int main(int argc, char** argv) {
 	}
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--cpu-extensions-only") == 0) {
+		RunTest(TestCpuExtensionContexts);
+		RunTest(TestPackedBitFieldInsert);
+		RunTest(TestCpuExtensionPatches);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--extrq-only") == 0) {
+		RunTest(TestPackedBitFieldExtract);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -3289,6 +4216,10 @@ int main(int argc, char** argv) {
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
+	RunTest(TestPackedBitFieldExtract);
+	RunTest(TestCpuExtensionContexts);
+	RunTest(TestPackedBitFieldInsert);
+	RunTest(TestCpuExtensionPatches);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
@@ -3330,6 +4261,9 @@ int main(int argc, char** argv) {
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
+#if defined(__linux__)
+	RunTest(TestFixedDirectReplacementPreservesAccess);
+#endif
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);

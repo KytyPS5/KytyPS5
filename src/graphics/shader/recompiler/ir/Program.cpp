@@ -142,6 +142,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .user_data_base  = user_data_base,
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
+	    .has_address_writes = has_address_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};
@@ -187,6 +188,18 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 		}
 	}
 	return invariant;
+}
+
+Value ResolveActiveU32(Value value, Value active) {
+	for (uint32_t depth = 0; depth <= 32; ++depth) {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 ||
+		    inst->Arg(0).Resolve() != active)
+			return value;
+		value = inst->Arg(1);
+	}
+	return {};
 }
 
 bool HasShaderMemoryWrites(const Program& program) {
@@ -398,7 +411,8 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind != ResourceKind::ScalarBuffer) {
+				if (memory.kind != ResourceKind::ScalarBuffer &&
+				    memory.kind != ResourceKind::IndirectBuffer) {
 					return Fail(fmt::format("{} has an invalid scalar-memory resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
@@ -456,7 +470,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
-					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
+					return Fail("indirect buffer requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
 				}
 				if (buffer_components > 1u &&
 				    (!vector_buffer || memory.data_bits != 32u ||

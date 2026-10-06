@@ -441,9 +441,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    NullImageDescriptor(candidate)) return false;
 			const uint64_t base =
 			    ((uint64_t {candidate.dwords[1] & 0xffu} << 32u) | candidate.dwords[0]) << 8u;
+			// Read through the uncaptured reader: a readability probe is not a
+			// specialization dependency.
+			const auto* capture = runtime.read_specialization_memory == CaptureStrictRead
+			                          ? static_cast<const ReadCapture*>(runtime.userdata)
+			                          : nullptr;
+			const auto  reader   = capture != nullptr ? capture->source.read_specialization_memory
+			                                          : runtime.read_specialization_memory;
+			void*       userdata = capture != nullptr ? capture->source.userdata : runtime.userdata;
 			std::array<uint32_t, 4> probe {};
-			return base == 0u || runtime.read_specialization_memory == nullptr ||
-			       !runtime.read_specialization_memory(runtime.userdata, base & AddressMask, probe);
+			return base == 0u || reader == nullptr || !reader(userdata, base & AddressMask, probe);
 		};
 		if (stale_image()) candidate = {.dword_count = dword_count};
 		if (!normalize(candidate)) {

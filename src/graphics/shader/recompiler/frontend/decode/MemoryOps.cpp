@@ -415,10 +415,10 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 		SetUnsupported(inst, Family::DS, opcode, "DS opcode is not implemented");
 	}
 	if (inst.opcode == Opcode::DS_ORDERED_COUNT) {
-		// offset0 = counter index * 4; offset1[5:4] selects add (0) or swap (1).
+		// Keep OFFSET1's wave type as well as its add/swap selector for GDS addressing.
 		inst.offset           = offset0 & 0xfcu;
-		inst.secondary_offset = (offset1 >> 4u) & 3u;
-		if (!inst.gds || inst.secondary_offset > 1u || ((offset1 >> 6u) & 3u) != 0u) {
+		inst.secondary_offset = offset1;
+		if (!inst.gds || ((offset1 >> 4u) & 3u) > 1u || ((offset1 >> 6u) & 3u) != 0u) {
 			SetUnsupported(inst, Family::DS, opcode, "DS ordered count variant is not implemented");
 		}
 	}

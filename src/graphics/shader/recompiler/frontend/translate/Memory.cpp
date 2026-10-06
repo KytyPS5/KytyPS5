@@ -236,7 +236,6 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src0 : MakeImmediate(decoded.offset & 0xffffu);
 			case Decoder::Opcode::DS_CONSUME:
 			case Decoder::Opcode::DS_APPEND:
-			case Decoder::Opcode::DS_ORDERED_COUNT:
 				return decoded.gds ? MakeM0Operand() : MakeImmediate(0);
 			case Decoder::Opcode::DS_READ_ADDTID_B32: return MakeM0Operand();
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
@@ -885,27 +884,47 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
-	// One GDS atomic per wave, issued by the first active lane with its ADDR value, and the
-	// pre-op value broadcast to every lane. Wave-launch ordering is not emulated: results
-	// stay unique per wave, which is what append-style users need.
+	// Approximate ordered counting with one GDS atomic per wave. Wave-launch ordering and
+	// release/done synchronization are not emulated.
 	const auto memory = MemoryInfoFromDecoded(inst);
-	const auto opcode = inst.secondary_offset == 1u ? IR::ValueOpcode::SharedAtomicSwap32
-	                                                : IR::ValueOpcode::SharedAtomicIAdd32;
+	const auto m0 = ir.GetM0();
+	auto address = ir.BitwiseAnd(ir.ShiftRightLogical(m0, IR::U32(IR::Value(16u))),
+	                             IR::U32(IR::Value(0xfffcu)));
+	if (((inst.secondary_offset >> 2u) & 3u) == 1u) {
+		const auto packer = ir.BitwiseAnd(m0, IR::U32(IR::Value(0xfu)));
+		address = ir.IAdd(address, ir.ShiftLeftLogical(packer, IR::U32(IR::Value(2u))));
+	}
 	const auto exec   = ir.GetExec();
 	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {exec});
-	const auto low  = IR::U32(ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {ballot, IR::Value(0u)}));
-	const auto high = IR::U32(ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {ballot, IR::Value(1u)}));
+	const auto low = ir.CompositeExtract(ballot, 0u);
+	const auto high = ir.CompositeExtract(ballot, 1u);
+	const auto active = ir.INotEqual(ir.BitwiseOr(low, high), IR::U32(IR::Value(0u)));
 	const auto first = ir.Select(
-	    IR::U1(ir.Emit(IR::ValueOpcode::INotEqual32, {low, IR::Value(0u)})),
+	    ir.INotEqual(low, IR::U32(IR::Value(0u))),
 	    IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {low})),
 	    ir.IAdd(IR::U32(IR::Value(32u)), IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {high}))));
-	const auto lane     = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
-	const auto is_first = IR::U1(ir.Emit(
-	    IR::ValueOpcode::LogicalAnd, {exec, IR::U1(ir.Emit(IR::ValueOpcode::IEqual32, {lane, first}))}));
-	const auto value  = IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane, {ReadU32(inst.src0), exec}));
-	const auto result = ir.Emit(opcode, {IR::U32(IR::Value(0u)), value, is_first},
-	                            AddMemoryInfo(memory, inst.pc));
-	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ReadFirstLane, {result, is_first}));
+	// An empty EXEC still returns the counter. Elect lane zero and perform an add of zero.
+	const auto selected = ir.Select(active, first, IR::U32(IR::Value(0u)));
+	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	const auto is_first = ir.IEqual(lane, selected);
+	const auto source = IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane,
+	                                   {ReadU32(inst.src0), is_first}));
+	const auto value = ir.Select(active, source, IR::U32(IR::Value(0u)));
+	const auto flags = AddMemoryInfo(memory, inst.pc);
+	IR::U32 result;
+	if (((inst.secondary_offset >> 4u) & 3u) == 1u) {
+		const auto swapped = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicSwap32,
+		    {address, value, ir.LogicalAnd(is_first, active)}, flags));
+		const auto unchanged = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
+		    {address, IR::Value(0u), ir.LogicalAnd(is_first, ir.LogicalNot(active))}, flags));
+		result = ir.Select(active, swapped, unchanged);
+	} else {
+		result = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
+		                        {address, value, is_first}, flags));
+	}
+	// DS_ORDERED_COUNT writes every destination lane, regardless of EXEC.
+	ir.SetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg),
+	    IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane, {result, is_first})));
 }
 
 void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {

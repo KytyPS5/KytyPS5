@@ -74,6 +74,8 @@ private:
 	void               SelectItem(QTreeWidgetItem* witem);
 	void               ApplyCompatibility();
 	void               UpdateToolbarIcons();
+	void               ImportGameSettings(QWidget* parent);
+	void               ExportGameSettings(QWidget* parent) const;
 	[[nodiscard]] bool HasValidGameDirectory() const;
 
 	ConfigurationItem*            m_selected_item = nullptr;

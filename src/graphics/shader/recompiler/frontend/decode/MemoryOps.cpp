@@ -109,6 +109,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x39u, Opcode::DS_READ_I8, 1, 8, true},     {0x3au, Opcode::DS_READ_U8, 1, 8},
     {0x3bu, Opcode::DS_READ_I16, 1, 16, true},   {0x3cu, Opcode::DS_READ_U16, 1, 16},
     {0x3du, Opcode::DS_CONSUME, 1, 32},          {0x3eu, Opcode::DS_APPEND, 1, 32},
+    {0x3fu, Opcode::DS_ORDERED_COUNT, 1, 32},
     {0x40u, Opcode::DS_ADD_U64, 2, 32},         {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
@@ -214,6 +215,7 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_READ_ADDTID_B32:
 		case Opcode::DS_CONSUME:
 		case Opcode::DS_APPEND: return 0u;
+		case Opcode::DS_ORDERED_COUNT: return 1u;
 		default: return IsDsWriteOpcode(opcode) || IsDsAtomicOpcode(opcode) ? 2u : 1u;
 	}
 }
@@ -411,6 +413,14 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::DS, opcode, "DS opcode is not implemented");
+	}
+	if (inst.opcode == Opcode::DS_ORDERED_COUNT) {
+		// Keep OFFSET1's wave type as well as its add/swap selector for GDS addressing.
+		inst.offset           = offset0 & 0xfcu;
+		inst.secondary_offset = offset1;
+		if (!inst.gds || ((offset1 >> 4u) & 3u) > 1u || ((offset1 >> 6u) & 3u) != 0u) {
+			SetUnsupported(inst, Family::DS, opcode, "DS ordered count variant is not implemented");
+		}
 	}
 	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");

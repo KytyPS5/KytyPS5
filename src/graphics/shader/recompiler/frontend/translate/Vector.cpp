@@ -344,6 +344,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_O_F32: EmitFloatOrderedCompare(inst, true, false); return;
 		case O::V_CMP_U_F32: EmitFloatOrderedCompare(inst, false, false); return;
 		case O::V_CMPX_O_F32: EmitFloatOrderedCompare(inst, true, true); return;
+		case O::V_CMPX_U_F32: EmitFloatOrderedCompare(inst, false, true); return;
 		case O::V_CMP_CLASS_F32: EmitFloatClassCompare(inst, false); return;
 		case O::V_CMPX_CLASS_F32: EmitFloatClassCompare(inst, true); return;
 		case O::V_CMPX_CLASS_F16: EmitFloatClassCompare(inst, true, true); return;

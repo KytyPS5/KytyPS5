@@ -19,6 +19,7 @@
 #include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -126,6 +127,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	setMinimumWidth(width());
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
+	m_ui->settings_button->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
@@ -354,6 +356,11 @@ void ConfigurationEditDialog::InitGameDirectories() {
 
 void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_global_settings = true;
+	auto* menu        = new QMenu(m_ui->settings_button);
+	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
+	menu->addAction(tr("Export..."), this, &ConfigurationEditDialog::ExportGameSettings);
+	m_ui->settings_button->setMenu(menu);
+	m_ui->settings_button->setVisible(true);
 	m_game_dirs_list->clear();
 	m_game_dirs_group->setMinimumWidth(GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH);
 

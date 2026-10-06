@@ -54,7 +54,21 @@ struct RasterScaler::Impl {
 	bool active = false;
 	bool color_sources_ready = false;
 	std::array<std::pair<uint64_t, uint64_t>, RENDER_COLOR_ATTACHMENTS_MAX> color_versions {};
+	// What each scaled image last stored into: (instance, version), mip and layer.
+	struct Stored { std::pair<uint64_t, uint64_t> version {}; uint32_t mip = 0, layer = 0, layers = 0; };
+	std::array<Stored, RENDER_COLOR_ATTACHMENTS_MAX + 1> stored {};
 	bool logged = false;
+
+	// The scaled image still equals the guest image when nothing wrote the guest
+	// since our last store. The current pass's own acquire adds at most one version.
+	bool Current(uint32_t slot, const RenderAttachment& attachment) const {
+		const auto& guest = *attachment.image;
+		const auto& last = stored[slot];
+		const auto now = guest.ContentVersion();
+		return last.layers != 0 && last.version.first == now.first && now.second - last.version.second <= 1 &&
+		       last.mip == attachment.mip_level && last.layer == attachment.base_layer &&
+		       last.layers == original.num_layers && !guest.IsCpuDirty() && !guest.IsBufferModified();
+	}
 
 	bool Supported(const RenderAttachment& attachment) const {
 		if (!attachment.image_view) return true;
@@ -84,9 +98,10 @@ struct RasterScaler::Impl {
 		const bool clears_all = attachment.has_depth || attachment.has_stencil ?
 		    (!attachment.has_depth || attachment.depth_clear) && (!attachment.has_stencil || attachment.stencil_clear) :
 		    attachment.is_clear;
-		if (!store && clears_all) {
+		if (!store && (clears_all || Current(slot, attachment))) {
 			// Keep mixed depth/stencil LOAD operations intact. Only omit a copy
-			// when the render pass clears every aspect it could have loaded.
+			// when the render pass clears every aspect it could have loaded, or
+			// when the scaled image already holds the guest content.
 			scaled.Transit(attachment.image_layout, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite, {}, command);
 			return;
 		}
@@ -117,6 +132,8 @@ struct RasterScaler::Impl {
 		           store ? vk::ImageLayout::eTransferDstOptimal : vk::ImageLayout::eTransferSrcOptimal, attachment.image_layout);
 		if (!store) {
 			scaled.Transit(attachment.image_layout, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite, {}, command);
+		} else {
+			stored[slot] = {guest.ContentVersion(), attachment.mip_level, attachment.base_layer, original.num_layers};
 		}
 	}
 
@@ -127,6 +144,7 @@ struct RasterScaler::Impl {
 		if (!image || image->backing.format != format || image->backing.extent.width != effective.width ||
 		    image->backing.extent.height != effective.height || image->backing.layers != original.num_layers) {
 			if (image) scheduler.DeferOperation([old = std::move(image)]() mutable { old.reset(); });
+			stored[slot] = {};
 			ImageInfo info {};
 			info.pixel_format = format;
 			info.extent = {effective.width, effective.height, 1};

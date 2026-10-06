@@ -40,7 +40,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// execinfo.h exists on glibc and Apple targets but not on musl.
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS &&     (defined(__GLIBC__) || defined(__APPLE__))
+#define SHADER_FUZZ_HAS_EXECINFO 1
 #include <execinfo.h>
 #endif
 
@@ -169,6 +171,7 @@ void RunIsolated(void (*body)(const std::vector<uint32_t> &),
     // then die by the same signal so the parent attributes it correctly.
     struct CrashTracer {
       static void Handle(int sig) {
+#ifdef SHADER_FUZZ_HAS_EXECINFO
         void *frames[32];
         const int count = ::backtrace(frames, 32);
         char header[64];
@@ -176,6 +179,7 @@ void RunIsolated(void (*body)(const std::vector<uint32_t> &),
                                       "ShaderFuzzTests: crashed with signal %d\n", sig);
         (void)::write(STDERR_FILENO, header, static_cast<size_t>(len));
         ::backtrace_symbols_fd(frames, count, STDERR_FILENO);
+#endif
         ::signal(sig, SIG_DFL);
         ::raise(sig);
       }
@@ -235,9 +239,18 @@ int main() {
   //   SHADER_FUZZ_REPRO=75 lldb -b -o run -o bt -- ./shader_fuzz_tests
   // SHADER_FUZZ_WORDS=0x..,0x.. replays exact words instead, e.g. from a
   // reported "words:" line.
+  // SHADER_FUZZ_REPRO replays decode cases only; translate cases are
+  // identified by seed + index in failure reports.
   size_t repro = SIZE_MAX;
   if (const char *only = std::getenv("SHADER_FUZZ_REPRO")) {
     repro = static_cast<size_t>(std::strtoull(only, nullptr, 10));
+    if (repro >= kDecodeCases) {
+      std::fprintf(stderr,
+                   "ShaderFuzzTests: SHADER_FUZZ_REPRO supports decode cases 0..%zu "
+                   "only\n",
+                   kDecodeCases - 1u);
+      return 2;
+    }
   }
   if (const char *hex = std::getenv("SHADER_FUZZ_WORDS")) {
     std::vector<uint32_t> code;

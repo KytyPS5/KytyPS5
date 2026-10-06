@@ -1449,6 +1449,9 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_FMA_F16:
+		case Opcode::V_MIN3_F16:
+		case Opcode::V_MAX3_F16:
+		case Opcode::V_MED3_F16:
 		case Opcode::V_CUBEID_F32:
 		case Opcode::V_CVT_PKRTZ_F16_F32:
 		case Opcode::V_LDEXP_F32:
@@ -1479,7 +1482,8 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 		return clamp != 0u || omod != 0u;
 	}
 	if (IsNativeVop3F16TernaryOpcode(opcode)) {
-		return opcode != Opcode::V_FMA_F16 && (clamp != 0u || omod != 0u);
+		// Clamp is applied by WriteF16 for every f16 ternary; omod only for V_FMA_F16.
+		return opcode != Opcode::V_FMA_F16 && omod != 0u;
 	}
 	if (IsNativeVop3I16TernaryOpcode(opcode)) {
 		return abs != 0u || (clamp != 0u && !clamp_modifier) || omod != 0u || neg != 0u;

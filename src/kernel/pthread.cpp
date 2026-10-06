@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/dateTime.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -3174,6 +3175,7 @@ static void CleanupThread(void* arg) {
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestThreadsExited);
 
 	thread->almost_done = true;
 }
@@ -3190,6 +3192,7 @@ static void* RunThread(void* arg) {
 	void* ret    = nullptr;
 
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestThreadsCreated);
 
 	g_pthread_self = thread;
 
@@ -3200,6 +3203,12 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	// Name the host thread so profilers and the performance panel show guest thread names.
+#if defined(__APPLE__)
+	pthread_setname_np(thread->name.c_str());
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+#endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",

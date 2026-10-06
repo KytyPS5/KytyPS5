@@ -1,7 +1,10 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -49,8 +52,15 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	const auto wait_begin = std::chrono::steady_clock::now();
+	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuWaits);
+	Common::DebugCounters::Add(
+	    Common::DebugCounters::Counter::GpuWaitNs,
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                              std::chrono::steady_clock::now() - wait_begin)
+	                              .count()));
 	Refresh();
 }
 

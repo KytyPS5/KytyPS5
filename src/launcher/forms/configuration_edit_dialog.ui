@@ -179,6 +179,12 @@
           <property name="text"><string>Auto-hide cursor</string></property>
          </widget>
         </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_perf_overlay">
+          <property name="toolTip"><string>Show FPS, frame times, CPU/GPU usage, RAM and memory pressure in the game window. Press F2 (Cmd+P on macOS) in game to toggle it, and add Shift for the detailed view.</string></property>
+          <property name="text"><string>Show performance panel</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

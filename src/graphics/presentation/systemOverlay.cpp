@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
@@ -484,8 +485,10 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto dialog = DialogIme::GetVisualState();
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
+	// The performance panel draws on presents that happen anyway; it only bumps the revision.
 	return {core.active || dialog.active || system.active || trophy_active,
-	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u)};
+	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
+	            PerformanceOverlayRevision()};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -1060,7 +1063,7 @@ struct SystemOverlay::Impl {
 		}
 	}
 
-	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now) {
+	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {
 		std::erase_if(retired_trophy_images, [](const auto& texture) {
 			if (texture->Status != ImTextureStatus_Destroyed) {
 				return false;
@@ -1106,8 +1109,9 @@ struct SystemOverlay::Impl {
 		const float  fade_out = std::clamp((TOAST_LIFETIME - age) / 0.4f, 0.0f, 1.0f);
 		const float  alpha    = std::min(fade_in, fade_out);
 		const float  slide    = (1.0f - fade_in) * (width + 24.0f);
+		// Sit below the performance panel, which shares the top-right corner.
 		const ImVec2 top_left {static_cast<float>(frame_extent.width) - 24.0f - width + slide,
-		                       32.0f};
+		                       std::max(32.0f, min_top + 12.0f)};
 		const ImVec2 bottom_right {top_left.x + width, top_left.y + height};
 		auto*        draw = ImGui::GetForegroundDrawList();
 		draw->AddRectFilled({top_left.x + 5.0f, top_left.y + 6.0f},
@@ -1157,7 +1161,8 @@ struct SystemOverlay::Impl {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
-		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire)) {
+		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
+		    !PerformanceOverlayEnabled()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1192,6 +1197,7 @@ struct SystemOverlay::Impl {
 			ImGui::EndFrame();
 			return false;
 		}
+		const float performance_bottom = DrawPerformanceOverlay(graphics, frame_extent);
 		if (has_overlay) {
 			if (snapshot.session.kind == OverlayKind::Dialog) {
 				DrawDialog(snapshot.dialog, frame_extent);
@@ -1199,7 +1205,7 @@ struct SystemOverlay::Impl {
 				DrawIme(snapshot.ime, frame_extent);
 			}
 		}
-		DrawTrophyNotification(frame_extent, now);
+		DrawTrophyNotification(frame_extent, now, performance_bottom);
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

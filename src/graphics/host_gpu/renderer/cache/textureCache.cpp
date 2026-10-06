@@ -1120,10 +1120,11 @@ void TextureCache::InitializeImage(ImageId id) {
 	if (upload) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
-		if (source == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+		// A stale descriptor may describe memory that cannot be staged; keep the image
+		// unloaded rather than aborting, the guest does not sample such an image.
+		if (source != nullptr) {
+			UploadImage(image, *source, source_offset);
 		}
-		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {

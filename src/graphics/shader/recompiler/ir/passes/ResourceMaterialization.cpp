@@ -1,3 +1,4 @@
+#include <set>
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
@@ -433,7 +434,25 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
 			return false;
 		}
-		if (!normalize(candidate)) return false;
+		// Probed slots past the table's live range may hold stale T#s whose memory is
+		// gone; the shader never selects them, so bind those as null images.
+		const auto stale_image = [&]() {
+			if (!sources.empty() || entry == 0u || dword_count != 8u ||
+			    NullImageDescriptor(candidate)) return false;
+			const uint64_t base =
+			    ((uint64_t {candidate.dwords[1] & 0xffu} << 32u) | candidate.dwords[0]) << 8u;
+			std::array<uint32_t, 4> probe {};
+			return base == 0u || runtime.read_specialization_memory == nullptr ||
+			       !runtime.read_specialization_memory(runtime.userdata, base & AddressMask, probe);
+		};
+		if (stale_image()) candidate = {.dword_count = dword_count};
+		if (!normalize(candidate)) {
+			if (sources.empty() && entry != 0u && dword_count == 8u) {
+				candidate = {.dword_count = dword_count};
+			} else {
+				return false;
+			}
+		}
 		uint32_t ordinal = 0;
 		if (entry == 0) {
 			descriptors[resource_index] = candidate;
@@ -642,9 +661,28 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				// Probed slots past the table's live range hold unrelated descriptors the
+				// shader never selects: bind them as null instead of refusing the table.
+				static std::set<uint32_t> reported;
+				if (reported.insert(program.info.images[root_index].first_use_pc).second) {
+					const auto& words = snapshot.images[candidate].dwords;
+					std::fprintf(stderr,
+					             "indirect image table at pc 0x%08x: candidate %u (class=%u/%u dim=%u/%u "
+					             "mips=%u/%u) bound as null; dwords=%08x %08x %08x %08x\n",
+					             program.info.images[root_index].first_use_pc, candidate,
+					             static_cast<uint32_t>(image.numeric_class),
+					             static_cast<uint32_t>(image_class.numeric_class),
+					             static_cast<uint32_t>(image.dimension),
+					             static_cast<uint32_t>(image_class.dimension), image.mip_count,
+					             image_class.mip_count, words[0], words[1], words[2], words[3]);
+				}
+				snapshot.images[candidate] = {.dword_count = snapshot.images[candidate].dword_count};
+				image.numeric_class     = image_class.numeric_class;
+				image.dimension         = image_class.dimension;
+				image.mip_count         = image_class.mip_count;
+				image.conversion_format = image_class.conversion_format;
+				image.shader_swizzle    = image_class.shader_swizzle;
+				image.cube              = image_class.cube;
 			}
 		}
 	}

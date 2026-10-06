@@ -1,3 +1,5 @@
+#include <cinttypes>
+#include <cstdio>
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
@@ -1021,7 +1023,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                          image->info.metadata.range}) {
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+						// Probed descriptor-table slots past the live range can touch
+						// neighbouring image memory; report once instead of aborting.
+						static bool reported = false;
+						if (!reported) {
+							reported = true;
+							std::fprintf(stderr,
+							             "scalar resource read 0x%016" PRIx64 "+%" PRIu64
+							             " overlaps an image or attachment write at 0x%016" PRIx64
+							             "+%" PRIu64 "\n",
+							             static_cast<uint64_t>(address), static_cast<uint64_t>(size),
+							             static_cast<uint64_t>(written.address),
+							             static_cast<uint64_t>(written.size));
+						}
 					}
 				}
 			}

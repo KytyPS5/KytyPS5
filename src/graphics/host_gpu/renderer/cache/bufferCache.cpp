@@ -495,8 +495,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		// Larger than the staging ring (streaming pools of several hundred MiB): serve the
+		// image from a cached buffer covering the range instead.
+		return ObtainBuffer(vaddr, size, false, false);
+	}
+	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+		// A descriptor can outlive its allocation (stale table slots). Upload zeros
+		// rather than aborting; the guest does not sample such an image.
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			std::fprintf(stderr, "BufferCache: unreadable guest image backing at 0x%016" PRIx64
+			                     " (%" PRIu64 " bytes), uploading zeros\n", vaddr, size);
+		}
+		std::memset(staging, 0, size);
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};

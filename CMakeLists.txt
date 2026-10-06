@@ -400,7 +400,6 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 # is not implemented yet. Wiring one up means implementing what it asserts rather than weakening
 # the assertion, and its name should be dropped from this list in the same change.
 set(kyty_shader_cfg_known_dormant
-	TestNewShaderRecompilerSopkWaitcntMarkers
 	TestNewShaderRecompilerRdna2ScalarOpcodes
 	TestNewShaderRecompilerScalarVectorAlu
 	TestNewShaderRecompilerMoreAluFamilies
@@ -441,7 +440,6 @@ set(kyty_shader_cfg_known_dormant
 	TestNewShaderRecompilerDsSubDwordTranslation
 	TestNewShaderRecompilerDsSwizzleTranslation
 	TestNewShaderRecompilerDsAddtidTranslation
-	TestNewShaderRecompilerDsFloatMinMaxTranslation
 	TestNewShaderRecompilerExpVertexOutputs
 )
 file(READ "${KYTY_TESTS_DIR}/shaderCfgTests.cpp" kyty_shader_cfg_source)
@@ -457,8 +455,10 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${KYTY_TESTS_DIR
 string(REGEX MATCHALL "void[ \t]+Test[A-Za-z0-9_]+" kyty_shader_cfg_defined_raw "${kyty_shader_cfg_source}${kyty_shader_cfg_included}")
 string(REGEX REPLACE "void[ \t]+" "" kyty_shader_cfg_defined "${kyty_shader_cfg_defined_raw}")
 list(REMOVE_DUPLICATES kyty_shader_cfg_defined)
-# The calls live after main(). Each name is looked up directly instead of matching a call pattern,
-# so the check does not depend on how a call happens to be spelled. Comments are dropped first,
+# The calls live after main(). Each name is looked up directly, as the "name(" prefix instead of
+# a full call spelling, so calls that pass arguments (there are no test definitions after main(),
+# so a prefix cannot match a definition) count and the check does not depend on call punctuation.
+# Comments are dropped first,
 # because a name mentioned only in a comment is not a call and would otherwise hide a test that is
 # still dormant. Block comments go before line comments: a block containing "//" on the line of
 # its closing delimiter would lose that delimiter to the line pass and then never match, leaving
@@ -474,7 +474,7 @@ string(REGEX REPLACE "/[*][^*]*[*]+([^/*][^*]*[*]+)*/" "" kyty_shader_cfg_main "
 string(REGEX REPLACE "//[^\n]*" "" kyty_shader_cfg_main "${kyty_shader_cfg_main}")
 set(kyty_shader_cfg_dormant "")
 foreach(kyty_shader_cfg_name ${kyty_shader_cfg_defined})
-	string(FIND "${kyty_shader_cfg_main}" "${kyty_shader_cfg_name}();" kyty_shader_cfg_at)
+	string(FIND "${kyty_shader_cfg_main}" "${kyty_shader_cfg_name}(" kyty_shader_cfg_at) # guard-needle-v2
 	if(kyty_shader_cfg_at EQUAL -1)
 		list(APPEND kyty_shader_cfg_dormant ${kyty_shader_cfg_name})
 	endif()

@@ -6508,6 +6508,47 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   }
 }
 
+void TestNewShaderRecompilerUnusedImageInstructions() {
+  {
+    const uint32_t shader[] = {
+        EncodeMimg0(0x00, 0xf),
+        EncodeMimg1(0, 0, 0, 4),
+        0xbf810000u,
+    };
+
+    auto user_data = ImageTestUserData();
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+
+    const auto result = RecompileForTest(shader, options);
+    Check(result.program.info.images.empty(),
+          "unused compute IMAGE_LOAD kept an image binding");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+  {
+    const uint32_t shader[] = {
+        EncodeMimg0(0x20, 0xf),
+        EncodeMimg1(0, 0, 0, 4),
+        EncodeMimg0(0x00, 0xf),
+        EncodeMimg1(8, 2, 0, 4),
+        EncodeExp0(0x00, 0xf, true, false, true),
+        EncodeExp1(0, 1, 2, 3),
+        0xbf810000u,
+    };
+
+    auto ps_info = RegressionPixelInputInfo();
+    auto user_data = ImageTestUserData();
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &ps_info;
+    options.user_data = user_data;
+
+    const auto result = RecompileForTest(shader, options);
+    Check(result.program.info.images.size() == 1u,
+          "unused pixel IMAGE_LOAD changed the live image bindings");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestNewShaderRecompilerImageViewDimensions() {
   constexpr uint32_t MimgDim1D = 0;
   constexpr uint32_t MimgDim3D = 2;
@@ -19645,6 +19686,12 @@ int main(int argc, char* argv[]) {
     return 0;
   }
   using namespace Libs::Graphics;
+
+  if (argc == 2 && std::strcmp(argv[1], "--unused-image-instructions-only") == 0) {
+    TestNewShaderRecompilerUnusedImageInstructions();
+    std::puts("KYTY_UNUSED_IMAGE_INSTRUCTIONS_PASS");
+    return 0;
+  }
 
   if (argc > 1 && std::strcmp(argv[1], "--audit-shader") == 0) {
     return RunShaderBatchAudit(argc, argv);

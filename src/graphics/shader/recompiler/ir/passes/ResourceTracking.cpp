@@ -2787,6 +2787,25 @@ private:
 		source.inline_descriptor->descriptor_dwords = descriptor_dwords;
 		source.inline_descriptor->selector_limit =
 		    DominatingSelectorLimit(selector, handle.Parent());
+		if (!buffer_resource && source.inline_descriptor->selector_limit == 0u) {
+			const auto* read = selector.Resolve().TryInstruction();
+			uint32_t memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			uint32_t index_stride = 0;
+			auto* index_buffer = read != nullptr && read->NumArgs() >= 2u
+			                         ? read->Arg(0).Resolve().TryInstruction() : nullptr;
+			if (read != nullptr && read->GetOpcode() == ValueOpcode::ReadConstBuffer &&
+			    memory != nullptr && MemoryIndexBelongsTo(memory_index, *read) &&
+			    memory->data_bits == 32u && memory->offset == 0u &&
+			    index_buffer != nullptr && index_buffer->GetOpcode() == ValueOpcode::GetBufferResource &&
+			    MatchInlineStride(read->Arg(1), index_stride) && index_stride == 4u) {
+				DescriptorSource index_source;
+				uint32_t index_source_index = 0;
+				if (MakeRuntimeBufferSource(*index_buffer, pc, index_source_index, index_source)) {
+					source.inline_descriptor->selector_buffer_source = index_source_index;
+				}
+			}
+		}
 		// Buffer table lowering uses the selector as a dense mapping index. Unlike
 		// sampled-image key search, it therefore requires an exact guarded domain.
 		if (buffer_resource && source.inline_descriptor->selector_limit == 0u) {

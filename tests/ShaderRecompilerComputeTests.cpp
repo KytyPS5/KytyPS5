@@ -1292,6 +1292,7 @@ struct TestCase {
   u32 expected_storage_mip_descriptors = 0;
   std::vector<SampledImageFixture> sampled_image_fixtures;
   bool use_runtime_samplers = false;
+  bool capture_scalar_selector_values = false;
   bool buffer_addresses_are_backing_offsets = false;
   u32 expected_buffer_resources = 0;
   std::optional<std::vector<u32>> expected_buffer_binding_resources;
@@ -1624,6 +1625,7 @@ CompiledShader CompileCase(const TestCase &test,
       .max_dense_buffers = max_dense_buffers,
       .max_native_samplers = max_native_samplers,
       .max_dense_images = max_dense_images,
+      .capture_scalar_selector_values = test.capture_scalar_selector_values,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -2063,6 +2065,9 @@ constexpr std::array ImmutableSrtScenarios {
     ImmutableSrtScenario{"buffer-overlap-ordered", "", true},
     ImmutableSrtScenario{"buffer-atomic-overlap", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"image-padding-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"image-padding-selector-ordered", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"buffer-selector-ordered", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"image-padding-selector-disjoint", "", true},
     ImmutableSrtScenario{"range-overflow", "immutable SRT snapshot has an invalid range"},
     ImmutableSrtScenario{"range-48bit", "immutable SRT snapshot has an invalid range"},
     ImmutableSrtScenario{"range-zero", "immutable SRT snapshot has an invalid range"},
@@ -13770,7 +13775,10 @@ void CheckSampledHtileArrayClearDiscovery() {
     const bool stride_zero_writer = selected == "buffer-stride-zero-disjoint" ||
                                     selected == "buffer-stride-zero-overlap";
     const bool stride_zero_overlap = selected == "buffer-stride-zero-overlap";
-    const bool ordered_overlap = selected == "buffer-overlap-ordered";
+    const bool selector_snapshot = selected.find("selector") != std::string_view::npos;
+    const bool ordered_overlap = selected == "buffer-overlap-ordered" ||
+                                 selected == "image-padding-selector-ordered" ||
+                                 selected == "buffer-selector-ordered";
     const bool graphics = selected == "vertex-snapshot";
     constexpr uintptr_t base = 0x0000000205200000ull;
     constexpr uint64_t allocation_size = 0x20000u;
@@ -13832,6 +13840,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       if (selected == "range-48bit") source={uint64_t{1}<<48u,4u};
       if (selected == "range-zero") source={0u,4u};
       runtime_snapshot.immutable_srt_ranges.push_back(source);
+      runtime_snapshot.scalar_selectors_snapshotted = selector_snapshot;
       if (source.size==sizeof(uint32_t) && source.address>=base &&
           source.address-base<=allocation_size-sizeof(uint32_t)) {
         const uint32_t snapshotted_word=runtime_snapshot.flattened_srt[0];
@@ -38839,6 +38848,23 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   return test;
 }
 
+TestCase CoherentInlineSelectorValues() {
+  auto test = MakeImageSampleDynamicMaterials(MaterialImageSampleMode::CompactDynamicSampler);
+  test.name = "CoherentInlineSelectorValues";
+  test.capture_scalar_selector_values = true;
+  const std::array<u32, 4> unreachable_fmask{
+      0x20u, static_cast<u32>(Prospero::BufferFormat::kFmask8_S2_F2) << 20u,
+      3u | (3u << 14u),
+      DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u)};
+  std::copy(unreachable_fmask.begin(), unreachable_fmask.end(),
+             test.initial.begin() + (128u + 152u + 32u) / 4u);
+  test.expected_dense_images = 5u;
+  test.expected_sampled_pairs = 5u;
+  test.initial[4] = 0xfeed1234u;
+  test.expected.push_back(0xfeed1234u);
+  return test;
+}
+
 TestCase CombinedNativeImageCapacity() {
   constexpr u32 rows = 256u;
   auto test = MakeImageSampleDynamicMaterials(
@@ -47608,6 +47634,18 @@ void CheckStorageBufferByteOffsetBoundary() {
                            "KYTY_BYTE_OFFSET_BOUNDARY_RETURNED ", cases);
 }
 
+void CheckScalarSelectorWriteAdmission() {
+  constexpr std::array cases{
+      RendererFailureCase{"image-padding-selector-ordered", "immutable SRT snapshot overlaps writable resource"},
+      RendererFailureCase{"buffer-selector-ordered", "immutable SRT snapshot overlaps writable resource"}};
+  CheckRendererFailureCases("ScalarSelectorWriteAdmission", "--immutable-srt-binding",
+                           "KYTY_IMMUTABLE_SRT_READY ", "KYTY_IMMUTABLE_SRT_RETURNED ", cases);
+  VulkanHarness vulkan;
+  vulkan.CheckImmutableSrtBindingCase("image-padding-selector-disjoint");
+  vulkan.CheckImmutableSrtBindingCase("buffer-overlap-ordered");
+  std::puts("KYTY_SCALAR_SELECTOR_WRITE_ADMISSION_PASS");
+}
+
 void CheckImmutableSrtBindingAdmission() {
   constexpr const char* name = "ImmutableSrtBindingAdmission";
   std::vector<RendererFailureCase> cases;
@@ -48210,6 +48248,10 @@ int main(int argc, char **argv) {
   if (argc==3 && std::strcmp(argv[1],"--immutable-srt-binding")==0) {
     VulkanHarness vulkan;
     vulkan.CheckImmutableSrtBindingCase(argv[2]);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-selector-write-admission-only") == 0) {
+    CheckScalarSelectorWriteAdmission();
     return 0;
   }
   if (argc==2 && std::strcmp(argv[1],"--immutable-srt-binding-admission-only")==0) {
@@ -49195,6 +49237,12 @@ if (argc == 1) {
     VulkanHarness vulkan;
     RunCase(&vulkan, SampledPairOperandDomain());
     std::puts("KYTY_SAMPLED_PAIR_OPERAND_DOMAIN_GPU_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--coherent-inline-selector-values-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, CoherentInlineSelectorValues());
+    std::puts("KYTY_COHERENT_INLINE_SELECTOR_VALUES_GPU_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--combined-native-image-capacity-only") == 0) {

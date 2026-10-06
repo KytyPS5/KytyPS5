@@ -606,6 +606,9 @@ struct DescriptorSource {
 		// Exclusive selector bound proven by a dominating unsigned CFG guard. Zero means
 		// unknown, so materialization retains the conservative wrapped-U32 domain.
 		uint32_t selector_limit = 0;
+		// Optional raw DWORD selector fetched from a scalar buffer at a U32
+		// byte offset divisible by four, with zero immediate offset.
+		uint32_t selector_buffer_source = UINT32_MAX;
 
 		bool operator==(const InlineDescriptor& other) const = default;
 	};

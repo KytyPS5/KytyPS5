@@ -921,7 +921,8 @@ static void ValidateImmutableSrtWriteAliases(
 	};
 	for (const auto* stage: stages) {
 		const auto& info = stage->program->info;
-		if (stage->program->bounded_srt_reads_precede_writes) {
+		if (stage->program->bounded_srt_reads_precede_writes &&
+		    !stage->resources->scalar_selectors_snapshotted) {
 			continue;
 		}
 		for (uint32_t index = 0; index < info.images.size(); ++index) {

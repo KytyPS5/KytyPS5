@@ -810,6 +810,7 @@ struct PipelineCache::ProgramCache {
 		    .max_dense_buffers          = dense_buffer_capacity,
 		    .max_native_samplers        = native_sampler_capacity,
 		    .max_dense_images           = dense_image_capacity,
+		    .capture_scalar_selector_values = stage == ShaderType::Compute,
 		};
 		const auto refresh_indirect_grid = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
 			if (runtime.compute_workgroups_trusted || indirect_args_addr == 0 ||

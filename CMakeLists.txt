@@ -690,6 +690,14 @@ if(BUILD_TESTING)
 	add_test(NAME shader_combined_native_image_capacity
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --combined-native-image-capacity-only)
 	set_tests_properties(shader_combined_native_image_capacity PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+	add_test(NAME shader_coherent_inline_selector_values
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --coherent-inline-selector-values-only)
+	set_tests_properties(shader_coherent_inline_selector_values PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+	if(WIN32)
+		add_test(NAME shader_scalar_selector_write_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-selector-write-admission-only)
+		set_tests_properties(shader_scalar_selector_write_admission PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+	endif()
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)

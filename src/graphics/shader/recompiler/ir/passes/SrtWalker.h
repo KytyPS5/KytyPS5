@@ -43,6 +43,9 @@ struct SrtRuntime {
 	// Combined native image operands from independently bounded tables. Logical
 	// guest admission and each table's probe/candidate work budget stay separate.
 	uint32_t max_dense_images = ShaderInfo::MaxImages;
+	// Opt in only with coherent input reads and immutable-range writer checks.
+	// Offline callers otherwise keep the full wrapped-U32 selector domain.
+	bool capture_scalar_selector_values = false;
 };
 
 // A raw scalar read bounded by a loop guard or one actual dispatch axis.

@@ -50,6 +50,8 @@ void Check(bool condition, const char *message) {
 bool SameResourceSnapshot(const ResourceSnapshot &lhs,
                           const ResourceSnapshot &rhs) {
   return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
+	     lhs.immutable_srt_ranges == rhs.immutable_srt_ranges &&
+	     lhs.scalar_selectors_snapshotted == rhs.scalar_selectors_snapshotted &&
          lhs.samplers == rhs.samplers &&
          lhs.flattened_srt == rhs.flattened_srt &&
          lhs.user_data == rhs.user_data &&
@@ -5642,6 +5644,107 @@ void TestInlineDescriptorPairs() {
   }
 }
 
+void TestCoherentInlineSelectorValues() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  auto fixture = MakeInlineDescriptorFixture();
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 8> user_data{
+      0x1000u, 872u << 16u, 2u, 0u, 0x2000u, 0u, 16u, 0u};
+  LinearTestMemory memory;
+  DescriptorValue image;
+  image.dword_count = 8u;
+  image.dwords[1] = static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  image.dwords[2] = 3u | (3u << 14u);
+  image.dwords[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+  std::array<DescriptorValue, 2> expected;
+  constexpr std::array<uint32_t, 4> sampler{146u, 0x00fff000u, 0x05000000u, 0u};
+  for (uint32_t row = 0; row < 2u; ++row) {
+    image.dwords[0] = 0x20u + row * 0x20u;
+    expected[row] = image;
+    std::copy(sampler.begin(), sampler.end(), memory.words.begin() + (row * 872u + 136u) / 4u);
+    std::copy_n(image.dwords.begin(), 4u, memory.words.begin() + (row * 872u + 152u) / 4u);
+  }
+  auto unreachable = image;
+  unreachable.dwords[1] = static_cast<uint32_t>(Prospero::BufferFormat::kFmask8_S2_F2) << 20u;
+  std::copy_n(unreachable.dwords.begin(), 4u, memory.words.begin() + (152u + 32u) / 4u);
+  const auto index_begin = (0x2000u - memory.base) / 4u;
+  for (uint32_t index = 0; index < 4u; ++index) memory.words[index_begin + index] = index % 2u;
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory,
+                     .capture_scalar_selector_values = true};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "coherent selector values did not exclude an unreachable FMASK alias");
+  Check(snapshot.images.size() == 3u,
+        "coherent selector domain retained unreachable native image candidates");
+  Check(snapshot.scalar_selectors_snapshotted &&
+            std::ranges::any_of(snapshot.immutable_srt_ranges, [](const auto& range) {
+              return range.address <= 0x2000u && range.address + range.size >= 0x2010u;
+            }), "coherent selector bytes were not protected from shader writers");
+  for (uint32_t row = 0; row < 2u; ++row) {
+    const auto candidate = InlineCandidateForKey(snapshot, specialization, row * 872u);
+    Check(candidate != 0u && snapshot.images[candidate] == expected[row],
+          "coherent selector domain changed a reachable descriptor or its mapping");
+  }
+  const auto previous = snapshot;
+  const auto previous_specialization = specialization;
+  // 109 * x == 4 modulo 2^29, so low32(x * 872) == 32.
+  constexpr uint32_t wraps_to_fmask = 0x09b02594u;
+  static_assert(static_cast<uint32_t>(static_cast<uint64_t>(wraps_to_fmask) * 872u) == 32u);
+  memory.words[index_begin] = wraps_to_fmask;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+        "coherent selector snapshot dropped a reachable wrapped FMASK candidate");
+  memory.words[index_begin] = 0u;
+  memory.fail_address = 0x2004u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+        "missing selector data was silently trusted or partially committed");
+  memory.fail_address = UINT64_MAX;
+  runtime.capture_scalar_selector_values = false;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "offline selector mode discarded possible wrapped aliases without a snapshot");
+
+  runtime.capture_scalar_selector_values = true;
+  user_data[6] = 64u * 1024u * 1024u + 4u;
+  memory.watched_address = 0x2000u;
+  const auto reads = memory.watched_reads;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.watched_reads == reads && SameResourceSnapshot(snapshot, previous),
+        "excessive selector snapshot read beyond its work budget or committed state");
+  for (const uint32_t size : {0u, 3u}) {
+    user_data[6] = size;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 2u && memory.watched_reads == reads &&
+              snapshot.immutable_srt_ranges.empty(),
+          "empty or partial selector DWORD did not retain its defined zero value");
+    const auto candidate = InlineCandidateForKey(snapshot, specialization, 0u);
+    Check(snapshot.images[candidate] == expected[0],
+          "zero selector from an incomplete read did not choose record zero");
+  }
+  user_data[6] = 16u;
+  for (const bool alias : {false, true}) {
+    auto written = MakeInlineDescriptorFixture();
+    const auto output = written->Buffer(
+        {Value(alias ? 0x2000u : 0x3000u), Value(4u << 16u), Value(4u), Value(0u)}, 0x600u);
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    written->Emit(ValueOpcode::StoreBufferU32,
+                  {output, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+                  written->AddMemory(store, 0x600u));
+    written->PlanAndTrack();
+    const auto saved = snapshot;
+    const auto saved_specialization = specialization;
+    Check(MaterializeResources(ExtractResourcePlan(written->program), runtime, snapshot, specialization) == !alias,
+          "selector snapshot accepted an aliased writer or rejected a disjoint writer");
+    if (alias) Check(SameResourceSnapshot(snapshot, saved) && specialization == saved_specialization,
+                     "aliased selector writer changed committed resource state");
+  }
+}
+
 void TestInlineImageUniformSamplers() {
   auto fixture = MakeInlineDescriptorFixture(true);
   fixture->PlanAndTrack();
@@ -8816,6 +8919,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_SHARED_INLINE_IMAGES_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--coherent-inline-selector-values-only") == 0) {
+      TestCoherentInlineSelectorValues();
+      std::cout << "KYTY_COHERENT_INLINE_SELECTOR_VALUES_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--combined-native-image-capacity-only") == 0) {
       TestCombinedNativeImageCapacity();
       std::cout << "KYTY_COMBINED_NATIVE_IMAGE_CAPACITY_PASS\n";
@@ -9033,6 +9141,7 @@ int main(int argc, char** argv) {
     Run("sampled pair materialization", [] { TestSharedInlineImageCandidates(true); });
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
     Run("inline native sampler capacity", TestInlineNativeSamplerCapacity);
+    Run("coherent inline selector values", TestCoherentInlineSelectorValues);
     Run("combined native image capacity", TestCombinedNativeImageCapacity);
     Run("native sampler class capacity", TestNativeSamplerClassCapacity);
     Run("inline SCC selector guard", TestInlineBufferSccConditionRefGuard);

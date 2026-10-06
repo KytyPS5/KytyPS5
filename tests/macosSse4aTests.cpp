@@ -97,6 +97,35 @@ constexpr uint8_t kTrappedVrsqrtpsXmm1Xmm0[] = {
 	0xc3,                                     // ret
 };
 
+// The same sequence with the ordinary VEX.128 VRSQRTPS encoding (vvvv = 1111), as it appears in guest
+// code before the patcher marks it as a trap.
+constexpr uint8_t kPlainVrsqrtpsXmm1Xmm0[] = {
+	0x0f, 0x10, 0x06,                         // movups (%rsi), %xmm0
+	0xc5, 0xfc, 0x10, 0x0e,                   // vmovups ymm1, [rsi]: dirty the upper half of ymm1
+	0xc5, 0xf8, 0x52, 0xc8,                   // vrsqrtps xmm1, xmm0
+	0x0f, 0x11, 0x0f,                         // movups %xmm1, (%rdi)
+	0xc4, 0xe3, 0x7d, 0x19, 0x4f, 0x10, 0x01, // vextractf128 [rdi + 16], ymm1, 1
+	0xc5, 0xf8, 0x77,                         // vzeroupper
+	0xc3,                                     // ret
+};
+
+// The same again behind a never taken indirect branch. A function with an indirect branch does not
+// let the patcher relocate neighbours, and the 4-byte VRSQRTPS cannot hold a jump on its own, so it
+// is left in place with the trap mark.
+constexpr uint8_t kPlainVrsqrtpsIndirectBranch[] = {
+	0x31, 0xc0,                               // xor %eax, %eax
+	0x85, 0xc0,                               // test %eax, %eax
+	0x74, 0x02,                               // jz over
+	0xff, 0xe0,                               // jmp *%rax (never taken)
+	0x0f, 0x10, 0x06,                         // movups (%rsi), %xmm0
+	0xc5, 0xfc, 0x10, 0x0e,                   // vmovups ymm1, [rsi]: dirty the upper half of ymm1
+	0xc5, 0xf8, 0x52, 0xc8,                   // vrsqrtps xmm1, xmm0
+	0x0f, 0x11, 0x0f,                         // movups %xmm1, (%rdi)
+	0xc4, 0xe3, 0x7d, 0x19, 0x4f, 0x10, 0x01, // vextractf128 [rdi + 16], ymm1, 1
+	0xc5, 0xf8, 0x77,                         // vzeroupper
+	0xc3,                                     // ret
+};
+
 constexpr uint8_t kMwaitx[] = {
 	0x0f, 0x01, 0xfb, // mwaitx
 	0xc3,             // ret
@@ -397,6 +426,60 @@ void TestPatchedInsertqRegister() {
 	    "register INSERTQ found by the patcher");
 }
 
+// The ordinary VEX.128 VRSQRTPS must be found by the patcher and give the reference result, either
+// through a native trampoline (no SIGILL) or, when it cannot be relocated, marked as a trap (the
+// vvvv bit is cleared in place) and emulated from the signal handler.
+template <size_t N>
+void CheckPatchedReciprocalSquareRoot(const uint8_t (&blob)[N], bool native) {
+	const uint32_t in_bits[8] {std::bit_cast<uint32_t>(4.0f), 0x00000000u, 0xbf800000u, 0x7f800000u,
+	                           0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+	const auto     Run = [&](LoadBlobFn fn, uint32_t (&out_bits)[8]) {
+		fn(reinterpret_cast<uint64_t *>(out_bits), reinterpret_cast<const uint64_t *>(in_bits));
+	};
+	uint32_t reference[8] {};
+	const int before_reference = IllegalHits();
+	Run(MapCode<LoadBlobFn>(kTrappedVrsqrtpsXmm1Xmm0), reference);
+	Check(IllegalHits() > before_reference, "host raises SIGILL for the pre-marked VRSQRTPS");
+
+	const auto unpatched = MapPatchedCode(blob, false);
+	Check(unpatched.result.reciprocal_sqrt.found == 0, "patcher leaves VRSQRTPS alone without emulate_amd");
+
+	const auto patched = MapPatchedCode(blob, true);
+	const auto &counts = patched.result.reciprocal_sqrt;
+	Check(counts.found == 1, "patcher finds the ordinary VEX.128 VRSQRTPS");
+	Check(counts.native == (native ? 1u : 0u) && counts.trapped == (native ? 0u : 1u),
+	      "VRSQRTPS native trampoline / trap count");
+	const auto *code = static_cast<const uint8_t *>(patched.code);
+	size_t      site = 0;
+	while (site + 2 < N && !(blob[site] == 0xc5 && blob[site + 1] == 0xf8 && blob[site + 2] == 0x52)) {
+		++site;
+	}
+	Check(site + 2 < N, "locate VRSQRTPS in the test blob");
+	if (!native) {
+		Check(code[site] == 0xc5 && code[site + 1] == 0xf0 && code[site + 2] == 0x52,
+		      "the trap mark clears a reserved VEX.vvvv bit (c5 f8 -> c5 f0)");
+	} else {
+		Check(code[site] != 0xc5 || code[site + 1] != 0xf8, "native trampoline replaced the VRSQRTPS");
+	}
+	uint32_t  out[8] {};
+	const int before = IllegalHits();
+	Run(reinterpret_cast<LoadBlobFn>(patched.code), out);
+	if (native) {
+		Check(IllegalHits() == before, "natively patched VRSQRTPS raises no SIGILL");
+	} else {
+		Check(IllegalHits() > before, "marked VRSQRTPS goes through the signal emulator");
+	}
+	Check(std::memcmp(out, reference, sizeof(out)) == 0, "patched VRSQRTPS result equals the emulated reference");
+	Check(std::bit_cast<float>(out[0]) == 0.5f && out[1] == 0x7f800000u && out[2] == 0xffc00000u && out[3] == 0,
+	      "patched VRSQRTPS produces the exact reciprocal square roots");
+	Check(out[4] == 0 && out[5] == 0 && out[6] == 0 && out[7] == 0, "patched VEX.128 form zeroes the upper half");
+}
+
+void TestPatchedReciprocalSquareRoot() {
+	CheckPatchedReciprocalSquareRoot(kPlainVrsqrtpsXmm1Xmm0, true);
+	CheckPatchedReciprocalSquareRoot(kPlainVrsqrtpsIndirectBranch, false);
+}
+
 } // namespace
 
 int main() {
@@ -416,6 +499,7 @@ int main() {
 	TestPatchedInsertqImmediate();
 	TestPatchedInsertqIndexedRexHigh();
 	TestPatchedInsertqRegister();
+	TestPatchedReciprocalSquareRoot();
 	std::printf("macosSse4aTests: all passed\n");
 	return 0;
 }

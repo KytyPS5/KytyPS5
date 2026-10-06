@@ -91,7 +91,8 @@ private:
 		return Mode::NoAccess;
 	}
 	if (watched == Mode::Read) {
-		return static_cast<Mode>(static_cast<uint32_t>(guest) & ~static_cast<uint32_t>(Mode::Write));
+		return static_cast<Mode>(static_cast<uint32_t>(guest) &
+		                         ~static_cast<uint32_t>(Mode::Write));
 	}
 	return guest;
 }
@@ -106,8 +107,8 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 
 struct PageManager::Impl {
 	struct PageState {
-		uint8_t write_watchers  : 7 = 0;
-		uint8_t access_watchers : 1 = 0;
+		uint16_t write_watchers  : 15 = 0;
+		uint16_t access_watchers : 1  = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -138,7 +139,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == 0x7f) {
+					if (write_watchers == MaxWriteWatchers) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -153,7 +154,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -327,7 +328,7 @@ struct PageManager::Impl {
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
 		for (auto chunk_begin = begin; chunk_begin < end;) {
-			const auto chunk_end = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
 			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
 			auto*      region = track ? GetOrCreateRegion(chunk_begin) : FindRegion(chunk_begin);
 			if (region == nullptr) {

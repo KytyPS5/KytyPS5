@@ -30,6 +30,8 @@ public:
 	// watch. Re-narrow the watched pages, never past what the guest just asked for.
 	void ReapplyProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode guest_mode);
 
+	static constexpr uint32_t MaxWriteWatchers = 0x7fff;
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

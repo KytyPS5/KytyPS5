@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -261,6 +262,41 @@ void TestSharedWatcherCounts() {
         "first unwatch released a shared watcher");
   manager.UpdatePageWatchers<false>(address + 128, 64);
   Check(IsWritable(memory), "last unwatch did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// RESIDENT EVIL 2 kept more than 127 cached images on one guest page, each with
+// its own write watch.
+void TestManyWriteWatchersOnOnePage() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  constexpr uint32_t watchers = 1000;
+  const auto range = [&](uint32_t index) {
+    const auto offset = (index * 16u) % page_size;
+    const auto size = (index & 1u) != 0 ? page_size : 16;
+    return std::pair<uint64_t, uint64_t>{address + offset, size};
+  };
+
+  g_protection_calls = 0;
+  for (uint32_t index = 0; index < watchers; index++) {
+    const auto [begin, size] = range(index);
+    manager.UpdatePageWatchers<true>(begin, size);
+  }
+  Check(g_protection_calls == 2 && Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size) == PAGE_READONLY,
+        "many watchers on one page did not protect it exactly once");
+
+  for (uint32_t index = 1; index < watchers; index++) {
+    const auto [begin, size] = range(index);
+    manager.UpdatePageWatchers<false>(begin, size);
+  }
+  Check(Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size),
+        "unwatching all but one watcher released the page");
+  const auto [begin, size] = range(0);
+  manager.UpdatePageWatchers<false>(begin, size);
+  Check(IsWritable(memory), "last of many unwatches did not restore access");
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -613,7 +649,7 @@ void TestConcurrentSharedWatchers() {
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 128; count++) {
+    for (uint32_t count = 0; count <= PageManager::MaxWriteWatchers; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }
@@ -733,12 +769,14 @@ int main(int argc, char **argv) {
   TestWatchAndUnwatch();
   TestWatchAndUnwatch(Libs::LibKernel::Memory::kExtendedMemoryBase);
   TestSharedWatcherCounts();
+  TestManyWriteWatchersOnOnePage();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestReapplyProtectionAfterGuestProtect();
+  TestConcurrentSharedWatchers();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

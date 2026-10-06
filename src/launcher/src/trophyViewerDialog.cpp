@@ -6,18 +6,16 @@
 #include "gameContent.h"
 
 #include <QAbstractItemView>
+#include <QDateTime>
 #include <QDialogButtonBox>
 #include <QFileInfo>
-#include <QFont>
 #include <QHBoxLayout>
-#include <QPainter>
-#include <QPainterPath>
-#include <QHeaderView>
-#include <QIcon>
 #include <QImage>
 #include <QLabel>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPixmap>
 #include <QProgressBar>
 #include <QRegularExpression>
@@ -25,10 +23,7 @@
 #include <QStringList>
 #include <QTabBar>
 #include <QTabWidget>
-#include <QTableWidget>
 #include <QVBoxLayout>
-
-#include <algorithm>
 
 namespace {
 
@@ -92,43 +87,37 @@ bool TrophyViewerDialog::HasTrophyData(const Configuration* info) {
 	return !FindTrophyFiles(info).isEmpty();
 }
 
-bool TrophyViewerDialog::GetProgress(const Configuration* info, const QString& runtime_directory,
-                                     Progress* progress) {
-	if (info == nullptr || progress == nullptr) {
-		return false;
+namespace {
+
+using Common::Trophies::Progress;
+
+Common::Trophies::UnlockData LoadUnlocks(const Configuration& info,
+                                         const QString& runtime_directory, const QString& file) {
+	const auto label = TrophyFilePattern.match(QFileInfo(file).fileName()).captured(1).toUInt();
+	return Common::Trophies::LoadUnlockData(Common::Trophies::UnlocksPath(
+	    GameContent::ToPath(runtime_directory), info.title_id.toStdString(), info.user_id, label));
+}
+
+Progress GetGameProgress(const Configuration* info, const QString& runtime_directory) {
+	Progress result;
+	if (info == nullptr) {
+		return result;
 	}
-	const auto runtime_path = GameContent::ToPath(runtime_directory);
-	Progress   result;
+	const auto reader = Common::OpenArchive(GameContent::ToPath(info->basedir));
 	for (const auto& file: FindTrophyFiles(info)) {
 		const auto package =
 		    Common::Trophies::LoadPackage(GameContent::ToPath(file), info->console_language);
-		if (package.trophies.empty()) {
-			continue;
-		}
-		const auto label =
-		    TrophyFilePattern.match(QFileInfo(file).fileName()).captured(1).toUInt();
-		const auto unlocks = Common::Trophies::LoadUnlockData(Common::Trophies::UnlocksPath(runtime_path, info->title_id.toStdString(),
-		                                  info->user_id, label));
-		for (const auto& [id, trophy]: package.trophies) {
-			const bool earned = unlocks.unlocked.contains(id);
-			const auto grade  = trophy.grade >= 1 && trophy.grade <= 4 ? trophy.grade : 0;
-			++result.total;
-			++result.total_grade[grade];
-			if (earned) {
-				++result.earned;
-				++result.earned_grade[grade];
-			}
+		const auto progress =
+		    Common::Trophies::GetProgress(package, LoadUnlocks(*info, runtime_directory, file));
+		result.total += progress.total;
+		result.earned += progress.earned;
+		for (size_t grade = 1; grade < result.total_grade.size(); ++grade) {
+			result.total_grade[grade] += progress.total_grade[grade];
+			result.earned_grade[grade] += progress.earned_grade[grade];
 		}
 	}
-	if (result.total == 0) {
-		return false;
-	}
-	result.percentage = (result.earned * 100 + result.total / 2) / result.total;
-	*progress         = result;
-	return true;
+	return result;
 }
-
-namespace {
 
 QPixmap MakeCupIcon(const QColor& color, int size) {
 	QPixmap pixmap(size, size);
@@ -165,8 +154,21 @@ QColor GradeColor(int grade) {
 	}
 }
 
+QWidget* MakeGradeCount(QWidget* parent, int grade, int value, int icon_size, int font_size) {
+	auto* box = new QWidget(parent);
+	auto* row = new QHBoxLayout(box);
+	row->setContentsMargins(0, 0, 0, 0);
+	auto* icon = new QLabel(box);
+	icon->setPixmap(MakeCupIcon(GradeColor(grade), icon_size));
+	auto* text = new QLabel(QString::number(value), box);
+	text->setStyleSheet(QStringLiteral("font-size: %1px;").arg(font_size));
+	row->addWidget(icon);
+	row->addWidget(text);
+	return box;
+}
+
 QPixmap LoadGameArt(const Configuration* game, int height) {
-	QPixmap art;
+	QPixmap    art;
 	const auto data = GameContent::ReadFile(game->basedir, QStringLiteral("sce_sys/icon0.png"),
 	                                        GameContent::MaxImageSize);
 	if (!data.isEmpty() && art.loadFromData(data)) {
@@ -183,44 +185,33 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 	dialog.setWindowTitle(QObject::tr("Trophies"));
 	dialog.resize(820, 640);
 	dialog.setStyleSheet(QStringLiteral(
-	    "QDialog { background: #14161d; }"
-	    "QLabel { color: #e8eaf0; }"
+	    "QDialog { background: palette(window); }"
+	    "QLabel { color: palette(text); }"
 	    "QListWidget { background: transparent; border: none; outline: none; }"
-	    "QListWidget::item { border-bottom: 1px solid #262a35; padding: 4px; }"
-	    "QListWidget::item:selected, QListWidget::item:hover { background: #232838; "
-	    "border: 1px solid #7a86b8; }"
-	    "QProgressBar { background: #262a35; border: none; height: 4px; }"
-	    "QProgressBar::chunk { background: #8fa3ff; }"));
+	    "QListWidget::item { border-bottom: 1px solid palette(mid); padding: 4px; }"
+	    "QListWidget::item:selected, QListWidget::item:hover { background: palette(midlight); "
+	    "border: 1px solid palette(highlight); }"
+	    "QProgressBar { background: palette(mid); border: none; height: 4px; }"
+	    "QProgressBar::chunk { background: palette(highlight); }"));
 	auto* layout = new QVBoxLayout(&dialog);
 
-	std::vector<const Configuration*> trophy_games;
-	std::vector<Progress>             progresses;
-	Progress                          totals;
+	struct GameProgress {
+		const Configuration* game;
+		Progress             progress;
+	};
+	std::vector<GameProgress> trophy_games;
+	Progress                  totals;
 	for (const auto* game: games) {
-		Progress progress;
-		if (!GetProgress(game, runtime_directory, &progress)) {
+		const auto progress = GetGameProgress(game, runtime_directory);
+		if (progress.total == 0) {
 			continue;
 		}
-		trophy_games.push_back(game);
-		progresses.push_back(progress);
+		trophy_games.push_back({game, progress});
 		totals.earned += progress.earned;
-		for (int grade = 1; grade <= 4; ++grade) {
+		for (size_t grade = 1; grade < totals.earned_grade.size(); ++grade) {
 			totals.earned_grade[grade] += progress.earned_grade[grade];
 		}
 	}
-
-	const auto make_count = [&dialog](int grade, int value, int icon_size, int font_size) {
-		auto* box = new QWidget(&dialog);
-		auto* row = new QHBoxLayout(box);
-		row->setContentsMargins(0, 0, 0, 0);
-		auto* icon = new QLabel(box);
-		icon->setPixmap(MakeCupIcon(GradeColor(grade), icon_size));
-		auto* text = new QLabel(QString::number(value), box);
-		text->setStyleSheet(QStringLiteral("font-size: %1px;").arg(font_size));
-		row->addWidget(icon);
-		row->addWidget(text);
-		return box;
-	};
 
 	auto* header = new QHBoxLayout;
 	auto* title  = new QLabel(QObject::tr("Trophies"), &dialog);
@@ -232,7 +223,7 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 	total->setStyleSheet(QStringLiteral("font-size: 16px;"));
 	header->addWidget(total);
 	for (int grade = 1; grade <= 4; ++grade) {
-		header->addWidget(make_count(grade, totals.earned_grade[grade], 32, 18));
+		header->addWidget(MakeGradeCount(&dialog, grade, totals.earned_grade[grade], 32, 18));
 	}
 	layout->addLayout(header);
 
@@ -242,9 +233,8 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 	layout->addWidget(list, 1);
 
 	for (size_t index = 0; index < trophy_games.size(); ++index) {
-		const auto* game     = trophy_games[index];
-		const auto& progress = progresses[index];
-		auto*       item     = new QListWidgetItem(list);
+		const auto& [game, progress] = trophy_games[index];
+		auto* item                   = new QListWidgetItem(list);
 		item->setSizeHint(QSize(760, 112));
 		item->setData(Qt::UserRole, static_cast<int>(index));
 
@@ -258,28 +248,28 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 		if (!pixmap.isNull()) {
 			art->setPixmap(pixmap);
 		} else {
-			art->setStyleSheet(QStringLiteral("background: #262a35;"));
+			art->setStyleSheet(QStringLiteral("background: palette(mid);"));
 		}
 		row->addWidget(art);
 		const auto name = !game->name.isEmpty() ? game->name : game->title_id;
-		auto*      text = new QLabel(QStringLiteral("%1\n%2").arg(name, game->title_id), row_widget);
+		auto* text = new QLabel(QStringLiteral("%1\n%2").arg(name, game->title_id), row_widget);
 		text->setStyleSheet(QStringLiteral("font-size: 18px;"));
 		row->addWidget(text, 1);
 
 		auto* percent_box = new QVBoxLayout;
 		percent_box->setSpacing(2);
 		percent_box->setContentsMargins(0, 0, 0, 0);
-		auto* percent = new QLabel(QStringLiteral("%1%").arg(progress.percentage), row_widget);
+		auto* percent = new QLabel(QStringLiteral("%1%").arg(progress.Percentage()), row_widget);
 		percent->setAlignment(Qt::AlignRight);
 		percent->setStyleSheet(QStringLiteral("font-size: 24px;"));
 		percent->setMinimumHeight(34);
-		auto* earned = new QLabel(QObject::tr("Earned %1/%2").arg(progress.earned).arg(progress.total),
-		                          row_widget);
+		auto* earned = new QLabel(
+		    QObject::tr("Earned %1/%2").arg(progress.earned).arg(progress.total), row_widget);
 		earned->setAlignment(Qt::AlignRight);
 		earned->setMinimumHeight(18);
 		auto* bar = new QProgressBar(row_widget);
 		bar->setRange(0, 100);
-		bar->setValue(progress.percentage);
+		bar->setValue(progress.Percentage());
 		bar->setTextVisible(false);
 		bar->setFixedWidth(130);
 		percent_box->addWidget(percent);
@@ -290,13 +280,13 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 			if (grade == 1 && progress.total_grade[1] == 0) {
 				continue;
 			}
-			row->addWidget(make_count(grade, progress.earned_grade[grade], 24, 18));
+			row->addWidget(MakeGradeCount(row_widget, grade, progress.earned_grade[grade], 24, 18));
 		}
 		list->setItemWidget(item, row_widget);
 	}
 	if (trophy_games.empty()) {
-		auto* empty = new QLabel(QObject::tr("No games with trophies found in the game folders."),
-		                         &dialog);
+		auto* empty =
+		    new QLabel(QObject::tr("No games with trophies found in the game folders."), &dialog);
 		empty->setAlignment(Qt::AlignCenter);
 		layout->insertWidget(1, empty);
 		list->hide();
@@ -306,7 +296,7 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 	        [&dialog, &trophy_games, &runtime_directory](QListWidgetItem* item) {
 		        const auto index = item->data(Qt::UserRole).toInt();
 		        if (index >= 0 && static_cast<size_t>(index) < trophy_games.size()) {
-			        ShowForGame(trophy_games[static_cast<size_t>(index)], runtime_directory,
+			        ShowForGame(trophy_games[static_cast<size_t>(index)].game, runtime_directory,
 			                    &dialog);
 		        }
 	        });
@@ -315,6 +305,7 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 	layout->addWidget(buttons);
 	dialog.exec();
 }
+
 void TrophyViewerDialog::ShowForGame(const Configuration* info, const QString& runtime_directory,
                                      QWidget* parent) {
 	if (info == nullptr) {
@@ -352,40 +343,11 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			errors.append(tr("Could not read trophy package %1.").arg(QFileInfo(file).fileName()));
 			continue;
 		}
-		const auto label = TrophyFilePattern.match(QFileInfo(file).fileName()).captured(1).toUInt();
-		const auto runtime_path = GameContent::ToPath(runtime_directory);
-		const auto unlocks      = Common::Trophies::LoadUnlockData(Common::Trophies::UnlocksPath(runtime_path, info.title_id.toStdString(), info.user_id,
-		                                  label));
-		const auto earned_count = static_cast<int>(std::count_if(
-		    package.trophies.begin(), package.trophies.end(),
-		    [&](const auto& entry) { return unlocks.unlocked.contains(entry.first); }));
-		const auto total_count = static_cast<int>(package.trophies.size());
-		const auto percentage =
-		    total_count == 0 ? 0 : (earned_count * 100 + total_count / 2) / total_count;
-		auto* page        = new QWidget(m_tabs);
-		auto* page_layout = new QVBoxLayout(page);
+		const auto unlocks     = LoadUnlocks(info, runtime_directory, file);
+		const auto counts      = Common::Trophies::GetProgress(package, unlocks);
+		auto*      page        = new QWidget(m_tabs);
+		auto*      page_layout = new QVBoxLayout(page);
 
-		int earned_grade[5] = {};
-		int total_grade[5]  = {};
-		for (const auto& [id, trophy]: package.trophies) {
-			const auto grade = trophy.grade >= 1 && trophy.grade <= 4 ? trophy.grade : 4;
-			++total_grade[grade];
-			if (unlocks.unlocked.contains(id)) {
-				++earned_grade[grade];
-			}
-		}
-		const auto make_count = [page](int grade, int value) {
-			auto* box = new QWidget(page);
-			auto* row = new QHBoxLayout(box);
-			row->setContentsMargins(0, 0, 0, 0);
-			auto* icon = new QLabel(box);
-			icon->setPixmap(MakeCupIcon(GradeColor(grade), 30));
-			auto* text = new QLabel(QString::number(value), box);
-			text->setStyleSheet(QStringLiteral("font-size: 20px;"));
-			row->addWidget(icon);
-			row->addWidget(text);
-			return box;
-		};
 		auto* header = new QHBoxLayout;
 		auto* art    = new QLabel(page);
 		if (const auto pixmap = LoadGameArt(&info, 56); !pixmap.isNull()) {
@@ -399,28 +361,28 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			auto* box    = new QVBoxLayout;
 			auto* name   = new QLabel(label, page);
 			auto* number = new QLabel(value, page);
-			name->setStyleSheet(QStringLiteral("color: #a8adbd; font-size: 14px;"));
+			name->setStyleSheet(QStringLiteral("font-size: 14px;"));
 			number->setStyleSheet(QStringLiteral("font-size: 22px;"));
 			box->addWidget(name);
 			box->addWidget(number);
 			return box;
 		};
-		header->addLayout(make_stat(tr("Progress"), QStringLiteral("%1%").arg(percentage)));
 		header->addLayout(
-		    make_stat(tr("Earned"), QStringLiteral("%1/%2").arg(earned_count).arg(total_count)));
+		    make_stat(tr("Progress"), QStringLiteral("%1%").arg(counts.Percentage())));
+		header->addLayout(
+		    make_stat(tr("Earned"), QStringLiteral("%1/%2").arg(counts.earned).arg(counts.total)));
 		for (int grade = 1; grade <= 4; ++grade) {
-			if (total_grade[grade] > 0) {
-				header->addWidget(make_count(grade, earned_grade[grade]));
+			if (counts.total_grade[grade] > 0) {
+				header->addWidget(MakeGradeCount(page, grade, counts.earned_grade[grade], 30, 20));
 			}
 		}
 		page_layout->addLayout(header);
 		auto* progress = new QProgressBar(page);
 		progress->setRange(0, 100);
-		progress->setValue(percentage);
+		progress->setValue(counts.Percentage());
 		progress->setTextVisible(false);
 		page_layout->addWidget(progress);
-		auto* count_label = new QLabel(tr("All trophies: %1").arg(total_count), page);
-		count_label->setStyleSheet(QStringLiteral("color: #a8adbd;"));
+		auto* count_label = new QLabel(tr("All trophies: %1").arg(counts.total), page);
 		page_layout->addWidget(count_label);
 
 		auto* list = new QListWidget(page);
@@ -435,8 +397,8 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			item->setSizeHint(QSize(900, 96));
 
 			auto* card = new QWidget(list);
-			card->setStyleSheet(QStringLiteral(
-			    "QWidget#card { background: #0e1016; border-radius: 12px; }"));
+			card->setStyleSheet(
+			    QStringLiteral("QWidget#card { background: palette(base); border-radius: 12px; }"));
 			card->setObjectName(QStringLiteral("card"));
 			auto* row  = new QHBoxLayout(card);
 			auto* icon = new QLabel(card);
@@ -448,44 +410,50 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			} else if (pixmap.loadFromData(reinterpret_cast<const uchar*>(trophy.icon_png.data()),
 			                               static_cast<uint>(trophy.icon_png.size())) &&
 			           !trophy_unlocked) {
-				pixmap = QPixmap::fromImage(
-				    pixmap.toImage().convertToFormat(QImage::Format_Grayscale8));
+				pixmap =
+				    QPixmap::fromImage(pixmap.toImage().convertToFormat(QImage::Format_Grayscale8));
 			}
 			if (!pixmap.isNull()) {
-				icon->setPixmap(pixmap.scaled(76, 76, Qt::KeepAspectRatio,
-				                              Qt::SmoothTransformation));
+				icon->setPixmap(
+				    pixmap.scaled(76, 76, Qt::KeepAspectRatio, Qt::SmoothTransformation));
 			}
 			row->addWidget(icon);
 
-			auto* left       = new QVBoxLayout;
-			const auto name_text =
-			    hidden_locked ? tr("Hidden trophy") : QString::fromStdString(trophy.name);
-			auto* name = new QLabel(name_text, card);
-			name->setStyleSheet(QStringLiteral("font-size: 20px; font-weight: bold;%1")
-			                        .arg(trophy_unlocked ? QString {}
-			                                             : QStringLiteral(" color: #9da2b3;")));
-			auto* grade_row = new QHBoxLayout;
-			auto* cup       = new QLabel(card);
-			cup->setPixmap(MakeCupIcon(GradeColor(trophy.grade), 18));
-			auto* grade_text = new QLabel(GradeToText(trophy.grade), card);
-			grade_text->setStyleSheet(QStringLiteral("color: #b4b9c9; font-size: 15px;"));
-			grade_row->addWidget(cup);
-			grade_row->addWidget(grade_text);
-			grade_row->addStretch(1);
+			auto*      left      = new QVBoxLayout;
+			const auto name_text = hidden_locked         ? tr("Hidden trophy")
+			                       : trophy.name.empty() ? tr("Trophy %1").arg(id)
+			                                             : QString::fromStdString(trophy.name);
+			auto*      name      = new QLabel(name_text, card);
+			name->setStyleSheet(QStringLiteral("font-size: 20px; font-weight: bold;"));
 			left->addWidget(name);
-			left->addLayout(grade_row);
+			if (!hidden_locked) {
+				auto* grade_row = new QHBoxLayout;
+				auto* cup       = new QLabel(card);
+				cup->setPixmap(MakeCupIcon(GradeColor(trophy.grade), 18));
+				auto* grade_text = new QLabel(GradeToText(trophy.grade), card);
+				grade_text->setStyleSheet(QStringLiteral("font-size: 15px;"));
+				grade_row->addWidget(cup);
+				grade_row->addWidget(grade_text);
+				grade_row->addStretch(1);
+				left->addLayout(grade_row);
+			}
+
 			row->addLayout(left, 2);
 
-			auto* right = new QVBoxLayout;
+			auto*   right = new QVBoxLayout;
 			QString date_text;
-			if (const auto found = unlocks.dates.find(id); found != unlocks.dates.end()) {
-				date_text = QString::fromStdString(found->second);
+			if (const auto found = unlocks.timestamps.find(id); found != unlocks.timestamps.end()) {
+				date_text = QDateTime::fromMSecsSinceEpoch(
+				                static_cast<qint64>(
+				                    (found->second - Common::Trophies::UnixEpochTick) / 1000))
+				                .toLocalTime()
+				                .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
 			} else if (trophy_unlocked) {
 				date_text = tr("Earned");
 			}
 			auto* date = new QLabel(date_text, card);
 			date->setAlignment(Qt::AlignRight);
-			date->setStyleSheet(QStringLiteral("color: #b4b9c9; font-size: 15px;"));
+			date->setStyleSheet(QStringLiteral("font-size: 15px;"));
 			auto* detail = new QLabel(
 			    hidden_locked ? QString {} : QString::fromStdString(trophy.description), card);
 			detail->setWordWrap(true);
@@ -496,7 +464,8 @@ bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runt
 			row->addLayout(right, 3);
 			card->setToolTip(hidden_locked ? name_text : TrophyTooltip(trophy));
 			list->setItemWidget(item, card);
-		}		m_tabs->addTab(page, QString::fromStdString(package.title));
+		}
+		m_tabs->addTab(page, QString::fromStdString(package.title));
 	}
 	m_tabs->tabBar()->setVisible(m_tabs->count() > 1);
 	if (m_tabs->count() == 0) {

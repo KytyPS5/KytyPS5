@@ -1,11 +1,9 @@
 #include "common/trophies.h"
 
-#include "common/dateTime.h"
 #include "common/file.h"
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <charconv>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -59,28 +57,6 @@ std::optional<uint64_t> ReadUnsigned(const Json& value) {
 	return error == std::errc {} && end == text.data() + text.size()
 	           ? std::optional<uint64_t>(number)
 	           : std::nullopt;
-}
-
-std::set<std::string> Words(std::string_view text) {
-	static const std::set<std::string_view> ignored {"a",    "an", "and", "at", "by",  "for",
-	                                                 "from", "in", "of",  "on", "the", "to"};
-	std::set<std::string>                   words;
-	std::string                             word;
-	for (const auto character: text) {
-		const auto value = static_cast<unsigned char>(character);
-		if (std::isalnum(value) != 0) {
-			word.push_back(static_cast<char>(std::tolower(value)));
-		} else if (!word.empty()) {
-			if (word.size() > 1 && !ignored.contains(word)) {
-				words.insert(word);
-			}
-			word.clear();
-		}
-	}
-	if (word.size() > 1 && !ignored.contains(word)) {
-		words.insert(word);
-	}
-	return words;
 }
 
 Json ReadJson(const Files& files, std::string_view name) {
@@ -191,11 +167,17 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 				}
 				if (condition.contains("targetValue")) {
 					trophy.target = ReadUnsigned(condition["targetValue"]);
-					if (!trophy.target) {
-						return {};
-					}
-				} else if (trophy.uds_stat_id) {
-					return {};
+				}
+				const auto comparison = condition.find("comparator");
+				if (comparison != condition.end()) {
+					if (*comparison == "ge")
+						trophy.comparison = Comparison::GreaterEqual;
+					else if (*comparison == "gt")
+						trophy.comparison = Comparison::Greater;
+					else if (*comparison == "le")
+						trophy.comparison = Comparison::LessEqual;
+					else if (*comparison == "lt")
+						trophy.comparison = Comparison::Less;
 				}
 			}
 		}
@@ -290,8 +272,11 @@ UnlockData LoadUnlockData(const std::filesystem::path& path) {
 	if (json.contains("unlockedAt") && json["unlockedAt"].is_object()) {
 		for (auto it = json["unlockedAt"].begin(); it != json["unlockedAt"].end(); ++it) {
 			const auto id = ReadId(Json(it.key()));
-			if (id >= 0 && unlocks.unlocked.contains(id) && it.value().is_string()) {
-				unlocks.dates.emplace(id, it.value().get<std::string>());
+			if (id >= 0 && unlocks.unlocked.contains(id)) {
+				const auto tick = ReadUnsigned(it.value());
+				if (tick && *tick >= UnixEpochTick && *tick <= 315537897599999999ULL) {
+					unlocks.timestamps.emplace(id, *tick);
+				}
 			}
 		}
 	}
@@ -302,14 +287,15 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 	if (path.empty() || !File::CreateDirectories(path.parent_path())) {
 		return false;
 	}
-	Json dates = Json::object();
-	for (const auto& [id, date]: unlocks.dates) {
+	Json timestamps = Json::object();
+	for (const auto& [id, tick]: unlocks.timestamps) {
 		if (unlocks.unlocked.contains(id)) {
-			dates[std::to_string(id)] = date;
+			timestamps[std::to_string(id)] = tick;
 		}
 	}
-	const auto text = Json {{"unlockedTrophies", unlocks.unlocked}, {"unlockedAt", dates}}.dump();
-	auto       temporary = path;
+	const auto text =
+	    Json {{"unlockedTrophies", unlocks.unlocked}, {"unlockedAt", timestamps}}.dump();
+	auto temporary = path;
 	temporary += ".tmp";
 	File file;
 	if (text.size() > MaxUnlocksSize || !file.Create(temporary)) {
@@ -319,47 +305,83 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 	file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
 	const bool complete = written == text.size() && file.Flush();
 	file.Close();
-	if (complete && File::RenameFile(temporary, path)) {
-		return true;
-	}
 	std::error_code error;
+	if (complete) {
+		std::filesystem::rename(temporary, path, error);
+		if (!error) {
+			return true;
+		}
+	}
 	std::filesystem::remove(temporary, error);
 	return false;
 }
 
-std::map<std::string, std::set<uint64_t>> ParseUdsEventStats(std::span<const std::byte> data) {
-	Files    files;
-	uint64_t size = 0;
-	if (!ReadFiles(data, files, size)) {
-		return {};
-	}
-	const auto rules = ReadJson(files, "stats_extraction.json");
-	if (!rules.is_object() || !rules.contains("statsExtractionRuleArray") || !rules["statsExtractionRuleArray"].is_array()) {
-		return {};
-	}
-	std::map<std::string, std::set<uint64_t>> events;
-	for (const auto& rule: rules["statsExtractionRuleArray"]) {
-		if (!rule.is_object() || !rule.contains("condition") || !rule.contains("action") ||
-		    !rule["condition"].is_object() || !rule["action"].is_object() ||
-		    !rule["condition"].contains("eventName") ||
-		    !rule["condition"]["eventName"].is_string() || !rule["action"].contains("output") ||
-		    !rule["action"]["output"].is_object() ||
-		    !rule["action"]["output"].contains("statId")) {
-			continue;
-		}
-		if (const auto stat = ReadUnsigned(rule["action"]["output"]["statId"])) {
-			events[rule["condition"]["eventName"].get<std::string>()].insert(*stat);
-		}
-	}
-	return events;
-}
-
-std::map<std::string, std::set<uint64_t>> LoadUdsEventStats(const std::filesystem::path& path) {
+UdsRules LoadUdsRules(const std::filesystem::path& path) {
 	File file(path, File::Mode::Read);
 	if (file.IsInvalid() || file.Size() > MaxPackageSize) {
 		return {};
 	}
-	return ParseUdsEventStats(file.ReadWholeBuffer());
+	const auto bytes = file.ReadWholeBuffer();
+	Files      files;
+	uint64_t   size = 0;
+	if (!ReadFiles(bytes, files, size)) {
+		return {};
+	}
+	const auto definitions = ReadJson(files, "stats_definition.json");
+	const auto extraction  = ReadJson(files, "stats_extraction.json");
+	if (!definitions.is_object() || !definitions.contains("statDefinitionArray") ||
+	    !definitions["statDefinitionArray"].is_array() || !extraction.is_object() ||
+	    !extraction.contains("statsExtractionRuleArray") ||
+	    !extraction["statsExtractionRuleArray"].is_array()) {
+		return {};
+	}
+	// Only direct unsigned latest-value stats are evaluated here. Aggregated stats
+	// and filtered/nested extraction require UDS state and event types we do not implement.
+	std::map<uint64_t, bool> stats;
+	for (const auto& definition: definitions["statDefinitionArray"]) {
+		if (!definition.is_object() || !definition.contains("statId") ||
+		    !definition.contains("aggregation") || definition["aggregation"] != "latest" ||
+		    !definition.contains("dataType")) {
+			continue;
+		}
+		const auto  id   = ReadUnsigned(definition["statId"]);
+		const auto& type = definition["dataType"];
+		if (!id || (type != "uint64" && type != "uint32")) {
+			continue;
+		}
+		const uint64_t maximum = type == "uint32" ? UINT32_MAX : UINT64_MAX;
+		if ((definition.contains("minValue") && ReadUnsigned(definition["minValue"]) != 0) ||
+		    (definition.contains("maxValue") && ReadUnsigned(definition["maxValue"]) != maximum)) {
+			continue;
+		}
+		stats.emplace(*id, type == "uint32");
+	}
+	UdsRules events;
+	for (const auto& rule: extraction["statsExtractionRuleArray"]) {
+		if (!rule.is_object() || !rule.contains("condition") || !rule.contains("action")) {
+			continue;
+		}
+		const auto& condition = rule["condition"];
+		const auto& action    = rule["action"];
+		if (!condition.is_object() || condition.size() != 1 || !condition.contains("eventName") ||
+		    !condition["eventName"].is_string() || !action.is_object() ||
+		    !action.contains("input") || !action["input"].is_string() ||
+		    !action.contains("output") || !action["output"].is_object() ||
+		    !action["output"].contains("statId")) {
+			continue;
+		}
+		const auto  id    = ReadUnsigned(action["output"]["statId"]);
+		const auto& input = action["input"].get_ref<const std::string&>();
+		if (!id || !stats.contains(*id) || !input.starts_with("$.") || input.size() == 2 ||
+		    input.find_first_not_of(
+		        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", 2) !=
+		        std::string::npos) {
+			continue;
+		}
+		events[condition["eventName"].get<std::string>()].push_back(
+		    {*id, input.substr(2), stats.at(*id)});
+	}
+	return events;
 }
 
 std::filesystem::path UdsPackagePath(uint32_t service_label) {
@@ -367,51 +389,65 @@ std::filesystem::path UdsPackagePath(uint32_t service_label) {
 }
 
 std::vector<int> FindUdsTrophies(const Package& package, std::string_view event_name,
-                                 uint64_t counter) {
-	const auto stat = package.event_stats.find(std::string(event_name));
-	if (stat == package.event_stats.end()) {
-		const auto fallback = FindUdsTrophy(package, event_name, counter);
-		return fallback ? std::vector<int> {*fallback} : std::vector<int> {};
+                                 const std::map<std::string, UdsInteger>& properties) {
+	const auto rules = package.event_rules.find(std::string(event_name));
+	if (rules == package.event_rules.end()) {
+		return {};
 	}
 	std::vector<int> ids;
 	for (const auto& [id, trophy]: package.trophies) {
-		if (trophy.uds_stat_id && stat->second.contains(*trophy.uds_stat_id) && trophy.target && counter >= *trophy.target) {
-			ids.push_back(id);
+		if (trophy.grade == 1 || !trophy.uds_stat_id || !trophy.target) {
+			continue;
+		}
+		for (const auto& rule: rules->second) {
+			const auto value = properties.find(rule.input);
+			if (rule.stat_id != *trophy.uds_stat_id || value == properties.end()) {
+				continue;
+			}
+			std::optional<uint64_t> number;
+			if (rule.is_uint32) {
+				if (const auto* input = std::get_if<uint32_t>(&value->second)) number = *input;
+			} else if (const auto* input = std::get_if<uint64_t>(&value->second)) {
+				number = *input;
+			}
+			if (!number) continue;
+			bool matched = false;
+			switch (trophy.comparison) {
+				case Comparison::GreaterEqual: matched = *number >= *trophy.target; break;
+				case Comparison::Greater: matched = *number > *trophy.target; break;
+				case Comparison::LessEqual: matched = *number <= *trophy.target; break;
+				case Comparison::Less: matched = *number < *trophy.target; break;
+				case Comparison::None: break;
+			}
+			if (matched) {
+				ids.push_back(id);
+				break;
+			}
 		}
 	}
 	return ids;
 }
 
-std::optional<int> FindUdsTrophy(const Package& package, std::string_view event_name,
-                                 uint64_t counter) {
-	const auto event_words = Words(event_name);
-	if (event_words.size() < 2) {
-		return std::nullopt;
-	}
-	std::optional<int> match;
-	size_t             best_score = 0;
-	bool               ambiguous  = false;
+uint32_t Progress::Percentage() const {
+	const auto points        = total_grade[2] * 6 + total_grade[3] * 2 + total_grade[4];
+	const auto earned_points = earned_grade[2] * 6 + earned_grade[3] * 2 + earned_grade[4];
+	return points == 0 ? 0 : earned_points * 100 / points;
+}
+
+Progress GetProgress(const Package& package, const UnlockData& unlocks, std::optional<int> group) {
+	Progress progress;
 	for (const auto& [id, trophy]: package.trophies) {
-		if (!trophy.uds_stat_id || !trophy.target || counter < *trophy.target) {
+		if (group && trophy.group_id != *group) {
 			continue;
 		}
-		const auto trophy_words = Words(trophy.name + " " + trophy.description);
-		const auto score        = static_cast<size_t>(
-		    std::count_if(event_words.begin(), event_words.end(),
-		                  [&](const auto& word) { return trophy_words.contains(word); }));
-		const auto minimum_score = std::max<size_t>(2, (event_words.size() * 2 + 2) / 3);
-		if (score < minimum_score) {
-			continue;
-		}
-		if (score > best_score) {
-			match      = id;
-			best_score = score;
-			ambiguous  = false;
-		} else if (score == best_score) {
-			ambiguous = true;
+		++progress.total;
+		++progress.total_grade[trophy.grade];
+		if (unlocks.unlocked.contains(id)) {
+			++progress.earned;
+			++progress.earned_grade[trophy.grade];
 		}
 	}
-	return ambiguous ? std::nullopt : match;
+	return progress;
 }
 
 } // namespace Common::Trophies

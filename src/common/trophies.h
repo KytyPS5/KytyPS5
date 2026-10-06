@@ -1,20 +1,24 @@
 #ifndef KYTY_COMMON_TROPHIES_H_
 #define KYTY_COMMON_TROPHIES_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <optional>
 #include <set>
-#include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace Common::Trophies {
 
-inline constexpr char PackageDirectory[] = "sce_sys/trophy2";
+inline constexpr char     PackageDirectory[] = "sce_sys/trophy2";
+inline constexpr uint64_t UnixEpochTick      = 62135596800000000ULL;
+
+enum class Comparison { None, GreaterEqual, Greater, LessEqual, Less };
 
 struct Trophy {
 	int                     id          = 0;
@@ -23,6 +27,7 @@ struct Trophy {
 	int                     grade       = 0;
 	std::optional<uint64_t> target;
 	std::optional<uint64_t> uds_stat_id;
+	Comparison              comparison  = Comparison::None;
 	bool                    progressive = false;
 	std::string             name;
 	std::string             description;
@@ -32,33 +37,50 @@ struct Trophy {
 	bool                    has_reward = false;
 };
 
+struct UdsRule {
+	uint64_t    stat_id;
+	std::string input;
+	bool        is_uint32;
+};
+
+using UdsRules   = std::map<std::string, std::vector<UdsRule>>;
+using UdsInteger = std::variant<int32_t, uint32_t, uint64_t>;
+
 struct Package {
 	std::string                title;
 	std::map<int, std::string> groups;
 	std::map<int, Trophy>      trophies;
-	// UDS event name -> stat ID, from uds00.ucp; empty when that file is unavailable.
-	std::map<std::string, std::set<uint64_t>> event_stats;
+	UdsRules                   event_rules;
 };
 
 struct UnlockData {
-	std::set<int>              unlocked;
-	std::map<int, std::string> dates;
+	std::set<int>           unlocked;
+	std::map<int, uint64_t> timestamps;
 };
+
+struct Progress {
+	std::array<uint32_t, 5> total_grade {};
+	std::array<uint32_t, 5> earned_grade {};
+	uint32_t                total  = 0;
+	uint32_t                earned = 0;
+
+	[[nodiscard]] uint32_t Percentage() const;
+};
+
+[[nodiscard]] Progress GetProgress(const Package& package, const UnlockData& unlocks,
+                                   std::optional<int> group = std::nullopt);
 
 [[nodiscard]] Package LoadPackage(const std::filesystem::path& path, int console_language);
 [[nodiscard]] std::filesystem::path PackagePath(uint32_t service_label);
 [[nodiscard]] std::filesystem::path UdsPackagePath(uint32_t service_label);
-[[nodiscard]] std::map<std::string, std::set<uint64_t>> ParseUdsEventStats(std::span<const std::byte> data);
-[[nodiscard]] std::map<std::string, std::set<uint64_t>> LoadUdsEventStats(const std::filesystem::path& path);
+[[nodiscard]] UdsRules              LoadUdsRules(const std::filesystem::path& path);
 [[nodiscard]] std::vector<int> FindUdsTrophies(const Package& package, std::string_view event_name,
-                                               uint64_t counter);
+                                               const std::map<std::string, UdsInteger>& properties);
 [[nodiscard]] std::filesystem::path UnlocksPath(const std::filesystem::path& root,
                                                 std::string_view title_id, int user_id,
                                                 uint32_t service_label);
 [[nodiscard]] UnlockData            LoadUnlockData(const std::filesystem::path& path);
 [[nodiscard]] bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks);
-[[nodiscard]] std::optional<int> FindUdsTrophy(const Package& package, std::string_view event_name,
-                                               uint64_t counter);
 
 } // namespace Common::Trophies
 

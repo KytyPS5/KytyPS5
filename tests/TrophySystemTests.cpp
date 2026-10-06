@@ -6,12 +6,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <set>
-#include <span>
+#include <map>
 #include <string>
 #include <vector>
 
 namespace {
+namespace Trophies = Common::Trophies;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -50,120 +50,211 @@ void WriteBigEndian(std::vector<char> &bytes, size_t offset, uint64_t value,
   }
 }
 
-std::filesystem::path WritePackage(const std::filesystem::path &directory) {
-  const std::string conf =
-      R"({"defaultLanguage":"en-US","trophies":[{"id":"30","grade":"B","unlockCondition":{"udsStatId":"308","targetValue":"1","progressive":false}}]})";
-  const std::string meta =
-      R"({"metadata":{"titleMetadata":{"name":"Test game"},"trophyMetadata":[{"id":"30","name":"Hell Diver","detail":"Dived into the water from the diving board."}]}})";
-  const size_t table_offset = 0x40;
-  const size_t data_offset = table_offset + 2 * 0x40;
-  std::vector<char> bytes(data_offset + conf.size() + meta.size());
+void WritePackage(const std::filesystem::path &path,
+                  const std::map<std::string, std::string> &files) {
+  size_t offset = 0x40 + files.size() * 0x40;
+  size_t size = offset;
+  for (const auto &[name, contents] : files)
+    size += contents.size();
+  std::vector<char> bytes(size);
   WriteBigEndian(bytes, 0, 0xb228c60a, 4);
   WriteBigEndian(bytes, 4, 1, 4);
   WriteBigEndian(bytes, 8, bytes.size(), 8);
-  WriteBigEndian(bytes, 0x10, 2, 4);
+  WriteBigEndian(bytes, 0x10, files.size(), 4);
   WriteBigEndian(bytes, 0x14, 0x20, 4);
-  const auto write_entry = [&](size_t index, const char *name, size_t offset,
-                               const std::string &contents) {
-    const auto entry = table_offset + index * 0x40;
-    std::memcpy(bytes.data() + entry, name, std::strlen(name));
+  size_t entry = 0x40;
+  for (const auto &[name, contents] : files) {
+    Check(name.size() < 0x20, "fixture file name fits");
+    std::memcpy(bytes.data() + entry, name.data(), name.size());
     WriteBigEndian(bytes, entry + 0x20, offset, 8);
     WriteBigEndian(bytes, entry + 0x28, contents.size(), 8);
     std::memcpy(bytes.data() + offset, contents.data(), contents.size());
-  };
-  write_entry(0, "tropconf.json", data_offset, conf);
-  write_entry(1, "tropmeta_en-US.json", data_offset + conf.size(), meta);
-
-  const auto path = directory / "trophy00.ucp";
+    offset += contents.size();
+    entry += 0x40;
+  }
   Common::File file;
   Check(file.Create(path), "create package fixture");
   uint32_t written = 0;
   file.Write(bytes.data(), static_cast<uint32_t>(bytes.size()), &written);
   Check(written == bytes.size(), "write package fixture");
-  return path;
 }
 
-void TestPackageTargetAndEventMapping(const std::filesystem::path &directory) {
-  const auto package =
-      Common::Trophies::LoadPackage(WritePackage(directory), 1);
-  Check(package.trophies.size() == 1, "parse package trophy");
-  const auto &trophy = package.trophies.at(30);
-  Check(trophy.uds_stat_id == 308 && trophy.target == 1 && !trophy.progressive,
-        "read UDS target even when progressive is false");
-  Check(!Common::Trophies::FindUdsTrophy(package,
-                                         "COOLING__DIVED_FROM_DIVING_BOARD", 0),
-        "do not unlock before target");
-  Check(Common::Trophies::FindUdsTrophy(
-            package, "COOLING__DIVED_FROM_DIVING_BOARD", 1) == 30,
-        "match named event and unlock at target");
-  Check(Common::Trophies::FindUdsTrophy(
-            package, "COOLING__DIVED_FROM_DIVING_BOARD", 3) == 30,
-        "unlock when the counter exceeds its target");
-  Check(!Common::Trophies::FindUdsTrophy(package,
-                                         "MEMORY_MEADOW__FOUND_A_SECRET", 1),
-        "ignore unrelated event names");
+Trophies::Package MakePackage(const std::filesystem::path &directory) {
+  const auto path = directory / "trophy00.ucp";
+  WritePackage(
+      path,
+      {{"tropconf.json", R"({"defaultLanguage":"en-US","trophies":[
+			{"id":"0","grade":"P"},
+			{"id":"1","grade":"G","unlockCondition":{"udsStatId":"10","comparator":"ge","targetValue":"10","progressive":false}},
+			{"id":"2","grade":"S","unlockCondition":{"udsStatId":"20","comparator":"gt","targetValue":"100","progressive":false}},
+			{"id":"3","grade":"B","groupId":"1","unlockCondition":{"udsStatId":"30","comparator":"le","targetValue":"5","progressive":false}},
+			{"id":"4","grade":"B","unlockCondition":{"udsStatId":"10","comparator":"lt","targetValue":"-1","progressive":false}}
+		]})"},
+       {"tropmeta_en-US.json",
+        R"({"metadata":{"titleMetadata":{"name":"Test game"},"trophyMetadata":[
+			{"id":"1","name":"Find All Coins","detail":"Find all coins in the level."}
+		]}})"}});
+  return Trophies::LoadPackage(path, 1);
+}
 
-  const std::string rules =
-      R"({"statsExtractionRuleArray":[{"ruleId":302,"condition":{"eventName":"COOLING__DIVED_FROM_DIVING_BOARD"},"action":{"input":"$.counter","output":{"statId":308}}},{"ruleId":9,"condition":{"eventName":"XYZ"},"action":{"output":{"statId":999}}},{"bad":1}]})";
-  std::vector<char> bytes(0x40 + 0x40 + rules.size());
-  WriteBigEndian(bytes, 0, 0xb228c60a, 4);
-  WriteBigEndian(bytes, 4, 1, 4);
-  WriteBigEndian(bytes, 8, bytes.size(), 8);
-  WriteBigEndian(bytes, 0x10, 1, 4);
-  WriteBigEndian(bytes, 0x14, 0x20, 4);
-  std::memcpy(bytes.data() + 0x40, "stats_extraction.json", 21);
-  WriteBigEndian(bytes, 0x60, 0x80, 8);
-  WriteBigEndian(bytes, 0x68, rules.size(), 8);
-  std::memcpy(bytes.data() + 0x80, rules.data(), rules.size());
-  auto mapped = package;
-  mapped.event_stats = Common::Trophies::ParseUdsEventStats(
-      std::as_bytes(std::span(bytes)));
-  Check(mapped.event_stats.size() == 2 && mapped.event_stats.at("XYZ").contains(999),
-        "parse UDS event stats");
-  Check(Common::Trophies::FindUdsTrophies(
-            mapped, "COOLING__DIVED_FROM_DIVING_BOARD", 2) ==
-            std::vector<int>{30},
-        "map event to trophy through stat ID at counter 2");
-  Check(Common::Trophies::FindUdsTrophies(
-            mapped, "COOLING__DIVED_FROM_DIVING_BOARD", 0).empty(),
-        "no unlock below target");
-  Check(Common::Trophies::FindUdsTrophies(mapped, "XYZ", 5).empty(),
-        "mapped stat without trophy does not fall back");
-  Check(Common::Trophies::ParseUdsEventStats({}).empty(),
-        "reject unparseable UDS package");
+void TestEventExtraction(const std::filesystem::path &directory) {
+  auto package = MakePackage(directory);
+  Check(package.trophies.size() == 5,
+        "unsupported signed target does not discard trophy metadata");
+  Check(package.trophies.at(1).uds_stat_id == 10 &&
+            package.trophies.at(1).target == 10 &&
+            !package.trophies.at(1).progressive,
+        "non-progressive trophy retains its stat target");
+  Check(!package.trophies.at(4).target,
+        "negative target is not converted to unsigned");
+  Check(Trophies::FindUdsTrophies(package, "FIND_ALL_COINS",
+                                  {{"counter", uint64_t{100}}})
+            .empty(),
+        "missing mapping never guesses from trophy text");
+  const auto path = directory / "uds00.ucp";
+  WritePackage(path, {{"stats_definition.json", R"({"statDefinitionArray":[
+			{"statId":10,"dataType":"uint64","aggregation":"latest","minValue":"0"},
+			{"statId":20,"dataType":"uint64","aggregation":"latest"},
+			{"statId":30,"dataType":"uint32","aggregation":"latest"},
+			{"statId":40,"dataType":"uint64","aggregation":"sum"},
+			{"statId":50,"dataType":"uint64","aggregation":"count"},
+			{"statId":60,"dataType":"uint64","aggregation":"max"},
+			{"statId":70,"dataType":"uint64","aggregation":"latest","maxValue":"3"}
+		]})"},
+                      {"stats_extraction.json", R"({"statsExtractionRuleArray":[
+			{"condition":{"eventName":"COLLECT"},"action":{"input":"$.counter","output":{"statId":10}}},
+			{"condition":{"eventName":"COLLECT"},"action":{"input":"$.counterBase","output":{"statId":20}}},
+			{"condition":{"eventName":"TIME"},"action":{"input":"$.seconds","output":{"statId":30}}},
+			{"condition":{"eventName":"FILTERED","property":{"path":"$.level","comparator":"==","value":1}},"action":{"input":"$.counter","output":{"statId":10}}},
+			{"condition":{"eventName":"NESTED"},"action":{"input":"$.player.counter","output":{"statId":10}}},
+			{"condition":{"eventName":"SUM"},"action":{"input":"$.counter","output":{"statId":40}}},
+			{"condition":{"eventName":"COUNT"},"action":{"output":{"statId":50}}},
+			{"condition":{"eventName":"MAX"},"action":{"input":"$.counter","output":{"statId":60}}},
+			{"condition":{"eventName":"BOUNDED"},"action":{"input":"$.counter","output":{"statId":70}}},
+			{"bad":1}
+		]})"}});
+  package.event_rules = Trophies::LoadUdsRules(path);
+  Check(package.event_rules.size() == 2,
+        "skip unsupported extraction and aggregation");
+  Check(Trophies::FindUdsTrophies(
+            package, "COLLECT",
+            {{"counter", uint64_t{9}}, {"counterBase", uint64_t{100}}})
+            .empty(),
+        "do not add independent counters or treat gt as ge");
+  Check(Trophies::FindUdsTrophies(
+            package, "COLLECT",
+            {{"counter", uint64_t{10}}, {"counterBase", uint64_t{100}}}) ==
+            std::vector<int>{1},
+        "each stat reads its configured property");
+  Check(Trophies::FindUdsTrophies(
+            package, "COLLECT",
+            {{"counter", uint64_t{0}}, {"counterBase", uint64_t{101}}}) ==
+            std::vector<int>{2},
+        "strict comparison requires greater value");
+  Check(Trophies::FindUdsTrophies(
+            package, "COLLECT",
+            {{"counter", uint64_t{10}}, {"counterBase", uint64_t{101}}}) ==
+            std::vector<int>({1, 2}),
+        "one event can unlock multiple mapped trophies");
+  Check(Trophies::FindUdsTrophies(
+            package, "TIME", {{"seconds", uint32_t{5}}}) == std::vector<int>{3},
+        "less-equal condition accepts its boundary");
+  Check(Trophies::FindUdsTrophies(package, "TIME", {{"seconds", uint32_t{6}}})
+            .empty(),
+        "less-equal condition rejects larger input");
+  Check(Trophies::FindUdsTrophies(package, "TIME", {{"counter", uint64_t{0}}})
+            .empty(),
+        "missing property is not zero");
+  package.trophies.at(3).comparison = Trophies::Comparison::Less;
+  Check(Trophies::FindUdsTrophies(package, "TIME", {{"seconds", uint32_t{5}}})
+            .empty(),
+        "strict less rejects its boundary");
+  Check(Trophies::FindUdsTrophies(
+            package, "TIME", {{"seconds", uint32_t{4}}}) == std::vector<int>{3},
+        "strict less accepts lower input");
+  package.trophies.at(3).comparison = Trophies::Comparison::GreaterEqual;
+  Check(Trophies::FindUdsTrophies(package, "TIME",
+                                  {{"seconds", uint64_t{UINT32_MAX} + 1}})
+            .empty(),
+        "uint64 input cannot update a uint32 stat");
+  Check(
+      Trophies::FindUdsTrophies(package, "COLLECT", {{"counter", int32_t{100}}})
+          .empty(),
+      "signed inputs cannot update unsigned stats");
+  Check(Trophies::FindUdsTrophies(package, "COLLECT",
+                                  {{"counter", uint32_t{100}}})
+            .empty(),
+        "unsigned input width must match the stat");
+  package.trophies.at(1).comparison = Trophies::Comparison::None;
+  Check(Trophies::FindUdsTrophies(package, "COLLECT",
+                                  {{"counter", uint64_t{100}}})
+            .empty(),
+        "unknown comparator cannot unlock");
+  WritePackage(path, {{"stats_extraction.json", "{}"}});
+  Check(Trophies::LoadUdsRules(path).empty(),
+        "missing stat definitions cannot infer aggregation");
+  Check(Trophies::LoadUdsRules(directory / "missing.ucp").empty(),
+        "missing UDS package has no rules");
+}
+
+void TestProgress(const std::filesystem::path &directory) {
+  const auto package = MakePackage(directory);
+  Trophies::UnlockData unlocks;
+  unlocks.unlocked = {0, 1, 999};
+  const auto progress = Trophies::GetProgress(package, unlocks);
+  Check(progress.total == 5 && progress.earned == 2,
+        "ignore unlock IDs absent from package");
+  Check(progress.earned_grade[1] == 1 && progress.earned_grade[2] == 1 &&
+            progress.Percentage() == 60,
+        "percentage uses 6:2:1 grade points and excludes platinum");
+  const auto group = Trophies::GetProgress(package, unlocks, 1);
+  Check(group.total == 1 && group.earned == 0 && group.Percentage() == 0,
+        "group counts filter trophies");
+  Check(Trophies::GetProgress({}, {}).Percentage() == 0,
+        "empty package progress is zero");
 }
 
 void TestUnlockPersistence(const std::filesystem::path &directory) {
-  namespace Trophies = Common::Trophies;
   const auto path = Trophies::UnlocksPath(directory, "PPSA00001", 1000, 0);
-  Check(path.generic_string().find("_Trophies") != std::string::npos &&
-            path.generic_string().find("_SaveData") == std::string::npos,
+  Check(path == directory / "_Trophies/PPSA00001/trophies_1000_0.json",
         "store trophies outside save data");
   Check(Trophies::UnlocksPath(directory, "../bad", 1000, 0).empty(),
         "reject unsafe title IDs");
-
-  Trophies::UnlockData unlocks;
-  unlocks.unlocked.insert(4);
   Check(Trophies::LoadUnlockData(path).unlocked.empty(),
         "missing unlock file loads as empty");
-  unlocks.unlocked.insert(42);
-  unlocks.dates.emplace(42, "2026-10-05 14:32:09");
-  Check(Trophies::SaveUnlockData(path, unlocks), "save dated unlocks");
+  Trophies::UnlockData unlocks;
+  unlocks.unlocked = {4, 42};
+  const auto tick = Trophies::UnixEpochTick + 1791288000123456ULL;
+  unlocks.timestamps.emplace(42, tick);
+  Check(Trophies::SaveUnlockData(path, unlocks), "save timestamped unlocks");
   auto loaded = Trophies::LoadUnlockData(path);
-  Check(loaded.unlocked == unlocks.unlocked && loaded.dates == unlocks.dates,
-        "load unlock dates alongside IDs");
+  Check(loaded.unlocked == unlocks.unlocked &&
+            loaded.timestamps == unlocks.timestamps,
+        "persist full UTC microsecond timestamp");
   loaded.unlocked.insert(43);
-  loaded.dates.emplace(43, "2026-10-06 08:01:00");
+  loaded.timestamps.emplace(43, tick + 1000000);
   Check(Trophies::SaveUnlockData(path, loaded), "replace existing unlock file");
-  Check(Trophies::LoadUnlockData(path).dates.at(42) == "2026-10-05 14:32:09",
-        "retain original dates when adding unlocks");
-}
+  Check(Trophies::LoadUnlockData(path).timestamps.at(42) == tick,
+        "retain original unlock time");
 
+  const auto blocked = directory / "blocked.json";
+  std::filesystem::create_directory(blocked);
+  Common::File sentinel;
+  Check(sentinel.Create(blocked / "keep"),
+        "create replacement failure fixture");
+  sentinel.Close();
+  Check(!Trophies::SaveUnlockData(blocked, loaded) &&
+            std::filesystem::exists(blocked / "keep"),
+        "failed replacement leaves destination intact");
+  Check(!std::filesystem::exists(directory / "blocked.json.tmp"),
+        "failed replacement removes temporary file");
+}
 } // namespace
 
 int main() {
   TempDirectory directory;
-  TestPackageTargetAndEventMapping(directory.Path());
+  TestEventExtraction(directory.Path());
+  TestProgress(directory.Path());
   TestUnlockPersistence(directory.Path());
   std::printf("TrophySystemTests: all cases passed\n");
   return 0;

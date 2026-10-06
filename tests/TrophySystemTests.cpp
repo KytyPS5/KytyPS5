@@ -268,7 +268,14 @@ void TestTextShaping() {
   // Lam + Alef becomes a single ligature glyph.
   Check(Trophies::PrepareDisplayText("\xD9\x84\xD8\xA7") == "\xEF\xBB\xBB",
         "lam alef ligature");
-  // Latin text keeps its order inside a right-to-left line.
+  Check(Trophies::PrepareDisplayText("\xD8\xA8 ab cd") == "ab cd \xEF\xBA\x8F",
+        "spaces inside a Latin run keep its word order");
+  Check(Trophies::PrepareDisplayText("\xD8\xA8(") == ")\xEF\xBA\x8F",
+        "brackets are mirrored");
+  Check(Trophies::PrepareDisplayText("\xD8\xA8\xD8") == "\xEF\xBF\xBD\xEF\xBA\x8F",
+        "truncated sequence becomes U+FFFD");
+  Check(Trophies::PrepareDisplayText("\xD8\xA8\x80") == "\xEF\xBF\xBD\xEF\xBA\x8F",
+        "stray continuation byte becomes U+FFFD");  // Latin text keeps its order inside a right-to-left line.
   Check(Trophies::PrepareDisplayText("\xD8\xA8 ab") == "ab \xEF\xBA\x8F",
         "Latin run keeps its order");
 }

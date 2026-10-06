@@ -59,21 +59,61 @@ bool IsLtrText(char32_t c) {
 	       (c >= 0x00C0 && c < 0x0600);
 }
 
+// Spaces and punctuation that stay inside a left-to-right run when text on both sides is left-to-right.
+bool IsRunNeutral(char32_t c) {
+	return c == ' ' || c == '-' || c == '\'' || c == '.' || c == ',' || c == ':' || c == '/';
+}
+
+char32_t Mirror(char32_t c) {
+	switch (c) {
+		case '(': return ')';
+		case ')': return '(';
+		case '[': return ']';
+		case ']': return '[';
+		case '{': return '}';
+		case '}': return '{';
+		case '<': return '>';
+		case '>': return '<';
+		default: return c;
+	}
+}
+
 std::vector<char32_t> Decode(std::string_view text) {
 	std::vector<char32_t> result;
-	for (size_t i = 0; i < text.size();) {
-		const auto   byte = static_cast<unsigned char>(text[i]);
-		const size_t length = byte < 0x80 ? 1 : (byte >> 5) == 0x6 ? 2 : (byte >> 4) == 0xE ? 3 : 4;
-		char32_t     c = length == 1 ? byte : byte & (0xFF >> (length + 1));
-		for (size_t k = 1; k < length && i + k < text.size(); ++k) {
-			c = (c << 6) | (static_cast<unsigned char>(text[i + k]) & 0x3F);
+	size_t                i = 0;
+	while (i < text.size()) {
+		const auto byte = static_cast<unsigned char>(text[i]);
+		size_t     length = 0;
+		char32_t   c      = 0;
+		if (byte < 0x80) {
+			length = 1;
+			c      = byte;
+		} else if (byte >= 0xC2 && byte <= 0xDF) {
+			length = 2;
+			c      = byte & 0x1F;
+		} else if (byte >= 0xE0 && byte <= 0xEF) {
+			length = 3;
+			c      = byte & 0x0F;
+		} else if (byte >= 0xF0 && byte <= 0xF4) {
+			length = 4;
+			c      = byte & 0x07;
+		}
+		bool valid = length != 0 && i + length <= text.size();
+		for (size_t k = 1; valid && k < length; ++k) {
+			const auto next = static_cast<unsigned char>(text[i + k]);
+			valid           = (next & 0xC0) == 0x80;
+			c               = (c << 6) | (next & 0x3F);
+		}
+		if (!valid || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) {
+			result.push_back(0xFFFD);
+			++i;
+			continue;
 		}
 		result.push_back(c);
 		i += length;
 	}
 	return result;
 }
-
 void Append(std::string& out, char32_t c) {
 	if (c < 0x80) {
 		out.push_back(static_cast<char>(c));
@@ -172,13 +212,20 @@ std::string PrepareDisplayText(std::string_view utf8) {
 		while (begin > 0 && IsMark(cps[begin])) {
 			--begin;
 		}
-		if (IsLtrText(cps[begin])) {
-			while (begin > 0 && IsLtrText(cps[begin - 1])) {
-				--begin;
+		const bool ltr = IsLtrText(cps[begin]);
+		if (ltr) {
+			while (begin > 0) {
+				if (IsLtrText(cps[begin - 1])) {
+					--begin;
+				} else if (IsRunNeutral(cps[begin - 1]) && begin > 1 && IsLtrText(cps[begin - 2])) {
+					begin -= 2;
+				} else {
+					break;
+				}
 			}
 		}
 		for (size_t k = begin; k < end; ++k) {
-			Append(out, cps[k]);
+			Append(out, ltr ? cps[k] : Mirror(cps[k]));
 		}
 		end = begin;
 	}

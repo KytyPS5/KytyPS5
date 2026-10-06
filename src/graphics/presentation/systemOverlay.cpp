@@ -1205,11 +1205,25 @@ struct SystemOverlay::Impl {
 				if (name[i] == ' ') {
 					flush_word();
 					space_before = true;
-				} else if (byte >= 0xE3 && byte <= 0xE9 && i + 2 < name.size()) {
-					flush_word();
-					space_before = false;
-					word.assign(name, i, 3);
-					flush_word();
+				} else if (byte >= 0xE0 && byte <= 0xE9 && i + 2 < name.size()) {
+					// Thai vowel and tone marks combine with the previous letter and must not start a line.
+					const bool thai_mark =
+					    byte == 0xE0 && static_cast<unsigned char>(name[i + 1]) == 0xB8 &&
+					            static_cast<unsigned char>(name[i + 2]) == 0xB1 ||
+					    byte == 0xE0 && static_cast<unsigned char>(name[i + 1]) == 0xB8 &&
+					        static_cast<unsigned char>(name[i + 2]) >= 0xB4 &&
+					        static_cast<unsigned char>(name[i + 2]) <= 0xBA ||
+					    byte == 0xE0 && static_cast<unsigned char>(name[i + 1]) == 0xB9 &&
+					        static_cast<unsigned char>(name[i + 2]) >= 0x87 &&
+					        static_cast<unsigned char>(name[i + 2]) <= 0x8E;
+					if (thai_mark && word.empty() && !line.empty()) {
+						line.append(name, i, 3);
+					} else {
+						flush_word();
+						space_before = false;
+						word.assign(name, i, 3);
+						flush_word();
+					}
 					i += 2;
 				} else {
 					word += name[i];

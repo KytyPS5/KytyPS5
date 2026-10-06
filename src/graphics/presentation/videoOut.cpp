@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/dlssFrameGeneration.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
@@ -246,6 +247,7 @@ private:
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
 	uint64_t             m_next_request_id = 1;
+	Graphics::PresentSmoother m_smoother; // Only touched by the present thread.
 };
 
 struct VideoOutDriver::Impl {
@@ -1242,6 +1244,27 @@ bool FlipQueue::Flip(uint32_t micros) {
 	// Lock each port in bus order, then present and complete the whole group at one Vblank.
 	std::sort(requests.begin(), requests.begin() + count,
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
+	// While Frame Generation interpolates, even out real-frame spacing. Hold at
+	// most part of this vblank, before taking the port locks guest threads use.
+	auto&      fg       = m_presenter.FrameGeneration();
+	const bool smooth   = fg.Enabled() && fg.Foreground();
+	const auto due_time = Common::Timer::QueryPerformanceCounter();
+	if (!smooth) {
+		m_smoother.Reset();
+	} else {
+		const auto owner_request = std::find_if(requests.begin(), requests.begin() + count,
+		                                        [group](const auto& r) { return r.id == group; });
+		bool owner_due = false;
+		{
+			Common::LockGuard cfg_lock(owner_request->cfg->mutex);
+			owner_due = IsFlipDueLocked(*owner_request->cfg, owner_request->generation);
+		}
+		const auto frequency = Common::Timer::QueryPerformanceFrequency();
+		const auto cap       = frequency / std::max(Config::GetVblankFrequency(), 1u) * 3 / 4;
+		if (const auto delay = owner_due ? m_smoother.Delay(due_time, cap) : 0; delay != 0) {
+			Common::Thread::SleepMicro(static_cast<uint32_t>(delay * 1000000u / frequency));
+		}
+	}
 	bool due = true;
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
 	for (size_t i = 0; i < count; i++) {
@@ -1255,6 +1278,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
+		if (smooth) m_smoother.Presented(due_time, Common::Timer::QueryPerformanceCounter());
 	}
 
 	m_mutex.Lock();

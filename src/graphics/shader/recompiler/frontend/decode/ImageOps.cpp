@@ -20,6 +20,12 @@ struct MimgGatherInfo {
 	uint32_t flags    = 0;
 };
 
+struct MimgAtomicInfo {
+	uint32_t encoding    = 0;
+	Opcode   decoded     = Opcode::UNSUPPORTED;
+	bool     supports_64 = false;
+};
+
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
 	switch (dim) {
 		case 0u: return ImageDimension::Dim1D;
@@ -190,17 +196,17 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
 };
 
-constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
-    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
+constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
+    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP, true},
     {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
-    {0x11u, Opcode::IMAGE_ATOMIC_ADD},
+    {0x11u, Opcode::IMAGE_ATOMIC_ADD, true},
     {0x14u, Opcode::IMAGE_ATOMIC_SMIN},
-    {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
+    {0x15u, Opcode::IMAGE_ATOMIC_UMIN, true},
     {0x16u, Opcode::IMAGE_ATOMIC_SMAX},
-    {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
-    {0x18u, Opcode::IMAGE_ATOMIC_AND},
-    {0x19u, Opcode::IMAGE_ATOMIC_OR},
-    {0x1au, Opcode::IMAGE_ATOMIC_XOR},
+    {0x17u, Opcode::IMAGE_ATOMIC_UMAX, true},
+    {0x18u, Opcode::IMAGE_ATOMIC_AND, true},
+    {0x19u, Opcode::IMAGE_ATOMIC_OR, true},
+    {0x1au, Opcode::IMAGE_ATOMIC_XOR, true},
     {0x1eu, Opcode::IMAGE_ATOMIC_FMIN},
     {0x1fu, Opcode::IMAGE_ATOMIC_FMAX},
 };
@@ -210,7 +216,7 @@ constexpr auto MIMG_GATHER_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_GATHER_OPCO
 constexpr auto MIMG_ATOMIC_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_ATOMIC_OPCODE_LIST);
 
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                        const Detail::OpcodeMap* atomic) {
+                        const MimgAtomicInfo* atomic) {
 	if (sample != nullptr) {
 		return Opcode::IMAGE_SAMPLE;
 	}
@@ -228,7 +234,8 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
-		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe6u:
+		case 0xe7u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -245,7 +252,7 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const Detail::OpcodeMap* atomic) {
+                                     const MimgAtomicInfo* atomic) {
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -258,6 +265,7 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 
 	switch (opcode) {
 		case 0xe6u: return 11u;
+		case 0xe7u: return 12u;
 		case 0x0eu: return 1u;
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
@@ -368,7 +376,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			SetUnsupported(inst, Family::MIMG, opcode, "MIMG image atomic has invalid DMASK");
 		} else if (inst.dmask == mask64) {
 			inst.data_bits = 64u;
-			if (inst.opcode != Opcode::IMAGE_ATOMIC_UMAX) {
+			if (!atomic->supports_64) {
 				SetUnsupported(inst, Family::MIMG, opcode,
 				               "MIMG 64-bit image atomic opcode is not implemented");
 			}
@@ -379,10 +387,10 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (d16 && !supports_d16) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
 	}
-	if (opcode == 0xe6u &&
+	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY &&
 	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
 		SetUnsupported(inst, Family::MIMG, opcode,
-		               "BVH intersection requires eleven full-float ray DWORDs and R128/dmask:0xf");
+		               "BVH intersection requires full-float ray DWORDs and R128/dmask:0xf");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

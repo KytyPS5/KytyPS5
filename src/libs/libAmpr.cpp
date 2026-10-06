@@ -1193,8 +1193,9 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 	               std::get_if<CommandBufferState::KernelEventCommand>(&entry.data)) {
 		const auto& command = *payload;
 		const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
-		auto        result  = LibKernel::EventQueue::KernelTriggerUserEvent(
-		    eq, command.id, reinterpret_cast<void*>(command.data));
+		auto        result  = LibKernel::EventQueue::KernelTriggerEvent(
+		    eq, static_cast<uintptr_t>(command.id), LibKernel::EventQueue::KERNEL_EVFILT_AMPR,
+		    reinterpret_cast<void*>(command.data));
 		if (result != OK) {
 			LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
 			     ", result=0x%08" PRIx32 "\n",

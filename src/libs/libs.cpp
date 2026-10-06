@@ -79,8 +79,10 @@ LIB_DEFINE(InitVideoOutVrrStatus_1);
 
 LIB_DEFINE(InitAppContent_1);
 LIB_DEFINE(InitAudio_1);
+LIB_DEFINE(InitBluetoothHid_1);
 LIB_DEFINE(InitConvertKeycode_1);
 LIB_DEFINE(InitDbgAddressSanitizer_1);
+LIB_DEFINE(InitDeviceService_1);
 LIB_DEFINE(InitDialog_1);
 LIB_DEFINE(InitFont_1);
 LIB_DEFINE(InitFontFt_1);
@@ -99,6 +101,7 @@ LIB_DEFINE(InitShare_1);
 LIB_DEFINE(InitSysmodule_1);
 LIB_DEFINE(InitSystemService_1);
 LIB_DEFINE(InitTextToSpeech2_1);
+LIB_DEFINE(InitUsbd_1);
 LIB_DEFINE(InitUserService_1);
 LIB_DEFINE(InitWebBrowserDialog_1);
 
@@ -120,6 +123,9 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitFont_1(s);
 	InitFontFt_1(s);
 	InitAgcDriver_1(s);
+	InitBluetoothHid_1(s);
+	InitDeviceService_1(s);
+	InitUsbd_1(s);
 	InitHmd2_1(s);
 	InitLibKernel_1(s);
 	LibMouse::InitMouse_1(s);

@@ -564,7 +564,7 @@ int KYTY_SYSV_ABI KernelAddAmprEvent(KernelEqueue eq, int id, void* udata) {
 	if (eq != KERNEL_EQUEUE_INVALID) {
 		KernelEqueueEvent event {};
 		event.event.ident         = static_cast<uintptr_t>(id);
-		event.event.filter        = KERNEL_EVFILT_USER;
+		event.event.filter        = KERNEL_EVFILT_AMPR;
 		event.event.flags         = EV_ADD | EV_CLEAR;
 		event.event.fflags        = 0;
 		event.event.data          = 0;
@@ -592,7 +592,7 @@ int KYTY_SYSV_ABI KernelDeleteAmprEvent(KernelEqueue eq, int id) {
 	LOGF("\t AMPR event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq), id);
 
 	if (eq != KERNEL_EQUEUE_INVALID) {
-		(void)KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
+		(void)KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_AMPR);
 	}
 
 	return OK;

@@ -327,7 +327,7 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 
 void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, ShaderInfo& info) {
 	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
-	                         input_info.pixel->alpha_blend_source_remap;
+	                         input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {

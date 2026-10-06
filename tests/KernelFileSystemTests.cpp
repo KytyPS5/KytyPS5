@@ -10,6 +10,7 @@
 #include "common/threads.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
@@ -640,6 +641,8 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
   using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
                                        void *, uint64_t, uint64_t);
+  using WriteKernelEvent = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint64_t,
+                                               uint64_t, uint64_t);
   struct Result { int32_t result; uint32_t error_offset; };
   using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
   using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
@@ -653,6 +656,7 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
   const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
   const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
+  const auto write_event = reinterpret_cast<WriteKernelEvent>(find("H896Pt-yB4I"));
   const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
   const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
   const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
@@ -675,7 +679,7 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
             "initialize AMPR command buffer");
     }
   };
-  // SDK WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
+  // WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
   struct Comparison { uint8_t compare; uint64_t blocked, reference, released; };
   constexpr std::array comparisons {
       Comparison{0, 1, 2, 2}, Comparison{1, 0x40000000000019c3, 0x40000000000019c3,
@@ -723,6 +727,42 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
             "submission wait observes the completed result");
     }
   }
+  reset(1);
+  namespace EventQueue = Libs::LibKernel::EventQueue;
+  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+  uint64_t ampr_user_data = 1, user_data = 2;
+  Check(EventQueue::KernelCreateEqueue(&queue, "apr-completion") == OK &&
+            EventQueue::KernelAddAmprEvent(queue, 42, &ampr_user_data) == OK &&
+            EventQueue::KernelAddUserEventEdge(queue, 42) == OK,
+        "AMPR and user events can share an identifier");
+  std::array<char, 3> output {};
+  Result event_result {1234, 5678};
+  uint32_t event_submission = 0;
+  auto *reader = buffers[0].header.data();
+  Check(read_file(reader, reinterpret_cast<uint64_t>(&buffers[0].header[3]),
+                  reinterpret_cast<uint64_t>(&buffers[0].header[4]), file_id,
+                  output.data(), output.size(), 0) == OK &&
+            write_event(reader, queue, 42, 0x123456789abc, 0, 0) == OK &&
+            submit_apr(reader, 3, &event_result, &event_submission) == OK &&
+            wait_apr(event_submission) == OK && event_result.result == OK,
+        "APR read submits its completion event");
+  std::array<EventQueue::KernelEvent, 2> events {};
+  int event_count = 0;
+  const Libs::LibKernel::KernelUseconds poll = 0;
+  Check(EventQueue::KernelWaitEqueue(queue, events.data(), 2, &event_count, &poll) == OK &&
+            event_count == 1 && events[0].ident == 42 && events[0].filter == -25 &&
+            events[0].data == 0x123456789abc && events[0].udata == &ampr_user_data &&
+            std::memcmp(output.data(), "APR", 3) == 0,
+        "APR completion reports the AMPR filter, payload and registration user data");
+  Check(EventQueue::KernelDeleteAmprEvent(queue, 42) == OK &&
+            EventQueue::KernelTriggerEvent(queue, 42, -25, nullptr) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            EventQueue::KernelTriggerUserEvent(queue, 42, &user_data) == OK &&
+            EventQueue::KernelWaitEqueue(queue, events.data(), 2, &event_count, &poll) == OK &&
+            event_count == 1 && events[0].filter == EventQueue::KERNEL_EVFILT_USER &&
+            events[0].udata == &user_data,
+        "deleting AMPR leaves the user event with the same identifier intact");
+  Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete APR completion queue");
   reset(0);
   uint64_t cpu_fence = 0, amm_done = 0, lower_done = 0;
   std::array<uint32_t, 2> ids {};

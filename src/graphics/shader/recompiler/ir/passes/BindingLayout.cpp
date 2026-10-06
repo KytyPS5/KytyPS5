@@ -15,11 +15,16 @@ namespace {
 	std::abort();
 }
 
-std::vector<uint32_t> CollectUserData(const Program& program) {
+void CollectShaderData(const Program& program, BindingLayout& layout) {
 	std::array<bool, NumScalarRegs> registers {};
+	bool uses_dispatch_threads = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (inst.GetOpcode() != ValueOpcode::GetUserData || !inst.HasUses()) {
+			if (!inst.HasUses()) {
+				continue;
+			}
+			uses_dispatch_threads |= inst.GetOpcode() == ValueOpcode::GetDispatchThreadExtent;
+			if (inst.GetOpcode() != ValueOpcode::GetUserData) {
 				continue;
 			}
 			if (inst.Arg(0).GetType() != Type::ScalarReg) {
@@ -32,13 +37,16 @@ std::vector<uint32_t> CollectUserData(const Program& program) {
 			registers[index] = true;
 		}
 	}
-	std::vector<uint32_t> result;
 	for (uint32_t index = 0; index < registers.size(); index++) {
 		if (registers[index]) {
-			result.push_back(index);
+			layout.user_data_registers.push_back(index);
 		}
 	}
-	return result;
+	layout.memory_offset_dword = static_cast<uint32_t>(layout.user_data_registers.size());
+	if (uses_dispatch_threads) {
+		layout.dispatch_thread_dword = layout.memory_offset_dword;
+		layout.memory_offset_dword += 3u;
+	}
 }
 
 void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
@@ -48,14 +56,15 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 
 } // namespace
 
-bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
+SharedMemoryResources CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
 	std::array<bool, ShaderInfo::MaxBuffers> live_buffers {};
-	bool uses_gds = false;
+	SharedMemoryResources shared;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();
 			if (BufferAccessOf(op) == BufferAccess::None &&
-			    SharedAccessOf(op) == SharedAccess::None) {
+			    SharedAccessOf(op) == SharedAccess::None &&
+			    AddressOpcodeInfoOf(op).access == AddressAccess::None) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;
@@ -66,14 +75,19 @@ bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffe
 			if (memory.planning_only) {
 				continue;
 			}
+			shared.lds |= memory.kind == ResourceKind::FlatLocal;
 			if (SharedAccessOf(op) != SharedAccess::None) {
 				if (memory.kind != ResourceKind::Lds && memory.kind != ResourceKind::Gds) {
 					BindingFail("typed shader contains invalid shared-memory metadata");
 				}
-				uses_gds |= memory.kind == ResourceKind::Gds;
+				shared.gds |= memory.kind == ResourceKind::Gds;
+				shared.lds |= memory.kind == ResourceKind::Lds;
 			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
 				EXIT_IF(memory.resource >= program.info.buffers.size());
 				live_buffers.at(memory.resource) = true;
+				for (const auto child: program.info.buffers[memory.resource].indirect_resources) {
+					live_buffers.at(child) = true;
+				}
 			}
 		}
 	}
@@ -82,20 +96,22 @@ bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffe
 			buffers.push_back(i);
 		}
 	}
-	return uses_gds;
+	return shared;
 }
 
 bool UsesFlattenedSrt(const Program& program) {
+	const auto uses_mapping = [](const auto& resource) {
+		return resource.indirect_search_iterations != 0u;
+	};
 	return std::ranges::any_of(program.blocks, [](const Block* block) {
 		return std::ranges::any_of(*block, [](const Inst& inst) {
 			return inst.GetOpcode() == ValueOpcode::ReadConst;
 		});
-	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		return image.indirect_search_iterations != 0u;
-	});
+	}) || std::ranges::any_of(program.info.buffers, uses_mapping) ||
+	       std::ranges::any_of(program.info.images, uses_mapping);
 }
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
+void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
@@ -103,9 +119,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	}
 	BindingLayout next;
 	std::vector<uint32_t> buffers;
-	const bool            uses_gds = CollectMemoryResources(program, buffers);
-	next.user_data_registers = CollectUserData(program);
-	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
+	const auto shared = CollectMemoryResources(program, buffers);
+	CollectShaderData(program, next);
 	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
@@ -148,8 +163,11 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (uses_gds) {
+	if (shared.gds) {
 		AddBinding(next, DescriptorBindingKind::Gds);
+	}
+	if (shared.lds && lds_storage) {
+		AddBinding(next, DescriptorBindingKind::SharedMemory);
 	}
 	if (program.info.uses_dma) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);

@@ -18,6 +18,7 @@ constexpr int16_t KERNEL_EVFILT_FILE      = -4;
 constexpr int16_t KERNEL_EVFILT_GRAPHICS  = -14;
 constexpr int16_t KERNEL_EVFILT_VIDEO_OUT = -13;
 constexpr int16_t KERNEL_EVFILT_HRTIMER   = -15;
+constexpr int16_t KERNEL_EVFILT_AMPR      = -25;
 
 class KernelEqueuePrivate;
 struct KernelEqueueEvent;

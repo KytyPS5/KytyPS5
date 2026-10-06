@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -25,6 +26,69 @@ void Check(bool value, const char* text) {
 
 void CheckConcurrentResult(int result, const char* text) {
 	Check(result == OK || result == KERNEL_ERROR_EBADF || result == KERNEL_ERROR_ENOENT, text);
+}
+
+void TestPeriodicTimerEvents() {
+	using namespace std::chrono_literals;
+	using Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+	Check(EventQueue::KernelAddTimerEvent(EventQueue::KERNEL_EQUEUE_INVALID, 10, 1000, nullptr) ==
+	          KERNEL_ERROR_EBADF,
+	      "timer rejects invalid queue");
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "periodic-timer") == OK, "create timer queue");
+	auto* user_data = reinterpret_cast<void*>(0x1234);
+	Check(EventQueue::KernelAddTimerEvent(queue, 10, 1000, user_data) == OK, "add periodic timer");
+	std::this_thread::sleep_for(5ms);
+	EventQueue::KernelEvent events[2] {};
+	int out = 0;
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1,
+	      "periodic occurrences are aggregated into one event");
+	Check(events[0].ident == 10 && events[0].filter == EventQueue::KERNEL_EVFILT_TIMER &&
+	          events[0].data >= 5 && events[0].udata == user_data,
+	      "timer reports identity, userdata and elapsed occurrence count");
+	timeout = 100000;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1 &&
+	          events[0].data >= 1,
+	      "periodic timer remains registered after delivery");
+
+	std::this_thread::sleep_for(5ms);
+	user_data = reinterpret_cast<void*>(0x5678);
+	Check(EventQueue::KernelAddTimerEvent(queue, 10, 3000000000u, user_data) == OK,
+	      "update periodic timer interval");
+	timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1 &&
+	          events[0].data >= 5 && events[0].udata == user_data,
+	      "timer update preserves accumulated occurrences and updates userdata");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
+	      "timer update replaces the repeating interval");
+	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
+	      "delete periodic timer");
+
+	Check(EventQueue::KernelAddTimerEvent(queue, 10, 0, user_data) == OK,
+	      "add immediate periodic timer");
+	for (int i = 0; i < 2; ++i) {
+		Check(EventQueue::KernelAddTimerEvent(queue, 10, 0, user_data) == OK,
+		      "update pending immediate timer");
+	}
+	for (int i = 0; i < 2; ++i) {
+		Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1 &&
+		          events[0].data == 1,
+		      "zero interval remains immediately ready after delivery");
+	}
+	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
+	      "delete immediate timer");
+
+	const Libs::LibKernel::KernelTimespec delay {0, 1000000};
+	Check(EventQueue::KernelAddHRTimerEvent(queue, 10, &delay, user_data) == OK,
+	      "add high resolution timer");
+	timeout = 100000;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1 &&
+	          events[0].filter == EventQueue::KERNEL_EVFILT_HRTIMER && events[0].udata == user_data,
+	      "shared timer scheduling delivers high resolution event");
+	Check(EventQueue::KernelDeleteHRTimerEvent(queue, 10) == KERNEL_ERROR_ENOENT,
+	      "high resolution timer is removed after one delivery");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete timer queue");
 }
 
 void CountDeletedEvent(EventQueue::KernelEqueue, EventQueue::KernelEqueueEvent* event) {
@@ -431,6 +495,7 @@ void TestConcurrentDelete() {
 } // namespace
 
 int main() {
+	TestPeriodicTimerEvents();
 	TestDuplicateAddPreservesEventState();
 	TestCallbackStateOutlivesPort();
 	TestCallbackOwnsPayload();

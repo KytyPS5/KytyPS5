@@ -75,6 +75,11 @@ void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
 int  GetActiveControllerId();
 
+enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
+
+void  CycleSetting(Setting setting);
+float GetSettingScale(Setting setting);
+
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index);

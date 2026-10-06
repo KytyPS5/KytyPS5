@@ -47,6 +47,12 @@ struct VulkanExtensions {
 	std::vector<vk::LayerProperties>     available_layers;
 };
 
+vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
+	vk::PhysicalDeviceVulkan11Features features {};
+	features.storageBuffer16BitAccess = VK_TRUE;
+	return features;
+}
+
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
 	features.samplerMirrorClampToEdge  = VK_TRUE;
@@ -55,6 +61,8 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.storageBuffer8BitAccess   = VK_TRUE;
+	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
 
@@ -206,6 +214,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		depth_clip_control.pNext = &depth_clip_enable;
 
 		vk::PhysicalDeviceVulkan12Features features12 {};
+		vk::PhysicalDeviceVulkan11Features features11 {};
 #if defined(__APPLE__)
 		features12.pNext = &depth_clip_control;
 #else
@@ -213,6 +222,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		fragment_barycentric.pNext = &depth_clip_control;
 		features12.pNext           = &fragment_barycentric;
 #endif
+		features11.pNext       = features12.pNext;
+		features12.pNext       = &features11;
 		features13.pNext       = &features12;
 		device_features2.pNext = &features13;
 
@@ -256,6 +267,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
 		              required_features12.samplerMirrorClampToEdge);
+		check_feature(features11.storageBuffer16BitAccess, "storageBuffer16BitAccess",
+		              WindowContext::RequiredVulkan11Features().storageBuffer16BitAccess);
+		check_feature(features12.storageBuffer8BitAccess, "storageBuffer8BitAccess",
+		              required_features12.storageBuffer8BitAccess);
 		check_feature(features12.timelineSemaphore, "timelineSemaphore",
 		              required_features12.timelineSemaphore);
 		check_feature(features12.shaderOutputLayer, "shaderOutputLayer",
@@ -266,6 +281,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.bufferDeviceAddress);
 		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
 		              required_features12.shaderBufferInt64Atomics);
+		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
+		              "shaderSampledImageArrayNonUniformIndexing",
+		              required_features12.shaderSampledImageArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
@@ -460,7 +478,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool image_atomic_int64_extension =
+	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
+	if (image_atomic_int64_extension) {
+		image_atomic_int64.pNext = supported_features2.pNext;
+		supported_features2.pNext = &image_atomic_int64;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -470,6 +496,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	workgroup_layout.pNext = &depth_clip_control;
 	features12.pNext = workgroup_layout_extension ? static_cast<void*>(&workgroup_layout)
 	                                             : static_cast<void*>(&depth_clip_control);
+	auto features11 = WindowContext::RequiredVulkan11Features();
+	features11.pNext = features12.pNext;
+	features12.pNext = &features11;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
@@ -552,8 +581,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
-	    float_controls.shaderSignedZeroInfNanPreserveFloat64 &&
-	    float_controls.shaderRoundingModeRTEFloat32;
+	    float_controls.shaderSignedZeroInfNanPreserveFloat64;
 	// if (device_features.shaderFloat64 && !float_controls.shaderDenormPreserveFloat64) {
 	// 	Log::WriteToConsoleAndLog(
 	// 	    "WARNING: Vulkan device does not guarantee FP64 denormal preservation; "
@@ -604,6 +632,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	if (graphics.shader_image_int64_atomics_enabled) {
+		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
+		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
+		create_info.pNext = &image_atomic_int64;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -969,6 +1002,7 @@ void WindowContext::CreateVulkan() {
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,

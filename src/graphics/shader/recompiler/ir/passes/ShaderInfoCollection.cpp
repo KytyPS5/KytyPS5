@@ -327,7 +327,7 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 
 void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, ShaderInfo& info) {
 	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
-	                         input_info.pixel->alpha_blend_source_remap;
+	                         input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
@@ -412,7 +412,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	ValidateOptions(program, input_info);
 	ValidateValueReferences(program, input_info);
 
-	auto next = program.info;
+	auto& next = program.info;
 	next.inputs.clear();
 	next.outputs.clear();
 	next.has_bitwise_xor =
@@ -433,7 +433,6 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	CollectBuiltinInputs(program, next);
 	CollectOutputs(program, input_info, next);
-	program.info                 = std::move(next);
 	program.shader_info_complete = true;
 }
 

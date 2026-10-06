@@ -88,6 +88,38 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
                               uint64_t& resolved_size) {
 	const auto& resources = *input.stage.resources;
+	if (input.stage.program != nullptr && input.stage.program->info.dword_pattern_fill) {
+		const auto& program = *input.stage.program;
+		// The matched kernel's modulo is zero for period one, so only s4 is stored.
+		// Its explicit bound and complete 64-thread groups must cover every record.
+		if (program.user_data_base != 0 || resources.user_data.size() < 10 ||
+		    program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+		    !program.info.images.empty() || !program.info.samplers.empty() ||
+		    resources.user_data[9] != 1 || input.dispatch_thread_dimensions || mode != 0x41u ||
+		    input.wave_size != 64 || input.threads_num[0] != 64 || input.threads_num[1] != 1 ||
+		    input.threads_num[2] != 1 || !input.group_id[0] || input.group_id[1] || input.group_id[2] ||
+		    input.thread_ids_num != 1 || input.workgroup_register != 10 || input.tg_size_en ||
+		    input.float_mode != 0xc0 || group_x == 0 || group_y != 1 || group_z != 1) {
+			return false;
+		}
+		const auto& resource = program.info.buffers[0];
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[0]);
+		const auto size       = descriptor.GetSize();
+		if (!resource.formatted || !resource.written || resource.read || resource.atomic ||
+		    resource.scalar || descriptor.Stride() != sizeof(uint32_t) ||
+		    descriptor.Format() != Prospero::BufferFormat::k32UInt || descriptor.SwizzleEnabled() ||
+		    descriptor.IndexStride() != 0 || descriptor.AddTid() || descriptor.Base48() == 0 ||
+		    !std::equal(resources.buffers[0].dwords.begin(), resources.buffers[0].dwords.begin() + 4,
+		                resources.user_data.begin()) ||
+		    uint64_t {group_x} * 64 != descriptor.NumRecords() ||
+		    resources.user_data[8] != descriptor.NumRecords() || size == 0 || size > UINT32_MAX) {
+			return false;
+		}
+		resolved_descriptor = descriptor;
+		resolved_clear      = resources.user_data[4];
+		resolved_size       = size;
+		return true;
+	}
 	const auto& fill      = resources.uniform_fill;
 	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
 		return false;

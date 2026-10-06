@@ -33,6 +33,30 @@ const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
 }
 
+bool IsDwordPatternFill(const Decoder::Program& decoded) {
+	// Compiler-generated bounded fill: index = (s10 << 6) + v0; stop at s8;
+	// write s4..s7 according to index % s9. The general uniform-fill analysis cannot
+	// prove coverage through its EXEC branches. Match every instruction, including
+	// operands and branch offsets, before permitting a period-one native clear.
+	// Padding and shader metadata after S_ENDPGM have no execution semantics.
+	static constexpr std::array<uint32_t, 69> code {
+		0xbfa00003u, 0xd7460002u, 0x04010c0au, 0x7da80408u, 0xbf88003fu, 0x7e000c09u,
+		0xbf070980u, 0x858a807eu, 0x7e005700u, 0x100000ffu, 0x4f800000u, 0x7e060f00u,
+		0xd5766a00u, 0x02020609u, 0x7d8a0280u, 0x4c020080u, 0x02000101u, 0xd56a0001u,
+		0x00020700u, 0x4c000303u, 0x4a020303u, 0x02000101u, 0xd56a0000u, 0x00020500u,
+		0xd5690001u, 0x00020009u, 0x4c060302u, 0x7d8c02f9u, 0x06068c02u, 0x7d860609u,
+		0x87ea6a0cu, 0x50000080u, 0xd5286a00u, 0x003200c1u, 0xd5010000u, 0x002a00c1u,
+		0xd5690000u, 0x00020009u, 0x4c000102u, 0x7d0a0080u, 0xbe88246au, 0xbf880015u,
+		0x7d0a0081u, 0xbe8a246au, 0xbf88000cu, 0x7d0a0082u, 0xbeea246au, 0xbf880003u,
+		0x7e000207u, 0xe0102000u, 0x80000002u, 0x8afe7e6au, 0xbf880003u, 0x7e000206u,
+		0xe0102000u, 0x80000002u, 0xbefe046au, 0x8afe7e0au, 0xbf880003u, 0x7e000205u,
+		0xe0102000u, 0x80000002u, 0xbefe040au, 0x8afe7e08u, 0xbf880003u, 0x7e000204u,
+		0xe0102000u, 0x80000002u, 0xbf810000u,
+	};
+	return decoded.instructions.size() == 55 && decoded.code.size() >= code.size() &&
+	       std::equal(code.begin(), code.end(), decoded.code.begin());
+}
+
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
 	dump += cfg;
@@ -617,6 +641,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg);
+	ir.info.dword_pattern_fill = options.stage == ShaderType::Compute && IsDwordPatternFill(decoded);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

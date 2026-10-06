@@ -5819,6 +5819,118 @@ void TestInlineImageMixedDynamicAndOrdinarySamplers() {
   }
 }
 
+void TestInlineNativeSamplerCapacity() {
+  auto fixture = MakeInlineDescriptorFixture();
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  constexpr uint32_t stride = 872u;
+  constexpr uint32_t records = 32u;
+  std::array<uint32_t, 8> user_data{
+      0x1000u, stride << 16u, records, 0u, 0x2000u, 0u, 16u, 0u};
+  LinearTestMemory memory;
+  memory.words.resize(records * stride / sizeof(uint32_t));
+  DescriptorValue image;
+  image.dword_count = 8u;
+  image.dwords[0] = 0x20u;
+  image.dwords[1] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  image.dwords[2] = 3u | (3u << 14u);
+  image.dwords[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  std::vector<DescriptorValue> expected(records);
+  for (uint32_t record = 0; record < records; ++record) {
+    auto& sampler = expected[record];
+    sampler.dword_count = 4u;
+    // Valid clamp/filter fields; each candidate has a distinct minimum LOD.
+    sampler.dwords = {146u, 0x00fff000u | (record + 1u), 0x05000000u, 0u,
+                      0u, 0u, 0u, 0u};
+    for (uint32_t word = 0; word < 4u; ++word) {
+      memory.words[(record * stride + 136u) / 4u + word] = sampler.dwords[word];
+      memory.words[(record * stride + 152u) / 4u + word] = image.dwords[word];
+    }
+  }
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory,
+                     .max_native_samplers = records + 1u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "host-supported 33 native inline samplers were rejected");
+  Check(snapshot.samplers.size() == records + 1u &&
+            specialization.sampler_origins.size() == records + 1u,
+        "expanded sampler count omitted a candidate or the explicit null fallback");
+  for (uint32_t record = 0; record < records; ++record) {
+    const auto candidate = InlineCandidateForKey(snapshot, specialization, record * stride);
+    const auto sampler = specialization.images[candidate].indirect_sampler;
+    Check(candidate != 0u && sampler < snapshot.samplers.size() &&
+              snapshot.samplers[sampler] == expected[record] &&
+              specialization.sampler_origins[sampler] == 0u &&
+              std::ranges::any_of(specialization.sampled_pairs, [&](const auto& pair) {
+                return pair.image == candidate && pair.sampler == sampler;
+              }),
+          "expanded inline sampler descriptor, origin or pair mapping was corrupted");
+  }
+  const auto previous = snapshot;
+  const auto previous_specialization = specialization;
+  runtime.max_native_samplers = records;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(previous, snapshot) && specialization == previous_specialization,
+        "sampler budget overflow was accepted or changed committed resources");
+  ApplyResourceSpecialization(fixture->program, previous_specialization);
+  Check(fixture->program.info.samplers.size() == records + 1u &&
+            fixture->program.info.sampled_pairs == previous_specialization.sampled_pairs,
+        "native sampler specialization truncated descriptor bindings");
+}
+
+void TestNativeSamplerClassCapacity() {
+  auto fixture = MakeInlineDescriptorFixture(true);
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  constexpr uint32_t stride = 872u;
+  std::array<uint32_t, 8> user_data{
+      0x1000u, stride << 16u, 3u, 0u, 0x2000u, 0u, 16u, 0u};
+  LinearTestMemory memory;
+  constexpr std::array formats{
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float,
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt,
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32SInt};
+  for (uint32_t record = 0; record < formats.size(); ++record) {
+    const auto start = (record * stride + 588u) / 4u;
+    memory.words[start] = 0x20u;
+    memory.words[start + 1u] = static_cast<uint32_t>(formats[record]) << 20u;
+    memory.words[start + 2u] = 3u | (3u << 14u);
+    memory.words[start + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory,
+                     .max_native_samplers = 6u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.samplers.size() == 6u && specialization.sampler_origins.size() == 2u,
+        "numeric sampler classes did not consume exactly six native descriptors");
+  const auto previous = snapshot;
+  const auto previous_specialization = specialization;
+  for (const uint32_t budget : {5u, 1u, 0u}) {
+    runtime.max_native_samplers = budget;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+              SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+          "numeric sampler class overflow was accepted or committed partial state");
+  }
+  ApplyResourceSpecialization(fixture->program, previous_specialization);
+  Check(fixture->program.info.samplers.size() == 6u,
+        "numeric sampler class expansion lost bindings");
+  for (const auto& pair : fixture->program.info.sampled_pairs) {
+    const auto& sampler = fixture->program.info.samplers[pair.sampler];
+    const auto numeric = fixture->program.info.images[pair.image].numeric_class;
+    const bool integer = numeric == Libs::Graphics::Prospero::TextureNumericClass::Uint ||
+                         numeric == Libs::Graphics::Prospero::TextureNumericClass::Sint;
+    Check(sampler.force_point_filtering == integer && sampler.integer_border == integer,
+          "numeric sampler class lost filtering or border semantics");
+  }
+}
+
 void TestInlineImageResourceLimits() {
   auto fixture = MakeInlineDescriptorFixture(true);
   fixture->PlanAndTrack();
@@ -8637,6 +8749,12 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_SHARED_INLINE_IMAGES_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-native-sampler-capacity-only") == 0) {
+      TestInlineNativeSamplerCapacity();
+      TestNativeSamplerClassCapacity();
+      std::cout << "KYTY_INLINE_NATIVE_SAMPLER_CAPACITY_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--inline-image-mixed-samplers-only") == 0) {
       TestInlineImageMixedDynamicAndOrdinarySamplers();
       std::cout << "KYTY_INLINE_IMAGE_MIXED_SAMPLERS_PASS\n";
@@ -8842,6 +8960,8 @@ int main(int argc, char** argv) {
     Run("shared inline images", [] { TestSharedInlineImageCandidates(); });
     Run("sampled pair materialization", [] { TestSharedInlineImageCandidates(true); });
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
+    Run("inline native sampler capacity", TestInlineNativeSamplerCapacity);
+    Run("native sampler class capacity", TestNativeSamplerClassCapacity);
     Run("inline SCC selector guard", TestInlineBufferSccConditionRefGuard);
     Run("inline sampled SCC guard", TestInlineSampledSccConditionRefGuard);
     Run("inline selector guard safety", TestInlineSelectorGuardPolarityAndSafety);

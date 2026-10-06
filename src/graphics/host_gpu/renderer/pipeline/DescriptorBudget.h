@@ -17,6 +17,12 @@ inline uint32_t StorageBufferDescriptorCeiling(const VkPhysicalDeviceLimits& lim
 	                 limits.maxDescriptorSetStorageBuffers, limits.maxPerStageResources});
 }
 
+// Separate samplers do not consume maxPerStageResources. The complete pipeline
+// layout still charges all stages against maxDescriptorSetSamplers below.
+inline uint32_t SamplerDescriptorCeiling(const VkPhysicalDeviceLimits& limits) {
+	return std::min(limits.maxPerStageDescriptorSamplers, limits.maxDescriptorSetSamplers);
+}
+
 struct DescriptorBudgetBinding {
 	VkDescriptorType   type;
 	uint32_t           count;

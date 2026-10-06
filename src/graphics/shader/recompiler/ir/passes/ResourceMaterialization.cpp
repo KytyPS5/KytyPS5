@@ -1977,9 +1977,9 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::array<std::array<uint32_t, 3>, ShaderInfo::MaxSamplers> mapping;
-	std::array<Binding, ShaderInfo::MaxSamplers>                bindings;
-	uint32_t                                                  sampler_count = 0;
+	std::vector<std::array<uint32_t, 3>> mapping;
+	std::vector<Binding>                bindings;
+	uint32_t                            sampler_count = 0;
 };
 
 struct ImageRemap {
@@ -2017,7 +2017,8 @@ private:
 };
 
 template <typename Images>
-bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
+bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan,
+                      uint32_t capacity);
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializedSnapshot snapshot,
                                         const SrtRuntime& runtime,
@@ -2095,7 +2096,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 					sampler++;
 				}
 				if (sampler == next_specialization.sampler_origins.size()) {
-					if (sampler >= ShaderInfo::MaxSamplers) {
+					if (sampler >= runtime.max_native_samplers) {
 						return SpecializationFail(fmt::format(
 						    "inline sampled pair at pc 0x{:08x} exceeds the sampler limit (size={} stride={} probes={} pairs={} samplers={})",
 						    program.info.images[table.resource].first_use_pc,
@@ -2450,7 +2451,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	}
 	next_specialization.sampled_pairs = sampler_info.sampled_pairs;
 	SamplerPlan sampler_plan;
-	if (!BuildSamplerPlan(sampler_info, next_specialization.images, sampler_plan)) {
+	if (!BuildSamplerPlan(sampler_info, next_specialization.images, sampler_plan,
+	                      runtime.max_native_samplers)) {
 		return SpecializationFail("specialized sampler layout exceeds its resource limit");
 	}
 	for (uint32_t index = static_cast<uint32_t>(sampler_info.samplers.size());
@@ -2468,11 +2470,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 }
 
 template <typename Images>
-bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan) {
-	if (base.samplers.size() > plan.mapping.size()) {
+bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan,
+                      uint32_t capacity) {
+	if (base.samplers.size() > capacity) {
 		return false;
 	}
-	std::array<uint8_t, ShaderInfo::MaxSamplers> usage {};
+	plan.mapping.resize(base.samplers.size());
+	plan.bindings.resize(base.samplers.size());
+	std::vector<uint8_t> usage(base.samplers.size());
 	plan.sampler_count = static_cast<uint32_t>(base.samplers.size());
 	for (const auto& pair: base.sampled_pairs) {
 		if (pair.image >= images.size() || pair.sampler >= base.samplers.size()) {
@@ -2487,8 +2492,12 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 		bool       first   = true;
 		for (uint32_t type = 0; type < mapping.size(); type++) {
 			if ((classes & (1u << type)) == 0u) continue;
-			const auto target = first ? index : plan.sampler_count++;
-			if (target >= ShaderInfo::MaxSamplers) return false;
+			const auto target = first ? index : plan.sampler_count;
+			if (target >= capacity) return false;
+			if (!first) {
+				++plan.sampler_count;
+				plan.bindings.emplace_back();
+			}
 			mapping[type]         = target;
 			plan.bindings[target] = {index, static_cast<SamplerClass>(type)};
 			first                = false;
@@ -2984,7 +2993,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		    specialization.sampler_depth_compare_funcs[index];
 	}
 	SamplerPlan sampler_plan;
-	EXIT_IF(!BuildSamplerPlan(sampler_info, images, sampler_plan));
+	// Materialization validates the class-expanded count against the host ceiling.
+	// Applying that specialization reconstructs the same mapping without a device.
+	EXIT_IF(!BuildSamplerPlan(sampler_info, images, sampler_plan, UINT32_MAX));
 	auto samplers      = sampler_info.samplers;
 	auto sampled_pairs = sampler_info.sampled_pairs;
 	samplers.reserve(sampler_plan.sampler_count);

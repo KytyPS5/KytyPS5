@@ -1573,7 +1573,8 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
 CompiledShader CompileCase(const TestCase &test,
     const ShaderRecompiler::ComputeWorkgroupLimits& workgroup_limits = {},
     const ShaderRecompiler::ShaderHostProfile& host_profile = {},
-    u32 max_dense_buffers = ShaderRecompiler::IR::ShaderInfo::MaxBuffers) {
+    u32 max_dense_buffers = ShaderRecompiler::IR::ShaderInfo::MaxBuffers,
+    u32 max_native_samplers = ShaderRecompiler::IR::ShaderInfo::MaxSamplers) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1620,6 +1621,7 @@ CompiledShader CompileCase(const TestCase &test,
           test.buffer_addresses_are_backing_offsets ? ReadTestMemory : nullptr,
       .compute_workgroups = std::array{test.dispatch_x, test.dispatch_y, test.dispatch_z},
       .max_dense_buffers = max_dense_buffers,
+      .max_native_samplers = max_native_samplers,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -2103,6 +2105,9 @@ public:
   [[nodiscard]] vk::Device Device() const { return m_device; }
   [[nodiscard]] u32 DenseBufferCapacity() const {
     return StorageBufferDescriptorCeiling(m_physical_device.getProperties().limits);
+  }
+  [[nodiscard]] u32 NativeSamplerCapacity() const {
+    return SamplerDescriptorCeiling(m_physical_device.getProperties().limits);
   }
   void CheckDescriptorCapacity(const TestCase& test, const CompiledShader& compiled) const {
     std::vector<DescriptorBudgetBinding> bindings;
@@ -21748,7 +21753,7 @@ void CompareGraphicsWords(const GraphicsCase &test,
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   if (test.companion_check != nullptr) test.companion_check();
-  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->WorkgroupLimits() : ShaderRecompiler::ComputeWorkgroupLimits{}, vulkan != nullptr ? vulkan->HostProfile() : ShaderRecompiler::ShaderHostProfile{}, vulkan != nullptr ? vulkan->DenseBufferCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxBuffers);
+  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->WorkgroupLimits() : ShaderRecompiler::ComputeWorkgroupLimits{}, vulkan != nullptr ? vulkan->HostProfile() : ShaderRecompiler::ShaderHostProfile{}, vulkan != nullptr ? vulkan->DenseBufferCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxBuffers, vulkan != nullptr ? vulkan->NativeSamplerCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxSamplers);
   if (test.check_shader_swizzle && test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -38598,13 +38603,14 @@ enum class MaterialImageSampleMode {
   FullStaticSampler,
 };
 
-TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode) {
+TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
+                                         bool expanded_samplers = false) {
   using O = ShaderOpcode;
   constexpr u32 material_base = 128u;
   constexpr u32 index_base = 64u;
   const bool full_inline = mode == MaterialImageSampleMode::FullStaticSampler;
   const u32 material_stride = full_inline ? 440u : 872u;
-  constexpr u32 material_count = 4u;
+  const u32 material_count = expanded_samplers ? 32u : 4u;
   constexpr uint64_t image_a_address = 0x100000u;
   constexpr uint64_t image_b_address = 0x200000u;
   constexpr u32 raw_table_base = 4096u;
@@ -38613,7 +38619,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode) {
   const bool image_table = mode == MaterialImageSampleMode::ImageTableDynamicSampler;
   const bool dynamic_sampler = mode == MaterialImageSampleMode::CompactDynamicSampler || image_table;
   const u32 image_offset = full_inline ? 0u : dynamic_sampler ? 152u : 588u;
-  const u32 iteration_count = image_table ? 5u : material_count;
+  const u32 iteration_count = expanded_samplers ? 4u : image_table ? 5u : material_count;
 
   TestCase test;
   test.name = full_inline ? "ImageSampleLzFullDynamicMaterialStaticSampler"
@@ -38631,11 +38637,19 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode) {
   const u32 backing_size = image_table ? raw_table_base + raw_table_offset + 2u * 32u
                                       : material_base + material_count * material_stride;
   test.initial.resize(backing_size / 4u);
-  const std::array keys{2u, 0u, 3u, 1u, 5u};
+  const auto keys = expanded_samplers ? std::array{0u, 30u, 31u, 33u, 5u}
+                                      : std::array{2u, 0u, 3u, 1u, 5u};
   std::copy_n(keys.begin(), iteration_count, test.initial.begin() + index_base / 4u);
   test.expected = {std::bit_cast<u32>(80.0f), std::bit_cast<u32>(8.0f),
                    std::bit_cast<u32>(dynamic_sampler ? 20.0f : 80.0f),
                    std::bit_cast<u32>(dynamic_sampler ? 2.0f : 8.0f)};
+  if (expanded_samplers) {
+    test.name = "Inline33NativeSamplers";
+    test.expected = {std::bit_cast<u32>(8.0f), std::bit_cast<u32>(80.0f),
+                     std::bit_cast<u32>(20.0f), 0u};
+    test.expected_dense_images = 33u;
+    test.expected_sampled_pairs = 33u;
+  }
   if (image_table) {
     // Out-of-bounds material reads yield index zero and a zero (repeat) sampler.
     test.expected.push_back(std::bit_cast<u32>(2.0f));
@@ -38668,7 +38682,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode) {
         static_cast<u32>(clamp_x) |
             (static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel) << 3u) |
             (static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel) << 6u),
-        0u, 0u, 0u};
+        expanded_samplers ? 0x00fff000u | (record + 1u) : 0u, 0u, 0u};
     const std::array image{
         static_cast<u32>(image_address >> 8u),
         (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) |
@@ -49120,6 +49134,16 @@ if (argc == 1) {
     VulkanHarness vulkan;
     RunCase(&vulkan, SampledPairOperandDomain());
     std::puts("KYTY_SAMPLED_PAIR_OPERAND_DOMAIN_GPU_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--inline-native-sampler-capacity-only") == 0) {
+    VulkanHarness vulkan;
+    std::printf("native sampler descriptor ceiling=%u\n", vulkan.NativeSamplerCapacity());
+    RunCase(&vulkan, MakeImageSampleDynamicMaterials(
+        MaterialImageSampleMode::CompactDynamicSampler, true));
+    RunCase(&vulkan, MakeImageSampleDynamicMaterials(
+        MaterialImageSampleMode::CompactDynamicSampler));
+    std::puts("KYTY_INLINE_NATIVE_SAMPLER_CAPACITY_GPU_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--shared-inline-images-only") == 0) {

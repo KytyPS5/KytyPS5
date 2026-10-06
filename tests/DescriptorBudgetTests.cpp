@@ -111,6 +111,22 @@ void TestSamplersAndCombinedImages() {
 	ExpectFailure(bindings, limits, "maxDescriptorSetSamplers", 136, 135, 0);
 }
 
+void TestNativeSamplerCeiling() {
+  auto limits = GenerousLimits();
+  limits.maxPerStageDescriptorSamplers = 64u;
+  limits.maxDescriptorSetSamplers = 96u;
+  limits.maxPerStageResources = 0u;
+  Check(SamplerDescriptorCeiling(limits) == 64u, "sampler stage ceiling was ignored");
+  limits.maxDescriptorSetSamplers = 33u;
+  Check(SamplerDescriptorCeiling(limits) == 33u, "sampler layout ceiling was ignored");
+  const std::array separate{
+      DescriptorBudgetBinding{VK_DESCRIPTOR_TYPE_SAMPLER, 32u, VK_SHADER_STAGE_VERTEX_BIT},
+      DescriptorBudgetBinding{VK_DESCRIPTOR_TYPE_SAMPLER, 2u, VK_SHADER_STAGE_FRAGMENT_BIT}};
+  ExpectFailure(separate, limits, "maxDescriptorSetSamplers", 34u, 33u, 0u);
+  limits.maxPerStageDescriptorSamplers = 0u;
+  Check(SamplerDescriptorCeiling(limits) == 0u, "zero sampler ceiling was ignored");
+}
+
 void TestSeparateSampledOperandBudget() {
 	// 257 images x two samplers describe 514 uses, but only 259 descriptors.
 	auto limits = GenerousLimits();
@@ -234,6 +250,7 @@ int main() {
 	TestNativeArraysAndAuxiliaryBuffers();
 	TestGraphicsStagesAndSharedVisibility();
 	TestSamplersAndCombinedImages();
+	TestNativeSamplerCeiling();
 	TestSeparateSampledOperandBudget();
 	TestTexelBufferAndInputTypes();
 	TestDynamicBuffers();

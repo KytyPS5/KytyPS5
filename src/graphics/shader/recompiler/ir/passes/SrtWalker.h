@@ -37,6 +37,9 @@ struct SrtRuntime {
 	// renderer supplies its actual stage/set ceiling; offline callers retain
 	// the conservative compiler policy. The final layout budget includes extras.
 	uint32_t max_dense_buffers = ShaderInfo::MaxBuffers;
+	// Expanded sampler candidates and numeric-class variants consume native
+	// descriptors independently of the original logical guest sampler count.
+	uint32_t max_native_samplers = ShaderInfo::MaxSamplers;
 };
 
 // A raw scalar read bounded by a loop guard or one actual dispatch axis.

@@ -522,25 +522,48 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
-		auto& image = cache.GetImage(depth.image_id);
-		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
+		EXIT_IF(image_view == nullptr ||
+		        cache.GetImage(depth.image_id).backing.samples != depth.desc.info.samples);
 		const auto draw_writes = depth.AttachmentWriteAspects();
+		const bool feedback_loops = m_context.GetGraphics().attachment_feedback_loop_enabled;
 		vk::ImageAspectFlags sampled_aspects;
-		for (const auto* stage: stages) {
-			for (const auto& binding: stage->images) {
+		for (auto* stage: stages) {
+			for (auto& binding: stage->images) {
 				if (binding.image_id != depth.image_id ||
 				    binding.desc.type != TextureCache::BindingType::Texture) continue;
-				const auto native =
-				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
-				EXIT_IF(native == image.views.end());
-				sampled_aspects |= native->info.aspect;
-				feedback_aspects |= DepthFeedbackAspects(draw_writes, depth.desc.view_info,
-				                                         native->info);
+				const auto& views = cache.GetImage(depth.image_id).views;
+				const auto  native =
+				    std::ranges::find(views, binding.image_view, &CachedImageView::view);
+				EXIT_IF(native == views.end());
+				const auto info     = native->info;
+				const auto feedback = DepthFeedbackAspects(draw_writes, depth.desc.view_info, info);
+				if (feedback && !feedback_loops) {
+					// The host cannot sample an attachment the draw writes: sample a copy of the
+					// depth image from before the draw instead.
+					std::vector<ImageViewInfo> mip_infos;
+					for (const auto mip_view: binding.mip_views) {
+						const auto found =
+						    std::ranges::find(views, mip_view, &CachedImageView::view);
+						EXIT_IF(found == views.end());
+						mip_infos.push_back(found->info);
+					}
+					const auto copy_id = cache.CopyDepthForFeedback(
+					    depth.image_id,
+					    {info.base_level, info.level_count, info.base_layer, info.layer_count},
+					    info.aspect);
+					auto& copy         = cache.GetImage(copy_id);
+					binding.image_id   = copy_id;
+					binding.image_view = copy.FindView(info);
+					for (size_t i = 0; i < mip_infos.size(); i++) {
+						binding.mip_views[i] = copy.FindView(mip_infos[i]);
+					}
+					continue;
+				}
+				sampled_aspects |= info.aspect;
+				feedback_aspects |= feedback;
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
-		}
+		auto& image = cache.GetImage(depth.image_id);
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled

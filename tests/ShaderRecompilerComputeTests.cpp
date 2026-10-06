@@ -15741,6 +15741,13 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  // Hosts without attachment feedback loops: the same depth read/write draws through a copy.
+  void CheckRasterizationWithoutFeedbackLoops() {
+    m_runtime_context.attachment_feedback_loop_enabled = false;
+    CheckRasterization(true);
+    m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+  }
+
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
@@ -15961,11 +15968,16 @@ public:
           executor, command, &color, 1, depth, stages, &feedback_aspects);
       const bool feedback_enabled = rendering.depth_stencil_attachment.image_layout ==
                                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+      // Without attachment feedback loops the draw samples a copy of the depth target instead.
+      const bool feedback_loops = m_runtime_context.attachment_feedback_loop_enabled;
+      const bool depth_read_write = depth_feedback && depth.depth_write_enable;
       Require(name, "per-draw depth feedback",
-              feedback_enabled == (depth_feedback && depth.depth_write_enable) &&
+              feedback_enabled == (feedback_loops && depth_read_write) &&
                   feedback_aspects == (feedback_enabled
                                           ? vk::ImageAspectFlagBits::eDepth
-                                          : vk::ImageAspectFlags{}),
+                                          : vk::ImageAspectFlags{}) &&
+                  (feedback_loops || !depth_read_write ||
+                   bindings.pixel->images[0].image_id != depth.image_id),
               "feedback was not selected only for an overlapping fragment depth read/write");
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], *bindings.pixel);
@@ -42580,6 +42592,7 @@ int main(int argc, char **argv) {
     CheckDepthTextureEncoding();
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterizationWithoutFeedbackLoops();
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
@@ -42682,6 +42695,7 @@ int main(int argc, char **argv) {
   if (rasterization) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterizationWithoutFeedbackLoops();
   } else {
     skipped_device_checks = true;
   }

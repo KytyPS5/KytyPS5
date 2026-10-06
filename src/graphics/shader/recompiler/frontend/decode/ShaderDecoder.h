@@ -382,6 +382,7 @@ enum class Opcode {
 	V_CMPX_LG_F32,
 	V_CMPX_GE_F32,
 	V_CMPX_O_F32,
+	V_CMPX_U_F32,
 	V_CMPX_NGE_F32,
 	V_CMPX_NLG_F32,
 	V_CMPX_NGT_F32,

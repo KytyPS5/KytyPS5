@@ -3244,6 +3244,70 @@ void TestGuardedScalarDescriptorReads() {
   }
 }
 
+// A block that is certain to run and has a single successor passes its certainty on: nothing is
+// left to the wave, so a failed read in the successor must fail the refresh instead of being skipped.
+void TestSingleSuccessorKeepsCertainty() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *optional = fixture.AddBlock();
+  auto *done = fixture.AddBlock();
+  entry->AddBranch(optional);
+  entry->AddBranch(done);
+  optional->AddBranch(done);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+  fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 2};
+  fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+  const auto control = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                      fixture.UserData(2), fixture.UserData(3)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  scalar.offset = 28;
+  const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(0u)},
+                                 fixture.AddMemory(scalar, 4));
+  // The condition comes from memory, so the walker decides it and `optional` is certain to run.
+  fixture.program.block_info[0].condition = fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
+  fixture.block = done;
+  const auto root = fixture.Address(fixture.UserData(4), Value(0u));
+  MemoryInfo address;
+  address.kind = ResourceKind::ScalarAddress;
+  const auto pointer = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {root, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(address, 8));
+  const auto table = fixture.Address(pointer, Value(0u));
+  std::array<Value, 4> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    address.offset = 40 + word * 4;
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {table, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(address, 12));
+  }
+  scalar.offset = 0;
+  fixture.Emit(ValueOpcode::ReadConstBuffer, {fixture.Buffer(words), Value(0u)},
+               fixture.AddMemory(scalar, 16));
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+      {fixture.Buffer({Value(0x9000u), Value(0u), Value(4u), Value(0u)}),
+       Value(0u), Value(0u), Value(0u), Value(1u), Value(true)}, fixture.AddMemory(store, 20));
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  Check(plan.control_flow.size() == 3 && !plan.control_flow[2].srt_reads.empty(),
+        "single-successor fixture lost its flattened read");
+  LinearTestMemory memory;
+  const std::array<uint32_t, 5> user_data{0x1000u, 0u, 64u, 0u, 0x1040u};
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                           .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  memory.words[7] = 1;  // `optional` runs, its only successor holds the read of the null table
+  std::vector<uint32_t> flat;
+  Check(!SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+        "successor of a certain block with a null descriptor table was treated as speculative");
+  memory.words[0x40 / 4] = 0x1080u;
+  memory.words[0xa8 / 4] = 0x2000u;
+  memory.words[0xb0 / 4] = 4u;
+  Check(SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+        "readable descriptor table in the certain successor was rejected");
+}
+
 void TestConservativeBufferReachability() {
   std::array<uint32_t, 8> user_data{
       0x1000, 16u << 16u, 1, 0x4dfac,
@@ -3661,6 +3725,7 @@ int main() {
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
+    Run("single successor keeps certainty", TestSingleSuccessorKeepsCertainty);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);

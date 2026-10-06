@@ -59,6 +59,7 @@ struct WindowContext {
 	std::unique_ptr<DlssFrameGeneration> frame_generation;
 	WindowLoopState                loop;
 	uint64_t title_fps_start = 0, title_frame_number = 0, title_fps_frames = 0;
+	uint64_t title_fg_display_start = 0;
 	bool title_initialized = false;
 
 	Common::Mutex mutex;

@@ -45,6 +45,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Same family as the renderer: no queue-family ownership transfers.
+	vk::Queue                          present_queue = nullptr;
+	Common::Mutex                      present_queue_mutex;
+	uint32_t                           present_queue_index = 0;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

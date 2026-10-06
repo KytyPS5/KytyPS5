@@ -26,6 +26,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -415,11 +416,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const std::array queue_priorities {1.0f, 1.0f};
+	const auto queue_families = physical_device.getQueueFamilyProperties();
+	graphics.present_queue_index = Config::DlssFrameGenerationEnabled() &&
+	    queue_families[queue_family].queueCount > 1 ? 1u : 0u;
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = graphics.present_queue_index + 1;
+	queue_create_info.pQueuePriorities = queue_priorities.data();
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -1053,6 +1057,7 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
+	graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.present_queue_index, &graphic_ctx.present_queue);
 	frame_generation->OnDevice(graphic_ctx);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 
@@ -1094,6 +1099,7 @@ WindowContext::~WindowContext() {
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;
 		graphic_ctx.queue  = nullptr;
+		graphic_ctx.present_queue = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);

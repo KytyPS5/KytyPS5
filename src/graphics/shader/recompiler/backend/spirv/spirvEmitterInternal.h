@@ -156,6 +156,9 @@ struct EmitterState {
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
+	uint32_t                   motion_previous_variable              = 0;
+	uint32_t                   motion_valid_variable                 = 0;
+	uint32_t                   motion_output_variable                = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
@@ -361,6 +364,9 @@ uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name);
 void     DefineModule(EmitterState& state);
+bool GeometryMotionEnabled(const EmitterState& state);
+void DefineGeometryMotion(EmitterState& state);
+void EmitGeometryMotion(EmitterState& state);
 void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,

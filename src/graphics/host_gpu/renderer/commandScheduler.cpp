@@ -93,8 +93,10 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics, bool presentation)
     : m_master(graphics), m_context(context), m_graphics(graphics),
+      m_queue(presentation && graphics.present_queue ? graphics.present_queue : graphics.queue),
+      m_queue_mutex(m_queue != graphics.queue ? graphics.present_queue_mutex : graphics.queue_mutex),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
@@ -350,13 +352,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	EXIT_IF(m_queue == nullptr);
 
 	vk::Result result;
 	uint64_t   tick;
 	{
-		Common::LockGuard lock(graphics.queue_mutex);
+		Common::LockGuard lock(m_queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 
@@ -376,7 +377,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = m_queue.submit(1, &submit_info, nullptr);
 	}
 
 	if (result != vk::Result::eSuccess) {

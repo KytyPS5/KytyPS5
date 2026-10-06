@@ -37,6 +37,7 @@ struct RenderState {
 	uint32_t                                                   num_layers            = 1;
 	uint32_t                                                   num_color_attachments = 0;
 	uint32_t                                                   raster_scale_percent  = 100;
+	bool                                                       geometry_motion_attachment = false;
 
 	bool operator==(const RenderState&) const = default;
 };

@@ -52,6 +52,8 @@ struct RasterScaler::Impl {
 	std::array<std::unique_ptr<Image>, RENDER_COLOR_ATTACHMENTS_MAX + 1> images;
 	RenderState original {}, effective {};
 	bool active = false;
+	bool color_sources_ready = false;
+	std::array<std::pair<uint64_t, uint64_t>, RENDER_COLOR_ATTACHMENTS_MAX> color_versions {};
 	bool logged = false;
 
 	bool Supported(const RenderAttachment& attachment) const {
@@ -79,6 +81,15 @@ struct RasterScaler::Impl {
 		auto& guest = *attachment.image;
 		auto& scaled = *images[slot];
 		const auto aspects = Aspects(attachment);
+		const bool clears_all = attachment.has_depth || attachment.has_stencil ?
+		    (!attachment.has_depth || attachment.depth_clear) && (!attachment.has_stencil || attachment.stencil_clear) :
+		    attachment.is_clear;
+		if (!store && clears_all) {
+			// Keep mixed depth/stencil LOAD operations intact. Only omit a copy
+			// when the render pass clears every aspect it could have loaded.
+			scaled.Transit(attachment.image_layout, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite, {}, command);
+			return;
+		}
 		// Do not change the original Image's tracked state: a caller may already
 		// have computed its next barrier before EndRendering is invoked. Restore
 		// exactly the layout that barrier expects before returning.
@@ -132,6 +143,7 @@ struct RasterScaler::Impl {
 		view.type = original.num_layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
 		view.usage = attachment.has_depth || attachment.has_stencil ? vk::ImageUsageFlagBits::eDepthStencilAttachment : vk::ImageUsageFlagBits::eColorAttachment;
 		output.image_view = image->FindView(view);
+		output.image = image.get();
 	}
 };
 
@@ -143,6 +155,7 @@ const RenderState& RasterScaler::Begin(vk::CommandBuffer command, const RenderSt
 	auto& impl = *m_impl;
 	impl.original = impl.effective = state;
 	impl.active = false;
+	impl.color_sources_ready = false;
 	if (state.raster_scale_percent >= 100 || state.width < 64 || state.height < 64 ||
 	    !impl.Supported(state.depth_stencil_attachment) ||
 	    !std::ranges::all_of(state.color_attachments, [&](const auto& a) { return impl.Supported(a); }) ||
@@ -154,6 +167,7 @@ const RenderState& RasterScaler::Begin(vk::CommandBuffer command, const RenderSt
 	}
 	impl.Prepare(command, RENDER_COLOR_ATTACHMENTS_MAX, state.depth_stencil_attachment, impl.effective.depth_stencil_attachment);
 	impl.active = true;
+	RefreshSourceVersions();
 	if (!impl.logged) {
 		Log::WriteToConsoleAndLog(fmt::format("Render scale active: {}%; raster attachments {}x{} -> {}x{}\n",
 		    state.raster_scale_percent, state.width, state.height, impl.effective.width, impl.effective.height));
@@ -173,6 +187,32 @@ void RasterScaler::End(vk::CommandBuffer command) {
 	if (impl.original.depth_stencil_attachment.image_view) {
 		impl.Transfer(command, RENDER_COLOR_ATTACHMENTS_MAX, impl.original.depth_stencil_attachment, true);
 	}
+	impl.color_sources_ready = true;
 }
 const RenderState& RasterScaler::State() const { return m_impl->effective; }
+
+void RasterScaler::RefreshSourceVersions() {
+	auto& impl = *m_impl;
+	if (!impl.active) return;
+	for (uint32_t slot = 0; slot < impl.original.num_color_attachments; ++slot) {
+		const auto* image = impl.original.color_attachments[slot].image;
+		impl.color_versions[slot] = image ? image->ContentVersion() : std::pair<uint64_t, uint64_t> {};
+	}
+}
+
+Image* RasterScaler::ColorSource(const Image& image) const {
+	const auto& impl = *m_impl;
+	if (!impl.color_sources_ready || image.IsCpuDirty() || image.IsBufferModified() ||
+	    impl.original.num_layers != 1 || image.backing.layers != 1 ||
+	    image.backing.extent.width != impl.original.width ||
+	    image.backing.extent.height != impl.original.height) return nullptr;
+	for (uint32_t slot = 0; slot < impl.original.num_color_attachments; ++slot) {
+		const auto& attachment = impl.original.color_attachments[slot];
+		if (attachment.image == &image && attachment.image_view && attachment.mip_level == 0 &&
+		    attachment.base_layer == 0 && image.ContentVersion() == impl.color_versions[slot]) {
+			return impl.images[slot].get();
+		}
+	}
+	return nullptr;
+}
 } // namespace Libs::Graphics

@@ -94,6 +94,7 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
+	EmitGeometryMotion(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 

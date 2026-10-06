@@ -18,7 +18,7 @@ namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
-	CommandScheduler(RenderContext& context, GraphicContext& graphics);
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, bool presentation = false);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -87,6 +87,8 @@ private:
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
+	vk::Queue                    m_queue;
+	Common::Mutex&               m_queue_mutex;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;

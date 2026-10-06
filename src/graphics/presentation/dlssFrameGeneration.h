@@ -17,6 +17,7 @@ struct DlssFgInputs {
 	bool pending = false;
 	DlssFgInputs();
 	~DlssFgInputs();
+	[[nodiscard]] bool Ready(GraphicContext& graphics) const;
 	void Wait(GraphicContext& graphics);
 };
 bool CaptureDlssFgInputs(GraphicContext& graphics, CommandScheduler& scheduler, CommandBuffer& command,
@@ -39,8 +40,11 @@ public:
 	[[nodiscard]] bool Available() const;
 	[[nodiscard]] bool Hooked() const;
 	[[nodiscard]] bool Enabled() const;
+	[[nodiscard]] bool Foreground() const;
 	// Returns true when switching mode requires swapchain recreation.
 	bool SetEnabled(bool enabled);
+	// Reflex may sleep: call before acquiring the renderer mutex.
+	bool BeginFrame();
 	bool TagFrame(CommandBuffer& command, DlssFgInputs& inputs, vk::Extent2D output);
 	void PresentStart();
 	void PresentEnd(DlssFgInputs* inputs = nullptr, bool new_frame = true);

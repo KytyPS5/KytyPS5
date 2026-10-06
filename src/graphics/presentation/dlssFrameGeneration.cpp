@@ -22,6 +22,14 @@
 namespace Libs::Graphics {
 DlssFgInputs::DlssFgInputs() = default;
 DlssFgInputs::~DlssFgInputs() = default;
+bool DlssFgInputs::Ready(GraphicContext& graphics) const {
+	if (!pending) return true;
+	// Without a completion timeline, only the existing drain can prove safety.
+	if (!completion) return false;
+	uint64_t counter = 0;
+	RequireVulkanSuccess(graphics.device.getSemaphoreCounterValue(completion, &counter), "query Frame Generation inputs");
+	return counter >= completion_value;
+}
 void DlssFgInputs::Wait(GraphicContext& graphics) {
 	if (!pending) return;
 	// Zero is a valid timeline value (no input work queued yet). Draining the
@@ -90,6 +98,7 @@ struct DlssFrameGeneration::Impl {
 	uint64_t total_presented = 0;
 #if defined(KYTY_HAS_DLSS_FG)
 	HMODULE module = nullptr;
+	HWND window = nullptr;
 	PFN_vkGetInstanceProcAddr proxy = nullptr;
 	PFN_vkGetInstanceProcAddr native = nullptr;
 	GraphicContext* graphics = nullptr;
@@ -231,6 +240,7 @@ bool DlssFrameGeneration::CreateSurface(SDL_Window* window, vk::Instance instanc
 		info.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
 		info.hinstance = GetModuleHandleW(nullptr);
 		info.hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+		m_impl->window = info.hwnd;
 		if (!create || !info.hwnd || create(instance, &info, nullptr, &native) != VK_SUCCESS) return false;
 		surface = native;
 		return true;
@@ -319,6 +329,13 @@ void DlssFrameGeneration::OnDevice(GraphicContext& graphics) {
 bool DlssFrameGeneration::Available() const { return m_impl->available; }
 bool DlssFrameGeneration::Hooked() const { return m_impl->initialized; }
 bool DlssFrameGeneration::Enabled() const { return m_impl->enabled; }
+bool DlssFrameGeneration::Foreground() const {
+#if defined(KYTY_HAS_DLSS_FG)
+	return m_impl->window && GetForegroundWindow() == m_impl->window;
+#else
+	return false;
+#endif
+}
 
 bool DlssFrameGeneration::SetEnabled(bool enabled) {
 #if defined(KYTY_HAS_DLSS_FG)
@@ -328,6 +345,9 @@ bool DlssFrameGeneration::SetEnabled(bool enabled) {
 	sl::DLSSGOptions options {};
 	options.mode = enabled ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
 	options.numFramesToGenerate = 1;
+	// Snapshots are owned by prepared frames and waited on before reuse.
+	// Allow guest submissions to run while the SDK processes interpolation.
+	options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockNoClientQueues;
 	const auto result = impl.options(sl::ViewportHandle(0), options);
 	if (result != sl::Result::eOk) {
 		LOGF("DLSS Frame Generation mode change failed: %u\n", uint32_t(result));
@@ -342,10 +362,35 @@ bool DlssFrameGeneration::SetEnabled(bool enabled) {
 #endif
 }
 
+bool DlssFrameGeneration::BeginFrame() {
+#if defined(KYTY_HAS_DLSS_FG)
+	auto& impl = *m_impl;
+	if (!impl.enabled) return false;
+	impl.token = nullptr;
+	const auto result = impl.get_token(impl.token, nullptr);
+	if (result != sl::Result::eOk || !impl.token) {
+		LOGF("DLSS Frame Generation frame token failed: %u\n", uint32_t(result));
+		impl.available = false;
+		return false;
+	}
+	const auto sleep_result = impl.sleep(*impl.token);
+	if (sleep_result != sl::Result::eOk) {
+		LOGF("DLSS Frame Generation Reflex sleep failed: %u\n", uint32_t(sleep_result));
+		impl.available = false;
+		return false;
+	}
+	impl.Mark(sl::PCLMarker::eSimulationStart);
+	impl.Mark(sl::PCLMarker::eSimulationEnd);
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool DlssFrameGeneration::TagFrame(CommandBuffer& command, DlssFgInputs& inputs, vk::Extent2D output) {
 #if defined(KYTY_HAS_DLSS_FG)
 	auto& impl = *m_impl;
-	if (!impl.enabled || !inputs.depth || !inputs.motion) return false;
+	if (!impl.enabled || !impl.token || !inputs.depth || !inputs.motion) return false;
 	const auto accept = [&](sl::Result result, const char* operation) {
 		if (result == sl::Result::eOk) return true;
 		LOGF("DLSS Frame Generation %s failed: %u\n", operation, uint32_t(result));
@@ -353,13 +398,6 @@ bool DlssFrameGeneration::TagFrame(CommandBuffer& command, DlssFgInputs& inputs,
 		return false;
 	};
 	++impl.frame_index;
-	// Share one SDK-issued token between constants, tags and latency markers.
-	impl.token = nullptr;
-	if (!accept(impl.get_token(impl.token, nullptr), "frame token")) return false;
-	const auto sleep_result = impl.sleep(*impl.token);
-	if (sleep_result != sl::Result::eOk) LOGF("FG Reflex sleep failed: %u\n", uint32_t(sleep_result));
-	impl.Mark(sl::PCLMarker::eSimulationStart);
-	impl.Mark(sl::PCLMarker::eSimulationEnd);
 	impl.Mark(sl::PCLMarker::eRenderSubmitStart);
 	sl::Constants constants {};
 	const sl::float4x4 identity {{{1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1}}};

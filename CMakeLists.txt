@@ -52,6 +52,10 @@ if(BUILD_TESTING)
 	add_executable(frame_pacer_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FramePacerTests.cpp")
 	target_include_directories(frame_pacer_tests PRIVATE "${KYTY_SOURCE_DIR}")
 	add_test(NAME presentation_frame_pacer COMMAND frame_pacer_tests)
+	add_executable(prepared_frame_selection_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PreparedFrameSelectionTests.cpp")
+	target_include_directories(prepared_frame_selection_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME prepared_frame_selection COMMAND prepared_frame_selection_tests)
+	set_tests_properties(prepared_frame_selection PROPERTIES LABELS "presentation;headless")
 endif()
 
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
@@ -419,6 +423,8 @@ if(KYTY_ENABLE_DLSS)
 	configure_windows_image_layout(dlss_gpu_tests)
 	deploy_kyty_dlss(dlss_gpu_tests)
 	add_test(NAME dlss_gpu COMMAND dlss_gpu_tests)
+	add_test(NAME dlss_quality_cost COMMAND dlss_gpu_tests --quality-cost)
+	set_tests_properties(dlss_quality_cost PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss;headless")
 	add_test(NAME dlss_window_device COMMAND dlss_gpu_tests --window-device)
 	add_test(NAME dlss_window_device_off COMMAND dlss_gpu_tests --window-device-off)
 	if(KYTY_ENABLE_DLSS_FG)
@@ -430,13 +436,13 @@ if(KYTY_ENABLE_DLSS)
 		set_tests_properties(dlss_frame_generation_validation_fallback dlss_frame_generation_extension_fallback PROPERTIES TIMEOUT 60 LABELS "gpu;dlss")
 	endif()
 	add_test(NAME dlss_emulator_presentation COMMAND dlss_gpu_tests --emulator-presentation)
-	foreach(regression srgb fallback pool)
+	foreach(regression srgb fallback pool detail)
 		add_test(NAME dlss_presentation_${regression} COMMAND dlss_gpu_tests --presentation-regression ${regression})
 		set_tests_properties(dlss_presentation_${regression} PROPERTIES LABELS "gpu;dlss")
 	endforeach()
 	add_test(NAME presentation_window_title COMMAND dlss_gpu_tests --window-title-timing)
 	set_tests_properties(presentation_window_title PROPERTIES TIMEOUT 15)
-	set_tests_properties(dlss_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss")
+	set_tests_properties(dlss_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss;headless")
 	set_tests_properties(dlss_window_device dlss_window_device_off dlss_emulator_presentation PROPERTIES LABELS "gpu;dlss")
 endif()
 
@@ -730,6 +736,7 @@ if(BUILD_TESTING)
 
 	add_custom_target(kyty_tests DEPENDS
 		frame_pacer_tests
+		prepared_frame_selection_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

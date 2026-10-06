@@ -202,7 +202,7 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 }
 
 void DefineDescriptors(EmitterState& state) {
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	if (state.program.bindings.UsesPushData() || GeometryMotionEnabled(state) || state.program.stage == ShaderType::Mesh ||
 	    (state.program.stage == ShaderType::Pixel && state.input_info.pixel->raster_scale_dword != UINT32_MAX)) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
@@ -453,6 +453,14 @@ void DefineInputs(EmitterState& state) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
 	}
+	if (GeometryMotionEnabled(state)) {
+		if (state.program.stage == ShaderType::Vertex) {
+			add_builtin(IR::StageInputKind::VertexIndex, 1, "gl_VertexIndex");
+			add_builtin(IR::StageInputKind::InstanceIndex, 1, "gl_InstanceIndex");
+		} else {
+			add_builtin(IR::StageInputKind::FragCoord, 4, "gl_FragCoord");
+		}
+	}
 	for (auto& input: state.inputs) {
 		if (state.program.stage == ShaderType::Pixel &&
 		    input.kind == IR::StageInputKind::Parameter) {
@@ -649,6 +657,7 @@ void DefineModule(EmitterState& state) {
 	                                  state.program.info.outputs.size());
 	DefineInputs(state);
 	DefineOutputs(state);
+	DefineGeometryMotion(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
 	if (state.requirements.function_lds) {
@@ -686,7 +695,7 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma) {
+	if (state.program.info.uses_dma || (GeometryMotionEnabled(state) && state.program.stage == ShaderType::Vertex)) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -747,7 +756,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel((state.program.info.uses_dma || (GeometryMotionEnabled(state) && state.program.stage == ShaderType::Vertex))
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);

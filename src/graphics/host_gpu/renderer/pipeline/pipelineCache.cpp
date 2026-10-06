@@ -587,7 +587,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, bool allow_geometry_motion) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -682,6 +682,47 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	}
+	// Reserve spare interfaces only when ordinary guest vertex/fragment stages
+	// leave them unused. This is based on shader interfaces, never title hashes.
+	using namespace ShaderRecompiler;
+	const auto& vs = *vertex_info[0].stage.program;
+	std::vector<uint32_t> active_pixel_inputs;
+	if (pixel_active) {
+		for (const auto& in : pixel_info.stage.program->info.inputs) {
+			if (in.kind == IR::StageInputKind::Parameter) active_pixel_inputs.push_back(in.location);
+		}
+	}
+	const bool motion_candidate = allow_geometry_motion && pixel_active && !mesh_active && !tess_active &&
+	    (Config::GetDlssMode() != Config::DlssMode::Off || Config::DlssFrameGenerationEnabled()) &&
+	    !context.GetClipControl().clip_disable && !pixel_info.dual_source_blending &&
+	    (!context.GetBlendControl(0).enable || context.GetRenderTarget(0).info.blend_bypass) &&
+	    !pixel_info.ps_depth_export_enable && !pixel_info.ps_sample_mask_export_enable &&
+	    !vs.has_address_writes && (vs.param_export_mask & 0xfc000000u) == 0 &&
+	    context.GetRenderTarget(0).attrib.num_fragments == 0 && context.GetDepthZInfo().num_samples == 0 &&
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxColorAttachments >= 8 &&
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxVertexOutputComponents >= 128 &&
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxFragmentInputComponents >= 128 &&
+	    std::ranges::any_of(vs.info.outputs, [](const auto& out) { return out.kind == IR::StageOutputKind::Position; }) &&
+	    std::ranges::all_of(vs.info.outputs, [](const auto& out) {
+		    return out.kind != IR::StageOutputKind::Layer && out.kind != IR::StageOutputKind::ViewportIndex;
+	    }) &&
+	    std::ranges::all_of(pixel_info.stage.program->info.outputs, [](const auto& out) {
+		    return out.kind != IR::StageOutputKind::Mrt || out.index == 0;
+	    }) &&
+	    std::ranges::all_of(pixel_info.stage.program->info.inputs, [&](const auto& in) {
+		    return in.kind != IR::StageInputKind::Parameter ||
+		           ShaderPixelParameterLocation(pixel_info, active_pixel_inputs, in.location) < 26;
+	    });
+	if (motion_candidate) {
+		push_data_cursor = 14; // Addresses, bounds, history, normalized viewport and raster extent.
+		vertex_info[0].geometry_motion_dword = pixel_info.geometry_motion_dword = 0;
+		if (pixel_info.raster_scale_dword != UINT32_MAX) {
+			pixel_info.raster_scale_dword = push_data_cursor;
+			push_data_cursor += 2;
+		}
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.vertex[0] = m_program_cache->Get(vertex_params[0], vertex_info[0], push_data_cursor);
 	}
 	return result;
 }
@@ -794,6 +835,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 				static_params.alpha_destblend[slot] = blend.alpha_destblend;
 			}
 		}
+	}
+	if (ps_active && ps_input_info->geometry_motion_dword != UINT32_MAX) {
+		rendering.color_count = 8;
+		rendering.color_formats[7] = vk::Format::eR16G16B16A16Sfloat;
+		static_params.color_mask[7] = 0xf;
+		static_params.blend_enable[7] = false;
 	}
 	const bool with_depth =
 	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);

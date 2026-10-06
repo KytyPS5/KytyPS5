@@ -270,7 +270,8 @@ bool EmulatorDlssInputs::ResampleColor(CommandBuffer& command, Image& source,
 }
 
 std::optional<DlssFrameInputs> EmulatorDlssInputs::Prepare(CommandBuffer& command, Image& source,
-                                                         vk::Extent2D extent) {
+	                                                         vk::Extent2D extent, bool reconstruct_color,
+	                                                         Image* geometry_motion_depth) {
 	auto& state = *m_impl;
 	const auto limit = state.graphics.physical_device_properties.limits.maxImageDimension2D;
 	if (command.IsInvalid() || &command.GetGraphics() != &state.graphics ||
@@ -297,7 +298,7 @@ std::optional<DlssFrameInputs> EmulatorDlssInputs::Prepare(CommandBuffer& comman
 	push.history = !state.reset;
 	// The first frame samples at the pixel center; temporal sampling starts
 	// only once a corresponding previous image exists.
-	if (!state.reset) {
+	if (!state.reset && reconstruct_color) {
 		push.jitter_x = Halton(state.frames % 32 + 1, 2);
 		push.jitter_y = Halton(state.frames % 32 + 1, 3);
 	}
@@ -314,13 +315,19 @@ std::optional<DlssFrameInputs> EmulatorDlssInputs::Prepare(CommandBuffer& comman
 		state.Dispatch(command, 1, {images.current[level].get(), images.previous[level].get(), coarse},
 		               {target, target, target, target}, push);
 	}
-	state.Dispatch(command, 2, {&source, &source, images.flow[0].get()},
+	push.coarse = reconstruct_color ? 0 : -1;
+	const bool native = geometry_motion_depth && geometry_motion_depth->backing.image &&
+	    geometry_motion_depth->backing.format == vk::Format::eR16G16B16A16Sfloat &&
+	    (geometry_motion_depth->backing.usage & vk::ImageUsageFlagBits::eSampled) &&
+	    geometry_motion_depth->backing.layers == 1 && geometry_motion_depth->backing.samples == 1;
+	if (native) push.history |= 2;
+	state.Dispatch(command, 2, {&source, native ? geometry_motion_depth : &source, images.flow[0].get()},
 	               {images.color.get(), images.depth.get(), images.motion.get(), images.bias.get()}, push);
-	DlssFrameInputs result {images.color.get(), images.depth.get(), images.motion.get()};
+	DlssFrameInputs result {reconstruct_color ? images.color.get() : nullptr, images.depth.get(), images.motion.get()};
 	result.jitter_x = push.jitter_x;
 	result.jitter_y = push.jitter_y;
 	result.reset_history = state.reset;
-	result.bias_current_color = images.bias.get();
+	result.bias_current_color = reconstruct_color ? images.bias.get() : nullptr;
 	state.reset = false;
 	++state.frames;
 	std::swap(images.current, images.previous);

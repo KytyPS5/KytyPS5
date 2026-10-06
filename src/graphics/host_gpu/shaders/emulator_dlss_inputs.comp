@@ -1,6 +1,7 @@
 #version 450
 layout(local_size_x=8, local_size_y=8) in;
 layout(binding=0) uniform sampler2D source_color;
+layout(binding=1) uniform sampler2D geometry_motion_depth;
 layout(binding=2) uniform sampler2D flow;
 layout(binding=3, rgba16f) uniform writeonly image2D target_color;
 layout(binding=4, r32f) uniform writeonly image2D target_depth;
@@ -12,13 +13,26 @@ void main() {
     ivec2 size = imageSize(target_color);
     if (any(greaterThanEqual(p, size))) return;
     vec2 uv = (vec2(p)+.5) / vec2(size);
-    // A positive sample displacement appears as a negative camera jitter.
-    vec4 color = textureLod(source_color, uv - pc.jitter / vec2(size), 0);
     vec4 estimate = textureLod(flow, uv, 0);
     vec2 motion = estimate.xy * vec2(size) / vec2(textureSize(flow, 0));
-    float bias = pc.history == 0 ? 1 : smoothstep(.005, .08, estimate.z);
-    imageStore(target_color, p, color);
-    imageStore(target_depth, p, vec4(.5)); // Explicit neutral image plane, not scene depth.
+    vec4 geometry = vec4(0);
+    if ((pc.history & 2) != 0) {
+        // Coverage is discrete: linear filtering across a silhouette would
+        // mix unrelated positions/depth and manufacture valid history.
+        ivec2 guide_size = textureSize(geometry_motion_depth, 0);
+        geometry = texelFetch(geometry_motion_depth, clamp(ivec2(uv * guide_size), ivec2(0), guide_size - 1), 0);
+    }
+    bool native_motion = geometry.w > .5 && (pc.history & 1) != 0;
+    if (native_motion) motion = geometry.xy * vec2(size);
+    // FG-only presentation uses the original color. Skip unused resampling
+    // and history-mask writes, and keep its input motion unjittered.
+    if (pc.coarse >= 0) {
+        // A positive sample displacement appears as a negative camera jitter.
+        vec4 color = textureLod(source_color, uv - pc.jitter / vec2(size), 0);
+        float bias = (pc.history & 1) == 0 ? 1 : native_motion ? 0 : smoothstep(.005, .08, estimate.z);
+        imageStore(target_color, p, color);
+        imageStore(target_bias, p, vec4(bias));
+    }
+    imageStore(target_depth, p, vec4(abs(geometry.w) > .5 ? geometry.z : .5));
     imageStore(target_motion, p, vec4(motion, 0, 0));
-    imageStore(target_bias, p, vec4(bias));
 }

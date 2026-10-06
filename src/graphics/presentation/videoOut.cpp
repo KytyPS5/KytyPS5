@@ -1122,6 +1122,11 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	} else {
 		frame = &m_presenter.PrepareFrame(buffer, source_info, nullptr, process_dlss);
 	}
+	if (process_dlss) {
+		Common::LockGuard render_lock(buffer.GetContext().GetMutex());
+		buffer.EndRendering();
+		buffer.GetContext().GetGeometryMotion().AdvanceFrame();
+	}
 
 	Common::LockGuard lock(m_mutex);
 	Request*          prepared = nullptr;

@@ -9,6 +9,10 @@
 #include "graphics/presentation/window.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include <spirv-tools/libspirv.hpp>
+#include <bit>
 #include "kernel/memory.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
@@ -60,11 +64,94 @@ ImageInfo Description(vk::Format format, vk::Extent2D size) {
 }
 
 std::vector<uint8_t> Readback(CommandScheduler& scheduler, VulkanImage& image, uint32_t bytes_per_pixel);
+void CheckEncodedResample(const std::vector<uint8_t>& source, vk::Extent2D source_size,
+                          const std::vector<uint8_t>& output, vk::Extent2D output_size, bool bgra);
+
+void FrameGenerationCompletionCase(GraphicContext& graphics) {
+	DlssFgInputs inputs;
+	Check(inputs.Ready(graphics), "unused FG inputs are not ready");
+	inputs.pending = true;
+	Check(!inputs.Ready(graphics), "missing FG completion timeline was treated as safe");
+	vk::SemaphoreTypeCreateInfo timeline {};
+	timeline.semaphoreType = vk::SemaphoreType::eTimeline;
+	vk::SemaphoreCreateInfo create {};
+	create.pNext = &timeline;
+	vk::Semaphore completion;
+	RequireVulkanSuccess(graphics.device.createSemaphore(&create, nullptr, &completion), "create FG completion test timeline");
+	inputs.completion = completion;
+	inputs.completion_value = 1;
+	Check(!inputs.Ready(graphics), "pending FG work was reused");
+	inputs.completion_value = 0;
+	Check(inputs.Ready(graphics), "zero FG completion value was not ready");
+	inputs.completion_value = 1;
+	vk::SemaphoreSignalInfo signal {};
+	signal.semaphore = completion;
+	signal.value = 1;
+	RequireVulkanSuccess(graphics.device.signalSemaphore(&signal), "signal FG completion test timeline");
+	Check(inputs.Ready(graphics) && inputs.pending, "FG readiness changed lifetime ownership");
+	inputs.Wait(graphics);
+	Check(!inputs.pending && !inputs.completion && inputs.completion_value == 0, "FG reuse did not retire completion state");
+	graphics.device.destroySemaphore(completion, nullptr);
+	std::puts("Frame Generation completion timeline cases passed");
+}
+
+void PresentationQueueCase(GraphicContext& graphics, RenderContext& renderer) {
+	if (graphics.present_queue == graphics.queue) {
+		std::puts("SKIP: device exposes only one universal queue");
+		return;
+	}
+	auto& producer = renderer.GetCommandScheduler();
+	CommandScheduler presentation(renderer, graphics, true);
+	HW::Context registers {};
+	HW::UserConfig user {};
+	HW::Shader shaders {};
+	presentation.Begin(registers, user, shaders);
+	Presenter::Frame frame;
+	frame.Configure(graphics, {32, 16}, vk::Format::eR8G8B8A8Unorm);
+	vk::ClearColorValue color {};
+	color.float32 = std::array<float, 4> {1, 0, 0, 1};
+	frame.Clear(producer.Current(), color);
+	vk::SemaphoreTypeCreateInfo type {};
+	type.semaphoreType = vk::SemaphoreType::eTimeline;
+	vk::SemaphoreCreateInfo create {};
+	create.pNext = &type;
+	vk::Semaphore gate;
+	RequireVulkanSuccess(graphics.device.createSemaphore(&create, nullptr, &gate), "create cross-queue test gate");
+	SubmitInfo blocked;
+	blocked.AddWait(gate, 1);
+	const auto producer_tick = producer.Submit(blocked);
+	frame.Transit(presentation.Current().Handle(), vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+	SubmitInfo dependency;
+	dependency.AddWait(producer.GetMasterSemaphore().Handle(), producer_tick);
+	const auto consumer_tick = presentation.Submit(dependency);
+	const auto consumer_done = presentation.GetMasterSemaphore().Handle();
+	vk::SemaphoreWaitInfo wait {};
+	wait.semaphoreCount = 1;
+	wait.pSemaphores = &consumer_done;
+	wait.pValues = &consumer_tick;
+	Check(graphics.device.waitSemaphores(&wait, 1000000) == vk::Result::eTimeout,
+	      "presentation finished before its producer dependency");
+	vk::SemaphoreSignalInfo signal {};
+	signal.semaphore = gate;
+	signal.value = 1;
+	RequireVulkanSuccess(graphics.device.signalSemaphore(&signal), "release cross-queue producer");
+	(void)producer.BeginCommand();
+	(void)presentation.BeginCommand();
+	const auto pixels = Readback(presentation, frame.image, 4);
+	for (size_t i = 0; i < pixels.size(); i += 4) {
+		Check(pixels[i] == 255 && pixels[i + 1] == 0 && pixels[i + 2] == 0 && pixels[i + 3] == 255,
+		      "separate presentation queue read incomplete producer pixels");
+	}
+	graphics.DeleteImage(frame.image);
+	graphics.device.destroySemaphore(gate, nullptr);
+	std::puts("Separate presentation queue and producer timeline dependency passed");
+}
 
 void RasterScaleCase(GraphicContext& graphics, CommandScheduler& scheduler) {
 	for (const auto percent : {25u, 50u, 67u, 100u}) {
 		auto& command = scheduler.Current();
 		Image color(graphics, scheduler, Description(vk::Format::eR8G8B8A8Unorm, {256, 128}));
+		Check(command.RasterColorSource(color) == nullptr, "a new image inherited a previous raster surface");
 		Image depth(graphics, scheduler, Description(vk::Format::eD32Sfloat, {256, 128}));
 		RenderState state {};
 		state.width = 256;
@@ -112,6 +199,53 @@ void RasterScaleCase(GraphicContext& graphics, CommandScheduler& scheduler) {
 		const auto right = (256 * 64 + 240) * 4;
 		Check(std::abs(int(pixels[right]) - 64) <= 1 && std::abs(int(pixels[right + 1]) - 128) <= 1,
 		      "scaled load clear did not preserve unmodified pixels");
+		if (percent == 50) {
+			// A native-sized nearest copy followed by DLSS input resampling must
+			// not replace one interpolation of the actual reduced raster color.
+			std::vector<uint8_t> reference(128 * 64 * 4);
+			// Retain the known two-color geometry, using the readback clear
+			// values to account for the device's permitted UNORM rounding.
+			for (uint32_t y = 0; y < 64; ++y) for (uint32_t x = 0; x < 128; ++x) {
+				const auto pixel = (y * 128 + x) * 4;
+				reference[pixel] = x < 64 ? 255 : pixels[right];
+				reference[pixel + 1] = x < 64 ? 0 : pixels[right + 1];
+				reference[pixel + 2] = 0;
+				reference[pixel + 3] = 255;
+			}
+			EmulatorDlssInputs generator(graphics, scheduler);
+			auto* reduced = command.RasterColorSource(color);
+			Check(reduced != nullptr && reduced->backing.extent.width == 128 && reduced->backing.extent.height == 64,
+			      "final color lost its actual reduced raster source");
+			auto inputs = generator.Prepare(scheduler.Current(), *reduced, {200, 100});
+			Check(inputs.has_value(), "reduced raster temporal inputs");
+			CheckEncodedResample(reference, {128, 64}, Readback(scheduler, inputs->color->backing, 8), {200, 100}, false);
+			color.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+			vk::ClearColorValue replacement {};
+			replacement.float32 = std::array<float, 4> {0, 1, 0, 1};
+			const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			scheduler.Current().Handle().clearColorImage(color.backing.image, vk::ImageLayout::eTransferDstOptimal, &replacement, 1, &range);
+			Check(command.RasterColorSource(color) == nullptr, "a later GPU write retained stale raster pixels");
+			// LOAD must still retain prior color/depth; only CLEAR copies may be skipped.
+			state.color_attachments[0].is_clear = false;
+			state.depth_stencil_attachment.depth_clear = false;
+			color.Transit(attachment.image_layout, vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+			depth.Transit(db.image_layout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {}, command.Handle());
+			command.BeginRendering(state);
+			command.Handle().clearAttachments(1, &clear, 1, &rect);
+			color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command.Handle());
+			const auto loaded = Readback(scheduler, color.backing, 4);
+			Check(loaded[0] == 255 && loaded[1] == 0 && loaded[right] == 0 && loaded[right + 1] == 255,
+			      "scaled LOAD discarded existing pixels");
+			Check(command.RasterColorSource(color) != nullptr, "a read-only consumer invalidated raster color");
+			// A destination barrier may be computed before it ends the pass. It
+			// must invalidate the source even though EndRendering then stores it.
+			color.Transit(attachment.image_layout, vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+			depth.Transit(db.image_layout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {}, command.Handle());
+			command.BeginRendering(state);
+			color.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command.Handle());
+			Check(command.RasterColorSource(color) == nullptr, "a write scheduled before pass completion retained stale raster color");
+			command.Handle().clearColorImage(color.backing.image, vk::ImageLayout::eTransferDstOptimal, &replacement, 1, &range);
+		}
 		// Exercise image retirement on a subsequent pass with a different size.
 		scheduler.FlushAndWait();
 	}
@@ -128,6 +262,7 @@ void Clear(CommandBuffer& command, Image& image, std::array<float, 4> value) {
 
 std::vector<uint8_t> Readback(CommandScheduler& scheduler, VulkanImage& image, uint32_t bytes_per_pixel) {
 	auto& graphics = scheduler.Graphics();
+	const auto aspect = image.format == vk::Format::eD32Sfloat ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
 	VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 	create.size = uint64_t(image.extent.width) * image.extent.height * bytes_per_pixel;
 	create.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -148,7 +283,7 @@ std::vector<uint8_t> Readback(CommandScheduler& scheduler, VulkanImage& image, u
 	barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
 	barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.image = image.image;
-	barrier.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	barrier.subresourceRange = {aspect, 0, 1, 0, 1};
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = 1;
 	dependency.pImageMemoryBarriers = &barrier;
@@ -158,7 +293,7 @@ std::vector<uint8_t> Readback(CommandScheduler& scheduler, VulkanImage& image, u
 	image.state = {barrier.dstStageMask, barrier.dstAccessMask, barrier.newLayout};
 	image.subresource_states.clear();
 	vk::BufferImageCopy copy {};
-	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageSubresource = {aspect, 0, 0, 1};
 	copy.imageExtent = image.extent;
 	command.Handle().copyImageToBuffer(image.image, barrier.newLayout, buffer, 1, &copy);
 	scheduler.Finish();
@@ -198,13 +333,16 @@ void CheckEncodedResample(const std::vector<uint8_t>& source, vk::Extent2D sourc
 			                                 std::lerp(sample(x0, y1), sample(x1, y1), x - x0), y - y0);
 			uint16_t actual;
 			std::memcpy(&actual, output.data() + (uint64_t(point[1]) * output_size.width + point[0]) * 8 + channel * 2, 2);
-			Check(std::abs(Half(actual) - expected) < .003f,
-			      "sRGB DLSS fallback changed encoded color or channel order");
+			if (std::abs(Half(actual) - expected) >= .003f) {
+				std::fprintf(stderr, "Color resampling mismatch at (%u, %u), channel %zu: expected %.6f, got %.6f\n",
+				             point[0], point[1], channel, expected, Half(actual));
+				Check(false, "color resampling changed encoded color or channel order");
+			}
 		}
 	}
 }
 
-void UploadPattern(CommandScheduler& scheduler, Image& image, int shift_x, int shift_y) {
+void UploadPattern(CommandScheduler& scheduler, Image& image, int shift_x, int shift_y, bool detail = false) {
 	auto& graphics = scheduler.Graphics();
 	const auto width = image.backing.extent.width, height = image.backing.extent.height;
 	std::vector<uint8_t> pixels(uint64_t(width) * height * 4);
@@ -215,6 +353,11 @@ void UploadPattern(CommandScheduler& scheduler, Image& image, int shift_x, int s
 		pixels[index + 1] = uint8_t(128 + 55 * std::sin(px * .021f - py * .051f));
 		pixels[index + 2] = uint8_t(128 + 55 * std::cos(px * .037f + py * .013f));
 		pixels[index + 3] = 255;
+		if (detail) {
+			const int sx = int(x) - shift_x, sy = int(y) - shift_y;
+			const uint8_t value = ((sx / 2 + sy / 2) & 1) ? 220 : 32;
+			pixels[index] = pixels[index + 1] = pixels[index + 2] = value;
+		}
 	}
 	VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 	create.size = pixels.size();
@@ -269,6 +412,16 @@ void EmulatorMotionCase(GraphicContext& graphics, CommandScheduler& scheduler) {
 	const auto mx = xs[xs.size() / 2], my = ys[ys.size() / 2];
 	std::printf("Emulator motion median: %.3f, %.3f (expected -8, -4 render pixels)\n", mx, my);
 	Check(std::abs(mx + 8) < 1.5f && std::abs(my + 4) < 1.5f, "GPU motion direction or render-pixel scale");
+	UploadPattern(scheduler, source, 32, 16);
+	auto fg_only = generator.Prepare(scheduler.Current(), source, {640, 360}, false);
+	Check(fg_only && !fg_only->color && !fg_only->bias_current_color &&
+	      fg_only->jitter_x == 0 && fg_only->jitter_y == 0 && !fg_only->reset_history,
+	      "FG-only preparation generated unused color or jitter");
+	const auto fg_motion = Readback(scheduler, fg_only->motion_vectors->backing, 4);
+	uint16_t fg_center[2];
+	std::memcpy(fg_center, fg_motion.data() + (180 * 640 + 320) * 4, 4);
+	Check(std::abs(Half(fg_center[0]) + 8) < 1.5f && std::abs(Half(fg_center[1]) + 4) < 1.5f,
+	      "FG-only preparation lost translated motion");
 	Clear(scheduler.Current(), source, {0, 0, 0, 1});
 	auto cut = generator.Prepare(scheduler.Current(), source, {640, 360});
 	Check(cut && cut->bias_current_color, "scene-cut rejection mask missing");
@@ -285,6 +438,307 @@ void EmulatorMotionCase(GraphicContext& graphics, CommandScheduler& scheduler) {
 	source.backing.format = original_format;
 	Check(!generator.Prepare(scheduler.Current(), source, {0, 180}), "zero input extent accepted");
 	scheduler.Finish();
+}
+
+void GeometryMotionCase(GraphicContext& graphics, RenderContext& renderer) {
+	using namespace ShaderRecompiler;
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& motion = renderer.GetGeometryMotion();
+	constexpr vk::Extent2D extent {64, 64};
+	Image color(graphics, scheduler, Description(vk::Format::eR8G8B8A8Unorm, extent));
+	Image reference(graphics, scheduler, Description(vk::Format::eR8G8B8A8Unorm, extent));
+	Image depth_target(graphics, scheduler, Description(vk::Format::eD32Sfloat, extent));
+	const auto vop1 = [](uint32_t op, uint32_t dst, uint32_t src) { return 0x7e000000u | (dst << 17) | (op << 9) | src; };
+	const auto vop2 = [](uint32_t op, uint32_t dst, uint32_t src, uint32_t vgpr) { return (op << 25) | (dst << 17) | (vgpr << 9) | src; };
+	std::vector<uint32_t> vertex_code;
+	// A full-screen triangle from the guest vertex ID. s0 moves its geometry;
+	// its uniform color gives image matching no signal for this movement.
+	vertex_code.push_back(vop2(0x1b, 1, 129, 5));
+	vertex_code.push_back(vop2(0x16, 2, 129, 5));
+	for (uint32_t reg : {1u, 2u}) {
+		vertex_code.push_back(vop1(6, reg, 256 + reg));
+		vertex_code.push_back(vop2(8, reg, 246, reg)); // inline 4.0
+		vertex_code.push_back(vop2(3, reg, 243, reg)); // inline -1.0
+	}
+	vertex_code.push_back(vop2(3, 1, 0, 1));
+	vertex_code.insert(vertex_code.end(), {vop1(1, 3, 1), vop1(1, 4, 242)});
+	vertex_code.insert(vertex_code.end(), {0xf80008cfu, 0x04030201u, 0xbf810000u});
+	std::vector<uint32_t> pixel_code;
+	for (uint32_t i = 0; i < 4; ++i) {
+		pixel_code.push_back(vop1(1, i, 255));
+		pixel_code.push_back(std::bit_cast<uint32_t>(i == 3 ? 1.f : .25f * (i + 1)));
+	}
+	pixel_code.insert(pixel_code.end(), {0xf800180fu, 0x03020100u, 0xbf810000u});
+	std::array<uint32_t, 64> user_data {};
+	std::array<CompileResult, 4> compiled;
+	std::array<vk::ShaderModule, 4> modules {};
+	for (uint32_t i = 0; i < 4; ++i) {
+		ShaderVertexInputInfo vertex {};
+		ShaderPixelInputInfo pixel {};
+		if (i < 2) vertex.geometry_motion_dword = pixel.geometry_motion_dword = 0;
+		CompileOptions options;
+		options.stage = i % 2 ? ShaderType::Pixel : ShaderType::Vertex;
+		options.user_data = user_data;
+		if (i % 2) options.input_info.pixel = &pixel;
+		else options.input_info.vertex = &vertex;
+		compiled[i] = CompileProgram(TranslateProgram(i % 2 ? pixel_code : vertex_code, options), options, {}, 14);
+		spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_3);
+		validator.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
+			std::fprintf(stderr, "geometry SPIR-V: %s\n", message);
+		});
+		Check(validator.Validate(compiled[i].spirv), "translated geometry shader SPIR-V validation");
+		vk::ShaderModuleCreateInfo create {};
+		create.codeSize = compiled[i].spirv.size() * 4; create.pCode = compiled[i].spirv.data();
+		RequireVulkanSuccess(graphics.device.createShaderModule(&create, nullptr, &modules[i]), "geometry shader module");
+	}
+	vk::PushConstantRange range {};
+	range.stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment; range.size = 128;
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.pushConstantRangeCount = 1; layout_info.pPushConstantRanges = &range;
+	vk::PipelineLayout layout;
+	RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout_info, nullptr, &layout), "geometry test layout");
+	std::array<vk::Pipeline, 2> pipelines {};
+	for (uint32_t i = 0; i < 2; ++i) {
+		std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
+		for (uint32_t stage = 0; stage < 2; ++stage) {
+			stages[stage].stage = stage ? vk::ShaderStageFlagBits::eFragment : vk::ShaderStageFlagBits::eVertex;
+			stages[stage].module = modules[i * 2 + stage]; stages[stage].pName = "main";
+		}
+		std::array<vk::Format, 8> formats {}; formats[0] = color.backing.format;
+		if (i == 0) formats[7] = vk::Format::eR16G16B16A16Sfloat;
+		vk::PipelineRenderingCreateInfo rendering {};
+		rendering.colorAttachmentCount = i == 0 ? 8 : 1; rendering.pColorAttachmentFormats = formats.data();
+		rendering.depthAttachmentFormat = vk::Format::eD32Sfloat;
+		vk::PipelineVertexInputStateCreateInfo input {};
+		vk::PipelineInputAssemblyStateCreateInfo assembly {}; assembly.topology = vk::PrimitiveTopology::eTriangleList;
+		vk::PipelineViewportStateCreateInfo viewport {}; viewport.viewportCount = viewport.scissorCount = 1;
+		vk::PipelineRasterizationStateCreateInfo raster {}; raster.polygonMode = vk::PolygonMode::eFill; raster.lineWidth = 1;
+		vk::PipelineMultisampleStateCreateInfo samples {}; samples.rasterizationSamples = vk::SampleCountFlagBits::e1;
+		vk::PipelineDepthStencilStateCreateInfo depth {}; depth.depthTestEnable = depth.depthWriteEnable = true; depth.depthCompareOp = vk::CompareOp::eLess;
+		std::array<vk::PipelineColorBlendAttachmentState, 8> attachments {};
+		attachments[0].colorWriteMask = attachments[7].colorWriteMask = vk::ColorComponentFlags(15);
+		vk::PipelineColorBlendStateCreateInfo blend {};
+		blend.attachmentCount = rendering.colorAttachmentCount; blend.pAttachments = attachments.data();
+		const vk::DynamicState dynamic_states[] {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+		vk::PipelineDynamicStateCreateInfo dynamic {}; dynamic.dynamicStateCount = 2; dynamic.pDynamicStates = dynamic_states;
+		vk::GraphicsPipelineCreateInfo create {};
+		create.pNext = &rendering; create.stageCount = 2; create.pStages = stages.data(); create.layout = layout;
+		create.pVertexInputState = &input; create.pInputAssemblyState = &assembly; create.pViewportState = &viewport;
+		create.pRasterizationState = &raster; create.pMultisampleState = &samples; create.pColorBlendState = &blend; create.pDynamicState = &dynamic;
+		create.pDepthStencilState = &depth;
+		RequireVulkanSuccess(graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipelines[i]), "geometry test graphics pipeline");
+	}
+	EmulatorDlssInputs generator(graphics, scheduler);
+	const uint64_t key[] {1, 2, 3};
+	auto render = [&](uint32_t pipeline, float shift, bool negative_height, uint32_t scale, bool indexed,
+	                  uint32_t capacity = 3, bool inverted_depth = false, float z = .25f, bool preserve = false) {
+		auto& command = scheduler.Current(); command.EndRendering();
+		auto push = pipeline == 0 ? motion.PrepareDraw(command, key, capacity, 4, 2) : std::array<uint32_t, 14> {};
+		if (inverted_depth) push[7] |= 2;
+		auto& target = pipeline == 0 ? color : reference;
+		target.Transit(vk::ImageLayout::eColorAttachmentOptimal, vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+		ImageViewInfo view {}; view.format = target.backing.format; view.aspect = vk::ImageAspectFlagBits::eColor; view.usage = vk::ImageUsageFlagBits::eColorAttachment;
+		RenderState state {}; state.width = state.height = 64; state.num_color_attachments = 1; state.raster_scale_percent = scale;
+		state.color_attachments[0].image = &target; state.color_attachments[0].image_view = target.FindView(view);
+		state.color_attachments[0].is_clear = true;
+		state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+		depth_target.Transit(vk::ImageLayout::eDepthAttachmentOptimal, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {}, command.Handle());
+		ImageViewInfo depth_view {}; depth_view.format = depth_target.backing.format; depth_view.aspect = vk::ImageAspectFlagBits::eDepth;
+		depth_view.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+		state.depth_stencil_attachment.image = &depth_target;
+		state.depth_stencil_attachment.image_view = depth_target.FindView(depth_view);
+		state.depth_stencil_attachment.image_layout = vk::ImageLayout::eDepthAttachmentOptimal;
+		state.depth_stencil_attachment.has_depth = state.depth_stencil_attachment.depth_clear = true;
+		state.depth_stencil_attachment.clear_value[0] = std::bit_cast<uint32_t>(.5f);
+		if (pipeline == 0) Check(motion.Attach(command, state), "geometry test sidecar attachment");
+		Buffer indices(graphics, scheduler, MemoryUsage::Upload, 0, vk::BufferUsageFlagBits::eIndexBuffer, 24);
+		const uint32_t index_data[] {0, 1, 2, 0, 1, 2};
+		std::memcpy(indices.Mapped().data(), index_data, sizeof(index_data)); indices.Flush(0, sizeof(index_data));
+		command.BeginRendering(state, preserve);
+		const auto& effective = command.EffectiveRenderState();
+		const float viewport_data[] {0, negative_height ? 1.f : 0.f, 1, negative_height ? -1.f : 1.f,
+		    1.f / effective.width, 1.f / effective.height};
+		std::memcpy(push.data() + 8, viewport_data, sizeof(viewport_data));
+		std::array<uint32_t, 32> constants {}; std::copy(push.begin(), push.end(), constants.begin());
+		const auto& bindings = compiled[pipeline * 2].program.bindings;
+		for (size_t i = 0; i < bindings.user_data_registers.size(); ++i) {
+			constants[bindings.push_data_start_dword + i] = std::bit_cast<uint32_t>(bindings.user_data_registers[i] == 0 ? shift : z);
+		}
+		command.Handle().pushConstants(layout, range.stageFlags, 0, sizeof(constants), constants.data());
+		vk::Viewport viewport {}; viewport.width = float(effective.width); viewport.height = float(effective.height);
+		if (negative_height) { viewport.y = viewport.height; viewport.height = -viewport.height; }
+		viewport.maxDepth = 1;
+		vk::Rect2D scissor {}; scissor.extent = {effective.width, effective.height};
+		command.Handle().setViewport(0, 1, &viewport); command.Handle().setScissor(0, 1, &scissor);
+		command.Handle().bindPipeline(vk::PipelineBindPoint::eGraphics, pipelines[pipeline]);
+		if (indexed) {
+			command.Handle().bindIndexBuffer(indices.Handle(), 0, vk::IndexType::eUint32);
+			command.Handle().drawIndexed(6, 2, 0, 0, 4);
+		} else command.Handle().draw(3, 2, 0, 4);
+		command.EndRendering(); scheduler.Finish();
+	};
+	Check(!motion.SupportsSurface(color, {UINT32_MAX, UINT32_MAX}), "unbounded guide allocation accepted");
+	Check(motion.PrepareDraw(scheduler.Current(), key, UINT32_MAX, 0, UINT32_MAX)[4] == 0, "overflowing vertex history allocation accepted");
+	for (bool inverted_depth : {false, true}) for (bool negative_height : {false, true}) for (uint32_t scale : {100u, 50u}) for (bool indexed : {false, true}) {
+		generator.Reset(); motion.AdvanceFrame(); motion.AdvanceFrame(); // disjoint fixture history
+		render(0, 0, negative_height, scale, indexed, 3, inverted_depth);
+		auto* guide = motion.Source(color); Check(guide != nullptr, "matching native color provenance");
+		auto first = generator.Prepare(scheduler.Current(), color, {32, 32}, true, guide);
+		Check(first.has_value(), "native first frame preparation");
+		const auto first_depth = Readback(scheduler, first->depth->backing, 4);
+		float depth; std::memcpy(&depth, first_depth.data() + (16 * 32 + 16) * 4, 4);
+		Check(std::abs(depth - (inverted_depth ? .75f : .25f)) < .001f, "first frame discarded actual geometry depth or inverted-depth convention");
+		const auto first_motion = Readback(scheduler, first->motion_vectors->backing, 4);
+		Check(std::all_of(first_motion.begin(), first_motion.end(), [](uint8_t v) { return v == 0; }), "first geometry frame fabricated movement");
+		motion.AdvanceFrame(); render(0, .25f, negative_height, scale, indexed, 3, inverted_depth);
+		guide = motion.Source(color); Check(guide != nullptr, "second frame lost native guide");
+		auto second = generator.Prepare(scheduler.Current(), color, {32, 32}, false, guide);
+		Check(second.has_value(), "native second frame preparation");
+		const auto vectors = Readback(scheduler, second->motion_vectors->backing, 4);
+		uint16_t center[2]; std::memcpy(center, vectors.data() + (16 * 32 + 16) * 4, 4);
+		Check(std::abs(Half(center[0]) + 4) < .02f && std::abs(Half(center[1])) < .02f,
+		      "guest geometry motion did not survive viewport, raster scale, instancing/indexing or DLSS pixel scaling");
+		render(1, .25f, negative_height, scale, indexed);
+		Check(Readback(scheduler, color.backing, 4) == Readback(scheduler, reference.backing, 4), "geometry instrumentation changed guest color");
+		color.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+		Check(motion.Source(color) == nullptr, "native guide survived unrelated color write");
+	}
+	motion.AdvanceFrame(); render(0, .25f, false, 100, false, 0);
+	auto fallback = generator.Prepare(scheduler.Current(), color, {32, 32}, false, motion.Source(color));
+	const auto fallback_depth = Readback(scheduler, fallback->depth->backing, 4);
+	float neutral; std::memcpy(&neutral, fallback_depth.data() + (16 * 32 + 16) * 4, 4);
+	Check(neutral == .5f, "unsupported draw supplied fabricated geometry depth");
+	motion.AdvanceFrame(); render(0, 0, false, 100, false, 3, false, .75f);
+	const auto occluded = Readback(scheduler, motion.Source(color)->backing, 8);
+	Check(std::all_of(occluded.begin(), occluded.end(), [](uint8_t v) { return v == 0; }), "depth-rejected fragments overwrote the motion guide");
+	// The same geometry identity twice in one frame is ambiguous; the entire
+	// previous guide must stop being available and next frame must reset it.
+	Check(motion.PrepareDraw(scheduler.Current(), key, 3, 4, 2)[4] == 0 && motion.Source(color) == nullptr, "ambiguous duplicate draw reused geometry history");
+	motion.AdvanceFrame();
+	Check(motion.PrepareDraw(scheduler.Current(), key, 3, 4, 2)[7] == 0, "ambiguous previous frame remained valid");
+	for (uint32_t scale : {100u, 50u}) {
+		render(1, 0, false, scale, false);
+		render(1, 0, false, scale, false, 3, false, .4f, true);
+		const auto preserved = Readback(scheduler, depth_target.backing, 4);
+		float visible; std::memcpy(&visible, preserved.data() + (32 * 64 + 32) * 4, 4);
+		Check(std::abs(visible - .25f) < .001f, "resumed capture pass repeated guest depth clear");
+	}
+	// Exercise the production shader cache too: instrumentation must be a
+	// distinct permutation, and occupied guest interfaces must remain untouched.
+	ShaderInit();
+	ShaderUserData vertex_metadata {};
+	const auto vertex_address = reinterpret_cast<uint64_t>(vertex_code.data());
+	const auto pixel_address = reinterpret_cast<uint64_t>(pixel_code.data());
+	ShaderMapUserData(vertex_address, {.type = Prospero::ShaderBinaryType::kGs, .user_data = &vertex_metadata,
+	    .code_size_bytes = uint32_t(vertex_code.size() * 4)});
+	ShaderMapUserData(pixel_address, {.type = Prospero::ShaderBinaryType::kPs, .code_size_bytes = uint32_t(pixel_code.size() * 4)});
+	HW::VertexShaderInfo vertex_regs {}; vertex_regs.es_regs.data_addr = vertex_address; vertex_regs.gs_regs.rsrc2.user_sgpr = 2;
+	vertex_regs.gs_user_sgpr.value[1] = std::bit_cast<uint32_t>(.25f);
+	HW::PixelShaderInfo pixel_regs {}; pixel_regs.ps_regs.data_addr = pixel_address;
+	HW::Context registers {}; HW::UserConfig user {};
+	user.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+	std::array<Prospero::ColorComponentMapping, 8> mapping {};
+	std::array<ShaderVertexInputInfo, 3> vertex_inputs {}; ShaderPixelInputInfo pixel_inputs {};
+	auto programs = [&](bool enable) {
+		return renderer.GetPipelineCache().GetGraphicsPrograms(vertex_regs, pixel_regs, registers.GetShaderRegisters(),
+		    registers, user, mapping, true, vertex_inputs, pixel_inputs, enable);
+	};
+	const auto native = programs(true);
+	Check(vertex_inputs[0].geometry_motion_dword == 0 && pixel_inputs.geometry_motion_dword == 0,
+	    "production shader cache did not enable geometry capture");
+	const auto ordinary = programs(false);
+	Check(vertex_inputs[0].geometry_motion_dword == UINT32_MAX && pixel_inputs.geometry_motion_dword == UINT32_MAX &&
+	    ordinary.vertex[0].id != native.vertex[0].id && ordinary.pixel.id != native.pixel.id,
+	    "instrumented shader permutation leaked into ordinary guest draws");
+	Check(programs(true).vertex[0].id == native.vertex[0].id, "geometry shader cache failed to reuse its native permutation");
+	auto occupied_code = vertex_code;
+	occupied_code.insert(occupied_code.end() - 1, {0xf8000bafu, 0x04030201u}); // guest parameter 26
+	vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(occupied_code.data());
+	ShaderMapUserData(vertex_regs.es_regs.data_addr, {.type = Prospero::ShaderBinaryType::kGs, .user_data = &vertex_metadata,
+	    .code_size_bytes = uint32_t(occupied_code.size() * 4)});
+	(void)programs(true);
+	Check(vertex_inputs[0].geometry_motion_dword == UINT32_MAX && pixel_inputs.geometry_motion_dword == UINT32_MAX,
+	    "geometry capture overwrote an occupied guest varying slot");
+	motion.AdvanceFrame(); scheduler.Finish();
+	for (auto pipeline : pipelines) graphics.device.destroyPipeline(pipeline, nullptr);
+	graphics.device.destroyPipelineLayout(layout, nullptr);
+	for (auto module : modules) graphics.device.destroyShaderModule(module, nullptr);
+	std::puts("Guest shader geometry motion/depth, indexed instancing, viewport/raster scale, reversed depth, occlusion, color preservation, pass continuation and provenance cases passed");
+}
+
+void InputCostCase(GraphicContext& graphics, CommandScheduler& scheduler) {
+	vk::QueryPoolCreateInfo create {};
+	create.queryType = vk::QueryType::eTimestamp;
+	create.queryCount = 2;
+	vk::QueryPool queries;
+	RequireVulkanSuccess(graphics.device.createQueryPool(&create, nullptr, &queries), "input timing queries");
+	for (const auto extent : {vk::Extent2D {640, 360}, vk::Extent2D {1707, 960}, vk::Extent2D {2560, 1440}}) {
+		for (const bool reconstruct : {true, false}) {
+		EmulatorDlssInputs generator(graphics, scheduler);
+		Image source(graphics, scheduler, Description(vk::Format::eR8G8B8A8Unorm, {1920, 1080}));
+		UploadPattern(scheduler, source, 0, 0);
+		std::vector<double> samples;
+		for (int frame = 0; frame < 10; ++frame) {
+			auto handle = scheduler.Current().Handle();
+			handle.resetQueryPool(queries, 0, 2);
+			handle.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, queries, 0);
+			Check(generator.Prepare(scheduler.Current(), source, extent, reconstruct).has_value(), "input cost preparation");
+			handle.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, queries, 1);
+			scheduler.Finish();
+			uint64_t ticks[2] {};
+			RequireVulkanSuccess(graphics.device.getQueryPoolResults(queries, 0, 2, sizeof(ticks), ticks, sizeof(uint64_t),
+			    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "input GPU timestamps");
+			if (frame >= 3) samples.push_back((ticks[1] - ticks[0]) * graphics.physical_device_properties.limits.timestampPeriod / 1e6);
+		}
+		std::sort(samples.begin(), samples.end());
+		std::printf("Temporal input GPU median %ux%u (%s): %.3f ms\n", extent.width, extent.height,
+		    reconstruct ? "SR" : "FG only", samples[samples.size() / 2]);
+		std::fflush(stdout);
+		}
+	}
+	graphics.device.destroyQueryPool(queries, nullptr);
+}
+
+void FinalFrameDetailCase(GraphicContext& graphics, CommandScheduler& scheduler, DlssProcessor& dlss) {
+	const vk::Extent2D extent {640, 360};
+	Image source(graphics, scheduler, Description(vk::Format::eR8G8B8A8Unorm, extent));
+	Image output(graphics, scheduler, Description(vk::Format::eR16G16B16A16Sfloat, extent));
+	ImageViewInfo view {};
+	view.format = output.backing.format;
+	view.usage = vk::ImageUsageFlagBits::eStorage;
+	const auto output_view = output.FindView(view);
+	EmulatorDlssInputs generator(graphics, scheduler);
+	UploadPattern(scheduler, source, 0, 0, true);
+	const auto reference = Readback(scheduler, source.backing, 4);
+	const auto input_extent = dlss.OptimalInputExtent(extent, extent);
+	double squared_error = 0;
+	for (int frame = 0; frame < 32; ++frame) {
+		if (input_extent) {
+			auto inputs = generator.Prepare(scheduler.Current(), source, *input_extent);
+			Check(inputs && dlss.Evaluate(scheduler.Current(), *inputs, output.backing, output_view), "detail NGX evaluation");
+		} else {
+			Check(generator.ResampleColor(scheduler.Current(), source, output.backing, output_view), "detail native presentation");
+		}
+		const auto pixels = Readback(scheduler, output.backing, 8);
+		if (frame >= 24) for (size_t pixel = 0; pixel < reference.size() / 4; ++pixel) {
+			uint16_t red;
+			std::memcpy(&red, pixels.data() + pixel * 8, 2);
+			const double error = Half(red) - reference[pixel * 4] / 255.0;
+			squared_error += error * error;
+		}
+	}
+	const double rmse = std::sqrt(squared_error / (8 * extent.width * extent.height));
+	std::printf("Headless final-frame detail RMSE: %.6f\n", rmse);
+	Check(rmse < .08, "final-frame DLSS discarded already rendered thin detail");
+	// Actual upscaling retains existing render samples, within NGX's legal
+	// dynamic-resolution range; do not manufacture a smaller render first.
+	const auto upscale = dlss.OptimalInputExtent({960, 540}, extent);
+	Check(upscale.has_value(), "actual upscale was disabled");
+	const auto recommended = dlss.OptimalInputExtent({960, 540});
+	Check(recommended.has_value(), "SDK settings missing");
+	const auto larger_source = dlss.OptimalInputExtent({960, 540}, {800, 450});
+	Check(larger_source && larger_source->width >= recommended->width && larger_source->height >= recommended->height,
+	      "higher-resolution rendered source lost samples before reconstruction");
 }
 
 void EvaluateCase(GraphicContext& graphics, RenderContext& renderer, DlssProcessor& dlss,
@@ -460,6 +914,17 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 		};
 		constexpr int count = 180;
 		for (int index = 0; index < count; ++index) {
+			// Input snapshots are only prepared for a foreground game. Restore
+			// focus before preparation as well as before SDK presentation.
+			if (GetForegroundWindow() != hwnd) {
+				const auto foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+				const auto this_thread = GetCurrentThreadId();
+				const bool attached = foreground_thread && foreground_thread != this_thread &&
+				    AttachThreadInput(this_thread, foreground_thread, TRUE);
+				ShowWindow(hwnd, SW_RESTORE);
+				SetForegroundWindow(hwnd);
+				if (attached) AttachThreadInput(this_thread, foreground_thread, FALSE);
+			}
 			UploadPattern(scheduler, source, index, 0);
 			cache.MarkGpuWritten(id);
 			auto& frame = presenter.PrepareFrame(scheduler.Current(), info);
@@ -564,7 +1029,36 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 	}
 	if (regression != nullptr) {
 		const auto original = Readback(scheduler, source.backing, 4);
-		if (std::strcmp(regression, "srgb") == 0) {
+		if (std::strcmp(regression, "detail") == 0) {
+			config.screen_width = 640;
+			config.screen_height = 360;
+			Config::Load(config);
+			UploadPattern(scheduler, source, 0, 0, true);
+			cache.MarkGpuWritten(id);
+			const auto reference = Readback(scheduler, source.backing, 4);
+			double squared_error = 0;
+			for (int index = 0; index < 32; ++index) {
+				auto& frame = presenter.PrepareFrame(scheduler.Current(), info);
+				const auto output = Readback(scheduler, frame.image, frame.dlss_evaluated ? 8 : 4);
+				if (index >= 24) {
+					for (size_t pixel = 0; pixel < reference.size() / 4; ++pixel) {
+						float actual;
+						if (frame.dlss_evaluated) {
+							uint16_t red;
+							std::memcpy(&red, output.data() + pixel * 8, 2);
+							actual = Half(red);
+						} else actual = output[pixel * 4] / 255.f;
+						const double error = actual - reference[pixel * 4] / 255.0;
+						squared_error += error * error;
+					}
+				}
+				presenter.Discard(frame);
+			}
+			const double rmse = std::sqrt(squared_error / (8 * 640 * 360));
+			std::printf("Final-frame detail RMSE (Quality, native output): %.6f\n", rmse);
+			std::fflush(stdout);
+			Check(rmse < .08, "final-frame DLSS discarded already rendered thin detail");
+		} else if (std::strcmp(regression, "srgb") == 0) {
 			config.dlss_mode = Config::DlssMode::Off;
 			Config::Load(config);
 			for (bool main_bus : {true, false}) {
@@ -891,11 +1385,12 @@ int main(int argc, char** argv) {
 	enabled = {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME};
 	graphics.dlss_extensions_enabled = AppendDlssDeviceExtensions(graphics, enabled, device_extensions);
 	Check(graphics.dlss_extensions_enabled, "DLSS device extensions");
-	float priority = 1;
+	const std::array priorities {1.0f, 1.0f};
+	graphics.present_queue_index = queues[graphics.queue_family].queueCount > 1 ? 1u : 0u;
 	vk::DeviceQueueCreateInfo queue {};
 	queue.queueFamilyIndex = graphics.queue_family;
-	queue.queueCount = 1;
-	queue.pQueuePriorities = &priority;
+	queue.queueCount = graphics.present_queue_index + 1;
+	queue.pQueuePriorities = priorities.data();
 	auto features11 = WindowContext::RequiredVulkan11Features();
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	auto features13 = WindowContext::RequiredVulkan13Features();
@@ -904,6 +1399,10 @@ int main(int argc, char** argv) {
 	vk::PhysicalDeviceFeatures features {};
 	features.shaderInt64 = VK_TRUE;
 	features.shaderInt16 = VK_TRUE;
+	features.vertexPipelineStoresAndAtomics = VK_TRUE;
+	features.independentBlend = VK_TRUE;
+	features.shaderClipDistance = VK_TRUE;
+	features.shaderCullDistance = VK_TRUE;
 	features.sampleRateShading = VK_TRUE;
 	graphics.sample_rate_shading_enabled = true;
 	vk::DeviceCreateInfo device_create {};
@@ -916,6 +1415,7 @@ int main(int argc, char** argv) {
 	RequireVulkanSuccess(graphics.physical_device.createDevice(&device_create, nullptr, &graphics.device), "test Vulkan device");
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
 	graphics.device.getQueue(graphics.queue_family, 0, &graphics.queue);
+	graphics.device.getQueue(graphics.queue_family, graphics.present_queue_index, &graphics.present_queue);
 	Check(graphics.CreateAllocator(), "VMA initialization");
 	{
 		RenderContext renderer(graphics);
@@ -928,15 +1428,25 @@ int main(int argc, char** argv) {
 		HW::Shader shaders {};
 		auto& scheduler = renderer.GetCommandScheduler();
 		scheduler.Begin(registers, user, shaders);
+		PresentationQueueCase(graphics, renderer);
+		FrameGenerationCompletionCase(graphics);
 		RasterScaleCase(graphics, scheduler);
 		EmulatorMotionCase(graphics, scheduler);
+		GeometryMotionCase(graphics, renderer);
 		{
 			DlssProcessor dlss(graphics, scheduler);
 			Check(dlss.Available(), "NGX capability check");
-			for (auto mode : {Config::DlssMode::Quality, Config::DlssMode::Balanced, Config::DlssMode::Performance, Config::DlssMode::UltraPerformance, Config::DlssMode::DLAA}) {
-				EvaluateCase(graphics, renderer, dlss, mode, {1920, 1080});
+			if (argc == 2 && std::strcmp(argv[1], "--quality-cost") == 0) {
+				FinalFrameDetailCase(graphics, scheduler, dlss);
+				InputCostCase(graphics, scheduler);
+			} else if (argc == 2 && std::strcmp(argv[1], "--input-cost") == 0) {
+				InputCostCase(graphics, scheduler);
+			} else {
+				for (auto mode : {Config::DlssMode::Quality, Config::DlssMode::Balanced, Config::DlssMode::Performance, Config::DlssMode::UltraPerformance, Config::DlssMode::DLAA}) {
+					EvaluateCase(graphics, renderer, dlss, mode, {1920, 1080});
+				}
+				EvaluateCase(graphics, renderer, dlss, Config::DlssMode::Quality, {1280, 720});
 			}
-			EvaluateCase(graphics, renderer, dlss, Config::DlssMode::Quality, {1280, 720});
 		}
 		scheduler.Finish(); // releases features and shuts down NGX after GPU completion
 	}

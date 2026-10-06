@@ -69,6 +69,10 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// Unique across image lifetimes and changes on every planned GPU write.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> ContentVersion() const noexcept {
+		return {m_instance_id, m_write_version};
+	}
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
@@ -165,6 +169,8 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
+	const uint64_t    m_instance_id;
+	uint64_t          m_write_version    = 0;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

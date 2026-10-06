@@ -130,6 +130,7 @@ struct ShaderVertexInputInfo {
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
+	uint32_t                geometry_motion_dword = UINT32_MAX;
 	ShaderType                  logical_stage        = ShaderType::Vertex;
 	int                     resources_num       = 0;
 	int                     fetch_attrib_reg    = 0;
@@ -172,6 +173,7 @@ struct ShaderPixelInputInfo {
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	uint32_t                                       raster_scale_dword           = UINT32_MAX;
+	uint32_t                                       geometry_motion_dword        = UINT32_MAX;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;

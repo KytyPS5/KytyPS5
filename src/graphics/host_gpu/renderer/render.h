@@ -111,9 +111,11 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
-	void BeginRendering(const RenderState& state) const;
+	void BeginRendering(const RenderState& state, bool preserve_attachments = false) const;
+	[[nodiscard]] std::optional<RenderState> ActiveRenderState() const;
 	void EndRendering() const;
 	[[nodiscard]] const RenderState& EffectiveRenderState() const;
+	[[nodiscard]] Image* RasterColorSource(const Image& image) const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }

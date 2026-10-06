@@ -6,6 +6,7 @@
 
 namespace Libs::Graphics {
 class CommandScheduler;
+class Image;
 struct GraphicContext;
 
 vk::Rect2D ScaleRasterScissor(vk::Rect2D scissor, float scale_x, float scale_y, vk::Extent2D extent);
@@ -21,6 +22,9 @@ public:
 	const RenderState& Begin(vk::CommandBuffer command, const RenderState& state);
 	void End(vk::CommandBuffer command);
 	const RenderState& State() const;
+	void RefreshSourceVersions();
+	// Only the last complete, unchanged, full-surface color pass is eligible.
+	Image* ColorSource(const Image& original) const;
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

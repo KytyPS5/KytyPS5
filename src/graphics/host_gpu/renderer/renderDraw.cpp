@@ -869,7 +869,7 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 }
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
+                           uint32_t color_output_mask, DrawRenderState& state, bool allow_geometry_motion = true) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -896,7 +896,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info, allow_geometry_motion);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -933,6 +933,18 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) {
+		const auto& color = state.color_info[0];
+		const auto& view = color.desc.view_info;
+		const auto extent = color.Extent();
+		if (state.color_count != 1 || color.target_slot != 0 || view.base_level != 0 ||
+		    view.base_layer != 0 || view.layer_count != 1 ||
+		    !m_context.GetGeometryMotion().SupportsSurface(m_context.GetTextureCache().GetImage(color.image_id), extent) ||
+		    (state.depth_info.image_id && (state.depth_info.desc.info.extent.width < extent.width ||
+		                                 state.depth_info.desc.info.extent.height < extent.height))) {
+			RefreshShaders(buffer, draw, color_output_mask, state, false);
+		}
+	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1113,9 +1125,49 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
+	const auto interrupted = buffer.ActiveRenderState();
+	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) buffer.EndRendering();
+	auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	std::array<uint32_t, 14> motion_push {};
+	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) {
+		const auto& vs = state.vertex_info[0];
+		const auto& viewport = buffer.GetRegisters().GetScreenViewport().viewports[0];
+		std::vector<uint64_t> key {vs.stage.program->shader_hash, state.ps_input_info.stage.program->shader_hash,
+		    uint64_t(topology), draw.index_count, uint32_t(emit.vertex_offset), emit.first_vertex,
+		    emit.first_instance, draw.instance_count, index_source.address, index_source.guest_element_size,
+		    rendering.width, rendering.height, std::bit_cast<uint32_t>(viewport.xscale),
+		    std::bit_cast<uint32_t>(viewport.yscale), std::bit_cast<uint32_t>(viewport.xoffset),
+		    std::bit_cast<uint32_t>(viewport.yoffset)};
+		const uint64_t last_vertex = uint64_t(emit.first_vertex) + draw.index_count;
+		uint32_t capacity = draw.IsIndexed() || last_vertex > UINT32_MAX ? 0 : uint32_t(last_vertex);
+		for (int i = 0; i < vs.buffers_num; ++i) {
+			const auto& vb = vs.buffers[i];
+			key.insert(key.end(), {vb.addr, vb.stride, vb.num_records, vb.fetch_index});
+			if (vb.fetch_index == 0 && vb.stride != 0) capacity = std::max(capacity, vb.num_records);
+		}
+		key.push_back(capacity);
+		auto& motion = m_context.GetGeometryMotion();
+		bool scene_geometry = true;
+		for (const auto* stage : stages) {
+			for (const auto& texture : stage->images) {
+				if (!texture.image_id) continue;
+				const auto& sampled = m_context.GetTextureCache().GetImage(texture.image_id);
+				// A post-processing quad describes its own geometry, not the
+				// scene sampled underneath it. Do not advertise that as scene motion.
+				if (sampled.usage.render_target || sampled.usage.storage) scene_geometry = false;
+			}
+		}
+		if (scene_geometry) motion_push = motion.PrepareDraw(buffer, key, capacity, emit.first_instance, draw.instance_count);
+		if (state.depth_info.depth_compare_op == vk::CompareOp::eGreater ||
+		    state.depth_info.depth_compare_op == vk::CompareOp::eGreaterOrEqual) motion_push[7] |= 2;
+		EXIT_IF(!motion.Attach(buffer, rendering));
+		const float normalized_viewport[] {(viewport.xoffset - viewport.xscale) / rendering.width,
+		    (viewport.yoffset - viewport.yscale) / rendering.height,
+		    viewport.xscale * 2 / rendering.width, viewport.yscale * 2 / rendering.height};
+		std::memcpy(motion_push.data() + 8, normalized_viewport, sizeof(normalized_viewport));
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1153,8 +1205,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
+	const auto guest_state = [](RenderState state) {
+		if (state.geometry_motion_attachment) {
+			state.color_attachments[7] = {};
+			state.num_color_attachments = 1;
+			state.geometry_motion_attachment = false;
+		}
+		return state;
+	};
+	// Capture barriers may split an otherwise unchanged guest pass. Resume its
+	// attachments with LOAD; clearing depth again would change guest visibility.
+	buffer.BeginRendering(rendering, interrupted && guest_state(*interrupted) == guest_state(rendering));
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) {
+		const auto& effective = buffer.EffectiveRenderState();
+		const float reciprocal_extent[] {1.f / effective.width, 1.f / effective.height};
+		std::memcpy(motion_push.data() + 12, reciprocal_extent, sizeof(reciprocal_extent));
+		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+		    0, sizeof(motion_push), motion_push.data());
+	}
 	if (state.ps_active && state.ps_input_info.raster_scale_dword != UINT32_MAX) {
 		const auto& effective = buffer.EffectiveRenderState();
 		const float inverse_scale[] {float(rendering.width) / effective.width,

@@ -43,7 +43,8 @@ public:
 	~DlssProcessor();
 	KYTY_CLASS_NO_COPY(DlssProcessor);
 	[[nodiscard]] bool Available() const;
-	[[nodiscard]] std::optional<vk::Extent2D> OptimalInputExtent(vk::Extent2D output) const;
+	[[nodiscard]] std::optional<vk::Extent2D> OptimalInputExtent(vk::Extent2D output,
+	                                                          vk::Extent2D source = {}) const;
 	// Call under the renderer mutex, only once per new guest frame, outside
 	// dynamic rendering. Output is a single-layer RGBA16F storage image.
 	[[nodiscard]] bool Evaluate(CommandBuffer& command, const DlssFrameInputs& inputs,

@@ -209,19 +209,28 @@ bool DlssProcessor::Available() const {
 	return m_impl->available && Config::GetDlssMode() != Config::DlssMode::Off;
 }
 
-std::optional<vk::Extent2D> DlssProcessor::OptimalInputExtent(vk::Extent2D output) const {
+std::optional<vk::Extent2D> DlssProcessor::OptimalInputExtent(vk::Extent2D output, vk::Extent2D source) const {
 #if defined(KYTY_HAS_DLSS)
 	if (!Available() || output.width == 0 || output.height == 0) return std::nullopt;
+	if (Config::GetDlssMode() != Config::DlssMode::DLAA &&
+	    source.width >= output.width && source.height >= output.height) return std::nullopt;
 	std::scoped_lock lock(ngx_mutex);
 	unsigned width = 0, height = 0, max_width = 0, max_height = 0, min_width = 0, min_height = 0;
 	float sharpness = 0;
+	// Final color has already been rendered. Preserve its detail rather than
+	// shrinking it to a resolution intended for a game's pre-render settings.
 	auto result = NGX_DLSS_GET_OPTIMAL_SETTINGS(m_impl->parameters, output.width, output.height,
 	    Quality(Config::GetDlssMode()), &width, &height, &max_width, &max_height,
 	    &min_width, &min_height, &sharpness);
 	if (NVSDK_NGX_FAILED(result) || width == 0 || height == 0) return std::nullopt;
+	if (source.width && source.height && Config::GetDlssMode() != Config::DlssMode::DLAA) {
+		width = std::clamp(source.width, min_width, max_width);
+		height = std::clamp(source.height, min_height, max_height);
+	}
 	return vk::Extent2D {width, height};
 #else
 	(void)output;
+	(void)source;
 	return std::nullopt;
 #endif
 }

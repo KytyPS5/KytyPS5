@@ -188,8 +188,8 @@ void TestPackedUnormImageAdmission() {
               P::RemapTextureFormat(format) == P::BufferFormat::k32UInt &&
               P::RenderTargetBytesPerElement(format) == 0u,
           "packed normalized load widened storage or admitted an unproved CB format");
-    for (uint32_t mode = 0; mode < 4u; ++mode) {
-      const auto operation = mode < 2u ? ValueOpcode::ImageRead
+    for (uint32_t mode = 0; mode < 5u; ++mode) {
+      const auto operation = mode < 2u || mode == 4u ? ValueOpcode::ImageRead
           : mode == 2u ? ValueOpcode::ImageSampleRaw : ValueOpcode::ImageWrite;
       Fixture fixture;
       std::array<Value, 8> words;
@@ -220,6 +220,17 @@ void TestPackedUnormImageAdmission() {
         fixture.Emit(ValueOpcode::ReferenceU32, {component});
       }
       fixture.PlanAndTrack();
+      if (mode == 4u) {
+        // Translation retains metadata after an unused D16 instruction is eliminated.
+        // The remaining live raw32 load uses resource zero; the removed entry must
+        // not restrict its format admission or be remapped as a live instruction.
+        MemoryInfo removed;
+        removed.kind = ResourceKind::Image;
+        removed.resource = 0u;
+        removed.data_bits = 16u;
+        removed.image_dimension = Decoder::ImageDimension::Dim2D;
+        fixture.program.memory_info.push_back(removed);
+      }
       const auto plan = ExtractResourcePlan(fixture.program);
       std::array<uint32_t, 64> user_data{};
       user_data[0] = 0x1000u;
@@ -234,7 +245,7 @@ void TestPackedUnormImageAdmission() {
       const auto before_specialization = specialization;
       const bool admitted = MaterializeResources(
           plan, {.user_data = user_data}, snapshot, specialization);
-      if (mode == 0u) {
+      if (mode == 0u || mode == 4u) {
         Check(admitted && snapshot.images.size() == 1u &&
                   snapshot.images[0].dwords[1] == user_data[1] &&
                   specialization.images[0].conversion_format == format &&

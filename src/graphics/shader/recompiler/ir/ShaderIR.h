@@ -707,6 +707,8 @@ struct ResourcePlan {
 	uint32_t                      user_data_count = 64;
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
+	// Width restrictions apply only to image instructions still present after DCE.
+	std::vector<bool>                   live_image_memory;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<uint32_t>               materialization_sources;
 	std::vector<ResourceBlock>          control_flow;

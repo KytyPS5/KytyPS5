@@ -2369,7 +2369,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		if (packed_unorm &&
 		    (storage || base.atomic || base.depth_compare ||
 		     std::ranges::any_of(program.memory_info, [&](const auto& memory) {
-			     return memory.kind == ResourceKind::Image && memory.resource == base_index &&
+			     const auto index = static_cast<size_t>(&memory - program.memory_info.data());
+			     const bool live = program.live_image_memory.size() != program.memory_info.size() ||
+			                       program.live_image_memory[index];
+			     return live && memory.kind == ResourceKind::Image && memory.resource == base_index &&
 			            memory.data_bits != 32u;
 		     }) ||
 		     std::ranges::any_of(program.info.sampled_pairs,
@@ -2870,6 +2873,15 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.user_data_count            = program.user_data_count;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
+	plan.live_image_memory.resize(program.memory_info.size());
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None) continue;
+			const auto index = inst.Flags<MemoryFlags>().index;
+			EXIT_IF(index >= plan.live_image_memory.size());
+			plan.live_image_memory[index] = true;
+		}
+	}
 	plan.bounded_srt_reads           = program.bounded_srt_reads;
 	plan.bounded_srt_reads_precede_writes = program.bounded_srt_reads_precede_writes;
 	plan.srt_plan_complete          = program.srt_plan_complete;

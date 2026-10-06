@@ -667,6 +667,9 @@ if(BUILD_TESTING)
 	add_test(NAME packed_unorm_image_admission
 		COMMAND $<TARGET_FILE:resource_tracking_tests> --packed-unorm-image-only)
 	set_tests_properties(packed_unorm_image_admission PROPERTIES TIMEOUT 30)
+	add_test(NAME shader_unused_image_instructions
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --unused-image-instructions-only)
+	set_tests_properties(shader_unused_image_instructions PROPERTIES TIMEOUT 30)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)

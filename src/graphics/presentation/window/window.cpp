@@ -947,23 +947,36 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
-	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
-	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	// Called after every present. Refresh the title a few times per second and never wait
+	// for the main thread: SDL 3.4 can lose the wake-up for a main-thread callback queued
+	// just before the event loop blocks, which stalled presentation for up to seconds.
+	static uint64_t title_refreshed = 0;
+	if (title_refreshed != 0 && now - title_refreshed < frequency / 4) {
+		return;
+	}
+	title_refreshed = now;
 
+	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+		SDL_Window* window;
+		std::string text;
+	};
+	auto* update = new TitleUpdate {
+	    window, fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}",
+	                        KYTY_BUILD_LABEL, build_type, (has_title ? title : ""),
+	                        (has_title ? ", " : ""), (has_title_id ? title_id : ""),
+	                        (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""),
+	                        (has_app_ver ? " " : ""), device_name, processor_name, frame_num,
+	                        current_fps)};
+	if (!SDL_RunOnMainThread(
+	        [](void* data) {
+		        const std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		        // SDL validates the window, so a callback that outlives it is harmless.
+		        SDL_SetWindowTitle(title->window, title->text.c_str());
+	        },
+	        update, false)) {
+		delete update;
+	}
 }
 
 } // namespace Libs::Graphics

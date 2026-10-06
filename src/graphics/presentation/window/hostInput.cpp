@@ -72,6 +72,9 @@ struct Binding {
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
+// SDL 3.4 can lose the wake-up for a main-thread callback queued just before the event
+// loop blocks (callbacks run before wakeup_window is published), so never wait unbounded.
+constexpr int              MAX_EVENT_WAIT_MS      = 20;
 constexpr uint64_t         CURSOR_IDLE_HIDE_MS    = 2000;
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
@@ -473,6 +476,7 @@ bool HostInputWaitEvent(SDL_Event* event) {
 		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
 		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
 	}
+	timeout = timeout < 0 ? MAX_EVENT_WAIT_MS : std::min(timeout, MAX_EVENT_WAIT_MS);
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);
 
 	if (Config::HideCursorEnabled()) {

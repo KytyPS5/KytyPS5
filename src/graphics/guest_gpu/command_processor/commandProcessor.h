@@ -62,7 +62,6 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
-	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }

@@ -170,6 +170,7 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 
 	bool found = QFile::exists(m_interpreter);
+	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
 
 	if (found) {
 		m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
@@ -228,9 +229,11 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (!info.audio_input_device.isEmpty()) {
 		args << "--mic" << info.audio_input_device;
 	}
-	if (!info.controller_color.isEmpty()) {
-		args << "--controller-color" << info.controller_color;
+	if (!info.controller.color.isEmpty()) {
+		args << "--controller-color" << info.controller.color;
 	}
+	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
+	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
@@ -238,7 +241,11 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
 	}
+	if (info.hide_cursor_enabled) {
+		args << "--hide-cursor";
+	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
@@ -529,8 +536,7 @@ void MainDialogPrivate::Update() {
 		m_lightbar.Stop();
 		return;
 	}
-	m_lightbar.SetColor(item != nullptr ? m_ui->widget->CreateConfiguration(*item)->controller_color
-	                                    : m_ui->widget->GetGlobalControllerColor());
+	m_lightbar.SetColor(m_ui->widget->GetGlobalControllerColor());
 }
 
 #include "mainDialog.moc"

@@ -9,7 +9,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-enum class ValueOpcode {
+enum class ValueOpcode : uint16_t {
 #define VALUE_OPCODE(name, ...) name,
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
 #undef VALUE_OPCODE

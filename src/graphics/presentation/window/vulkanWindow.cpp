@@ -24,7 +24,9 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -406,6 +408,32 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+// SteamOS Streaming LXC: global priority of the emulator's GPU queue. The
+// emulator shares the GPU with the desktop compositor and the stream
+// capture/encoder; at the default (medium) priority a GPU-saturating game
+// starves them and the stream stutters. LOW lets every other client go
+// first. KYTY_GPU_QUEUE_PRIORITY=low|medium|default (default = upstream
+// behaviour, no request). Set by VulkanCreate before device creation.
+static bool                    g_queue_priority_enabled = false;
+static vk::QueueGlobalPriority g_queue_priority         = vk::QueueGlobalPriority::eLow;
+
+static bool QueuePriorityFromEnv(vk::QueueGlobalPriority* priority) {
+	const char*       env   = std::getenv("KYTY_GPU_QUEUE_PRIORITY");
+	const std::string value = (env != nullptr ? env : "low");
+	if (value == "low") {
+		*priority = vk::QueueGlobalPriority::eLow;
+		return true;
+	}
+	if (value == "medium") {
+		*priority = vk::QueueGlobalPriority::eMedium;
+		return true;
+	}
+	if (value != "default" && !value.empty()) {
+		LOGF("KYTY_GPU_QUEUE_PRIORITY=%s not recognized (low, medium, default)\n", value.c_str());
+	}
+	return false;
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -418,6 +446,34 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = &queue_priority;
+
+	vk::DeviceQueueGlobalPriorityCreateInfo global_priority_info {};
+	global_priority_info.globalPriority = g_queue_priority;
+	if (g_queue_priority_enabled) {
+		queue_create_info.pNext = &global_priority_info;
+	}
+
+	// RADV (seen in Mesa 26.1) looks up its MEDIUM-priority hardware context
+	// for the private SDMA queue the WSI uses for PRIME blits on present, but
+	// only creates the contexts for priorities the application's queues ask
+	// for: with a LOW-only device that lookup is NULL and the first such
+	// present segfaults in radv_amdgpu_winsys_cs_submit. Create one unused
+	// default-priority queue on another family so the context exists.
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, {}};
+	uint32_t                                 queue_create_info_count = 1;
+	if (g_queue_priority_enabled && g_queue_priority != vk::QueueGlobalPriority::eMedium) {
+		const auto families = physical_device.getQueueFamilyProperties();
+		for (uint32_t family = 0; family < static_cast<uint32_t>(families.size()); family++) {
+			if (family != queue_family && families[family].queueCount > 0) {
+				auto& extra             = queue_create_infos[1];
+				extra.queueFamilyIndex  = family;
+				extra.queueCount        = 1;
+				extra.pQueuePriorities  = &queue_priority;
+				queue_create_info_count = 2;
+				break;
+			}
+		}
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -638,8 +694,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_info_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -647,6 +703,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::Device device = nullptr;
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
+	if (g_queue_priority_enabled && (result == vk::Result::eErrorNotPermitted ||
+	                                 result == vk::Result::eErrorInitializationFailed)) {
+		LOGF("GPU queue global priority refused (%s); using the default priority\n",
+		     vk::to_string(result).c_str());
+		g_queue_priority_enabled         = false;
+		queue_create_infos[0].pNext      = nullptr;
+		create_info.queueCreateInfoCount = 1;
+		result = physical_device.createDevice(&create_info, nullptr, &device);
+	}
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
 		return nullptr;
@@ -997,6 +1062,19 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
+		if (QueuePriorityFromEnv(&g_queue_priority)) {
+			for (const auto* extension:
+			     {VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME}) {
+				if (HasExtension(available_extensions, extension)) {
+					device_extensions.push_back(extension);
+					g_queue_priority_enabled = true;
+					break;
+				}
+			}
+			LOGF("GPU queue global priority: %s\n", g_queue_priority_enabled
+			                                            ? vk::to_string(g_queue_priority).c_str()
+			                                            : "unsupported by the driver");
+		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;

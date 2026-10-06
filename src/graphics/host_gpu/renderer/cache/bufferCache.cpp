@@ -496,9 +496,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
 	if (staging == nullptr) {
-		// Larger than the staging ring (streaming pools of several hundred MiB): serve the
-		// image from a cached buffer covering the range instead.
-		return ObtainBuffer(vaddr, size, false, false);
+		// Larger than the staging ring (streaming pools of several hundred MiB): read the
+		// guest range sparsely into a one-off upload buffer released after the submission.
+		auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+		                                         vk::BufferUsageFlagBits::eTransferSrc, size);
+		auto* mapped = temporary->Mapped().data();
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+			std::memset(mapped, 0, size);
+		}
+		temporary->Flush(0, size);
+		auto* source = temporary.get();
+		m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+		return {source, 0};
 	}
 	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
 		// A descriptor can outlive its allocation (stale table slots). Upload zeros

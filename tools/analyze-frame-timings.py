@@ -5,6 +5,11 @@ import json
 import statistics
 from pathlib import Path
 
+PREPARATION_FIELDS = (
+    "prepare_wait_ms", "prepare_lock_ms", "resolve_ms", "inputs_ms",
+    "fg_capture_ms", "dlss_record_ms",
+)
+
 
 def percentile(values, fraction):
     values = sorted(values)
@@ -18,10 +23,13 @@ def summarize(path, start, end):
     rows = []
     discarded = 0
     with path.open(newline="", encoding="utf-8") as trace:
-        for raw in csv.DictReader(trace):
+        reader = csv.DictReader(trace)
+        optional = [key for key in (*PREPARATION_FIELDS, "display_frames")
+                    if key in (reader.fieldnames or ())]
+        for raw in reader:
             try:
                 row = {key: float(raw[key]) for key in (
-                    "elapsed_ms", "frame_ms", "present_ms", "new_frame", "dlss_evaluated"
+                    "elapsed_ms", "frame_ms", "present_ms", "new_frame", "dlss_evaluated", *optional
                 )}
             except (KeyError, TypeError, ValueError):
                 # An interrupted process can leave one incomplete buffered row.
@@ -36,7 +44,7 @@ def summarize(path, start, end):
     intervals = [row["frame_ms"] for row in rows[1:] if row["frame_ms"] > 0]
     present = [row["present_ms"] for row in rows]
     new_frames = sum(int(row["new_frame"]) for row in rows)
-    return {
+    result = {
         "trace": str(path), "seconds": round(elapsed, 3), "submissions": len(rows),
         "submission_fps": round((len(rows) - 1) / elapsed, 2),
         "new_frames": new_frames,
@@ -57,6 +65,21 @@ def summarize(path, start, end):
         },
         "incomplete_rows": discarded,
     }
+    prepared = [row for row in rows if row["new_frame"] and
+                any(row.get(key, 0) > 0 for key in PREPARATION_FIELDS)]
+    if prepared:
+        result["preparation_ms"] = {
+            key.removesuffix("_ms"): {
+                "median": round(statistics.median(row[key] for row in prepared), 3),
+                "p99": round(percentile([row[key] for row in prepared], .99), 3),
+            }
+            for key in PREPARATION_FIELDS if key in optional
+        }
+    if "display_frames" in optional:
+        result["sdk_display_fps"] = round(
+            sum(row["display_frames"] for row in rows[1:] if row["new_frame"]) / elapsed, 2
+        )
+    return result
 
 
 def main():

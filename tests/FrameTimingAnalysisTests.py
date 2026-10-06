@@ -48,6 +48,26 @@ class FrameTimingAnalysisTests(unittest.TestCase):
         self.assertEqual(result["interval_ms"]["over_33_33"], 1)
         self.assertEqual(result["incomplete_rows"], 1)
 
+    def test_preparation_and_display_counts_exclude_cached_presents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            path.write_text(
+                "frame,elapsed_ms,frame_ms,present_ms,new_frame,dlss_evaluated,"
+                "prepare_wait_ms,prepare_lock_ms,resolve_ms,inputs_ms,"
+                "fg_capture_ms,dlss_record_ms,display_frames\n"
+                "1,35000,20000,1,1,1,2,1,0.1,0.2,0.3,0.4,2\n"
+                "2,35005,5,1,0,1,0,0,0,0,0,0,0\n"
+                "3,35010,5,1,1,1,4,1,0.1,0.2,0.3,0.4,2\n"
+                "4,35020,10,1,1,1,6,1,0.1,0.2,0.3,0.4,2\n"
+                "5,35030,10,1,1,1,8,\n",
+                encoding="utf-8",
+            )
+            result = analysis.summarize(path, 35, 36)
+        self.assertEqual(result["guest_fps"], 100)
+        self.assertEqual(result["sdk_display_fps"], 200)
+        self.assertEqual(result["preparation_ms"]["prepare_wait"]["median"], 4)
+        self.assertEqual(result["incomplete_rows"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

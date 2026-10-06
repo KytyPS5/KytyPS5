@@ -48,7 +48,6 @@ using s64 = int64_t;
 
 constexpr size_t NearJumpSize = 5;
 
-
 struct PatchModule {
 	std::mutex           mutex {};
 	u8*                  start = nullptr;
@@ -1567,7 +1566,6 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	}
 	return result;
 }
-
 
 namespace {
 

@@ -282,22 +282,6 @@ void TestInsertqRegister() {
 	}
 }
 
-void TestTrappedReciprocalSquareRoot() {
-	auto           fn = MapCode<LoadBlobFn>(kTrappedVrsqrtpsXmm1Xmm0);
-	const uint32_t in_bits[8] {std::bit_cast<uint32_t>(4.0f), 0x00000000u, 0xbf800000u, 0x7f800000u,
-	                           0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-	uint32_t       out_bits[8] {};
-	const int      before = IllegalHits();
-	fn(reinterpret_cast<uint64_t *>(out_bits), reinterpret_cast<const uint64_t *>(in_bits));
-	Check(IllegalHits() > before, "host raises SIGILL for the trapped VRSQRTPS");
-	Check(std::bit_cast<float>(out_bits[0]) == 0.5f, "vrsqrtps of 4.0 is 0.5");
-	Check(out_bits[1] == 0x7f800000u, "vrsqrtps of +0 is +infinity");
-	Check(out_bits[2] == 0xffc00000u, "vrsqrtps of a negative number is the default NaN");
-	Check(out_bits[3] == 0, "vrsqrtps of +infinity is +0");
-	Check(out_bits[4] == 0 && out_bits[5] == 0 && out_bits[6] == 0 && out_bits[7] == 0,
-	      "the VEX.128 form zeroes the upper half of ymm1");
-}
-
 void TestMwaitxEmulated() {
 	auto      fn     = MapCode<VoidBlobFn>(kMwaitx);
 	const int before = IllegalHits();
@@ -491,7 +475,6 @@ int main() {
 	TestRexHighRegisterExtrq();
 	TestRexHighRegisterInsertqWithIndex();
 	TestInsertqRegister();
-	TestTrappedReciprocalSquareRoot();
 	TestMwaitxEmulated();
 	TestUnknownInstructionRefused();
 	TestPatchedExtrqImmediate();

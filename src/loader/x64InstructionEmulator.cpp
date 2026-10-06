@@ -714,7 +714,6 @@ static bool TryEmulateCpuExtensions(Context& context) {
 	return true;
 }
 
-
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	if (rip[0] != 0x0f || rip[1] != 0x01 || (rip[2] != 0xfa && rip[2] != 0xfb)) {
@@ -800,7 +799,6 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	return true;
 }
 
-
 bool TryEmulate(void* native_context) {
 	if (native_context == nullptr) {
 		return false;
@@ -816,14 +814,12 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
-	// VRSQRTPS is trapped by the guest instruction patcher on every host, so Rosetta needs it too.
+	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
+	       TryEmulateSse4a(context) ||
 #if !defined(__APPLE__)
-	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
-	       TryEmulateSse4a(context) || TryEmulateShaNi(context) || TryEmulateCpuExtensions(context);
-#else
-	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
-	       TryEmulateSse4a(context) || TryEmulateCpuExtensions(context);
+	       TryEmulateShaNi(context) ||
 #endif
+	       TryEmulateCpuExtensions(context);
 }
 
 } // namespace Loader::X64InstructionEmulator

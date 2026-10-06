@@ -1,10 +1,20 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include "common/common.h"
+#include "common/logging/log.h"
 
 #include <Zydis/Zydis.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#include <vector>
 #include <emmintrin.h>
 #include <xmmintrin.h>
 #include <cpuid.h>
@@ -404,6 +414,7 @@ struct Context {
 
 	[[nodiscard]] uint64_t Rip() const { return native->Rip; }
 	void                   Advance(size_t length) { native->Rip += length; }
+	void                   SetRip(uint64_t rip) { native->Rip = rip; }
 	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
 
 	[[nodiscard]] auto& Gpr(uint8_t index) const {
@@ -445,6 +456,7 @@ struct Context {
 		                         &state->__r12, &state->__r13, &state->__r14, &state->__r15};
 		return *registers[index];
 	}
+	void SetRip(uint64_t rip) { native->uc_mcontext->__ss.__rip = rip; }
 	// Darwin names the XMM file __fpu_xmm0..__fpu_xmm15 instead of exposing an array.
 	[[nodiscard]] void* Xmm(uint8_t index) const {
 		auto* fs = &native->uc_mcontext->__fs;
@@ -477,6 +489,7 @@ struct Context {
 	void Advance(size_t length) {
 		native->uc_mcontext.gregs[REG_RIP] += static_cast<greg_t>(length);
 	}
+	void SetRip(uint64_t rip) { native->uc_mcontext.gregs[REG_RIP] = static_cast<greg_t>(rip); }
 	[[nodiscard]] void* Xmm(uint8_t index) const {
 		if (native->uc_mcontext.fpregs == nullptr) {
 			return nullptr;
@@ -792,6 +805,572 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 
 #endif
 
+static bool IsPlainWideStore(const ZydisDecodedInstruction& instruction,
+                             const ZydisDecodedOperand*     operands) {
+	// Only the unaligned forms: a 32-byte aligned store cannot cross a page, and the aligned forms
+	// must keep raising #GP on a misaligned address.
+	switch (instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_VMOVUPS:
+		case ZYDIS_MNEMONIC_VMOVUPD:
+		case ZYDIS_MNEMONIC_VMOVDQU: break;
+		default: return false;
+	}
+	return instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
+	       instruction.operand_count_visible == 2 &&
+	       operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && operands[0].size == 256 &&
+	       operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	       operands[1].reg.value >= ZYDIS_REGISTER_YMM0 &&
+	       operands[1].reg.value <= ZYDIS_REGISTER_YMM15;
+}
+
+// fs:/gs: accesses (TLS) are not moved: re-encoding lost the segment in the test title and the
+// moved load read address 0.
+static bool UsesSegmentBase(const ZydisDecodedInstruction& instruction,
+                            const ZydisDecodedOperand*     operands) {
+	for (uint32_t i = 0; i < instruction.operand_count; i++) {
+		if (operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+		    (operands[i].mem.segment == ZYDIS_REGISTER_FS ||
+		     operands[i].mem.segment == ZYDIS_REGISTER_GS)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Encodes at runtime_address; RIP-relative memory operands carry absolute addresses.
+static bool EncodeAt(ZydisEncoderRequest& request, uint64_t runtime_address, uint8_t* out,
+                     uint64_t capacity, uint64_t* length) {
+	ZyanUSize size = capacity;
+	if (!ZYAN_SUCCESS(
+	        ZydisEncoderEncodeInstructionAbsolute(&request, out, &size, runtime_address))) {
+		return false;
+	}
+	*length = size;
+	return true;
+}
+
+// next_ip is the address after the original instruction, the base of a RIP-relative operand.
+static void SetMemoryOperand(ZydisEncoderOperand& op, const ZydisDecodedOperand& mem,
+                             uint64_t next_ip, int64_t extra_displacement) {
+	op.type             = ZYDIS_OPERAND_TYPE_MEMORY;
+	op.mem.base         = mem.mem.base;
+	op.mem.index        = mem.mem.index;
+	op.mem.scale        = mem.mem.scale;
+	op.mem.displacement = (mem.mem.base == ZYDIS_REGISTER_RIP ? static_cast<int64_t>(next_ip) : 0) +
+	                      mem.mem.disp.value + extra_displacement;
+	op.mem.size         = 16;
+}
+
+// Short stores patched to ud2: site -> trampoline. Written while modules load, read from the
+// signal handler, so it is a fixed lock-free open-addressing table.
+namespace {
+struct WideStoreTrap {
+	std::atomic<uint64_t> site {0};
+	std::atomic<uint64_t> trampoline {0};
+	std::atomic<uint32_t> hits {0};
+};
+// KYTY_WIDE_STORE_HOT names a profile: sites redirected often are appended to it, and on the
+// next start those sites are patched by moving the following instructions into the trampoline
+// instead of through a signal per execution.
+constexpr uint32_t WideStoreHotHits    = 1024;
+int                g_wide_store_hot_fd = -1;
+
+const std::vector<uint64_t>& WideStoreHotSites() {
+	static const std::vector<uint64_t> sites = [] {
+		std::vector<uint64_t> result;
+		const char*           path = std::getenv("KYTY_WIDE_STORE_HOT");
+		if (path == nullptr) {
+			return result;
+		}
+		if (FILE* file = std::fopen(path, "r"); file != nullptr) {
+			unsigned long long site = 0;
+			while (std::fscanf(file, "%llx", &site) == 1) {
+				result.push_back(site);
+			}
+			std::fclose(file);
+		}
+		std::sort(result.begin(), result.end());
+		result.erase(std::unique(result.begin(), result.end()), result.end());
+		g_wide_store_hot_fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+		return result;
+	}();
+	return sites;
+}
+
+// Async-signal-safe: formats with no allocation and writes with one write(). Sites already on the
+// list (loaded at startup, sorted, read-only afterwards) are not appended again.
+void RecordHotWideStore(uint64_t site) {
+	if (g_wide_store_hot_fd < 0) {
+		return;
+	}
+	const auto& known = WideStoreHotSites();
+	if (std::binary_search(known.begin(), known.end(), site)) {
+		return;
+	}
+	char buffer[20];
+	int  length      = 0;
+	buffer[length++] = '0';
+	buffer[length++] = 'x';
+	for (int shift = 60; shift >= 0; shift -= 4) {
+		buffer[length++] = "0123456789abcdef"[(site >> shift) & 0xfu];
+	}
+	buffer[length++] = '\n';
+	(void)!write(g_wide_store_hot_fd, buffer, static_cast<size_t>(length));
+}
+constexpr uint64_t                               WideStoreTrapCapacity = 1u << 15u;
+std::array<WideStoreTrap, WideStoreTrapCapacity> g_wide_store_traps {};
+std::atomic<uint64_t>                            g_wide_store_trap_hits {0};
+
+uint64_t TrapSlot(uint64_t site) {
+	return (site * 0x9E3779B97F4A7C15ull) >> 49u; // 15 bits
+}
+} // namespace
+
+static bool RegisterWideStoreTrap(uint64_t site, uint64_t trampoline) {
+	for (uint64_t i = 0; i < WideStoreTrapCapacity; i++) {
+		auto&    entry    = g_wide_store_traps[(TrapSlot(site) + i) % WideStoreTrapCapacity];
+		uint64_t expected = 0;
+		if (entry.site.load(std::memory_order_acquire) == site) {
+			entry.trampoline.store(trampoline, std::memory_order_release);
+			return true;
+		}
+		if (entry.site.compare_exchange_strong(expected, site, std::memory_order_acq_rel)) {
+			entry.trampoline.store(trampoline, std::memory_order_release);
+			return true;
+		}
+	}
+	return false;
+}
+
+static WideStoreTrap* FindWideStoreTrapEntry(uint64_t site) {
+	for (uint64_t i = 0; i < WideStoreTrapCapacity; i++) {
+		auto&      entry = g_wide_store_traps[(TrapSlot(site) + i) % WideStoreTrapCapacity];
+		const auto key   = entry.site.load(std::memory_order_acquire);
+		if (key == site) {
+			return &entry;
+		}
+		if (key == 0) {
+			return nullptr;
+		}
+	}
+	return nullptr;
+}
+
+WideStoreSplitResult SplitWideStores(uint64_t address, uint64_t size, uint64_t* cursor,
+                                     uint64_t trampoline_end) {
+	WideStoreSplitResult result;
+	ZydisDecoder         decoder {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+		return result;
+	}
+	constexpr uint64_t JumpSize      = 5;
+	constexpr uint64_t ShortJumpSize = 2;
+
+	// Stores shorter than a rel32 jump get a rel8 jump to a "cave": a run of int3 padding
+	// between functions (never executed), which holds the rel32 jump to the trampoline.
+	struct Cave {
+		uint64_t start = 0;
+		uint64_t size  = 0;
+		uint64_t used  = 0;
+	};
+	// Also usable: nop padding that directly follows an unconditional ret/jmp/ud2, which
+	// execution cannot fall into (branches target the aligned code after it).
+	std::vector<Cave>     caves;
+	std::vector<uint64_t> branch_targets;
+	std::vector<uint64_t> candidates; // offsets of VEX vector moves, checked in the phases
+	bool                  after_unconditional = false;
+	uint64_t          nop_start           = 0;
+	uint64_t          nop_size            = 0;
+	const auto            end_nops            = [&]() {
+		if (nop_size >= ShortJumpSize) {
+			caves.push_back({nop_start, nop_size, 0});
+		}
+		nop_size = 0;
+	};
+	for (uint64_t offset = 0; offset < size;) {
+		const auto*             code = reinterpret_cast<const uint8_t*>(address + offset);
+		ZydisDecoderContext     decode_context {};
+		ZydisDecodedInstruction instruction {};
+		if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder, &decode_context, code,
+		                                                size - offset, &instruction))) {
+			end_nops();
+			after_unconditional = false;
+			++offset;
+			continue;
+		}
+		if (instruction.mnemonic == ZYDIS_MNEMONIC_INT3 && instruction.length == 1) {
+			end_nops();
+			const uint64_t start = address + offset;
+			uint64_t       run   = 0;
+			while (offset + run < size && code[run] == 0xCC) {
+				++run;
+			}
+			if (run >= ShortJumpSize) {
+				caves.push_back({start, run, 0});
+			}
+			offset += run;
+			after_unconditional = true;
+			continue;
+		}
+		if (instruction.mnemonic == ZYDIS_MNEMONIC_NOP && (after_unconditional || nop_size != 0)) {
+			if (nop_size == 0) {
+				nop_start = address + offset;
+			}
+			nop_size += instruction.length;
+			after_unconditional = false;
+			offset += instruction.length;
+			continue;
+		}
+		end_nops();
+		if (instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX) {
+			switch (instruction.mnemonic) {
+				case ZYDIS_MNEMONIC_VMOVUPS:
+				case ZYDIS_MNEMONIC_VMOVUPD:
+				case ZYDIS_MNEMONIC_VMOVDQU: candidates.push_back(offset); break;
+				default: break;
+			}
+		}
+		if (instruction.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE &&
+		    (instruction.attributes & ZYDIS_ATTRIB_IS_RELATIVE) != 0) {
+			ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT] {};
+			ZyanU64             target = 0;
+			if (ZYAN_SUCCESS(ZydisDecoderDecodeOperands(&decoder, &decode_context, &instruction,
+			                                            ops, instruction.operand_count)) &&
+			    ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+			    ZYAN_SUCCESS(
+			        ZydisCalcAbsoluteAddress(&instruction, &ops[0], address + offset, &target))) {
+				branch_targets.push_back(target);
+			}
+		}
+		after_unconditional = instruction.mnemonic == ZYDIS_MNEMONIC_RET ||
+		                      instruction.mnemonic == ZYDIS_MNEMONIC_UD2 ||
+		                      (instruction.mnemonic == ZYDIS_MNEMONIC_JMP);
+		offset += instruction.length;
+	}
+	end_nops();
+	std::sort(caves.begin(), caves.end(),
+	          [](const Cave& a, const Cave& b) { return a.start < b.start; });
+	std::sort(branch_targets.begin(), branch_targets.end());
+	const auto& hot_sites = WideStoreHotSites();
+
+	// Finds a chain of dead-byte slots from a short jump at next_ip: every hop is a rel8 jump
+	// (2 bytes) and the last slot holds the rel32 jump (5 bytes). Reserves the bytes it uses.
+	constexpr uint32_t MaxHops = 4;
+	const auto find_path = [&](uint64_t next_ip, std::array<uint64_t, MaxHops>& path) -> uint32_t {
+		struct Node {
+			uint64_t next_ip;
+			uint32_t depth;
+			int32_t  parent;
+			size_t   cave;
+		};
+		std::vector<Node> nodes {{next_ip, 0, -1, SIZE_MAX}};
+		for (size_t n = 0; n < nodes.size(); n++) {
+			const auto     node = nodes[n];
+			const uint64_t low  = node.next_ip >= 128 ? node.next_ip - 128 : 0;
+			const uint64_t high = node.next_ip + 127;
+			auto           it =
+			    std::lower_bound(caves.begin(), caves.end(), low, [](const Cave& cave, uint64_t v) {
+				    return cave.start + cave.size <= v;
+			    });
+			for (; it != caves.end() && it->start <= high; ++it) {
+				const size_t   index = static_cast<size_t>(it - caves.begin());
+				const uint64_t slot  = it->start + it->used;
+				if (slot < low || slot > high) {
+					continue;
+				}
+				bool on_path = false;
+				for (int32_t k = static_cast<int32_t>(n); k >= 0 && !on_path;
+				     k         = nodes[static_cast<size_t>(k)].parent) {
+					on_path = nodes[static_cast<size_t>(k)].cave == index;
+				}
+				if (on_path) {
+					continue;
+				}
+				const uint64_t free = it->size - it->used;
+				if (free >= JumpSize) {
+					// Reserve: the terminal slot, then each hop back to the start.
+					uint32_t count  = node.depth + 1;
+					path[count - 1] = slot;
+					it->used += JumpSize;
+					uint32_t i = count - 1;
+					for (int32_t k = static_cast<int32_t>(n); k > 0;
+					     k         = nodes[static_cast<size_t>(k)].parent) {
+						auto& hop = caves[nodes[static_cast<size_t>(k)].cave];
+						path[--i] = hop.start + hop.used;
+						hop.used += ShortJumpSize;
+					}
+					return count;
+				}
+				if (free >= ShortJumpSize && node.depth + 1 < MaxHops && nodes.size() < 4096) {
+					nodes.push_back(
+					    {slot + ShortJumpSize, node.depth + 1, static_cast<int32_t>(n), index});
+				}
+			}
+		}
+		return 0;
+	};
+
+	// Phase 0 patches stores that hold a rel32 jump; their dead bytes become more slots. Phase 1
+	// patches the short ones.
+	for (int phase = 0; phase < 2; phase++) {
+		if (phase == 1) {
+			std::sort(caves.begin(), caves.end(),
+			          [](const Cave& a, const Cave& b) { return a.start < b.start; });
+		}
+		// Bytes before skip_until were rewritten by a moved-instruction patch in this phase.
+		uint64_t skip_until = 0;
+		for (const uint64_t start: candidates) {
+			if (start < skip_until) {
+				continue;
+			}
+			uint64_t                offset = start;
+			auto*                   code   = reinterpret_cast<uint8_t*>(address + offset);
+			ZydisDecodedInstruction instruction {};
+			ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+			if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, code, size - offset, &instruction,
+			                                         operands))) {
+				continue;
+			}
+			const uint64_t length = instruction.length;
+			offset += length;
+			if (!IsPlainWideStore(instruction, operands) || (phase == 0) != (length >= JumpSize)) {
+				continue;
+			}
+			result.candidates++;
+			uint64_t                      cave = 0;
+			std::array<uint64_t, MaxHops> path {};
+			uint32_t                      hops = 0;
+			// No padding in reach: the store becomes ud2, and the illegal-instruction handler sends
+			// execution to the trampoline (see TryRedirectWideStore). Costs a signal per execution.
+			bool trap = false;
+			if (length < JumpSize) {
+				hops = length >= ShortJumpSize
+				           ? find_path(reinterpret_cast<uint64_t>(code) + ShortJumpSize, path)
+				           : 0;
+				cave = hops != 0 ? path[hops - 1] : 0;
+				if (cave == 0) {
+					trap = length >= ShortJumpSize;
+					if (!trap) {
+						result.too_short++;
+						continue;
+					}
+				}
+			}
+			// A hot trapped site (from the profile) moves its following instructions into the
+			// trampoline: up to four, no control flow, not a direct branch target, re-encodable.
+			uint64_t                moved_original = 0;
+			std::array<uint64_t, 4> moved_ips {};
+			uint32_t                moved_count = 0;
+			// Moving instructions is only safe when nothing jumps into them. The sweep sees direct
+			// branch targets only, not jump tables, computed jumps or landing pads, so by default
+			// only sites from the hot profile are moved. KYTY_WIDE_STORE_MOVE=all also moves at
+			// unprofiled sites.
+			static const bool move_all = [] {
+				const char* value = std::getenv("KYTY_WIDE_STORE_MOVE");
+				return value != nullptr && std::strcmp(value, "all") == 0;
+			}();
+			if (trap && (move_all || std::binary_search(hot_sites.begin(), hot_sites.end(),
+			                                            reinterpret_cast<uint64_t>(code)))) {
+				while (length + moved_original < JumpSize && moved_count < moved_ips.size()) {
+					const uint64_t ip = reinterpret_cast<uint64_t>(code) + length + moved_original;
+					ZydisDecodedInstruction next {};
+					ZydisDecodedOperand     next_ops[ZYDIS_MAX_OPERAND_COUNT] {};
+					if (ip >= address + size ||
+					    std::binary_search(branch_targets.begin(), branch_targets.end(), ip) ||
+					    !ZYAN_SUCCESS(
+					        ZydisDecoderDecodeFull(&decoder, reinterpret_cast<uint8_t*>(ip),
+					                               address + size - ip, &next, next_ops)) ||
+					    next.meta.category == ZYDIS_CATEGORY_RET ||
+					    next.meta.category == ZYDIS_CATEGORY_SYSTEM ||
+					    next.meta.category == ZYDIS_CATEGORY_INTERRUPT ||
+					    next.meta.category == ZYDIS_CATEGORY_CALL ||
+					    IsPlainWideStore(next, next_ops) || UsesSegmentBase(next, next_ops)) {
+						break;
+					}
+					// A relative jmp/jcc (a loop's back edge) is re-encoded with its absolute
+					// target and ends the moved sequence; other control flow is not moved.
+					const bool branch = next.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE;
+					if (branch && ((next.attributes & ZYDIS_ATTRIB_IS_RELATIVE) == 0 ||
+					               (next.meta.category != ZYDIS_CATEGORY_UNCOND_BR &&
+					                next.meta.category != ZYDIS_CATEGORY_COND_BR))) {
+						break;
+					}
+					moved_ips[moved_count++] = ip;
+					moved_original += next.length;
+					if (branch) {
+						break;
+					}
+				}
+				if (length + moved_original >= JumpSize) {
+					trap = false;
+				} else {
+					moved_count    = 0;
+					moved_original = 0;
+				}
+			}
+			const auto& mem = operands[0];
+			if (mem.mem.segment != ZYDIS_REGISTER_DS && mem.mem.segment != ZYDIS_REGISTER_SS &&
+			    mem.mem.segment != ZYDIS_REGISTER_NONE) {
+				result.unsupported++;
+				continue;
+			}
+			const auto ymm = operands[1].reg.value;
+			const auto xmm =
+			    static_cast<ZydisRegister>(ZYDIS_REGISTER_XMM0 + (ymm - ZYDIS_REGISTER_YMM0));
+
+			// Low half: vmovups xmmword [mem], xmmN
+			ZydisEncoderRequest low {};
+			low.machine_mode    = ZYDIS_MACHINE_MODE_LONG_64;
+			low.mnemonic        = ZYDIS_MNEMONIC_VMOVUPS;
+			low.operand_count   = 2;
+			const uint64_t site = reinterpret_cast<uint64_t>(code);
+			const uint64_t back = site + length;
+			SetMemoryOperand(low.operands[0], mem, back, 0);
+			low.operands[1].type      = ZYDIS_OPERAND_TYPE_REGISTER;
+			low.operands[1].reg.value = xmm;
+			// High half: vextractf128 xmmword [mem + 16], ymmN, 1
+			ZydisEncoderRequest high {};
+			high.machine_mode  = ZYDIS_MACHINE_MODE_LONG_64;
+			high.mnemonic      = ZYDIS_MNEMONIC_VEXTRACTF128;
+			high.operand_count = 3;
+			SetMemoryOperand(high.operands[0], mem, back, 16);
+			high.operands[1].type      = ZYDIS_OPERAND_TYPE_REGISTER;
+			high.operands[1].reg.value = ymm;
+			high.operands[2].type      = ZYDIS_OPERAND_TYPE_IMMEDIATE;
+			high.operands[2].imm.u     = 1;
+
+			const uint64_t trampoline = *cursor;
+			uint8_t        buffer[128];
+			uint64_t       low_length  = 0;
+			uint64_t       high_length = 0;
+			if (!EncodeAt(low, trampoline, buffer, sizeof(buffer), &low_length) ||
+			    !EncodeAt(high, trampoline + low_length, buffer + low_length,
+			              sizeof(buffer) - low_length, &high_length)) {
+				result.unsupported++;
+				continue;
+			}
+			uint64_t moved_length = 0;
+			bool     moved_ok     = true;
+			for (uint32_t i = 0; i < moved_count && moved_ok; i++) {
+				const auto              ip = moved_ips[i];
+				ZydisDecodedInstruction insn {};
+				ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT] {};
+				ZydisEncoderRequest     request {};
+				moved_ok =
+				    ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<uint8_t*>(ip),
+				                                        address + size - ip, &insn, ops)) &&
+				    ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(
+				        &insn, ops, insn.operand_count_visible, &request));
+				if (!moved_ok) {
+					break;
+				}
+				// Nops (alignment padding that execution falls through) are dropped: re-encoding
+				// a 15-byte "nop cs:[rax + rax]" produced a load of address 0 in the test title.
+				if (insn.mnemonic == ZYDIS_MNEMONIC_NOP) {
+					continue;
+				}
+				for (uint32_t k = 0; k < request.operand_count; k++) {
+					auto& op = request.operands[k];
+					if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.mem.base == ZYDIS_REGISTER_RIP) {
+						op.mem.displacement += static_cast<int64_t>(ip + insn.length);
+					}
+				}
+				if ((insn.attributes & ZYDIS_ATTRIB_IS_RELATIVE) != 0 &&
+				    insn.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) {
+					ZyanU64 target = 0;
+					moved_ok = ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &ops[0], ip, &target));
+					request.operands[0].imm.u = target;
+					request.branch_type       = ZYDIS_BRANCH_TYPE_NONE;
+					request.branch_width      = ZYDIS_BRANCH_WIDTH_NONE;
+					if (!moved_ok) {
+						break;
+					}
+				}
+				const uint64_t used    = low_length + high_length + moved_length;
+				uint64_t       encoded = 0;
+				moved_ok               = EncodeAt(request, trampoline + used, buffer + used,
+				                                  sizeof(buffer) - used, &encoded);
+				moved_length += encoded;
+			}
+			if (!moved_ok) {
+				result.unsupported++;
+				continue;
+			}
+			const uint64_t prologue = low_length + high_length + moved_length;
+			const uint64_t body     = prologue + JumpSize;
+			if (trampoline + body > trampoline_end) {
+				result.unsupported++;
+				continue;
+			}
+			const uint64_t jump_from = cave != 0 ? cave : site;
+			const int64_t  to_tramp =
+			    static_cast<int64_t>(trampoline) - static_cast<int64_t>(jump_from + JumpSize);
+			const int64_t to_back = static_cast<int64_t>(back + moved_original) -
+			                        static_cast<int64_t>(trampoline + prologue + JumpSize);
+			if (to_tramp < INT32_MIN || to_tramp > INT32_MAX || to_back < INT32_MIN ||
+			    to_back > INT32_MAX) {
+				result.unsupported++;
+				continue;
+			}
+			auto* out = reinterpret_cast<uint8_t*>(trampoline);
+			std::memcpy(out, buffer, prologue);
+			out[prologue]     = 0xE9;
+			const auto back32 = static_cast<int32_t>(to_back);
+			std::memcpy(out + prologue + 1, &back32, sizeof(back32));
+			*cursor += body;
+			result.trampoline_bytes += body;
+
+			const auto tramp32 = static_cast<int32_t>(to_tramp);
+			if (cave != 0) {
+				// site: jmp rel8 -> [hop: jmp rel8 ->]... slot: jmp rel32 -> trampoline
+				auto* slot = reinterpret_cast<uint8_t*>(cave);
+				slot[0]    = 0xE9;
+				std::memcpy(slot + 1, &tramp32, sizeof(tramp32));
+				uint64_t from = site;
+				for (uint32_t h = 0; h < hops; h++) {
+					auto* jump = reinterpret_cast<uint8_t*>(from);
+					jump[0]    = 0xEB;
+					jump[1]    = static_cast<uint8_t>(
+					    static_cast<int8_t>(static_cast<int64_t>(path[h]) -
+					                        static_cast<int64_t>(from + ShortJumpSize)));
+					from = path[h];
+				}
+				std::memset(code + ShortJumpSize, 0xCC, length - ShortJumpSize);
+				result.via_cave++;
+				result.patched++;
+				continue;
+			}
+			if (trap) {
+				if (!RegisterWideStoreTrap(site, trampoline)) {
+					result.unsupported++;
+					continue;
+				}
+				code[0] = 0x0F; // ud2
+				code[1] = 0x0B;
+				std::memset(code + ShortJumpSize, 0xCC, length - ShortJumpSize);
+				result.trapped++;
+				result.patched++;
+				continue;
+			}
+			// The original instruction (with any moved ones) becomes the jump; the remaining bytes
+			// are never executed.
+			code[0] = 0xE9;
+			std::memcpy(code + 1, &tramp32, sizeof(tramp32));
+			std::memset(code + JumpSize, 0xCC, length + moved_original - JumpSize);
+			if (moved_count != 0) {
+				result.relocated++;
+				skip_until = offset + moved_original;
+			}
+			if (phase == 0 && length >= JumpSize + ShortJumpSize) {
+				caves.push_back({site + JumpSize, length - JumpSize, 0});
+			}
+			result.patched++;
+		}
+	}
+	return result;
+}
+
 bool TryEmulate(void* native_context) {
 	if (native_context == nullptr) {
 		return false;
@@ -807,6 +1386,20 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
+	if (auto* trap = FindWideStoreTrapEntry(context.Rip()); trap != nullptr) {
+		const auto trampoline = trap->trampoline.load(std::memory_order_acquire);
+		if (trap->hits.fetch_add(1, std::memory_order_relaxed) + 1 == WideStoreHotHits) {
+			RecordHotWideStore(context.Rip());
+		}
+		const auto hits = g_wide_store_trap_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((hits & (hits - 1)) == 0) {
+			LOGF("[wide-store-trap] hits=%llu last site=0x%llx\n",
+			     static_cast<unsigned long long>(hits),
+			     static_cast<unsigned long long>(context.Rip()));
+		}
+		context.SetRip(trampoline);
+		return true;
+	}
 #if !defined(__APPLE__)
 	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
 	       TryEmulateSse4a(context) || TryEmulateShaNi(context) || TryEmulateCpuExtensions(context);

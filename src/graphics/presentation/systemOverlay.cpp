@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/emulatorConfig.h"
 #include "common/stringUtils.h"
+#include "common/textShaping.h"
 #include "common/trophyStrings.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
@@ -620,6 +621,55 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	}
 }
 
+// The built-in ImGui font only covers basic Latin. Trophy text can be in any console language, so
+// the system fonts that cover the current language are merged in as fallbacks.
+void AddSystemFontFallbacks(ImGuiIO& io) {
+	const std::string_view locale = Common::Trophies::LocaleName(Config::GetConsoleLanguage());
+	std::vector<std::string> candidates;
+	const auto               add = [&](std::initializer_list<const char*> paths) {
+        for (const char* path: paths) {
+            std::error_code error;
+            if (std::filesystem::is_regular_file(path, error)) {
+                candidates.emplace_back(path);
+                return;
+            }
+        }
+	};
+	// Latin extended, Greek, Cyrillic, Vietnamese and Arabic.
+	add({"C:/Windows/Fonts/segoeui.ttf", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+	     "/Library/Fonts/Arial Unicode.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+	     "/usr/share/fonts/TTF/DejaVuSans.ttf"});
+	const char* noto_cjk[] = {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+	                          "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+	                          "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"};
+	if (locale == "ja-JP") {
+		add({"C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/msgothic.ttc",
+		     "/System/Library/Fonts/Hiragino Sans GB.ttc", noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "ko-KR") {
+		add({"C:/Windows/Fonts/malgun.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+		     noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "zh-Hans") {
+		add({"C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc",
+		     "/System/Library/Fonts/PingFang.ttc", noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "zh-Hant") {
+		add({"C:/Windows/Fonts/msjh.ttc", "C:/Windows/Fonts/mingliu.ttc",
+		     "/System/Library/Fonts/PingFang.ttc", noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "th-TH") {
+		add({"C:/Windows/Fonts/leelawui.ttf", "C:/Windows/Fonts/tahoma.ttf",
+		     "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+		     "/usr/share/fonts/truetype/tlwg/Garuda.ttf"});
+	} else if (locale == "ar-AE") {
+		add({"C:/Windows/Fonts/tahoma.ttf", "C:/Windows/Fonts/arial.ttf"});
+	}
+	io.Fonts->AddFontDefault();
+	for (const auto& path: candidates) {
+		ImFontConfig config;
+		config.MergeMode = true;
+		if (io.Fonts->AddFontFromFileTTF(path.c_str(), 0.0f, &config) == nullptr) {
+			LOGF("[Trophy] could not load fallback font %s\n", path.c_str());
+		}
+	}
+}
 void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                           std::span<const std::byte> icon_png) {
 	static const Common::Trophies::Strings strings = [] {
@@ -673,6 +723,7 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
+		AddSystemFontFallbacks(io);
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -1133,11 +1184,12 @@ struct SystemOverlay::Impl {
 			const auto  fits = [&](const std::string& s) {
                 return font->CalcTextSizeA(title_fs, FLT_MAX, 0.0f, s.c_str()).x <= wrap_w;
 			};
-			const auto flush_word = [&] {
+			bool       space_before = false;
+			const auto flush_word   = [&] {
 				if (word.empty()) {
 					return;
 				}
-				const auto candidate = line.empty() ? word : line + " " + word;
+				const auto candidate = line.empty() ? word : line + (space_before ? " " : "") + word;
 				if (line.empty() || fits(candidate)) {
 					line = candidate;
 				} else {
@@ -1146,11 +1198,21 @@ struct SystemOverlay::Impl {
 				}
 				word.clear();
 			};
-			for (const char ch : trophy_notification->name) {
-				if (ch == ' ') {
+			// Chinese, Japanese and similar text has no spaces, so it may break between characters.
+			const auto& name = trophy_notification->name;
+			for (size_t i = 0; i < name.size(); ++i) {
+				const auto byte = static_cast<unsigned char>(name[i]);
+				if (name[i] == ' ') {
 					flush_word();
+					space_before = true;
+				} else if (byte >= 0xE3 && byte <= 0xE9 && i + 2 < name.size()) {
+					flush_word();
+					space_before = false;
+					word.assign(name, i, 3);
+					flush_word();
+					i += 2;
 				} else {
-					word += ch;
+					word += name[i];
 				}
 			}
 			flush_word();
@@ -1216,11 +1278,12 @@ struct SystemOverlay::Impl {
 		float line_y = title_y;
 		for (const auto& line : title_lines) {
 			draw->AddText(nullptr, title_fs, {title_x, line_y}, fade(255, 255, 255, 255),
-			              line.c_str());
+			              Common::Trophies::PrepareDisplayText(line).c_str());
 			line_y += line_h;
 		}
 		draw->AddText(nullptr, sub_fs, {text_left, line_y + 8.0f * screen_scale},
-		              fade(176, 180, 192, 255), trophy_notification->subtitle.c_str());
+		              fade(176, 180, 192, 255),
+		              Common::Trophies::PrepareDisplayText(trophy_notification->subtitle).c_str());
 		draw->PopClipRect();
 	}
 

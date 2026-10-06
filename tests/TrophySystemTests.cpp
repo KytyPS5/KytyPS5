@@ -1,4 +1,5 @@
 #include "common/file.h"
+#include "common/textShaping.h"
 #include "common/trophies.h"
 #include "common/trophyStrings.h"
 
@@ -256,6 +257,21 @@ void WriteText(const std::filesystem::path &path, const std::string &text) {
   file << text;
 }
 
+void TestTextShaping() {
+  Check(Trophies::PrepareDisplayText("Trophy earned!") == "Trophy earned!",
+        "text without Arabic is unchanged");
+  Check(Trophies::PrepareDisplayText("\xE3\x83\x88") == "\xE3\x83\x88",
+        "other scripts are unchanged");
+  // Teh + Meem joins (initial, final) and is shown right to left.
+  Check(Trophies::PrepareDisplayText("\xD8\xAA\xD9\x85") == "\xEF\xBB\xA2\xEF\xBA\x97",
+        "Arabic letters are joined and reversed");
+  // Lam + Alef becomes a single ligature glyph.
+  Check(Trophies::PrepareDisplayText("\xD9\x84\xD8\xA7") == "\xEF\xBB\xBB",
+        "lam alef ligature");
+  // Latin text keeps its order inside a right-to-left line.
+  Check(Trophies::PrepareDisplayText("\xD8\xA8 ab") == "ab \xEF\xBA\x8F",
+        "Latin run keeps its order");
+}
 void TestStrings(const std::filesystem::path &directory) {
   const auto dir = directory / "strings";
   std::filesystem::create_directories(dir);
@@ -299,6 +315,7 @@ int main() {
   TestProgress(directory.Path());
   TestUnlockPersistence(directory.Path());
   TestStrings(directory.Path());
+  TestTextShaping();
   std::printf("TrophySystemTests: all cases passed\n");
   return 0;
 }

@@ -59,3 +59,7 @@ No rebuild is needed. Restart the emulator or open the viewer again.
 | `trophy.overview.earned` | `{0}` earned, `{1}` total |
 | `trophy.overview.empty` | |
 | `trophy.inspector.title`, `trophy.inspector.grade`, `trophy.inspector.status`, `trophy.inspector.status_earned`, `trophy.inspector.status_not_earned`, `trophy.inspector.earned_date`, `trophy.inspector.details`, `trophy.inspector.show_hidden` | |
+
+## Toast fonts
+
+The in-game toast uses ImGui, which only has Latin glyphs built in. For the current console language the emulator merges in an installed system font that covers it (Segoe UI, Yu Gothic, Malgun Gothic, Microsoft YaHei or JhengHei, Leelawadee UI, Tahoma on Windows; Arial Unicode, PingFang and similar on macOS; DejaVu and Noto CJK on Linux). Arabic text is joined and shown right to left by `src/common/textShaping.cpp`. If no suitable font is installed, the missing characters are drawn as `?`.

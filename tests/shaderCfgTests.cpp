@@ -19960,6 +19960,7 @@ int main(int argc, char* argv[]) {
   TestDisabledSystemDebugBranch();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   Libs::Graphics::TestNewShaderRecompilerImageGatherVariants();
+  TestNewShaderRecompilerUnusedImageInstructions();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();

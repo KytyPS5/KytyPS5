@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -466,6 +467,24 @@ void WindowContext::ProcessEvent(double time_s) {
 	    event->key.key == SDLK_F7) {
 		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
 			HostInputToggleMouseToJoystick();
+		}
+		return;
+	}
+	// Mac keyboards send brightness instead of F2 unless fn is held, so also accept Cmd+P there.
+	const bool performance_key =
+	    event->key.key == SDLK_F2
+#if defined(__APPLE__)
+	    || (event->key.key == SDLK_P && (event->key.mod & SDL_KMOD_GUI) != 0)
+#endif
+	    ;
+	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
+	    performance_key) {
+		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
+			if ((event->key.mod & SDL_KMOD_SHIFT) != 0) {
+				TogglePerformanceOverlayDetails();
+			} else {
+				TogglePerformanceOverlay();
+			}
 		}
 		return;
 	}

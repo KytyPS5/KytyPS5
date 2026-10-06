@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -24,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -38,6 +40,14 @@
 namespace Libs::Graphics {
 
 namespace {
+
+void RecordPipelineCreated(std::chrono::steady_clock::time_point begin) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelinesCreated);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelineCreateNs,
+	                           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                                     std::chrono::steady_clock::now() - begin)
+	                                                     .count()));
+}
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -368,6 +378,7 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		const auto compile_begin = std::chrono::steady_clock::now();
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
@@ -378,6 +389,12 @@ struct PipelineCache::ProgramCache {
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::ShadersCompiled);
+		Common::DebugCounters::Add(
+		    Common::DebugCounters::Counter::ShaderCompileNs,
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - compile_begin)
+		                              .count()));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -878,8 +895,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto create_begin = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
+	RecordPipelineCreated(create_begin);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -907,8 +926,10 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto cached = std::make_unique<Pipeline>();
+	auto       cached       = std::make_unique<Pipeline>();
+	const auto create_begin = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	RecordPipelineCreated(create_begin);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

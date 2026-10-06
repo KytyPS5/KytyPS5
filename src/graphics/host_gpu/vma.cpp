@@ -97,6 +97,26 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+std::vector<GraphicContext::HeapUsage> GraphicContext::GetHeapUsage() const {
+	std::vector<HeapUsage> heaps;
+	if (allocator == nullptr) {
+		return heaps;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+		heaps.push_back({.usage            = budgets[heap].usage,
+		                 .budget           = budgets[heap].budget,
+		                 .size             = properties.size,
+		                 .allocation_bytes = budgets[heap].statistics.allocationBytes,
+		                 .allocations      = budgets[heap].statistics.allocationCount,
+		                 .device_local     = static_cast<bool>(properties.flags &
+		                                                       vk::MemoryHeapFlagBits::eDeviceLocal)});
+	}
+	return heaps;
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (allocator == nullptr) {
 		return 0;

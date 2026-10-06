@@ -146,8 +146,14 @@ public:
 			}
 
 			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
-			                      binding.key == SDLK_F7 || binding.key == SDLK_F11;
-			if (binding.control == INVALID_CONTROL || reserved ||
+			                      binding.key == SDLK_F2 || binding.key == SDLK_F7 ||
+			                      binding.key == SDLK_F11;
+			// Saved mappings can predate a key becoming reserved (F2 for the performance panel).
+			if (reserved && binding.control != INVALID_CONTROL) {
+				LOGF("Ignoring input mapping on reserved key: %s\n", value.c_str());
+				continue;
+			}
+			if (binding.control == INVALID_CONTROL ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
 			}

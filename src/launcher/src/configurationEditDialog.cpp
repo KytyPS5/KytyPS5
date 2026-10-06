@@ -275,6 +275,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
+	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -429,6 +430,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
+	info.perf_overlay_enabled      = ui.checkBox_perf_overlay->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();

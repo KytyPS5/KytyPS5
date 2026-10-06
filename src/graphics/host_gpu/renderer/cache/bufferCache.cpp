@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -71,6 +72,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::BufferCacheBytes,
+		                              static_cast<int64_t>(buffer.Size()));
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
@@ -85,6 +88,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.erase(found);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
+		Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::BufferCacheBytes,
+		                              -static_cast<int64_t>(buffer.Size()));
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
@@ -129,6 +134,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -419,6 +425,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -618,6 +625,7 @@ void BufferCache::RunGarbageCollector() {
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
 		return ++retire_count == limit;
 	});

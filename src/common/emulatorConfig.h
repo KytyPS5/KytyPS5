@@ -75,6 +75,7 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
+	bool                   perf_overlay_enabled        = false;
 	bool                   playgo_hack_enabled         = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
@@ -125,6 +126,7 @@ bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
+bool PerfOverlayEnabled();
 bool PlayGoHackEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();

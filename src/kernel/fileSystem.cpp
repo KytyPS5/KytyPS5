@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/dateTime.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hash.h"
@@ -639,6 +640,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
 	file->mutex.Unlock();
 
@@ -701,6 +703,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 		file->f.Seek(file->f.Size());
 	}
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
 	if (file->sync_writes) {
 		file->f.Flush();
 	}
@@ -765,6 +768,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
@@ -866,6 +870,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
 		file->f.Read(buffer.iov_base, count, &bytes);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {
@@ -915,6 +920,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	uint32_t bytes_written = 0;
 	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
 	if (file->sync_writes) {
 		file->f.Flush();
 	}
@@ -983,6 +989,7 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 		}
 		uint32_t bytes = 0;
 		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes);
 		bytes_written += bytes;
 		if (bytes < buffer.iov_len) {
 			break;

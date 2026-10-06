@@ -14076,6 +14076,167 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckLayoutAliasSync() {
+    constexpr const char *name = "LayoutAliasSync";
+    constexpr uintptr_t base = 0x0000000204800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr auto tile = Prospero::TileMode::kStandard64KB;
+    constexpr vk::Extent3D extent{64, 64, 1};
+    constexpr uint32_t levels = 2;
+    constexpr uint32_t layers = 6;
+    constexpr uint32_t guest_bytes = 0xdeadbeefu;
+    constexpr uint32_t storage_bits = 0x12345678u;
+    constexpr uint32_t untracked_bits = 0x0abcdef0u;
+    EnsureRuntimeContext();
+
+    // RESIDENT EVIL 2 fills an R11G11B10 cube through R32_UINT storage views of the same
+    // tiled bytes, then samples it as R11G11B10.
+    const auto make_desc = [&](vk::Format format, Prospero::BufferFormat guest_format) {
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(guest_format, extent.width, extent.height, layers, levels, tile,
+                              false, total);
+      TileSizeOffset offsets[16]{};
+      TilePaddedSize padded[16]{};
+      TileGetTextureSize(guest_format, extent.width, extent.height, levels, tile, nullptr,
+                         offsets, padded);
+      ImageDesc desc{};
+      desc.type = BindingType::Texture;
+      desc.info.data = {base, total.size};
+      desc.info.pixel_format = format;
+      desc.info.guest_format = guest_format;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = extent;
+      desc.info.resources = {levels, layers};
+      desc.info.pitch = TileGetTexturePitch(guest_format, extent.width, tile);
+      desc.info.bytes_per_block = sizeof(uint32_t);
+      desc.info.tile_mode = tile;
+      for (uint32_t level = 0; level < levels; ++level) {
+        const auto offset =
+            offsets[level].src_size != 0 ? offsets[level].src_offset : offsets[level].offset;
+        const auto size =
+            offsets[level].src_size != 0 ? offsets[level].src_size : offsets[level].size;
+        desc.info.mip_layout[level] = {offset, static_cast<uint64_t>(size) * layers,
+                                       padded[level].width, padded[level].height};
+      }
+      desc.view_info.format = format;
+      desc.view_info.type = vk::ImageViewType::e2DArray;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.level_count = levels;
+      desc.view_info.layer_count = layers;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      return desc;
+    };
+    auto packed = make_desc(vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+    packed.type = BindingType::Storage;
+    packed.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+    auto cube = make_desc(vk::Format::eB10G11R11UfloatPack32,
+                          Prospero::BufferFormat::k11_11_10Float);
+    Require(name, "one guest layout",
+            packed.info.data == cube.info.data && packed.info.pitch == cube.info.pitch &&
+                packed.info.mip_layout == cube.info.mip_layout &&
+                packed.info.data.size <= allocation_size,
+            "the two descriptions do not describe the same tiled bytes");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "alias allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "alias mapping failed");
+    std::fill_n(static_cast<uint32_t *>(mapped), allocation_size / sizeof(uint32_t),
+                guest_bytes);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+
+      const auto fill = [&](ImageId id, const vk::ClearColorValue &value) {
+        auto &image = cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                      vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, levels, 0,
+                                              layers};
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &value, 1, &range);
+      };
+      const auto expect = [&](const char *check, ImageId id, uint32_t bits) {
+        for (uint32_t level = 0; level < levels; ++level) {
+          const vk::Extent3D mip{extent.width >> level, extent.height >> level, 1};
+          for (uint32_t layer = 0; layer < layers; ++layer) {
+            const auto pixels = ReadCachedTexel(name, context, id, {}, mip, layer, level);
+            for (uint32_t texel = 0; texel < pixels.size(); ++texel) {
+              if (pixels[texel] == bits) {
+                continue;
+              }
+              char detail[112];
+              std::snprintf(detail, sizeof(detail),
+                            "mip %u layer %u texel %u holds 0x%08x, expected 0x%08x", level,
+                            layer, texel, pixels[texel], bits);
+              Require(name, check, false, detail);
+            }
+          }
+        }
+      };
+
+      const auto packed_id = cache.FindImage(packed);
+      (void)cache.FindTexture(packed_id, packed);
+      fill(packed_id, vk::ClearColorValue{}.setUint32({storage_bits, 0, 0, 0}));
+      cache.MarkGpuWritten(packed_id);
+
+      const auto cube_id = cache.FindImage(cube);
+      (void)cache.FindTexture(cube_id, cube);
+      Require(name, "separate packed float backing",
+              cube_id != packed_id &&
+                  cache.GetImage(cube_id).backing.format == vk::Format::eB10G11R11UfloatPack32,
+              "the cube shared the R32_UINT image");
+      expect("cube reads the storage writes", cube_id, storage_bits);
+
+      fill(cube_id, vk::ClearColorValue{std::array<float, 4>{1.0f, 0.5f, 0.25f, 1.0f}});
+      cache.MarkGpuWritten(cube_id);
+      const auto cube_bits = ReadCachedTexel(name, context, cube_id).at(0);
+      Require(name, "packed float clear", cube_bits != storage_bits && cube_bits != guest_bytes,
+              "the cube clear did not land");
+      Require(name, "packed alias identity", cache.FindImage(packed) == packed_id,
+              "the R32_UINT view lost its image");
+      expect("storage view reads the cube writes", packed_id, cube_bits);
+
+      // A synced copy is not a write of its own: it must not flow back.
+      fill(packed_id, vk::ClearColorValue{}.setUint32({untracked_bits, 0, 0, 0}));
+      Require(name, "cube identity", cache.FindImage(cube) == cube_id,
+              "the cube lost its image");
+      expect("synced copy does not echo back", cube_id, cube_bits);
+
+      // Binding the R32_UINT image for storage is a write the cube must pick up.
+      Require(name, "packed rebind", cache.FindImage(packed) == packed_id,
+              "the R32_UINT view lost its image");
+      (void)cache.FindTexture(packed_id, packed);
+      Require(name, "cube relookup", cache.FindImage(cube) == cube_id,
+              "the cube lost its image");
+      expect("cube reads a later storage binding", cube_id, untracked_bits);
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "alias backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorStandardTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
@@ -51385,6 +51546,12 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
     vulkan.CheckCubeFaceStorageExpansion();
+    vulkan.CheckLayoutAliasSync();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--layout-alias-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLayoutAliasSync();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-cache-only") == 0) {

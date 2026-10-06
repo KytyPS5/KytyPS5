@@ -987,7 +987,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u] |
 			                  (speculative ? Speculative : 0u));
 		} else {
-			for (const auto successor: block.successors) pending.push_back(successor | Speculative);
+			// A single successor is no choice: it is as definite as the block that leads to it.
+			const bool undecided = block.successors.size() > 1u;
+			for (const auto successor: block.successors)
+				pending.push_back(successor | (speculative || undecided ? Speculative : 0u));
 		}
 	}
 	return true;

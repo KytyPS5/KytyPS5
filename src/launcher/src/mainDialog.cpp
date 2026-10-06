@@ -246,6 +246,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}

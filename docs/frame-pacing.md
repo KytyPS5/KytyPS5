@@ -41,6 +41,18 @@ or animation advances at the same rate as the configured vblank frequency.
 the backend; repeated presentation of that output is not a new evaluation.
 The analyzer counts evaluations only on new frames.
 
+Optional producer timings are recorded as `prepare_wait_ms`, `prepare_lock_ms`,
+`resolve_ms`, `inputs_ms`, `fg_capture_ms` and `dlss_record_ms`. They separate CPU
+frame retirement, renderer-lock acquisition, source resolution, input preparation,
+FG snapshot recording and output/NGX recording. Cached/blank frames carry zero
+preparation timings. The analyzer summarizes the preparation of new MAIN frames;
+these values remain CPU measurements, not GPU timestamps.
+
+`display_frames` records Streamline's count for each new MAIN presentation when
+FG is enabled, or one for ordinary presentation. Cached refreshes contribute zero.
+The analyzer reports `sdk_display_fps` separately from `guest_fps` and continues
+to accept older traces without these columns.
+
 Files are buffered. Close the emulator normally before analyzing; a forcefully
 terminated process can lose the last buffered samples. The analyzer skips an
 incomplete trailing row. CSV recording is disabled unless the variable is set.
@@ -51,7 +63,10 @@ generates temporal inputs from the main VideoOut color, so a supported surface
 can activate reconstruction without a game-specific adapter. This stage adds
 GPU work. The separate render-scale option reduces supported raster passes and
 adds attachment copies; measure total cost separately. Frame Generation inserts
-display frames, which the guest-submission CSV and title FPS do not count.
+display frames, which the guest-submission CSV does not count. When FG is
+enabled, the title's `fps` (tagged `[FG]`) shows the SDK's reported
+display-frame throughput, including generated frames. This is an SDK
+counter, not an independent scanout measurement.
 See [dlss.md](dlss.md).
 
 ## Reproducible DLSS comparisons

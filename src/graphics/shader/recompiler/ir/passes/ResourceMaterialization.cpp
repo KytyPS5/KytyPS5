@@ -637,11 +637,45 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
+			const bool mip_compatible = image.mip_count == image_class.mip_count ||
+			                            program.info.images[root_index].mip_mode == ImageMipMode::None;
+			// A swizzle only affects generated code when the image conversion path (or a
+			// storage image path) consumes it. For ordinary sampled images with no
+			// conversion, descriptor swizzle is runtime state and does not need to be
+			// part of the shader specialization. This is important for indirect image
+			// tables whose entries can legally point at differently swizzled views.
+			const bool swizzle_relevant = image_class.conversion_format != Prospero::BufferFormat::kInvalid ||
+			                              image.conversion_format != Prospero::BufferFormat::kInvalid ||
+			                              program.info.images[root_index].resource_class ==
+			                                  ImageResourceClass::Storage;
+			const bool swizzle_compatible = !swizzle_relevant ||
+			                                image.shader_swizzle == image_class.shader_swizzle;
 			if (image.numeric_class != image_class.numeric_class ||
 			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
-			    image.mip_count != image_class.mip_count ||
+			    !mip_compatible ||
 			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle) {
+			    !swizzle_compatible) {
+#ifdef KYTY_WOLVERINE_RELAXED_IMAGE_SPECIALIZATION
+				// Experimental Windows-only compatibility path. If the only mismatch is
+				// specialization metadata that is not consumed by the generated module,
+				// normalize the indirect candidates to the typed exemplar instead of
+				// aborting the entire pipeline. Keep numeric class, coordinates and
+				// conversion format strict because those change SPIR-V types/operations.
+				if (image.numeric_class == image_class.numeric_class &&
+				    (same_coordinates || (is_2d(image.dimension) && is_2d(image_class.dimension))) &&
+				    image.conversion_format == image_class.conversion_format) {
+					if (program.info.images[root_index].mip_mode == ImageMipMode::None) {
+						image.mip_count = image_class.mip_count;
+					}
+					if (!swizzle_relevant) {
+						image.shader_swizzle = image_class.shader_swizzle;
+					}
+					std::fprintf(stderr,
+					             "shader resource specialization: relaxed indirect image candidate at pc 0x%08x\n",
+					             program.info.images[root_index].first_use_pc);
+					continue;
+				}
+#endif
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));

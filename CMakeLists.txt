@@ -131,6 +131,9 @@ endif()
 
 set(KYTY_PROJECT_NAME "Emulator" CACHE STRING "Project name suffix")
 
+option(KYTY_WOLVERINE_RELAXED_IMAGE_SPECIALIZATION
+	"Experimental Windows-only fallback for indirect image specialization mismatches" OFF)
+
 string(TOLOWER ${KYTY_COMPILER} KYTY_COMPILER_ID)
 string(TOLOWER ${KYTY_LINKER} KYTY_LINKER_ID)
 
@@ -757,6 +760,9 @@ endif()
 # dlopen/dlsym/dladdr for RenderDoc.
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
+if(WIN32 AND KYTY_WOLVERINE_RELAXED_IMAGE_SPECIALIZATION)
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_WOLVERINE_RELAXED_IMAGE_SPECIALIZATION=1)
+endif()
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
 

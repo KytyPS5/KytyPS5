@@ -1499,6 +1499,7 @@ LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
 
 constexpr int COMMERCE_STATUS_NONE        = 0;
 constexpr int COMMERCE_STATUS_INITIALIZED = 1;
+constexpr int COMMERCE_STATUS_FINISHED    = 3;
 
 constexpr int COMMERCE_ERROR_NOT_INITIALIZED     = static_cast<int>(0x80B80003u);
 constexpr int COMMERCE_ERROR_ALREADY_INITIALIZED = static_cast<int>(0x80B80004u);
@@ -1523,6 +1524,16 @@ static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
 	return OK;
 }
 
+// There is no store to show: the dialog finishes at once, as if the user closed it.
+static int KYTY_SYSV_ABI NpCommerceDialogOpen(const void* /*param*/) {
+	PRINT_NAME();
+	if (g_commerce_status == COMMERCE_STATUS_NONE) {
+		return COMMERCE_ERROR_NOT_INITIALIZED;
+	}
+	g_commerce_status = COMMERCE_STATUS_FINISHED;
+	return OK;
+}
+
 static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 	PRINT_NAME();
 
@@ -1532,6 +1543,7 @@ static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 LIB_DEFINE(InitNet_1_NpCommerce) {
 	LIB_FUNC("0aR2aWmQal4", NpCommerceDialogInitialize);
 	LIB_FUNC("m-I92Ab50W8", NpCommerceDialogTerminate);
+	LIB_FUNC("DfSCDRA3EjY", NpCommerceDialogOpen);
 	LIB_FUNC("LR5cwFMMCVE", NpCommerceDialogUpdateStatus);
 }
 

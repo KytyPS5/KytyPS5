@@ -59,6 +59,10 @@ namespace Libs::LibNpWebApi2 {
 void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibNpCommerce {
+void InitNet_1_NpCommerce(Loader::SymbolDatabase *symbols);
+}
+
 namespace {
 
 namespace FileSystem = Libs::LibKernel::FileSystem;
@@ -248,6 +252,28 @@ void TestAioBatches() {
             }),
         "maximum-sized wait returns every invalid-ID error");
   Check(FileSystem::KernelClose(fd) == OK, "close AIO read fixture");
+}
+
+void TestNpCommerceDialog() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibNpCommerce::InitNet_1_NpCommerce(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "NpCommerce dialog exports resolve");
+    return symbol->vaddr;
+  };
+  using Call = int (KYTY_SYSV_ABI *)();
+  using Open = int (KYTY_SYSV_ABI *)(const void *);
+  const auto initialize = reinterpret_cast<Call>(find("0aR2aWmQal4"));
+  const auto terminate = reinterpret_cast<Call>(find("m-I92Ab50W8"));
+  const auto update = reinterpret_cast<Call>(find("LR5cwFMMCVE"));
+  const auto open = reinterpret_cast<Open>(find("DfSCDRA3EjY"));
+  std::array<uint8_t, 64> param {};
+  Check(open(param.data()) == static_cast<int>(0x80B80003u),
+        "NpCommerce dialog open requires initialization");
+  Check(initialize() == OK && update() == 1 && open(param.data()) == OK && update() == 3 &&
+            terminate() == OK && update() == 0,
+        "NpCommerce dialog finishes at once without a store and terminates");
 }
 
 void TestNpWebApi2Memory() {
@@ -1383,6 +1409,7 @@ int main(int, char**) {
   FileSystem::Shutdown();
   CheckSocketWakeup();
   TestNpWebApi2Memory();
+  TestNpCommerceDialog();
   graphics.reset();
   subsystems.Destroy();
 

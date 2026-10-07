@@ -46,6 +46,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -876,6 +877,8 @@ struct SocketTransport {
 	std::atomic<NativeSocket> socket;
 	const int                type;
 #if defined(_WIN32)
+	// Winsock cannot report the current mode, so the guest blocking mode is tracked here.
+	std::atomic_bool nonblocking {false};
 	std::mutex         receive_mutex;
 	std::vector<char>  receive_buffer;
 	std::atomic_size_t buffered_bytes   = 0;
@@ -1098,13 +1101,13 @@ static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
 	}
 }
 
-static int ConvertMessageFlags(int flags) {
-	constexpr int guest_msg_peek      = 0x00000002;
-	constexpr int guest_msg_dontroute = 0x00000004;
-	constexpr int guest_msg_waitall   = 0x00000040;
-	constexpr int guest_msg_dontwait  = 0x00000080;
-	constexpr int guest_msg_nosignal  = 0x00020000;
+constexpr int guest_msg_peek      = 0x00000002;
+constexpr int guest_msg_dontroute = 0x00000004;
+constexpr int guest_msg_waitall   = 0x00000040;
+constexpr int guest_msg_dontwait  = 0x00000080;
+constexpr int guest_msg_nosignal  = 0x00020000;
 
+static int ConvertMessageFlags(int flags) {
 	int host_flags = 0;
 	if ((flags & guest_msg_peek) != 0) {
 		host_flags |= MSG_PEEK;
@@ -2045,7 +2048,8 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 	     s, reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addrlen));
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	SocketSlot   state;
+	if (!GetSocketBackend(s, &socket, &state)) {
 		return -1;
 	}
 
@@ -2057,8 +2061,17 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 		return SetHostSocketError();
 	}
 
-	auto      transport = std::make_shared<SocketTransport>(accepted, SOCK_STREAM);
-	const int fd        = AllocSocketFd(transport);
+	auto transport = std::make_shared<SocketTransport>(accepted, SOCK_STREAM);
+#if defined(_WIN32)
+	// FreeBSD accept(2) inherits O_NONBLOCK. Keep both the native Winsock mode and the
+	// guest-side flag in sync so later receives preserve that behavior.
+	u_long nonblocking = state.transport->nonblocking ? 1 : 0;
+	if (ioctlsocket(accepted, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+		return SetHostSocketError();
+	}
+	transport->nonblocking = nonblocking != 0;
+#endif
+	const int fd = AllocSocketFd(transport);
 	if (fd < 0) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EMFILE;
 		return -1;
@@ -2282,7 +2295,13 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		    flags < 0 ||
 		    ::fcntl(socket, F_SETFL, enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) != 0;
 #endif
-		return failed ? SetHostSocketError() : 0;
+		if (failed) {
+			return SetHostSocketError();
+		}
+#if defined(_WIN32)
+		state.transport->nonblocking = enabled;
+#endif
+		return 0;
 	}
 	const bool send_timeout = (level == 0xffff && optname == 0x1105);
 	optname                = ConvertSocketOptionName(level, optname);
@@ -2480,6 +2499,10 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	sockaddr_storage host_addr {};
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;
+	// Winsock rejects MSG_PEEK | MSG_WAITALL with WSAEOPNOTSUPP on datagram sockets, while a
+	// datagram is delivered whole anyway; only stream receives keep the combined flag.
+	const int recv_flags =
+	    transport->type == SOCK_STREAM ? host_flags : (host_flags & ~MSG_WAITALL);
 #if defined(_WIN32)
 	if (transport->type == SOCK_STREAM) {
 		if (addr != nullptr &&
@@ -2496,9 +2519,9 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	{
 		transport.reset();
 		if (addr == nullptr) {
-			result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
+			result = ::recv(socket, static_cast<char*>(buf), host_len, recv_flags);
 		} else {
-			result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
+			result = ::recvfrom(socket, static_cast<char*>(buf), host_len, recv_flags,
 			                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
 		}
 	}

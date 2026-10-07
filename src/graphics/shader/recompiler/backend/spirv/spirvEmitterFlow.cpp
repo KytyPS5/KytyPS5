@@ -714,7 +714,8 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// Scalar branches include lanes disabled by EXEC, which the branch body may restore.
-	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	if (ctx.other_half != nullptr && ctx.half != 0)
+		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||

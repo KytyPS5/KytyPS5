@@ -315,7 +315,7 @@ bool UsesBluetooth(const Stream* stream) {
 }
 
 uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames, uint32_t channels,
-               bool is_float, const int* volume, float gain) {
+               bool is_float, const int* volume, float gain, const float* gains) {
 	if (stream == nullptr || data == nullptr || frames == 0 || channels == 0 || volume == nullptr) {
 		return 0;
 	}
@@ -357,7 +357,7 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 			const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
 			float      value  = is_float ? static_cast<const float*>(data)[index]
 			                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
-			value *= volume[src_ch] / 32768.0f * gain;
+			value *= volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
 			// USB places the speaker in front and the actuators in back; Bluetooth takes stereo.
 			stream->buffer[static_cast<size_t>(frame) * output_channels + ch + channel_offset] =
 			    value;

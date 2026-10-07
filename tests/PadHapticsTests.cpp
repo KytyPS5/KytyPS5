@@ -414,11 +414,16 @@ void TestFormatsAndVolume() {
 	Check(opened_device == 10 && opened_spec.channels == 4 && opened_spec.format == SDL_AUDIO_F32,
 	      "did not select quad DualSense PCM");
 	ExpectPcm({0, 0, 0.5f, -0.125f, 0, 0, 1.0f, 0});
+	const std::array gains {0.25f, 2.0f};
+	Haptics::Queue(port.get(), 1, stereo.data(), 2, 2, true, volume.data(), 1.0f, gains.data());
+	ExpectPcm({0, 0, 0.125f, -0.25f, 0, 0, 0.25f, 0});
 	const std::array<int16_t, 2> mono {16384, -32768};
 	Queue(port, mono.data(), 2, 1, false, volume.data() + 1);
 	ExpectPcm({0, 0, 0.25f, 0.25f, 0, 0, -0.5f, -0.5f});
 	Queue(port, mono.data(), 2, 1, false, volume.data() + 1, 0.5f);
 	ExpectPcm({0, 0, 0.125f, 0.125f, 0, 0, -0.25f, -0.25f});
+	Haptics::Queue(port.get(), 1, mono.data(), 2, 1, false, volume.data() + 1, 1.0f, gains.data());
+	ExpectPcm({0, 0, 0.0625f, 0.0625f, 0, 0, -0.125f, -0.125f});
 	std::array<float, 24> multichannel {};
 	multichannel.fill(0.9f);
 	multichannel[0]  = 0.1f;

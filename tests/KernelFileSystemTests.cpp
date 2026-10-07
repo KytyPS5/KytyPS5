@@ -121,6 +121,20 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void TestRandomDevices() {
+  for (const auto* path : {"/dev/urandom", "/dev/random"}) {
+    const int fd = FileSystem::KernelOpen(path, 0, 0);
+    FileSystem::FileStat stat {};
+    Check(fd >= 3 && FileSystem::KernelFstat(fd, &stat) == OK &&
+              (stat.st_mode & 0170000) == 0020000,
+          "entropy sources are character devices");
+    std::array<uint8_t, 32> entropy {};
+    Check(FileSystem::KernelRead(fd, entropy.data(), entropy.size()) == entropy.size(),
+          "character device supplies requested entropy");
+    Check(FileSystem::KernelClose(fd) == OK, "close entropy source");
+  }
+}
+
 void TestSaveOpenVisibility() {
   constexpr char Path[] = "/savedata0/visible-save.dat";
   constexpr char Payload[] = "saved progress";
@@ -1398,6 +1412,7 @@ int main(int, char**) {
 
   TempDirectory temporary;
   FileSystem::Initialize();
+  TestRandomDevices();
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());

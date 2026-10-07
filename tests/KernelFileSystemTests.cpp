@@ -5,6 +5,7 @@
 #include "common/archive.h"
 #include "common/file.h"
 #include "common/hostException.h"
+#include "common/platform/sysFileIO.h"
 #include "common/virtualMemory.h"
 #include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
@@ -183,6 +184,13 @@ void TestReadsIntoProtectedPages() {
         "allocate the read target and install the guard handler");
   g_guard_base = memory + Half;
   g_guard_size = Half;
+  // The emulator registers GPU-mapped guest memory; here only the guarded target qualifies.
+  static uint64_t recoverable_base = 0;
+  recoverable_base = memory;
+  SysFileSetRecoverableDestination([](const void *data, uint64_t size) {
+    const auto address = reinterpret_cast<uint64_t>(data);
+    return address >= recoverable_base && address - recoverable_base <= 0x20000 - size;
+  });
   auto *target = reinterpret_cast<uint8_t *>(memory);
   const auto guard = [&] {
     std::memset(target, 0, Half * 2);
@@ -206,7 +214,7 @@ void TestReadsIntoProtectedPages() {
                        static_cast<int64_t>(payload.size()) && filled(),
         "preadv fills vectors that cross into a write-protected page");
 #if defined(__linux__)
-  // An unmapped destination is not recovered: the read stays short instead of faulting.
+  // A destination the emulator cannot fault in is not recovered: the read stays short.
   const long page = sysconf(_SC_PAGESIZE);
   void *pages = mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   Check(pages != MAP_FAILED && munmap(static_cast<char *>(pages) + page, page) == 0,
@@ -216,6 +224,7 @@ void TestReadsIntoProtectedPages() {
         "pread into a partly unmapped buffer returns the mapped prefix");
   munmap(pages, page);
 #endif
+  SysFileSetRecoverableDestination(nullptr);
   g_guard_size = 0;
   Common::VirtualMemory::Free(memory);
   Check(FileSystem::KernelClose(fd) == OK &&

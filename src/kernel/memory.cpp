@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/platform/sysFileIO.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -929,6 +930,15 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
+	// Write faults in GPU-mapped guest memory are resolved by HandleGpuFault.
+	SysFileRecoverableDestination probe = nullptr;
+	if (resources != nullptr) {
+		probe = [](const void* data, uint64_t size) {
+			return g_gpu_resources != nullptr &&
+			       g_gpu_resources->IsMapped(reinterpret_cast<uint64_t>(data), size);
+		};
+	}
+	SysFileSetRecoverableDestination(probe);
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {

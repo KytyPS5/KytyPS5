@@ -10,13 +10,13 @@
 #include "common/stringUtils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
 #include <filesystem>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
@@ -84,14 +84,10 @@ static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
 #endif
 }
 
-// True when every page of [data, data + size) is mapped, whatever its protection.
-static bool IsRangeMapped(const void* data, size_t size) {
-	static const auto page  = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
-	const auto        begin = reinterpret_cast<uintptr_t>(data) & ~(page - 1u);
-	const auto        end   = (reinterpret_cast<uintptr_t>(data) + size + page - 1u) & ~(page - 1u);
-	thread_local std::vector<unsigned char> residency;
-	residency.resize((end - begin) / page);
-	return mincore(reinterpret_cast<void*>(begin), end - begin, residency.data()) == 0;
+static std::atomic<SysFileRecoverableDestination> g_recoverable_destination {nullptr};
+
+void SysFileSetRecoverableDestination(SysFileRecoverableDestination probe) {
+	g_recoverable_destination.store(probe, std::memory_order_release);
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
@@ -102,13 +98,16 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 			// The destination can be write-protected guest memory (pages tracked for GPU
 			// synchronization). read() fails with EFAULT there instead of raising the fault the
 			// emulator handles, so finish through a host buffer copied from user mode (as on
-			// Windows and in the AMPR read path). An unmapped destination keeps the short read.
+			// Windows and in the AMPR read path). Other destinations keep the short read.
 			clearerr(f.f);
 			thread_local std::vector<uint8_t> chunk(1u << 20u);
 			if (fseeko(f.f, start + static_cast<off_t>(w), SEEK_SET) == 0) {
 				while (w < size) {
 					const size_t step = std::min<size_t>(size - w, chunk.size());
-					if (!IsRangeMapped(static_cast<uint8_t*>(data) + w, step)) {
+					const auto   recoverable =
+					    g_recoverable_destination.load(std::memory_order_acquire);
+					if (recoverable == nullptr ||
+					    !recoverable(static_cast<uint8_t*>(data) + w, step)) {
 						break;
 					}
 					const size_t got = fread(chunk.data(), 1, step, f.f);

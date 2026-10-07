@@ -1012,6 +1012,28 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
+  // A non-ASCII install folder (#1156): stat and size must reach the file through the
+  // stored host path, which Windows would mangle if it went through an ANSI string.
+  constexpr std::string_view UnicodeDirectory =
+      "\xd0\x98\xd0\xbd\xd1\x81\xd1\x82\xd0\xb0\xd0\xbb\xd0\xbb\xd1\x8f\xd1\x82\xd0\xbe\xd1\x80\xd1\x8b";
+  const auto unicode_root = root / Common::PathFromUtf8(UnicodeDirectory);
+  Check(Common::File::CreateDirectories(unicode_root), "create Unicode APR directory");
+  Check(fixture.Create(unicode_root / "global.utoc"), "create Unicode APR fixture");
+  fixture.Write("UTOC", 4);
+  fixture.Close();
+  const auto unicode_path = std::string(UnicodeDirectory) + "/global.utoc";
+  const char *unicode_paths[] = {unicode_path.c_str()};
+  {
+    FileSystem::FileStat stat {};
+    uint64_t size = 0;
+    uint32_t id = 0xffffffffu;
+    Check(resolve("/app0/", unicode_paths, 1, &id, nullptr, &error_index) == OK &&
+              id != 0xffffffffu &&
+              reinterpret_cast<Stat>(stat_symbol->vaddr)(id, &stat) == OK &&
+              reinterpret_cast<Size>(size_symbol->vaddr)(id, &size) == OK &&
+              stat.st_size == 4 && size == 4,
+          "APR stat and size work under a non-ASCII host folder");
+  }
   CheckAmprOrdering(symbols, collision_ids[0]);
   FileSystem::Umount("/app0");
 }

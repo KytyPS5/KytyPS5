@@ -567,13 +567,19 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
-	EXIT_IF(info.type != Format::ComponentType::Uint || !info.packed_bitfield);
+	const bool normalized = info.type == Format::ComponentType::Unorm;
+	EXIT_IF((info.type != Format::ComponentType::Uint && !normalized) || !info.packed_bitfield);
 
 	auto packed = ConstantU32(ctx.state, 0u);
 	for (uint32_t component = 0; component < info.component_count; component++) {
-		const auto value = ctx.state.builder.AllocateId();
+		auto value = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), value, texel,
 		                              component);
+		if (normalized) {
+			// Guest image data is FP32 bits even though the host view is raw R32_UINT.
+			// Share clamp, NaN and normalized rounding with formatted buffer stores.
+			value = PackFormatComponent(ctx.state, info, component, value);
+		}
 		const auto maximum =
 		    ConstantU32(ctx.state, info.component_bits[component] == 32u
 		                               ? UINT32_MAX

@@ -188,9 +188,10 @@ void TestPackedUnormImageAdmission() {
               P::RemapTextureFormat(format) == P::BufferFormat::k32UInt &&
               P::RenderTargetBytesPerElement(format) == 0u,
           "packed normalized load widened storage or admitted an unproved CB format");
-    for (uint32_t mode = 0; mode < 5u; ++mode) {
+    for (uint32_t mode = 0; mode < 7u; ++mode) {
       const auto operation = mode < 2u || mode == 4u ? ValueOpcode::ImageRead
-          : mode == 2u ? ValueOpcode::ImageSampleRaw : ValueOpcode::ImageWrite;
+          : mode == 2u || mode == 6u ? ValueOpcode::ImageSampleRaw
+          : mode == 5u ? ValueOpcode::ImageAtomicIAdd32 : ValueOpcode::ImageWrite;
       Fixture fixture;
       std::array<Value, 8> words;
       for (uint32_t word = 0; word < words.size(); ++word)
@@ -202,8 +203,15 @@ void TestPackedUnormImageAdmission() {
       access.data_bits = mode == 1u ? 16u : 32u;
       access.data_dwords = 4u;
       access.dmask = 0xfu;
+      if (mode == 6u) access.image_sample_flags = Decoder::ImageSampleFlagCompare;
       const auto address = fixture.ImageAddress();
-      if (operation == ValueOpcode::ImageWrite) {
+      if (operation == ValueOpcode::ImageAtomicIAdd32) {
+        access.data_dwords = 1u;
+        access.dmask = 1u;
+        const auto previous = fixture.Emit(operation,
+            {image, address, Value(1u), Value(true)}, fixture.AddMemory(access, 0x44u));
+        fixture.Emit(ValueOpcode::ReferenceU32, {previous});
+      } else if (operation == ValueOpcode::ImageWrite) {
         const auto data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
             {Value(0u), Value(0u), Value(0u), Value(0u)});
         fixture.Emit(operation, {image, address, data, Value(true)},
@@ -245,18 +253,19 @@ void TestPackedUnormImageAdmission() {
       const auto before_specialization = specialization;
       const bool admitted = MaterializeResources(
           plan, {.user_data = user_data}, snapshot, specialization);
-      if (mode == 0u || mode == 4u) {
+      if (mode == 0u || mode == 3u || mode == 4u) {
         Check(admitted && snapshot.images.size() == 1u &&
                   snapshot.images[0].dwords[1] == user_data[1] &&
                   specialization.images[0].conversion_format == format &&
                   specialization.images[0].numeric_class == P::TextureNumericClass::Uint,
-              "raw normalized load lost its genuine descriptor or integer backing");
+              "raw normalized load/store lost its genuine descriptor or integer backing");
       } else {
-        Check(!admitted && LastResourceSpecializationError().find("raw image loads only") !=
+        Check(!admitted && LastResourceSpecializationError().find(
+                  mode == 5u ? "atomic image descriptor" : "packed UNorm") !=
                                 std::string_view::npos &&
                   SameResourceSnapshot(snapshot, before) &&
                   specialization == before_specialization,
-              "normalized sampling/storage was admitted or rejection changed prior state");
+              "unproved normalized sample/atomic/compare/D16 was admitted or rejection changed state");
       }
     }
   }

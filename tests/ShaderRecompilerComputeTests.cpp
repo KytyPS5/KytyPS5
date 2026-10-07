@@ -10541,8 +10541,8 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckPackedUnormTextureBacking() {
-    constexpr const char *name = "PackedUnormTextureBacking";
+  void CheckPackedUnormTextureBacking(bool storage = false) {
+    const char *name = storage ? "PackedUnormStorageBacking" : "PackedUnormTextureBacking";
     constexpr uintptr_t base = 0x0000000204f00000ull;
     constexpr uint64_t allocation_size = 0x10000;
     constexpr std::array<u32, 4> words{0u, 0xffffffffu, 0x00400801u, 0xaae2b321u};
@@ -10578,12 +10578,14 @@ public:
       value.dword_count = 8;
       std::copy_n(descriptor.fields, 8, value.dwords.begin());
       ShaderRecompiler::IR::ImageResource resource{};
-      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.resource_class = storage ? ShaderRecompiler::IR::ImageResourceClass::Storage
+                                        : ShaderRecompiler::IR::ImageResourceClass::Sampled;
       resource.numeric_class = Prospero::TextureNumericClass::Uint;
       resource.conversion_format = format;
       resource.shader_swizzle = DstSel(4, 5, 6, 7);
       resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-      resource.read = true;
+      resource.read = !storage;
+      resource.written = storage;
       const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
       (void)cache.FindTexture(binding.image_id, binding.desc);
       Require(name, "same-width native backing",
@@ -40409,6 +40411,72 @@ TestCase ImageStoreR32UintUsesFormatlessStorageImage() {
   return test;
 }
 
+template <bool ReverseWidths, bool Swizzled>
+TestCase ImageStorePackedUnormExactComponents() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = ReverseWidths
+      ? (Swizzled ? "ImageStorePackedUnorm10_11_11Swizzled"
+                  : "ImageStorePackedUnorm10_11_11Components")
+      : (Swizzled ? "ImageStorePackedUnorm11_11_10Swizzled"
+                  : "ImageStorePackedUnorm11_11_10Components");
+  constexpr u32 maximum_r = ReverseWidths ? 1023u : 2047u;
+  constexpr u32 maximum_b = ReverseWidths ? 2047u : 1023u;
+  // Independent normalized-field oracle, not the production format/packer table.
+  // RDNA2 image writes replace the whole element; omitted DMASK components are zero.
+  constexpr std::array<std::array<u32, 3>, 7> fields{{
+      {0, 0, 0}, {maximum_r, 2047, maximum_b},
+      {Swizzled ? (ReverseWidths ? 767u : 1535u) : (ReverseWidths ? 256u : 512u),
+       1024u,
+       Swizzled ? (ReverseWidths ? 512u : 256u) : (ReverseWidths ? 1535u : 767u)},
+      {0, 2047, 0},
+      {Swizzled ? (ReverseWidths ? 512u : 1024u) : maximum_r, 0,
+       Swizzled ? maximum_b : (ReverseWidths ? 1024u : 512u)},
+      {Swizzled ? maximum_r : (ReverseWidths ? 512u : 1024u), 512u,
+       Swizzled ? (ReverseWidths ? 1024u : 512u) : maximum_b},
+      {1, 1, 1}}};
+  const std::array<std::array<float, 4>, 7> values{{
+      {0.f, 0.f, 0.f, 0.f}, {1.f, 1.f, 1.f, 17.f},
+      {.25f, .5f, .75f, 0.f},
+      {-1.f, std::numeric_limits<float>::infinity(),
+       std::bit_cast<float>(0x7fc01234u), 0.f},
+      {std::numeric_limits<float>::infinity(), -1.f, .5f, 0.f},
+      {.5f, .25f, 1.f, 0.f},
+      {1.f / float(Swizzled ? maximum_b : maximum_r), 1.f / 2047.f,
+       1.f / float(Swizzled ? maximum_r : maximum_b), 0.f}}};
+  test.storage_image_r32ui.assign(16, 0xa5a5a5a5u);
+  test.expected_storage_image_r32ui = test.storage_image_r32ui;
+  for (u32 pixel = 0; pixel < values.size(); ++pixel) {
+    AppendVMovU32(&test.code, 20, pixel % 4u);
+    AppendVMovU32(&test.code, 21, pixel / 4u);
+    const u32 mask = pixel == 4u ? 5u : pixel == 1u ? 15u : 7u;
+    u32 packed_component = 0;
+    for (u32 component = 0; component < 4u; ++component) {
+      if ((mask & (1u << component)) != 0u)
+        AppendVMovLiteral(&test.code, packed_component++,
+                          std::bit_cast<u32>(values[pixel][component]));
+    }
+    test.code.push_back(EncodeMimg0(0x08, mask));
+    test.code.push_back(EncodeMimg1(0, 20));
+    const auto& expected = fields[pixel];
+    test.expected_storage_image_r32ui[pixel] = expected[0] |
+        (expected[1] << (ReverseWidths ? 10u : 11u)) |
+        (expected[2] << (ReverseWidths ? 21u : 22u));
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
+  const auto format = ReverseWidths ? Prospero::BufferFormat::k10_11_11UNorm
+                                    : Prospero::BufferFormat::k11_11_10UNorm;
+  test.user_data = MakeStorageTextureData(format);
+  test.user_data[1] |= 3u << 30u;
+  test.user_data[2] = 3u << 14u;
+  test.has_user_data = true;
+  test.expected_image_format = format;
+  test.image_descriptor_swizzle = Swizzled ? DstSel(6, 5, 4, 1)
+                                          : DstSel(4, 5, 6, 7);
+  return test;
+}
+
 TestCase ImageStorePackedUintSaturatesChannels() {
   using O = ShaderOpcode;
 
@@ -42479,6 +42547,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
+  AddCase(ImageStorePackedUnormExactComponents<false, false>);
+  AddCase(ImageStorePackedUnormExactComponents<false, true>);
+  AddCase(ImageStorePackedUnormExactComponents<true, false>);
+  AddCase(ImageStorePackedUnormExactComponents<true, true>);
   AddCase(ImageLoadPackedUnormExactComponents<false, false>);
   AddCase(ImageLoadPackedUnormExactComponents<false, true>);
   AddCase(ImageLoadPackedUnormExactComponents<true, false>);
@@ -48858,6 +48930,22 @@ if (argc == 1) {
     for (const auto &test : MakeCases()) {
       std::printf("KYTY_COMPUTE_CASE %s\n", test.name);
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--packed-unorm-store-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageStorePackedUnormExactComponents<false, false>());
+    RunCase(&vulkan, ImageStorePackedUnormExactComponents<false, true>());
+    RunCase(&vulkan, ImageStorePackedUnormExactComponents<true, false>());
+    RunCase(&vulkan, ImageStorePackedUnormExactComponents<true, true>());
+    vulkan.CheckPackedUnormTextureBacking(true);
+    for (auto neighbor : {ImageStorePackedUintSaturatesChannels(),
+                          ImageStorePackedUintHonorsSparseDmask()}) {
+      neighbor.user_data[1] |= 3u << 30u;
+      neighbor.user_data[2] = 3u << 14u;
+      RunCase(&vulkan, neighbor);
+    }
+    RunCase(&vulkan, BufferStoreFormatXyzwPackedUnormSkinningVectors());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-unorm-load-only") == 0) {

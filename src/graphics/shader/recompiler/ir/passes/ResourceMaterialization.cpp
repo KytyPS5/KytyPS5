@@ -2367,7 +2367,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    image.conversion_format != Prospero::BufferFormat::kInvalid &&
 		    Format::GetFormatInfo(format).type == Format::ComponentType::Unorm;
 		if (packed_unorm &&
-		    (storage || base.atomic || base.depth_compare ||
+		    (base.atomic || base.depth_compare ||
 		     std::ranges::any_of(program.memory_info, [&](const auto& memory) {
 			     const auto index = static_cast<size_t>(&memory - program.memory_info.data());
 			     const bool live = program.live_image_memory.size() != program.memory_info.size() ||
@@ -2377,9 +2377,28 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		     }) ||
 		     std::ranges::any_of(program.info.sampled_pairs,
 		                        [&](const auto& pair) { return pair.image == base_index; }))) {
-			// A raw integer backing cannot implement normalized filtering or float stores.
-			// Preserve rejection until those operations have their own semantic proof.
-			return SpecializationFail("packed UNorm image format supports raw image loads only");
+			// Raw32 stores use the shared normalized format packer. Filtering,
+			// atomics, depth comparison and D16 remain independently unsupported.
+			uint32_t incompatible_width = 0;
+			for (size_t index = 0; index < program.memory_info.size(); ++index) {
+				const auto& memory = program.memory_info[index];
+				const bool live = program.live_image_memory.size() != program.memory_info.size() ||
+				                  program.live_image_memory[index];
+				if (live && memory.kind == ResourceKind::Image && memory.resource == base_index &&
+				    memory.data_bits != 32u) {
+					incompatible_width = memory.data_bits;
+					break;
+				}
+			}
+			const bool root_sampled = std::ranges::any_of(program.info.sampled_pairs,
+			    [&](const auto& pair) { return pair.image == base_index; });
+			return SpecializationFail(fmt::format(
+			    "packed UNorm image format supports raw32 loads/stores only "
+			    "(image={} root={} pc=0x{:08x} format={} source={} storage={} atomic={} "
+			    "compare={} root_sampled={} incompatible_width={} indirect={})",
+			    i, base_index, base.first_use_pc, static_cast<uint32_t>(format), base.source,
+			    storage, base.atomic, base.depth_compare, root_sampled, incompatible_width,
+			    image.indirect_root != ImageResource::NoIndirectImage));
 		}
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);

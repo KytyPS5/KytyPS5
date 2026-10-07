@@ -81,6 +81,15 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// BDA synchronisation for RenderContext::PrepareBda; both walk only `mapped`.
+	// Legacy: drop the pending hints the walk answers, then visit every registered owner.
+	void SynchronizeBdaLegacy(const RangeSet& mapped);
+	// Selective: visit only owners of CPU-dirty pages in hinted regions. Returns false on an
+	// owner-index failure, after making every obligation it had not completed pending again.
+	[[nodiscard]] bool SynchronizeBdaSelective(const RangeSet& mapped);
+	void               PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept;
+	// Invariant checker for tests and --bda-sync SelectiveChecked.
+	[[nodiscard]] bool CheckBdaHintInvariant(const RangeSet& mapped);
 	void               RunGarbageCollector();
 
 private:
@@ -120,6 +129,9 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped);
+	[[nodiscard]] bool SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
+	                                          uint64_t begin, uint64_t end);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -141,6 +153,10 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Regions owned by the selective pass in progress (for the invariant checker).
+	static constexpr size_t BdaNoActiveWord   = SIZE_MAX;
+	size_t                  m_bda_active_word = BdaNoActiveWord;
+	uint64_t                m_bda_active_bits = 0;
 };
 
 } // namespace Libs::Graphics

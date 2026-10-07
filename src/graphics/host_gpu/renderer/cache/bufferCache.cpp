@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/bdaTestHooks.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -14,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -79,6 +81,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		// P3: the actual registered span, after JoinOverlap merges and stream growth, may cover
+		// CPU-dirty pages that no mapped owner could reach before.
+		m_memory_tracker.PublishBdaHints(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -381,8 +386,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    (void)BdaTestHooks::Fire(BdaTestHooks::Point::BeforeUploadCopy, buffer.CpuAddress());
+		    source = UploadCopies(buffer, copies, total_size);
+		    (void)BdaTestHooks::Fire(BdaTestHooks::Point::AfterUploadCopy, buffer.CpuAddress());
+	    });
 	if (source) {
+		(void)BdaTestHooks::Fire(BdaTestHooks::Point::UploadRecorded, total_size);
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -654,12 +664,195 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	}
 	for (; it != m_buffers.end() && it->first < end; ++it) {
 		auto&      buffer = m_slot_buffers[it->second];
+		(void)BdaTestHooks::Fire(BdaTestHooks::Point::OwnerCandidate, buffer.CpuAddress());
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 		if (start < finish) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}
+}
+
+namespace {
+
+// Owns the regions of one consumed hint word while a selective pass processes them. Whatever
+// the pass has not completed is made pending again on every exit: an owner-index failure, an
+// early return, or unwinding. Completed regions are never cleared a second time, so a
+// publication that lands after the exchange stays pending.
+class BdaHintClaim final {
+public:
+	BdaHintClaim(MemoryTracker& tracker, size_t word, uint64_t bits) noexcept
+	    : m_tracker(tracker), m_word(word), m_bits(bits) {}
+	~BdaHintClaim() { m_tracker.RestoreBdaHints(m_word, m_bits); }
+	BdaHintClaim(const BdaHintClaim&)            = delete;
+	BdaHintClaim& operator=(const BdaHintClaim&) = delete;
+
+	void SetRemaining(uint64_t bits) noexcept { m_bits = bits; }
+
+private:
+	MemoryTracker& m_tracker;
+	size_t         m_word;
+	uint64_t       m_bits;
+};
+
+// Visits, once each and in ascending order, the hint words whose 256 MiB span intersects a
+// mapped range, until `func` fails. Only these words can hold an obligation for a BDA pass:
+// both walks synchronise mapped ranges only, and P4 re-publishes a range when it is mapped.
+// A mapped range outside the tracker's address space cannot be indexed, so it fails closed.
+template <typename Func>
+bool ForEachMappedHintWord(const RangeSet& mapped, Func&& func) {
+	constexpr uint64_t WordSpan = TRACKER_REGION_SIZE * 64;
+	uint64_t           next     = 0;
+	bool               ok       = true;
+	mapped.ForEach([&](uint64_t begin, uint64_t end) {
+		if (!ok) {
+			return;
+		}
+		if (end > TRACKER_ADDRESS_SIZE) {
+			ok = false;
+			return;
+		}
+		const uint64_t last = (end - 1) / WordSpan;
+		for (uint64_t word = std::max(next, begin / WordSpan); ok && word <= last; word++) {
+			ok = func(static_cast<size_t>(word));
+		}
+		next = std::max(next, last + 1);
+	});
+	return ok;
+}
+
+} // namespace
+
+void BufferCache::PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept {
+	m_memory_tracker.PublishBdaHints(vaddr, size);
+}
+
+void BufferCache::SynchronizeBdaLegacy(const RangeSet& mapped) {
+	// Drop the pending hints of the mapped words first. Every hint published before this point
+	// is answered by the full walk below; a publication after it stays pending for a later
+	// selective pass. Hints outside mapped words stay pending; that is only conservative.
+	(void)ForEachMappedHintWord(mapped, [this](size_t word) {
+		(void)m_memory_tracker.ConsumeBdaHintWord(word);
+		return true;
+	});
+	mapped.ForEach(
+	    [this](uint64_t start, uint64_t end) { SynchronizeBuffersInRange(start, end - start); });
+}
+
+bool BufferCache::SynchronizeBdaSelective(const RangeSet& mapped) {
+	struct ActivePass {
+		BufferCache& cache;
+		~ActivePass() {
+			cache.m_bda_active_word = BdaNoActiveWord;
+			cache.m_bda_active_bits = 0;
+		}
+	} active_pass {*this};
+
+	return ForEachMappedHintWord(mapped, [&](size_t word) {
+		uint64_t bits = m_memory_tracker.ConsumeBdaHintWord(word);
+		if (bits == 0) {
+			return true;
+		}
+		BdaHintClaim claim(m_memory_tracker, word, bits);
+		m_bda_active_word = word;
+		m_bda_active_bits = bits;
+		(void)BdaTestHooks::Fire(BdaTestHooks::Point::AfterHintExchange, word);
+		while (bits != 0) {
+			const uint64_t region = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
+			if (!SynchronizeBdaRegion(region, mapped)) {
+				return false; // `claim` re-publishes this region and the rest of the word
+			}
+			bits &= bits - 1;
+			claim.SetRemaining(bits);
+			m_bda_active_bits = bits;
+		}
+		return true;
+	});
+}
+
+bool BufferCache::SynchronizeBdaRegion(uint64_t region, const RangeSet& mapped) {
+	const uint64_t region_begin = region * TRACKER_REGION_SIZE;
+	auto*          manager      = m_memory_tracker.FindRegion(region);
+	if (manager == nullptr) {
+		// P2 or P3 hinted a region that is not tracked yet, so every page counts as CPU-dirty.
+		// Synchronise its mapped part now through the legacy walk: the current consumer may
+		// need these bytes, and that walk's Iterate<true> creates (or waits for) the manager.
+		(void)BdaTestHooks::Fire(BdaTestHooks::Point::NullRegionManager, region);
+		mapped.ForEachInRange(region_begin, TRACKER_REGION_SIZE,
+		                      [this](uint64_t begin, uint64_t end) {
+			                      SynchronizeBuffersInRange(begin, end - begin);
+		                      });
+		return true;
+	}
+	// Discovery input only; SynchronizeBuffer re-reads the live bits under the region lock.
+	const auto dirty = m_memory_tracker.SnapshotCpuDirty(*manager);
+	(void)BdaTestHooks::Fire(BdaTestHooks::Point::AfterDirtySnapshot, region);
+	if (dirty.None()) {
+		return true;
+	}
+	bool consistent = true;
+	mapped.ForEachInRange(region_begin, TRACKER_REGION_SIZE, [&](uint64_t begin, uint64_t end) {
+		consistent = consistent && SynchronizeDirtyOwners(dirty, region_begin, begin, end);
+	});
+	return consistent;
+}
+
+bool BufferCache::SynchronizeDirtyOwners(const RegionBits& dirty, uint64_t region_begin,
+                                         uint64_t begin, uint64_t end) {
+	// [begin, end) is one non-empty mapped interval inside the region. Each owner it reaches
+	// gets one complete SynchronizeBuffer over owner, region and this interval. `synced_end` is
+	// local to the interval, so another mapped piece of the same owner is still visited.
+	uint64_t   synced_end = begin;
+	auto       page       = static_cast<size_t>((begin - region_begin) / TRACKER_PAGE_SIZE);
+	const auto page_limit =
+	    static_cast<size_t>((end - region_begin + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE);
+	while (page < page_limit) {
+		const auto [first, last] = dirty.FirstRangeFrom(page);
+		if (first >= page_limit) {
+			break;
+		}
+		const uint64_t run_begin = std::max(region_begin + first * TRACKER_PAGE_SIZE, begin);
+		const uint64_t run_end   = std::min(region_begin + last * TRACKER_PAGE_SIZE, end);
+		for (uint64_t cursor = std::max(run_begin, synced_end); cursor < run_end;) {
+			const auto* owner = m_page_table.Find(cursor >> CACHING_PAGEBITS);
+			if (owner == nullptr || !*owner) {
+				// No registered owner on this caching page: step to the next aligned boundary.
+				cursor = (cursor & ~(CACHING_PAGESIZE - 1)) + CACHING_PAGESIZE;
+				continue;
+			}
+			auto* buffer = m_slot_buffers.try_get(*owner);
+			if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(cursor, 1) ||
+			    BdaTestHooks::Fire(BdaTestHooks::Point::ForceSelectiveFailure, cursor)) {
+				return false; // the page table disagrees with the registered owners
+			}
+			(void)BdaTestHooks::Fire(BdaTestHooks::Point::OwnerCandidate, buffer->CpuAddress());
+			const uint64_t owner_begin = std::max(buffer->CpuAddress(), begin);
+			const uint64_t owner_end   = std::min(buffer->CpuAddress() + buffer->Size(), end);
+			(void)SynchronizeBuffer(*buffer, owner_begin, owner_end - owner_begin, false, false);
+			synced_end = owner_end;
+			cursor     = owner_end;
+		}
+		page = last;
+	}
+	return true;
+}
+
+bool BufferCache::CheckBdaHintInvariant(const RangeSet& mapped) {
+	const auto owned = [this](uint64_t region) {
+		return region / 64 == m_bda_active_word && ((m_bda_active_bits >> (region % 64)) & 1u) != 0;
+	};
+	for (const auto& [address, id]: m_buffers) {
+		(void)address;
+		const auto& buffer  = m_slot_buffers[id];
+		bool        covered = true;
+		mapped.ForEachInRange(buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
+			covered = covered && m_memory_tracker.BdaHintsCoverCpuDirty(begin, end - begin, owned);
+		});
+		if (!covered) {
+			return false;
+		}
+	}
+	return true;
 }
 
 } // namespace Libs::Graphics

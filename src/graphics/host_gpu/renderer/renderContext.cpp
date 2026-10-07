@@ -90,6 +90,10 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	// P4: the new mapping can expose CPU-dirty pages of registered owners (for example after
+	// an unmap invalidated them). Published under the exclusive lock, so no PrepareBda pass or
+	// checker holding the shared lock can observe the mapping without its hints.
+	m_buffer_cache.PublishBdaHints(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -129,9 +133,23 @@ void RenderContext::PrepareBda() {
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	if (m_bda_sync_mode == Config::BdaSyncMode::Legacy || m_bda_selective_failed) {
+		m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+	} else if (!m_buffer_cache.SynchronizeBdaSelective(m_mapped_ranges)) {
+		// Fail closed. The pass has made every obligation it had not completed pending again;
+		// answer this consumer with the legacy walk and stay on it.
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+		EXIT("selective BDA sync: the owner or hint index is inconsistent\n");
+#else
+		LOGF("selective BDA sync: owner or hint index inconsistency; switching to the legacy "
+		     "walk\n");
+		m_bda_selective_failed = true;
+		m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+#endif
+	} else if (m_bda_sync_mode == Config::BdaSyncMode::SelectiveChecked &&
+	           !m_buffer_cache.CheckBdaHintInvariant(m_mapped_ranges)) {
+		EXIT("selective BDA sync: a CPU-dirty page of a mapped owner has no pending hint\n");
+	}
 	m_fault_process_pending = true;
 }
 

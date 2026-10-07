@@ -26399,6 +26399,34 @@ TestCase VectorVop3CompareNeU64OnGpu() {
            O::S_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorCmpxUF32CapturedExecMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 2, 0x7fc00000u);
+  AppendVMovLiteral(&code, 3, 0x3f800000u);
+  AppendVMovLiteral(&code, 4, 0x40000000u);
+  AppendVMovU32(&code, 5, 1);
+  auto append_cmpx = [&](u32 src0, u32 src1, u32 offset) {
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    AppendVMovU32(&code, 31, offset);
+    code.push_back(EncodeVopc(0x18, src0, src1));
+    AppendBufferStoreDword(&code, 5, 31);
+  };
+  append_cmpx(Vgpr(2), 3, 0);
+  append_cmpx(Vgpr(3), 2, 4);
+  append_cmpx(Vgpr(3), 4, 8);
+  append_cmpx(Vgpr(3), 3, 12);
+  AppendEnd(&code);
+
+  return {"VectorCmpxUF32CapturedExecMask",
+          code,
+          {0x11223344u, 0x55667788u, 0xaabbccddu, 0xeeff0011u},
+          {1u, 1u, 0xaabbccddu, 0xeeff0011u},
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_CMPX_U_F32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
 TestCase VectorVopcCmpxNeU64CapturedExecMask() {
   using O = ShaderOpcode;
 
@@ -36227,6 +36255,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCompareLtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);
   AddCase(VectorVopcCmpxNeU64CapturedExecMask);
+  AddCase(VectorCmpxUF32CapturedExecMask);
   AddCase(VectorVop3CmpxNeI64CapturedExecMask);
   AddCase(VectorCompareClassF32);
   AddCase(VectorVopcSdwaCmpxClassF32CapturedExecMask);
@@ -41656,6 +41685,7 @@ int main(int argc, char **argv) {
     }
     RunCase(&vulkan, VectorCompareClassF32());
     RunCase(&vulkan, VectorCompareF16Ops());
+    RunCase(&vulkan, VectorCmpxUF32CapturedExecMask());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-format-store-only") == 0) {

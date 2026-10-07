@@ -28,8 +28,10 @@
 #else
 #include <map>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utility>
 #endif
 
 namespace {
@@ -638,6 +640,170 @@ void CheckDeathCase(const char *name) {
 #endif
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+using Writes = std::vector<std::pair<uint64_t, uint64_t>>;
+
+void CollectWrites(void *context, uint64_t vaddr, uint64_t size) {
+  static_cast<Writes *>(context)->emplace_back(vaddr, size);
+}
+
+Writes Harvest(PageManager &manager) {
+  Writes writes;
+  manager.HarvestWrites(CollectWrites, &writes);
+  return writes;
+}
+
+// Guest direct memory is a shared memfd mapping; other guest memory is anonymous.
+uint8_t *AllocateShared(uint64_t size, uintptr_t address) {
+  const int fd = static_cast<int>(::syscall(SYS_memfd_create, "PageManagerTests", 0));
+  Check(fd >= 0 && ::ftruncate(fd, static_cast<off_t>(size)) == 0, "memfd failed");
+  void *raw = ::mmap(reinterpret_cast<void *>(address), size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+  ::close(fd);
+  Check(raw == reinterpret_cast<void *>(address), "fixed shared mmap failed");
+  AllocationSizes()[raw] = static_cast<size_t>(size);
+  return static_cast<uint8_t *>(raw);
+}
+
+void TestAsyncWriteWatch(bool shared) {
+  ::setenv("KYTY_ASYNC_WRITE_WATCH", "1", 1);
+  PageManager manager;
+  ::unsetenv("KYTY_ASYNC_WRITE_WATCH");
+  if (!manager.AsyncWriteWatchEnabled()) {
+    std::puts("PageManagerTests: asynchronous write watches unavailable, skipped");
+    return;
+  }
+  const auto page = manager.GetPageSize();
+  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
+  constexpr uintptr_t test_address = 0x0000000200010000ull;
+  auto *memory = shared ? AllocateShared(page * 8, test_address)
+                        : Allocate(page * 8, PAGE_READWRITE, test_address);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base = base & ~(region_size - 1);
+  const auto page_index = [&](uint64_t offset) {
+    return static_cast<size_t>((base + offset - region_base) / page);
+  };
+
+  manager.UpdatePageWatchers<true>(base, page * 4);
+  Check(Protection(memory) == PAGE_READONLY, "write watch is not synchronous before promotion");
+  for (int fault = 0; fault < 64; fault++) {
+    manager.NoteWriteFault(base);
+  }
+  Check(Harvest(manager).empty(), "promotion reported writes");
+  Check(IsWritable(memory) && IsWritable(memory + page * 3),
+        "promoted write watch still uses mprotect");
+
+  // A write to a watched page is reported once, and again after the next write.
+  memory[page] = 1;
+  memory[page + 5] = 2;
+  memory[page * 6] = 3;
+  auto writes = Harvest(manager);
+  Check(writes.size() == 1 && writes[0] == std::make_pair(base + page, page),
+        "harvest did not report exactly the written watched page");
+  Check(Harvest(manager).empty(), "a write was reported twice");
+  memory[page] = 4;
+  writes = Harvest(manager);
+  Check(writes.size() == 1 && writes[0].first == base + page,
+        "a still-watched page was not re-armed after its harvest");
+
+  // A released watch is not reported.
+  memory[page * 2] = 1;
+  manager.UpdatePageWatchers<false>(base + page * 2, page);
+  Check(Harvest(manager).empty(), "a released write watch was reported");
+
+  // Access watches stay synchronous, and a write made before one is installed is kept.
+  memory[0] = 9;
+  Libs::Graphics::RegionBits access;
+  access.Set(page_index(0));
+  access.Set(page_index(page * 3));
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, access);
+  Check(Protection(memory) == PAGE_NOACCESS && Protection(memory + page * 3) == PAGE_NOACCESS,
+        "access watch in an asynchronous region is not synchronous");
+  writes = Harvest(manager);
+  Check(writes.size() == 1 && writes[0] == std::make_pair(base, page),
+        "a write made before an access watch was lost");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, access);
+  Check(IsWritable(memory) && IsWritable(memory + page * 3),
+        "released access watch did not restore the asynchronous write watch");
+  memory[page * 3] = 1;
+  writes = Harvest(manager);
+  Check(writes.size() == 1 && writes[0].first == base + page * 3,
+        "write watch restored from an access watch is not armed");
+
+  // A range harvest takes only its range; the rest stays for the next full harvest, which
+  // also repeats the range for the other owners.
+  memory[0] = 1;
+  memory[page] = 1;
+  Writes ranged;
+  manager.HarvestRange(base + page, page, CollectWrites, &ranged);
+  Check(ranged.size() == 1 && ranged[0].first == base + page, "range harvest left its range");
+  writes = Harvest(manager);
+  Check(writes.size() == 2, "full harvest lost a write or the queued range");
+
+  manager.UpdatePageWatchers<false>(base, page * 2);
+  manager.UpdatePageWatchers<false>(base + page * 3, page);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestAsyncWriteWatchLifecycle() {
+  ::setenv("KYTY_ASYNC_WRITE_WATCH", "1", 1);
+  PageManager manager;
+  ::unsetenv("KYTY_ASYNC_WRITE_WATCH");
+  if (!manager.AsyncWriteWatchEnabled()) {
+    return;
+  }
+  const auto page = manager.GetPageSize();
+  auto *memory = AllocateShared(page * 4, 0x0000000200010000ull);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  manager.UpdatePageWatchers<true>(base, page * 2);
+
+  // Faults spread over more than a promotion window do not promote.
+  for (int fault = 0; fault < 63; fault++) {
+    manager.NoteWriteFault(base);
+  }
+  for (int harvest = 0; harvest < 70; harvest++) {
+    (void)Harvest(manager);
+  }
+  manager.NoteWriteFault(base);
+  (void)Harvest(manager);
+  Check(Protection(memory) == PAGE_READONLY, "faults outside the window promoted the region");
+
+  for (int fault = 0; fault < 64; fault++) {
+    manager.NoteWriteFault(base);
+  }
+  (void)Harvest(manager);
+  Check(IsWritable(memory), "region was not promoted");
+
+  // An idle region returns to synchronous watches without losing a pending write.
+  // The promoting harvest already counts as idle; stay below the limit.
+  for (int harvest = 0; harvest < 500; harvest++) {
+    Check(Harvest(manager).empty(), "idle region reported a write");
+  }
+  memory[page] = 1;
+  auto writes = Harvest(manager);
+  Check(writes.size() == 1 && writes[0].first == base + page, "write before demotion was lost");
+  Check(IsWritable(memory), "a region that was written is demoted");
+  for (int harvest = 0; harvest < 512; harvest++) {
+    (void)Harvest(manager);
+  }
+  Check(Protection(memory) == PAGE_READONLY && Protection(memory + page) == PAGE_READONLY,
+        "idle region did not return to synchronous watches");
+
+  // It can be promoted again.
+  for (int fault = 0; fault < 64; fault++) {
+    manager.NoteWriteFault(base);
+  }
+  (void)Harvest(manager);
+  Check(IsWritable(memory) && IsWritable(memory + page), "region was not promoted again");
+  memory[0] = 1;
+  writes = Harvest(manager);
+  Check(writes.size() == 1 && writes[0].first == base, "re-promoted region lost a write");
+
+  manager.UpdatePageWatchers<false>(base, page * 2);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+#endif
+
 void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch",
@@ -669,6 +835,11 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+  TestAsyncWriteWatch(false);
+  TestAsyncWriteWatch(true);
+  TestAsyncWriteWatchLifecycle();
+#endif
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

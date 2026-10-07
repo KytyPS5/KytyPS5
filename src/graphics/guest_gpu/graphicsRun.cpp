@@ -317,7 +317,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
+		return;
 	}
+	// The guest may have written the data this wait orders after.
+	m_renderer.HarvestCpuWrites();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -546,6 +549,10 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.ResetDeCe();
 		cp.SetFlip({});
 	}
+
+	// Guest CPU writes before a submission (or before the wait it resumes from) must be
+	// visible to its commands.
+	m_renderer.HarvestCpuWrites();
 
 	cp.BufferInit();
 	bool complete = true;

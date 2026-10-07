@@ -156,11 +156,14 @@ public:
 	}
 
 private:
+	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
+
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
 	ValueOpcode         opcode;
+	bool                live = false;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;

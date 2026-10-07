@@ -78,10 +78,12 @@ struct Fixture {
 struct TestMemory {
   std::unordered_map<uint64_t, uint32_t> words;
   uint32_t reads = 0;
+  uint32_t attempts = 0;
 };
 
 bool ReadMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
   auto &memory = *static_cast<TestMemory *>(userdata);
+  memory.attempts++;
   for (auto &value : values) {
     const auto it = memory.words.find(address);
     if (it == memory.words.end()) return false;
@@ -606,11 +608,13 @@ void TestConstantBufferBounds() {
     uint32_t immediate;
     bool valid;
     uint32_t expected;
+    uint32_t expected_attempts;
   };
-  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u},
-                           Case{3u, 1u, true, 0x12345678u},
-                           Case{0xfffffffcu, 4u, false, 0u},
-                           Case{16u, 0u, false, 0u}}) {
+  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u, 1u},
+                           Case{3u, 1u, true, 0x12345678u, 1u},
+                           Case{0xfffffffcu, 4u, true, 0u, 0u},
+                           Case{16u, 0u, true, 0u, 0u},
+                           Case{4u, 0u, false, 0u, 1u}}) {
     Fixture fixture;
     const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, test.immediate);
     const auto buffer =
@@ -626,7 +630,10 @@ void TestConstantBufferBounds() {
     std::vector<uint32_t> flat;
     Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) == test.valid,
           "constant-buffer walk misaligned or wrapped its offset components");
-    Check(test.valid ? flat == std::vector<uint32_t>{test.expected} : memory_image.reads == 0,
+    // Match the already-proved scalar-buffer contract: descriptor OOB is a known
+    // zero without a memory probe; an unavailable in-bounds DWORD must still fail.
+    Check((!test.valid || flat == std::vector<uint32_t>{test.expected}) &&
+              memory_image.attempts == test.expected_attempts,
           "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
   }
 }

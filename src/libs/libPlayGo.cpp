@@ -5,6 +5,8 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
+#include "common/file.h"
+#include "kernel/fileSystem.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
@@ -98,7 +100,17 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     "\t reserved = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
-	if (Config::PlayGoHackEnabled() && !ensure_chunks_loaded()) {
+
+	// Extracted BO2 has separate executables but can omit PlayGo metadata. Apply
+	// the existing fallback to this title only, when all three modes are present.
+	std::string title_id;
+	const bool extracted_bo2 =
+	    Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) &&
+	    title_id == "PPSA34502" &&
+	    Common::File::IsFileExisting(LibKernel::FileSystem::GetRealFilename("/app0/eboot.bin")) &&
+	    Common::File::IsFileExisting(LibKernel::FileSystem::GetRealFilename("/app0/codmp.elf")) &&
+	    Common::File::IsFileExisting(LibKernel::FileSystem::GetRealFilename("/app0/codzm.elf"));
+	if ((Config::PlayGoHackEnabled() || extracted_bo2) && !ensure_chunks_loaded()) {
 		g_chunks_num = PLAYGO_DEFAULT_CHUNKS_NUM;
 		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", g_chunks_num);
 	}

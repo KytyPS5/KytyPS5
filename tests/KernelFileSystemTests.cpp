@@ -205,6 +205,17 @@ void TestReadsIntoProtectedPages() {
   Check(guard() && FileSystem::KernelPreadv(fd, iov, 2, 0) ==
                        static_cast<int64_t>(payload.size()) && filled(),
         "preadv fills vectors that cross into a write-protected page");
+#if defined(__linux__)
+  // An unmapped destination is not recovered: the read stays short instead of faulting.
+  const long page = sysconf(_SC_PAGESIZE);
+  void *pages = mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  Check(pages != MAP_FAILED && munmap(static_cast<char *>(pages) + page, page) == 0,
+        "map a read target whose second page is unmapped");
+  Check(FileSystem::KernelPread(fd, pages, page * 2, 0) == page &&
+            std::memcmp(pages, payload.data(), page) == 0,
+        "pread into a partly unmapped buffer returns the mapped prefix");
+  munmap(pages, page);
+#endif
   g_guard_size = 0;
   Common::VirtualMemory::Free(memory);
   Check(FileSystem::KernelClose(fd) == OK &&

@@ -15329,6 +15329,13 @@ public:
     stage.stage = vk::ShaderStageFlagBits::eCompute;
     stage.module = module;
     stage.pName = "main";
+    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo required_subgroup_size{};
+    const u32 wave_size = compiled.program.wave_size;
+    if (m_compute_subgroup_size_control && wave_size >= m_min_subgroup_size &&
+        wave_size <= m_max_subgroup_size) {
+      required_subgroup_size.requiredSubgroupSize = wave_size;
+      stage.pNext = &required_subgroup_size;
+    }
 
     vk::ComputePipelineCreateInfo pipeline_info{};
     pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
@@ -18132,6 +18139,9 @@ public:
 private:
   bool m_rasterization_supported = true;
   u32   m_skipped_cases          = 0;
+  bool m_compute_subgroup_size_control = false;
+  u32  m_min_subgroup_size             = 0;
+  u32  m_max_subgroup_size             = 0;
 
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -18315,6 +18325,16 @@ private:
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
     m_physical_device.getFeatures2(&available_features2);
+    vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
+    vk::PhysicalDeviceProperties2 subgroup_properties{};
+    subgroup_properties.pNext = &subgroup_size_control;
+    m_physical_device.getProperties2(&subgroup_properties);
+    m_compute_subgroup_size_control =
+        available_features13.subgroupSizeControl == true &&
+        (subgroup_size_control.requiredSubgroupSizeStages &
+         vk::ShaderStageFlagBits::eCompute);
+    m_min_subgroup_size = subgroup_size_control.minSubgroupSize;
+    m_max_subgroup_size = subgroup_size_control.maxSubgroupSize;
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -18396,6 +18416,7 @@ private:
     device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    device_features13.subgroupSizeControl = m_compute_subgroup_size_control;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;

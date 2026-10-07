@@ -121,6 +121,7 @@ constexpr Elf64_Sxword DT_RELACOUNT = 0x6ffffff9;
 
 constexpr Elf64_Sxword DT_NULL = 0;
 
+constexpr Elf64_Word R_X86_64_NONE      = 0;
 constexpr Elf64_Word R_X86_64_64        = 1;
 constexpr Elf64_Word R_X86_64_GLOB_DAT  = 6;
 constexpr Elf64_Word R_X86_64_JUMP_SLOT = 7;

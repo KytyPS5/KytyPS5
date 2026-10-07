@@ -200,6 +200,7 @@ private:
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();
+bool TestRelocationSkipsNoneEntries();
 #endif
 
 } // namespace Loader

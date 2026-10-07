@@ -875,6 +875,11 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool jmprela_table) {
 	KYTY_PROFILER_FUNCTION();
 
+	// A no-op; report it as done so it is not stubbed and patched at base_vaddr + r_offset.
+	if (r->GetType() == R_X86_64_NONE) {
+		return true;
+	}
+
 	const auto ri      = GetRelocationInfo(r, program);
 	auto       value   = ri.value;
 	bool       stubbed = false;
@@ -913,6 +918,24 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	}
 	return ri.resolved;
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestRelocationSkipsNoneEntries() {
+	constexpr uint64_t sentinel = 0x4b59545950415443;
+	uint64_t           words[2] = {sentinel, sentinel};
+
+	Program program;
+	program.base_vaddr   = reinterpret_cast<uint64_t>(words);
+	program.dynamic_info = std::make_unique<DynamicInfo>();
+	Elf64_Rela none {};
+	Elf64_Rela relative {.r_offset = 8, .r_info = R_X86_64_RELATIVE, .r_addend = 0x40};
+
+	const bool none_done     = RelocateRecord(0, &none, &program, false);
+	const bool relative_done = RelocateRecord(1, &relative, &program, false);
+	return none_done && relative_done && words[0] == sentinel &&
+	       words[1] == program.base_vaddr + 0x40;
+}
+#endif
 
 static void ForEachRelocation(Program* program, auto&& func) {
 	const auto& info = *program->dynamic_info;

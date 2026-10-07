@@ -2971,6 +2971,13 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestRelocationSkipsNoneEntries() {
+	const char* test = "RelocationSkipsNoneEntries";
+	Check(test, Loader::TestRelocationSkipsNoneEntries(),
+	      "R_X86_64_NONE was not skipped or changed module memory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 volatile sig_atomic_t g_instruction_traps = 0;
 
@@ -4279,6 +4286,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestRelocationSkipsNoneEntries);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

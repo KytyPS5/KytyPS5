@@ -20556,6 +20556,37 @@ TestCase ScalarBitfieldPack() {
            O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarFf1I32B32() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 20, 0u);
+  AppendSMovLiteral(&code, 21, 0x00000001u);
+  AppendSMovLiteral(&code, 22, 0x80000000u);
+  AppendSMovLiteral(&code, 23, 0x00f00000u);
+  AppendSMovLiteral(&code, 24, 0xffffffffu);
+  code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1)));
+  code.push_back(EncodeSop1(0x13, 30, 20));
+  code.push_back(EncodeSop2(0x0a, 35, InlineU32(1), InlineU32(0)));
+  code.push_back(EncodeSop1(0x13, 31, 21));
+  code.push_back(EncodeSop1(0x13, 32, 22));
+  code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(1)));
+  code.push_back(EncodeSop1(0x13, 33, 23));
+  code.push_back(EncodeSop2(0x0a, 36, InlineU32(1), InlineU32(0)));
+  code.push_back(EncodeSop1(0x13, 34, 24));
+  for (u32 i = 0; i < 7; i++) {
+    AppendStoreSgpr(&code, 30 + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"ScalarFf1I32B32",
+          code,
+          {},
+          {0xffffffffu, 0, 31, 20, 0, 1, 0},
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_FF1_I32_B32, O::S_CSELECT_B32,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarBrevB32PreservesScc() {
   using O = ShaderOpcode;
 
@@ -36034,6 +36065,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
+  AddCase(ScalarFf1I32B32);
   AddCase(ScalarBitcmpB64DynamicOperands);
   AddCase(ScalarBitcmpB64IntegerConstants);
   AddCase(ScalarBrevB32PreservesScc);
@@ -42170,6 +42202,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sff1-b64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarBitfieldPack());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sff1-b32-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarFf1I32B32());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {

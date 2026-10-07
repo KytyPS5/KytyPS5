@@ -487,7 +487,7 @@ uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t va
 
 uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_t value);
 
-uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32);
+uint32_t EmitF32ToF16Bits(EmitterState& state, uint32_t f32, bool round_to_zero);
 
 uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 

@@ -774,9 +774,7 @@ uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
 		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
 	}
 	if (bits == 16u && info.type == Format::ComponentType::Float) {
-		const auto pair = EmitCompositeConstructF32x2(
-		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
-		return EmitPackHalf2x16(state, pair);
+		return EmitF32ToF16Bits(state, EmitBitCastF32U32(state, data), false);
 	}
 	return data;
 }

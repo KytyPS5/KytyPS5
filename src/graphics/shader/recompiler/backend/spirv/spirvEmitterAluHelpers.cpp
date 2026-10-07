@@ -30,7 +30,7 @@ uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_
 	return ret;
 }
 
-uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
+uint32_t EmitF32ToF16Bits(EmitterState& state, uint32_t f32, bool round_to_zero) {
 	const auto bits = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, f32);
 
@@ -52,10 +52,10 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 
 	const auto mant_with_hidden = EmitOrU32(state, mant, ConstantU32(state, 0x00800000u));
 	const auto raw_sub_shift    = EmitSubConstantMinusU32(state, 126, exp);
-	const auto exp_lt_103       = EmitCompareU32Constant(state, spv::OpULessThan, exp, 103);
+	const auto exp_lt_102       = EmitCompareU32Constant(state, spv::OpULessThan, exp, 102);
 	const auto exp_gt_112       = EmitCompareU32Constant(state, spv::OpUGreaterThan, exp, 112);
 	const auto sub_shift_low =
-	    EmitSelectValueU32(state, exp_lt_103, ConstantU32(state, 31), raw_sub_shift);
+	    EmitSelectValueU32(state, exp_lt_102, ConstantU32(state, 31), raw_sub_shift);
 	const auto sub_shift =
 	    EmitSelectValueU32(state, exp_gt_112, ConstantU32(state, 14), sub_shift_low);
 	const auto sub_mant  = state.builder.AllocateId();
@@ -76,9 +76,23 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto exp_le_112 = EmitCompareU32Constant(state, spv::OpULessThanEqual, exp, 112);
 	const auto exp_ge_143 = EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, exp, 143);
 	const auto exp_eq_255 = EmitCompareU32Constant(state, spv::OpIEqual, exp, 255);
-	const auto finite0    = EmitSelectValueU32(state, exp_le_112, subnormal, normal);
-	const auto finite1    = EmitSelectValueU32(state, exp_lt_103, sign, finite0);
-	const auto finite2    = EmitSelectValueU32(state, exp_ge_143, max_finite, finite1);
+	auto       finite0    = EmitSelectValueU32(state, exp_le_112, subnormal, normal);
+	if (!round_to_zero) {
+		const auto width = EmitSelectValueU32(state, exp_le_112, sub_shift, ConstantU32(state, 13));
+		const auto source = EmitSelectValueU32(state, exp_le_112, mant_with_hidden, mant);
+		const auto unit =
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1), width);
+		const auto mask = Binary(state, spv::OpISub, TypeU32(state), unit, ConstantU32(state, 1));
+		const auto rest = EmitAndU32(state, source, mask);
+		const auto below_half = EmitShiftRightConstant(state, mask, 1);
+		const auto bias       = EmitAddU32(state, below_half, EmitAndConstant(state, finite0, 1));
+		const auto round_up   = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                               EmitAddU32(state, rest, bias), width);
+		finite0               = EmitAddU32(state, finite0, round_up);
+	}
+	const auto finite1 = EmitSelectValueU32(state, exp_lt_102, sign, finite0);
+	const auto finite2 =
+	    EmitSelectValueU32(state, exp_ge_143, round_to_zero ? max_finite : inf, finite1);
 	return EmitAndConstant(state, EmitSelectValueU32(state, exp_eq_255, special, finite2), 0xffffu);
 }
 

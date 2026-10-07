@@ -175,10 +175,7 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
-	const auto pair = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
-	                          ConstantF32(state, 0));
-	return EmitPackHalf2x16(state, pair);
+	return EmitF32ToF16Bits(state, arg0, false);
 }
 
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {
@@ -228,10 +225,20 @@ uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value
 	return EmitNative<spv::OpCompositeExtract, IR::Type::U32>(state, arg0, arg1.U32());
 }
 
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t arg0) {
+	const auto low = EmitF32ToF16Bits(
+	    state, EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, arg0, 0u), false);
+	const auto high = EmitF32ToF16Bits(
+	    state, EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, arg0, 1u), false);
+	return Binary(
+	    state, spv::OpBitwiseOr, TypeU32(state), low,
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), high, ConstantU32(state, 16)));
+}
+
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	const auto low  = EmitF32ToF16RtzBits(state, arg0);
+	const auto low  = EmitF32ToF16Bits(state, arg0, true);
 	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-	                         EmitF32ToF16RtzBits(state, arg1), ConstantU32(state, 16));
+	                         EmitF32ToF16Bits(state, arg1, true), ConstantU32(state, 16));
 	return Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
 }
 

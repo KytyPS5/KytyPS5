@@ -259,9 +259,7 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 				const auto pair = ctx.state.builder.AllocateId();
 				ctx.state.builder.AddFunction(spv::OpCompositeConstruct,
 				                              TypeF32Vector(ctx.state, 2), pair, low, high);
-				packed[word] = ctx.state.builder.AllocateId();
-				ctx.state.builder.AddFunction(spv::OpExtInst, TypeU32(ctx.state), packed[word],
-				                              GlslStd450(ctx.state), GLSLstd450PackHalf2x16, pair);
+				packed[word] = EmitPackHalf2x16(ctx.state, pair);
 			}
 		}
 		const auto result = ctx.state.builder.AllocateId();

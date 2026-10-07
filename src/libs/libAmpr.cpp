@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -44,21 +45,21 @@ struct ResultBuffer {
 };
 
 struct ResolvedPathInfo {
-	int         result    = OK;
-	uint32_t    file_id   = 0xffffffffu;
-	uint64_t    file_size = 0;
-	bool        is_dir    = false;
-	std::string host_path;
+	int                   result    = OK;
+	uint32_t              file_id   = 0xffffffffu;
+	uint64_t              file_size = 0;
+	bool                  is_dir    = false;
+	std::filesystem::path host_path;
 };
 
-static std::mutex                                        g_mutex;
-static uint32_t                                          g_next_submission_id = 1;
-static uint32_t                                          g_next_file_id       = 1;
-static std::unordered_map<uint32_t, bool>                g_submissions;
-static std::condition_variable                           g_submission_cv;
-static std::unordered_map<uint32_t, std::string>         g_files;
-static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
-static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
+static std::mutex                                          g_mutex;
+static uint32_t                                            g_next_submission_id = 1;
+static uint32_t                                            g_next_file_id       = 1;
+static std::unordered_map<uint32_t, bool>                  g_submissions;
+static std::condition_variable                             g_submission_cv;
+static std::unordered_map<uint32_t, std::filesystem::path> g_files;
+static std::unordered_map<uint32_t, uint64_t>              g_file_sizes;
+static std::unordered_map<std::string, ResolvedPathInfo>   g_resolved_paths;
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
 	(void)write;
@@ -113,7 +114,7 @@ static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 	return LibKernel::KERNEL_ERROR_ENAMETOOLONG;
 }
 
-static bool TryGetHostPath(uint32_t file_id, std::string* out) {
+static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	std::scoped_lock lock(g_mutex);
 	const auto       it = g_files.find(file_id);
 	if (it == g_files.end()) {
@@ -133,7 +134,8 @@ static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	return true;
 }
 
-static int GetHostPathStat(const std::string& host_path, LibKernel::FileSystem::FileStat* st) {
+static int GetHostPathStat(const std::filesystem::path&     host_path,
+                           LibKernel::FileSystem::FileStat* st) {
 	if (st == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
@@ -193,8 +195,10 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 	}
 
 	if (!found) {
+		// Keep the native path: on Windows a UTF-8 std::string converts back through the ANSI
+		// code page, so install folders with non-ASCII names would no longer resolve.
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
-		info.host_path       = Common::PathToString(real_path);
+		info.host_path       = real_path;
 
 		if (Common::File::IsDirectoryExisting(real_path)) {
 			info.is_dir    = true;
@@ -225,7 +229,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			}
 		}
 		if (log_missing) {
-			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, info.host_path.c_str());
+			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path,
+			     Common::PathToString(info.host_path).c_str());
 		}
 	}
 
@@ -408,7 +413,7 @@ static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::Fi
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EINVAL);
 	}
 
-	std::string host_path;
+	std::filesystem::path host_path;
 	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
 		LOGF("\tAPR stat failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
@@ -430,7 +435,7 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	std::string host_path;
+	std::filesystem::path host_path;
 	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
 		LOGF("\tAPR size failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
@@ -1161,13 +1166,13 @@ static bool AppendCommandRecord(uint64_t command_buffer, CommandBufferState::Com
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
-static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
+static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
 static int ExecuteCommand(const CommandBufferState::Command& entry) {
 	if (const auto* payload = std::get_if<CommandBufferState::ReadFileCommand>(&entry.data)) {
 		const auto& command = *payload;
-		std::string host_path;
+		std::filesystem::path host_path;
 		if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
 			LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n", command.file_id);
 			return LibKernel::KERNEL_ERROR_ENOENT;
@@ -1178,7 +1183,8 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		                                      command.size, &bytes_read);
 		if (result != OK) {
 			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
-			     command.file_id, static_cast<uint32_t>(result), host_path.c_str());
+			     command.file_id, static_cast<uint32_t>(result),
+			     Common::PathToString(host_path).c_str());
 			return result;
 		}
 	} else if (const auto* payload =
@@ -1380,7 +1386,7 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
-static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
+static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	if (bytes_read == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -1396,7 +1402,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 
 	Common::File file;
 	if (!file.Open(host_path, Common::File::Mode::Read)) {
-		LOGF("\tAPR read missing host file: %s\n", host_path.c_str());
+		LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
 	const auto file_size = file.Size();

@@ -82,6 +82,9 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
+		if (is_written) {
+			CollectCpuWrites(vaddr, size);
+		}
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -107,6 +110,17 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+
+	// Writes that asynchronous write watches have not reported yet must reach the GPU copy
+	// before the GPU takes ownership of the range, or a later download would revert them.
+	void CollectCpuWrites(uint64_t vaddr, uint64_t size) {
+		m_page_manager.HarvestRange(
+		    vaddr, size,
+		    [](void* context, uint64_t address, uint64_t bytes) {
+			    static_cast<MemoryTracker*>(context)->MarkRegionAsCpuModified(address, bytes);
+		    },
+		    this);
+	}
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

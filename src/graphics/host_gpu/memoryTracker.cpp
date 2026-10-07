@@ -92,6 +92,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	CollectCpuWrites(vaddr, size);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);

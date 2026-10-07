@@ -25,6 +25,22 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	// Receives guest ranges that the CPU wrote while they were write-watched.
+	using WriteSink = void (*)(void* context, uint64_t vaddr, uint64_t size);
+
+	// On Linux, regions that take many write faults switch their write watches to
+	// asynchronous userfaultfd write protection: the kernel lifts the protection on the
+	// first write without raising a signal, and the writes are collected here instead.
+	// Access watches stay synchronous. Callers must hold no tracker or cache locks.
+	void HarvestWrites(WriteSink sink, void* context);
+	// Collects the writes in [vaddr, vaddr + size) and passes them to `sink` while the
+	// caller may hold tracker locks. The ranges are also queued for the next HarvestWrites,
+	// so the remaining owners still see them.
+	void HarvestRange(uint64_t vaddr, uint64_t size, WriteSink sink, void* context);
+	// Counts a synchronous write fault toward switching its region to asynchronous watches.
+	void NoteWriteFault(uint64_t vaddr) noexcept;
+	[[nodiscard]] bool AsyncWriteWatchEnabled() const noexcept;
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

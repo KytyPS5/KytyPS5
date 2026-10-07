@@ -64,10 +64,23 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_page_manager.NoteWriteFault(fault_vaddr);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
+}
+
+void RenderContext::HarvestCpuWrites() {
+	m_page_manager.HarvestWrites(
+	    [](void* context, uint64_t vaddr, uint64_t size) {
+		    auto* self = static_cast<RenderContext*>(context);
+		    if (self->IsMapped(vaddr, size)) {
+			    self->m_buffer_cache.InvalidateMemory(vaddr, size);
+			    self->m_texture_cache.InvalidateMemory(vaddr, size);
+		    }
+	    },
+	    this);
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {

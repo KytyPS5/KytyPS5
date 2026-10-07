@@ -49,6 +49,9 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Delivers CPU writes collected by asynchronous write watches, as if each had faulted.
+	// Call where the GPU starts consuming guest memory (submission start, satisfied waits).
+	void HarvestCpuWrites();
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

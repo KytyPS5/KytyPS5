@@ -175,9 +175,16 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
+#if defined(__APPLE__)
+	// MoltenVK returns an unusable OpArrayLength for these storage-buffer arrays (reads then fail
+	// their bounds check and yield zeros). The descriptor range already limits the buffer and
+	// robustBufferAccess covers stray accesses, so treat the array as unbounded.
+	access.length = ConstantU32(state, 0x10000000u);
+#else
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
+#endif
 	return access;
 }
 

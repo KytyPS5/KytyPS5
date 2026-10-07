@@ -376,8 +376,17 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
 	vk_buffer.setBlendConstants(blend_constants.data());
+#if defined(__APPLE__)
+	// Without a depth attachment the test is a no-op per the Vulkan spec, but MoltenVK/Metal
+	// rejects every fragment when a depth test is enabled with no depth target bound.
+	const bool has_depth_target = static_cast<bool>(depth.image_id);
+	vk_buffer.setDepthTestEnable(has_depth_target && depth.depth_test_enable ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthWriteEnable(has_depth_target && depth.depth_write_enable ? VK_TRUE
+	                                                                           : VK_FALSE);
+#else
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
+#endif
 	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
 #if !defined(__APPLE__)
 	vk_buffer.setDepthBoundsTestEnable(depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);

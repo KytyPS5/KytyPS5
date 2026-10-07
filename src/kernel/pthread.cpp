@@ -3114,6 +3114,9 @@ bool PthreadTakePendingSignal(Pthread thread, int signum) {
 	}
 
 	const auto mask = 1ull << static_cast<uint32_t>(signum);
+	if ((thread->pending_signal_mask.load(std::memory_order_acquire) & mask) == 0) {
+		return false;
+	}
 	return (thread->pending_signal_mask.fetch_and(~mask, std::memory_order_acq_rel) & mask) != 0;
 }
 

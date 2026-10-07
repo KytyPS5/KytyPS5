@@ -286,8 +286,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					if (kind == CFG::BranchCondition::ExecZero ||
 					    kind == CFG::BranchCondition::VccZero ||
 					    kind == CFG::BranchCondition::ExecNonZero ||
-					    kind == CFG::BranchCondition::VccNonZero)
+					    kind == CFG::BranchCondition::VccNonZero) {
 						requirements.subgroup_ballot = true;
+						if (program.wave_size == 32u)
+							requirements.subgroup_local_invocation_id = true;
+					}
 					break;
 				}
 				case IR::ValueOpcode::DppMoveU32:

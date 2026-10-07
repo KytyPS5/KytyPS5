@@ -724,7 +724,16 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          ConstantU32(state, spv::ScopeSubgroup), predicate);
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
-		state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), combined, low, high);
+		if (state.program.wave_size == 32u) {
+			// A 64-wide host subgroup may hold two guest wave32 waves: vote within this one.
+			const auto upper = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), upper,
+			                          EmitSubgroupLocalInvocationId(state),
+			                          ConstantU32(state, 32u));
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), combined, upper, high, low);
+		} else {
+			state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), combined, low, high);
+		}
 		state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result,
 		                          combined, ConstantU32(state, 0u));
 		return result;

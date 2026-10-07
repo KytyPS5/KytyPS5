@@ -9,6 +9,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include <system_error>
 #include <unistd.h>
 #include <utime.h>
+#include <vector>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 enum sys_file_type_t {
@@ -83,7 +85,27 @@ static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
-		size_t w = fread(data, 1, size, f.f);
+		const off_t start = ftello(f.f);
+		size_t      w     = fread(data, 1, size, f.f);
+		if (w < size && ferror(f.f) && errno == EFAULT && start >= 0) {
+			// The destination can be write-protected guest memory (pages tracked for GPU
+			// synchronization). read() fails with EFAULT there instead of raising the fault the
+			// emulator handles, so finish through a host buffer copied from user mode (as on
+			// Windows and in the AMPR read path).
+			clearerr(f.f);
+			thread_local std::vector<uint8_t> chunk(1u << 20u);
+			if (fseeko(f.f, start + static_cast<off_t>(w), SEEK_SET) == 0) {
+				while (w < size) {
+					const size_t got =
+					    fread(chunk.data(), 1, std::min<size_t>(size - w, chunk.size()), f.f);
+					if (got == 0) {
+						break;
+					}
+					std::memcpy(static_cast<uint8_t*>(data) + w, chunk.data(), got);
+					w += got;
+				}
+			}
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

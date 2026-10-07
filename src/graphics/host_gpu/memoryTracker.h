@@ -16,6 +16,12 @@
 
 namespace Libs::Graphics {
 
+// Per-thread state of MemoryTracker::InvalidateWriteFault.
+struct WriteFaultStream {
+	uint64_t next   = 0;
+	uint64_t window = 1;
+};
+
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
@@ -52,6 +58,47 @@ public:
 			}
 		});
 	}
+	// Handles a guest write fault. Guest code tends to write buffers front to back, faulting
+	// once per page; a fault on the page where the same thread's previous release ended
+	// releases the following pages too, doubling the window up to FAULT_AHEAD_PAGES as file
+	// readahead does. A page released ahead and never written costs one upload of unchanged
+	// data.
+	template <typename Flush>
+	void InvalidateWriteFault(uint64_t vaddr, Flush&& on_flush) noexcept {
+		static_assert(std::is_invocable_v<Flush&>);
+		CheckNotInUploadCallback();
+
+		auto&      stream = s_fault_stream;
+		const auto page   = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+		stream.window     = page == stream.next ? std::min(stream.window * 2, FAULT_AHEAD_PAGES) : 1;
+		// One region, so the release takes a single lock.
+		const auto region_end = (page & ~(TRACKER_REGION_SIZE - 1)) + TRACKER_REGION_SIZE;
+		auto       bytes      = std::min(stream.window * TRACKER_PAGE_SIZE, region_end - page);
+
+		Iterate<false>(page, TRACKER_PAGE_SIZE, [&](RegionManager* manager, uint64_t offset, uint64_t) {
+			const bool should_flush = [&] {
+				std::scoped_lock lock(manager->lock);
+				if (manager->IsModified<DirtySource::Gpu>(offset, TRACKER_PAGE_SIZE)) {
+					return true;
+				}
+				// Pages ahead that the GPU owns need their own fault and flush.
+				if (bytes > TRACKER_PAGE_SIZE && manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+					bytes = TRACKER_PAGE_SIZE;
+				}
+				manager->ChangeState<DirtySource::Cpu, true>(page, bytes);
+				return false;
+			}();
+			if (should_flush) {
+				bytes = TRACKER_PAGE_SIZE;
+				on_flush();
+			}
+		});
+		stream.next = page + bytes;
+		if (bytes == TRACKER_PAGE_SIZE) {
+			stream.window = 1;
+		}
+	}
+
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
@@ -107,6 +154,9 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+
+	static constexpr uint64_t FAULT_AHEAD_PAGES = 16;
+	inline static thread_local WriteFaultStream s_fault_stream;
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

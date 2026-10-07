@@ -596,11 +596,34 @@ struct ShaderInfo {
 	// User-data registers holding the low dword of a 64-bit base address that DMA (FLAT/global)
 	// accesses offset from; the next register holds the high dword.
 	std::vector<uint32_t>            dma_base_registers;
+	// The guest memory DMA reads, when every DMA access is a read whose address is a user-data
+	// base pair plus an offset with known possible bits (see DmaFootprint).
+	struct DmaWindow {
+		// Bytes [base + first, base + last) from the base in registers base_register and +1.
+		uint32_t base_register = 0;
+		int64_t  first         = 0;
+		uint64_t last          = 0;
+
+		bool operator==(const DmaWindow& other) const = default;
+	};
+	// V#s read from base + immediate + offset, for every offset whose set bits lie within
+	// offset_bits; the shader reads buffer memory through them.
+	struct DmaDescriptorTable {
+		uint32_t base_register = 0;
+		int64_t  immediate     = 0;
+		uint32_t offset_bits   = 0;
+
+		bool operator==(const DmaDescriptorTable& other) const = default;
+	};
+	std::vector<DmaWindow>           dma_windows;
+	std::vector<DmaDescriptorTable>  dma_tables;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	// dma_windows and dma_tables hold everything DMA can read (only with uses_dma).
+	bool                            dma_bounded                   = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;

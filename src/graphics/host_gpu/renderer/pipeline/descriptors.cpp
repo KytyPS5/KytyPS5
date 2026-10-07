@@ -2164,20 +2164,25 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma        = false;
-	bool dma_write       = false;
-	bool uses_image_heap = false;
+	bool                                     dma_write = false;
+	std::array<const ShaderStageRuntime*, 4> dma_stages {};
+	uint32_t                                 dma_stage_count = 0;
+	bool                                     uses_image_heap = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		if (stage->runtime->module->info.info.uses_dma) {
 			m_context.CacheDmaBases(*stage->runtime);
-			uses_dma = true;
 			dma_write |= stage->runtime->module->info.has_address_writes;
+			EXIT_IF(dma_stage_count == dma_stages.size());
+			dma_stages[dma_stage_count++] = stage->runtime;
 		}
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
-	if (uses_dma) {
-		m_context.PrepareBda(dma_write);
+	if (dma_stage_count != 0) {
+		// Only operations whose device-address reach is unknown upload all cached memory.
+		const bool reach_synchronized =
+		    m_context.SynchronizeDmaFootprint(std::span {dma_stages.data(), dma_stage_count});
+		m_context.PrepareBda(dma_write, !reach_synchronized);
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);

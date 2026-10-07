@@ -25,6 +25,7 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class CommandRecorder;
 class TextureCache;
 
 using BufferId = Common::SlotId;
@@ -353,6 +354,22 @@ private:
 	uint64_t                       m_mirror_uses      = 0;
 	uint64_t                       m_mirror_flush_use = 0;
 	StreamBuffer                                      m_staging_buffer;
+	struct UploadBatch;
+	// SynchronizeBuffersInRanges(): the uploads of one synchronization, recorded together
+	// behind one pair of barriers (see FlushUploadBatch()).
+	bool                                              m_upload_batching   = false;
+	uint64_t                                          m_upload_batch_tick = 0;
+	struct UploadBatchBuffer {
+		vk::Buffer        buffer;
+		vk::DeviceAddress address = 0;
+		uint32_t          count   = 0;
+	};
+	std::vector<UploadBatchBuffer>                    m_upload_batch_buffers;
+	std::vector<vk::BufferCopy>                       m_upload_batch_copies;
+	// The batch's copies as one dispatch (buffer_scatter.comp), created at the first batch that
+	// copies to several buffers.
+	vk::PipelineLayout                                m_scatter_layout   = nullptr;
+	vk::Pipeline                                      m_scatter_pipeline = nullptr;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;

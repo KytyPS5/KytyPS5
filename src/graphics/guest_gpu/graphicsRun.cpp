@@ -590,6 +590,7 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
 	BindState(operation.state);
+	m_renderer.NoteOperation(operation.submit_id, operation.after_wait);
 	auto& executor = m_renderer.GetRenderExecutor();
 	executor.UseContextId(operation.state.context_id);
 	if (operation.after_wait) {

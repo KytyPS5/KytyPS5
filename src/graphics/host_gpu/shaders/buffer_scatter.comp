@@ -1,0 +1,52 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Batched uploads of the buffer cache (see BufferCache::FlushUploadBatch()): one workgroup per job
+// copies `size` bytes from the staging buffer to a cached buffer, both by device address. Jobs
+// whose addresses and size are 16-byte multiples copy 16 bytes per invocation, others 4.
+
+layout(local_size_x = 256) in;
+
+struct Job {
+	uint64_t source;
+	uint64_t destination;
+	uint     size;
+	uint     pad0;
+	uint64_t pad1;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Jobs {
+	Job jobs[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4 {
+	uvec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 {
+	uint v[];
+};
+
+layout(push_constant, std430) uniform Push {
+	uint64_t jobs;
+	uint     job_count;
+	uint     pad;
+} pc;
+
+void main() {
+	if (gl_WorkGroupID.x >= pc.job_count) {
+		return;
+	}
+	const Job job = Jobs(pc.jobs).jobs[gl_WorkGroupID.x];
+	if (((job.source | job.destination | uint64_t(job.size)) & 15ul) == 0ul) {
+		U32x4 source      = U32x4(job.source);
+		U32x4 destination = U32x4(job.destination);
+		for (uint i = gl_LocalInvocationID.x; i < job.size / 16u; i += gl_WorkGroupSize.x) {
+			destination.v[i] = source.v[i];
+		}
+	} else {
+		U32 source      = U32(job.source);
+		U32 destination = U32(job.destination);
+		for (uint i = gl_LocalInvocationID.x; i < job.size / 4u; i += gl_WorkGroupSize.x) {
+			destination.v[i] = source.v[i];
+		}
+	}
+}

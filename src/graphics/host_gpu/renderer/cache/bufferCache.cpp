@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
+#include "gpu_tiler_shaders/buffer_scatter_spv.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/hackNotice.h"
@@ -35,8 +36,9 @@ constexpr uint64_t DownloadWindowSize = 512 * 1024;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
-                                        vk::BufferUsageFlags usage, const auto& write) {
-	const auto [mapped, offset] = staging.Map(size, alignment);
+                                        vk::BufferUsageFlags usage, const auto& write,
+                                        bool wait = true) {
+	const auto [mapped, offset] = staging.Map(size, alignment, wait);
 	if (mapped != nullptr) {
 		write(mapped, offset);
 		staging.Commit();
@@ -289,6 +291,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetSubmitHook(nullptr, nullptr);
+	if (m_scatter_pipeline) {
+		m_graphics.device.destroyPipeline(m_scatter_pipeline);
+	}
+	if (m_scatter_layout) {
+		m_graphics.device.destroyPipelineLayout(m_scatter_layout);
+	}
 	if (m_readback.pool) {
 		m_graphics.device.destroyFence(m_readback.fence);
 		m_graphics.device.destroyCommandPool(m_readback.pool);
@@ -499,7 +507,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
-	if (source) {
+	if (source && m_upload_batching && source == m_staging_buffer.Handle()) {
+		m_upload_batch_buffers.push_back(
+		    {buffer.Handle(), buffer.BufferDeviceAddress(), static_cast<uint32_t>(copies.size())});
+		m_upload_batch_copies.insert(m_upload_batch_copies.end(), copies.begin(), copies.end());
+	} else if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -538,7 +550,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
-	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
+	// Within a batch of uploads (see FlushUploadBatch()) the staging buffer must not wait for
+	// the current command buffer: that would submit it without the batched copies. A copy that
+	// does not fit then goes through a buffer of its own.
+	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
@@ -547,7 +562,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			}
 			copy.srcOffset += base_offset;
 		}
-	});
+	}, !m_upload_batching);
 	return source.first->Handle();
 }
 
@@ -1624,6 +1639,7 @@ void BufferCache::ForceSynchronization(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
+	const UploadBatch batch {*this};
 	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
 	// it again, and the next call visits the region again. Regions without buffers have nothing
 	// to upload; a buffer registered later forces its regions.

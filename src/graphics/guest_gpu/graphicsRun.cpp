@@ -889,6 +889,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		m_renderer.GetBufferCache().ReadMemory(reinterpret_cast<uint64_t>(count_addr),
+		                                       sizeof(uint32_t));
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -901,6 +903,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
+	m_renderer.GetBufferCache().ReadMemory(
+	    m_draw_indirect_args_base_addr + data_offset,
+	    args_size + static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes);
 
 	uint64_t index_size = 0;
 	if (indexed) {

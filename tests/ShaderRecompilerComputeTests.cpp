@@ -40349,6 +40349,25 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
 
 void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   GraphicsInitJmpTables();
+  constexpr uint64_t guest_base = 0x0000000201000000ull;
+  constexpr uint64_t guest_size = 0x10000;
+  constexpr uint64_t count_offset = 0x8000;
+  constexpr uint64_t index_offset = 0x9000;
+  int64_t direct_offset = -1;
+  Require("Pm4DrawIndirectMulti", "guest memory setup",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), guest_size,
+              guest_size, 0, &direct_offset) == 0,
+          "indirect draw test direct-memory allocation failed");
+  void *mapped = reinterpret_cast<void *>(guest_base);
+  Require("Pm4DrawIndirectMulti", "guest memory mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, guest_size, 0x3, 0x10, direct_offset, guest_size) == 0 &&
+              mapped == reinterpret_cast<void *>(guest_base),
+          "indirect draw test fixed direct-memory mapping failed");
+  std::memset(mapped, 0, guest_size);
+  renderer.InitializeGpu(nullptr);
+  renderer.MapMemory(guest_base, guest_size);
   CommandProcessor processor(renderer, 0);
   const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
     Pm4Execution execution;
@@ -40358,7 +40377,7 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
 
   constexpr uint64_t modifier = 0x0000000069380b1dull;
   constexpr auto packet_mismatch = static_cast<int>(0x8a6c000cu);
-  const auto *count_address = reinterpret_cast<const volatile void *>(
+  const auto *packet_count_address = reinterpret_cast<const volatile void *>(
       static_cast<uintptr_t>(0x123456789abcdef3ull));
   constexpr std::array<uint32_t, 16> expected{
       0xc0017904u, 0x00000342u, 0xc6000008u, 0xc0082c00u,
@@ -40376,7 +40395,7 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
                           0};
   auto *emitted = Gen5::AgcDcbDrawIndirectMulti(
       reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0x11223344u, 1u,
-      0x55667788u, count_address, 0xaabbccddu, modifier);
+      0x55667788u, packet_count_address, 0xaabbccddu, modifier);
 
   const uint32_t invalid_payload[]{0x342u, 0xc6000010u};
   Require("Pm4DrawIndirectMulti", "native packet",
@@ -40384,7 +40403,7 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
               dcb.cursor_up == packet.data() + packet.size() &&
               packet == expected && execute(packet.data(), 3u) &&
               execute(packet.data() + 13u, 3u) &&
-              Gen5::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
+              Gen5::AgcWaitRegMemPatchAddress(packet.data(), packet_count_address) ==
                   packet_mismatch &&
               Gen5::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
                   packet_mismatch &&
@@ -40398,15 +40417,35 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   const std::array<uint32_t, 5> second{0, 2, 5, 7, 11};
   std::copy(first.begin(), first.end(), arguments.begin() + data_offset / 4);
   std::copy(second.begin(), second.end(), arguments.begin() + (data_offset + stride) / 4);
-  std::array<uint32_t, 8> indices{};
+  std::memcpy(mapped, arguments.data(), sizeof(arguments));
+  auto *stale_arguments = static_cast<uint32_t *>(mapped);
+  stale_arguments[0] = 1;
+  auto *count_address = reinterpret_cast<volatile uint32_t *>(guest_base + count_offset);
   processor.BufferInit();
-  processor.SetDrawIndirectArgsBaseAddress(reinterpret_cast<uint64_t>(arguments.data()));
-  processor.SetIndexBaseAddress(reinterpret_cast<uint64_t>(indices.data()));
+  processor.SetDrawIndirectArgsBaseAddress(guest_base);
+  processor.SetIndexBaseAddress(guest_base + index_offset);
   processor.SetIndexType(0);
   std::array<uint32_t, 5> captured{0xc0032500u, data_offset, 0x94, 0x95, 0};
   Require("Pm4DrawIndirectMulti", "captured indexed single execution",
           execute(captured.data(), captured.size()),
           "indexed indirect draw rejected native source-select zero");
+  auto &buffer_cache = renderer.GetBufferCache();
+  (void)buffer_cache.ObtainBuffer(guest_base + count_offset, sizeof(uint32_t), true);
+  buffer_cache.FillBuffer(guest_base + count_offset, sizeof(uint32_t), 1, false);
+  (void)buffer_cache.ObtainBuffer(guest_base, 4 * sizeof(uint32_t), true);
+  buffer_cache.FillBuffer(guest_base, 4 * sizeof(uint32_t), 0, false);
+  processor.DrawIndirectMulti(0, 1, count_address, 4 * sizeof(uint32_t), 2, false);
+  Require("Pm4DrawIndirectMulti", "GPU indirect argument readback",
+          *count_address == 1 && stale_arguments[0] == 0 &&
+              !buffer_cache.IsRegionGpuModified(guest_base + count_offset,
+                                                sizeof(uint32_t)) &&
+              !buffer_cache.IsRegionGpuModified(guest_base,
+                                                4 * sizeof(uint32_t)),
+          "GPU-written indirect count or arguments were not synchronized");
+  const auto FillCount = [&](uint32_t value) {
+    (void)buffer_cache.ObtainBuffer(guest_base + count_offset, sizeof(uint32_t), true);
+    buffer_cache.FillBuffer(guest_base + count_offset, sizeof(uint32_t), value, false);
+  };
   // Zero primitive counts still traverse CP argument decoding and renderer entry,
   // while avoiding unrelated shader and attachment requirements.
   for (const bool indexed : {false, true}) {
@@ -40415,12 +40454,11 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
         packet.fill(0);
         dcb.cursor_up = packet.data();
         auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&dcb);
-        alignas(4) uint32_t draw_count = 3;
         if (multi) {
           emitted = indexed ? Gen5::AgcDcbDrawIndexIndirectMulti(buffer, data_offset, 1, 2,
-                                  &draw_count, stride, draw_modifier)
+                                  count_address, stride, draw_modifier)
                             : Gen5::AgcDcbDrawIndirectMulti(buffer, data_offset, 1, 2,
-                                  &draw_count, stride, draw_modifier);
+                                  count_address, stride, draw_modifier);
         } else {
           emitted = indexed ? Gen5::AgcDcbDrawIndexIndirect(buffer, data_offset, draw_modifier)
                             : Gen5::AgcDcbDrawIndirect(buffer, data_offset, draw_modifier);
@@ -40436,11 +40474,14 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
                     packet[begin] == opcode && packet[begin + 1] == data_offset &&
                     packet[begin + (multi ? 9 : 4)] == initiator,
                 "indirect opcode, source select, or modifier bits differ from the native packet");
+        if (multi) {
+          FillCount(3);
+        }
         Require("Pm4DrawIndirectMulti", "single/multi argument execution",
                 execute(packet.data(), words),
                 "indirect draw failed shared argument decoding or padded/count-limited traversal");
         if (multi) {
-          draw_count = 0;
+          FillCount(0);
           Require("Pm4DrawIndirectMulti", "zero indirect count execution",
                   execute(packet.data(), words), "zero indirect draw count did not complete");
         }
@@ -40448,6 +40489,13 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
     }
   }
   renderer.GetCommandScheduler().Finish();
+  renderer.UnmapMemory(guest_base, guest_size);
+  Require("Pm4DrawIndirectMulti", "guest memory cleanup",
+          Libs::LibKernel::Memory::KernelMunmap(guest_base, guest_size) == 0 &&
+              Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                  direct_offset, guest_size) == 0,
+          "indirect draw test guest memory cleanup failed");
+  renderer.ShutdownGpu();
   std::printf("[host]    %-32s ok\n", "Pm4DrawIndirectMulti");
 }
 

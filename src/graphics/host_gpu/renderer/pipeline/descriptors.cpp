@@ -115,10 +115,11 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, bool compute,
+                    uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto& [address, size, id, unbounded] = source;
 	if (address == 0 || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
@@ -127,9 +128,14 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	auto& cache = context.GetBufferCache();
+	const bool texel = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+	// An unbounded written window is only a bound of the stores: the dispatch's comparison finds
+	// the pages it really changed. Graphics stages keep whole-window ownership.
+	auto [buffer, offset] =
+	    compute && unbounded && resource.written
+	        ? cache.ObtainSpeculativeWriteBuffer(address, size, texel, id)
+	        : cache.ObtainBuffer(address, size, resource.written, texel, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -853,7 +859,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				}
 			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size),
+			                                   descriptor.NumRecords() == UINT32_MAX});
 		}
 	}
 }
@@ -881,6 +888,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		uint32_t buffer_offset = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[resource],
+		                                               program.stage == ShaderType::Compute,
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}

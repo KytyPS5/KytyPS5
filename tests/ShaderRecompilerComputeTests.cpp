@@ -178,6 +178,23 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static void SetSpeculativeWrites(BufferCache &cache, bool enabled) {
+    cache.m_speculative_writes = enabled;
+  }
+
+  static void SetPageDiffMaxBytes(BufferCache &cache, uint64_t bytes) {
+    cache.m_page_diff_max_bytes = bytes;
+  }
+
+  static size_t PendingWriteClaims(const BufferCache &cache) {
+    return cache.m_write_claims.size();
+  }
+
+  static bool HasSpeculativeBytes(const BufferCache &cache, uint64_t address,
+                                  uint64_t size) {
+    return cache.m_speculative_ranges.Intersects(address, size);
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -5000,6 +5017,300 @@ public:
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // An unbounded written descriptor binds a large window although its shader stores to only a
+  // few pages. Legacy whole-window ownership makes every CPU access to the window fault and read
+  // back; the window comparison leaves only the pages the GPU changed GPU-modified.
+  void CheckPreciseGpuWriteOwnership() {
+    constexpr const char *name = "PreciseGpuWriteOwnership";
+    constexpr uintptr_t base = 0x0000000240000000ull;
+    constexpr uint64_t allocation_size = 0x4100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = 0x1000;
+    // Guest addresses the GPU writes. The NUM_RECORDS = ~0 windows start at base + 0x10000 or
+    // inside that page and run to the end of the mapping.
+    constexpr uint64_t edge_fill = base + 0x10000;
+    constexpr uint64_t first_run = base + 0x210000;
+    constexpr uint64_t straddling_run = base + 0x410000 - 0x80; // tracker pages 1023 and 1024
+    constexpr uint64_t counter = base + 0x610000 + 9 * 4;      // an odd dword, atomically added
+    constexpr uint64_t earlier_fill = base + 0x810000;
+    constexpr uint64_t later_writer = base + 0xa10000;
+    constexpr uint64_t second_run = base + 0xc10000;
+    constexpr uint64_t args = base + 0x100;
+    constexpr uint64_t written_pages = 8;
+    constexpr uint32_t lanes = 64;
+    constexpr uint32_t first_value = 0x11110000u;
+    constexpr uint32_t later_value = 0x22220000u;
+    constexpr uint32_t second_value = 0x33330000u;
+    constexpr uint32_t fill_value = 0x5a5a5a5au;
+    constexpr uint32_t cpu_value = 0x77777777u;
+    constexpr uint32_t probe_count = 1000;
+
+    // Per lane: store s5 + lane at s4 + 4 * lane and at s6 + 4 * lane, then add 1 at s7.
+    static const std::vector<u32> shader = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0)); // v1 = lane << 2
+      code.push_back(EncodeVop2(0x25, 2, 4, 1));            // v2 = s4 + v1
+      code.push_back(EncodeVop2(0x25, 3, 5, 0));            // v3 = s5 + lane
+      code.push_back(EncodeMubuf0(0x1c));                   // buffer_store_dword v3, v2
+      code.push_back(EncodeMubuf1(3, 0, 2));
+      code.push_back(EncodeVop2(0x25, 4, 6, 1));            // v4 = s6 + v1
+      code.push_back(EncodeMubuf0(0x1c));                   // buffer_store_dword v3, v4
+      code.push_back(EncodeMubuf1(3, 0, 4));
+      code.push_back(EncodeVop1(0x01, 6, InlineU32(1)));    // v6 = 1
+      code.push_back(EncodeVop1(0x01, 7, 7));               // v7 = s7
+      code.push_back(EncodeMubuf0(0x32));                   // buffer_atomic_add v6, v7
+      code.push_back(EncodeMubuf1(6, 0, 7));
+      code.push_back(0xbf810000u);                          // s_endpgm
+      return code;
+    }();
+    ShaderMapUserData(reinterpret_cast<uint64_t>(shader.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(shader.size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "precise-write direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "precise-write fixed direct mapping failed");
+    const auto pattern = [](uint64_t address) {
+      return static_cast<uint32_t>(0xc0de0000u ^ ((address >> 2u) * 2654435761u));
+    };
+    const auto guest_word = [](uint64_t address) {
+      uint32_t value = 0;
+      std::memcpy(&value, reinterpret_cast<const void *>(address), sizeof(value));
+      return value;
+    };
+    const auto store_word = [](uint64_t address, uint32_t value) {
+      std::memcpy(reinterpret_cast<void *>(address), &value, sizeof(value));
+    };
+
+    struct Result {
+      uint64_t window_pages = 0;
+      uint64_t dirty_after_dispatch = 0;
+      uint64_t dirty_after_probes = 0;
+      uint64_t probe_faults = 0;
+      uint64_t probe_downloads = 0;
+      uint64_t probe_download_bytes = 0;
+      uint64_t probe_submits = 0;
+      uint64_t read_downloads = 0;
+      uint64_t claims = 0;
+      uint64_t released_bytes = 0;
+      bool values = true;
+    };
+    // `limited`: the device's storage-buffer range holds the window but not its whole tracker
+    // pages, which the comparison binds.
+    const auto run = [&](bool precise, uint64_t window, bool limited = false) {
+      Result result;
+      const uint64_t window_size = base + allocation_size - window;
+      const uint64_t first_page = window & ~(page - 1);
+      result.window_pages = (base + allocation_size - first_page) / page;
+      const uint64_t range_limit = limited ? result.window_pages * page - 1 : 0;
+      for (uint64_t address = base; address < base + allocation_size; address += 4) {
+        store_word(address, pattern(address));
+      }
+      const std::array<uint32_t, 3> groups{1, 1, 1};
+      std::memcpy(reinterpret_cast<void *>(args), groups.data(), sizeof(groups));
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &cache = context.GetBufferCache();
+      auto &scheduler = context.GetCommandScheduler();
+      // Faults update the cache from the fault handler, invisibly to the compiler: read its
+      // counters on the GPU thread.
+      const auto stats = [&] {
+        BufferCache::WriteClaimStats copy;
+        context.GetGpu().SendCommandSync([&] { copy = cache.GetWriteClaimStats(); });
+        return copy;
+      };
+      const auto dirty_pages = [&] {
+        uint64_t count = 0;
+        context.GetGpu().SendCommandSync([&] {
+          for (uint64_t address = first_page; address < base + allocation_size; address += page) {
+            count += cache.IsRegionGpuModified(address, page) ? 1u : 0u;
+          }
+        });
+        return count;
+      };
+      const auto dispatch = [&](uint64_t descriptor_base, uint32_t records, uint64_t first,
+                                uint32_t value, uint64_t second, uint64_t atomic, bool indirect) {
+        const std::array<uint32_t, 8> user_data{
+            static_cast<uint32_t>(descriptor_base),
+            static_cast<uint32_t>(descriptor_base >> 32u),
+            records,
+            DstSel(4, 5, 6, 7) | (1u << 24u) | (3u << 28u),
+            static_cast<uint32_t>(first - descriptor_base),
+            value,
+            static_cast<uint32_t>(second - descriptor_base),
+            static_cast<uint32_t>(atomic - descriptor_base)};
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(shader.data()),
+                             .num_thread_x = lanes, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 8, .tgid_x_en = true});
+        for (uint32_t i = 0; i < user_data.size(); i++) {
+          shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
+        }
+        auto &executor = context.GetRenderExecutor();
+        if (indirect) {
+          executor.DispatchIndirect(0, scheduler.Current(), args, 0x41u);
+        } else {
+          executor.DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u);
+        }
+      };
+      context.GetGpu().SendCommandSync([&] {
+        scheduler.Begin(registers, user_config, shaders);
+        context.MapMemory(base, allocation_size);
+        BufferCacheTestAccess::SetSpeculativeWrites(cache, precise);
+        if (limited) {
+          BufferCacheTestAccess::SetPageDiffMaxBytes(cache, range_limit);
+        }
+        // GPU fills made these bytes GPU-modified before any window was bound: one inside the
+        // windows, one on the first page (outside an unaligned window).
+        for (const auto address : {edge_fill, earlier_fill}) {
+          (void)cache.ObtainBuffer(address, 64, true);
+          cache.FillBuffer(address, 64, fill_value, false);
+        }
+        dispatch(window, UINT32_MAX, first_run, first_value, straddling_run, counter, false);
+        // A finite descriptor writes inside the window after its comparison.
+        dispatch(later_writer, 0x1000, later_writer, later_value, later_writer + 0x100,
+                 later_writer + 0x200, false);
+        // A second unbounded window over the same range writes other pages.
+        dispatch(window, UINT32_MAX, second_run, second_value, second_run + 0x100,
+                 second_run + 0x200, true);
+      });
+      result.dirty_after_dispatch = dirty_pages();
+
+      const auto before = stats();
+      uint64_t first_tick = 0;
+      context.GetGpu().SendCommandSync([&] { first_tick = scheduler.CurrentTick(); });
+      for (uint32_t probe = 0; probe < probe_count; probe++) {
+        const auto address = first_page + (72 + 16 * uint64_t {probe}) * page + 0x10;
+        result.values &= guest_word(address) == pattern(address);
+      }
+      uint64_t last_tick = 0;
+      context.GetGpu().SendCommandSync([&] { last_tick = scheduler.CurrentTick(); });
+      const auto probed = stats();
+      result.probe_faults = probed.read_requests - before.read_requests;
+      result.probe_downloads = probed.downloads - before.downloads;
+      result.probe_download_bytes = probed.download_bytes - before.download_bytes;
+      result.probe_submits = last_tick - first_tick;
+      result.dirty_after_probes = dirty_pages();
+
+      const auto expect_run = [&](uint64_t address, uint32_t value) {
+        for (uint32_t lane = 0; lane < lanes; lane++) {
+          result.values &= guest_word(address + 4 * lane) == value + lane;
+        }
+      };
+      // A CPU store to a page the GPU wrote but nobody read yet keeps the page's GPU bytes.
+      store_word(second_run + 0x80, cpu_value);
+      // A CPU store to a page no GPU work wrote.
+      const uint64_t untouched = first_page + 80 * page + 0x40;
+      store_word(untouched, cpu_value);
+      result.values &= guest_word(untouched) == cpu_value &&
+                       guest_word(untouched + 4) == pattern(untouched + 4);
+      const auto stored = stats();
+      expect_run(first_run, first_value);
+      expect_run(straddling_run, first_value);
+      result.values &= guest_word(counter) == pattern(counter) + lanes;
+      result.values &= guest_word(straddling_run - 4) == pattern(straddling_run - 4);
+      result.values &= guest_word(straddling_run + 4 * lanes) ==
+                       pattern(straddling_run + 4 * lanes);
+      for (uint64_t offset = 0; offset < 64; offset += 4) {
+        result.values &= guest_word(edge_fill + offset) == fill_value;
+        result.values &= guest_word(earlier_fill + offset) == fill_value;
+      }
+      result.values &= guest_word(edge_fill + 64) == pattern(edge_fill + 64);
+      result.values &= guest_word(window) == (window == edge_fill ? fill_value : pattern(window));
+      expect_run(later_writer, later_value);
+      expect_run(later_writer + 0x100, later_value);
+      result.values &= guest_word(later_writer + 0x200) == pattern(later_writer + 0x200) + lanes;
+      for (uint32_t lane = 0; lane < lanes; lane++) {
+        const auto address = second_run + 4 * lane;
+        result.values &= guest_word(address) ==
+                         (address == second_run + 0x80 ? cpu_value : second_value + lane);
+      }
+      expect_run(second_run + 0x100, second_value);
+      result.values &= guest_word(second_run + 0x200) == pattern(second_run + 0x200) + lanes;
+      const auto read = stats();
+      result.read_downloads = read.downloads - stored.downloads;
+      result.claims = read.claims;
+      result.released_bytes = read.released_bytes;
+
+      context.GetGpu().SendCommandSync([&] {
+        Require(name, "claims resolved",
+                BufferCacheTestAccess::PendingWriteClaims(cache) == 0 &&
+                    !BufferCacheTestAccess::HasSpeculativeBytes(cache, window, window_size),
+                "a window comparison was left pending after the faults that needed it");
+        RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      return result;
+    };
+
+    const auto print = [&](const char *mode, const Result &r) {
+      std::printf("[gpu]     %s %-17s bound=%" PRIu64 " pages, dirty after dispatch=%" PRIu64
+                  ", after probes=%" PRIu64 ", probe faults=%" PRIu64 ", probe downloads=%" PRIu64
+                  " (%" PRIu64 " bytes), probe submits=%" PRIu64 ", written-page downloads=%" PRIu64
+                  ", windows=%" PRIu64 ", released=%" PRIu64 " bytes, values=%s\n",
+                  name, mode, r.window_pages, r.dirty_after_dispatch, r.dirty_after_probes,
+                  r.probe_faults, r.probe_downloads, r.probe_download_bytes, r.probe_submits,
+                  r.read_downloads, r.claims, r.released_bytes, r.values ? "ok" : "WRONG");
+    };
+    for (const uint64_t window : {base + 0x10000, base + 0x10100}) {
+      const bool aligned = window == base + 0x10000;
+      const auto legacy = run(false, window);
+      const auto precise = run(true, window);
+      const auto limited = run(true, window, true);
+      print(aligned ? "legacy" : "legacy/unaligned", legacy);
+      print(aligned ? "precise" : "precise/unaligned", precise);
+      print(aligned ? "limited" : "limited/unaligned", limited);
+      Require(name, "limited GPU values", limited.values,
+              "a window refused for the device range limit returned a wrong guest value");
+      Require(name, "limited device range",
+              limited.claims == 0 && limited.dirty_after_probes == legacy.dirty_after_probes &&
+                  limited.probe_downloads == probe_count,
+              "a window whose tracker pages exceed maxStorageBufferRange was compared");
+      Require(name, "legacy GPU values", legacy.values,
+              "whole-window ownership returned a wrong guest value");
+      Require(name, "precise GPU values", precise.values,
+              "the window comparison released bytes the GPU had written, or lost a value");
+      Require(name, "legacy whole-window ownership",
+              legacy.dirty_after_dispatch == legacy.window_pages &&
+                  legacy.probe_faults == probe_count && legacy.probe_downloads == probe_count &&
+                  legacy.claims == 0,
+              "the legacy fixture did not reproduce one readback per untouched probed page");
+      Require(name, "window marked before its comparison",
+              precise.dirty_after_dispatch == precise.window_pages && precise.claims == 2,
+              "an unbounded window was not GPU-modified until its dispatch completed");
+      Require(name, "precise ownership",
+              precise.dirty_after_probes == written_pages && precise.probe_faults <= 1 &&
+                  precise.probe_downloads == 0 && precise.probe_submits <= 1 &&
+                  precise.read_downloads == legacy.read_downloads,
+              "untouched pages of the window still needed readbacks, or written pages lost them");
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "precise-write direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "precise-write direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckComputeMetaClearClassification() {
@@ -41925,6 +42236,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--precise-gpu-writes-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPreciseGpuWriteOwnership();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {

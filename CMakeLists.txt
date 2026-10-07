@@ -297,6 +297,22 @@ add_custom_command(
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
+set(buffer_page_diff_shader_source "${gpu_tiler_shader_dir}/buffer_page_diff.comp")
+set(buffer_page_diff_shader_spv "${gpu_tiler_generated_dir}/buffer_page_diff.spv")
+set(buffer_page_diff_shader_header "${gpu_tiler_generated_dir}/buffer_page_diff_spv.h")
+add_custom_command(
+	OUTPUT "${buffer_page_diff_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${buffer_page_diff_shader_spv}" "${buffer_page_diff_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${buffer_page_diff_shader_spv}
+	        -DOUTPUT=${buffer_page_diff_shader_header} -DSYMBOL=BUFFER_PAGE_DIFF_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${buffer_page_diff_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${buffer_page_diff_shader_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
@@ -671,6 +687,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME buffer_cache_precise_gpu_writes
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --precise-gpu-writes-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 

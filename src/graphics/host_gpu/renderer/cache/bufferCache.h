@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/pageDiff.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
@@ -58,6 +59,31 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// A written binding whose range only bounds what the shader can store, such as the window
+	// bound for an unbounded descriptor. The range becomes GPU-modified as for ObtainBuffer, and
+	// is compared before and after the work recorded until SealWriteClaims. Once that work
+	// completed, bytes on pages it left unchanged that only such windows made GPU-modified stop
+	// being GPU-modified without a download.
+	[[nodiscard]] std::pair<Buffer*, uint64_t>
+	ObtainSpeculativeWriteBuffer(uint64_t vaddr, uint64_t size, bool is_texel_buffer = false,
+	                             BufferId id = {});
+	// Records the comparisons of the windows obtained since the previous call. Call after the work
+	// that can write them is recorded.
+	void SealWriteClaims();
+
+	struct WriteClaimStats {
+		uint64_t claims          = 0;
+		uint64_t refused         = 0;
+		uint64_t resolved        = 0;
+		uint64_t changed_pages   = 0;
+		uint64_t released_bytes  = 0;
+		uint64_t read_requests   = 0;
+		uint64_t downloads       = 0;
+		uint64_t download_bytes  = 0;
+	};
+	[[nodiscard]] const WriteClaimStats& GetWriteClaimStats() const noexcept {
+		return m_write_claim_stats;
+	}
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -121,6 +147,20 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
+	// A speculative write window and the comparison that finds the pages its work changed.
+	struct WriteClaim {
+		uint64_t         begin      = 0;
+		uint64_t         end        = 0;
+		uint64_t         first_page = 0;
+		PageDiff::Ticket ticket;
+		uint64_t         tick   = 0;
+		bool             sealed = false;
+	};
+	// Applies the comparisons of sealed claims whose work completed. Claims overlapping
+	// [vaddr, vaddr + size) are waited for when `wait` is set.
+	void ResolveWriteClaims(uint64_t vaddr, uint64_t size, bool wait);
+	void ApplyWriteClaim(const WriteClaim& claim);
+
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
@@ -136,6 +176,14 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	PageDiff                                          m_page_diff;
+	std::vector<WriteClaim>                           m_write_claims;
+	// GPU-modified bytes that only unresolved speculative windows made GPU-modified.
+	RangeSet                                          m_speculative_ranges;
+	bool                                              m_speculative_writes = true;
+	// The comparison binds a window's whole tracker pages as storage buffers.
+	uint64_t                                          m_page_diff_max_bytes = 0;
+	WriteClaimStats                                   m_write_claim_stats;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

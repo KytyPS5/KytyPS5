@@ -1,0 +1,52 @@
+#version 450
+
+// Compares a buffer range with the copy taken before GPU work ran: bit p of the result is set
+// when any dword of 4 KiB page p differs. One workgroup produces one result word (32 pages) and
+// writes it whole, so the result needs no clearing.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer current_buf {
+    uint current_words[];
+};
+
+layout(std430, binding = 1) readonly buffer before_buf {
+    uint before_words[];
+};
+
+layout(std430, binding = 2) writeonly buffer changed_buf {
+    uint changed_words[];
+};
+
+layout(push_constant) uniform Params {
+    uint page_count;
+} params;
+
+const uint PAGE_DWORDS = 1024u;
+const uint DWORDS_PER_THREAD = PAGE_DWORDS / 256u;
+
+shared uint changed_bits;
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        changed_bits = 0u;
+    }
+    barrier();
+    const uint first_page = gl_WorkGroupID.x * 32u;
+    const uint pages = min(params.page_count - first_page, 32u);
+    for (uint page = 0u; page < pages; page++) {
+        const uint first =
+            (first_page + page) * PAGE_DWORDS + gl_LocalInvocationIndex * DWORDS_PER_THREAD;
+        bool differs = false;
+        for (uint i = 0u; i < DWORDS_PER_THREAD; i++) {
+            differs = differs || current_words[first + i] != before_words[first + i];
+        }
+        if (differs) {
+            atomicOr(changed_bits, 1u << page);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        changed_words[gl_WorkGroupID.x] = changed_bits;
+    }
+}

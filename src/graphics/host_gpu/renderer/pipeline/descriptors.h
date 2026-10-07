@@ -31,6 +31,8 @@ struct PreparedBindings {
 		uint64_t address = 0;
 		uint64_t size    = 0;
 		BufferId id;
+		// The descriptor declared no size (NUM_RECORDS = ~0): `size` is only a bound.
+		bool unbounded = false;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.

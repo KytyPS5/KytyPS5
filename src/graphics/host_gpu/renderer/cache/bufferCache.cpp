@@ -123,12 +123,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
+			    m_write_claim_stats.download_bytes += end - start;
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    m_speculative_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
 		return false;
 	}
+	m_write_claim_stats.downloads++;
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -201,7 +204,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-      m_texture_cache(texture_cache) {
+      m_page_diff(graphics, scheduler), m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -210,6 +213,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	m_page_diff_max_bytes = m_graphics.physical_device_properties.limits.maxStorageBufferRange;
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -253,6 +257,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		m_write_claim_stats.read_requests++;
+		// A window's comparison can show that its pages need no download at all.
+		const auto first_page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto end_page   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		ResolveWriteClaims(first_page, end_page - first_page, true);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -473,8 +482,150 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// This writer can change any of its bytes: no window comparison may release them.
+		m_speculative_ranges.Subtract(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainSpeculativeWriteBuffer(uint64_t vaddr,
+                                                                       uint64_t size,
+                                                                       bool     is_texel_buffer,
+                                                                       BufferId id) {
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+	// Completed comparisons free their result slots.
+	ResolveWriteClaims(0, 0, false);
+	const auto first_page = Common::AlignDown(vaddr, PageDiff::PageSize);
+	const auto end_page   = Common::AlignUp(vaddr + size, PageDiff::PageSize);
+	const auto pages      = (end_page - first_page) / PageDiff::PageSize;
+	if (!m_speculative_writes || size > PageDiff::MaxRangeBytes || pages > PageDiff::MaxPages ||
+	    pages * PageDiff::PageSize > m_page_diff_max_bytes || !m_page_diff.HasFreeSlot()) {
+		m_write_claim_stats.refused++;
+		return ObtainBuffer(vaddr, size, true, is_texel_buffer, id);
+	}
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
+	}
+	auto& buffer = m_slot_buffers[id];
+	if (!buffer.IsInBounds(first_page, pages * PageDiff::PageSize)) {
+		m_write_claim_stats.refused++;
+		return ObtainBuffer(vaddr, size, true, is_texel_buffer, id);
+	}
+	TouchBuffer(buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, true, is_texel_buffer);
+	// Bytes another writer made GPU-modified stay its own; the window owns only the clean ones.
+	RangeSet window;
+	window.Add(vaddr, size);
+	m_gpu_modified_ranges.ForEachInRange(
+	    vaddr, size, [&](uint64_t begin, uint64_t end) { window.Subtract(begin, end - begin); });
+	m_gpu_modified_ranges.Add(vaddr, size);
+	const auto ticket = m_page_diff.Snapshot(buffer, buffer.Offset(first_page), pages);
+	if (!ticket) {
+		m_speculative_ranges.Subtract(vaddr, size);
+		m_write_claim_stats.refused++;
+		return {&buffer, buffer.Offset(vaddr)};
+	}
+	window.ForEach(
+	    [&](uint64_t begin, uint64_t end) { m_speculative_ranges.Add(begin, end - begin); });
+	m_write_claims.push_back({.begin      = vaddr,
+	                          .end        = vaddr + size,
+	                          .first_page = first_page,
+	                          .ticket     = *ticket});
+	m_write_claim_stats.claims++;
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
+void BufferCache::SealWriteClaims() {
+	bool recorded = false;
+	for (auto& claim: m_write_claims) {
+		if (!claim.sealed) {
+			m_page_diff.Compare(claim.ticket);
+			recorded = true;
+		}
+	}
+	if (!recorded) {
+		return;
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	for (auto& claim: m_write_claims) {
+		if (!claim.sealed) {
+			claim.tick   = tick;
+			claim.sealed = true;
+		}
+	}
+	m_page_diff.EndBatch();
+}
+
+void BufferCache::ResolveWriteClaims(uint64_t vaddr, uint64_t size, bool wait) {
+	for (size_t index = 0; index < m_write_claims.size();) {
+		const auto& claim = m_write_claims[index];
+		const bool  hit   = size != 0 && claim.begin < vaddr + size && vaddr < claim.end;
+		// An unsealed claim's work is not recorded yet: its comparison proves nothing.
+		if (!claim.sealed || (!m_scheduler.IsFree(claim.tick) && !(hit && wait))) {
+			++index;
+			continue;
+		}
+		m_scheduler.Wait(claim.tick);
+		const auto resolved = claim;
+		m_write_claims.erase(m_write_claims.begin() + static_cast<ptrdiff_t>(index));
+		ApplyWriteClaim(resolved);
+		m_page_diff.Free(resolved.ticket);
+	}
+}
+
+void BufferCache::ApplyWriteClaim(const WriteClaim& claim) {
+	const auto changed = m_page_diff.Result(claim.ticket);
+	RangeSet   released;
+	for (uint64_t page = 0; page < claim.ticket.pages;) {
+		const bool page_changed = ((changed[page / 32u] >> (page % 32u)) & 1u) != 0;
+		auto       last         = page + 1;
+		while (last < claim.ticket.pages &&
+		       (((changed[last / 32u] >> (last % 32u)) & 1u) != 0) == page_changed) {
+			last++;
+		}
+		const auto begin = std::max(claim.first_page + page * PageDiff::PageSize, claim.begin);
+		const auto end   = std::min(claim.first_page + last * PageDiff::PageSize, claim.end);
+		page             = last;
+		if (begin >= end) {
+			continue;
+		}
+		if (page_changed) {
+			// The work wrote these pages: they stay GPU-modified like any written binding's.
+			m_speculative_ranges.Subtract(begin, end - begin);
+			m_write_claim_stats.changed_pages +=
+			    last - (begin - claim.first_page) / PageDiff::PageSize;
+			continue;
+		}
+		m_speculative_ranges.ForEachInRange(begin, end - begin, [&](uint64_t first, uint64_t past) {
+			released.Add(first, past - first);
+		});
+	}
+	// A window that is still pending can change these bytes; its own comparison decides them.
+	for (const auto& other: m_write_claims) {
+		released.Subtract(other.begin, other.end - other.begin);
+	}
+	released.ForEach([&](uint64_t begin, uint64_t end) {
+		m_gpu_modified_ranges.Subtract(begin, end - begin);
+		m_speculative_ranges.Subtract(begin, end - begin);
+		m_write_claim_stats.released_bytes += end - begin;
+		const auto inner_begin = Common::AlignUp(begin, TRACKER_PAGE_SIZE);
+		const auto inner_end   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
+		if (inner_begin < inner_end) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(inner_begin, inner_end - inner_begin);
+		}
+		// Pages the range only partly covers keep their protection while other bytes are dirty.
+		for (const auto page: {Common::AlignDown(begin, TRACKER_PAGE_SIZE),
+		                       Common::AlignDown(end - 1, TRACKER_PAGE_SIZE)}) {
+			if ((page < inner_begin || page >= inner_end) &&
+			    !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+			}
+		}
+	});
+	m_write_claim_stats.resolved++;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -589,6 +740,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	ResolveWriteClaims(0, 0, false);
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

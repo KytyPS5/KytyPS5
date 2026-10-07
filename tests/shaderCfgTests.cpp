@@ -14883,6 +14883,41 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+void TestZeroBranchBallotIgnoresInactiveLanes() {
+  const uint32_t execz[] = {
+      EncodeSMovB32(0, 128),
+      EncodeSop2(0x00, 0, 0, 129),
+      EncodeSopp(0x08, 0xfffeu),
+      EncodeSopp(0x01),
+  };
+  const uint32_t execnz[] = {
+      EncodeSMovB32(0, 128),
+      EncodeSop2(0x00, 0, 0, 129),
+      EncodeSopp(0x09, 0xfffeu),
+      EncodeSopp(0x01),
+  };
+  ShaderComputeInputInfo compute{};
+  compute.host_subgroup_size = 32;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.wave_size = 64;
+  const auto zero = RecompileForTest(execz, options);
+  const auto nonzero = RecompileForTest(execnz, options);
+  CheckSpirvBinaryValidates(zero.spirv);
+  CheckSpirvBinaryValidates(nonzero.spirv);
+  Check(SpirvInstructionOpcodeCount(zero.spirv, 168u) >
+            SpirvInstructionOpcodeCount(nonzero.spirv, 168u),
+        "an ExecZero branch on a split wave did not ballot the inverted condition");
+  // The ballot is reduced with OpIEqual (170) for EXECZ and OpINotEqual (171) for EXECNZ; the
+  // fixtures contain no other integer comparisons, so a swapped direction shows in either count.
+  Check(SpirvInstructionOpcodeCount(zero.spirv, 170u) >
+            SpirvInstructionOpcodeCount(nonzero.spirv, 170u),
+        "an ExecZero branch did not reduce the ballot with OpIEqual");
+  Check(SpirvInstructionOpcodeCount(nonzero.spirv, 171u) >
+            SpirvInstructionOpcodeCount(zero.spirv, 171u),
+        "an ExecNonZero branch did not reduce the ballot with OpINotEqual");
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -14892,6 +14927,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestZeroBranchBallotIgnoresInactiveLanes();
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

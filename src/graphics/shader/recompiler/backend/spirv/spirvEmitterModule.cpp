@@ -538,26 +538,20 @@ void DefineInputs(EmitterState& state) {
 
 void DefineOutputs(EmitterState& state) {
 	state.outputs.reserve(state.program.info.outputs.size());
-	uint32_t clip_distance_count = 0;
-	uint32_t cull_distance_count = 0;
 	for (const auto& output: state.program.info.outputs) {
 		state.outputs.push_back({output});
-		if (output.kind == IR::StageOutputKind::ClipDistance) {
-			clip_distance_count = std::max(clip_distance_count, output.index + 1);
-		} else if (output.kind == IR::StageOutputKind::CullDistance) {
-			cull_distance_count = std::max(cull_distance_count, output.index + 1);
-		}
 	}
+	const auto distances =
+	    IR::CountOutputDistances(state.program.stage, state.program.info.outputs);
+	const uint32_t clip_distance_count = distances.clip;
+	const uint32_t cull_distance_count = distances.cull;
 	if (state.program.stage == ShaderType::Mesh) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
+	if (distances.invalid_position_plane) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
-		state.invalid_position_clip_distance = clip_distance_count++;
+		state.invalid_position_clip_distance = clip_distance_count - 1;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
 		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
 	}

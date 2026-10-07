@@ -1546,6 +1546,42 @@ void CheckRectListShaders() {
   const auto position_only = BuildRectListShaders(vertex, nullptr);
   ValidateSpirv(name, position_only.control);
   ValidateSpirv(name, position_only.evaluation);
+
+  // A vertex shader that exports a position also gets the appended clip plane:
+  // with one clip distance of its own it writes two, and both tessellation
+  // stages must declare and pass them on.
+  ShaderRecompiler::IR::CompiledShaderInfo clip_program{
+      .stage = ShaderType::Vertex, .param_export_mask = 1u};
+  clip_program.info.outputs.push_back(
+      {ShaderRecompiler::IR::StageOutputKind::Position, 0, 0, "position"});
+  clip_program.info.outputs.push_back(
+      {ShaderRecompiler::IR::StageOutputKind::ClipDistance, 0, 0, "clip_0"});
+  ShaderVertexInputInfo clip_vertex = vertex;
+  clip_vertex.stage.program = &clip_program;
+  const auto clipped = BuildRectListShaders(clip_vertex, nullptr);
+  ValidateSpirv(name, clipped.control);
+  ValidateSpirv(name, clipped.evaluation);
+  Require(name, "clip distance disassembly",
+          tools.Disassemble(clipped.control, &control_text) &&
+              tools.Disassemble(clipped.evaluation, &evaluation_text),
+          "failed to disassemble rectangle-list shaders with clip distances");
+  Require(
+      name, "clip distances passed on",
+      CountText(control_text, "BuiltIn ClipDistance") == 1 &&
+          CountText(evaluation_text, "BuiltIn ClipDistance") == 1 &&
+          control_text.find("OpTypeStruct %v4float %_arr_float_uint_2") !=
+              std::string::npos &&
+          evaluation_text.find("OpTypeStruct %v4float %_arr_float_uint_2") !=
+              std::string::npos,
+      "both stages must carry the vertex shader's two clip distances in their "
+      "per-vertex block");
+  Require(name, "clip distance capability",
+          control_text.find("OpCapability ClipDistance") != std::string::npos &&
+              evaluation_text.find("OpCapability ClipDistance") !=
+                  std::string::npos,
+          "stages that declare BuiltIn ClipDistance need the ClipDistance "
+          "capability");
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
@@ -41066,6 +41102,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--rect-list-only") == 0) {
+    CheckRectListShaders();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {

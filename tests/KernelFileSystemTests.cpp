@@ -34,6 +34,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
@@ -164,12 +169,14 @@ void TestAioBatches() {
   using Batch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *);
   using Single = int (KYTY_SYSV_ABI *)(int32_t, int32_t *);
   using Wait = int (KYTY_SYSV_ABI *)(int32_t, int32_t *, uint32_t *);
+  using WaitBatch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *, uint32_t, uint32_t *);
   const auto submit = reinterpret_cast<Submit>(find("HgX7+AORI58"));
   const auto poll = reinterpret_cast<Batch>(find("o7O4z3jwKzo"));
   const auto erase = reinterpret_cast<Batch>(find("Ft3EtsZzAoY"));
   const auto poll_one = reinterpret_cast<Single>(find("2pOuoWoCxdk"));
   const auto erase_one = reinterpret_cast<Single>(find("5TgME6AYty4"));
   const auto wait = reinterpret_cast<Wait>(find("KOF-oJbQVvc"));
+  const auto wait_batch = reinterpret_cast<WaitBatch>(find("lgK+oIWkJyA"));
   constexpr char Payload[] = "AIO payload";
   const int fd = FileSystem::KernelOpen("/savedata0/aio.dat", 0x602, 0777);
   Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload)) == sizeof(Payload),
@@ -186,14 +193,22 @@ void TestAioBatches() {
   }
   ids[2] = -1;
   std::array<int32_t, 3> states {-1, -1, -1};
-  Check(poll(ids.data(), ids.size(), states.data()) == OK &&
+  uint32_t timeout = 0;
+  Check(wait_batch(ids.data(), ids.size(), states.data(), 2, &timeout) == OK &&
             states[0] == 3 && states[1] == 3 && states[2] == Kernel::KERNEL_ERROR_ESRCH,
-        "batch poll writes every state and per-request invalid-ID error");
+        "OR wait observes completed reads and invalid-ID errors even with a zero timeout");
   Check(poll_one(ids[0], &states[0]) == OK && states[0] == (3 | 0x10000) &&
             poll(ids.data(), 2, states.data()) == OK &&
             states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
             wait(ids[0], &states[0], nullptr) == OK && states[0] == (3 | 0x10000),
         "single and batch polls and waits share completion notification state");
+  timeout = 1000000;
+  Check(wait_batch(ids.data(), ids.size(), states.data(), 1, &timeout) == OK &&
+            states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
+            states[2] == Kernel::KERNEL_ERROR_ESRCH && timeout <= 1000000 &&
+            wait_batch(ids.data(), ids.size(), states.data(), 2, nullptr) == OK &&
+            wait_batch(ids.data(), 1, states.data(), 0, nullptr) == OK,
+        "AND and OR waits return when all IDs are terminal and one-ID waits ignore mode");
   Check(erase(ids.data(), ids.size(), states.data()) == OK &&
             states[0] == OK && states[1] == OK && states[2] == Kernel::KERNEL_ERROR_ESRCH,
         "batch deletion writes per-request results");
@@ -216,6 +231,22 @@ void TestAioBatches() {
               }),
           "maximum-sized batch returns all invalid-ID errors");
   }
+  states.fill(42);
+  Check(wait_batch(nullptr, 1, states.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
+            wait_batch(ids.data(), 1, nullptr, 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
+            wait_batch(ids.data(), 0, states.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
+            wait_batch(ids.data(), 129, states.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
+            wait_batch(ids.data(), 2, states.data(), 0, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
+            wait_batch(ids.data(), 2, states.data(), 3, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
+            states == std::array<int32_t, 3> {42, 42, 42},
+        "invalid wait arguments do not modify outputs");
+  std::array<int32_t, 128> invalid_ids {};
+  std::array<int32_t, 128> errors {};
+  Check(wait_batch(invalid_ids.data(), invalid_ids.size(), errors.data(), 1, nullptr) == OK &&
+            std::all_of(errors.begin(), errors.end(), [](int32_t error) {
+              return error == Kernel::KERNEL_ERROR_ESRCH;
+            }),
+        "maximum-sized wait returns every invalid-ID error");
   Check(FileSystem::KernelClose(fd) == OK, "close AIO read fixture");
 }
 
@@ -1061,19 +1092,40 @@ void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
   Libs::LibNet::InitNet_1_Net(&symbols);
+  const auto *connect_symbol = symbols.Find(
+      {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *getsockopt_symbol = symbols.Find(
+      {"xphrZusl78E", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *setsockopt_symbol = symbols.Find(
+      {"2mKX2Spso7I", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *send_symbol = symbols.Find(
       {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *sendto_symbol = symbols.Find(
+      {"gvD1greCu0A", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *recv_symbol = symbols.Find(
       {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *recvfrom_symbol = symbols.Find(
+      {"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
       {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  Check(send_symbol && recv_symbol && errno_symbol,
-        "Net send, receive and errno exports resolve with the guest ABI versions");
+  Check(connect_symbol && getsockopt_symbol && setsockopt_symbol && send_symbol && sendto_symbol &&
+            recv_symbol && recvfrom_symbol && errno_symbol,
+        "Net socket and errno exports resolve with the guest ABI versions");
+  using Connect = int (KYTY_SYSV_ABI *)(int, const void *, uint32_t);
+  using Getsockopt = int (KYTY_SYSV_ABI *)(int, int, int, void *, uint32_t *);
+  using Setsockopt = int (KYTY_SYSV_ABI *)(int, int, int, const void *, uint32_t);
   using Send = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int);
+  using Sendto = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int, const void *, uint32_t);
   using Recv = int (KYTY_SYSV_ABI *)(int, void *, size_t, int);
+  using Recvfrom = int (KYTY_SYSV_ABI *)(int, void *, size_t, int, void *, uint32_t *);
   using Errno = int *(KYTY_SYSV_ABI *)();
+  const auto net_connect = reinterpret_cast<Connect>(connect_symbol->vaddr);
+  const auto net_getsockopt = reinterpret_cast<Getsockopt>(getsockopt_symbol->vaddr);
+  const auto net_setsockopt = reinterpret_cast<Setsockopt>(setsockopt_symbol->vaddr);
   const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
+  const auto net_sendto = reinterpret_cast<Sendto>(sendto_symbol->vaddr);
   const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
+  const auto net_recvfrom = reinterpret_cast<Recvfrom>(recvfrom_symbol->vaddr);
   auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
   const auto [reader, writer] = CreateTcpPair();
   const int enabled = 1;
@@ -1082,10 +1134,15 @@ void CheckSocketWakeup() {
   int socket_error = -1;
   uint32_t error_size = sizeof(socket_error);
   *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
-  Check(Net::Getsockopt(writer, 0xffff, 0x1007, &socket_error, &error_size) == 0 &&
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_getsockopt(writer, 0xffff, 0x1007, &socket_error, &error_size) == 0 &&
             socket_error == 0 && error_size == sizeof(socket_error) &&
+            *net_errno == Libs::Posix::POSIX_EINVAL &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-        "SO_ERROR reports socket status without changing guest errno");
+        "Net SO_ERROR reports socket status without changing either guest errno");
+  Check(net_getsockopt(writer, 0xffff, 0x1007, nullptr, &error_size) ==
+            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT,
+        "Net getsockopt translates an invalid output buffer");
 
   std::array<uint64_t, 16> readable {};
   const auto bit = uint64_t {1} << (reader % 64);
@@ -1122,6 +1179,131 @@ void CheckSocketWakeup() {
             *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
         "Net nonblocking receive translates POSIX failure and Net errno");
 #endif
+  const int datagram = Net::Socket(2, 2, 0);
+  const int datagram_writer = Net::Socket(2, 2, 0);
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  std::array<uint8_t, 16> peer {}, expected_peer {};
+  uint32_t address_size = address.size(), peer_size = peer.size();
+  uint32_t expected_peer_size = expected_peer.size();
+  Check(datagram >= 0 && datagram_writer >= 0 &&
+            Net::Bind(datagram, address.data(), address.size()) == 0 &&
+            Net::Bind(datagram_writer, address.data(), address.size()) == 0 &&
+            Net::Getsockname(datagram, address.data(), &address_size) == 0 &&
+            Net::Getsockname(datagram_writer, expected_peer.data(), &expected_peer_size) == 0 &&
+            Net::Setsockopt(datagram, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0,
+        "create nonblocking loopback datagrams for Net ABI verification");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+  for (const int option : {0x1001, 0x1002}) {
+    constexpr int requested = 16384;
+    int actual = 0;
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(datagram, 0xffff, option, &requested, sizeof(requested)) == 0 &&
+              net_getsockopt(datagram, 0xffff, option, &actual, &size) == 0 &&
+              actual >= requested && size == sizeof(actual),
+          "Net UDP send and receive buffers accept guest option numbers");
+  }
+  for (const int value : {1, 0}) {
+    int actual = -1;
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(datagram, 0xffff, 0x20, &value, sizeof(value)) == 0 &&
+              net_getsockopt(datagram, 0xffff, 0x20, &actual, &size) == 0 &&
+              actual == value && size == sizeof(actual),
+          "Net UDP broadcast option can be enabled and disabled");
+  }
+  int timeout = 0;
+  int *timeout_value = &timeout;
+#if defined(__linux__)
+  int broadcast = -1;
+  uint32_t broadcast_size = sizeof(broadcast);
+  Check(net_setsockopt(datagram, 0xffff, 0x10000, &enabled, sizeof(enabled)) == 0 &&
+            net_getsockopt(datagram, 0xffff, 0x20, &broadcast, &broadcast_size) == 0 &&
+            broadcast == 0,
+        "preserving the all-ones destination does not enable broadcast permission");
+  const long page_size = sysconf(_SC_PAGESIZE);
+  Check(page_size > 0, "get host page size for socket timeout boundary");
+  void *timeout_pages = mmap(nullptr, page_size * 2, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  Check(timeout_pages != MAP_FAILED &&
+            mprotect(static_cast<char *>(timeout_pages) + page_size, page_size,
+                     PROT_NONE) == 0,
+        "guard memory after the four-byte socket timeout");
+  timeout_value = reinterpret_cast<int *>(static_cast<char *>(timeout_pages) +
+                                           page_size - sizeof(int));
+#endif
+  for (const int value : {1500000, 0, -1}) {
+    *timeout_value = value;
+    Check(net_setsockopt(datagram, 0xffff, 0x1105, timeout_value, sizeof(int)) == 0,
+          "Net send timeout reads a four-byte microsecond value");
+    *timeout_value = -2;
+    uint32_t size = sizeof(int);
+    Check(net_getsockopt(datagram, 0xffff, 0x1105, timeout_value, &size) == 0 &&
+              *timeout_value == std::max(value, 0) && size == sizeof(int),
+          "Net send timeout returns four-byte microseconds and disables nonpositive values");
+  }
+#if defined(__linux__)
+  Check(munmap(timeout_pages, page_size * 2) == 0, "free socket timeout guard pages");
+#endif
+  Check(*net_errno == Libs::Posix::POSIX_EINVAL &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "successful Net socket option calls preserve both guest errno values");
+  Check(net_setsockopt(datagram, 0xffff, 0x1105, nullptr, sizeof(timeout)) ==
+            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT &&
+            net_getsockopt(datagram, 0xffff, 0x1105, &timeout, nullptr) ==
+            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT,
+        "Net socket options reject null value and length pointers");
+  uint32_t short_size = sizeof(timeout) - 1;
+  Check(net_setsockopt(datagram, 0xffff, 0x1105, &timeout, short_size) ==
+            Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL &&
+            net_getsockopt(datagram, 0xffff, 0x1105, &timeout, &short_size) ==
+            Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net send timeout rejects undersized values");
+  uint32_t option_size = sizeof(timeout);
+  Check(net_setsockopt(datagram, 0xffff, 0x7fffffff, &timeout, option_size) ==
+            Libs::Network::NET_ERROR_ENOPROTOOPT &&
+            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
+            net_getsockopt(datagram, 0xffff, 0x7fffffff, &timeout, &option_size) ==
+            Libs::Network::NET_ERROR_ENOPROTOOPT &&
+            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
+        "Net unknown socket options return protocol-option errors");
+#if defined(__linux__)
+  Check(net_setsockopt(datagram, 0xffff, 0x1007, &timeout, option_size) ==
+            Libs::Network::NET_ERROR_ENOPROTOOPT &&
+            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
+        "Net native protocol-option errors retain their guest error code");
+#endif
+  received.fill(0);
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_sendto(datagram_writer, payload, sizeof(payload), 0,
+                   address.data(), address_size) == sizeof(payload) &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net sendto delivers to a guest sockaddr and preserves errno on success");
+  Check(net_recvfrom(datagram, received.data(), received.size(), 0,
+                     peer.data(), &peer_size) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
+            peer_size == expected_peer_size && peer == expected_peer &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net recvfrom returns datagram bytes and sender address while preserving errno");
+  Check(net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
+            Libs::Network::NET_ERROR_EWOULDBLOCK &&
+            *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+        "Net recvfrom translates nonblocking failure with an omitted sender address");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_connect(datagram_writer, address.data(), address_size) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL &&
+            net_sendto(datagram_writer, payload, sizeof(payload), 0, nullptr, 0) ==
+                sizeof(payload) && *net_errno == Libs::Posix::POSIX_EINVAL &&
+            net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
+                sizeof(payload) && std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "Net connect selects the peer used by sendto with an omitted destination");
+  Check(net_connect(-1, address.data(), address_size) == Libs::Network::NET_ERROR_EBADF &&
+            *net_errno == Libs::Posix::POSIX_EBADF,
+        "Net connect translates an invalid socket");
+  Check(net_sendto(-1, payload, sizeof(payload), 0, address.data(), address_size) ==
+            Libs::Network::NET_ERROR_EBADF && *net_errno == Libs::Posix::POSIX_EBADF,
+        "Net sendto translates an invalid socket");
+  Check(Net::SocketClose(datagram) == 0 && Net::SocketClose(datagram_writer) == 0,
+        "close Net loopback datagrams");
   Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&
             *net_errno == Libs::Posix::POSIX_EBADF,
         "Net send translates an invalid socket instead of returning POSIX minus one");
@@ -1138,10 +1320,12 @@ void CheckSocketWakeup() {
   const auto previous_sigpipe = std::signal(SIGPIPE, SIG_DFL);
   Check(previous_sigpipe != SIG_ERR, "set default SIGPIPE disposition for Net send");
   const auto broken_send = net_send(disconnected, payload, sizeof(payload), 0);
+  const auto broken_sendto = net_sendto(disconnected, payload, sizeof(payload), 0, nullptr, 0);
   std::signal(SIGPIPE, previous_sigpipe);
   Check(broken_send == Libs::Network::NET_ERROR_EPIPE &&
+            broken_sendto == Libs::Network::NET_ERROR_EPIPE &&
             *net_errno == Libs::Posix::POSIX_EPIPE,
-        "Net send reports a broken pipe without raising host SIGPIPE");
+        "Net send and sendto report a broken pipe without raising host SIGPIPE");
   Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
 #endif
 #if defined(_WIN32)

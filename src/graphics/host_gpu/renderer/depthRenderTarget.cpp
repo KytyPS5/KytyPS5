@@ -315,8 +315,6 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
-	r.depth_min_bounds         = hw.GetDepthBoundsMin();
-	r.depth_max_bounds         = hw.GetDepthBoundsMax();
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;

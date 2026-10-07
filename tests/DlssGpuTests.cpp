@@ -1278,11 +1278,14 @@ int main(int argc, char** argv) {
 		WindowContext window;
 		window.window = SDL_CreateWindow("title timing", 64, 64, SDL_WINDOW_HIDDEN);
 		Check(window.window != nullptr, "hidden title-test window");
-		window.UpdateTitle();
+		window.loop.presented_frames.store(1, std::memory_order_relaxed);
+		window.UpdateTitle(1, 0, 0);
 		const std::string first_title = SDL_GetWindowTitle(window.window);
 		std::atomic<bool> finished = false;
 		std::thread producer([&] {
-			for (int i = 0; i < 120; ++i) window.UpdateTitle();
+			for (int i = 0; i < 120; ++i) {
+				window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+			}
 			finished.store(true, std::memory_order_release);
 		});
 		// Reproduce the presentation worker while the UI thread is busy.
@@ -1297,24 +1300,32 @@ int main(int argc, char** argv) {
 		while (SDL_PollEvent(&event)) {}
 		Check(finished_without_ui, "frame title updates block on the UI thread");
 		Check(first_title == SDL_GetWindowTitle(window.window), "title is changed on every frame");
-		for (int i = 0; i < 20; ++i) window.UpdateTitle(false, false);
-		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-		finished.store(false, std::memory_order_release);
 		std::thread due_update([&] {
-			window.UpdateTitle();
-			finished.store(true, std::memory_order_release);
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+			// Cached/host presents publish status without counting another guest frame.
+			for (int i = 0; i < 20; ++i) {
+				window.loop.dlss_active.store(false, std::memory_order_relaxed);
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+			SDL_Event quit {};
+			quit.type = SDL_EVENT_QUIT;
+			Check(SDL_PushEvent(&quit), "stop title-test event loop");
 		});
-		std::this_thread::sleep_for(std::chrono::milliseconds(200));
-		const bool due_finished_without_ui = finished.load(std::memory_order_acquire);
-		while (!finished.load(std::memory_order_acquire)) (void)SDL_WaitEventTimeout(&event, 10);
+		window.Run();
 		due_update.join();
-		while (SDL_PollEvent(&event)) {}
-		Check(due_finished_without_ui, "periodic FPS refresh still waits for the UI thread");
 		Check(first_title != SDL_GetWindowTitle(window.window), "title is not refreshed after FPS interval");
 		Check(std::strstr(SDL_GetWindowTitle(window.window), "frame: 122,") != nullptr,
 		      "cached/host frames inflate the gameplay FPS counter");
 		Check(std::strstr(SDL_GetWindowTitle(window.window), "DLSS: inactive") != nullptr,
 		      "a requested DLSS mode is incorrectly shown as evaluated");
+		window.loop.dlss_active.store(true, std::memory_order_relaxed);
+		window.loop.fg_enabled.store(true, std::memory_order_relaxed);
+		window.UpdateTitle(122, 60, 120);
+		Check(std::strstr(SDL_GetWindowTitle(window.window), "frame: 122, fps: 120") != nullptr,
+		      "FG display FPS changes the guest frame count");
+		Check(std::strstr(SDL_GetWindowTitle(window.window), "[DLSS: active] [FG]") != nullptr,
+		      "main-thread title loses DLSS or FG status");
 		std::puts("Window title timing tests passed");
 		return 0;
 	}

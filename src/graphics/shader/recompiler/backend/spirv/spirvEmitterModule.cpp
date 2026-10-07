@@ -35,14 +35,11 @@ uint32_t TypeU32(EmitterState& state) {
 }
 
 uint32_t TypeU64(EmitterState& state) {
-	return TypeU32Vector(state, 2);
-}
-
-uint32_t TypeScalarU64(EmitterState& state) {
-	if (state.native_u64_type == 0) {
-		state.native_u64_type = state.builder.Type(spv::OpTypeInt, 64, 0);
+	if (state.u64_type == 0) {
+		state.builder.RequireCapability(spv::CapabilityInt64);
+		state.u64_type = state.builder.Type(spv::OpTypeInt, 64, 0);
 	}
-	return state.native_u64_type;
+	return state.u64_type;
 }
 
 uint32_t TypeU32Pair(EmitterState& state) {
@@ -124,8 +121,9 @@ uint32_t TypeFunction(EmitterState& state) {
 }
 
 uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits) {
-	return bits == 32u ? TypeU32(state) : bits == 64u ? TypeScalarU64(state)
-	                                                   : state.builder.Type(spv::OpTypeInt, bits, 0);
+	return bits == 32u   ? TypeU32(state)
+	       : bits == 64u ? TypeU64(state)
+	                     : state.builder.Type(spv::OpTypeInt, bits, 0);
 }
 
 uint32_t StorageRuntimeArrayType(EmitterState& state, uint32_t bits) {
@@ -332,9 +330,8 @@ uint32_t ConstantBool(EmitterState& state, bool value) {
 }
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value) {
-	return state.builder.Constant(spv::OpConstantComposite, TypeU64(state),
-	                              ConstantU32(state, static_cast<uint32_t>(value)),
-	                              ConstantU32(state, static_cast<uint32_t>(value >> 32u)));
+	return state.builder.Constant(spv::OpConstant, TypeU64(state), static_cast<uint32_t>(value),
+	                              static_cast<uint32_t>(value >> 32u));
 }
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components) {

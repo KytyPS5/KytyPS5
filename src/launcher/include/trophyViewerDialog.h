@@ -3,6 +3,8 @@
 
 #include <QDialog>
 
+#include <vector>
+
 class QTabWidget;
 class QWidget;
 
@@ -14,6 +16,8 @@ public:
 	static bool HasTrophyData(const Configuration* info);
 	static void ShowForGame(const Configuration* info, const QString& runtime_directory,
 	                        QWidget* parent);
+	static void ShowOverview(const std::vector<const Configuration*>& games,
+	                         const QString& runtime_directory, QWidget* parent);
 
 private:
 	bool LoadGame(const Configuration& info, const QString& runtime_directory, QString& error);

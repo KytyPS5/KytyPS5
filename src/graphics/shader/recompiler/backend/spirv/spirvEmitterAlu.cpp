@@ -17,21 +17,8 @@ Pair ExtractPair(EmitterState& state, uint32_t value) {
 	return result;
 }
 
-uint32_t MakePair(EmitterState& state, uint32_t low, uint32_t high) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result, low, high);
-	return result;
-}
-
-uint32_t CompareEqual64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
-                        bool not_equal) {
-	const auto compare = Binary(state, not_equal ? spv::OpINotEqual : spv::OpIEqual,
-	                            TypeBoolVector(state, 2), lhs_value, rhs_value);
-	return Unary(state, not_equal ? spv::OpAny : spv::OpAll, TypeBool(state), compare);
-}
-
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto bits_type = TypeU64(state);
+	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
 	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
 	const auto ordered = Binary(state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
@@ -52,17 +39,6 @@ uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max
 	              rhs, result);
 }
 
-uint32_t CompareOrdered64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
-                          spv::Op high_compare, spv::Op low_compare) {
-	const auto lhs         = ExtractPair(state, lhs_value);
-	const auto rhs         = ExtractPair(state, rhs_value);
-	const auto high_equal  = Binary(state, spv::OpIEqual, TypeBool(state), lhs.high, rhs.high);
-	const auto high_result = Binary(state, high_compare, TypeBool(state), lhs.high, rhs.high);
-	const auto low_result  = Binary(state, low_compare, TypeBool(state), lhs.low, rhs.low);
-	const auto low_path = Binary(state, spv::OpLogicalAnd, TypeBool(state), high_equal, low_result);
-	return Binary(state, spv::OpLogicalOr, TypeBool(state), high_result, low_path);
-}
-
 uint32_t EmitMulHigh(EmitterState& state, uint32_t lhs, uint32_t rhs, bool signed_value) {
 	const auto operand_type = signed_value ? TypeI32(state) : TypeU32(state);
 	const auto pair_type    = signed_value ? TypeI32Pair(state) : TypeU32Pair(state);
@@ -78,86 +54,6 @@ uint32_t EmitMulHigh(EmitterState& state, uint32_t lhs, uint32_t rhs, bool signe
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, operand_type, high, extended, 1);
 	return signed_value ? Unary(state, spv::OpBitcast, TypeU32(state), high) : high;
-}
-
-uint32_t EmitShift64(EmitterState& state, spv::Op opcode, uint32_t value, uint32_t shift) {
-	const auto pair       = ExtractPair(state, value);
-	const auto amount     = EmitAndConstant(state, shift, 63u);
-	const auto word_shift = EmitAndConstant(state, amount, 31u);
-	const auto at_least_32 =
-	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), amount, ConstantU32(state, 32));
-	const auto nonzero =
-	    Binary(state, spv::OpINotEqual, TypeBool(state), amount, ConstantU32(state, 0));
-	const auto carry_count = EmitAndConstant(
-	    state, Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 32), word_shift), 31u);
-	if (opcode == spv::OpShiftLeftLogical) {
-		const auto low = Binary(state, opcode, TypeU32(state), pair.low, word_shift);
-		const auto carry =
-		    Select(state, TypeU32(state), nonzero,
-		           Binary(state, spv::OpShiftRightLogical, TypeU32(state), pair.low, carry_count),
-		           ConstantU32(state, 0));
-		const auto high =
-		    Binary(state, spv::OpBitwiseOr, TypeU32(state),
-		           Binary(state, opcode, TypeU32(state), pair.high, word_shift), carry);
-		return MakePair(state,
-		                Select(state, TypeU32(state), at_least_32, ConstantU32(state, 0), low),
-		                Select(state, TypeU32(state), at_least_32, low, high));
-	}
-	const auto high = Binary(state, opcode, TypeU32(state), pair.high, word_shift);
-	const auto carry =
-	    Select(state, TypeU32(state), nonzero,
-	           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), pair.high, carry_count),
-	           ConstantU32(state, 0));
-	const auto low = Binary(
-	    state, spv::OpBitwiseOr, TypeU32(state),
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), pair.low, word_shift), carry);
-	const auto fill = opcode == spv::OpShiftRightArithmetic
-	                      ? Binary(state, opcode, TypeU32(state), pair.high, ConstantU32(state, 31))
-	                      : ConstantU32(state, 0);
-	return MakePair(state, Select(state, TypeU32(state), at_least_32, high, low),
-	                Select(state, TypeU32(state), at_least_32, fill, high));
-}
-
-uint32_t EmitConstantShift64(EmitterState& state, spv::Op opcode, uint32_t value, uint32_t shift) {
-	shift &= 63u;
-	if (shift == 0u) {
-		return value;
-	}
-	const auto pair = ExtractPair(state, value);
-	if (opcode == spv::OpShiftLeftLogical) {
-		if (shift < 32u) {
-			const auto low  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), pair.low,
-			                         ConstantU32(state, shift));
-			const auto high = Binary(state, spv::OpBitwiseOr, TypeU32(state),
-			                         Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-			                                pair.high, ConstantU32(state, shift)),
-			                         Binary(state, spv::OpShiftRightLogical, TypeU32(state),
-			                                pair.low, ConstantU32(state, 32u - shift)));
-			return MakePair(state, low, high);
-		}
-		return MakePair(state, ConstantU32(state, 0),
-		                shift == 32u ? pair.low
-		                             : Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-		                                      pair.low, ConstantU32(state, shift - 32u)));
-	}
-	if (shift < 32u) {
-		const auto low = Binary(state, spv::OpBitwiseOr, TypeU32(state),
-		                        Binary(state, spv::OpShiftRightLogical, TypeU32(state), pair.low,
-		                               ConstantU32(state, shift)),
-		                        Binary(state, spv::OpShiftLeftLogical, TypeU32(state), pair.high,
-		                               ConstantU32(state, 32u - shift)));
-		const auto high =
-		    Binary(state, opcode, TypeU32(state), pair.high, ConstantU32(state, shift));
-		return MakePair(state, low, high);
-	}
-	const auto high = opcode == spv::OpShiftRightArithmetic
-	                      ? Binary(state, spv::OpShiftRightArithmetic, TypeU32(state), pair.high,
-	                               ConstantU32(state, 31u))
-	                      : ConstantU32(state, 0);
-	const auto low  = shift == 32u ? pair.high
-	                               : Binary(state, opcode, TypeU32(state), pair.high,
-	                                        ConstantU32(state, shift - 32u));
-	return MakePair(state, low, high);
 }
 
 uint32_t EmitMinMax3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c, bool signed_value,
@@ -231,15 +127,18 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	// Legacy MAD/MAC round and flush between multiply and add, irrespective of SP_DENORM.
-	a = EmitFlushF32DenormToSignedZero(state, a);
-	b = EmitFlushF32DenormToSignedZero(state, b);
-	c = EmitFlushF32DenormToSignedZero(state, c);
+	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
+	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
+	// a = EmitFlushF32DenormToSignedZero(state, a);
+	// b = EmitFlushF32DenormToSignedZero(state, b);
+	// c = EmitFlushF32DenormToSignedZero(state, c);
 	const auto product = EmitFPMul32(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	// const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	const auto sum = EmitFPAdd32(state, product, c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	return EmitFlushF32DenormToSignedZero(state, sum);
+	// return EmitFlushF32DenormToSignedZero(state, sum);
+	return sum;
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -256,57 +155,15 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 }
 
 uint32_t EmitFindUMsb64(EmitterState& state, uint32_t value) {
-	const auto pair   = ExtractPair(state, value);
-	const auto high_i = state.builder.AllocateId();
-	const auto low_i  = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeI32(state), high_i, GlslStd450(state),
-	                          GLSLstd450FindUMsb, pair.high);
-	state.builder.AddFunction(spv::OpExtInst, TypeI32(state), low_i, GlslStd450(state),
-	                          GLSLstd450FindUMsb, pair.low);
-	const auto high = Unary(state, spv::OpBitcast, TypeU32(state), high_i);
-	const auto low  = Unary(state, spv::OpBitcast, TypeU32(state), low_i);
-	const auto high_nonzero =
-	    Binary(state, spv::OpINotEqual, TypeBool(state), pair.high, ConstantU32(state, 0));
-	return Select(state, TypeU32(state), high_nonzero,
-	              Binary(state, spv::OpIAdd, TypeU32(state), high, ConstantU32(state, 32)), low);
-}
-
-uint32_t EmitIMul64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value) {
-	const auto lhs   = ExtractPair(state, lhs_value);
-	const auto rhs   = ExtractPair(state, rhs_value);
-	const auto low   = Binary(state, spv::OpIMul, TypeU32(state), lhs.low, rhs.low);
-	const auto high0 = EmitMulHigh(state, lhs.low, rhs.low, false);
-	const auto high1 = Binary(state, spv::OpIMul, TypeU32(state), lhs.low, rhs.high);
-	const auto high2 = Binary(state, spv::OpIMul, TypeU32(state), lhs.high, rhs.low);
-	return MakePair(state, low,
-	                Binary(state, spv::OpIAdd, TypeU32(state),
-	                       Binary(state, spv::OpIAdd, TypeU32(state), high0, high1), high2));
-}
-
-uint32_t EmitISub64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value) {
-	const auto lhs    = ExtractPair(state, lhs_value);
-	const auto rhs    = ExtractPair(state, rhs_value);
-	const auto low    = Binary(state, spv::OpISub, TypeU32(state), lhs.low, rhs.low);
-	const auto borrow = Binary(state, spv::OpULessThan, TypeBool(state), lhs.low, rhs.low);
-	const auto borrow_u32 =
-	    Select(state, TypeU32(state), borrow, ConstantU32(state, 1), ConstantU32(state, 0));
-	const auto high0 = Binary(state, spv::OpISub, TypeU32(state), lhs.high, rhs.high);
-	const auto high  = Binary(state, spv::OpISub, TypeU32(state), high0, borrow_u32);
-	return MakePair(state, low, high);
-}
-
-uint32_t EmitIAdd64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value) {
-	const auto lhs      = ExtractPair(state, lhs_value);
-	const auto rhs      = ExtractPair(state, rhs_value);
-	const auto low_pair = state.builder.AllocateId();
-	const auto low      = state.builder.AllocateId();
-	const auto carry    = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIAddCarry, TypeU32Pair(state), low_pair, lhs.low, rhs.low);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, low_pair, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), carry, low_pair, 1);
-	const auto high0 = Binary(state, spv::OpIAdd, TypeU32(state), lhs.high, rhs.high);
-	const auto high  = Binary(state, spv::OpIAdd, TypeU32(state), high0, carry);
-	return MakePair(state, low, high);
+	// GLSL FindUMsb is restricted to 32-bit components.
+	const auto unpacked = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), value);
+	const auto pair =
+	    ExtractPair(state, EmitExt(state, TypeU32Vector(state, 2), GLSLstd450FindUMsb, {unpacked}));
+	const auto high_found =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), pair.high, ConstantU32(state, UINT32_MAX));
+	return Select(state, TypeU32(state), high_found,
+	              Binary(state, spv::OpIAdd, TypeU32(state), pair.high, ConstantU32(state, 32)),
+	              pair.low);
 }
 
 uint32_t EmitConvertU16U32(EmitterState& state, uint32_t arg0) {
@@ -335,7 +192,7 @@ uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
 uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
 	const auto converted = Unary(state, spv::OpFConvert, TypeF32(state), arg0);
 	const auto source    = EmitNative<spv::OpCompositeExtract, IR::Type::U32>(
-	    state, Unary(state, spv::OpBitcast, TypeU64(state), arg0), 1u);
+	    state, Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0), 1u);
 	const auto exponent = EmitAndConstant(state, source, 0x7ff00000u);
 	const auto overflow =
 	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
@@ -353,7 +210,21 @@ uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0) {
 	                                                  EmitFlushF32DenormToSignedZero(state, arg0));
 }
 
+uint32_t EmitCompositeConstructU64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
+	arg1 = arg1.Resolve();
+	return arg1.IsImmediate() && arg1.U32() == 0u
+	           ? Unary(ctx.state, spv::OpUConvert, TypeU64(ctx.state), arg0)
+	           : PackU64(ctx.state, arg0, ctx.Def(arg1));
+}
+
 uint32_t EmitCompositeExtractU64(EmitterState& state, uint32_t arg0, IR::Value arg1) {
+	const auto value = arg1.U32() == 0u ? arg0
+	                                    : Binary(state, spv::OpShiftRightLogical, TypeU64(state),
+	                                             arg0, ConstantU32(state, 32));
+	return Unary(state, spv::OpUConvert, TypeU32(state), value);
+}
+
+uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value arg1) {
 	return EmitNative<spv::OpCompositeExtract, IR::Type::U32>(state, arg0, arg1.U32());
 }
 
@@ -385,33 +256,11 @@ uint32_t EmitIAbs32(EmitterState& state, uint32_t arg0) {
 	return Select(state, TypeU32(state), negative, neg, value);
 }
 
-uint32_t EmitShiftLeftLogical64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
-	auto& state = ctx.state;
-	return arg1.Resolve().IsImmediate()
-	           ? EmitConstantShift64(state, spv::OpShiftLeftLogical, arg0, arg1.Resolve().U32())
-	           : EmitShift64(state, spv::OpShiftLeftLogical, arg0, ctx.Def(arg1));
-}
-
-uint32_t EmitShiftRightLogical64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
-	auto& state = ctx.state;
-	return arg1.Resolve().IsImmediate()
-	           ? EmitConstantShift64(state, spv::OpShiftRightLogical, arg0, arg1.Resolve().U32())
-	           : EmitShift64(state, spv::OpShiftRightLogical, arg0, ctx.Def(arg1));
-}
-
-uint32_t EmitShiftRightArithmetic64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
-	auto& state = ctx.state;
-	return arg1.Resolve().IsImmediate()
-	           ? EmitConstantShift64(state, spv::OpShiftRightArithmetic, arg0, arg1.Resolve().U32())
-	           : EmitShift64(state, spv::OpShiftRightArithmetic, arg0, ctx.Def(arg1));
-}
-
-uint32_t EmitBitwiseAnd64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return Binary(state, spv::OpBitwiseAnd, TypeU64(state), arg0, arg1);
-}
-
 uint32_t EmitBitCount64(EmitterState& state, uint32_t arg0) {
-	const auto pair = ExtractPair(state, Unary(state, spv::OpBitCount, TypeU64(state), arg0));
+	// Vulkan bit-count operands remain 32-bit, including when counting a U64.
+	const auto unpacked = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0);
+	const auto pair =
+	    ExtractPair(state, Unary(state, spv::OpBitCount, TypeU32Vector(state, 2), unpacked));
 	return Binary(state, spv::OpIAdd, TypeU32(state), pair.low, pair.high);
 }
 
@@ -463,38 +312,6 @@ uint32_t EmitSMedTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32
 
 uint32_t EmitUMedTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
 	return EmitMed3(state, arg0, arg1, arg2, false);
-}
-
-uint32_t EmitIEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return CompareEqual64(state, arg0, arg1, false);
-}
-
-uint32_t EmitINotEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return CompareEqual64(state, arg0, arg1, true);
-}
-
-uint32_t EmitULessThan64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return CompareOrdered64(state, arg0, arg1, spv::OpULessThan, spv::OpULessThan);
-}
-
-uint32_t EmitSLessThan64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return CompareOrdered64(state, arg0, arg1, spv::OpSLessThan, spv::OpULessThan);
-}
-
-uint32_t EmitUGreaterThan64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return CompareOrdered64(state, arg0, arg1, spv::OpUGreaterThan, spv::OpUGreaterThan);
-}
-
-uint32_t EmitSLessThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return CompareOrdered64(state, arg0, arg1, spv::OpSLessThan, spv::OpULessThanEqual);
-}
-
-uint32_t EmitULessThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return CompareOrdered64(state, arg0, arg1, spv::OpULessThan, spv::OpULessThanEqual);
-}
-
-uint32_t EmitUGreaterThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return CompareOrdered64(state, arg0, arg1, spv::OpUGreaterThan, spv::OpUGreaterThanEqual);
 }
 
 uint32_t EmitFPIsNan32(EmitterState& state, uint32_t arg0) {

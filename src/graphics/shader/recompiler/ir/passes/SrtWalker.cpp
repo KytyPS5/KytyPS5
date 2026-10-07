@@ -23,6 +23,9 @@ namespace {
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
+	if (base > AddressMask) {
+		return false;
+	}
 	if (offset < 0) {
 		const auto magnitude = uint64_t {0} - static_cast<uint64_t>(offset);
 		if (magnitude > base) {
@@ -32,7 +35,7 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 		return true;
 	}
 	const auto magnitude = static_cast<uint64_t>(offset);
-	if (magnitude > UINT64_MAX - base) {
+	if (magnitude > AddressMask - base) {
 		return false;
 	}
 	result = base + magnitude;
@@ -477,7 +480,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
 		return false;
 	}
-	const auto base      = (high << 32u) | static_cast<uint32_t>(low);
+	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 	uint64_t   address   = 0;
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
@@ -507,7 +510,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
 			return false;
 		}
-		address = (base & AddressMask & ~uint64_t {3}) + byte_offset;
+		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);

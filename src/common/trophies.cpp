@@ -5,9 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <span>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
+#include <span>
 
 namespace Common::Trophies {
 namespace {
@@ -40,6 +40,25 @@ int ReadId(const Json& value) {
 	return error == std::errc {} && end == text.data() + text.size() && id >= 0 ? id : -1;
 }
 
+std::optional<uint64_t> ReadUnsigned(const Json& value) {
+	if (value.is_number_unsigned()) {
+		return value.get<uint64_t>();
+	}
+	if (value.is_number_integer()) {
+		const auto number = value.get<int64_t>();
+		return number >= 0 ? std::optional<uint64_t>(static_cast<uint64_t>(number)) : std::nullopt;
+	}
+	if (!value.is_string()) {
+		return std::nullopt;
+	}
+	const auto& text        = value.get_ref<const std::string&>();
+	uint64_t    number      = 0;
+	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), number);
+	return error == std::errc {} && end == text.data() + text.size()
+	           ? std::optional<uint64_t>(number)
+	           : std::nullopt;
+}
+
 Json ReadJson(const Files& files, std::string_view name) {
 	const auto entry = files.find(name);
 	if (entry == files.end()) {
@@ -48,19 +67,18 @@ Json ReadJson(const Files& files, std::string_view name) {
 	return Json::parse(entry->second.begin(), entry->second.end(), nullptr, false);
 }
 
-Package ParsePackage(std::span<const std::byte> data, int console_language) {
+bool ReadFiles(std::span<const std::byte> data, Files& files, uint64_t& size) {
 	if (data.size() < 0x40 || data.size() > MaxPackageSize ||
 	    ReadBigEndian(data.data(), 4) != 0xb228c60a || ReadBigEndian(data.data() + 4, 4) != 1) {
-		return {};
+		return false;
 	}
-	const auto size  = ReadBigEndian(data.data() + 8, 8);
+	size             = ReadBigEndian(data.data() + 8, 8);
 	const auto count = ReadBigEndian(data.data() + 0x10, 4);
 	const auto toc   = ReadBigEndian(data.data() + 0x14, 4);
 	if (size < 0x40 || size > data.size() || count > 4096 || toc > size ||
 	    0x20 + count * 0x40 > size - toc) {
-		return {};
+		return false;
 	}
-	Files files;
 	for (uint64_t i = 0; i < count; ++i) {
 		const auto*            entry = data.data() + toc + 0x20 + i * 0x40;
 		const auto*            name  = reinterpret_cast<const char*>(entry);
@@ -68,9 +86,18 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 		const auto             offset = ReadBigEndian(entry + 0x20, 8);
 		const auto             length = ReadBigEndian(entry + 0x28, 8);
 		if (offset > size || length > size - offset) {
-			return {};
+			return false;
 		}
 		files.emplace(filename, data.subspan(offset, length));
+	}
+	return true;
+}
+
+Package ParsePackage(std::span<const std::byte> data, int console_language) {
+	Files    files;
+	uint64_t size = 0;
+	if (!ReadFiles(data, files, size)) {
+		return {};
 	}
 	const auto conf = ReadJson(files, "tropconf.json");
 	if (!conf.is_object() || !conf.contains("trophies") || !conf["trophies"].is_array() ||
@@ -129,19 +156,29 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 		trophy.has_reward = definition.contains("hasReward") && definition["hasReward"] == true;
 		if (definition.contains("unlockCondition")) {
 			const auto& condition = definition["unlockCondition"];
-			if (condition.is_object() && condition.contains("progressive") &&
-			    condition["progressive"] == true) {
-				if (!condition.contains("targetValue") || !condition["targetValue"].is_string()) {
-					return {};
+			if (condition.is_object()) {
+				trophy.progressive =
+				    condition.contains("progressive") && condition["progressive"] == true;
+				if (condition.contains("udsStatId")) {
+					trophy.uds_stat_id = ReadUnsigned(condition["udsStatId"]);
+					if (!trophy.uds_stat_id) {
+						return {};
+					}
 				}
-				const auto& value  = condition["targetValue"].get_ref<const std::string&>();
-				uint64_t    target = 0;
-				const auto [end, error] =
-				    std::from_chars(value.data(), value.data() + value.size(), target);
-				if (error != std::errc {} || end != value.data() + value.size()) {
-					return {};
+				if (condition.contains("targetValue")) {
+					trophy.target = ReadUnsigned(condition["targetValue"]);
 				}
-				trophy.target = target;
+				const auto comparison = condition.find("comparator");
+				if (comparison != condition.end()) {
+					if (*comparison == "ge")
+						trophy.comparison = Comparison::GreaterEqual;
+					else if (*comparison == "gt")
+						trophy.comparison = Comparison::Greater;
+					else if (*comparison == "le")
+						trophy.comparison = Comparison::LessEqual;
+					else if (*comparison == "lt")
+						trophy.comparison = Comparison::Less;
+				}
 			}
 		}
 		const auto icon = files.find(fmt::format("trop{:04}.png", trophy.id));
@@ -210,11 +247,11 @@ std::filesystem::path UnlocksPath(const std::filesystem::path& root, std::string
 	    })) {
 		return {};
 	}
-	return root / "_SaveData" / title_id /
+	return root / "_Trophies" / title_id /
 	       fmt::format("trophies_{}_{}.json", user_id, service_label);
 }
 
-std::set<int> LoadUnlocks(const std::filesystem::path& path) {
+UnlockData LoadUnlockData(const std::filesystem::path& path) {
 	File file(path, File::Mode::Read);
 	if (file.IsInvalid() || file.Size() > MaxUnlocksSize) {
 		return {};
@@ -225,22 +262,40 @@ std::set<int> LoadUnlocks(const std::filesystem::path& path) {
 	    !json["unlockedTrophies"].is_array()) {
 		return {};
 	}
-	std::set<int> unlocked;
+	UnlockData unlocks;
 	for (const auto& value: json["unlockedTrophies"]) {
 		const auto id = ReadId(value);
 		if (id >= 0) {
-			unlocked.insert(id);
+			unlocks.unlocked.insert(id);
 		}
 	}
-	return unlocked;
+	if (json.contains("unlockedAt") && json["unlockedAt"].is_object()) {
+		for (auto it = json["unlockedAt"].begin(); it != json["unlockedAt"].end(); ++it) {
+			const auto id = ReadId(Json(it.key()));
+			if (id >= 0 && unlocks.unlocked.contains(id)) {
+				const auto tick = ReadUnsigned(it.value());
+				if (tick && *tick >= UnixEpochTick && *tick <= 315537897599999999ULL) {
+					unlocks.timestamps.emplace(id, *tick);
+				}
+			}
+		}
+	}
+	return unlocks;
 }
 
-bool SaveUnlocks(const std::filesystem::path& path, const std::set<int>& unlocked) {
+bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks) {
 	if (path.empty() || !File::CreateDirectories(path.parent_path())) {
 		return false;
 	}
-	const auto text      = Json {{"unlockedTrophies", unlocked}}.dump();
-	auto       temporary = path;
+	Json timestamps = Json::object();
+	for (const auto& [id, tick]: unlocks.timestamps) {
+		if (unlocks.unlocked.contains(id)) {
+			timestamps[std::to_string(id)] = tick;
+		}
+	}
+	const auto text =
+	    Json {{"unlockedTrophies", unlocks.unlocked}, {"unlockedAt", timestamps}}.dump();
+	auto temporary = path;
 	temporary += ".tmp";
 	File file;
 	if (text.size() > MaxUnlocksSize || !file.Create(temporary)) {
@@ -259,6 +314,140 @@ bool SaveUnlocks(const std::filesystem::path& path, const std::set<int>& unlocke
 	}
 	std::filesystem::remove(temporary, error);
 	return false;
+}
+
+UdsRules LoadUdsRules(const std::filesystem::path& path) {
+	File file(path, File::Mode::Read);
+	if (file.IsInvalid() || file.Size() > MaxPackageSize) {
+		return {};
+	}
+	const auto bytes = file.ReadWholeBuffer();
+	Files      files;
+	uint64_t   size = 0;
+	if (!ReadFiles(bytes, files, size)) {
+		return {};
+	}
+	const auto definitions = ReadJson(files, "stats_definition.json");
+	const auto extraction  = ReadJson(files, "stats_extraction.json");
+	if (!definitions.is_object() || !definitions.contains("statDefinitionArray") ||
+	    !definitions["statDefinitionArray"].is_array() || !extraction.is_object() ||
+	    !extraction.contains("statsExtractionRuleArray") ||
+	    !extraction["statsExtractionRuleArray"].is_array()) {
+		return {};
+	}
+	// Only direct unsigned latest-value stats are evaluated here. Aggregated stats
+	// and filtered/nested extraction require UDS state and event types we do not implement.
+	std::map<uint64_t, bool> stats;
+	for (const auto& definition: definitions["statDefinitionArray"]) {
+		if (!definition.is_object() || !definition.contains("statId") ||
+		    !definition.contains("aggregation") || definition["aggregation"] != "latest" ||
+		    !definition.contains("dataType")) {
+			continue;
+		}
+		const auto  id   = ReadUnsigned(definition["statId"]);
+		const auto& type = definition["dataType"];
+		if (!id || (type != "uint64" && type != "uint32")) {
+			continue;
+		}
+		const uint64_t maximum = type == "uint32" ? UINT32_MAX : UINT64_MAX;
+		if ((definition.contains("minValue") && ReadUnsigned(definition["minValue"]) != 0) ||
+		    (definition.contains("maxValue") && ReadUnsigned(definition["maxValue"]) != maximum)) {
+			continue;
+		}
+		stats.emplace(*id, type == "uint32");
+	}
+	UdsRules events;
+	for (const auto& rule: extraction["statsExtractionRuleArray"]) {
+		if (!rule.is_object() || !rule.contains("condition") || !rule.contains("action")) {
+			continue;
+		}
+		const auto& condition = rule["condition"];
+		const auto& action    = rule["action"];
+		if (!condition.is_object() || condition.size() != 1 || !condition.contains("eventName") ||
+		    !condition["eventName"].is_string() || !action.is_object() ||
+		    !action.contains("input") || !action["input"].is_string() ||
+		    !action.contains("output") || !action["output"].is_object() ||
+		    !action["output"].contains("statId")) {
+			continue;
+		}
+		const auto  id    = ReadUnsigned(action["output"]["statId"]);
+		const auto& input = action["input"].get_ref<const std::string&>();
+		if (!id || !stats.contains(*id) || !input.starts_with("$.") || input.size() == 2 ||
+		    input.find_first_not_of(
+		        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", 2) !=
+		        std::string::npos) {
+			continue;
+		}
+		events[condition["eventName"].get<std::string>()].push_back(
+		    {*id, input.substr(2), stats.at(*id)});
+	}
+	return events;
+}
+
+std::filesystem::path UdsPackagePath(uint32_t service_label) {
+	return std::filesystem::path("sce_sys/uds") / fmt::format("uds{:02}.ucp", service_label);
+}
+
+std::vector<int> FindUdsTrophies(const Package& package, std::string_view event_name,
+                                 const std::map<std::string, UdsInteger>& properties) {
+	const auto rules = package.event_rules.find(std::string(event_name));
+	if (rules == package.event_rules.end()) {
+		return {};
+	}
+	std::vector<int> ids;
+	for (const auto& [id, trophy]: package.trophies) {
+		if (trophy.grade == 1 || !trophy.uds_stat_id || !trophy.target) {
+			continue;
+		}
+		for (const auto& rule: rules->second) {
+			const auto value = properties.find(rule.input);
+			if (rule.stat_id != *trophy.uds_stat_id || value == properties.end()) {
+				continue;
+			}
+			std::optional<uint64_t> number;
+			if (rule.is_uint32) {
+				if (const auto* input = std::get_if<uint32_t>(&value->second)) number = *input;
+			} else if (const auto* input = std::get_if<uint64_t>(&value->second)) {
+				number = *input;
+			}
+			if (!number) continue;
+			bool matched = false;
+			switch (trophy.comparison) {
+				case Comparison::GreaterEqual: matched = *number >= *trophy.target; break;
+				case Comparison::Greater: matched = *number > *trophy.target; break;
+				case Comparison::LessEqual: matched = *number <= *trophy.target; break;
+				case Comparison::Less: matched = *number < *trophy.target; break;
+				case Comparison::None: break;
+			}
+			if (matched) {
+				ids.push_back(id);
+				break;
+			}
+		}
+	}
+	return ids;
+}
+
+uint32_t Progress::Percentage() const {
+	const auto points        = total_grade[2] * 6 + total_grade[3] * 2 + total_grade[4];
+	const auto earned_points = earned_grade[2] * 6 + earned_grade[3] * 2 + earned_grade[4];
+	return points == 0 ? 0 : earned_points * 100 / points;
+}
+
+Progress GetProgress(const Package& package, const UnlockData& unlocks, std::optional<int> group) {
+	Progress progress;
+	for (const auto& [id, trophy]: package.trophies) {
+		if (group && trophy.group_id != *group) {
+			continue;
+		}
+		++progress.total;
+		++progress.total_grade[trophy.grade];
+		if (unlocks.unlocked.contains(id)) {
+			++progress.earned;
+			++progress.earned_grade[trophy.grade];
+		}
+	}
+	return progress;
 }
 
 } // namespace Common::Trophies

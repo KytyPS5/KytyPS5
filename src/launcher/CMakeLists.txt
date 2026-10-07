@@ -45,13 +45,14 @@ set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
 
 if(BUILD_TESTING)
 	add_executable(dlss_settings_tests EXCLUDE_FROM_ALL
-		"${KYTY_TESTS_DIR}/DlssSettingsTests.cpp" include/configuration.h)
+		"${KYTY_TESTS_DIR}/DlssSettingsTests.cpp" src/configuration.cpp include/configuration.h)
 	set_target_properties(dlss_settings_tests PROPERTIES AUTOMOC ON)
+	target_include_directories(dlss_settings_tests PRIVATE include)
 	target_link_libraries(dlss_settings_tests PRIVATE Qt6::Gui common)
 	add_test(NAME dlss_settings COMMAND dlss_settings_tests)
 	add_executable(upscale_menu_tests EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/UpscaleMenuTests.cpp"
-		src/configurationEditDialog.cpp src/mandatoryLineEdit.cpp
+		src/configuration.cpp src/configurationEditDialog.cpp src/mandatoryLineEdit.cpp
 		include/configurationEditDialog.h include/mandatoryLineEdit.h include/configuration.h
 		forms/configuration_edit_dialog.ui)
 	set_target_properties(upscale_menu_tests PROPERTIES AUTOMOC ON AUTOUIC ON)

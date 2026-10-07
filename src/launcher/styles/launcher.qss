@@ -39,9 +39,11 @@ QLineEdit#search_line_edit:focus {
     border-color: palette(highlight);
 }
 
+QToolButton#refresh_button,
 QToolButton#global_settings_button,
 QToolButton#input_mapping_button,
 QToolButton#edit_button,
+QToolButton#trophy_overview_button,
 QToolButton#delete_button {
     background: transparent;
     border: 1px solid transparent;
@@ -49,17 +51,21 @@ QToolButton#delete_button {
     padding: 3px;
 }
 
+QToolButton#refresh_button:hover,
 QToolButton#global_settings_button:hover,
 QToolButton#input_mapping_button:hover,
 QToolButton#edit_button:hover,
+QToolButton#trophy_overview_button:hover,
 QToolButton#delete_button:hover {
     background: palette(button);
     border-color: palette(mid);
 }
 
+QToolButton#refresh_button:pressed,
 QToolButton#global_settings_button:pressed,
 QToolButton#input_mapping_button:pressed,
 QToolButton#edit_button:pressed,
+QToolButton#trophy_overview_button:pressed,
 QToolButton#delete_button:pressed {
     background: palette(midlight);
 }

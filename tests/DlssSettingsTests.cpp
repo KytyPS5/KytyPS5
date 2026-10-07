@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
 		original.dlss_mode = TextToEnum<Configuration::DlssMode>(text);
 		original.render_scale_percent = 50;
 		original.dlss_frame_generation = true;
+		original.skip_notice_screen = true;
 		original.WriteSettings(&settings);
 		settings.sync();
 		QSettings saved(directory.filePath("settings.ini"), QSettings::IniFormat);
@@ -35,6 +36,14 @@ int main(int argc, char** argv) {
 		Check(loaded.dlss_mode == original.dlss_mode, "DLSS mode not persisted");
 		Check(loaded.render_scale_percent == 50, "render scale not persisted");
 		Check(loaded.dlss_frame_generation, "Frame Generation not persisted");
+		Check(loaded.skip_notice_screen, "upstream notice setting not persisted");
+		Configuration imported;
+		QString error;
+		Check(imported.SetGameSettings(QJsonObject::fromVariantMap(original.GameSettings()), error),
+		      "game settings import rejects DLSS configuration");
+		Check(imported.dlss_mode == original.dlss_mode && imported.render_scale_percent == 50 &&
+		          imported.dlss_frame_generation && imported.skip_notice_screen,
+		      "game settings import loses DLSS or upstream configuration");
 		Configuration game;
 		game.CopyEmulatorSettingsFrom(loaded);
 		Check(game.dlss_mode == loaded.dlss_mode, "global mode not inherited by game");

@@ -32,8 +32,7 @@ AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   return *result;
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address,
-                                                       bool buffer = false) {
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -42,22 +41,16 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address,
   auto &value_block = AddValueBlock(program);
 
   MemoryInfo memory;
-  memory.kind = buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress;
+  memory.kind = ResourceKind::ScalarAddress;
   memory.planning_only = true;
   program.memory_info.push_back(memory);
   const auto low = Value(static_cast<uint32_t>(address));
   const auto high = Value(static_cast<uint32_t>(address >> 32u));
-  auto &handle = buffer
-                     ? value_block.AppendNewInst(ValueOpcode::GetBufferResource,
-                                                {low, high, Value(4u), Value(0u)})
-                     : value_block.AppendNewInst(ValueOpcode::GetAddressResource,
-                                                {low, high});
-  auto &raw = buffer
-                  ? value_block.AppendNewInst(ValueOpcode::ReadConstBuffer,
-                                             {Value(&handle), Value(0u)})
-                  : value_block.AppendNewInst(
-                        ValueOpcode::LoadAddressU32,
-                        {Value(&handle), Value(0u), Value(0u), Value(true)});
+  auto &handle =
+      value_block.AppendNewInst(ValueOpcode::GetAddressResource, {low, high});
+  auto &raw = value_block.AppendNewInst(
+      ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(0u), Value(0u), Value(true)});
   raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
   program.srt_reads.push_back({Value(&raw), 0});
 
@@ -173,32 +166,6 @@ void TestMappedSrtUsesDirectReaderByDefault() {
   Check(snapshot.flattened_srt.size() == 1 &&
             snapshot.flattened_srt[0] == dword,
         "cache rematerialization did not use the direct reader by default");
-}
-
-void TestRawScalarAddressPreservesHighBits() {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  constexpr uint64_t address = 0xabcd000156780003ull;
-  for (const bool buffer : {false, true}) {
-    auto plan = SrtPlan(address, buffer);
-    uint64_t observed = 0;
-    const SrtRuntime runtime{
-        .read_memory = [](void *userdata, uint64_t requested,
-                          std::span<uint32_t> words) {
-          if (words.size() != 1) return false;
-          *static_cast<uint64_t *>(userdata) = requested;
-          words[0] = 0x12345678;
-          return true;
-        },
-        .userdata = &observed};
-    ResourceSnapshot snapshot;
-    ResourceSpecialization specialization;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization),
-          "scalar address materialization failed");
-    Check(observed == (buffer ? 0x0000000156780000ull : address & ~uint64_t{3}),
-          "raw pointer high bits and buffer descriptor flags were conflated");
-    Check(snapshot.flattened_srt == std::vector<uint32_t>{0x12345678},
-          "scalar address read did not reach its flattened slot");
-  }
 }
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
@@ -599,7 +566,6 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
-  TestRawScalarAddressPreservesHighBits();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();

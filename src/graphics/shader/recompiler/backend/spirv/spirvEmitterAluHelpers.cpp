@@ -125,20 +125,23 @@ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
 	return EmitLogicalAndBool(state, selected, class_match);
 }
 
-uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
-	const auto bits          = EmitBitcastF32ToU32(state, value);
-	const auto sign_bits     = EmitAndConstant(state, bits, 0x80000000u);
-	const auto abs_bits      = EmitAndConstant(state, bits, 0x7fffffffu);
-	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
-	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
-	const auto quiet_bits    = EmitAndConstant(state, mantissa_bits, 0x00400000u);
+static uint32_t EmitClassMaskBits(EmitterState& state, uint32_t bits, uint32_t mask, bool half) {
+	const uint32_t sign_mask     = half ? 0x8000u : 0x80000000u;
+	const uint32_t exponent_mask = half ? 0x7c00u : 0x7f800000u;
+	const uint32_t mantissa_mask = half ? 0x03ffu : 0x007fffffu;
+	const uint32_t quiet_mask    = half ? 0x0200u : 0x00400000u;
+	const auto     sign_bits     = EmitAndConstant(state, bits, sign_mask);
+	const auto     abs_bits      = EmitAndConstant(state, bits, sign_mask - 1u);
+	const auto     exponent_bits = EmitAndConstant(state, abs_bits, exponent_mask);
+	const auto     mantissa_bits = EmitAndConstant(state, abs_bits, mantissa_mask);
+	const auto     quiet_bits    = EmitAndConstant(state, mantissa_bits, quiet_mask);
 
 	const auto sign             = EmitCompareU32Constant(state, spv::OpINotEqual, sign_bits, 0);
 	const auto positive         = EmitLogicalNotBool(state, sign);
 	const auto exponent_zero    = EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0);
 	const auto exponent_nonzero = EmitLogicalNotBool(state, exponent_zero);
 	const auto exponent_inf =
-	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
+	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, exponent_mask);
 	const auto finite_exponent  = EmitLogicalNotBool(state, exponent_inf);
 	const auto mantissa_zero    = EmitCompareU32Constant(state, spv::OpIEqual, mantissa_bits, 0);
 	const auto mantissa_nonzero = EmitLogicalNotBool(state, mantissa_zero);
@@ -176,6 +179,14 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 	return EmitLogicalOrBool(
 	    state, match,
 	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
+}
+
+uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
+	return EmitClassMaskBits(state, EmitBitcastF32ToU32(state, value), mask, false);
+}
+
+uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
+	return EmitClassMaskBits(state, bits, mask, true);
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {

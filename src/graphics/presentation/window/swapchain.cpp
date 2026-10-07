@@ -1247,8 +1247,14 @@ void Presenter::Impl::Present(bool new_frame) {
 		    std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
 			    return layer.frame != nullptr && layer.frame->guest_frame;
 		    });
-		window.UpdateTitle(layers[0].frame != nullptr && layers[0].frame->dlss_evaluated, new_guest_frame,
-		                   layers[0].frame != nullptr && layers[0].frame->dlss_bypassed);
+		window.loop.dlss_active.store(layers[0].frame != nullptr && layers[0].frame->dlss_evaluated,
+		                              std::memory_order_relaxed);
+		window.loop.dlss_bypassed.store(layers[0].frame != nullptr && layers[0].frame->dlss_bypassed,
+		                                std::memory_order_relaxed);
+		window.loop.fg_enabled.store(fg && fg->Enabled(), std::memory_order_relaxed);
+		window.loop.fg_presented_frames.store(fg ? fg->TotalPresentedFrames() : 0,
+		                                      std::memory_order_relaxed);
+		if (new_guest_frame) window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
 		const auto* main_frame = layers[0].frame;
 		const auto preparation = new_guest_frame && main_frame && main_frame->guest_frame ?
 		    main_frame->preparation : FramePreparationTiming {};

@@ -6,6 +6,7 @@
 #include <QByteArray>
 #include <QChar>
 #include <QColor>
+#include <QJsonObject>
 #include <QMetaEnum>
 #include <QMetaType>
 #include <QObject>
@@ -13,9 +14,6 @@
 #include <QString>
 #include <QStringList>
 #include <QVariant>
-
-#define KYTY_CFG_SET(n) s->setValue(#n, QVariant::fromValue(n).toString());
-#define KYTY_CFG_GET(n) n = s->value(#n).value<decltype(n)>();
 
 template <class T>
 inline QStringList EnumToList() {
@@ -129,10 +127,11 @@ public:
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
+	bool                   skip_notice_screen          = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
-	bool                   shader_validation_enabled   = true;
+	bool                   shader_validation_enabled   = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	QString                shader_log_folder           = "_Shaders";
@@ -165,6 +164,7 @@ public:
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
 		trophy_enabled              = other.trophy_enabled;
+		skip_notice_screen          = other.skip_notice_screen;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -197,100 +197,16 @@ public:
 		game_comment    = other.game_comment;
 	}
 
-	void WriteSettings(QSettings* s) const {
-		KYTY_CFG_SET(name);
-		KYTY_CFG_SET(basedir);
-		KYTY_CFG_SET(game_path);
-		KYTY_CFG_SET(custom_settings);
-		KYTY_CFG_SET(screen_resolution);
-		KYTY_CFG_SET(user_name);
-		KYTY_CFG_SET(user_id);
-		KYTY_CFG_SET(audio_input_device);
-		KYTY_CFG_SET(present_mode);
-		KYTY_CFG_SET(dlss_mode);
-		KYTY_CFG_SET(render_scale_percent);
-		KYTY_CFG_SET(dlss_frame_generation);
-		KYTY_CFG_SET(gpu_index);
-		KYTY_CFG_SET(fullscreen_enabled);
-		KYTY_CFG_SET(hide_cursor_enabled);
-		KYTY_CFG_SET(readback_linear_images);
-		KYTY_CFG_SET(tessellation_enabled);
-		KYTY_CFG_SET(trophy_enabled);
-		KYTY_CFG_SET(vblank_frequency);
-		KYTY_CFG_SET(console_language);
-		KYTY_CFG_SET(vulkan_validation_enabled);
-		KYTY_CFG_SET(shader_validation_enabled);
-		KYTY_CFG_SET(shader_optimization_type);
-		KYTY_CFG_SET(shader_log_direction);
-		KYTY_CFG_SET(shader_log_folder);
-		KYTY_CFG_SET(command_buffer_dump_enabled);
-		KYTY_CFG_SET(command_buffer_dump_folder);
-		KYTY_CFG_SET(printf_direction);
-		KYTY_CFG_SET(printf_output_file);
-		KYTY_CFG_SET(profiler_enabled);
-		KYTY_CFG_SET(renderdoc_enabled);
-		KYTY_CFG_SET(amd_cpu_enabled);
-#if defined(_WIN32)
-		KYTY_CFG_SET(red_zone_protection_enabled);
-#endif
-		s->setValue("host_input_mapping", host_input_mapping);
-		KYTY_CFG_SET(elf);
-	}
+	void WriteSettings(QSettings* s) const;
+	void ReadSettings(QSettings* s);
 
-	void ReadSettings(QSettings* s) {
-		KYTY_CFG_GET(name);
-		KYTY_CFG_GET(basedir);
-		KYTY_CFG_GET(game_path);
-		KYTY_CFG_GET(custom_settings);
-		KYTY_CFG_GET(screen_resolution);
-		user_name          = s->value("user_name", user_name).toString();
-		bool user_id_ok    = false;
-		auto saved_user_id = s->value("user_id", user_id).toInt(&user_id_ok);
-		user_id            = user_id_ok && Config::IsConfiguredUserIdValid(saved_user_id)
-		                         ? saved_user_id
-		                         : Config::DEFAULT_USER_ID;
-		audio_input_device = s->value("audio_input_device", audio_input_device).toString();
-		KYTY_CFG_GET(present_mode);
-		// Older settings and invalid values must keep DLSS disabled.
-		const auto saved_dlss = TextToEnum<DlssMode>(s->value("dlss_mode", "Off").toString());
-		dlss_mode = EnumToText(saved_dlss).isEmpty() ? DlssMode::Off : saved_dlss;
-		bool scale_ok = false;
-		const auto scale = s->value("render_scale_percent", 100).toInt(&scale_ok);
-		render_scale_percent = scale_ok && scale >= 25 && scale <= 100 ? scale : 100;
-		dlss_frame_generation = s->value("dlss_frame_generation", false).toBool();
-		gpu_index = s->value("gpu_index", -1).toInt();
-		if (EnumToText(present_mode).isEmpty()) {
-			present_mode = PresentMode::Mailbox;
-		}
-		KYTY_CFG_GET(fullscreen_enabled);
-		KYTY_CFG_GET(hide_cursor_enabled);
-		KYTY_CFG_GET(readback_linear_images);
-		KYTY_CFG_GET(tessellation_enabled);
-		trophy_enabled = s->value("trophy_enabled", trophy_enabled).toBool();
-		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
-		console_language = s->value("console_language", console_language).toInt();
-		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
-			console_language = DEFAULT_CONSOLE_LANGUAGE;
-		}
-		KYTY_CFG_GET(vulkan_validation_enabled);
-		KYTY_CFG_GET(shader_validation_enabled);
-		KYTY_CFG_GET(shader_optimization_type);
-		KYTY_CFG_GET(shader_log_direction);
-		KYTY_CFG_GET(shader_log_folder);
-		KYTY_CFG_GET(command_buffer_dump_enabled);
-		KYTY_CFG_GET(command_buffer_dump_folder);
-		KYTY_CFG_GET(printf_direction);
-		KYTY_CFG_GET(printf_output_file);
-		KYTY_CFG_GET(profiler_enabled);
-		KYTY_CFG_GET(renderdoc_enabled);
-		amd_cpu_enabled = s->value("amd_cpu_enabled", false).toBool();
-#if defined(_WIN32)
-		red_zone_protection_enabled =
-		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();
-#endif
-		host_input_mapping = s->value("host_input_mapping", host_input_mapping).toStringList();
-		elf                = s->value("elf", elf).toString();
-	}
+	[[nodiscard]] QVariantMap GameSettings() const;
+	// Call on a temporary configuration: validation can fail after loading values.
+	bool SetGameSettings(const QJsonObject& settings, QString& error);
+
+private:
+	template <class Settings>
+	void ReadGameSettingsValues(const Settings& s);
 };
 
 Q_DECLARE_METATYPE(Configuration*)

@@ -1,11 +1,11 @@
 #include "mainDialog.h"
 
+#include "cheatFile.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
 #include "controllerLightbar.h"
 #include "gameContent.h"
-#include "patchesDialog.h"
 #include "updateChecker.h"
 
 #include <QApplication>
@@ -249,6 +249,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
@@ -288,7 +289,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--game" << game;
 
-	const auto patch_plan = PatchesDialog::PatchPlanPath(info.title_id);
+	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
 		args << "--game-patch" << patch_plan;
 	}

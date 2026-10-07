@@ -206,7 +206,7 @@ static int KYTY_SYSV_ABI SystemServiceGetNoticeScreenSkipFlag(bool* value) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	*value = false;
+	*value = Config::SkipNoticeScreen();
 
 	return OK;
 }

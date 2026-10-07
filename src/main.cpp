@@ -91,6 +91,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf(
+	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
+	    "                                      Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -445,6 +448,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--trophy-notifications") {
 			if (!ParseBool(value, options.config.trophy_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--skip-notice-screen") {
+			if (!ParseBool(value, options.config.skip_notice_screen)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

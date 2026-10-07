@@ -471,14 +471,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
-	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
-	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
-	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
@@ -497,6 +489,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
+	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}

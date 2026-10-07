@@ -31,11 +31,12 @@ void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }
 
-void Translator::V_MED3_I16(const Decoder::Instruction& inst) {
+void Translator::Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                  bool sign) {
 	const auto result = IR::U32(ir.Emit(
-	    IR::ValueOpcode::SMedTri32, {ReadU16AsU32(inst.src0, true), ReadU16AsU32(inst.src1, true),
-	                                 ReadU16AsU32(inst.src2, true)}));
-	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
+	    opcode, {ReadU16AsU32(inst.src0, sign), ReadU16AsU32(inst.src1, sign),
+	             ReadU16AsU32(inst.src2, sign)}));
+	Write16Bits(DestinationOperand(inst), result);
 }
 
 void Translator::PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
@@ -114,6 +115,7 @@ void Translator::S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode lo
 		return;
 	}
 
+	// Descriptor tracking reasons about each scalar word independently.
 	const auto lhs        = ReadU32Pair(inst.src0);
 	auto       mask_valid = ReadMaskValid(inst.src0);
 	if (inst.src_count > 1u) {
@@ -269,22 +271,18 @@ void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool add
 }
 
 void Translator::V_MAD_U64_U32(const Decoder::Instruction& inst) {
-	const auto lhs       = ReadU32(inst.src0);
-	const auto rhs       = ReadU32(inst.src1);
-	const auto add       = ExtractU64(ReadU64(inst.src2));
-	const auto mul_low   = ir.IMul(lhs, rhs);
-	const auto mul_high  = IR::U32(ir.Emit(IR::ValueOpcode::UMulHi, {lhs, rhs}));
-	const auto low       = ir.IAdd(mul_low, add[0]);
-	const auto carry_low = ir.ULessThan(low, mul_low);
-	const auto high0     = ir.IAdd(mul_high, add[1]);
-	const auto carry0    = ir.ULessThan(high0, mul_high);
-	const auto high =
-	    ir.IAdd(high0, ir.Select(carry_low, IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u))));
-	const auto carry1 = ir.ULessThan(high, high0);
-	WriteOperand(DestinationOperand(inst), ir.ConstructU64(low, high));
+	const auto lhs = ReadU32(inst.src0);
+	const auto rhs = ReadU32(inst.src1);
+	// Keep the 32x32 product in words: native widening IMul64 fails NVIDIA compilation
+	// in large vertex shaders (Astro's Playroom). The 64-bit addition stays native.
+	const auto product = ir.ConstructU64(
+	    ir.IMul(lhs, rhs), IR::U32(ir.Emit(IR::ValueOpcode::UMulHi, {lhs, rhs})));
+	const auto result  = ir.Emit(IR::ValueOpcode::IAdd64, {product, ReadU64(inst.src2)});
+	WriteOperand(DestinationOperand(inst), result);
 	if (inst.dst2.kind != Decoder::OperandKind::Null &&
 	    inst.dst2.kind != Decoder::OperandKind::Unknown) {
-		WriteMask(inst.dst2, ir.LogicalOr(carry0, carry1));
+		// The 32x32 product fits in 64 bits, so only the addition can carry.
+		WriteMask(inst.dst2, IR::U1(ir.Emit(IR::ValueOpcode::ULessThan64, {result, product})));
 	}
 }
 
@@ -407,9 +405,12 @@ IR::U64 Translator::RightMask64(IR::U32 count) {
 }
 
 void Translator::S_BFM_B64(const Decoder::Instruction& inst) {
-	const auto count  = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(63u)));
-	const auto offset = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(63u)));
-	const auto result = ir.Emit(IR::ValueOpcode::ShiftLeftLogical64, {RightMask64(count), offset});
+	const auto count  = ReadU32(inst.src0);
+	const auto offset = ReadU32(inst.src1);
+	const auto one    = IR::Value(uint64_t {1});
+	const auto limit  = ir.Emit(IR::ValueOpcode::ShiftLeftLogical64, {one, count});
+	const auto mask   = ir.Emit(IR::ValueOpcode::ISub64, {limit, one});
+	const auto result = ir.Emit(IR::ValueOpcode::ShiftLeftLogical64, {mask, offset});
 	WriteOperand(DestinationOperand(inst), result);
 }
 

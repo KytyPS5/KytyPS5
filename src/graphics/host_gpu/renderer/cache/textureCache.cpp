@@ -1962,6 +1962,11 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	return true;
 }
 
+bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return !FindImagesInRegion(address, size, false).empty();
+}
+
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");

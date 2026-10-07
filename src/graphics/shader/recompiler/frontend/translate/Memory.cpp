@@ -129,8 +129,9 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	// Vector loads use GLC/DLC to bypass L0/GL1; atomics use GLC only to return data.
 	const bool buffer_atomic = decoded.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
 	                           decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX;
-	memory.coherent = memory.kind == ResourceKind::Buffer && !buffer_atomic &&
-	                  (decoded.glc || decoded.dlc);
+	memory.coherent = (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::Flat ||
+	                   memory.kind == ResourceKind::Global) &&
+	                  !buffer_atomic && (decoded.glc || decoded.dlc);
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
@@ -186,7 +187,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 	if (decoded.family == Decoder::Family::MUBUF || decoded.family == Decoder::Family::MTBUF) {
 		const bool store_or_atomic =
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_X &&
-		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW) ||
+		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_BYTE &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_DWORDX4) ||
 		    (decoded.opcode >= Decoder::Opcode::TBUFFER_STORE_FORMAT_X &&
@@ -426,7 +427,7 @@ void Translator::S_LOAD(const Decoder::Instruction& inst, bool raw) {
 void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	const auto      memory = MemoryInfoFromDecoded(inst);
 	IR::ValueOpcode opcode;
-	const auto      bits = memory.data_bits;
+	const auto      bits = memory.formatted ? 32u : memory.data_bits;
 	const auto      sign = memory.data_signed;
 	switch (bits) {
 		case 8u: opcode = IR::ValueOpcode::LoadBufferU8; break;
@@ -472,7 +473,8 @@ void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 	const auto      data     = ReadU32(data_src);
 	IR::ValueOpcode opcode;
 	IR::Value       value;
-	switch (memory.data_bits) {
+	// Formatted stores carry packed VGPR bits; the format determines their conversion.
+	switch (memory.formatted ? 32u : memory.data_bits) {
 		case 8u:
 			opcode = IR::ValueOpcode::StoreBufferU8;
 			value  = NarrowSubdword(data, 8u);
@@ -882,6 +884,50 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 	                                ReadU32(MemorySourceAt(inst, 1)), ir.GetExec()}));
 }
 
+void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
+	// Approximate ordered counting with one GDS atomic per wave. Wave-launch ordering and
+	// release/done synchronization are not emulated.
+	const auto memory = MemoryInfoFromDecoded(inst);
+	const auto m0 = ir.GetM0();
+	auto address = ir.BitwiseAnd(ir.ShiftRightLogical(m0, IR::U32(IR::Value(16u))),
+	                             IR::U32(IR::Value(0xfffcu)));
+	if (((inst.secondary_offset >> 2u) & 3u) == 1u) {
+		const auto packer = ir.BitwiseAnd(m0, IR::U32(IR::Value(0xfu)));
+		address = ir.IAdd(address, ir.ShiftLeftLogical(packer, IR::U32(IR::Value(2u))));
+	}
+	const auto exec   = ir.GetExec();
+	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {exec});
+	const auto low = ir.CompositeExtract(ballot, 0u);
+	const auto high = ir.CompositeExtract(ballot, 1u);
+	const auto active = ir.INotEqual(ir.BitwiseOr(low, high), IR::U32(IR::Value(0u)));
+	const auto first = ir.Select(
+	    ir.INotEqual(low, IR::U32(IR::Value(0u))),
+	    IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {low})),
+	    ir.IAdd(IR::U32(IR::Value(32u)), IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {high}))));
+	// An empty EXEC still returns the counter. Elect lane zero and perform an add of zero.
+	const auto selected = ir.Select(active, first, IR::U32(IR::Value(0u)));
+	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	const auto is_first = ir.IEqual(lane, selected);
+	const auto source = IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane,
+	                                   {ReadU32(inst.src0), is_first}));
+	const auto value = ir.Select(active, source, IR::U32(IR::Value(0u)));
+	const auto flags = AddMemoryInfo(memory, inst.pc);
+	IR::U32 result;
+	if (((inst.secondary_offset >> 4u) & 3u) == 1u) {
+		const auto swapped = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicSwap32,
+		    {address, value, ir.LogicalAnd(is_first, active)}, flags));
+		const auto unchanged = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
+		    {address, IR::Value(0u), ir.LogicalAnd(is_first, ir.LogicalNot(active))}, flags));
+		result = ir.Select(active, swapped, unchanged);
+	} else {
+		result = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
+		                        {address, value, is_first}, flags));
+	}
+	// DS_ORDERED_COUNT writes every destination lane, regardless of EXEC.
+	ir.SetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg),
+	    IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane, {result, is_first})));
+}
+
 void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 	const auto address = ir.IAdd(ReadU32(inst.src0), IR::U32(IR::Value(inst.offset)));
 	WriteOperand(inst.dst, ir.Emit(backward ? IR::ValueOpcode::BpermuteU32
@@ -935,6 +981,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:
@@ -950,6 +997,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
@@ -1113,6 +1161,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_SWIZZLE_B32: return DS_SWIZZLE_B32(inst);
 		case Decoder::Opcode::DS_PERMUTE_B32: return DS_PERMUTE(inst, false);
 		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_PERMUTE(inst, true);
+		case Decoder::Opcode::DS_ORDERED_COUNT: return DS_ORDERED_COUNT(inst);
 		case Decoder::Opcode::DS_CONSUME:
 			return DS_APPEND_CONSUME(inst, IR::ValueOpcode::DataConsume);
 		case Decoder::Opcode::DS_APPEND:

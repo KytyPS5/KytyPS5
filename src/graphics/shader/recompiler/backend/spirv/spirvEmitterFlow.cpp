@@ -444,16 +444,16 @@ uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto quad_bits   = state.builder.AllocateId();
 	const auto result      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU64(state), shifted_one, value,
-	                          ConstantU64(state, 0x0000000100000001ull));
+	                          ConstantU32(state, 1));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU64(state), merged_one, value, shifted_one);
 	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU64(state), shifted_two, merged_one,
-	                          ConstantU64(state, 0x0000000200000002ull));
+	                          ConstantU32(state, 2));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU64(state), merged_two, merged_one,
 	                          shifted_two);
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU64(state), quad_bits, merged_two,
 	                          ConstantU64(state, 0x1111111111111111ull));
 	state.builder.AddFunction(spv::OpIMul, TypeU64(state), result, quad_bits,
-	                          ConstantU64(state, 0x0000000f0000000full));
+	                          ConstantU64(state, 15));
 	return result;
 }
 

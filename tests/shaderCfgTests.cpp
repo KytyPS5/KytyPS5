@@ -3669,6 +3669,39 @@ void TestNewShaderRecompilerVop1SdwaBfrev() {
   }
 }
 
+void TestVop2SdwaMulI24Destination() {
+  using namespace ShaderRecompiler::Decoder;
+  const uint32_t captured[][2] = {
+      {0x121818f9u, 0x04861488u}, {0x123434f9u, 0x0486146au}};
+  for (uint32_t index = 0; index < 2; ++index) {
+    Instruction decoded;
+    DecodeInstruction(captured[index], 0, decoded);
+    const uint32_t reg = index == 0 ? 12u : 26u;
+    Check(decoded.opcode == Opcode::V_MUL_I32_I24 && decoded.word_count == 2 &&
+              decoded.dst.kind == OperandKind::Vgpr && decoded.dst.reg == reg &&
+              decoded.dst.sdwa_sel == 4 && decoded.dst.sdwa_dst_unused == 2 &&
+              decoded.dst.explicit_sdwa_dst && !decoded.dst.clamp &&
+              decoded.dst.omod == 0 && decoded.src0.sdwa_sel == 6 &&
+              decoded.src1.kind == OperandKind::Vgpr && decoded.src1.reg == reg &&
+              decoded.src1.sdwa_sel == 4 && !decoded.src1.sdwa_sext,
+          "captured V_MUL_I32_I24 SDWA destination/source metadata is incorrect");
+    Check(index == 0 ? decoded.src0.kind == OperandKind::IntegerInlineConstant &&
+                           decoded.src0.value == 8
+                     : decoded.src0.kind == OperandKind::VccLo,
+          "captured V_MUL_I32_I24 SDWA scalar source is incorrect");
+  }
+  for (const uint32_t modifier : {
+           0x04861788u, 0x04861c88u, 0x04871488u, 0x07861488u,
+           0x04961488u, 0x04a61488u, 0x14861488u, 0x24861488u,
+           0x04863488u, 0x04865488u}) {
+    const uint32_t invalid[] = {captured[0][0], modifier};
+    Instruction decoded;
+    DecodeInstruction(invalid, 0, decoded);
+    Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.word_count == 2,
+          "V_MUL_I32_I24 SDWA accepted reserved selectors or float modifiers");
+  }
+}
+
 void TestNewShaderRecompilerVop1SdwaNotDestination() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
 
@@ -4860,6 +4893,46 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   Check((result.decoded_dump.find("V_CMPX_CLASS_F32 exec_lo, v13, vcc_lo") != std::string::npos),
         "captured SDWA V_CMPX_CLASS_F32 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestVopcCmpxClassF16Decoder() {
+  using namespace ShaderRecompiler::Decoder;
+  for (const uint32_t modifier : {0x86360000u, 0x86350002u}) {
+    const uint32_t captured[] = {0x7d3f70f9u, modifier};
+    Instruction decoded;
+    DecodeInstruction(captured, 0, decoded);
+    Check(decoded.opcode == Opcode::V_CMPX_CLASS_F16 && decoded.word_count == 2 &&
+              decoded.dst.kind == OperandKind::ExecLo &&
+              decoded.src0.kind == OperandKind::Vgpr &&
+              decoded.src0.reg == (modifier == 0x86360000u ? 0u : 2u) &&
+              decoded.src0.sdwa_sel == (modifier == 0x86360000u ? 6u : 5u) &&
+              decoded.src0.absolute && decoded.src0.negate &&
+              decoded.src1.kind == OperandKind::IntegerInlineConstant &&
+              decoded.src1.value == 56 && decoded.src1.sdwa_sel == 6,
+          "captured V_CMPX_CLASS_F16 SDWA fields are incorrect");
+    const uint32_t shader[] = {captured[0], captured[1], EncodeSopp(0x01)};
+    auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+  const uint32_t compact[] = {EncodeVopc(0x9f, 256, 1)};
+  const uint32_t vop3[] = {EncodeVop3Word0(0x9f, 126),
+                           EncodeVop3Word1(256, 257, 0)};
+  for (auto words : {std::span<const uint32_t>(compact),
+                     std::span<const uint32_t>(vop3)}) {
+    Instruction decoded;
+    DecodeInstruction(words, 0, decoded);
+    Check(decoded.opcode == Opcode::V_CMPX_CLASS_F16 &&
+              decoded.dst.kind == OperandKind::ExecLo && decoded.src0.reg == 0 &&
+              decoded.src1.kind == OperandKind::Vgpr && decoded.src1.reg == 1,
+          "compact/VOP3 V_CMPX_CLASS_F16 did not decode to an EXEC compare");
+  }
+  for (const uint32_t modifier : {0x86370000u, 0x87360000u}) {
+    const uint32_t invalid[] = {0x7d3f70f9u, modifier};
+    Instruction decoded;
+    DecodeInstruction(invalid, 0, decoded);
+    Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.word_count == 2,
+          "V_CMPX_CLASS_F16 accepted reserved SDWA selector 7");
+  }
 }
 
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16() {
@@ -7870,7 +7943,7 @@ void TestNewShaderRecompilerStructuredU64Phi() {
   const auto after = MeasureSpirv(spirv);
   Check(after.phis == before.phis + 1u &&
             after.function_variables == before.function_variables,
-        "structured U64 Phi was not emitted as a native vector OpPhi");
+        "structured U64 Phi was not emitted as a native scalar OpPhi");
 }
 
 void TestNewShaderRecompilerCfgTerminalExitMergePS() {
@@ -9794,7 +9867,7 @@ void TestNewShaderRecompilerPlanningOnlyLoads() {
         "planning-only loads or references emitted GPU operands/instructions");
 }
 
-void TestNewShaderRecompilerU64PairTranslation() {
+void TestNewShaderRecompilerNativeU64Translation() {
   using namespace ShaderRecompiler;
 
   auto options = MakeCompileOptions(ShaderType::Compute);
@@ -9924,20 +9997,23 @@ void TestNewShaderRecompilerU64PairTranslation() {
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, options.input_info);
   CheckSpirvBinaryValidates(spirv);
   const auto source = DisassembleSpirvBinary(spirv);
-  Check((source.find("OpCapability Int64") == std::string::npos) &&
-            (source.find("OpTypeInt 64") == std::string::npos),
-        "portable pair-U64 translation introduced native shader Int64");
-  Check(SpirvInstructionOpcodeCount(spirv, 149u) == 1u,
-        "pair-U64 addition did not use exactly one carry instruction");
-  Check(SpirvInstructionOpcodeCount(spirv, 154u) == 1u &&
-            SpirvInstructionOpcodeCount(spirv, 155u) == 1u,
-        "pair-U64 equality did not reduce its vector comparison with Any/All");
+  Check(source.find("OpCapability Int64") != std::string::npos &&
+            source.find("OpTypeInt 64 0") != std::string::npos &&
+            SpirvSourceHasInstructionUsing(source, "OpIAdd", "%ulong") &&
+            SpirvSourceHasInstructionUsing(source, "OpIMul", "%ulong") &&
+            SpirvSourceHasInstructionUsing(source, "OpBitwiseAnd", "%ulong"),
+        "U64 arithmetic did not emit native 64-bit scalar instructions");
+  Check(SpirvInstructionOpcodeCount(spirv, spv::OpIAddCarry) == 0u &&
+            SpirvInstructionOpcodeCount(spirv, spv::OpUMulExtended) == 0u &&
+            SpirvInstructionOpcodeCount(spirv, spv::OpAny) == 0u &&
+            SpirvInstructionOpcodeCount(spirv, spv::OpAll) == 0u,
+        "native U64 arithmetic retained split-word operations");
   const auto direct_metrics = MeasureSpirv(spirv);
-  Check(
-      direct_metrics.words <= 940u && direct_metrics.instructions <= 199u &&
-          direct_metrics.type_vectors == 2u && direct_metrics.phis == 0u &&
-          direct_metrics.function_variables == 0u,
-      "portable pair-U64 translation exceeded its declaration/code-size ratchet");
+  // The same fixture required 864 words and 182 instructions with split U64s.
+  Check(direct_metrics.words <= 285u && direct_metrics.instructions <= 67u &&
+            direct_metrics.phis == 0u &&
+            direct_metrics.function_variables == 0u,
+        "native U64 translation exceeded its declaration/code-size ratchet");
 
   const uint32_t dispatcher_shader[] = {
       EncodeSopp(0x05, 2),       EncodeSopp(0x02, 0), EncodeSopp(0x05, 0xfffeu),
@@ -9962,7 +10038,39 @@ void TestNewShaderRecompilerU64PairTranslation() {
   Check(after.function_variables == before.function_variables + 1u &&
             after.loads == before.loads + 1u &&
             after.stores == before.stores + 1u,
-        "dispatcher did not use one canonical U64 vector spill slot");
+        "dispatcher did not use one canonical U64 scalar spill slot");
+}
+
+
+void TestVertexMadU64UsesPortableProduct() {
+  using StageInputKind = ShaderRecompiler::IR::StageInputKind;
+  for (const bool dynamic_addend : {false, true}) {
+    const uint32_t shader[] = {
+        EncodeVop1(0x01, 6,
+                   8 + 256), // Dynamic addend is [VertexIndex, InstanceIndex].
+        EncodeVop3Word0Sdst(0x176, 0, 20),
+        EncodeVop3Word1(5 + 256, 8 + 256, dynamic_addend ? 5 + 256 : 128),
+        EncodeExp0(0x0c, 0x3),
+        EncodeExp1(0, 1, 0, 0), // POS0.xy keeps both product words live.
+        EncodeSopp(0x01),
+    };
+    const auto result =
+        RecompileForTest(shader, MakeCompileOptions(ShaderType::Vertex));
+    Check(ProgramHasInput(result.program, StageInputKind::VertexIndex) &&
+              ProgramHasInput(result.program, StageInputKind::InstanceIndex),
+          "vertex MAD fixture lost its runtime multiplication operands");
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    // Large vertex shaders on NVIDIA rejected native widening multiplication.
+    Check(SpirvInstructionOpcodeCount(result.spirv, spv::OpUMulExtended) ==
+                  1u &&
+              SpirvSourceHasInstructionUsing(source, "OpIMul", "%uint") &&
+              !SpirvSourceHasInstructionUsing(source, "OpIMul", "%ulong"),
+          "vertex MAD lost its portable 32x32 product");
+    Check(!dynamic_addend ||
+              SpirvSourceHasInstructionUsing(source, "OpIAdd", "%ulong"),
+          "vertex MAD split its live 64-bit addition into word operations");
+  }
 }
 
 void TestComputeDispatchWaveSize() {
@@ -12059,7 +12167,8 @@ void TestU64ShiftConstantPropagation() {
   std::vector<ShiftCase> shift_cases;
   for (const uint64_t source :
        {uint64_t{0x0123456789abcdefull}, uint64_t{0xf123456789abcdefull}}) {
-    for (const uint32_t count : {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u}) {
+    for (const uint32_t count :
+         {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, UINT32_MAX}) {
       const uint32_t amount = count & 63u;
       shift_cases.push_back({shift_ir.Emit(ValueOpcode::ShiftLeftLogical64,
                                            {Value(source), Value(count)}),
@@ -12078,8 +12187,39 @@ void TestU64ShiftConstantPropagation() {
     const auto value = test.value.Resolve();
     Check(value.IsImmediate() && value.GetType() == Type::U64 &&
               value.U64() == test.expected,
-          "pair-U64 shift propagation violated the masked RDNA2 count");
+          "U64 shift propagation violated the masked RDNA2 count");
   }
+}
+
+void TestU64RegisterPairRoundTrip() {
+  using namespace ShaderRecompiler::IR;
+  Program program;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.blocks.push_back(program.block_storage.back().get());
+  IREmitter ir(program.blocks.front());
+  const auto lane = ir.Emit(ValueOpcode::LaneId);
+  const auto pair = ir.Emit(ValueOpcode::CompositeConstructU64, {lane, lane});
+  const auto first = ir.Emit(ValueOpcode::IAdd64, {pair, Value(uint64_t{1})});
+  const auto second = ir.Emit(ValueOpcode::IAdd64, {pair, Value(uint64_t{2})});
+  const auto low =
+      ir.Emit(ValueOpcode::CompositeExtractU64, {first, Value(0u)});
+  const auto high =
+      ir.Emit(ValueOpcode::CompositeExtractU64, {first, Value(1u)});
+  const auto other_high =
+      ir.Emit(ValueOpcode::CompositeExtractU64, {second, Value(1u)});
+  const auto restored =
+      ir.Emit(ValueOpcode::CompositeConstructU64, {low, high});
+  const auto swapped = ir.Emit(ValueOpcode::CompositeConstructU64, {high, low});
+  const auto mixed =
+      ir.Emit(ValueOpcode::CompositeConstructU64, {low, other_high});
+  ConstantPropagationPass(program.blocks);
+  Check(restored.Resolve() == first.Resolve(),
+        "unchanged SGPR pair did not retain its native U64 value");
+  Check(swapped.Resolve().Instruction()->GetOpcode() ==
+                ValueOpcode::CompositeConstructU64 &&
+            mixed.Resolve().Instruction()->GetOpcode() ==
+                ValueOpcode::CompositeConstructU64,
+        "modified SGPR pair incorrectly reused an unrelated native U64 value");
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -14815,6 +14955,7 @@ int main() {
   TestNewShaderRecompilerF64AluEncodings();
   TestNewShaderRecompilerVop1SdwaBfrev();
   TestNewShaderRecompilerVop1SdwaNotDestination();
+  TestVop2SdwaMulI24Destination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
@@ -14827,6 +14968,7 @@ int main() {
   TestSopkCompareImmediateExtension();
   TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
+  TestVopcCmpxClassF16Decoder();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
@@ -14887,7 +15029,8 @@ int main() {
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerPlanningOnlyLoads();
-  TestNewShaderRecompilerU64PairTranslation();
+  TestNewShaderRecompilerNativeU64Translation();
+  TestVertexMadU64UsesPortableProduct();
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
@@ -14912,6 +15055,7 @@ int main() {
   TestValuePhiValidation();
   TestWave32MaskProjection();
   TestU64ShiftConstantPropagation();
+  TestU64RegisterPairRoundTrip();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
 #endif

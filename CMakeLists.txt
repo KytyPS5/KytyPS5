@@ -674,15 +674,12 @@ if(BUILD_TESTING)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
-	if(WIN32)
-		# These tests still depend on the Windows multisample-depth path.
-		add_test(NAME texture_cache_image_overlap
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
-		add_test(NAME texture_cache_htile_clear
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
-		add_test(NAME buffer_cache_ranges
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
-	endif()
+	add_test(NAME texture_cache_image_overlap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
+	add_test(NAME texture_cache_htile_clear
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
+	add_test(NAME buffer_cache_ranges
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests

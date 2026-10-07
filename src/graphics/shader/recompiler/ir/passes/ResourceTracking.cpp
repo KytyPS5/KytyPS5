@@ -1731,7 +1731,7 @@ private:
 		indirect.table_immediate = table_immediate;
 		indirect.table_stride = table_stride;
 		indirect.workgroup_axis = WorkgroupAxis(key);
-		if (indirect.workgroup_axis != UINT32_MAX && table_source.dword_count == 2u) {
+		if (indirect.workgroup_axis != UINT32_MAX && !plan.table_indexed) {
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.retain_reads = true;

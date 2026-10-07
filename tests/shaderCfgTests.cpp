@@ -6539,6 +6539,7 @@ void TestPerspectiveCentroidInputs() {
     ShaderMapUserData(regs.ps_regs.data_addr, mapped);
     HW::ShaderRegisters sh{};
     sh.ps_input_ena = sh.ps_input_addr = inputs;
+    sh.m_cbShaderMask = 0xf;
     const std::array<Prospero::ColorComponentMapping, 8> mappings{};
     ShaderPixelInputInfo pixel{};
     (void)PrepareProgram(regs, sh, mappings, pixel);
@@ -6566,6 +6567,47 @@ void TestPerspectiveCentroidInputs() {
       Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float "),
             "center pair lost its ordinary barycentric loads when centroid was enabled");
     }
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestPerspectiveSampleInputs() {
+  for (const uint32_t inputs : {1u, 3u, 5u, 7u}) {
+    const std::vector<uint32_t> shader = {
+        EncodeExp0(0x00, 0xf),
+        EncodeExp1(0, 1, inputs == 1 ? 0 : 2, inputs == 1 ? 1 : 3),
+        EncodeSopp(0x01)};
+    HW::PixelShaderInfo regs{};
+    regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
+    ShaderMappedData mapped{};
+    mapped.code_size_bytes = shader.size() * sizeof(uint32_t);
+    ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+    HW::ShaderRegisters sh{};
+    sh.ps_input_ena = sh.ps_input_addr = inputs;
+    sh.m_cbShaderMask = 0xf;
+    const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+    ShaderPixelInputInfo pixel{};
+    (void)PrepareProgram(regs, sh, mappings, pixel);
+    Check(pixel.ps_perspective_sample_vgpr == 0 &&
+              pixel.ps_system_input_base == 2u * std::popcount(inputs),
+          "perspective sample pair did not occupy the first enabled VGPRs");
+    const auto key = MakeStageStaticKey(pixel);
+    pixel.ps_perspective_sample_vgpr = UINT32_MAX;
+    Check(key != MakeStageStaticKey(pixel), "sample input is missing from shader key");
+    pixel.ps_perspective_sample_vgpr = 0;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &pixel;
+    const auto result = RecompileForTest(shader, options);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(SpirvContainsCapability(result.spirv, 52u) &&
+              SpirvHasDecorationValue(result.spirv, 11u, 18u) &&
+              source.find("InterpolateAtSample %gl_BaryCoordKHR") != std::string::npos &&
+              SpirvSourceHasInstructionUsing(source, "OpLoad", "%int %gl_SampleID") &&
+              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
+              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
+          "sample I/J did not evaluate BaryCoordKHR Y/Z at SampleId");
+    Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u),
+          "sample interpolation changed the shared barycentric input location");
     CheckSpirvBinaryValidates(result.spirv);
   }
 }
@@ -10573,6 +10615,32 @@ void TestMergedShaderUserDataSnapshot() {
   regs.gs_user_sgpr.value[HW::UserSgprInfo::SGPRS_MAX - 1]++;
   Check(full.user_data.back() == 0x10001000u + HW::UserSgprInfo::SGPRS_MAX - 1,
         "merged shader parameters borrowed mutable register storage");
+  regs.gs_regs.rsrc2.lds_size = 64;
+  regs.gs_regs.rsrc1.gs_vgpr_component_count = 1;
+  context.SetGsMaxVertOut(0);
+  for (const uint32_t wave_size : {32u, 64u}) {
+    context.SetShaderStages(wave_size == 32 ? 0x00400000u : 0u);
+    for (const uint16_t capacity : {64u, 128u, 256u}) {
+      context.SetMaxOutputPerSubgroup(capacity);
+      user_config.SetGeControl({capacity, capacity});
+      ShaderVertexInputInfo input{};
+      const auto params = PrepareProgram(regs, context, user_config, input);
+      Check(input.logical_stage == ShaderType::Mesh && input.mesh.wave_size == wave_size &&
+                input.mesh.lds_size_dwords == 8192 && input.mesh.max_vertices == capacity &&
+                input.mesh.max_primitives == capacity / 3 &&
+                input.mesh.primitives_per_group == capacity / 3 &&
+                input.mesh.vertices_per_group == capacity / 3 * 3 &&
+                input.mesh.threads_num[0] == capacity && params.back_code.empty() &&
+                params.user_data_count == 8u + HW::UserSgprInfo::SGPRS_MAX &&
+                params.user_data[0] == 0 && params.user_data[1] == 0 &&
+                std::equal(std::begin(regs.gs_user_sgpr.value), std::end(regs.gs_user_sgpr.value),
+                           params.user_data.begin() + 8),
+            "non-amplifying NGG shader lost its workgroup, GE bounds, or native user SGPRs");
+    }
+  }
+  regs.gs_regs.rsrc2.lds_size = 0;
+  regs.gs_regs.rsrc1.gs_vgpr_component_count = 3;
+  context.SetShaderStages(0x20);
   context.SetMaxOutputPerSubgroup(256);
   context.SetGsMaxVertOut(8);
   user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriFan);
@@ -10830,7 +10898,7 @@ void TestMeshInputAssembly() {
   struct Case {
     Prospero::PrimitiveType topology;
     uint32_t capacity, count, group, lane, width, address_low, base_vertex;
-    uint32_t wave_info, first, second, third, byte_offset, vertex_id;
+    uint32_t wave_info, group_info, first, second, third, byte_offset, vertex_id;
     bool fetch;
     uint32_t wave_size = 64;
     bool fast_launch = false;
@@ -10838,51 +10906,63 @@ void TestMeshInputAssembly() {
   };
   std::vector<Case> cases = {
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
-       0x40000309, 6, 7, 8, 340, 0xabcc, true},
+       0x40000309, 0x00c09000, 6, 7, 8, 340, 0xabcc, true},
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 9, 2, 0x1002, 0,
-       0x40000309, 27, 28, 29, 356, 0, false},
+       0x40000309, 0x00c09000, 27, 28, 29, 356, 0, false},
       {Prospero::PrimitiveType::kTriList, 8, 180, 0, 64, 2, 0x1002, 0,
-       0x41000000, 192, 193, 194, 128, 0, false},
+       0x41000000, 0x00806000, 192, 193, 194, 128, 0, false},
       {Prospero::PrimitiveType::kTriList, 8, 180, 1, 1, 1, 0x1000, 5,
-       0x40000206, 3, 4, 5, 4, 0xb0, true},
+       0x40000206, 0x00806000, 3, 4, 5, 4, 0xb0, true},
       {Prospero::PrimitiveType::kTriList, 8, 180, 1, 1, 4, 0x1000, 5,
-       0x40000206, 3, 4, 5, 28, 0xabcd0128, true},
+       0x40000206, 0x00806000, 3, 4, 5, 28, 0xabcd0128, true},
       {Prospero::PrimitiveType::kTriStrip, 5, 8, 1, 1, 0, 0, 11,
-       0x40000305, 1, 2, 3, 0, 15, false},
+       0x40000305, 0x00c05000, 1, 2, 3, 0, 15, false},
       {Prospero::PrimitiveType::kTriStrip, 5, 8, 0, 1, 0, 0, 11,
-       0x40000305, 2, 1, 3, 0, 12, false},
+       0x40000305, 0x00c05000, 2, 1, 3, 0, 12, false},
       {Prospero::PrimitiveType::kTriFan, 32, 6, 0, 3, 2, 0x1002, 0,
-       0x40000406, 0, 4, 5, 8, 0x0123, true},
+       0x40000406, 0x01006000, 0, 4, 5, 8, 0x0123, true},
       {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 0, 2, 0x1002, 0,
-       0x40000305, 0, 1, 2, 0, 0xabcd, true},
+       0x40000305, 0x00c05000, 0, 1, 2, 0, 0xabcd, true},
       {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 1, 0, 0, 11,
-       0x40000305, 0, 2, 3, 0, 15, false},
+       0x40000305, 0x00c05000, 0, 2, 3, 0, 15, false},
       {Prospero::PrimitiveType::kTriFan, 5, 7, 1, 3, 2, 0x1002, 11,
-       0x40000204, 0, 4, 5, 12, 0xabd8, true},
+       0x40000204, 0x00804000, 0, 4, 5, 12, 0xabd8, true},
       {Prospero::PrimitiveType::kTriFan, 5, 7, 1, 4, 2, 0x1002, 0,
-       0x40000204, 0, 5, 6, 16, 0, false},
+       0x40000204, 0x00804000, 0, 5, 6, 16, 0, false},
       {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 64, 4, 0x1000, 0,
-       0x41000000, 0, 65, 66, 268, 0, false},
+       0x41000000, 0x00c05000, 0, 65, 66, 268, 0, false},
       {Prospero::PrimitiveType::kLineList, 5, 17, 3, 0, 0, 0, 11,
-       0x40000204, 0, 1, 0, 0, 23, false},
+       0x40000204, 0x00804000, 0, 1, 0, 0, 23, false},
       {Prospero::PrimitiveType::kLineList, 6, 17, 2, 4, 2, 0x1002, 11,
-       0x40000205, 8, 9, 0, 32, 0xabd8, true},
+       0x40000205, 0x00805000, 8, 9, 0, 32, 0xabd8, true},
       {Prospero::PrimitiveType::kLineList, 6, 17, 2, 5, 2, 0x1002, 0,
-       0x40000205, 10, 11, 0, 36, 0, false},
+       0x40000205, 0x00805000, 10, 11, 0, 36, 0, false},
       {Prospero::PrimitiveType::kLineList, 8, 180, 1, 64, 4, 0x1000, 0,
-       0x41000000, 128, 129, 0, 288, 0, false},
+       0x41000000, 0x01008000, 128, 129, 0, 288, 0, false},
       {Prospero::PrimitiveType::kPointList, 12, 265, 22, 0, 2, 0x1002, 0,
-       0x40000101, 0, 0, 0, 528, 0xabcd, true},
+       0x40000101, 0x00401000, 0, 0, 0, 528, 0xabcd, true},
       {Prospero::PrimitiveType::kPointList, 12, 265, 22, 1, 2, 0x1002, 0,
-       0x40000101, 1, 0, 0, 532, 0, false},
+       0x40000101, 0x00401000, 1, 0, 0, 532, 0, false},
       {Prospero::PrimitiveType::kPointList, 1, 1, 0, 0, 0, 0, 11,
-       0x40000101, 0, 0, 0, 0, 11, false},
+       0x40000101, 0x00401000, 0, 0, 0, 0, 11, false},
       {Prospero::PrimitiveType::kPointList, 12, 265, 1, 1, 4, 0x1000, 5,
-       0x40000c0c, 1, 0, 0, 52, 0xabcd0128, true},
+       0x40000c0c, 0x0300c000, 1, 0, 0, 52, 0xabcd0128, true},
       {Prospero::PrimitiveType::kPointList, 12, 265, 1, 64, 4, 0x1000, 0,
-       0x41000000, 64, 0, 0, 304, 0, false},
+       0x41000000, 0x0300c000, 64, 0, 0, 304, 0, false},
       {Prospero::PrimitiveType::kTriStrip, 40, 40, 0, 32, 0, 0, 11,
-       0x81000608, 32, 33, 34, 0, 43, false, 32},
+       0x81000608, 0x09828000, 32, 33, 34, 0, 43, false, 32},
+      {Prospero::PrimitiveType::kTriList, 64, 64, 0, 0, 0, 0, 11,
+       0x1000153f, 0x0543f000, 0, 1, 2, 0, 11, false, 64, false, 64},
+      {Prospero::PrimitiveType::kTriList, 128, 128, 0, 64, 0, 0, 11,
+       0x2100003e, 0x0a87e000, 192, 193, 194, 0, 75, false, 64, false, 128},
+      {Prospero::PrimitiveType::kTriList, 256, 256, 0, 192, 0, 0, 11,
+       0x4300003f, 0x154ff000, 576, 577, 578, 0, 203, false, 64, false, 256},
+      {Prospero::PrimitiveType::kTriList, 64, 64, 0, 32, 0, 0, 11,
+       0x2100001f, 0x0543f000, 96, 97, 98, 0, 43, false, 32, false, 64},
+      {Prospero::PrimitiveType::kTriList, 128, 128, 0, 32, 0, 0, 11,
+       0x41000a20, 0x0a87e000, 96, 97, 98, 0, 43, false, 32, false, 128},
+      {Prospero::PrimitiveType::kTriList, 256, 256, 0, 64, 0, 0, 11,
+       0x82001520, 0x154ff000, 192, 193, 194, 0, 75, false, 32, false, 256},
   };
   for (const uint32_t wave_size : {32u, 64u}) {
     for (const uint32_t threads : {wave_size, 2u * wave_size}) {
@@ -10893,7 +10973,7 @@ void TestMeshInputAssembly() {
                                      (lane < wave_size ? 0x101u : 0u);
           const uint32_t base_vertex = group == 11u ? UINT32_MAX : 11u;
           cases.push_back({Prospero::PrimitiveType::kPointList, 1, 12, group, lane, 0, 0,
-                           base_vertex, wave_info, 0, 0, 0, 0, group + base_vertex, false,
+                           base_vertex, wave_info, 0x00401000, 0, 0, 0, 0, group + base_vertex, false,
                            wave_size, true, threads});
         }
       }
@@ -10956,15 +11036,16 @@ void TestMeshInputAssembly() {
       ConstantPropagationPass(program.blocks);
     }
     std::array<uint32_t, 9> vgprs{};
-    uint32_t sgpr3 = 0;
+    std::array<uint32_t, 4> sgprs{};
     for (const auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
         vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
       } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
-        sgpr3 = inst.Arg(1).Resolve().U32();
+        sgprs[RegIndex(inst.Arg(0).ScalarRegister())] = inst.Arg(1).Resolve().U32();
       }
     }
-    Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
+    Check(sgprs[2] == test.group_info && sgprs[3] == test.wave_info &&
+              vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
               vgprs[test.fast_launch ? 6 : 8] == 9u,
           "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
@@ -12981,9 +13062,23 @@ void TestRenderTargetReverseExportMapping() {
         "inactive reverse MRT mapping was not normalized out of the shader "
       "cache key");
   sh.target_output_mode[0] = 4;
+  sh.m_cbShaderMask = 0xf;
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(compiled_info.target_export_mapping[0] == gr32.export_mapping,
       "active reverse MRT mapping was lost before shader specialization");
+  const auto first_slot_key = MakeStageStaticKey(compiled_info);
+  sh.m_cbShaderMask = 0xf000;
+  mappings[3] = gr32.export_mapping;
+  PrepareProgram(regs, sh, mappings, compiled_info);
+  Check(compiled_info.target_shader_mask == sh.m_cbShaderMask &&
+            compiled_info.target_export_mapping[0] == gr32.export_mapping &&
+            first_slot_key != MakeStageStaticKey(compiled_info),
+        "compact MRT ordinal lost its physical export mapping or cache identity");
+  const auto sparse_slot_key = MakeStageStaticKey(compiled_info);
+  sh.m_cbShaderMask = 0x1000;
+  PrepareProgram(regs, sh, mappings, compiled_info);
+  Check(sparse_slot_key == MakeStageStaticKey(compiled_info),
+        "component-only shader mask changes introduced a duplicate shader variant");
 }
 
 void TestBlendMappingClassification() {
@@ -14675,13 +14770,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto structured_result = compile("structured-phi", structured_phi,
-                                         {.words = 140,
-                                          .instructions = 41,
+                                         {.words = 174,
+                                          .instructions = 49,
                                           .phis = 1,
                                           .labels = 8,
                                           .loop_merges = 1,
                                           .branches = 6,
-                                          .conditional_branches = 1});
+                                          .conditional_branches = 1,
+                                          .ballots = 2});
   const auto structured_metrics = MeasureSpirv(structured_result.spirv);
   Check((structured_result.ir_dump.find("Phi") != std::string::npos),
         "structured Phi size fixture no longer contains an IR Phi");
@@ -14692,13 +14788,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(structured_result.spirv);
   const auto structured_repeat =
       compile("structured-phi-repeat", structured_phi,
-              {.words = 140,
-               .instructions = 41,
+              {.words = 174,
+               .instructions = 49,
                .phis = 1,
                .labels = 8,
                .loop_merges = 1,
                .branches = 6,
-               .conditional_branches = 1});
+               .conditional_branches = 1,
+               .ballots = 2});
   Check(structured_repeat.spirv == structured_result.spirv,
         "deferred Phi patching is not deterministic");
 
@@ -14862,8 +14959,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 242,
-                                          .instructions = 67,
+                                         {.words = 255,
+                                          .instructions = 70,
                                           .variables = 3,
                                           .function_variables = 3,
                                           .loads = 3,
@@ -14874,7 +14971,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                           .selection_merges = 1,
                                           .branches = 10,
                                           .conditional_branches = 1,
-                                          .switches = 1});
+                                          .switches = 1,
+                                          .ballots = 1});
   Check(dispatcher_result.program.dispatcher_fallback &&
             (dispatcher_result.ir_dump.find("Phi") != std::string::npos) &&
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 2u &&
@@ -15054,6 +15152,7 @@ int main() {
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
   TestPerspectiveCentroidInputs();
+  TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();

@@ -280,6 +280,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
+				case IR::ValueOpcode::ConditionRef:
+					requirements.subgroup_ballot |=
+					    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
+					break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:

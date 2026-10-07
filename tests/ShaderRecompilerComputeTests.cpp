@@ -41720,6 +41720,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
+  vulkan.CheckBufferCachePrtHoleUpload();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -41736,7 +41737,6 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
-    vulkan.CheckBufferCachePrtHoleUpload();
 #endif
   } else {
     skipped_device_checks = true;

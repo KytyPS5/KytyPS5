@@ -1277,8 +1277,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		if (const auto* owners =
+		        m_image_page_table.Find(desc.info.data.address >> ImagePageTable::kPageBits)) {
+			owners->ForEach([&](ImageId id) {
+				const auto* image = m_slot_images.try_get(id);
+				if (image != nullptr && SameBacking(image->info, desc.info, exact_format)) {
+					result = id;
+				}
+			});
+		}
+		ImageIds candidates;
+		if (!result) {
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		}
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];

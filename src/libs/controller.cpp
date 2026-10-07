@@ -96,6 +96,53 @@ struct ControllerState {
 	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
 };
 
+// A connected pad, the sequence number of its most recent real input (0: none yet), and
+// which of its axes are outside the deadzone.
+struct PadActivity {
+	int      id                                            = -1;
+	uint64_t last_input                                    = 0;
+	bool     axis_outside[static_cast<int>(Axis::AxisMax)] = {};
+};
+
+// The stick deadzone PadGetControllerInformation reports to the game (8000 of 32768), in the
+// 0..255 axis units the pads deliver; sticks rest at 128. Triggers use the same threshold.
+static const int INPUT_DEADZONE = controller_get_axis(-32768, 32767, 8000) - 128;
+
+// The pad with the newest real input is active. Until any pad has input, the first connected
+// pad is active; with no pad connected, the keyboard is.
+static int SelectActivePad(const std::vector<PadActivity>& pads) {
+	int      active   = -1;
+	bool     keyboard = false;
+	uint64_t newest   = 0;
+	for (const auto& pad: pads) {
+		if (pad.id == HOST_INPUT_CONTROLLER_ID) {
+			keyboard = true;
+			continue;
+		}
+		if (active == -1 || pad.last_input > newest) {
+			active = pad.id;
+			newest = pad.last_input;
+		}
+	}
+	if (active != -1) {
+		return active;
+	}
+	return keyboard ? HOST_INPUT_CONTROLLER_ID : -1;
+}
+
+// How far a stick is from centre, or a trigger from rest.
+static int AxisDeflection(Axis axis, int value) {
+	switch (axis) {
+		case Axis::LeftX:
+		case Axis::LeftY:
+		case Axis::RightX:
+		case Axis::RightY: return std::abs(value - 128);
+		case Axis::TriggerLeft:
+		case Axis::TriggerRight: return value;
+		default: return 0;
+	}
+}
+
 class GameController {
 public:
 	GameController() = default;
@@ -127,18 +174,22 @@ private:
 	static constexpr uint32_t STATES_MAX = 64;
 
 	void CheckActive();
+	void NoteRealInput(int id);
+	void NoteAxisInput(int id, Controller::Axis axis, int value);
+	void StopActiveOutput();
 	void AddState();
 	// Apply cached output without changing its game-requested lifetime; caller holds m_mutex.
 	void ApplyVibration();
 	bool SendTriggerEffect(const PadTriggerEffectParam& param);
 
-	Common::Mutex    m_mutex;
-	std::vector<int> m_connected_ids;
-	int              m_active_id       = -1;
-	bool             m_connected       = false;
-	int              m_connected_count = 0;
-	bool             m_motion_enabled  = true;
-	uint64_t         m_gyro_time       = 0;
+	Common::Mutex            m_mutex;
+	std::vector<PadActivity> m_pads;
+	uint64_t                 m_input_sequence  = 0;
+	int                      m_active_id       = -1;
+	bool                     m_connected       = false;
+	int                      m_connected_count = 0;
+	bool                     m_motion_enabled  = true;
+	uint64_t                 m_gyro_time       = 0;
 	// Accelerometer gravity direction in the reset frame.
 	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
 	bool                 m_up_reference_valid = false;
@@ -352,11 +403,12 @@ void EmergencyShutdown() {
 void GameController::Connect(int id) {
 	Common::LockGuard lock(m_mutex);
 
-	if (std::find(m_connected_ids.begin(), m_connected_ids.end(), id) != m_connected_ids.end()) {
+	if (std::find_if(m_pads.begin(), m_pads.end(),
+	                 [id](const PadActivity& pad) { return pad.id == id; }) != m_pads.end()) {
 		return;
 	}
 
-	m_connected_ids.push_back(id);
+	m_pads.push_back({id, 0});
 
 	if (id != HOST_INPUT_CONTROLLER_ID) {
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
@@ -379,31 +431,35 @@ void GameController::Connect(int id) {
 void GameController::Disconnect(int id) {
 	Common::LockGuard lock(m_mutex);
 
-	const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
-	EXIT_IF(it == m_connected_ids.end());
+	const auto it = std::find_if(m_pads.begin(), m_pads.end(),
+	                             [id](const PadActivity& pad) { return pad.id == id; });
+	EXIT_IF(it == m_pads.end());
 
-	m_connected_ids.erase(it);
+	m_pads.erase(it);
 
 	CheckActive();
 }
 
-void GameController::CheckActive() {
-	int  new_active_id = -1;
-	bool new_connected = false;
+static void ResetTriggerEffects(SDL_Gamepad* pad) {
+	DualSenseEffects effect {};
+	effect.enable_bits      = 0x0c;
+	effect.right_trigger[0] = 0x05;
+	effect.left_trigger[0]  = 0x05;
+	(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
+}
 
-	if (!m_connected_ids.empty()) {
-		new_active_id = m_connected_ids[0];
-		for (const auto id: m_connected_ids) {
-			if (id != HOST_INPUT_CONTROLLER_ID) {
-				new_active_id = id;
-				break;
-			}
-		}
-		new_connected = true;
-	}
+void GameController::CheckActive() {
+	const int  new_active_id = SelectActivePad(m_pads);
+	const bool new_connected = !m_pads.empty();
 
 	if (m_connected == new_connected && m_active_id == new_active_id) {
 		return;
+	}
+	// A pad that loses the slot but stays connected stops the game's rumble and trigger effects.
+	if (m_active_id != new_active_id && m_active_id != HOST_INPUT_CONTROLLER_ID &&
+	    std::any_of(m_pads.begin(), m_pads.end(),
+	                [this](const PadActivity& pad) { return pad.id == m_active_id; })) {
+		StopActiveOutput();
 	}
 	if (!m_connected && new_connected) {
 		m_connected_count++;
@@ -421,6 +477,51 @@ void GameController::CheckActive() {
 	m_trigger_effect     = {};
 }
 
+// Caller holds m_mutex. The pad with the most recent real input becomes the active one.
+void GameController::NoteRealInput(int id) {
+	const auto it = std::find_if(m_pads.begin(), m_pads.end(),
+	                             [id](const PadActivity& pad) { return pad.id == id; });
+	if (it == m_pads.end()) {
+		return;
+	}
+	it->last_input = ++m_input_sequence;
+	CheckActive();
+}
+
+// Caller holds m_mutex. A stick or trigger counts as real input when it leaves the deadzone, so
+// a stick resting or drifting outside it does not keep taking the slot. It must come back within
+// half the deadzone before it counts again.
+void GameController::NoteAxisInput(int id, Controller::Axis axis, int value) {
+	const auto it = std::find_if(m_pads.begin(), m_pads.end(),
+	                             [id](const PadActivity& pad) { return pad.id == id; });
+	if (it == m_pads.end()) {
+		return;
+	}
+	auto&      outside    = it->axis_outside[static_cast<int>(axis)];
+	const auto deflection = AxisDeflection(axis, value);
+	if (!outside && deflection > INPUT_DEADZONE) {
+		outside = true;
+		NoteRealInput(id);
+	} else if (outside && deflection <= INPUT_DEADZONE / 2) {
+		outside = false;
+	}
+}
+
+// Caller holds m_mutex. Stops the rumble and trigger effects on the active pad.
+void GameController::StopActiveOutput() {
+	if (m_vibration_until != 0) {
+		m_vibration       = {};
+		m_vibration_until = 0;
+		ApplyVibration();
+	}
+	if (m_trigger_effect.trigger_mask != 0) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+		    pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
+			ResetTriggerEffects(pad);
+		}
+	}
+}
+
 void GameController::AddState() {
 	if (m_states_num >= STATES_MAX) {
 		m_states_num  = STATES_MAX - 1;
@@ -436,6 +537,10 @@ void GameController::AddState() {
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
+	if (down && id != HOST_INPUT_CONTROLLER_ID) {
+		NoteRealInput(id);
+	}
+
 	// The keyboard shares the player-1 pad with the active gamepad.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
@@ -448,6 +553,10 @@ void GameController::Button(int id, uint32_t button, bool down) {
 
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
+
+	if (id != HOST_INPUT_CONTROLLER_ID) {
+		NoteAxisInput(id, axis, value);
+	}
 
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
@@ -637,18 +746,14 @@ void GameController::ReleaseHostPads() {
 	DualSenseHaptics::Shutdown();
 
 	std::vector<SDL_Gamepad*> pads;
-	for (const auto id: m_connected_ids) {
-		if (id == HOST_INPUT_CONTROLLER_ID) {
+	for (const auto& entry: m_pads) {
+		if (entry.id == HOST_INPUT_CONTROLLER_ID) {
 			continue;
 		}
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(entry.id));
 		    pad != nullptr) {
 			if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
-				DualSenseEffects effect {};
-				effect.enable_bits     = 0x0c;
-				effect.right_trigger[0] = 0x05;
-				effect.left_trigger[0]  = 0x05;
-				(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
+				ResetTriggerEffects(pad);
 			}
 			(void)SDL_RumbleGamepad(pad, 0, 0, 0);
 			(void)SDL_SetGamepadLED(pad, 0, 0, 0);
@@ -663,7 +768,7 @@ void GameController::ReleaseHostPads() {
 		}
 	}
 
-	m_connected_ids.clear();
+	m_pads.clear();
 	CheckActive();
 }
 

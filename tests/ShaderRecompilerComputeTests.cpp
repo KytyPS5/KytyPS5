@@ -199,6 +199,12 @@ struct ImageTestAccess {
                            uint64_t capacity) {
     return Image::CopyRows(row_size, rows, capacity);
   }
+  static uint32_t CopyExtent(uint32_t source, uint32_t destination,
+                             uint32_t source_block,
+                             uint32_t destination_block) {
+    return Image::CopyExtent(source, destination, source_block,
+                             destination_block);
+  }
 };
 
 struct TileManagerTestAccess {
@@ -37868,6 +37874,17 @@ void CheckImageTransitionState(RenderContext &renderer) {
           ImageTestAccess::CopyRows(32ull << 10, 4097, copy_capacity) == 4096 &&
           ImageTestAccess::CopyRows(copy_capacity + 4, 1, copy_capacity) == 0,
       "buffered image copy does not split at the fixed scratch capacity");
+  Require(name, "image copy extent stays inside both images",
+          ImageTestAccess::CopyExtent(475, 455, 1, 1) == 455 &&
+              ImageTestAccess::CopyExtent(455, 475, 1, 1) == 455 &&
+              ImageTestAccess::CopyExtent(64, 64, 4, 4) == 64 &&
+              ImageTestAccess::CopyExtent(64, 16, 4, 1) == 64 &&
+              ImageTestAccess::CopyExtent(64, 8, 4, 1) == 32 &&
+              ImageTestAccess::CopyExtent(16, 64, 1, 4) == 16 &&
+              ImageTestAccess::CopyExtent(16, 32, 1, 4) == 8 &&
+              ImageTestAccess::CopyExtent(1, 2, 1, 4) == 0 &&
+              ImageTestAccess::CopyExtent(8, 8, 0, 1) == 0,
+          "image-to-image copy extent can exceed the smaller image");
 
   Image image(context, scheduler, MakeInfo(vk::Format::eR8Unorm, 2, 3));
   auto barriers =

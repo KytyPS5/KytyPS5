@@ -160,6 +160,9 @@ private:
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
+	[[nodiscard]] static uint32_t             CopyExtent(uint32_t source, uint32_t destination,
+	                                                     uint32_t source_block,
+	                                                     uint32_t destination_block) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 

@@ -175,6 +175,9 @@ private:
 	std::vector<Use>    uses;
 };
 
-static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
+// Debug standard libraries can add bookkeeping to the uses vector. Keep the
+// instruction metadata and operand storage budget independent of that overhead.
+static_assert(sizeof(Inst) <= 88 + sizeof(std::vector<Use>),
+              "Inst operand storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

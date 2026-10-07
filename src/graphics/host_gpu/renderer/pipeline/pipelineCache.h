@@ -40,7 +40,8 @@ public:
 	void Clear() {
 		m_entries.clear();
 		m_bytes.clear();
-		m_failed = false;
+		m_failed      = false;
+		m_gpu_written = false;
 	}
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
@@ -49,6 +50,9 @@ public:
 	void               RecordLoad(uint64_t address, uint32_t value);
 	void               Fail() { m_failed = true; }
 	[[nodiscard]] bool Failed() const { return m_failed; }
+	// Whether some read may have taken stale bytes of memory the GPU wrote (the backing store
+	// gets them only once read back).
+	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
 	// Execution thread: whether every read still gives the recorded bytes.
 	[[nodiscard]] bool StillValid() const;
 
@@ -63,7 +67,8 @@ private:
 	void                 Append(uint64_t address, const void* data, uint32_t size, bool strict);
 	std::vector<Entry>   m_entries;
 	std::vector<uint8_t> m_bytes;
-	bool                 m_failed = false;
+	bool                 m_failed      = false;
+	bool                 m_gpu_written = false;
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots
@@ -301,6 +306,10 @@ private:
 		// added.
 		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
+		// The module found last by the execution thread and by the others (all under the
+		// program lock): consecutive lookups of a thread mostly repeat it, and a program can
+		// have many modules.
+		std::array<size_t, 2>                        last_module {SIZE_MAX, SIZE_MAX};
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);

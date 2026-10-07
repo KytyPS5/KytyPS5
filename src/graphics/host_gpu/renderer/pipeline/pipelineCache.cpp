@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -301,6 +302,7 @@ std::filesystem::path ShaderStorePath() {
 }
 
 void GuestReadLog::Append(uint64_t address, const void* data, uint32_t size, bool strict) {
+	m_gpu_written = m_gpu_written || Libs::LibKernel::Memory::MayBeGpuWritten(address, size);
 	const auto offset = static_cast<uint32_t>(m_bytes.size());
 	m_bytes.insert(m_bytes.end(), static_cast<const uint8_t*>(data),
 	               static_cast<const uint8_t*>(data) + size);
@@ -440,19 +442,28 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
                                                  uint32_t push_data_cursor) {
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
-	for (auto& candidate: modules) {
+	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
 		        push_data_cursor, layout.ShaderDataDwords()) ||
 		    candidate.specialization != specialization) {
-			continue;
+			return false;
 		}
 		if constexpr (HasCalls) {
-			if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+			if (!std::ranges::equal(candidate.function_code, FunctionCode())) return false;
 		}
-		return &candidate;
+		return true;
+	};
+	auto& last = last_module[GuestGpu::IsGpuThread() ? 0u : 1u];
+	if (last < modules.size() && matches(modules[last])) {
+		return &modules[last];
 	}
-	return nullptr;
+	const auto found = std::ranges::find_if(modules, matches);
+	if (found == modules.end()) {
+		return nullptr;
+	}
+	last = static_cast<size_t>(found - modules.begin());
+	return &*found;
 }
 
 ShaderModule PipelineCache::BuildModule(const ProgramKey&                                  key,
@@ -1216,18 +1227,30 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		ahead.reads.Fail();
 		return nullptr;
 	}
-	const auto module = std::ranges::find_if(entry->second.modules, [&](const ShaderModule& candidate) {
+	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		return layout.push_data_start_dword ==
 		           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
 		                                                    layout.ShaderDataDwords()) &&
 		       candidate.specialization == specialization;
-	});
-	if (module == entry->second.modules.end()) {
-		QueueCompile(params, input_info, push_data_cursor, &specialization);
+	};
+	auto& modules = entry->second.modules;
+	auto& last    = entry->second.last_module[1];
+	auto  module  = last < modules.size() && matches(modules[last])
+	                    ? modules.begin() + static_cast<std::ptrdiff_t>(last)
+	                    : std::ranges::find_if(modules, matches);
+	if (module == modules.end()) {
+		// A specialization made of stale bytes of GPU-written memory is usually one the execution
+		// thread never asks for (in GTA V, V#s of garbage strides: thousands of permutations of
+		// some compute shaders, each compiled, stored and given a pipeline). Only the execution
+		// thread's own lookup compiles those.
+		if (!ahead.reads.MayHaveReadGpuWrites()) {
+			QueueCompile(params, input_info, push_data_cursor, &specialization);
+		}
 		ahead.reads.Fail();
 		return nullptr;
 	}
+	last = static_cast<size_t>(module - modules.begin());
 	input_info.stage = {.module = &*module, .resources = &resources};
 	module->info.bindings.AdvancePushData(push_data_cursor);
 	return &*module;

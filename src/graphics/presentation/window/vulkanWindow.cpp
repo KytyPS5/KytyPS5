@@ -18,6 +18,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -1049,6 +1050,9 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create Vulkan memory allocator");
 	}
 
+	// GTA V's ray tracing shader selects up to ~200 T#s by key from guest data that changes every
+	// frame; each new layout is a pipeline compile of several seconds.
+	ShaderRecompiler::IR::SetComputeIndirectFloors(256, 8);
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);

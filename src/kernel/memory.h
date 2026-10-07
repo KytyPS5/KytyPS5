@@ -145,6 +145,9 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU threads: whether a direct load of the range may fault because the GPU owns its pages.
 bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
+// Any thread, lock-free: whether a tracking region the range touches may hold bytes the GPU
+// wrote that the backing store does not have yet.
+bool                   MayBeGpuWritten(uint64_t vaddr, uint64_t size);
 // GPU threads: reads [vaddr, vaddr + size) from the backing store when its pages are GPU-owned
 // but the GPU wrote none of its bytes, where a direct load would fault and read back everything
 // the GPU has queued. False when the caller should load the bytes directly.

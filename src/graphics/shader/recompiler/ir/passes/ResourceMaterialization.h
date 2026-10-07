@@ -64,6 +64,12 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
 bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
+// Makes indirect descriptor layouts stable: mappings reserve room for a power of two of keys
+// (compute shaders at least `keys`, other stages at least 8) and indirect image roots bind a power
+// of two of images (compute shaders at least `images`), so that the guest data they select from
+// changes the shader permutation less often. Until it is called, layouts keep exact counts.
+void SetComputeIndirectFloors(size_t keys, size_t images);
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);

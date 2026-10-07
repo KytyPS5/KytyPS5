@@ -836,7 +836,41 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	// The strides depend only on the LS/HS code (identified by content hash) and the control-point
+	// counts, so decoding both programs again for every patch draw is redundant.
+	struct StrideKey {
+		uint64_t ls_hash;
+		uint64_t hs_hash;
+		uint32_t input_control_points;
+		uint32_t output_control_points;
+		bool     operator==(const StrideKey&) const = default;
+	};
+	struct StrideKeyHash {
+		size_t operator()(const StrideKey& key) const {
+			return static_cast<size_t>(key.ls_hash ^ (key.hs_hash * 0x9e3779b97f4a7c15ull) ^
+			                           (static_cast<uint64_t>(key.input_control_points) << 40u) ^
+			                           (static_cast<uint64_t>(key.output_control_points) << 52u));
+		}
+	};
+	static std::mutex                                                                g_stride_mutex;
+	static std::unordered_map<StrideKey, std::pair<uint32_t, uint32_t>, StrideKeyHash> g_strides;
+
+	const StrideKey stride_key {params[0].hash, params[1].hash, tess.input_control_points,
+	                            tess.output_control_points};
+	bool            stride_cached = false;
+	{
+		std::scoped_lock lock(g_stride_mutex);
+		if (const auto found = g_strides.find(stride_key); found != g_strides.end()) {
+			tess.ls_stride = found->second.first;
+			tess.hs_stride = found->second.second;
+			stride_cached  = true;
+		}
+	}
+	if (!stride_cached) {
+		ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+		std::scoped_lock lock(g_stride_mutex);
+		g_strides.emplace(stride_key, std::pair {tess.ls_stride, tess.hs_stride});
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}

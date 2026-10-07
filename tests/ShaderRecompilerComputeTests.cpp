@@ -36784,8 +36784,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
-void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
-  using namespace ShaderRecompiler;
+std::array<std::vector<u32>, 3> BuildTessellationCode(u32 ls_stride, u32 hs_stride) {
   const bool multiplied_stride = hs_stride == 112;
   const u32 local_address = multiplied_stride ? 18 : 21;
   const u32 control_point = multiplied_stride ? 30 : 34;
@@ -36871,6 +36870,14 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   evaluation.push_back(EncodeExp0(0x0c, 0xf));
   evaluation.push_back(EncodeExp1(5, 6, 10, 12));
   AppendEnd(&evaluation);
+  return code;
+}
+
+void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
+  using namespace ShaderRecompiler;
+  const auto code = BuildTessellationCode(ls_stride, hs_stride);
+  const auto &local = code[0];
+  const auto &control = code[1];
 
   ShaderTessellationInputInfo tess{.input_control_points = 3,
                                   .output_control_points = 3,
@@ -36964,9 +36971,191 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// PrepareTessellationPrograms memoizes the LS/HS stride analysis per (shader hashes, control point
+// counts). The uncached AnalyzeTessellationPrograms is the oracle: every result, whether it came
+// from a cache miss or a hit, from one thread or many, must equal it.
+void CheckTessellationStrideCache() {
+  constexpr const char *name = "TessellationStrideCache";
+  using namespace ShaderRecompiler;
+
+  struct ShaderSet {
+    std::array<std::vector<u32>, 3> code;
+    u32 ls_stride, hs_stride;
+  };
+  // Keep the code alive for the whole run: the shader map is keyed by address.
+  static const std::array<ShaderSet, 2> sets = [] {
+    std::array<ShaderSet, 2> result{ShaderSet{BuildTessellationCode(124, 128), 124, 128},
+                                    ShaderSet{BuildTessellationCode(108, 112), 108, 112}};
+    return result;
+  }();
+  static ShaderUserData user_data{};
+  const auto Map = [&](const std::vector<u32> &code, Prospero::ShaderBinaryType type) {
+    const auto address = reinterpret_cast<uint64_t>(code.data());
+    ShaderMapUserData(address, {.type = type,
+                                .user_data = &user_data,
+                                .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+    return address;
+  };
+  struct Mapped {
+    uint64_t ls, hs, es;
+  };
+  std::array<Mapped, 2> mapped;
+  for (u32 i = 0; i < sets.size(); i++) {
+    mapped[i] = {Map(sets[i].code[0], Prospero::ShaderBinaryType::kHsFront),
+                 Map(sets[i].code[1], Prospero::ShaderBinaryType::kHsBack),
+                 Map(sets[i].code[2], Prospero::ShaderBinaryType::kGs)};
+  }
+
+  struct Strides {
+    u32 ls, hs;
+    bool operator==(const Strides &) const = default;
+  };
+  const auto Oracle = [&](u32 set, u32 input_cp, u32 output_cp) {
+    ShaderTessellationInputInfo tess{.input_control_points = input_cp,
+                                    .output_control_points = output_cp};
+    AnalyzeTessellationPrograms(sets[set].code[0], sets[set].code[1], tess);
+    return Strides{tess.ls_stride, tess.hs_stride};
+  };
+  // Runs the production path and returns its strides, also checking all three stages agree.
+  const auto Prepare = [&](u32 set, u32 input_cp, u32 output_cp) {
+    HW::Context context;
+    context.SetShaderStages(0x4u);
+    context.SetLsHsConfig((input_cp << 8u) | (output_cp << 14u));
+    context.SetTfParam(1u | (2u << 2u) | (2u << 5u));
+    HW::VertexShaderInfo regs{};
+    regs.ls_regs.data_addr = mapped[set].ls;
+    regs.hs_regs.data_addr = mapped[set].hs;
+    regs.hs_regs.user_data_addr = 0x1000;
+    regs.es_regs.data_addr = mapped[set].es;
+    std::array<ShaderVertexInputInfo, 3> info{};
+    (void)PrepareTessellationPrograms(regs, context, info);
+    const Strides result{info[0].tess.ls_stride, info[0].tess.hs_stride};
+    for (const auto &stage : info) {
+      if (stage.tess.ls_stride != result.ls || stage.tess.hs_stride != result.hs ||
+          stage.tess.input_control_points != input_cp ||
+          stage.tess.output_control_points != output_cp) {
+        return Strides{~0u, ~0u};
+      }
+    }
+    return result;
+  };
+
+  // The oracle itself must distinguish the sets, or the checks below prove nothing.
+  Require(name, "distinct oracle", !(Oracle(0, 3, 3) == Oracle(1, 3, 3)),
+          "test shader sets must have different strides");
+  Require(name, "oracle matches construction",
+          Oracle(0, 3, 3) == Strides{sets[0].ls_stride, sets[0].hs_stride} &&
+              Oracle(1, 3, 3) == Strides{sets[1].ls_stride, sets[1].hs_stride},
+          "oracle must reproduce the strides the shaders were built with");
+
+  // First call per key is a miss, later calls are hits.
+  for (u32 round = 0; round < 3; round++) {
+    for (u32 set = 0; set < sets.size(); set++) {
+      Require(name, "miss then hit equals oracle", Prepare(set, 3, 3) == Oracle(set, 3, 3),
+              "cached strides differ from the uncached analysis");
+    }
+  }
+  // Interleaving the sets many times: a key collision would return the other set's strides.
+  for (u32 i = 0; i < 64; i++) {
+    const u32 set = (i * 7u + (i >> 2u)) & 1u;
+    Require(name, "interleaved sets", Prepare(set, 3, 3) == Oracle(set, 3, 3),
+            "a cached entry was returned for the wrong shader pair");
+  }
+
+  // Concurrent callers racing on warm keys.
+  std::atomic<u32> failures{0};
+  {
+    std::vector<std::thread> workers;
+    for (u32 t = 0; t < 8; t++) {
+      workers.emplace_back([&, t] {
+        for (u32 i = 0; i < 200; i++) {
+          const u32 set = (t + i) & 1u;
+          if (!(Prepare(set, 3, 3) == Oracle(set, 3, 3))) {
+            failures.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      });
+    }
+    for (auto &worker : workers) {
+      worker.join();
+    }
+  }
+  Require(name, "concurrent warm callers", failures.load() == 0,
+          "a concurrent caller observed strides different from the uncached analysis");
+
+  // Concurrent callers racing on cold keys: every thread inserts many distinct shader pairs at
+  // once, so unsynchronized map insertion and rehashing would corrupt the cache.
+  constexpr u32 kColdSets = 96;
+  struct ColdSet {
+    std::array<std::vector<u32>, 3> code;
+    Mapped mapped;
+    Strides expected;
+  };
+  static const auto cold_sets = [&] {
+    std::vector<ColdSet> result(kColdSets);
+    for (u32 k = 0; k < kColdSets; k++) {
+      // Only the LS stride follows the builder parameter; this HS variant always reports 128.
+      const u32 ls = 132 + 8 * k;
+      result[k].code = BuildTessellationCode(ls, 128);
+      result[k].expected = Strides{ls, 128};
+    }
+    return result;
+  }();
+  std::vector<Mapped> cold_mapped(kColdSets);
+  for (u32 k = 0; k < kColdSets; k++) {
+    cold_mapped[k] = {Map(cold_sets[k].code[0], Prospero::ShaderBinaryType::kHsFront),
+                      Map(cold_sets[k].code[1], Prospero::ShaderBinaryType::kHsBack),
+                      Map(cold_sets[k].code[2], Prospero::ShaderBinaryType::kGs)};
+  }
+  const auto PrepareMapped = [&](const Mapped &m) {
+    HW::Context context;
+    context.SetShaderStages(0x4u);
+    context.SetLsHsConfig((3u << 8u) | (3u << 14u));
+    context.SetTfParam(1u | (2u << 2u) | (2u << 5u));
+    HW::VertexShaderInfo regs{};
+    regs.ls_regs.data_addr = m.ls;
+    regs.hs_regs.data_addr = m.hs;
+    regs.hs_regs.user_data_addr = 0x1000;
+    regs.es_regs.data_addr = m.es;
+    std::array<ShaderVertexInputInfo, 3> info{};
+    (void)PrepareTessellationPrograms(regs, context, info);
+    return Strides{info[0].tess.ls_stride, info[0].tess.hs_stride};
+  };
+  // The oracle must agree with how the sets were built before the cache is judged by them.
+  for (u32 k = 0; k < kColdSets; k++) {
+    ShaderTessellationInputInfo tess{.input_control_points = 3, .output_control_points = 3};
+    AnalyzeTessellationPrograms(cold_sets[k].code[0], cold_sets[k].code[1], tess);
+    Require(name, "cold oracle", Strides{tess.ls_stride, tess.hs_stride} == cold_sets[k].expected,
+            "cold shader set was not built with the expected strides");
+  }
+  std::atomic<u32> cold_failures{0};
+  std::atomic<bool> go{false};
+  std::vector<std::thread> cold_workers;
+  for (u32 t = 0; t < 8; t++) {
+    cold_workers.emplace_back([&, t] {
+      while (!go.load(std::memory_order_acquire)) {
+      }
+      for (u32 i = 0; i < kColdSets; i++) {
+        const u32 k = (i * 5u + t * 11u) % kColdSets; // different order on each thread
+        if (!(PrepareMapped(cold_mapped[k]) == cold_sets[k].expected)) {
+          cold_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  go.store(true, std::memory_order_release);
+  for (auto &worker : cold_workers) {
+    worker.join();
+  }
+  Require(name, "concurrent cold callers", cold_failures.load() == 0,
+          "a concurrent first-use caller observed wrong strides");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
+  CheckTessellationStrideCache();
 }
 
 void CheckEmbeddedFetchVertexOffset() {

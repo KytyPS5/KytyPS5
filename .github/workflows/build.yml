@@ -155,6 +155,7 @@ jobs:
           xcodebuild -version
 
       - name: Install build dependencies
+        timeout-minutes: 15
         shell: bash
         run: brew install glslang
 
@@ -301,6 +302,7 @@ jobs:
           submodules: recursive
 
       - name: Install build dependencies
+        timeout-minutes: 15
         shell: bash
         run: |
           sudo apt-get update

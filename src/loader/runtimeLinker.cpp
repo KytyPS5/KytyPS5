@@ -21,6 +21,7 @@
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
@@ -1290,6 +1291,32 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		params->argv[0] = "KytyEmu";
 		const auto& arguments = Config::GetGuestArguments();
 		EXIT_IF(arguments.size() > 32);
+		// BO2's offline MP frontend defaults its cosmetic catalog to hidden even
+		// after processing installed add-on entitlements. Use the game's startup
+		// setting to expose that catalog; ownership still comes from its add-ons.
+		// Keep this workaround confined to the extracted version tested locally.
+		std::string title_id;
+		std::string app_version;
+		bool bo2_cosmetic_catalog = !m_programs.empty() &&
+		    m_programs.front()->file_name.filename() == "codmp.elf" &&
+		    SystemContentParamSfoGetString("TITLE_ID", &title_id) && title_id == "PPSA34502" &&
+		    SystemContentParamSfoGetString("APP_VER", &app_version) && app_version == "01.010.000";
+		if (bo2_cosmetic_catalog) {
+			for (const char* file : {"weapons.clump", "common_mp.ff", "common_mp.ipak", "patch_mp.ff",
+			                         "patch_mp.ipak", "ui_mp.ff", "patch_ui_mp.ff"}) {
+				bo2_cosmetic_catalog &= Common::File::IsFileExisting(
+				    Libs::LibKernel::FileSystem::GetRealFilename(std::string("/app0/zone/all/") + file));
+			}
+		}
+		const bool explicit_cosmetic_setting = std::any_of(arguments.begin(), arguments.end(), [](const auto& argument) {
+			return argument.find("tu8_mtx_enabled") != std::string::npos;
+		});
+		if (bo2_cosmetic_catalog && !explicit_cosmetic_setting) {
+			// argv holds the program name, 32 supplied arguments, this default,
+			// and a zero terminator. The literal remains valid for guest execution.
+			params->argv[params->argc++] = "+set tu8_mtx_enabled 2";
+			LOGF("BO2: enabling installed cosmetic catalog for offline Multiplayer\n");
+		}
 		for (const auto& argument : arguments) {
 			params->argv[params->argc++] = argument.c_str();
 		}

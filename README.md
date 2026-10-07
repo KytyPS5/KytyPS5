@@ -141,7 +141,8 @@ the Vulkan/SPIR-V validation rules.
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslangValidator`) on `PATH`
+- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslang` or `glslangValidator`) on `PATH`
+- Python 3 on `PATH`; the bundled SPIRV-Tools runs it at configure time
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 

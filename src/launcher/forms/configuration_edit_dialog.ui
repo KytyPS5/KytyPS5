@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>760</width>
+    <width>900</width>
     <height>620</height>
    </rect>
   </property>
@@ -23,7 +23,7 @@
    <property name="verticalSpacing">
     <number>8</number>
    </property>
-   <item row="0" column="0">
+   <item row="0" column="0" colspan="2">
     <layout class="QGridLayout" name="sectionsLayout" columnstretch="1,1">
      <property name="horizontalSpacing">
       <number>8</number>
@@ -173,10 +173,43 @@
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
          </widget>
         </item>
+        <item row="8" column="1">
+         <widget class="QCheckBox" name="checkBox_hide_cursor">
+          <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>
+          <property name="text"><string>Auto-hide cursor</string></property>
+         </widget>
+        </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_skip_notice_screen">
+          <property name="toolTip"><string>Skip startup logos and notices in supported games.</string></property>
+          <property name="text"><string>Skip boot logos</string></property>
+         </widget>
+        </item>
+        <item row="10" column="1">
+         <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
+          <property name="toolTip"><string>Can fix missing textures and incorrect transparency in some games. May reduce performance.</string></property>
+          <property name="text"><string>Accurate texture synchronization</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>
-     <item row="3" column="0" colspan="2">
+     <item row="3" column="0">
+      <widget class="QGroupBox" name="notifications_group">
+       <property name="title"><string>Notifications</string></property>
+       <layout class="QVBoxLayout" name="notificationsLayout">
+        <item>
+         <widget class="QCheckBox" name="checkBox_trophy_notifications">
+          <property name="toolTip"><string>Show trophy unlock notifications and play their sound.
+To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav with a WAV file and restart the game.</string></property>
+          <property name="text"><string>Enable trophy notifications</string></property>
+          <property name="checked"><bool>true</bool></property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="4" column="0" colspan="2">
       <widget class="QGroupBox" name="debug_group">
        <property name="title">
         <string>Debugging &amp;&amp; logs</string>
@@ -295,13 +328,95 @@
      </item>
     </layout>
    </item>
-   <item row="2" column="0">
+   <item row="1" column="1">
+    <widget class="QGroupBox" name="controller_group">
+     <property name="title"><string>Controller</string></property>
+     <layout class="QFormLayout" name="controllerLayout">
+      <property name="fieldGrowthPolicy"><enum>QFormLayout::AllNonFixedFieldsGrow</enum></property>
+      <item row="0" column="0">
+       <widget class="QLabel" name="label_controller_color">
+        <property name="text"><string>DualSense lightbar:</string></property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <layout class="QHBoxLayout" name="controllerColorLayout">
+        <item>
+         <widget class="QPushButton" name="button_controller_color">
+          <property name="toolTip"><string>Choose and preview a fixed LED color. Bluetooth DualSense may take several seconds to update.</string></property>
+          <property name="text"><string>Custom</string></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="button_controller_color_reset">
+          <property name="toolTip"><string>Let the game control the lightbar</string></property>
+          <property name="text"><string>Default</string></property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="label_controller_vibration">
+        <property name="text"><string>Vibration intensity:</string></property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <layout class="QHBoxLayout" name="controllerVibrationLayout">
+        <item>
+         <widget class="QSlider" name="slider_controller_vibration">
+          <property name="toolTip"><string>Scale DualSense vibration over USB and Bluetooth</string></property>
+          <property name="maximum"><number>100</number></property>
+          <property name="value"><number>100</number></property>
+          <property name="orientation"><enum>Qt::Horizontal</enum></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="label_controller_vibration_value">
+          <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+          <property name="text"><string>100%</string></property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="label_controller_volume">
+        <property name="text"><string>Speaker volume:</string></property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <layout class="QHBoxLayout" name="controllerVolumeLayout">
+        <item>
+         <widget class="QSlider" name="slider_controller_volume">
+          <property name="toolTip"><string>Scale the DualSense speaker over USB and Bluetooth. 50% is the previous default; 100% adds 6 dB of gain.</string></property>
+          <property name="maximum"><number>100</number></property>
+          <property name="value"><number>50</number></property>
+          <property name="orientation"><enum>Qt::Horizontal</enum></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="label_controller_volume_value">
+          <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+          <property name="text"><string>50%</string></property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item row="2" column="0" colspan="2">
     <layout class="QHBoxLayout" name="buttonLayout">
      <item>
      <widget class="QPushButton" name="clear_button">
        <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
        <property name="text"><string>Reset</string></property>
        <property name="toolTip"><string>Restore default settings</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="settings_button">
+       <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
+       <property name="text"><string>Game Configs</string></property>
+       <property name="toolTip"><string>Import or export game configs</string></property>
       </widget>
      </item>
      <item>

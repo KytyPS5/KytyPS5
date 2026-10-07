@@ -394,7 +394,28 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
+	const auto float16 = [](uint32_t value) {
+		const auto sign = (value & 0x8000u) << 16u;
+		const auto exponent = (value >> 10u) & 0x1fu;
+		const auto mantissa = value & 0x3ffu;
+		if (exponent == 0) {
+			return std::copysign(static_cast<float>(mantissa) * 0x1p-24f,
+			                     std::bit_cast<float>(sign));
+		}
+		return std::bit_cast<float>(sign | ((exponent == 31 ? 255u : exponent + 112u) << 23u) |
+		                            (mantissa << 13u));
+	};
 	switch (format) {
+		case vk::Format::eR16G16Sfloat:
+			next.float32[1] = float16(packed >> 16u);
+			[[fallthrough]];
+		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
+		case vk::Format::eR16G16Unorm:
+			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
+			[[fallthrough]];
+		case vk::Format::eR16Unorm:
+			next.float32[0] = static_cast<float>(packed & 0xffffu) / 65535.0f;
+			break;
 		// A single-plane float target carries its clear as raw float bits, the same encoding the
 		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
 		// contents.
@@ -441,6 +462,24 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	}
 	clear = next;
 	return true;
+}
+
+// Unlike a register clear, a DWORD fill repeats the same word across the entire pixel.
+// Keep this separate: the first register word alone cannot describe a 64-bit color.
+[[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
+                                               vk::ClearColorValue& clear) {
+	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
+	    (packed & 0xffffu) != (packed >> 16u)) {
+		return false;
+	}
+	if (format == vk::Format::eR16G16B16A16Sfloat) {
+		if (packed != 0) {
+			return false;
+		}
+		clear = vk::ClearColorValue {};
+		return true;
+	}
+	return DecodePackedColorClear(format, packed, clear);
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

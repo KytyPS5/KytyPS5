@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -25,6 +26,109 @@ void Check(bool value, const char* text) {
 
 void CheckConcurrentResult(int result, const char* text) {
 	Check(result == OK || result == KERNEL_ERROR_EBADF || result == KERNEL_ERROR_ENOENT, text);
+}
+
+void TestLevelUserEventDelivery() {
+	using Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "level-user-events") == OK, "create user event queue");
+	Check(EventQueue::KernelAddUserEvent(queue, 1) == OK &&
+	          EventQueue::KernelAddUserEvent(queue, 2) == OK &&
+	          EventQueue::KernelAddUserEventEdge(queue, 3) == OK, "add level and edge events");
+	for (int id = 1; id <= 3; ++id)
+		Check(EventQueue::KernelTriggerUserEvent(queue, id, reinterpret_cast<void*>(uintptr_t(id))) == OK,
+		      "trigger distinct user events");
+	EventQueue::KernelEvent events[16] {};
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	int out = 0;
+	const auto find_event = [&](uintptr_t id) {
+		return std::find_if(events, events + out, [=](const auto& event) { return event.ident == id; });
+	};
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == OK && out == 3,
+	      "level events are returned once per wait without starving following events");
+	for (uintptr_t id = 1; id <= 3; ++id) {
+		const auto* event = find_event(id);
+		Check(event != events + out && event->data == static_cast<intptr_t>(id) &&
+		          event->udata == reinterpret_cast<void*>(id), "distinct event payloads");
+	}
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == OK && out == 2 &&
+	          find_event(1) != events + out && find_event(2) != events + out,
+	      "level persists while edge clears");
+	Check(EventQueue::KernelDeleteUserEvent(queue, 1) == OK, "delete first level event");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == OK && out == 1 &&
+	          events[0].ident == 2, "remaining level event is delivered only once");
+	Check(EventQueue::KernelDeleteUserEvent(queue, 2) == OK, "delete remaining level event");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
+	      "deleted levels and consumed edge do not reappear");
+	Check(EventQueue::KernelTriggerUserEvent(queue, 3, nullptr) == OK, "retrigger edge event");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == OK && out == 1 &&
+	          events[0].ident == 3, "retriggered edge is delivered once");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
+	      "retriggered edge clears after delivery");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete user event queue");
+}
+
+void TestPeriodicTimerEvents() {
+	using namespace std::chrono_literals;
+	using Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+	Check(EventQueue::KernelAddTimerEvent(EventQueue::KERNEL_EQUEUE_INVALID, 10, 1000, nullptr) ==
+	          KERNEL_ERROR_EBADF,
+	      "timer rejects invalid queue");
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "periodic-timer") == OK, "create timer queue");
+	auto* user_data = reinterpret_cast<void*>(0x1234);
+	Check(EventQueue::KernelAddTimerEvent(queue, 10, 1000, user_data) == OK, "add periodic timer");
+	std::this_thread::sleep_for(5ms);
+	EventQueue::KernelEvent events[2] {};
+	int out = 0;
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1,
+	      "periodic occurrences are aggregated into one event");
+	Check(events[0].ident == 10 && events[0].filter == EventQueue::KERNEL_EVFILT_TIMER &&
+	          events[0].data >= 5 && events[0].udata == user_data,
+	      "timer reports identity, userdata and elapsed occurrence count");
+	timeout = 100000;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1 &&
+	          events[0].data >= 1,
+	      "periodic timer remains registered after delivery");
+
+	std::this_thread::sleep_for(5ms);
+	user_data = reinterpret_cast<void*>(0x5678);
+	Check(EventQueue::KernelAddTimerEvent(queue, 10, 3000000000u, user_data) == OK,
+	      "update periodic timer interval");
+	timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1 &&
+	          events[0].data >= 5 && events[0].udata == user_data,
+	      "timer update preserves accumulated occurrences and updates userdata");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
+	      "timer update replaces the repeating interval");
+	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
+	      "delete periodic timer");
+
+	Check(EventQueue::KernelAddTimerEvent(queue, 10, 0, user_data) == OK,
+	      "add immediate periodic timer");
+	for (int i = 0; i < 2; ++i) {
+		Check(EventQueue::KernelAddTimerEvent(queue, 10, 0, user_data) == OK,
+		      "update pending immediate timer");
+	}
+	for (int i = 0; i < 2; ++i) {
+		Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1 &&
+		          events[0].data == 1,
+		      "zero interval remains immediately ready after delivery");
+	}
+	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
+	      "delete immediate timer");
+
+	const Libs::LibKernel::KernelTimespec delay {0, 1000000};
+	Check(EventQueue::KernelAddHRTimerEvent(queue, 10, &delay, user_data) == OK,
+	      "add high resolution timer");
+	timeout = 100000;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1 &&
+	          events[0].filter == EventQueue::KERNEL_EVFILT_HRTIMER && events[0].udata == user_data,
+	      "shared timer scheduling delivers high resolution event");
+	Check(EventQueue::KernelDeleteHRTimerEvent(queue, 10) == KERNEL_ERROR_ENOENT,
+	      "high resolution timer is removed after one delivery");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete timer queue");
 }
 
 void CountDeletedEvent(EventQueue::KernelEqueue, EventQueue::KernelEqueueEvent* event) {
@@ -124,6 +228,12 @@ void TestDuplicateAddPreservesEventState() {
 	      "duplicate add updates deadline metadata");
 	Check(timer_event.data == 0 && timer_event.udata == reinterpret_cast<void*>(0x2222),
 	      "deadline trigger retains updated duplicate metadata");
+	for (uintptr_t value: {0x9abcu, 0xdef0u})
+		Check(EventQueue::KernelTriggerEvent(queue, 17, EventQueue::KERNEL_EVFILT_VIDEO_OUT,
+		                                     reinterpret_cast<void*>(value)) == OK, "queue bounded read payload");
+	for (intptr_t value: {0x9abcu, 0xdef0u})
+		Check(EventQueue::KernelWaitEqueue(queue, events, 1, &out, &timeout) == OK && out == 1 &&
+		          events[0].data == value, "capacity-one reads preserve pending event order");
 
 	auto retained_owner = weak_original.lock();
 	Check(retained_owner != nullptr, "original owner alive before delete");
@@ -431,6 +541,8 @@ void TestConcurrentDelete() {
 } // namespace
 
 int main() {
+	TestLevelUserEventDelivery();
+	TestPeriodicTimerEvents();
 	TestDuplicateAddPreservesEventState();
 	TestCallbackStateOutlivesPort();
 	TestCallbackOwnsPayload();

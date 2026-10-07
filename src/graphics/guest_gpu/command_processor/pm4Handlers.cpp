@@ -184,7 +184,6 @@ static HW::RenderControl DecodeRenderControl(uint32_t value) {
 	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
 	r.copy_centroid          = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
 	r.copy_sample            = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
-	EXIT_NOT_IMPLEMENTED(r.copy_depth_to_color || r.copy_stencil_to_color);
 
 	return r;
 }
@@ -1642,8 +1641,12 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto data_offset    = buffer[0];
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
+	// The native indexed packet enables the high-half first-index destination in word 3.
+	const IndirectDrawRegisters registers {
+	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
+	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 
-	cp.DrawIndirect(data_offset, draw_initiator, indexed);
+	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
 
 	return 4;
 }
@@ -1661,13 +1664,17 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
+	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3.
+	const IndirectDrawRegisters registers {
+	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
+	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     draw_initiator, indexed);
+	                     registers, draw_initiator, indexed);
 
 	return 9;
 }
@@ -2266,7 +2273,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
 	auto trigger_interrupt = [&]() {
-		bool queued = false;
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
@@ -2274,12 +2280,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x02:
 			case 0x04:
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				queued = true;
+				cp.BufferFlush();
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
-		}
-		if (queued) {
-			cp.BufferFlush();
 		}
 	};
 
@@ -2318,7 +2321,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+			cp.BufferFlush();
+		}
 
 		return 7;
 	}
@@ -3624,6 +3629,18 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
+	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS;
+	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS; offset++) {
+		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			cp.GetShCtx().SetPsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS,
+			                                   value);
+		};
+	}
+	for (uint32_t offset = 4; offset <= 5; offset++) {
+		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			cp.GetShCtx().SetPsAuxiliaryTableAddress(cmd_offset - 4, value);
+		};
+	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};

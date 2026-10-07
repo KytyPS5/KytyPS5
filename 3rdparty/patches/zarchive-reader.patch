@@ -1,0 +1,100 @@
+--- a/include/zarchive/zarchivecommon.h
++++ b/include/zarchive/zarchivecommon.h
+@@ -256,7 +256,7 @@
+ 
+ 			bool IsWithinValidRange(uint64_t fileSize) const
+ 			{
+-				return (offset + size) <= fileSize;
++				return offset <= fileSize && size <= fileSize - offset;
+ 			}
+ 		};
+ 
+--- a/src/zarchivereader.cpp
++++ b/src/zarchivereader.cpp
+@@ -14,6 +14,7 @@
+ 
+ static bool _ifstream_readBytes(std::ifstream& file, uint64_t offset, void* buffer, uint32_t size)
+ {
++	file.clear();
+ 	file.seekg(offset, std::ios_base::beg);
+ 	file.read((char*)buffer, size);
+ 	return file.gcount() == size;
+@@ -80,9 +81,27 @@
+ 	// verify file tree
+ 	if (fileTree[0].IsFile())
+ 		return nullptr; // first entry must be root directory
+-	auto rootName = GetName(nameTable, fileTree[0].GetNameOffset());
+-	if (!rootName.empty())
++	if (fileTree[0].GetNameOffset() != 0x7FFFFFFF)
+ 		return nullptr; // root node must not have a name
++	const uint64_t dataCapacity = (uint64_t)offsetRecords.size() * _ZARCHIVE::ENTRIES_PER_OFFSETRECORD * _ZARCHIVE::COMPRESSED_BLOCK_SIZE;
++	for (size_t i = 0; i < fileTree.size(); ++i)
++	{
++		auto& entry = fileTree[i];
++		if (i != 0)
++		{
++			auto name = GetName(nameTable, entry.GetNameOffset());
++			if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\") != std::string_view::npos || name.find('\0') != std::string_view::npos)
++				return nullptr;
++		}
++		if (entry.IsFile())
++		{
++			if (entry.GetFileOffset() > dataCapacity || entry.GetFileSize() > dataCapacity - entry.GetFileOffset())
++				return nullptr;
++		}
++		else if (entry.directoryRecord.nodeStartIndex > fileTree.size() ||
++			entry.directoryRecord.count > fileTree.size() - entry.directoryRecord.nodeStartIndex)
++			return nullptr;
++	}
+ 	// read meta data
+ 	// todo
+ 
+@@ -238,7 +257,7 @@
+ 		uint32_t stepSize = std::min<uint32_t>(remainingBytes, _ZARCHIVE::COMPRESSED_BLOCK_SIZE - blockOffset);
+ 		CacheBlock* block = GetCachedBlock(blockIdx);
+ 		if (!block)
+-			return 0;
++			return bytesToRead - remainingBytes;
+ 		std::memcpy(bufferU8, block->data + blockOffset, stepSize);
+ 		rawReadOffset += stepSize;
+ 		remainingBytes -= stepSize;
+@@ -325,14 +344,18 @@
+ 	// determine offset and size of compressed block
+ 	auto& record = m_offsetRecords[recordIndex];
+ 	uint64_t offset = record.baseOffset;
++	if (offset > m_compressedDataSize)
++		return false;
+ 	for (uint32_t i = 0; i < recordSubIndex; i++)
+ 	{
+-		offset += (uint64_t)record.size[i];
+-		offset++;
++		const uint64_t size = (uint64_t)record.size[i] + 1;
++		if (size > m_compressedDataSize - offset)
++			return false;
++		offset += size;
+ 	}
+ 	uint32_t compressedSize = (uint32_t)record.size[recordSubIndex] + 1;
+ 	// load file data
+-	if ((offset + compressedSize) > m_compressedDataSize)
++	if (compressedSize > m_compressedDataSize - offset)
+ 		return false;
+ 	offset += m_compressedDataOffset;
+ 	if (compressedSize == _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
+@@ -350,7 +373,7 @@
+ // returns empty view on failure
+ std::string_view ZArchiveReader::GetName(const std::vector<uint8_t>& nameTable, uint32_t nameOffset)
+ {
+-	if (nameOffset == 0x7FFFFFFF || nameOffset > nameTable.size())
++	if (nameOffset == 0x7FFFFFFF || nameOffset >= nameTable.size())
+ 		return "";
+ 	// parse header
+ 	uint16_t nameLength = nameTable[nameOffset] & 0x7F;
+@@ -359,7 +382,7 @@
+ 		// extended 2-byte length
+ 		if (nameOffset + 1 >= nameTable.size())
+ 			return "";
+-		nameLength |= ((uint16_t)nameTable[nameOffset] << 7);
++		nameLength |= ((uint16_t)nameTable[nameOffset + 1] << 7);
+ 		nameOffset += 2;
+ 	}
+ 	else

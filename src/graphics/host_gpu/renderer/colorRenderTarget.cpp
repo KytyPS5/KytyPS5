@@ -21,8 +21,6 @@
 
 namespace Libs::Graphics {
 
-static std::atomic<uint32_t> g_render_color_log_count = 0;
-
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	switch (info.format) {
 		case Prospero::ChannelLayout::k10_10_10_2:
@@ -262,21 +260,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		EXIT("render-target backing range is invalid\n");
 	}
 
-	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
-	                                  std::max(height >> rt.view.current_mip_level, 1u)};
-
-	auto decision_log_id = g_render_color_log_count.fetch_add(1);
-	if (decision_log_id < 128) {
-		LOGF("RenderColorTarget: slot=%" PRIu32 " addr=0x%010" PRIx64 " size=0x%016" PRIx64
-		     " extent=%ux%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
-		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 " samples=%u tile=%s\n",
-		     rt_slot, rt.base.addr, backing_size, width, height, depth, rt.view.current_mip_level,
-		     view_extent.width, view_extent.height, levels, pitch,
-		     static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
-		     static_cast<uint32_t>(rt.info.channel_order), samples, tile ? "tiled" : "linear");
-	}
-
-	TextureCache::ImageDesc desc {};
+	auto& desc = r.desc;
 	desc.type              = TextureCache::BindingType::RenderTarget;
 	desc.info.data         = {rt.base.addr, backing_size};
 	desc.info.pixel_format = target_format.format;
@@ -348,7 +332,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 	auto& texture_cache        = m_context.GetTextureCache();
-	r.desc                     = std::move(desc);
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);

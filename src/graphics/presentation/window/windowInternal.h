@@ -32,6 +32,7 @@ struct WindowLoopState {
 	SDL_Event        event {};
 	bool             need_exit = false;
 	std::atomic_bool paused    = false;
+	std::atomic<uint64_t> presented_frames {0};
 };
 
 struct WindowContext {
@@ -39,6 +40,7 @@ struct WindowContext {
 	~WindowContext();
 	KYTY_CLASS_NO_COPY(WindowContext);
 
+	[[nodiscard]] static vk::PhysicalDeviceVulkan11Features RequiredVulkan11Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan12Features RequiredVulkan12Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features RequiredVulkan13Features() noexcept;
 	[[nodiscard]] static uint32_t InitialWindowFlags(bool fullscreen) noexcept;
@@ -46,9 +48,9 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void                                                    UpdateTitle();
-	void                                                    ApplyPendingTitle();
-	void                                                    Resize(uint32_t width, uint32_t height);
+	void UpdateTitle(uint64_t frame_num, double current_fps);
+	void ApplyPendingTitle();
+	void Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
 	void ProcessEvent(double time_seconds);

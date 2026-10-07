@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,10 @@ public:
 	struct DirEntry {
 		std::string name;
 		bool        is_file;
+	};
+	struct Info {
+		bool     is_file;
+		uint64_t size;
 	};
 
 	File();
@@ -72,6 +77,7 @@ public:
 	std::vector<std::byte> ReadWholeBuffer();
 
 	static uint64_t Size(const std::filesystem::path& name);
+	static std::optional<Info> GetInfo(const std::filesystem::path& name);
 
 	static bool IsDirectoryExisting(const std::filesystem::path& path);
 	static bool IsFileExisting(const std::filesystem::path& name);

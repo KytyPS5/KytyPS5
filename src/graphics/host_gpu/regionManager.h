@@ -9,6 +9,12 @@
 #include <mutex>
 #include <utility>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -30,21 +36,20 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		if (m_owner.load(std::memory_order_relaxed) == thread) {
-			EXIT("recursive region tracking lock\n");
-		}
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			if (m_owner.load(std::memory_order_relaxed) == thread) {
-				EXIT("recursive region tracking lock while contended\n");
-			}
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+#if defined(__x86_64__) || defined(_M_X64)
+			_mm_pause();
+#elif defined(_M_ARM64)
+			__yield();
+#elif defined(__aarch64__)
+			asm volatile("yield");
+#endif
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
 	void unlock() noexcept {
-		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
-			EXIT("region tracking lock released by non-owner\n");
-		}
+		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
 	}
@@ -88,8 +93,7 @@ public:
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		const auto& bits        = GetBits<source>();
-		return RegionBits(bits, start, end).Any();
+		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
 	template <DirtySource source, bool enable>
@@ -122,6 +126,9 @@ public:
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
+		if (bits.FirstRangeFrom(start).first >= end) {
+			return;
+		}
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);

@@ -99,7 +99,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		// Guest-memory priority callbacks must drain even without cached resources.
+		if (m_command_scheduler.Active() &&
+		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		     m_command_scheduler.HasPendingPriorityOperations())) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -119,6 +123,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	if (!m_bda_logged) {
+		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+		m_bda_logged = true;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);

@@ -4,7 +4,10 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <cstddef>
 #include <memory>
+#include <span>
+#include <string_view>
 
 union SDL_Event;
 struct SDL_Window;
@@ -22,6 +25,8 @@ void                     InitializeSystemOverlayInput(SDL_Window* window);
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
+void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
+                                              std::span<const std::byte> icon_png);
 
 class SystemOverlay final {
 public:

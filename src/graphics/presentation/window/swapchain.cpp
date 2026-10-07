@@ -1129,7 +1129,6 @@ RenderContext& Presenter::Renderer() const noexcept {
 }
 
 void Presenter::UpdateWindowTitle() {
-	m_impl->window.UpdateTitle();
 }
 
 void Presenter::Present(Frame& frame) {
@@ -1209,6 +1208,7 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentDone);
+		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

@@ -5,14 +5,14 @@
 #include <Zydis/Zydis.h>
 #include <bit>
 #include <cstring>
-#if !defined(__APPLE__)
 #include <emmintrin.h>
 #include <xmmintrin.h>
-#endif
+#include <cpuid.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
+#include <sched.h>
 #include <sys/ucontext.h>
 #else
 #include <sched.h>
@@ -407,12 +407,12 @@ struct Context {
 	void                   Advance(size_t length) { native->Rip += length; }
 	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
 
-	void LoadGprs(uint64_t (&gpr)[16]) const {
-		const uint64_t registers[] = {native->Rax, native->Rcx, native->Rdx, native->Rbx,
-		                              native->Rsp, native->Rbp, native->Rsi, native->Rdi,
-		                              native->R8,  native->R9,  native->R10, native->R11,
-		                              native->R12, native->R13, native->R14, native->R15};
-		std::memcpy(gpr, registers, sizeof(gpr));
+	[[nodiscard]] auto& Gpr(uint8_t index) const {
+		DWORD64* registers[] = {&native->Rax, &native->Rcx, &native->Rdx, &native->Rbx,
+		                        &native->Rsp, &native->Rbp, &native->Rsi, &native->Rdi,
+		                        &native->R8,  &native->R9,  &native->R10, &native->R11,
+		                        &native->R12, &native->R13, &native->R14, &native->R15};
+		return *registers[index];
 	}
 
 	void ClearUpperYmm(uint8_t index) const {
@@ -438,6 +438,14 @@ struct Context {
 	void Advance(size_t length) {
 		native->uc_mcontext->__ss.__rip += static_cast<uint64_t>(length);
 	}
+	[[nodiscard]] auto& Gpr(uint8_t index) const {
+		auto*     state       = &native->uc_mcontext->__ss;
+		uint64_t* registers[] = {&state->__rax, &state->__rcx, &state->__rdx, &state->__rbx,
+		                         &state->__rsp, &state->__rbp, &state->__rsi, &state->__rdi,
+		                         &state->__r8,  &state->__r9,  &state->__r10, &state->__r11,
+		                         &state->__r12, &state->__r13, &state->__r14, &state->__r15};
+		return *registers[index];
+	}
 	// Darwin names the XMM file __fpu_xmm0..__fpu_xmm15 instead of exposing an array.
 	[[nodiscard]] void* Xmm(uint8_t index) const {
 		auto* fs = &native->uc_mcontext->__fs;
@@ -461,6 +469,16 @@ struct Context {
 			default: return nullptr;
 		}
 	}
+	// The kernel hands AVX threads the longer context that carries YMM[255:128]; a plain SSE
+	// context has no such state to clear.
+	void ClearUpperYmm(uint8_t index) const {
+		if (index >= 16 || native->uc_mcsize < sizeof(_STRUCT_MCONTEXT_AVX64)) {
+			return;
+		}
+		auto* avx = reinterpret_cast<_STRUCT_MCONTEXT_AVX64*>(native->uc_mcontext);
+		auto* ymmh = &avx->__fs.__fpu_ymmh0;
+		ymmh[index] = {};
+	}
 #else
 	ucontext_t* native;
 
@@ -477,13 +495,11 @@ struct Context {
 		return native->uc_mcontext.fpregs->_xmm[index].element;
 	}
 
-	void LoadGprs(uint64_t (&gpr)[16]) const {
+	[[nodiscard]] auto& Gpr(uint8_t index) const {
 		constexpr int registers[] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP,
 		                             REG_RSI, REG_RDI, REG_R8,  REG_R9,  REG_R10, REG_R11,
 		                             REG_R12, REG_R13, REG_R14, REG_R15};
-		for (size_t i = 0; i < 16; ++i) {
-			gpr[i] = static_cast<uint64_t>(native->uc_mcontext.gregs[registers[i]]);
-		}
+		return native->uc_mcontext.gregs[registers[index]];
 	}
 
 	void ClearUpperYmm(uint8_t index) const {
@@ -507,6 +523,12 @@ struct Context {
 		}
 	}
 #endif
+
+	void LoadGprs(uint64_t (&gpr)[16]) const {
+		for (uint8_t i = 0; i < 16; ++i) {
+			gpr[i] = static_cast<uint64_t>(Gpr(i));
+		}
+	}
 };
 
 #if !defined(__APPLE__)
@@ -575,8 +597,8 @@ static bool TryEmulateSse4a(Context& context) {
 	if (rip[offset] != 0x0f) {
 		return false;
 	}
-	const bool register_extract = prefix == 0x66 && rip[offset + 1] == 0x79;
-	if (rip[offset + 1] != 0x78 && !register_extract) {
+	const bool register_form = rip[offset + 1] == 0x79;
+	if (rip[offset + 1] != 0x78 && !register_form) {
 		return false;
 	}
 
@@ -590,7 +612,7 @@ static bool TryEmulateSse4a(Context& context) {
 
 	// Immediate EXTRQ encodes its destination in r/m; the two-register form uses reg.
 	uint8_t dest_index = reg;
-	if (prefix == 0x66 && !register_extract) {
+	if (prefix == 0x66 && !register_form) {
 		dest_index = rm;
 	}
 	auto* dest_xmm = context.Xmm(dest_index);
@@ -599,15 +621,17 @@ static bool TryEmulateSse4a(Context& context) {
 		return false;
 	}
 	uint64_t dest[2] {};
-	uint64_t source = 0;
+	uint64_t source[2] {};
 	std::memcpy(dest, dest_xmm, sizeof(dest));
-	std::memcpy(&source, src_xmm, sizeof(source));
+	std::memcpy(source, src_xmm, sizeof(source));
 	uint8_t length             = 0;
 	uint8_t index              = 0;
 	size_t  instruction_length = offset + 3;
-	if (register_extract) {
-		length = static_cast<uint8_t>(source);
-		index  = static_cast<uint8_t>(source >> 8u);
+	if (register_form) {
+		// EXTRQ controls occupy the low quadword; INSERTQ uses the upper quadword.
+		const uint64_t controls = source[prefix == 0x66 ? 0 : 1];
+		length                  = static_cast<uint8_t>(controls);
+		index                   = static_cast<uint8_t>(controls >> 8u);
 	} else {
 		length = rip[offset + 3];
 		index  = rip[offset + 4];
@@ -617,14 +641,78 @@ static bool TryEmulateSse4a(Context& context) {
 		dest[0] = ExtractBitField(dest[0], length, index);
 		dest[1] = 0;
 	} else {
-		dest[0] = InsertBitField(dest[0], source, length, index);
+		dest[0] = InsertBitField(dest[0], source[0], length, index);
 	}
 	std::memcpy(dest_xmm, dest, sizeof(dest));
 	context.Advance(instruction_length);
 	return true;
 }
 
-#if !defined(__APPLE__)
+static bool ReadTscAux(uint32_t& auxiliary) {
+	uint32_t eax = 0;
+	uint32_t ebx = 0;
+	uint32_t ecx = 0;
+	uint32_t edx = 0;
+	if (!__get_cpuid(0x80000001u, &eax, &ebx, &ecx, &edx) || (edx & (1u << 27u)) == 0) {
+		return false;
+	}
+	asm volatile("rdtscp" : "=a"(eax), "=d"(edx), "=c"(auxiliary));
+	return true;
+}
+
+static void FlushCacheLine(uint64_t address, ZydisRegister segment) {
+	// Preserve FS/GS addressing rather than treating a segment-relative offset as a pointer.
+	if (segment == ZYDIS_REGISTER_FS) {
+		asm volatile("clflush %%fs:(%0)" : : "r"(address) : "memory");
+	} else if (segment == ZYDIS_REGISTER_GS) {
+		asm volatile("clflush %%gs:(%0)" : : "r"(address) : "memory");
+	} else {
+		_mm_clflush(reinterpret_cast<const void*>(address));
+	}
+}
+
+static bool TryEmulateCpuExtensions(Context& context) {
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) ||
+	    !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(context.Rip()),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction,
+	                                         operands))) {
+		return false;
+	}
+	if (instruction.mnemonic == ZYDIS_MNEMONIC_RDPID &&
+	    operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+		const auto reg_class = ZydisRegisterGetClass(operands[0].reg.value);
+		const auto index     = ZydisRegisterGetId(operands[0].reg.value);
+		uint32_t   auxiliary = 0;
+		if ((reg_class != ZYDIS_REGCLASS_GPR32 && reg_class != ZYDIS_REGCLASS_GPR64) || index < 0 ||
+		    index >= 16 || !ReadTscAux(auxiliary)) {
+			return false;
+		}
+		// RDPID and guest RDTSCP observe the same host TSC_AUX; only RDPID's destination changes.
+		context.Gpr(static_cast<uint8_t>(index)) = auxiliary;
+	} else if (instruction.mnemonic == ZYDIS_MNEMONIC_CLWB &&
+	           operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+		ZydisRegisterContext registers {};
+		for (uint8_t i = 0; i < 16; ++i) {
+			const auto value                         = static_cast<uint64_t>(context.Gpr(i));
+			registers.values[ZYDIS_REGISTER_RAX + i] = value;
+			registers.values[ZYDIS_REGISTER_EAX + i] = static_cast<uint32_t>(value);
+		}
+		uint64_t address = 0;
+		if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddressEx(&instruction, &operands[0], context.Rip(),
+		                                             &registers, &address))) {
+			return false;
+		}
+		FlushCacheLine(address, operands[0].mem.segment);
+	} else {
+		return false;
+	}
+	context.Advance(instruction.length);
+	return true;
+}
 
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -711,48 +799,6 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	return true;
 }
 
-#endif
-
-bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
-                            const ZydisDecodedOperand* operands) {
-	return instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
-	       instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
-	       instruction.raw.vex.offset == 0 && operands[0].size == 128 &&
-	       operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER;
-}
-
-uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
-	uint64_t patched = 0;
-#if !defined(__APPLE__)
-	ZydisDecoder decoder {};
-	if (!ZYAN_SUCCESS(
-	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
-		return 0;
-	}
-	for (uint64_t offset = 0; offset < size;) {
-		auto*                   code = reinterpret_cast<uint8_t*>(address + offset);
-		ZydisDecodedInstruction instruction {};
-		ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
-		if (!ZYAN_SUCCESS(
-		        ZydisDecoderDecodeFull(&decoder, code, size - offset, &instruction, operands))) {
-			++offset;
-			continue;
-		}
-		if (IsReciprocalSquareRoot(instruction, operands)) {
-			// vvvv is reserved (must be 1111b). Clear one bit to route this
-			// otherwise intact instruction through the illegal-instruction emulator.
-			code[instruction.raw.vex.size - 1] &= ~0x08u;
-			++patched;
-		}
-		offset += instruction.length;
-	}
-#else
-	(void)address;
-	(void)size;
-#endif
-	return patched;
-}
-
 bool TryEmulate(void* native_context) {
 	if (native_context == nullptr) {
 		return false;
@@ -768,15 +814,12 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
+	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
+	       TryEmulateSse4a(context) ||
 #if !defined(__APPLE__)
-	if (TryEmulateReciprocalSquareRoot(context)) {
-		return true;
-	}
-	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
-	       TryEmulateShaNi(context);
-#else
-	return TryEmulateSse4a(context);
+	       TryEmulateShaNi(context) ||
 #endif
+	       TryEmulateCpuExtensions(context);
 }
 
 } // namespace Loader::X64InstructionEmulator

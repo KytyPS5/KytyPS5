@@ -116,6 +116,13 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan(uint32_t sam
 
   const auto image0 = AddSource(8, 0);
   const auto image1 = AddSource(8, 0);
+  // A genuine packed-UInt image requests a point-filter sampler variant.
+  // A null descriptor is normalized before conversion and cannot exercise this case.
+  program.descriptor_sources[image1].dwords[0] = Value(1u);
+  program.descriptor_sources[image1].dwords[1] = Value(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k11_11_10UInt) << 20u);
+  program.descriptor_sources[image1].dwords[3] = Value(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   const auto sampler0 = AddSource(4, 0x11111111u);
   const auto sampler1 = AddSource(4, 0x22222222u);
   program.info.images.push_back(

@@ -2,10 +2,31 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(cpuinfo)
 
-# The Windows guest red-zone patcher needs a decoder/encoder and a small
-# trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 include(FetchContent)
 
+# The Bluetooth DualSense transports speaker audio as fixed-size Opus packets.
+set(kyty_build_testing_saved "${BUILD_TESTING}")
+set(BUILD_TESTING OFF)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+	# Opus assumes MSVC accepts SSE4.1 intrinsics without per-file flags, but
+	# clang-cl rejects them in its baseline x64 files. Its AVX2 dispatch also
+	# depends on the SSE4.1 declarations, so retain the x64 SSE2 baseline only.
+	set(OPUS_X86_MAY_HAVE_SSE4_1 OFF CACHE BOOL "" FORCE)
+	set(OPUS_X86_MAY_HAVE_AVX2 OFF CACHE BOOL "" FORCE)
+endif()
+FetchContent_Declare(opus
+	GIT_REPOSITORY https://github.com/xiph/opus.git
+	GIT_TAG ddbe48383984d56acd9e1ab6a090c54ca6b735a6
+	GIT_SHALLOW FALSE)
+FetchContent_MakeAvailable(opus)
+set(BUILD_TESTING "${kyty_build_testing_saved}")
+install(FILES "${opus_SOURCE_DIR}/COPYING" DESTINATION "licenses/opus")
+
+# The guest instruction patcher needs a decoder/encoder and a small
+# trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
 	xbyak
@@ -27,6 +48,50 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(xbyak zydis)
+target_compile_definitions(xbyak INTERFACE XBYAK_NO_EXCEPTION)
+
+# ZArchive provides random-access reads for compressed game dumps. Build only
+# the reader/writer library and its zstd dependency; the command-line tool is
+# not part of KytyPS5's runtime distribution.
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
+set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	zstd
+	GIT_REPOSITORY https://github.com/facebook/zstd.git
+	GIT_TAG f8745da6ff1ad1e7bab384bd1f9d742439278e99
+	GIT_SHALLOW FALSE
+	SOURCE_SUBDIR build/cmake
+)
+FetchContent_Declare(
+	zarchive_source
+	GIT_REPOSITORY https://github.com/Exzap/ZArchive.git
+	GIT_TAG d2c717730092c7bf8cbb033b12fd4001b7c4d932
+	GIT_SHALLOW FALSE
+	PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
+		"${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
+	SOURCE_SUBDIR kyty-library-only
+)
+FetchContent_MakeAvailable(zstd zarchive_source)
+
+add_library(zarchive STATIC
+	"${zarchive_source_SOURCE_DIR}/src/zarchivereader.cpp"
+	"${zarchive_source_SOURCE_DIR}/src/zarchivewriter.cpp"
+	"${zarchive_source_SOURCE_DIR}/src/sha_256.c"
+)
+add_library(ZArchive::zarchive ALIAS zarchive)
+target_include_directories(zarchive SYSTEM PUBLIC "${zarchive_source_SOURCE_DIR}/include")
+target_include_directories(zarchive PRIVATE "${zstd_SOURCE_DIR}/lib")
+target_link_libraries(zarchive PRIVATE libzstd_static)
+target_compile_features(zarchive PRIVATE cxx_std_20)
+if(MSVC)
+	target_compile_options(zarchive PRIVATE /W0)
+else()
+	target_compile_options(zarchive PRIVATE -w)
+endif()
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 if(APPLE)
@@ -124,6 +189,7 @@ endif()
 
 set(TRACY_STATIC ON CACHE BOOL "" FORCE)
 set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
+set(TRACY_NO_CRASH_HANDLER ON CACHE BOOL "" FORCE)
 set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
 set(TRACY_DELAYED_INIT ON CACHE BOOL "" FORCE)
 set(TRACY_MANUAL_LIFETIME ON CACHE BOOL "" FORCE)

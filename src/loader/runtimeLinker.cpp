@@ -93,7 +93,7 @@ ThreadLocalStorage::~ThreadLocalStorage() {
 struct EntryParams {
 	int         argc;
 	uint32_t    pad;
-	const char* argv[3];
+	const char* argv[35];
 };
 
 #pragma pack()
@@ -1284,10 +1284,15 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 	if (auto entry = GetEntry(); entry != 0) {
 		auto* params = reinterpret_cast<EntryParams*>(
-		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
+		    (reinterpret_cast<uintptr_t>(main_stack_top) - sizeof(EntryParams) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
 		std::memset(params, 0, sizeof(EntryParams));
 		params->argc    = 1;
 		params->argv[0] = "KytyEmu";
+		const auto& arguments = Config::GetGuestArguments();
+		EXIT_IF(arguments.size() > 32);
+		for (const auto& argument : arguments) {
+			params->argv[params->argc++] = argument.c_str();
+		}
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 

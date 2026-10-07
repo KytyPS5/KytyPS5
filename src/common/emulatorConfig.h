@@ -80,9 +80,11 @@ struct ConfigOptions {
 	bool red_zone_protection_enabled = false;
 #endif
 	Keymap keymap;
+	std::vector<std::string> guest_arguments;
 };
 
 void Load(const ConfigOptions& cfg);
+const std::vector<std::string>& GetGuestArguments();
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();

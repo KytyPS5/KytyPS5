@@ -52,6 +52,7 @@ struct ResolvedPathInfo {
 
 static std::mutex                                        g_mutex;
 static uint32_t                                          g_next_submission_id = 1;
+static uint32_t                                          g_next_file_id       = 1;
 static std::unordered_map<uint32_t, bool>                g_submissions;
 static std::condition_variable                           g_submission_cv;
 static std::unordered_map<uint32_t, std::string>         g_files;
@@ -92,15 +93,6 @@ static bool WriteGuest(uint64_t addr, const T& value) {
 	return WriteGuestBytes(addr, &value, sizeof(T));
 }
 
-static uint32_t ComputeFileId(const char* guest_path) {
-	uint32_t hash = 2166136261u;
-	for (auto* p = reinterpret_cast<const uint8_t*>(guest_path); p != nullptr && *p != 0; ++p) {
-		hash ^= *p;
-		hash *= 16777619u;
-	}
-	return hash & static_cast<uint32_t>(std::numeric_limits<int32_t>::max());
-}
-
 static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 	if (addr == 0) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
@@ -118,18 +110,6 @@ static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 	}
 
 	return LibKernel::KERNEL_ERROR_ENAMETOOLONG;
-}
-
-static void RegisterHostPathLocked(uint32_t file_id, const std::string& host_path,
-                                   uint64_t file_size, bool is_dir) {
-	g_files[file_id]      = host_path;
-	g_file_sizes[file_id] = is_dir ? 0 : file_size;
-}
-
-static void RegisterHostPath(uint32_t file_id, const std::string& host_path, uint64_t file_size,
-                             bool is_dir) {
-	std::scoped_lock lock(g_mutex);
-	RegisterHostPathLocked(file_id, host_path, file_size, is_dir);
 }
 
 static bool TryGetHostPath(uint32_t file_id, std::string* out) {
@@ -213,7 +193,6 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	if (!found) {
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
-		info.file_id         = AprShared::ComputeFileId(guest_path);
 		info.host_path       = Common::PathToString(real_path);
 
 		if (Common::File::IsDirectoryExisting(real_path)) {
@@ -232,7 +211,14 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			if (!inserted) {
 				info = it->second;
 			} else if (info.result == OK) {
-				RegisterHostPathLocked(info.file_id, info.host_path, info.file_size, info.is_dir);
+				// Allocate once under the cache lock; distinct paths can share a hash.
+				if (g_next_file_id == 0xffffffffu) {
+					info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
+				} else {
+					info.file_id = it->second.file_id = g_next_file_id++;
+					g_files.emplace(info.file_id, info.host_path);
+					g_file_sizes.emplace(info.file_id, info.is_dir ? 0 : info.file_size);
+				}
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
@@ -240,8 +226,6 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		if (log_missing) {
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, info.host_path.c_str());
 		}
-	} else if (info.result == OK) {
-		AprShared::RegisterHostPath(info.file_id, info.host_path, info.file_size, info.is_dir);
 	}
 
 	if (info.result != OK) {

@@ -19,6 +19,7 @@
 #include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -126,6 +127,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	setMinimumWidth(width());
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
+	m_ui->settings_button->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
@@ -273,7 +275,9 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
+	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
+	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
@@ -354,6 +358,11 @@ void ConfigurationEditDialog::InitGameDirectories() {
 
 void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_global_settings = true;
+	auto* menu        = new QMenu(m_ui->settings_button);
+	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
+	menu->addAction(tr("Export..."), this, &ConfigurationEditDialog::ExportGameSettings);
+	m_ui->settings_button->setMenu(menu);
+	m_ui->settings_button->setVisible(true);
 	m_game_dirs_list->clear();
 	m_game_dirs_group->setMinimumWidth(GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH);
 
@@ -427,7 +436,9 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
+	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
+	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();

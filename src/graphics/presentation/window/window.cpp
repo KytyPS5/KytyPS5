@@ -722,6 +722,10 @@ void WindowContext::Run() {
 	loop.need_exit = false;
 	loop.paused.store(false, std::memory_order_release);
 
+	constexpr uint64_t title_interval_ms = 1000;
+	auto               title_time        = SDL_GetTicks();
+	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
+
 	while (!loop.need_exit) {
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
@@ -731,7 +735,20 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (!HostInputWaitEvent(&loop.event)) {
+		// Refresh the title on the main thread without making presentation wait for it.
+		const auto now     = SDL_GetTicks();
+		const auto elapsed = now - title_time;
+		if (elapsed >= title_interval_ms) {
+			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			if (frames != 0) {
+				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
+				                        static_cast<double>(elapsed));
+			}
+			title_time   = now;
+			title_frames = frames;
+		}
+		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
+		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
@@ -913,7 +930,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle() {
+void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -923,10 +940,6 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -936,17 +949,6 @@ void WindowContext::UpdateTitle() {
 	static constexpr auto build_type = "Unknown";
 #endif
 
-	const auto now       = Common::Timer::QueryPerformanceCounter();
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	frame_num++;
-	fps_frames++;
-	if (now - fps_start >= frequency) {
-		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
-		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
-	}
-
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
@@ -954,16 +956,7 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+	SDL_SetWindowTitle(window, text.c_str());
 }
 
 } // namespace Libs::Graphics

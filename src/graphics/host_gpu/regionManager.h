@@ -9,6 +9,12 @@
 #include <mutex>
 #include <utility>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,7 +38,13 @@ public:
 		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+#if defined(__x86_64__) || defined(_M_X64)
+			_mm_pause();
+#elif defined(_M_ARM64)
+			__yield();
+#elif defined(__aarch64__)
+			asm volatile("yield");
+#endif
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}

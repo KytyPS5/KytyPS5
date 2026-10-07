@@ -31,11 +31,12 @@ void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }
 
-void Translator::V_MED3_I16(const Decoder::Instruction& inst) {
+void Translator::Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                  bool sign) {
 	const auto result = IR::U32(ir.Emit(
-	    IR::ValueOpcode::SMedTri32, {ReadU16AsU32(inst.src0, true), ReadU16AsU32(inst.src1, true),
-	                                 ReadU16AsU32(inst.src2, true)}));
-	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
+	    opcode, {ReadU16AsU32(inst.src0, sign), ReadU16AsU32(inst.src1, sign),
+	             ReadU16AsU32(inst.src2, sign)}));
+	Write16Bits(DestinationOperand(inst), result);
 }
 
 void Translator::PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,

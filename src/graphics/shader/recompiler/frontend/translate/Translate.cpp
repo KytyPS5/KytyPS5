@@ -889,9 +889,16 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CMP_GT_U64:
 		case Decoder::Opcode::V_CMP_NE_U64:
 		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMPX_LT_I64:
+		case Decoder::Opcode::V_CMPX_EQ_I64:
+		case Decoder::Opcode::V_CMPX_LE_I64:
 		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_LT_U64:
+		case Decoder::Opcode::V_CMPX_EQ_U64:
 		case Decoder::Opcode::V_CMPX_LE_U64:
+		case Decoder::Opcode::V_CMPX_GT_U64:
 		case Decoder::Opcode::V_CMPX_NE_U64:
+		case Decoder::Opcode::V_CMPX_GE_U64:
 			include_vector(inst.src0, 2u);
 			include_vector(inst.src1, 2u);
 			break;
@@ -1130,7 +1137,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 64u ||
+			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 0x1ffu ||
+			                     mesh.primitives_per_group > 0x1ffu ||
 			                     total_threads > 15u * options.wave_size);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
@@ -1166,6 +1174,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto wave_info = entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(wave, u32(24)),
 			                                          u32(((total_threads + options.wave_size - 1u) /
 			                                               options.wave_size) << 28u));
+			entry_ir.SetScalarReg(
+			    static_cast<IR::ScalarReg>(2),
+			    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(vertices, u32(12)),
+			                       entry_ir.ShiftLeftLogical(primitives, u32(22))));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
@@ -1274,6 +1286,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 			};
 			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
+			barycentric_pair(ps->ps_perspective_sample_vgpr,
+			                 IR::StageInputKind::BaryCoordSmoothSample);
 			barycentric_pair(ps->ps_perspective_centroid_vgpr,
 			                 IR::StageInputKind::BaryCoordSmoothCentroid);
 			uint32_t reg = ps->ps_system_input_base;

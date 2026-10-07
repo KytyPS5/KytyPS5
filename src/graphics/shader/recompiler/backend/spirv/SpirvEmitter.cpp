@@ -205,7 +205,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (memory_index >= program.memory_info.size()) {
 					Fail(program, "address operation has invalid memory metadata");
 				}
-				const auto kind = program.memory_info[memory_index].kind;
+				const auto& memory = program.memory_info[memory_index];
+				const auto kind = memory.kind;
 				if (kind == IR::ResourceKind::Scratch || kind == IR::ResourceKind::FlatLocal) {
 					if (program.scratch_dwords == 0) {
 						Fail(program, "scratch operation has no per-thread storage");
@@ -217,6 +218,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					}
 				} else if (address_access == IR::AddressAccess::Write) {
 					Fail(program, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
+				} else {
+					// Descriptor stores can alias coherent physical-address loads.
+					requirements.coherent_buffers |= memory.coherent;
 				}
 			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
@@ -276,6 +280,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
+				case IR::ValueOpcode::ConditionRef:
+					requirements.subgroup_ballot |=
+					    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
+					break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:

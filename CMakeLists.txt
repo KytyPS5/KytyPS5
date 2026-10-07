@@ -413,7 +413,16 @@ add_executable(archive_file_tests EXCLUDE_FROM_ALL
 target_link_libraries(archive_file_tests common ZArchive::zarchive)
 target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 
-add_executable(avplayer_file_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp")
+add_executable(trophy_system_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TrophySystemTests.cpp"
+)
+target_link_libraries(trophy_system_tests common)
+target_include_directories(trophy_system_tests PRIVATE ${inc_headers})
+
+add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
 target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
 target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
 
@@ -606,6 +615,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
+	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
@@ -664,15 +674,12 @@ if(BUILD_TESTING)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
-	if(WIN32)
-		# These tests still depend on the Windows multisample-depth path.
-		add_test(NAME texture_cache_image_overlap
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
-		add_test(NAME texture_cache_htile_clear
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
-		add_test(NAME buffer_cache_ranges
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
-	endif()
+	add_test(NAME texture_cache_image_overlap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
+	add_test(NAME texture_cache_htile_clear
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
+	add_test(NAME buffer_cache_ranges
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
@@ -682,6 +689,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
+		trophy_system_tests
 		avplayer_file_tests
 		bit_array_tests
 		lru_cache_tests
@@ -712,8 +720,9 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	add_executable(macos_sse4a_tests EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/macosSse4aTests.cpp"
 		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+		"${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp"
 	)
-	target_link_libraries(macos_sse4a_tests common fmt::fmt Zydis::Zydis)
+	target_link_libraries(macos_sse4a_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
 	target_include_directories(macos_sse4a_tests PRIVATE ${inc_headers})
 	if(BUILD_TESTING)
 		add_test(NAME macos_sse4a COMMAND $<TARGET_FILE:macos_sse4a_tests>)

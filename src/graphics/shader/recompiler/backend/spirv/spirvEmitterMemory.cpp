@@ -180,29 +180,46 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
 }
 
-uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
+uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
 	auto&      state   = ctx.state;
 	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
 	return EmitValueOrZeroIfCondition(state, present, [&]() {
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-		                          bda);
+		auto pointer = state.builder.AllocateId();
+		if (coherent) {
+			const auto block = state.builder.DecoratedType(
+			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+			                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+			                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
+			state.builder.AddFunction(
+			    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
+			    pointer, bda);
+			const auto base = pointer;
+			pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
+			                          base, ConstantU32(state, 0));
+		} else {
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+		}
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-		                          spv::MemoryAccessAlignedMask, alignment);
+		                          spv::MemoryAccessAlignedMask |
+		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
+		                          alignment);
 		return value;
 	});
 }
 
-uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits) {
+uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
+                 bool coherent = false) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
 		                            ConstantU64(state, ~uint64_t {3}));
-		const auto first   = LoadBdaDword(ctx, aligned);
+		const auto first   = LoadBdaDword(ctx, aligned, coherent);
 		const auto byte =
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
 		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
@@ -212,7 +229,7 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
 		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
 			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
-			                                ConstantU64(state, sizeof(uint32_t))));
+			                                ConstantU64(state, sizeof(uint32_t))), coherent);
 		});
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
@@ -699,18 +716,38 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 			return LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, 0u), resource);
 		}
 		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info);
-		return EmitValueOrDefaultIfCondition(
+		const auto value = EmitValueOrDefaultIfCondition(
 		    ctx.state, plan.in_bounds, TypeU32(ctx.state),
 		    FormattedOutOfBoundsValue(ctx, mem, plan, 1u),
 		    [&]() { return LoadFormattedInBounds(ctx, mem, plan, 0u); });
+		if (mem.data_bits != 16u) {
+			return value;
+		}
+		if (info.type == Format::ComponentType::Uint) {
+			return EmitUMin32(ctx.state, value, ConstantU32(ctx.state, 0xffffu));
+		}
+		if (info.type == Format::ComponentType::Sint) {
+			const auto lower = EmitSMax32(ctx.state, value, ConstantU32(ctx.state, 0xffff8000u));
+			return EmitSMin32(ctx.state, lower, ConstantU32(ctx.state, 0x7fffu));
+		}
+		return EmitConvertF16F32(ctx.state, EmitBitCastF32U32(ctx.state, value));
 	});
 }
 
 uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
                                        const Format::BufferFormatInfo& info,
-                                       uint32_t component, uint32_t data) {
+                                       uint32_t component, uint32_t data, uint32_t data_bits) {
 	auto& state = ctx.state;
 	const auto bits = info.component_bits[component];
+	if (data_bits == 16u) {
+		if (info.type == Format::ComponentType::Uint) {
+			data = EmitBitFieldUExtract(state, data, ConstantU32(state, 0), ConstantU32(state, 16));
+		} else if (info.type == Format::ComponentType::Sint) {
+			data = EmitBitFieldSExtract(state, data, ConstantU32(state, 0), ConstantU32(state, 16));
+		} else {
+			data = EmitBitCastU32F32(state, EmitF16BitsToF32(state, data));
+		}
+	}
 	const bool normalized = info.type == Format::ComponentType::Unorm ||
 	                        info.type == Format::ComponentType::Snorm;
 	const bool scaled = info.type == Format::ComponentType::Uscaled ||
@@ -762,7 +799,7 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 					                              value, data, component);
 				}
 			}
-			value = EncodeFormattedStoreComponent(ctx, info, component, value);
+			value = EncodeFormattedStoreComponent(ctx, info, component, value, mem.data_bits);
 			const auto bits = info.component_bits[component];
 			if (info.packed_bitfield) {
 				packed = EmitBitFieldInsert(
@@ -1359,7 +1396,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
-		                address_info.data_bits);
+		                address_info.data_bits, mem.coherent);
 	else if (op == IR::ValueOpcode::LoadBufferU32 && mem.formatted)
 		value = mem.kind == IR::ResourceKind::IndirectBuffer ? LoadIndirectFormattedX(ctx, inst)
 		                                                     : FormattedLoad(ctx, inst, mem);

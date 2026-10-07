@@ -2388,6 +2388,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 	return cmd;
 }
 
+uint64_t KYTY_SYSV_ABI AgcDcbSetShRegistersIndirectGetSize() {
+	PRINT_NAME();
+
+	return 5u * sizeof(uint32_t);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs) {

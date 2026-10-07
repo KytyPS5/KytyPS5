@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <limits>
 #include <magic_enum.hpp>
 #include <vector>
 
@@ -90,8 +89,9 @@ public:
 	};
 
 	struct OutputParam {
-		Id          handle;
-		const void* data = nullptr;
+		Id           handle;
+		const void*  data  = nullptr;
+		const float* gains = nullptr;
 	};
 
 	Audio() = default;
@@ -159,8 +159,10 @@ private:
 	static void            OpenSdlDevice(PortIn* port, Format format);
 	static void            CloseSdlDevice(PortIn* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
-	                                           std::vector<uint8_t>* buffer, float gain);
-	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain);
+	                                           std::vector<uint8_t>* buffer, float gain,
+	                                           const float* gains);
+	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
+	                          const float* gains);
 };
 
 static Audio* g_audio = nullptr;
@@ -196,7 +198,7 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	for (uint32_t i = 0; i < num; i++) {
 		if (params[i].handle > 0 && params[i].data != nullptr) {
 			output_params.push_back(
-			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data});
+			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data, params[i].gains});
 		}
 	}
 
@@ -302,7 +304,8 @@ void Audio::CloseSdlDevice(PortOut* port) {
 }
 
 const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
-                                       std::vector<uint8_t>* buffer, float gain) {
+                                       std::vector<uint8_t>* buffer, float gain,
+                                       const float* gains) {
 	EXIT_IF(data == nullptr);
 	EXIT_IF(buffer == nullptr);
 
@@ -312,12 +315,12 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	const auto bytes_per_sample = BytesPerSample(port.format);
 	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
 
-	bool volume_changed = gain != 1.0f;
+	std::array<double, 12> scales {};
+	bool                   volume_changed = false;
 	for (uint32_t ch = 0; ch < channels; ch++) {
-		if (port.volume[ch] != 32768) {
-			volume_changed = true;
-			break;
-		}
+		scales[ch] = (static_cast<double>(port.volume[ch]) / 32768.0) * gain *
+		             (gains != nullptr ? gains[ch] : 1.0f);
+		volume_changed |= scales[ch] != 1.0;
 	}
 
 	if (!volume_changed && !reorder) {
@@ -337,8 +340,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
 				dst[frame * output_channels + ch] =
-				    src[frame * channels + src_ch] *
-				    (static_cast<float>(port.volume[src_ch]) / 32768.0f) * gain;
+				    static_cast<float>(src[frame * channels + src_ch] * scales[src_ch]);
 			}
 			if (channels == 12) {
 				// Add the four top channels to their front/back channels, turning 12 into 8.
@@ -346,8 +348,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				static constexpr uint32_t HEIGHT_DST[4] = {0, 1, 4, 5};
 				for (uint32_t ch = 0; ch < 4; ch++) {
 					dst[frame * output_channels + HEIGHT_DST[ch]] +=
-					    src[frame * channels + 8 + ch] *
-					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f) * gain;
+					    static_cast<float>(src[frame * channels + 8 + ch] * scales[8 + ch]);
 				}
 			}
 		}
@@ -358,15 +359,9 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
-				int64_t sample =
-				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
-				sample = static_cast<int64_t>(sample * static_cast<double>(gain));
-				if (sample > std::numeric_limits<int16_t>::max()) {
-					sample = std::numeric_limits<int16_t>::max();
-				} else if (sample < std::numeric_limits<int16_t>::min()) {
-					sample = std::numeric_limits<int16_t>::min();
-				}
-				dst[frame * output_channels + ch] = static_cast<int16_t>(sample);
+				const double sample = src[frame * channels + src_ch] * scales[src_ch];
+				dst[frame * output_channels + ch] = static_cast<int16_t>(
+				    std::clamp(sample, -32768.0, 32767.0));
 			}
 		}
 	}
@@ -374,7 +369,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
-bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain) {
+bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
+                          const float* gains) {
 	EXIT_IF(port == nullptr);
 
 	if (port->stream == nullptr || data == nullptr) {
@@ -382,7 +378,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	}
 
 	std::vector<uint8_t> prepared_buffer;
-	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer, gain);
+	const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer, gain, gains);
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
@@ -570,14 +566,14 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
 			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
 			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume,
-			    gain);
+			    gain, params[i].gains);
 			controller_uses_bluetooth =
 			    Controller::DualSenseHaptics::UsesBluetooth(port.haptics);
 		}
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
-			if (QueueSdlAudio(&port, params[i].data, blocking, gain)) {
+			if (QueueSdlAudio(&port, params[i].data, blocking, gain, params[i].gains)) {
 				any_device = true;
 				paced[i]   = port.queue_primed;
 			}

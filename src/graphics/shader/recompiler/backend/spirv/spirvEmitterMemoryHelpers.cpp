@@ -44,6 +44,16 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	};
 	const auto mapping = ConstantU32(state, mapping_offset);
 	const auto count = LoadMapping(mapping);
+	if (search_iterations == 0u) {
+		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
+		                          ConstantU32(state, 2u));
+		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
+		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
+		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
+		                          ConstantU32(state, mapping_offset + 1u));
+		return Select(state, TypeU32(state), valid, LoadMapping(entry),
+		              ConstantU32(state, default_resource));
+	}
 	const auto entry_at = [&](uint32_t index) {
 		return Binary(state, spv::OpIAdd, TypeU32(state), mapping,
 		              Binary(state, spv::OpIAdd, TypeU32(state),

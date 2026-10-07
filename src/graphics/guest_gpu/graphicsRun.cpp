@@ -875,15 +875,32 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
-void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
+static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters registers,
+                                     uint32_t vertex_offset, uint32_t instance_offset,
+                                     uint32_t first_index) {
+	const auto write = [&](uint32_t location, uint32_t value) {
+		if (location == Pm4::SH_NOP) {
+			return;
+		}
+		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM ||
+		                     g_hw_sh_indirect_func[location] == nullptr);
+		g_hw_sh_indirect_func[location](cp, location, value);
+	};
+	write(registers.vertex_offset, vertex_offset);
+	write(registers.instance_offset, instance_offset);
+	write(registers.index_offset, first_index);
+}
+
+void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
+                                    uint32_t draw_initiator, bool indexed) {
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
-	DrawIndirectMulti(data_offset, 1, nullptr, args_size, draw_initiator, indexed);
+	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
-                                         uint32_t stride_in_bytes, uint32_t draw_initiator,
-                                         bool indexed) {
+                                         uint32_t stride_in_bytes, IndirectDrawRegisters registers,
+                                         uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -918,6 +935,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		if (!indexed) {
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
+			                         args->start_instance_location, 0);
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -928,6 +947,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		PatchIndirectDrawOffsets(*this, registers, args->base_vertex_location,
+		                         args->start_instance_location, args->start_index_location);
 
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);

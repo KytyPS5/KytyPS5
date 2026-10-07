@@ -31,6 +31,7 @@ void Translator::EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueO
 	const bool signed_64 = opcode == IR::ValueOpcode::SLessThan64 ||
 	                       opcode == IR::ValueOpcode::SLessThanEqual64 ||
 	                       inst.opcode == Decoder::Opcode::V_CMP_EQ_I64 ||
+	                       inst.opcode == Decoder::Opcode::V_CMPX_EQ_I64 ||
 	                       inst.opcode == Decoder::Opcode::V_CMP_NE_I64 ||
 	                       inst.opcode == Decoder::Opcode::V_CMPX_NE_I64;
 	const auto read = [&](const Decoder::Operand& operand) {

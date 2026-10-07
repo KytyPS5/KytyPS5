@@ -152,6 +152,10 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+bool SyncRawImageBuffersEnabled() {
+	return g_config->sync_raw_image_buffers;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
@@ -162,6 +166,10 @@ bool TrophyEnabled() {
 
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
+}
+
+bool SkipNoticeScreen() {
+	return g_config->skip_notice_screen;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

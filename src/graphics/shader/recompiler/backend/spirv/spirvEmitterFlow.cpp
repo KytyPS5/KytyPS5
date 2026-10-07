@@ -42,8 +42,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		                  EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, size)));
 	}
 	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid;
+	const bool sample = kind == IR::StageInputKind::BaryCoordSmoothSample;
 	const auto variable = InputVariableForKind(
-	    state, centroid ? IR::StageInputKind::BaryCoordSmooth : kind);
+	    state, centroid || sample ? IR::StageInputKind::BaryCoordSmooth : kind);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
@@ -76,15 +77,24 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 		return bits;
 	}
-	if (centroid || kind == IR::StageInputKind::BaryCoordSmooth ||
+	if (centroid || sample || kind == IR::StageInputKind::BaryCoordSmooth ||
 	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
-		if (centroid) {
+		if (centroid || sample) {
 			const auto coordinates = state.builder.AllocateId();
 			state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
-			state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
-			                          GlslStd450(state), GLSLstd450InterpolateAtCentroid, variable);
+			if (sample) {
+				const auto sample_id = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeI32(state), sample_id,
+				                          InputVariableForKind(state, IR::StageInputKind::SampleId));
+				state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
+				                          GlslStd450(state), GLSLstd450InterpolateAtSample,
+				                          variable, sample_id);
+			} else {
+				state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
+				                          GlslStd450(state), GLSLstd450InterpolateAtCentroid, variable);
+			}
 			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value,
 			                          coordinates, component + 1u);
 		} else {
@@ -252,8 +262,12 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
                       bool uint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
-		const auto unpack =
-		    MrtOutputMode(state, exp) == 5u ? GLSLstd450UnpackUnorm2x16 : GLSLstd450UnpackHalf2x16;
+		auto unpack = GLSLstd450UnpackHalf2x16;
+		switch (MrtOutputMode(state, exp)) {
+			case 5: unpack = GLSLstd450UnpackUnorm2x16; break;
+			case 6: unpack = GLSLstd450UnpackSnorm2x16; break;
+			default: break;
+		}
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
 		                   ConstantF32(state, 0x3f800000u)};
 		for (uint32_t pair = 0; pair < 2u; pair++) {
@@ -699,26 +713,18 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.other_half == nullptr) return ctx.Arg(inst, 0);
-	// A native scalar branch makes one decision for both emulated wave halves.
-	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	// Scalar branches include lanes disabled by EXEC, which the branch body may restore.
+	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
-	const auto ballot = ctx.Ballot(inst.Arg(0));
-	const auto low = ctx.state.builder.AllocateId();
-	const auto high = ctx.state.builder.AllocateId();
-	const auto combined = ctx.state.builder.AllocateId();
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
-	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
-	                              TypeU32(ctx.state), combined, low, high);
-	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual,
-	                              TypeBool(ctx.state), result, combined,
-	                              ConstantU32(ctx.state, zero ? ~0u : 0u));
-	return result;
+	const auto ballot = ctx.Ballot(inst.Arg(0));
+	const auto reference = zero ? ctx.Ballot(IR::Value(true))
+	                            : ConstantU32CompositeZero(ctx.state, 4);
+	const auto compare = Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual,
+	                            TypeBoolVector(ctx.state, 4), ballot, reference);
+	return Unary(ctx.state, zero ? spv::OpAll : spv::OpAny, TypeBool(ctx.state), compare);
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {

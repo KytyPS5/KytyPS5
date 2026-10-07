@@ -717,9 +717,9 @@ void TestConcurrentBackingReads() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "ConcurrentBackingReads";
 	constexpr uint64_t original = 0x123456789abcdef0ull;
-	for (const auto& readers: {std::pair {TryReadBacking, TryReadBacking},
-	                           std::pair {TryReadBacking, TryReadSparseBacking},
-	                           std::pair {TryReadSparseBacking, TryReadSparseBacking}}) {
+	for (const auto& readers: {std::pair {&TryReadBacking, &TryReadBacking},
+	                           std::pair {&TryReadBacking, &TryReadSparseBacking},
+	                           std::pair {&TryReadSparseBacking, &TryReadSparseBacking}}) {
 		const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
 		                                   "concurrent_backing_reads");
 		std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));

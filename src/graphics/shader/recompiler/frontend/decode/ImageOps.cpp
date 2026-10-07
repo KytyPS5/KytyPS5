@@ -319,12 +319,15 @@ uint32_t ImageAddressDwordCount(uint32_t flags, uint32_t components) {
 void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
 	const uint32_t word0      = code[word_index];
-	const uint32_t word1      = code[word_index + 1u];
 	const uint32_t opcode     = ((word0 >> 18u) & 0x7fu) | ((word0 & 1u) << 7u);
 	const uint32_t nsa_dwords = (word0 >> 1u) & 0x3u;
 	const auto     dimension  = DecodeImageDimension((word0 >> 3u) & 0x7u);
 	const uint32_t word_count = 2u + nsa_dwords;
+	if (RejectTruncated(inst, pc, Family::MIMG, opcode, code, word_index, word_count)) {
+		return;
+	}
 
+	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t vdata  = (word1 >> 8u) & 0xffu;
 	const uint32_t vaddr  = word1 & 0xffu;
 	const uint32_t srsrc  = (word1 >> 16u) & 0x1fu;

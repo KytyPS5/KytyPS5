@@ -832,6 +832,8 @@ void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, In
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,
                  uint32_t word_count);
 void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const char* reason);
+bool RejectTruncated(Instruction& inst, uint32_t pc, Family family, uint32_t opcode_id,
+                     std::span<const uint32_t> code, uint32_t word_index, uint32_t word_count);
 std::string OperandToString(const Operand& operand);
 const char* ImageDimensionToString(ImageDimension dimension);
 std::string InstructionToString(const Instruction& inst);

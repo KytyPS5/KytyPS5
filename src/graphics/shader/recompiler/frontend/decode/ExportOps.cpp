@@ -5,9 +5,12 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 void DecodeExp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                Instruction& inst) {
 	const uint32_t word0  = code[word_index];
-	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t target = (word0 >> 4u) & 0x3fu;
 	const uint32_t en     = word0 & 0xfu;
+	if (RejectTruncated(inst, pc, Family::EXP, target, code, word_index, 2u)) {
+		return;
+	}
+	const uint32_t word1 = code[word_index + 1u];
 
 	inst.pc         = pc;
 	inst.word_count = 2;

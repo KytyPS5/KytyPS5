@@ -299,6 +299,10 @@ void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, In
 	if (!HasLiteral(inst)) {
 		return;
 	}
+	if (RejectTruncated(inst, inst.pc, inst.family, inst.opcode_id, code, word_index,
+	                    inst.word_count + 1u)) {
+		return;
+	}
 
 	const auto literal = code[word_index + inst.word_count];
 	ApplyLiteral(inst.src0, literal);
@@ -322,6 +326,17 @@ void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const 
 	inst.family             = family;
 	inst.opcode_id          = opcode_id;
 	inst.unsupported_reason = reason;
+}
+
+bool RejectTruncated(Instruction& inst, uint32_t pc, Family family, uint32_t opcode_id,
+                     std::span<const uint32_t> code, uint32_t word_index, uint32_t word_count) {
+	if (code.size() - word_index >= word_count) {
+		return false;
+	}
+	inst.pc = pc;
+	SetRawWords(inst, code, word_index, static_cast<uint32_t>(code.size() - word_index));
+	SetUnsupported(inst, family, opcode_id, "instruction extends past the end of the shader code");
+	return true;
 }
 
 Family GetInstructionFamily(uint32_t word) {

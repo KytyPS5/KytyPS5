@@ -238,9 +238,12 @@ bool IsFlatStoreOpcode(Opcode opcode) {
 
 void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
-	const uint32_t word0   = code[word_index];
+	const uint32_t word0  = code[word_index];
+	const uint32_t opcode = (word0 >> 18u) & 0xffu;
+	if (RejectTruncated(inst, pc, Family::SMEM, opcode, code, word_index, 2u)) {
+		return;
+	}
 	const uint32_t word1   = code[word_index + 1u];
-	const uint32_t opcode  = (word0 >> 18u) & 0xffu;
 	const uint32_t sdst    = (word0 >> 6u) & 0x7fu;
 	const uint32_t sbase   = word0 & 0x3fu;
 	const uint32_t soffset = (word1 >> 25u) & 0x7fu;
@@ -272,9 +275,12 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                  Instruction& inst) {
-	const uint32_t word0   = code[word_index];
+	const uint32_t word0  = code[word_index];
+	const uint32_t opcode = ((word0 >> 18u) & 0x7fu) | (((word0 >> 25u) & 1u) << 7u);
+	if (RejectTruncated(inst, pc, Family::MUBUF, opcode, code, word_index, 2u)) {
+		return;
+	}
 	const uint32_t word1   = code[word_index + 1u];
-	const uint32_t opcode  = ((word0 >> 18u) & 0x7fu) | (((word0 >> 25u) & 1u) << 7u);
 	const uint32_t vdata   = (word1 >> 8u) & 0xffu;
 	const uint32_t vaddr   = word1 & 0xffu;
 	const uint32_t srsrc   = (word1 >> 16u) & 0x1fu;
@@ -309,7 +315,10 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 
 void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                  Instruction& inst) {
-	const uint32_t word0   = code[word_index];
+	const uint32_t word0 = code[word_index];
+	if (RejectTruncated(inst, pc, Family::MTBUF, (word0 >> 16u) & 0x7u, code, word_index, 2u)) {
+		return;
+	}
 	const uint32_t word1   = code[word_index + 1u];
 	const uint32_t opcode  = ((word0 >> 16u) & 0x7u) | (((word1 >> 21u) & 1u) << 3u);
 	const uint32_t dfmt    = (word0 >> 19u) & 0xfu;
@@ -348,11 +357,14 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
 	const uint32_t word0  = code[word_index];
+	const uint32_t opcode = (word0 >> 18u) & 0x7fu;
+	if (RejectTruncated(inst, pc, Family::FLAT, opcode, code, word_index, 2u)) {
+		return;
+	}
 	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t offset = word0 & 0xfffu;
 	const uint32_t lds    = (word0 >> 13u) & 1u;
 	const uint32_t seg    = (word0 >> 14u) & 0x3u;
-	const uint32_t opcode = (word0 >> 18u) & 0x7fu;
 	const uint32_t vdst   = (word1 >> 24u) & 0xffu;
 	const uint32_t saddr  = (word1 >> 16u) & 0x7fu;
 	const uint32_t data   = (word1 >> 8u) & 0xffu;
@@ -397,9 +409,12 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 }
 
 void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
-	const uint32_t word0   = code[word_index];
+	const uint32_t word0  = code[word_index];
+	const uint32_t opcode = (word0 >> 18u) & 0xffu;
+	if (RejectTruncated(inst, pc, Family::DS, opcode, code, word_index, 2u)) {
+		return;
+	}
 	const uint32_t word1   = code[word_index + 1u];
-	const uint32_t opcode  = (word0 >> 18u) & 0xffu;
 	const uint32_t offset0 = word0 & 0xffu;
 	const uint32_t offset1 = (word0 >> 8u) & 0xffu;
 	const uint32_t vdst    = (word1 >> 24u) & 0xffu;

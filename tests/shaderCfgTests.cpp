@@ -4838,6 +4838,58 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
         "V_CMP_NE_I64 accepted an illegal SDWA encoding");
 }
 
+void TestDecoderRejectsTruncatedInstructions() {
+  using namespace ShaderRecompiler::Decoder;
+  struct TruncatedCase {
+    Family family;
+    std::vector<uint32_t> words;
+  };
+  const TruncatedCase cases[] = {
+      {Family::MIMG, {0xf0000004u, 0xbf810000u}},
+      {Family::MIMG, {0xf0000002u, 0x00000000u}},
+      {Family::MIMG, {0xf0000006u, 0x00000000u, 0x00000000u, 0x00000000u}},
+      {Family::MIMG, {0xf0000000u}},
+      {Family::VOP3, {0xd5030000u}},
+      {Family::VOP3, {0xd5030000u, 0x000000ffu}},
+      {Family::VOP3P, {0xcc000000u}},
+      {Family::VOP2, {0x020000ffu}},
+      {Family::VOP2, {0x020000f9u}},
+      {Family::VOP2, {0x020000fau}},
+      {Family::VOPC, {0x7c0000ffu}},
+      {Family::VOPC, {0x7c0000f9u}},
+      {Family::VOPC, {0x7c0000fau}},
+      {Family::VOP1, {0x7e0002f9u}},
+      {Family::VOP1, {0x7e0002fau}},
+      {Family::VOP1, {0x7e0002e9u}},
+      {Family::SOP1, {0xbe8003ffu}},
+      {Family::SOP2, {0x800000ffu}},
+      {Family::DS, {0xd8000000u}},
+      {Family::FLAT, {0xdc000000u}},
+      {Family::SMEM, {0xf4000000u}},
+      {Family::MUBUF, {0xe0000000u}},
+      {Family::MTBUF, {0xe8000000u}},
+      {Family::EXP, {0xf8000000u}},
+  };
+  for (const auto &test : cases) {
+    Instruction inst;
+    DecodeInstruction(test.words, 0u, inst);
+    Check(inst.opcode == Opcode::UNSUPPORTED && inst.family == test.family &&
+              inst.word_count == test.words.size() &&
+              std::equal(test.words.begin(), test.words.end(), inst.raw) &&
+              inst.unsupported_reason.find("extends past the end of the shader code") !=
+                  std::string::npos,
+          "decoder accepted an instruction that extends past the end of the code");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    ExpectFatal(
+        [&] {
+          Program program;
+          DecodeProgram(test.words, program);
+        },
+        "truncated shader code did not stop decoding with an explicit error");
+#endif
+  }
+}
+
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   using namespace ShaderRecompiler;
 
@@ -15039,6 +15091,7 @@ int main() {
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
+  TestDecoderRejectsTruncatedInstructions();
   TestFloatComparisonInputModes();
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();

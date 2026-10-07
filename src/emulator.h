@@ -13,8 +13,11 @@ struct RunOptions {
 	std::filesystem::path app0_dir;
 	std::filesystem::path elf;
 	std::filesystem::path game_patch;
+	uint32_t wait_for_process = 0;
 };
 
+void SetHostArguments(int argc, char* argv[]);
+int LoadExec(const char* path, const char* const argv[]);
 void Run(const RunOptions& options);
 
 } // namespace Emulator

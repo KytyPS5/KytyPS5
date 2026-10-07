@@ -56,6 +56,8 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// Caller has updated both images and validated the copy geometry/format.
+	void CopyImageThroughBuffer(ImageId destination, ImageId source);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);

@@ -1,6 +1,9 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/file.h"
+#include "kernel/fileSystem.h"
+#include "loader/systemContent.h"
 #include "common/logging/log.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -1629,6 +1632,33 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
 };
 
+static std::vector<NpEntitlementAccessAddcontEntitlementInfo> InstalledAddonList() {
+	std::string title_id;
+	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id != "PPSA34502") {
+		return {std::begin(NP_ENTITLEMENT_ACCESS_ADDON_LIST), std::end(NP_ENTITLEMENT_ACCESS_ADDON_LIST)};
+	}
+	// This extracted title bundles its maps in app0; its frontend recognizes
+	// the season-pass label rather than individual map filenames.
+	for (const char* file : {"dlc1_load_zm.ff", "dlc2_load_zm.ff", "dlc3_load_zm.ff", "dlc4_load_zm.ff",
+	                         "zm_highrise.ff", "zm_prison.ff", "zm_buried.ff", "zm_tomb.ff", "zm_nuked.ff",
+	                         "mp_hydro.ff", "mp_mirage.ff", "mp_downhill.ff"}) {
+		if (!Common::File::IsFileExisting(LibKernel::FileSystem::GetRealFilename(
+		        std::string("/app0/zone/all/") + file))) return {};
+	}
+	std::vector<NpEntitlementAccessAddcontEntitlementInfo> addons {
+	    {{{"CODBO2SEASONPASS"}, {}}, 3, 4}};
+	// The cosmetic catalog is bundled with this title's weapon/MP assets.
+	// Presence is a compatibility heuristic, not a full bundle-integrity check.
+	bool cosmetic_assets = true;
+	for (const char* file : {"weapons.clump", "common_mp.ff", "common_mp.ipak", "patch_mp.ff",
+	                         "patch_mp.ipak", "ui_mp.ff", "patch_ui_mp.ff"}) {
+		cosmetic_assets &= Common::File::IsFileExisting(LibKernel::FileSystem::GetRealFilename(
+		    std::string("/app0/zone/all/") + file));
+	}
+	if (cosmetic_assets) addons.push_back({{{"CODBO2CSMTICPACK"}, {}}, 3, 4});
+	return addons;
+}
+
 static int KYTY_SYSV_ABI NpEntitlementAccessInitialize(
     const NpEntitlementAccessInitParam* init_param, NpEntitlementAccessBootParam* boot_param) {
 	PRINT_NAME();
@@ -1667,15 +1697,16 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
 		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
 	}
 
-	*hit_num = static_cast<uint32_t>(sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST) /
-	                                 sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST[0]));
+	const auto addons = InstalledAddonList();
+	*hit_num = static_cast<uint32_t>(addons.size());
+	for (const auto& addon : addons) LOGF("\t installed add-on = %s\n", addon.entitlement_label.data);
 
 	if (list != nullptr && list_num != 0) {
 		memset(list, 0, sizeof(*list) * list_num);
 
 		const auto copy_num = (list_num < *hit_num ? list_num : *hit_num);
 		for (uint32_t i = 0; i < copy_num; i++) {
-			list[i] = NP_ENTITLEMENT_ACCESS_ADDON_LIST[i];
+			list[i] = addons[i];
 		}
 	}
 
@@ -1698,7 +1729,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 
 	memset(info, 0, sizeof(*info));
 
-	for (const auto& entitlement: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
+	for (const auto& entitlement: InstalledAddonList()) {
 		if (strncmp(entitlement_label->data, entitlement.entitlement_label.data,
 		            sizeof(entitlement_label->data)) == 0) {
 			*info = entitlement;

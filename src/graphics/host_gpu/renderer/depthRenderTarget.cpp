@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -346,6 +347,64 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	auto& cache = m_context.GetTextureCache();
 	r.image_id = cache.FindImage(r.desc);
 	BindRenderTarget(r.image_id);
+}
+
+bool RenderExecutor::DepthToColorCopy(CommandBuffer& buffer, uint32_t slice_offset) {
+	const auto& hw = buffer.GetRegisters();
+	const auto& rc = hw.GetRenderControl();
+	if (!rc.copy_depth_to_color && !rc.copy_stencil_to_color) {
+		return false;
+	}
+	LOGF("DepthToColorCopy: depth=%u stencil=%u sample=%u centroid=%u\n",
+	     rc.copy_depth_to_color, rc.copy_stencil_to_color, rc.copy_sample, rc.copy_centroid);
+	if (rc.copy_stencil_to_color || rc.copy_sample != 0) {
+		DepthFatal("depth-to-color copy requires depth-only sample zero");
+	}
+	auto source_desc = MakeDepthTargetDesc(buffer, hw.GetDepthRenderTarget());
+	auto& cache = m_context.GetTextureCache();
+	const auto source_id = cache.FindImage(source_desc);
+	BindRenderTarget(source_id);
+	cache.UpdateImage(source_id);
+	RenderColorInfo target {};
+	ResolveRenderColorTarget(buffer, target, slice_offset, 0, true, true);
+	if (!target.image_id) {
+		DepthFatal("depth-to-color copy has no color destination");
+	}
+	cache.UpdateImage(target.image_id);
+	auto& source = cache.GetImage(source_id);
+	auto& destination = cache.GetImage(target.image_id);
+	LOGF("DepthToColorCopy: source format=%u extent=%ux%u samples=%u layers=%u; destination format=%u extent=%ux%u samples=%u layers=%u mip=%u layer=%u\n",
+	     static_cast<uint32_t>(source.backing.format), source.backing.extent.width,
+	     source.backing.extent.height, source.backing.samples, source.backing.layers,
+	     static_cast<uint32_t>(destination.backing.format), destination.backing.extent.width,
+	     destination.backing.extent.height, destination.backing.samples, destination.backing.layers,
+	     target.guest_mip_level, target.guest_array_layer);
+	// A full, single-sample D32 -> R32 float export can use the existing
+	// image-buffer-image transfer, preserving the depth values without conversion.
+	if ((source.backing.format != vk::Format::eD32Sfloat &&
+	     source.backing.format != vk::Format::eD32SfloatS8Uint) ||
+	    destination.backing.format != vk::Format::eR32Sfloat ||
+	    source.backing.samples != 1 || destination.backing.samples != 1 ||
+	    source.backing.extent != destination.backing.extent ||
+	    source.backing.layers != 1 || destination.backing.layers != 1 ||
+	    source.backing.mip_levels != 1 || destination.backing.mip_levels != 1 ||
+	    target.guest_mip_level != 0 || target.guest_array_layer != 0 ||
+	    source_desc.view_info.base_layer != 0) {
+		DepthFatal("unsupported depth-to-color copy geometry or format");
+	}
+	if (source_id != target.image_id) {
+		const auto scissor = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
+		                                      target.Extent(), 0);
+		if (scissor.left != 0 || scissor.top != 0 ||
+		    scissor.right != static_cast<int>(target.Extent().width) ||
+		    scissor.bottom != static_cast<int>(target.Extent().height)) {
+			DepthFatal("partial depth-to-color copy is not supported: (%d,%d)-(%d,%d)",
+			           scissor.left, scissor.top, scissor.right, scissor.bottom);
+		}
+		cache.CopyImageThroughBuffer(target.image_id, source_id);
+		cache.MarkGpuWritten(target.image_id);
+	}
+	return true;
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {

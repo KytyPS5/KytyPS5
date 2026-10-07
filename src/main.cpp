@@ -259,7 +259,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			return false;
 		}
 
-		if (arg == "--game") {
+		if (arg == "--guest-arg") {
+			if (options.config.guest_arguments.size() >= 32 || value.size() > 4096) return false;
+			options.config.guest_arguments.push_back(value);
+		} else if (arg == "--wait-for-process") {
+			if (!ParseUint32(value, options.wait_for_process)) return false;
+		} else if (arg == "--game") {
 			if (!options.app0_dir.empty()) {
 				::printf("--game can only be specified once\n");
 				return false;
@@ -478,6 +483,7 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
+	SetHostArguments(argc, argv);
 	Run(options);
 
 	return 0;

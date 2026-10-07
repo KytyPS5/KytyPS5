@@ -57,7 +57,7 @@ struct CContext {
 struct InitEnvParams {
 	int         argc;
 	uint32_t    pad;
-	const char* argv[3];
+	const char* argv[35];
 };
 
 static int                g_argc = 0;

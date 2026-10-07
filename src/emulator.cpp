@@ -20,6 +20,13 @@
 #include "libs/audio.h"
 #include "libs/controller.h"
 #include "libs/libs.h"
+#include "libs/errno.h"
+#include <atomic>
+#include <fstream>
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#undef DeleteFile
+#endif
 #include "libs/network.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
@@ -30,6 +37,102 @@
 #include <thread>
 
 namespace Emulator {
+
+
+static std::vector<std::string> g_host_arguments;
+static std::filesystem::path g_app0;
+static std::atomic_flag g_restarting = ATOMIC_FLAG_INIT;
+
+void SetHostArguments(int argc, char* argv[]) {
+	g_host_arguments.assign(argv + 1, argv + argc);
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Quote for the Windows argv parser, never for a shell.
+static std::wstring QuoteArgument(const std::wstring& argument) {
+	std::wstring result = L"\"";
+	size_t slashes = 0;
+	for (auto ch : argument) {
+		if (ch == L'\\') { ++slashes; continue; }
+		result.append(slashes * (ch == L'"' ? 2 : 1), L'\\');
+		slashes = 0;
+		if (ch == L'"') result += L'\\';
+		result += ch;
+	}
+	result.append(slashes * 2, L'\\');
+	return result + L'"';
+}
+#endif
+
+int LoadExec(const char* path, const char* const argv[]) {
+	using namespace Libs;
+	using namespace Libs::SystemService;
+	if (path == nullptr || *path == '\0') return SYSTEM_SERVICE_ERROR_PARAMETER;
+	LOGF("LoadExec: requested %s\n", path);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::error_code ec;
+	auto guest_path = Common::PathFromUtf8(Common::FixFilenameSlash(path));
+	if (guest_path.is_relative()) guest_path = std::filesystem::path("/app0") / guest_path;
+	const auto host_path = std::filesystem::weakly_canonical(
+	    LibKernel::FileSystem::GetRealFilename(Common::PathToGenericString(guest_path)), ec);
+	if (ec) return SYSTEM_SERVICE_ERROR_PARAMETER;
+	const auto root = std::filesystem::weakly_canonical(g_app0, ec);
+	if (ec) return SYSTEM_SERVICE_ERROR_PARAMETER;
+	const auto relative = host_path.lexically_relative(root);
+	// Only a real guest ELF in the current application's root is supported.
+	// Reject host executables, traversal, archives, and nested roots explicitly.
+	if (relative.empty() || relative.has_parent_path() ||
+	    !std::filesystem::is_regular_file(host_path, ec) || ec) {
+		LOGF("LoadExec: target is outside application root or missing\n");
+		return SYSTEM_SERVICE_ERROR_PARAMETER;
+	}
+	std::ifstream elf(host_path, std::ios::binary);
+	char magic[4] {};
+	elf.read(magic, sizeof(magic));
+	if (!elf || std::string_view(magic, 4) != std::string_view("\x7f" "ELF", 4))
+		return SYSTEM_SERVICE_ERROR_PARAMETER;
+	std::vector<std::string> guest_args;
+	if (argv != nullptr) {
+		for (size_t i = 0; argv[i] != nullptr; ++i) {
+			if (i >= 32 || strnlen(argv[i], 4097) > 4096) return SYSTEM_SERVICE_ERROR_PARAMETER;
+			guest_args.emplace_back(argv[i]);
+			LOGF("LoadExec: argv[%zu] = %s\n", i, argv[i]);
+		}
+	}
+	if (g_restarting.test_and_set()) return SYSTEM_SERVICE_ERROR_UNAVAILABLE;
+	std::vector<std::string> args;
+	for (size_t i = 0; i < g_host_arguments.size(); ++i) {
+		const auto& a = g_host_arguments[i];
+		if (a == "--game" || a == "--guest-arg" || a == "--wait-for-process") { ++i; continue; }
+		args.push_back(a);
+	}
+	args.insert(args.end(), {"--game", Common::PathToString(host_path),
+	                        "--wait-for-process", std::to_string(GetCurrentProcessId())});
+	for (const auto& a : guest_args) args.insert(args.end(), {"--guest-arg", a});
+	wchar_t executable[32768] {};
+	const auto length = GetModuleFileNameW(nullptr, executable, 32768);
+	if (length == 0 || length >= 32768) {
+		g_restarting.clear(); return SYSTEM_SERVICE_ERROR_INTERNAL;
+	}
+	std::wstring command = QuoteArgument(executable);
+	for (const auto& a : args) command += L" " + QuoteArgument(Common::PathFromUtf8(a).wstring());
+	STARTUPINFOW startup {};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process {};
+	if (!CreateProcessW(executable, command.data(), nullptr, nullptr, FALSE,
+	                    CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+		LOGF("LoadExec: process creation failed: %lu\n", GetLastError());
+		g_restarting.clear(); return SYSTEM_SERVICE_ERROR_INTERNAL;
+	}
+	LOGF("LoadExec: handoff to %s (process %lu)\n", Common::PathToString(host_path).c_str(), process.dwProcessId);
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	std::fflush(nullptr);
+	std::quick_exit(0);
+#else
+	return SYSTEM_SERVICE_ERROR_UNAVAILABLE;
+#endif
+}
 
 static void PrintSystemInfo() {
 	const Common::SystemInfo info = Common::GetSystemInfo();
@@ -181,6 +284,17 @@ static void Execute(const std::filesystem::path& game_patch) {
 }
 
 void Run(const RunOptions& options) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (options.wait_for_process != 0) {
+		HANDLE previous = OpenProcess(SYNCHRONIZE, FALSE, options.wait_for_process);
+		if (previous != nullptr) {
+			const auto waited = WaitForSingleObject(previous, 30000);
+			CloseHandle(previous);
+			if (waited != WAIT_OBJECT_0) return;
+		}
+	}
+#endif
+	g_app0 = options.app0_dir;
 	if (options.app0_dir.empty()) {
 		EXIT("app0 directory is required\n");
 	}

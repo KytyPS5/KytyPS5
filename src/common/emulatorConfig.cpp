@@ -156,6 +156,10 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+const std::vector<std::string>& GetGuestArguments() {
+	return g_config->guest_arguments;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

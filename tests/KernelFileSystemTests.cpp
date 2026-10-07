@@ -422,6 +422,64 @@ void TestNpWebApi2Memory() {
         "NpWebApi2 termination removes only the selected library context");
 }
 
+void TestPosixFileExports() {
+  namespace Posix = Libs::Posix;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "POSIX file exports resolve");
+    return symbol->vaddr;
+  };
+  using Open = int (KYTY_SYSV_ABI *)(const char *, int, int);
+  using Close = int (KYTY_SYSV_ABI *)(int);
+  using Write = int64_t (KYTY_SYSV_ABI *)(int, const void *, size_t);
+  using UnderscoreWrite = int64_t (KYTY_SYSV_ABI *)(int, const char *, int64_t);
+  using Unlink = int (KYTY_SYSV_ABI *)(const char *);
+  const auto posix_open = reinterpret_cast<Open>(find("wuCroIGjt2g"));
+  const auto posix_close = reinterpret_cast<Close>(find("bY-PO6JhzhQ"));
+  const auto posix_write = reinterpret_cast<Write>(find("FN4gaPmuFV8"));
+  const auto underscore_write = reinterpret_cast<UnderscoreWrite>(find("FxVZqBAA7ks"));
+  const auto posix_unlink = reinterpret_cast<Unlink>(find("VAzswvTOCzI"));
+  int *error = Posix::GetErrorAddr();
+  constexpr char Missing[] = "/savedata0/posix-missing.dat";
+  constexpr char Path[] = "/savedata0/posix-export.dat";
+  constexpr char Payload[] = "posix payload";
+
+  *error = 0;
+  Check(posix_open(Missing, 0, 0) == -1 && *error == Posix::POSIX_ENOENT,
+        "POSIX open returns -1 and ENOENT for a missing file");
+  *error = 0;
+  Check(posix_unlink(Missing) == -1 && *error == Posix::POSIX_ENOENT,
+        "POSIX unlink returns -1 and ENOENT for a missing file");
+  *error = 0;
+  Check(posix_close(-1) == -1 && *error == Posix::POSIX_EBADF,
+        "POSIX close returns -1 and EBADF for a negative descriptor");
+  *error = 0;
+  Check(posix_write(-1, Payload, 1) == -1 && *error == Posix::POSIX_EBADF,
+        "POSIX write returns -1 and EBADF for a negative descriptor");
+  *error = 0;
+  Check(underscore_write(-1, Payload, 1) == -1 && *error == Posix::POSIX_EBADF,
+        "POSIX _write returns -1 and EBADF for a negative descriptor");
+
+  const int fd = posix_open(Path, 0x601, 0777);
+  Check(fd >= 3 && posix_write(fd, Payload, sizeof(Payload) - 1) == sizeof(Payload) - 1 &&
+            posix_close(fd) == 0,
+        "POSIX open, write and close return the descriptor, byte count and zero");
+  FileSystem::FileStat stat {};
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == sizeof(Payload) - 1,
+        "POSIX write stores its payload");
+  *error = 0;
+  Check(posix_close(fd) == -1 && *error == Posix::POSIX_EBADF,
+        "POSIX close returns -1 and EBADF for a closed descriptor");
+  *error = 0;
+  Check(posix_write(fd, Payload, 1) == -1 && *error == Posix::POSIX_EBADF,
+        "POSIX write returns -1 and EBADF for a closed descriptor");
+  Check(posix_unlink(Path) == 0 &&
+            FileSystem::KernelStat(Path, &stat) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "POSIX unlink removes the file and returns zero");
+}
+
 void CheckMountRoot(const std::filesystem::path &root) {
   Common::File cache;
   Check(cache.Create(root / "rpf.cache"), "create directory listing fixture");
@@ -1636,6 +1694,7 @@ int main(int, char**) {
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
+  TestPosixFileExports();
   TestSaveOpenVisibility();
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");

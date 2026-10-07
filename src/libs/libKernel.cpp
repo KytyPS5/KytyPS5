@@ -1381,7 +1381,10 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
 	// PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(d < 0);
+	if (d < 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
 
 	if (Network::Net::IsSocket(d)) {
 		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
@@ -1926,6 +1929,12 @@ int KYTY_SYSV_ABI mkdir(const char* path, uint16_t mode) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelMkdir(path, mode));
 }
 
+int KYTY_SYSV_ABI unlink(const char* path) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelUnlink(path));
+}
+
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
@@ -1942,6 +1951,12 @@ int64_t KYTY_SYSV_ABI pwrite(int d, const void* buf, size_t nbytes, int64_t offs
 	PRINT_NAME();
 
 	return POSIX_N_CALL(LibKernel::FileSystem::KernelPwrite(d, buf, nbytes, offset));
+}
+
+int64_t KYTY_SYSV_ABI write(int d, const void* buf, size_t nbytes) {
+	PRINT_NAME();
+
+	return POSIX_N_CALL(LibKernel::FileSystem::KernelWrite(d, buf, nbytes));
 }
 
 int KYTY_SYSV_ABI flock(int d, int operation) {
@@ -3338,11 +3353,11 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("mqQMh1zPPT8", Posix::fstat);
 
 	LIB_FUNC("z0dtnPxYgtg", chmod);
-	LIB_FUNC("VAzswvTOCzI", FileSystem::KernelUnlink);
+	LIB_FUNC("VAzswvTOCzI", Posix::unlink);
 	LIB_FUNC("JGMio+21L4c", Posix::mkdir);
-	LIB_FUNC("wuCroIGjt2g", FileSystem::KernelOpen);
-	LIB_FUNC("bY-PO6JhzhQ", FileSystem::KernelClose);
-	LIB_FUNC("FN4gaPmuFV8", FileSystem::KernelWrite);
+	LIB_FUNC("wuCroIGjt2g", LibKernel::open);
+	LIB_FUNC("bY-PO6JhzhQ", LibKernel::close);
+	LIB_FUNC("FN4gaPmuFV8", Posix::write);
 }
 
 static void AddLibkernelUnityFunc(Loader::SymbolDatabase* s, const char* nid, uint64_t func,

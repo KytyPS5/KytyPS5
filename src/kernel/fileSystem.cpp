@@ -87,6 +87,7 @@ public:
 	void  DeleteDescriptor(int d);
 	File* GetFile(int d);
 	File* GetFile(const std::filesystem::path& real_name);
+	bool  FlushWritable(const std::filesystem::path& real_name);
 	void  CloseAll();
 
 private:
@@ -236,6 +237,23 @@ File* FileDescriptors::GetFile(const std::filesystem::path& real_name) {
 	}
 
 	return nullptr;
+}
+
+bool FileDescriptors::FlushWritable(const std::filesystem::path& real_name) {
+	Common::LockGuard lock(m_mutex);
+
+	bool ok = true;
+	for (auto* f: m_files) {
+		if (f != nullptr && f->real_name == real_name) {
+			Common::LockGuard file_lock(f->mutex);
+			if (f->opened && f->writable && !f->directory && f->special == SpecialFile::None &&
+			    !f->f.IsInvalid()) {
+				ok = f->f.Flush() && ok;
+			}
+		}
+	}
+
+	return ok;
 }
 
 void FileDescriptors::CloseAll() {
@@ -1247,18 +1265,12 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	bool  ok        = false;
-	auto* open_file = g_files->GetFile(real_file_name);
-	if (open_file != nullptr && open_file->opened && open_file->writable &&
-	    !open_file->f.IsInvalid()) {
-		Common::LockGuard lock(open_file->mutex);
-		ok = open_file->f.Truncate(static_cast<uint64_t>(length));
-	} else {
-		Common::File file(real_file_name, Common::File::Mode::ReadWrite);
-		ok = !file.IsInvalid() && file.Truncate(static_cast<uint64_t>(length));
+	if (!g_files->FlushWritable(real_file_name)) {
+		return KERNEL_ERROR_EIO;
 	}
 
-	if (!ok) {
+	Common::File file(real_file_name, Common::File::Mode::ReadWrite);
+	if (file.IsInvalid() || !file.Truncate(static_cast<uint64_t>(length))) {
 		return KERNEL_ERROR_EIO;
 	}
 

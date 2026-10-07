@@ -193,6 +193,23 @@ void TestTruncate() {
         "sceKernelTruncate rejects invalid arguments");
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 2,
         "rejected truncations leave the file untouched");
+
+  constexpr char OldPath[] = "/savedata0/truncate-old.dat";
+  constexpr char MovedPath[] = "/savedata0/truncate-moved.dat";
+  const int moved = FileSystem::KernelOpen(OldPath, 0x602, 0777);
+  Check(moved >= 3 && FileSystem::KernelWrite(moved, "0123456789", 10) == 10 &&
+            FileSystem::KernelRename(OldPath, MovedPath) == OK,
+        "rename an open truncate fixture");
+  const int replacement = FileSystem::KernelOpen(OldPath, 0x602, 0777);
+  Check(replacement >= 3 && FileSystem::KernelWrite(replacement, "abcdefgh", 8) == 8 &&
+            FileSystem::KernelClose(replacement) == OK,
+        "create a replacement at the old path");
+  Check(truncate_path(OldPath, 3) == OK && FileSystem::KernelStat(OldPath, &stat) == OK &&
+            stat.st_size == 3,
+        "sceKernelTruncate resizes the file currently at the path");
+  Check(FileSystem::KernelClose(moved) == OK && FileSystem::KernelStat(MovedPath, &stat) == OK &&
+            stat.st_size == 10,
+        "sceKernelTruncate leaves a renamed open file alone");
 }
 
 void TestAioBatches() {

@@ -3,6 +3,8 @@
 
 #include <QDialog>
 
+#include <vector>
+
 class QTabWidget;
 class QWidget;
 
@@ -12,10 +14,13 @@ public:
 	explicit TrophyViewerDialog(QWidget* parent = nullptr);
 
 	static bool HasTrophyData(const Configuration* info);
-	static void ShowForGame(const Configuration* info, QWidget* parent);
+	static void ShowForGame(const Configuration* info, const QString& runtime_directory,
+	                        QWidget* parent);
+	static void ShowOverview(const std::vector<const Configuration*>& games,
+	                         const QString& runtime_directory, QWidget* parent);
 
 private:
-	bool LoadGame(const Configuration& info, QString& error);
+	bool LoadGame(const Configuration& info, const QString& runtime_directory, QString& error);
 
 	QTabWidget* m_tabs = nullptr;
 };

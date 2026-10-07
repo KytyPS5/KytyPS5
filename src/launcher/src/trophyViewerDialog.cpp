@@ -1,498 +1,69 @@
 #include "trophyViewerDialog.h"
 
 #include "common/archive.h"
+#include "common/trophies.h"
 #include "configuration.h"
 #include "gameContent.h"
 
 #include <QAbstractItemView>
-#include <QBrush>
-#include <QByteArray>
+#include <QDateTime>
 #include <QDialogButtonBox>
-#include <QDir>
 #include <QFileInfo>
-#include <QFont>
-#include <QHeaderView>
-#include <QIcon>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonParseError>
-#include <QJsonValue>
+#include <QHBoxLayout>
+#include <QImage>
 #include <QLabel>
-#include <QMap>
+#include <QListWidget>
 #include <QMessageBox>
-#include <QObject>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPixmap>
+#include <QProgressBar>
 #include <QRegularExpression>
-#include <QSet>
 #include <QSize>
-#include <QString>
 #include <QStringList>
+#include <QTabBar>
 #include <QTabWidget>
-#include <QTableWidget>
-#include <QTableWidgetItem>
 #include <QVBoxLayout>
-#include <QVariant>
-#include <QWidget>
-#include <QtEndian>
-
-#include <utility>
 
 namespace {
 
-constexpr quint32 UCP_MAGIC              = 0xb228c60a;
-constexpr quint32 UCP_VERSION            = 1;
-constexpr int     UCP_HEADER_LEN         = 0x40;
-constexpr int     UCP_TOC_SKIP           = 0x20;
-constexpr int     UCP_ENTRY_LEN          = 0x40;
-constexpr int     UCP_NAME_LEN           = 0x20;
-constexpr quint32 UCP_MAX_FILES          = 4096;
-constexpr quint64 UCP_MAX_EXTRACTED_SIZE = quint64 {64} << 20u;
-
-struct UcpEntry {
-	QString name;
-	quint64 offset = 0;
-	quint64 size   = 0;
-};
-
-struct TrophyDefinition {
-	QString id;
-	QString grade;
-	bool    hidden     = false;
-	bool    has_reward = false;
-};
-
-struct TrophyText {
-	QString name;
-	QString detail;
-	QString reward;
-};
-
-struct TrophyRow {
-	QString id;
-	QString name;
-	QString detail;
-	QString grade;
-	QString reward;
-	bool    hidden     = false;
-	bool    has_reward = false;
-	QPixmap icon;
-};
-
-struct TrophySet {
-	QString          tab_title;
-	QList<TrophyRow> trophies;
-};
-
-static bool CanRead(const QByteArray& data, qsizetype offset, qsizetype size) {
-	return offset >= 0 && size >= 0 && offset <= data.size() && size <= data.size() - offset;
-}
-
-static QString ReadFixedString(const QByteArray& data, qsizetype offset, qsizetype max_size) {
-	if (!CanRead(data, offset, max_size)) {
-		return {};
-	}
-
-	qsizetype len = 0;
-	while (len < max_size && data.at(offset + len) != '\0') {
-		len++;
-	}
-
-	return QString::fromLatin1(data.constData() + offset, len);
-}
-
-static bool IsUsedUcpEntry(const QString& name) {
-	const auto lower = name.toCaseFolded();
-	return lower == QStringLiteral("tropconf.json") || lower == QStringLiteral("tropmeta.json") ||
-	       (lower.startsWith(QStringLiteral("tropmeta_")) &&
-	        lower.endsWith(QStringLiteral(".json"))) ||
-	       (lower.startsWith(QStringLiteral("trop")) && lower.endsWith(QStringLiteral(".png")));
-}
-
-static bool ReadUcp(const QString& file_name, QMap<QString, QByteArray>& files, QString& error) {
-	const QByteArray data =
-	    GameContent::ReadPath(GameContent::ToPath(file_name), GameContent::MaxTrophyPackageSize);
-	if (data.isEmpty()) {
-		error = QObject::tr("Could not open %1").arg(QDir::toNativeSeparators(file_name));
-		return false;
-	}
-
-	if (data.size() < UCP_HEADER_LEN) {
-		error = QObject::tr("%1 is too small to be a trophy package.")
-		            .arg(QFileInfo(file_name).fileName());
-		return false;
-	}
-
-	const auto magic = qFromBigEndian<quint32>(data.constData() + 0x00);
-	if (magic != UCP_MAGIC) {
-		error = QObject::tr("%1 has an invalid trophy package magic.")
-		            .arg(QFileInfo(file_name).fileName());
-		return false;
-	}
-
-	const auto version = qFromBigEndian<quint32>(data.constData() + 0x04);
-	if (version != UCP_VERSION) {
-		error = QObject::tr("%1 uses unsupported trophy package version %2.")
-		            .arg(QFileInfo(file_name).fileName(), QString::number(version));
-		return false;
-	}
-
-	const auto declared_size = qFromBigEndian<quint64>(data.constData() + 0x08);
-	if (declared_size < UCP_HEADER_LEN || declared_size > static_cast<quint64>(data.size())) {
-		error = QObject::tr("%1 is truncated.").arg(QFileInfo(file_name).fileName());
-		return false;
-	}
-
-	const auto file_count = qFromBigEndian<quint32>(data.constData() + 0x10);
-	if (file_count > UCP_MAX_FILES) {
-		error = QObject::tr("%1 contains too many files.").arg(QFileInfo(file_name).fileName());
-		return false;
-	}
-	const auto toc_offset = static_cast<quint64>(qFromBigEndian<quint32>(data.constData() + 0x14));
-	const auto data_size  = declared_size;
-
-	const quint64 table_size = UCP_TOC_SKIP + static_cast<quint64>(file_count) * UCP_ENTRY_LEN;
-	if (toc_offset > data_size || table_size > data_size - toc_offset ||
-	    !std::in_range<qsizetype>(toc_offset + table_size)) {
-		error = QObject::tr("%1 has an invalid table of contents.")
-		            .arg(QFileInfo(file_name).fileName());
-		return false;
-	}
-
-	quint64 extracted_size = 0;
-	for (quint32 i = 0; i < file_count; i++) {
-		const auto entry_offset = static_cast<qsizetype>(toc_offset + UCP_TOC_SKIP +
-		                                                 static_cast<quint64>(i) * UCP_ENTRY_LEN);
-		UcpEntry   entry;
-		entry.name   = ReadFixedString(data, entry_offset, UCP_NAME_LEN).trimmed();
-		entry.offset = qFromBigEndian<quint64>(data.constData() + entry_offset + 0x20);
-		entry.size   = qFromBigEndian<quint64>(data.constData() + entry_offset + 0x28);
-
-		if (entry.name.isEmpty()) {
-			continue;
-		}
-		if (entry.offset > data_size || entry.size > data_size - entry.offset ||
-		    !std::in_range<qsizetype>(entry.offset) || !std::in_range<qsizetype>(entry.size)) {
-			error = QObject::tr("%1 has an invalid entry for %2.")
-			            .arg(QFileInfo(file_name).fileName(), entry.name);
-			return false;
-		}
-		if (!IsUsedUcpEntry(entry.name)) {
-			continue;
-		}
-
-		const auto entry_limit = entry.name.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive)
-		                             ? GameContent::MaxImageSize
-		                             : GameContent::MaxMetadataSize;
-		if (entry.size > entry_limit || entry.size > UCP_MAX_EXTRACTED_SIZE - extracted_size) {
-			error = QObject::tr("%1 contains an oversized entry for %2.")
-			            .arg(QFileInfo(file_name).fileName(), entry.name);
-			return false;
-		}
-
-		files.insert(entry.name.toCaseFolded(), data.mid(static_cast<qsizetype>(entry.offset),
-		                                                 static_cast<qsizetype>(entry.size)));
-		extracted_size += entry.size;
-	}
-
-	return true;
-}
-
-static const QByteArray* FindFile(const QMap<QString, QByteArray>& files, const QString& name) {
-	const auto it = files.constFind(name.toCaseFolded());
-	return it == files.constEnd() ? nullptr : &it.value();
-}
-
-static const QByteArray* FindFirstTrophyMetadataFile(const QMap<QString, QByteArray>& files) {
-	for (auto it = files.constBegin(); it != files.constEnd(); ++it) {
-		if (it.key().startsWith(QStringLiteral("tropmeta_")) &&
-		    it.key().endsWith(QStringLiteral(".json"))) {
-			return &it.value();
-		}
-	}
-
-	return FindFile(files, QStringLiteral("tropmeta.json"));
-}
-
-static bool ReadJsonObject(const QByteArray& data, const QString& file_name, QJsonObject& object,
-                           QString& error) {
-	QJsonParseError parse_error;
-	const auto      doc = QJsonDocument::fromJson(data, &parse_error);
-	if (parse_error.error != QJsonParseError::NoError || !doc.isObject()) {
-		error = QObject::tr("Could not read %1: %2").arg(file_name, parse_error.errorString());
-		return false;
-	}
-
-	object = doc.object();
-	return true;
-}
-
-static QString JsonString(const QJsonValue& value) {
-	if (value.isString()) {
-		return value.toString();
-	}
-	if (value.isDouble()) {
-		const double number = value.toDouble();
-		if (number == static_cast<int>(number)) {
-			return QString::number(static_cast<int>(number));
-		}
-		return QString::number(number);
-	}
-	if (value.isBool()) {
-		return value.toBool() ? QStringLiteral("true") : QStringLiteral("false");
-	}
-
-	return {};
-}
-
-static QList<TrophyDefinition> ReadDefinitions(const QJsonObject& tropconf) {
-	QList<TrophyDefinition> ret;
-
-	const auto trophies = tropconf.value(QStringLiteral("trophies")).toArray();
-	for (const auto& value: trophies) {
-		const auto       obj = value.toObject();
-		TrophyDefinition def;
-		def.id         = JsonString(obj.value(QStringLiteral("id"))).trimmed();
-		def.grade      = JsonString(obj.value(QStringLiteral("grade"))).trimmed();
-		def.hidden     = obj.value(QStringLiteral("hidden")).toBool(false);
-		def.has_reward = obj.value(QStringLiteral("hasReward")).toBool(false);
-
-		if (!def.id.isEmpty()) {
-			ret.append(def);
-		}
-	}
-
-	return ret;
-}
-
-static QMap<QString, TrophyText> ReadMetadata(const QJsonObject& tropmeta) {
-	QMap<QString, TrophyText> ret;
-
-	const auto metadata = tropmeta.value(QStringLiteral("metadata")).toObject();
-	const auto trophies = metadata.value(QStringLiteral("trophyMetadata")).toArray();
-	for (const auto& value: trophies) {
-		const auto obj = value.toObject();
-		const auto id  = JsonString(obj.value(QStringLiteral("id"))).trimmed();
-		if (id.isEmpty()) {
-			continue;
-		}
-
-		TrophyText text;
-		text.name   = JsonString(obj.value(QStringLiteral("name"))).trimmed();
-		text.detail = JsonString(obj.value(QStringLiteral("detail"))).trimmed();
-		text.reward = JsonString(obj.value(QStringLiteral("reward"))).trimmed();
-		ret.insert(id, text);
-	}
-
-	return ret;
-}
-
-static QString GradeToText(const QString& grade) {
-	if (grade == QStringLiteral("P")) {
-		return QObject::tr("Platinum");
-	}
-	if (grade == QStringLiteral("G")) {
-		return QObject::tr("Gold");
-	}
-	if (grade == QStringLiteral("S")) {
-		return QObject::tr("Silver");
-	}
-	if (grade == QStringLiteral("B")) {
-		return QObject::tr("Bronze");
-	}
-
-	return grade;
-}
-
-static QPixmap LoadTrophyIcon(const QMap<QString, QByteArray>& files, const QString& id) {
-	QStringList names;
-	names.append(QStringLiteral("trop%1.png").arg(id));
-
-	bool      id_is_number = false;
-	const int id_num       = id.toInt(&id_is_number);
-	if (id_is_number) {
-		names.append(QStringLiteral("trop%1.png").arg(id_num, 4, 10, QLatin1Char('0')));
-	}
-
-	for (const auto& name: names) {
-		const auto* data = FindFile(files, name);
-		if (data == nullptr) {
-			continue;
-		}
-
-		QPixmap pixmap;
-		if (pixmap.loadFromData(*data)) {
-			return pixmap;
-		}
-	}
-
-	return {};
-}
-
-static QString TrophyTabTitle(const QString& file_name) {
-	static const QRegularExpression trophy_file_re(QStringLiteral("^trophy(\\d+)\\.ucp$"),
-	                                               QRegularExpression::CaseInsensitiveOption);
-
-	const auto name  = QFileInfo(file_name).fileName();
-	const auto match = trophy_file_re.match(name);
-	if (match.hasMatch()) {
-		return QObject::tr("Trophy %1").arg(match.captured(1));
-	}
-
-	return QFileInfo(file_name).completeBaseName();
-}
-
-static bool BuildTrophySet(const QString& ucp_file, TrophySet& set, QString& error) {
-	QMap<QString, QByteArray> files;
-	if (!ReadUcp(ucp_file, files, error)) {
-		return false;
-	}
-
-	const auto* conf_data = FindFile(files, QStringLiteral("tropconf.json"));
-	if (conf_data == nullptr) {
-		error =
-		    QObject::tr("%1 does not contain tropconf.json.").arg(QFileInfo(ucp_file).fileName());
-		return false;
-	}
-
-	QJsonObject tropconf;
-	if (!ReadJsonObject(*conf_data, QStringLiteral("tropconf.json"), tropconf, error)) {
-		return false;
-	}
-
-	const auto default_language =
-	    JsonString(tropconf.value(QStringLiteral("defaultLanguage"))).trimmed();
-	const QByteArray* meta_data = nullptr;
-	if (!default_language.isEmpty()) {
-		meta_data = FindFile(files, QStringLiteral("tropmeta_%1.json").arg(default_language));
-	}
-	if (meta_data == nullptr) {
-		meta_data = FindFirstTrophyMetadataFile(files);
-	}
-	if (meta_data == nullptr) {
-		error = QObject::tr("%1 does not contain readable trophy metadata.")
-		            .arg(QFileInfo(ucp_file).fileName());
-		return false;
-	}
-
-	QJsonObject tropmeta;
-	if (!ReadJsonObject(*meta_data, QStringLiteral("tropmeta.json"), tropmeta, error)) {
-		return false;
-	}
-
-	const auto definitions = ReadDefinitions(tropconf);
-	if (definitions.isEmpty()) {
-		error = QObject::tr("%1 does not define any trophies.").arg(QFileInfo(ucp_file).fileName());
-		return false;
-	}
-
-	const auto texts = ReadMetadata(tropmeta);
-
-	set.tab_title = TrophyTabTitle(ucp_file);
-	for (const auto& def: definitions) {
-		const auto text = texts.value(def.id);
-
-		TrophyRow row;
-		row.id         = def.id;
-		row.grade      = def.grade;
-		row.hidden     = def.hidden;
-		row.has_reward = def.has_reward;
-		row.reward     = text.reward;
-		row.name       = text.name;
-		row.detail     = text.detail;
-		row.icon       = LoadTrophyIcon(files, def.id);
-
-		if (row.name.isEmpty()) {
-			row.name =
-			    row.hidden ? QObject::tr("Hidden Trophy") : QObject::tr("Trophy %1").arg(def.id);
-		}
-		if (row.detail.isEmpty() && row.hidden) {
-			row.detail = QObject::tr("This trophy is hidden.");
-		}
-
-		set.trophies.append(row);
-	}
-
-	return true;
-}
+static const QRegularExpression TrophyFilePattern(QStringLiteral("^trophy(\\d+)\\.ucp$"));
 
 static QStringList FindTrophyFiles(const Configuration* info) {
 	if (info == nullptr || info->basedir.isEmpty()) {
 		return {};
 	}
-
 	QStringList files;
-	for (const auto& file:
-	     GameContent::ListFiles(info->basedir, QStringLiteral("sce_sys/trophy2"))) {
-		const auto name = QFileInfo(file).fileName();
-		if (name.startsWith(QStringLiteral("trophy"), Qt::CaseInsensitive) &&
-		    name.endsWith(QStringLiteral(".ucp"), Qt::CaseInsensitive)) {
+	for (const auto& file: GameContent::ListFiles(
+	         info->basedir, QString::fromLatin1(Common::Trophies::PackageDirectory))) {
+		if (TrophyFilePattern.match(QFileInfo(file).fileName()).hasMatch()) {
 			files.append(file);
 		}
 	}
-	files.sort(Qt::CaseInsensitive);
-
-	QStringList   trophy_files;
-	QSet<QString> seen;
-	for (const auto& file: files) {
-		auto key = QFileInfo(file).canonicalFilePath();
-		if (key.isEmpty()) {
-			key = file;
-		}
-		key = QDir::cleanPath(key).toCaseFolded();
-
-		if (!seen.contains(key)) {
-			seen.insert(key);
-			trophy_files.append(file);
-		}
-	}
-	return trophy_files;
+	files.sort();
+	return files;
 }
 
-static void PrepareTable(QTableWidget* table) {
-	table->setColumnCount(4);
-	table->setHorizontalHeaderLabels({QObject::tr("Unlocked"), QObject::tr("Trophy"),
-	                                  QObject::tr("Name"), QObject::tr("Description")});
-	table->setAlternatingRowColors(true);
-	table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-	table->setSelectionBehavior(QAbstractItemView::SelectRows);
-	table->setSelectionMode(QAbstractItemView::SingleSelection);
-	table->setShowGrid(false);
-	table->setWordWrap(true);
-	table->verticalHeader()->setVisible(false);
-	table->verticalHeader()->setDefaultSectionSize(112);
-	table->horizontalHeader()->setStretchLastSection(true);
-	table->horizontalHeader()->setHighlightSections(false);
-	table->setColumnWidth(0, 100);
-	table->setColumnWidth(1, 132);
-	table->setColumnWidth(2, 260);
-	table->setColumnWidth(3, 480);
+static QString GradeToText(int grade) {
+	switch (grade) {
+		case 1: return QObject::tr("Platinum");
+		case 2: return QObject::tr("Gold");
+		case 3: return QObject::tr("Silver");
+		case 4: return QObject::tr("Bronze");
+		default: return {};
+	}
 }
 
-static QTableWidgetItem* CreateItem(const QString& text) {
-	auto* item = new QTableWidgetItem(text);
-	item->setFlags(item->flags() & ~Qt::ItemIsEditable);
-	return item;
-}
-
-static QString TrophyTooltip(const TrophyRow& row) {
-	QStringList lines;
-	lines.append(row.name);
-	if (!row.detail.isEmpty()) {
-		lines.append(row.detail);
-	}
-
-	const auto grade = GradeToText(row.grade);
-	if (!grade.isEmpty()) {
-		lines.append(QObject::tr("Grade: %1").arg(grade));
-	}
-	if (row.hidden) {
+static QString TrophyTooltip(const Common::Trophies::Trophy& trophy) {
+	QStringList lines {QString::fromStdString(trophy.name),
+	                   QString::fromStdString(trophy.description),
+	                   QObject::tr("Grade: %1").arg(GradeToText(trophy.grade))};
+	if (trophy.hidden) {
 		lines.append(QObject::tr("Hidden trophy"));
 	}
-	if (row.has_reward && !row.reward.isEmpty()) {
-		lines.append(QObject::tr("Reward: %1").arg(row.reward));
+	if (trophy.has_reward && !trophy.reward.empty()) {
+		lines.append(QObject::tr("Reward: %1").arg(QString::fromStdString(trophy.reward)));
 	}
-
 	return lines.join(QLatin1Char('\n'));
 }
 
@@ -516,7 +87,227 @@ bool TrophyViewerDialog::HasTrophyData(const Configuration* info) {
 	return !FindTrophyFiles(info).isEmpty();
 }
 
-void TrophyViewerDialog::ShowForGame(const Configuration* info, QWidget* parent) {
+namespace {
+
+using Common::Trophies::Progress;
+
+Common::Trophies::UnlockData LoadUnlocks(const Configuration& info,
+                                         const QString& runtime_directory, const QString& file) {
+	const auto label = TrophyFilePattern.match(QFileInfo(file).fileName()).captured(1).toUInt();
+	return Common::Trophies::LoadUnlockData(Common::Trophies::UnlocksPath(
+	    GameContent::ToPath(runtime_directory), info.title_id.toStdString(), info.user_id, label));
+}
+
+Progress GetGameProgress(const Configuration* info, const QString& runtime_directory) {
+	Progress result;
+	if (info == nullptr) {
+		return result;
+	}
+	const auto reader = Common::OpenArchive(GameContent::ToPath(info->basedir));
+	for (const auto& file: FindTrophyFiles(info)) {
+		const auto package =
+		    Common::Trophies::LoadPackage(GameContent::ToPath(file), info->console_language);
+		const auto progress =
+		    Common::Trophies::GetProgress(package, LoadUnlocks(*info, runtime_directory, file));
+		result.total += progress.total;
+		result.earned += progress.earned;
+		for (size_t grade = 1; grade < result.total_grade.size(); ++grade) {
+			result.total_grade[grade] += progress.total_grade[grade];
+			result.earned_grade[grade] += progress.earned_grade[grade];
+		}
+	}
+	return result;
+}
+
+QPixmap MakeCupIcon(const QColor& color, int size) {
+	QPixmap pixmap(size, size);
+	pixmap.fill(Qt::transparent);
+	QPainter painter(&pixmap);
+	painter.setRenderHint(QPainter::Antialiasing);
+	const double u = size / 20.0;
+	painter.setPen(Qt::NoPen);
+	painter.setBrush(color);
+	QPainterPath cup;
+	cup.moveTo(5 * u, 2 * u);
+	cup.lineTo(15 * u, 2 * u);
+	cup.lineTo(14 * u, 9 * u);
+	cup.quadTo(10 * u, 13 * u, 6 * u, 9 * u);
+	cup.closeSubpath();
+	painter.drawPath(cup);
+	painter.setPen(QPen(color, 1.6 * u));
+	painter.setBrush(Qt::NoBrush);
+	painter.drawArc(QRectF(1.5 * u, 3 * u, 5 * u, 5 * u), 90 * 16, 180 * 16);
+	painter.drawArc(QRectF(13.5 * u, 3 * u, 5 * u, 5 * u), 90 * 16, -180 * 16);
+	painter.drawLine(QPointF(10 * u, 12 * u), QPointF(10 * u, 16 * u));
+	painter.setPen(Qt::NoPen);
+	painter.setBrush(color);
+	painter.drawRoundedRect(QRectF(6 * u, 16 * u, 8 * u, 2.5 * u), u, u);
+	return pixmap;
+}
+
+QColor GradeColor(int grade) {
+	switch (grade) {
+		case 1: return QColor(0x7fc8ff);
+		case 2: return QColor(0xf5c542);
+		case 3: return QColor(0xc4cad2);
+		default: return QColor(0xcd7f4f);
+	}
+}
+
+QWidget* MakeGradeCount(QWidget* parent, int grade, int value, int icon_size, int font_size) {
+	auto* box = new QWidget(parent);
+	auto* row = new QHBoxLayout(box);
+	row->setContentsMargins(0, 0, 0, 0);
+	auto* icon = new QLabel(box);
+	icon->setPixmap(MakeCupIcon(GradeColor(grade), icon_size));
+	auto* text = new QLabel(QString::number(value), box);
+	text->setStyleSheet(QStringLiteral("font-size: %1px;").arg(font_size));
+	row->addWidget(icon);
+	row->addWidget(text);
+	return box;
+}
+
+QPixmap LoadGameArt(const Configuration* game, int height) {
+	QPixmap    art;
+	const auto data = GameContent::ReadFile(game->basedir, QStringLiteral("sce_sys/icon0.png"),
+	                                        GameContent::MaxImageSize);
+	if (!data.isEmpty() && art.loadFromData(data)) {
+		return art.scaledToHeight(height, Qt::SmoothTransformation);
+	}
+	return {};
+}
+
+} // namespace
+
+void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& games,
+                                      const QString& runtime_directory, QWidget* parent) {
+	QDialog dialog(parent);
+	dialog.setWindowTitle(QObject::tr("Trophies"));
+	dialog.resize(820, 640);
+	dialog.setStyleSheet(QStringLiteral(
+	    "QDialog { background: palette(window); }"
+	    "QLabel { color: palette(text); }"
+	    "QListWidget { background: transparent; border: none; outline: none; }"
+	    "QListWidget::item { border-bottom: 1px solid palette(mid); padding: 4px; }"
+	    "QListWidget::item:selected, QListWidget::item:hover { background: palette(midlight); "
+	    "border: 1px solid palette(highlight); }"
+	    "QProgressBar { background: palette(mid); border: none; height: 4px; }"
+	    "QProgressBar::chunk { background: palette(highlight); }"));
+	auto* layout = new QVBoxLayout(&dialog);
+
+	struct GameProgress {
+		const Configuration* game;
+		Progress             progress;
+	};
+	std::vector<GameProgress> trophy_games;
+	Progress                  totals;
+	for (const auto* game: games) {
+		const auto progress = GetGameProgress(game, runtime_directory);
+		if (progress.total == 0) {
+			continue;
+		}
+		trophy_games.push_back({game, progress});
+		totals.earned += progress.earned;
+		for (size_t grade = 1; grade < totals.earned_grade.size(); ++grade) {
+			totals.earned_grade[grade] += progress.earned_grade[grade];
+		}
+	}
+
+	auto* header = new QHBoxLayout;
+	auto* title  = new QLabel(QObject::tr("Trophies"), &dialog);
+	title->setStyleSheet(QStringLiteral("font-size: 30px;"));
+	header->addWidget(title);
+	header->addStretch(1);
+	auto* total = new QLabel(QObject::tr("Total %1").arg(totals.earned), &dialog);
+	total->setAlignment(Qt::AlignCenter);
+	total->setStyleSheet(QStringLiteral("font-size: 16px;"));
+	header->addWidget(total);
+	for (int grade = 1; grade <= 4; ++grade) {
+		header->addWidget(MakeGradeCount(&dialog, grade, totals.earned_grade[grade], 32, 18));
+	}
+	layout->addLayout(header);
+
+	auto* list = new QListWidget(&dialog);
+	list->setSelectionMode(QAbstractItemView::SingleSelection);
+	list->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+	layout->addWidget(list, 1);
+
+	for (size_t index = 0; index < trophy_games.size(); ++index) {
+		const auto& [game, progress] = trophy_games[index];
+		auto* item                   = new QListWidgetItem(list);
+		item->setSizeHint(QSize(760, 112));
+		item->setData(Qt::UserRole, static_cast<int>(index));
+
+		auto* row_widget = new QWidget(list);
+		row_widget->setAttribute(Qt::WA_TransparentForMouseEvents);
+		auto* row = new QHBoxLayout(row_widget);
+		auto* art = new QLabel(row_widget);
+		art->setFixedSize(80, 80);
+		art->setAlignment(Qt::AlignCenter);
+		const auto pixmap = LoadGameArt(game, 80);
+		if (!pixmap.isNull()) {
+			art->setPixmap(pixmap);
+		} else {
+			art->setStyleSheet(QStringLiteral("background: palette(mid);"));
+		}
+		row->addWidget(art);
+		const auto name = !game->name.isEmpty() ? game->name : game->title_id;
+		auto* text = new QLabel(QStringLiteral("%1\n%2").arg(name, game->title_id), row_widget);
+		text->setStyleSheet(QStringLiteral("font-size: 18px;"));
+		row->addWidget(text, 1);
+
+		auto* percent_box = new QVBoxLayout;
+		percent_box->setSpacing(2);
+		percent_box->setContentsMargins(0, 0, 0, 0);
+		auto* percent = new QLabel(QStringLiteral("%1%").arg(progress.Percentage()), row_widget);
+		percent->setAlignment(Qt::AlignRight);
+		percent->setStyleSheet(QStringLiteral("font-size: 24px;"));
+		percent->setMinimumHeight(34);
+		auto* earned = new QLabel(
+		    QObject::tr("Earned %1/%2").arg(progress.earned).arg(progress.total), row_widget);
+		earned->setAlignment(Qt::AlignRight);
+		earned->setMinimumHeight(18);
+		auto* bar = new QProgressBar(row_widget);
+		bar->setRange(0, 100);
+		bar->setValue(progress.Percentage());
+		bar->setTextVisible(false);
+		bar->setFixedWidth(130);
+		percent_box->addWidget(percent);
+		percent_box->addWidget(earned);
+		percent_box->addWidget(bar);
+		row->addLayout(percent_box);
+		for (int grade = 1; grade <= 4; ++grade) {
+			if (grade == 1 && progress.total_grade[1] == 0) {
+				continue;
+			}
+			row->addWidget(MakeGradeCount(row_widget, grade, progress.earned_grade[grade], 24, 18));
+		}
+		list->setItemWidget(item, row_widget);
+	}
+	if (trophy_games.empty()) {
+		auto* empty =
+		    new QLabel(QObject::tr("No games with trophies found in the game folders."), &dialog);
+		empty->setAlignment(Qt::AlignCenter);
+		layout->insertWidget(1, empty);
+		list->hide();
+	}
+
+	connect(list, &QListWidget::itemClicked, &dialog,
+	        [&dialog, &trophy_games, &runtime_directory](QListWidgetItem* item) {
+		        const auto index = item->data(Qt::UserRole).toInt();
+		        if (index >= 0 && static_cast<size_t>(index) < trophy_games.size()) {
+			        ShowForGame(trophy_games[static_cast<size_t>(index)].game, runtime_directory,
+			                    &dialog);
+		        }
+	        });
+	auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+	connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+	layout->addWidget(buttons);
+	dialog.exec();
+}
+
+void TrophyViewerDialog::ShowForGame(const Configuration* info, const QString& runtime_directory,
+                                     QWidget* parent) {
 	if (info == nullptr) {
 		return;
 	}
@@ -527,7 +318,7 @@ void TrophyViewerDialog::ShowForGame(const Configuration* info, QWidget* parent)
 	}
 
 	QString error;
-	if (!dlg.LoadGame(*info, error)) {
+	if (!dlg.LoadGame(*info, runtime_directory, error)) {
 		QMessageBox::warning(parent, tr("Trophy Viewer"), error);
 		return;
 	}
@@ -535,66 +326,151 @@ void TrophyViewerDialog::ShowForGame(const Configuration* info, QWidget* parent)
 	dlg.exec();
 }
 
-bool TrophyViewerDialog::LoadGame(const Configuration& info, QString& error) {
-	const auto reader = Common::OpenArchive(GameContent::ToPath(info.basedir));
+bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runtime_directory,
+                                  QString& error) {
+	const auto reader       = Common::OpenArchive(GameContent::ToPath(info.basedir));
 	const auto trophy_files = FindTrophyFiles(&info);
 	if (trophy_files.isEmpty()) {
-		error = tr("No trophy package found in sce_sys/trophy2.");
+		error = tr("No trophy package found in %1.")
+		            .arg(QString::fromLatin1(Common::Trophies::PackageDirectory));
 		return false;
 	}
-
 	QStringList errors;
 	for (const auto& file: trophy_files) {
-		TrophySet set;
-		QString   set_error;
-		if (!BuildTrophySet(file, set, set_error)) {
-			errors.append(set_error);
+		const auto package =
+		    Common::Trophies::LoadPackage(GameContent::ToPath(file), info.console_language);
+		if (package.trophies.empty()) {
+			errors.append(tr("Could not read trophy package %1.").arg(QFileInfo(file).fileName()));
 			continue;
 		}
+		const auto unlocks     = LoadUnlocks(info, runtime_directory, file);
+		const auto counts      = Common::Trophies::GetProgress(package, unlocks);
+		auto*      page        = new QWidget(m_tabs);
+		auto*      page_layout = new QVBoxLayout(page);
 
-		auto* table = new QTableWidget(set.trophies.size(), 4, m_tabs);
-		PrepareTable(table);
-
-		for (int row_index = 0; row_index < set.trophies.size(); row_index++) {
-			const auto& row = set.trophies.at(row_index);
-			table->setRowHeight(row_index, 112);
-
-			auto* status = CreateItem(tr("locked"));
-			status->setTextAlignment(Qt::AlignCenter);
-			if (row.hidden) {
-				status->setForeground(QBrush(Qt::gray));
-			}
-			table->setItem(row_index, 0, status);
-
-			auto* icon_label = new QLabel(table);
-			icon_label->setAlignment(Qt::AlignCenter);
-			icon_label->setMinimumSize(QSize(108, 108));
-			if (!row.icon.isNull()) {
-				icon_label->setPixmap(
-				    row.icon.scaled(QSize(96, 96), Qt::KeepAspectRatio, Qt::SmoothTransformation));
-			}
-			table->setCellWidget(row_index, 1, icon_label);
-
-			auto* name = CreateItem(row.name);
-			auto  font = name->font();
-			font.setBold(true);
-			name->setFont(font);
-			name->setToolTip(TrophyTooltip(row));
-			table->setItem(row_index, 2, name);
-
-			auto* detail = CreateItem(row.detail);
-			detail->setToolTip(TrophyTooltip(row));
-			table->setItem(row_index, 3, detail);
+		auto* header = new QHBoxLayout;
+		auto* art    = new QLabel(page);
+		if (const auto pixmap = LoadGameArt(&info, 56); !pixmap.isNull()) {
+			art->setPixmap(pixmap);
+			header->addWidget(art);
 		}
+		auto* title = new QLabel(QString::fromStdString(package.title), page);
+		title->setStyleSheet(QStringLiteral("font-size: 28px;"));
+		header->addWidget(title, 1);
+		const auto make_stat = [page](const QString& label, const QString& value) {
+			auto* box    = new QVBoxLayout;
+			auto* name   = new QLabel(label, page);
+			auto* number = new QLabel(value, page);
+			name->setStyleSheet(QStringLiteral("font-size: 14px;"));
+			number->setStyleSheet(QStringLiteral("font-size: 22px;"));
+			box->addWidget(name);
+			box->addWidget(number);
+			return box;
+		};
+		header->addLayout(
+		    make_stat(tr("Progress"), QStringLiteral("%1%").arg(counts.Percentage())));
+		header->addLayout(
+		    make_stat(tr("Earned"), QStringLiteral("%1/%2").arg(counts.earned).arg(counts.total)));
+		for (int grade = 1; grade <= 4; ++grade) {
+			if (counts.total_grade[grade] > 0) {
+				header->addWidget(MakeGradeCount(page, grade, counts.earned_grade[grade], 30, 20));
+			}
+		}
+		page_layout->addLayout(header);
+		auto* progress = new QProgressBar(page);
+		progress->setRange(0, 100);
+		progress->setValue(counts.Percentage());
+		progress->setTextVisible(false);
+		page_layout->addWidget(progress);
+		auto* count_label = new QLabel(tr("All trophies: %1").arg(counts.total), page);
+		page_layout->addWidget(count_label);
 
-		m_tabs->addTab(table, set.tab_title);
+		auto* list = new QListWidget(page);
+		list->setSelectionMode(QAbstractItemView::NoSelection);
+		list->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+		list->setSpacing(4);
+		page_layout->addWidget(list, 1);
+		for (const auto& [id, trophy]: package.trophies) {
+			const bool trophy_unlocked = unlocks.unlocked.contains(id);
+			const auto hidden_locked   = trophy.hidden && !trophy_unlocked;
+			auto*      item            = new QListWidgetItem(list);
+			item->setSizeHint(QSize(900, 96));
+
+			auto* card = new QWidget(list);
+			card->setStyleSheet(
+			    QStringLiteral("QWidget#card { background: palette(base); border-radius: 12px; }"));
+			card->setObjectName(QStringLiteral("card"));
+			auto* row  = new QHBoxLayout(card);
+			auto* icon = new QLabel(card);
+			icon->setFixedSize(76, 76);
+			icon->setAlignment(Qt::AlignCenter);
+			QPixmap pixmap;
+			if (hidden_locked) {
+				pixmap = QPixmap(QStringLiteral(":/icons/hidden-trophy.png"));
+			} else if (pixmap.loadFromData(reinterpret_cast<const uchar*>(trophy.icon_png.data()),
+			                               static_cast<uint>(trophy.icon_png.size())) &&
+			           !trophy_unlocked) {
+				pixmap =
+				    QPixmap::fromImage(pixmap.toImage().convertToFormat(QImage::Format_Grayscale8));
+			}
+			if (!pixmap.isNull()) {
+				icon->setPixmap(
+				    pixmap.scaled(76, 76, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+			}
+			row->addWidget(icon);
+
+			auto*      left      = new QVBoxLayout;
+			const auto name_text = hidden_locked         ? tr("Hidden trophy")
+			                       : trophy.name.empty() ? tr("Trophy %1").arg(id)
+			                                             : QString::fromStdString(trophy.name);
+			auto*      name      = new QLabel(name_text, card);
+			name->setStyleSheet(QStringLiteral("font-size: 20px; font-weight: bold;"));
+			left->addWidget(name);
+			if (!hidden_locked) {
+				auto* grade_row = new QHBoxLayout;
+				auto* cup       = new QLabel(card);
+				cup->setPixmap(MakeCupIcon(GradeColor(trophy.grade), 18));
+				auto* grade_text = new QLabel(GradeToText(trophy.grade), card);
+				grade_text->setStyleSheet(QStringLiteral("font-size: 15px;"));
+				grade_row->addWidget(cup);
+				grade_row->addWidget(grade_text);
+				grade_row->addStretch(1);
+				left->addLayout(grade_row);
+			}
+
+			row->addLayout(left, 2);
+
+			auto*   right = new QVBoxLayout;
+			QString date_text;
+			if (const auto found = unlocks.timestamps.find(id); found != unlocks.timestamps.end()) {
+				date_text = QDateTime::fromMSecsSinceEpoch(
+				                static_cast<qint64>(
+				                    (found->second - Common::Trophies::UnixEpochTick) / 1000))
+				                .toLocalTime()
+				                .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+			} else if (trophy_unlocked) {
+				date_text = tr("Earned");
+			}
+			auto* date = new QLabel(date_text, card);
+			date->setAlignment(Qt::AlignRight);
+			date->setStyleSheet(QStringLiteral("font-size: 15px;"));
+			auto* detail = new QLabel(
+			    hidden_locked ? QString {} : QString::fromStdString(trophy.description), card);
+			detail->setWordWrap(true);
+			detail->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+			detail->setStyleSheet(QStringLiteral("font-size: 17px;"));
+			right->addWidget(date);
+			right->addWidget(detail, 1);
+			row->addLayout(right, 3);
+			card->setToolTip(hidden_locked ? name_text : TrophyTooltip(trophy));
+			list->setItemWidget(item, card);
+		}
+		m_tabs->addTab(page, QString::fromStdString(package.title));
 	}
-
+	m_tabs->tabBar()->setVisible(m_tabs->count() > 1);
 	if (m_tabs->count() == 0) {
-		error = errors.isEmpty() ? tr("No readable trophy data found.")
-		                         : errors.join(QLatin1Char('\n'));
+		error = errors.join(QLatin1Char('\n'));
 		return false;
 	}
-
 	return true;
 }

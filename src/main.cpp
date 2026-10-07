@@ -54,7 +54,7 @@ static void PrintUsage() {
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
-	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 100.\n");
+	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
@@ -84,7 +84,12 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf(
+	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf(
+	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
+	    "                                      Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -418,6 +423,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--trophy-notifications") {
+			if (!ParseBool(value, options.config.trophy_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--skip-notice-screen") {
+			if (!ParseBool(value, options.config.skip_notice_screen)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

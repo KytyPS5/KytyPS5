@@ -315,6 +315,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;
 			ctx.state.lane_half = half;
 			if (half == 0 || (inst.GetOpcode() != IR::ValueOpcode::Barrier &&
+			                  inst.GetOpcode() != IR::ValueOpcode::StoreCompletion &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
 				emit_instruction(lane, inst);
 			}
@@ -688,9 +689,7 @@ void EmitProgram(EmitterState& state) {
 	DefineBvhIntersect(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
-			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32 ||
-			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMin32 ||
-			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32;
+			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32;
 		    })) {
 			ctx.scratch_u32_variable = state.builder.AllocateId();
 			if (state.lane_count == 2) {
@@ -750,6 +749,17 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
+		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
+		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
+		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
+		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
+		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

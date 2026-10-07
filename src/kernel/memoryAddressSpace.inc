@@ -231,9 +231,8 @@ public:
 		return true;
 	}
 
-	bool MapExistingPlaceholderFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
-	                                 VirtualMemory::Mode mode,
-	                                 FailureReason*      failure_reason = nullptr) {
+	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
+	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			SetFailure(failure_reason, !IsAvailable() ? FailureReason::BackingUnavailable
 			                                          : FailureReason::PhysicalRangeOutOfBounds);
@@ -257,14 +256,13 @@ public:
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
+		std::lock_guard lock(m_mutex);
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			return false;
 		}
-		{
-			std::lock_guard lock(m_mutex);
-			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
-		}
+		RemoveMappingsUnlocked(vaddr, size);
+		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
@@ -302,8 +300,7 @@ public:
 			bool part_placeholder_preserved = false;
 			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved)) {
 				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-					EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
-					                                     it->mode));
+					EXIT_IF(!MapFixed(it->vaddr, it->size, it->backing_offset, it->mode));
 				}
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = false;
@@ -320,8 +317,7 @@ public:
 		// views into one placeholder before publishing it there.
 		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
 			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-				EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
-				                                     it->mode));
+				EXIT_IF(!MapFixed(it->vaddr, it->size, it->backing_offset, it->mode));
 			}
 			return false;
 		}
@@ -363,12 +359,10 @@ public:
 			return false;
 		}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		const uint64_t left_size  = vaddr - old.vaddr;
 		const uint64_t right_addr = vaddr + size;
-		const uint64_t old_end    = old.vaddr + old.size;
-		const uint64_t right_size = old_end - right_addr;
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const uint64_t right_size = old.vaddr + old.size - right_addr;
 		const bool exact_unmap = (vaddr == old.vaddr && size == old.size);
 		if (exact_unmap) {
 			const bool unmapped =
@@ -393,14 +387,11 @@ public:
 				ok = SplitPlaceholder(vaddr, size) && ok;
 			}
 			if (left_size != 0) {
-				ok = MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset,
-				                                 old.mode) &&
-				     ok;
+				ok = MapFixed(old.vaddr, left_size, old.backing_offset, old.mode) && ok;
 			}
 			if (right_size != 0) {
-				ok = MapExistingPlaceholderFixed(right_addr, right_size,
-				                                 old.backing_offset + (right_addr - old.vaddr),
-				                                 old.mode) &&
+				ok = MapFixed(right_addr, right_size,
+				              old.backing_offset + (right_addr - old.vaddr), old.mode) &&
 				     ok;
 			}
 			if (ok) {
@@ -418,8 +409,7 @@ public:
 			}
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
-			EXIT_IF(
-			    !MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode));
+			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
@@ -433,16 +423,7 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
-		m_maps.erase(old.vaddr);
-		if (left_size != 0) {
-			m_maps.emplace(old.vaddr,
-			               MapEntry {old.vaddr, left_size, old.backing_offset, old.mode});
-		}
-		if (right_size != 0) {
-			m_maps.emplace(right_addr,
-			               MapEntry {right_addr, right_size,
-			                         old.backing_offset + right_addr - old.vaddr, old.mode});
-		}
+		RemoveMappingsUnlocked(vaddr, size);
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
@@ -515,6 +496,33 @@ private:
 		uint64_t            backing_offset = 0;
 		VirtualMemory::Mode mode           = VirtualMemory::Mode::NoAccess;
 	};
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	void RemoveMappingsUnlocked(uint64_t vaddr, uint64_t size) {
+		const auto end = vaddr + size;
+		auto       it = m_maps.upper_bound(vaddr);
+		if (it != m_maps.begin()) {
+			--it;
+		}
+		while (it != m_maps.end() && it->first < end) {
+			const auto old     = it->second;
+			const auto old_end = old.vaddr + old.size;
+			if (old_end <= vaddr) {
+				++it;
+				continue;
+			}
+			it = m_maps.erase(it);
+			if (old.vaddr < vaddr) {
+				m_maps.emplace(old.vaddr,
+				               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
+			}
+			if (end < old_end) {
+				m_maps.emplace(end, MapEntry {end, old_end - end,
+				                             old.backing_offset + end - old.vaddr, old.mode});
+			}
+		}
+	}
+#endif
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
 		EXIT_IF(out == nullptr);
@@ -621,6 +629,12 @@ private:
 
 	void* MapView(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode,
 	              FailureReason* failure_reason) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (const auto callback = g_test_before_backing_map) {
+			g_test_before_backing_map = nullptr;
+			callback(vaddr, size);
+		}
+#endif
 		void* ptr = mmap(reinterpret_cast<void*>(vaddr), size, GetProtect(mode),
 		                 MAP_SHARED | MAP_FIXED, m_fd, static_cast<off_t>(backing_offset));
 		if (ptr == MAP_FAILED) {
@@ -778,7 +792,12 @@ public:
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
 		std::lock_guard lock(m_mutex);
-		if (!ConsumeUnlocked(vaddr, size)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
+#else
+		constexpr bool replacing = false;
+#endif
+		if (!replacing && !ConsumeUnlocked(vaddr, size)) {
 			if (failure_reason != nullptr) {
 				*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
 			}
@@ -787,12 +806,15 @@ public:
 		const auto host_mode = VirtualMemory::IsExecute(mode)
 		                           ? VirtualMemory::Mode::ExecuteReadWrite
 		                           : VirtualMemory::Mode::ReadWrite;
-		if (m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode,
-		                                           failure_reason)) {
-			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
+		if (m_backing->MapFixed(vaddr, size, backing_offset, host_mode, failure_reason)) {
+			if (!replacing) {
+				EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
+			}
 			return true;
 		}
-		AddFreeUnlocked(vaddr, size);
+		if (!replacing) {
+			AddFreeUnlocked(vaddr, size);
+		}
 		return false;
 	}
 

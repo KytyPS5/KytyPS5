@@ -28,6 +28,7 @@ public:
 	~ConfigurationListWidget() override;
 
 	void SetRunEnabled(bool flag) { m_run_enabled = flag; }
+	void SetRuntimeDirectory(const QString& directory) { m_runtime_directory = directory; }
 
 	[[nodiscard]] const ConfigurationItem* GetSelectedItem() const { return m_selected_item; }
 	ConfigurationItem*                     GetSelectedItem() { return m_selected_item; }
@@ -42,6 +43,7 @@ public:
 	bool EnsureGameDirectory();
 	void ScanGameDirectory();
 	void ViewTrophies();
+	void ViewTrophyOverview();
 
 signals:
 
@@ -72,12 +74,15 @@ private:
 	void               SelectItem(QTreeWidgetItem* witem);
 	void               ApplyCompatibility();
 	void               UpdateToolbarIcons();
+	void               ImportGameSettings(QWidget* parent);
+	void               ExportGameSettings(QWidget* parent) const;
 	[[nodiscard]] bool HasValidGameDirectory() const;
 
 	ConfigurationItem*            m_selected_item = nullptr;
 	bool                          m_run_enabled   = true;
 	Ui::ConfigurationListWidget*  m_ui            = nullptr;
 	QString                       m_settings_file;
+	QString                       m_runtime_directory;
 	QStringList                   m_game_dirs;
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;

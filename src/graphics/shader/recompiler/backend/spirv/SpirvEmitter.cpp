@@ -18,7 +18,7 @@ namespace {
 	std::abort();
 }
 
-void ValidateNativeProgram(const IR::Program& program) {
+void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	using Kind                                             = IR::DescriptorBindingKind;
 	constexpr auto                               KindCount = static_cast<size_t>(Kind::Count);
 	std::array<std::vector<uint32_t>, KindCount> expected;
@@ -53,10 +53,13 @@ void ValidateNativeProgram(const IR::Program& program) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
 	}
 	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
-	const bool uses_gds = IR::CollectMemoryResources(program, buffers);
+	const auto shared = IR::CollectMemoryResources(program, buffers);
 	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty();
-	if (uses_gds) {
+	if (shared.gds) {
 		Expect(Kind::Gds);
+	}
+	if (shared.lds && lds_storage) {
+		Expect(Kind::SharedMemory);
 	}
 	if (program.info.uses_dma) {
 		Expect(Kind::BdaPagetable);
@@ -85,9 +88,13 @@ void ValidateNativeProgram(const IR::Program& program) {
 	}
 	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
 	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
+	const auto user_data_dwords = program.bindings.user_data_registers.size();
+	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
-	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
+	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
+	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
+	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
 	    program.bindings.memory_offset_count != buffers.size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
@@ -198,7 +205,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (memory_index >= program.memory_info.size()) {
 					Fail(program, "address operation has invalid memory metadata");
 				}
-				const auto kind = program.memory_info[memory_index].kind;
+				const auto& memory = program.memory_info[memory_index];
+				const auto kind = memory.kind;
 				if (kind == IR::ResourceKind::Scratch || kind == IR::ResourceKind::FlatLocal) {
 					if (program.scratch_dwords == 0) {
 						Fail(program, "scratch operation has no per-thread storage");
@@ -210,6 +218,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					}
 				} else if (address_access == IR::AddressAccess::Write) {
 					Fail(program, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
+				} else {
+					// Descriptor stores can alias coherent physical-address loads.
+					requirements.coherent_buffers |= memory.coherent;
 				}
 			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
@@ -218,7 +229,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					Fail(program, "buffer operation has invalid memory metadata");
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind == IR::ResourceKind::IndirectBuffer) {
+				if (memory.kind == IR::ResourceKind::IndirectBuffer &&
+				    inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) {
 					requirements.subgroup_local_invocation_id = true;
 				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
@@ -226,6 +238,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
+					const auto bits = StorageBufferElementBits(program, memory);
+					requirements.buffer_u8 |= bits == 8u;
+					requirements.buffer_u16 |= bits == 16u;
 					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
 						if (program.stage != ShaderType::Compute) {
 							Fail(program, "buffer ADD_TID is only valid for compute shaders");
@@ -263,6 +278,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 			}
 			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::DppMoveU32:
@@ -288,6 +304,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					break;
 				}
 				case IR::ValueOpcode::SwizzleU32:
+				case IR::ValueOpcode::PermuteU32:
 				case IR::ValueOpcode::BpermuteU32: {
 					requirements.subgroup_ballot              = true;
 					requirements.subgroup_shuffle             = true;
@@ -334,7 +351,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    !program.shader_info_complete || !program.binding_layout_complete) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
-	ValidateNativeProgram(program);
+	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
+	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);

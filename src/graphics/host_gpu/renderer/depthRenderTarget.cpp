@@ -160,8 +160,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 			           z.depth_view.slice_max);
 	}
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
-	if (z.z_info.partially_resident ||
-	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
+	if (z.z_info.max_mip_level != 0 ||
 	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
 	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
 		DepthFatal("unsupported depth register state");
@@ -316,8 +315,6 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
-	r.depth_min_bounds         = hw.GetDepthBoundsMin();
-	r.depth_max_bounds         = hw.GetDepthBoundsMax();
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;

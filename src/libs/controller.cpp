@@ -224,7 +224,9 @@ void GameController::CycleSetting(Setting setting) {
 float GameController::GetSettingScale(Setting setting) const {
 	const auto step = m_setting_steps[static_cast<size_t>(setting)].load(std::memory_order_relaxed);
 	if (setting == Setting::SpeakerVolume) {
-		return SPEAKER_VOLUME[step] * (Config::GetControllerSpeakerVolume() / 100.0f);
+		// The old speaker level matches the PS5 slider's midpoint. Give the upper
+		// half of the global slider up to 6 dB of extra software gain.
+		return SPEAKER_VOLUME[step] * (Config::GetControllerSpeakerVolume() / 50.0f);
 	}
 	if (setting == Setting::VibrationIntensity) {
 		return INTENSITY[step] * (Config::GetControllerVibrationIntensity() / 100.0f);

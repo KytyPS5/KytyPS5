@@ -3,14 +3,17 @@
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
 #include "libs/dialog.h"
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
+#include "stb_image.h"
 
 #include <algorithm>
 #include <array>
@@ -18,12 +21,17 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <deque>
+#include <limits>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -178,6 +186,14 @@ bool                         g_input_lifecycle_active     = false;
 bool                         g_controller_captured        = false;
 OverlaySession               g_session;
 SDL_Window*                  g_input_window               = nullptr;
+struct TrophyNotification {
+	std::string            name;
+	int32_t                grade;
+	std::vector<std::byte> icon_png;
+};
+std::mutex                     g_trophy_notification_mutex;
+std::deque<TrophyNotification> g_trophy_notifications;
+std::atomic<bool>              g_trophy_notification_active {false};
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -467,8 +483,9 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto system = SystemDialog::GetVisualState();
-	return {core.active || dialog.active || system.active,
-	        core.revision + dialog.revision + system.revision};
+	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
+	return {core.active || dialog.active || system.active || trophy_active,
+	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -599,12 +616,34 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	}
 }
 
+void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
+                          std::span<const std::byte> icon_png) {
+	std::scoped_lock lock(g_trophy_notification_mutex);
+	g_trophy_notifications.push_back(
+	    {std::string(name), grade, std::vector<std::byte>(icon_png.begin(), icon_png.end())});
+	g_trophy_notification_active.store(true, std::memory_order_release);
+}
+
 struct SystemOverlay::Impl {
+	using Clock = std::chrono::steady_clock;
+
 	explicit Impl(GraphicContext& context): graphics(context) {}
 
 	~Impl() {
+		SDL_DestroyAudioStream(trophy_sound_stream);
+		SDL_free(trophy_sound_data);
+		if (trophy_sound_initialized) {
+			SDL_QuitSubSystem(SDL_INIT_AUDIO);
+		}
 		ReleaseVulkan();
 		if (imgui_context != nullptr) {
+			ImGui::SetCurrentContext(imgui_context);
+			if (trophy_notification_image) {
+				ImGui::UnregisterUserTexture(trophy_notification_image.get());
+			}
+			for (const auto& texture: retired_trophy_images) {
+				ImGui::UnregisterUserTexture(texture.get());
+			}
 			ImGui::DestroyContext(imgui_context);
 		}
 	}
@@ -629,6 +668,75 @@ struct SystemOverlay::Impl {
 		style.WindowRounding = 10.0f;
 		style.FrameRounding  = 6.0f;
 		style.ItemSpacing    = {8.0f, 8.0f};
+	}
+
+	void PlayTrophySound() {
+		if (!trophy_sound_attempted) {
+			trophy_sound_attempted   = true;
+			trophy_sound_initialized = SDL_InitSubSystem(SDL_INIT_AUDIO);
+			if (!trophy_sound_initialized) {
+				LOGF("[Trophy] could not initialize audio: %s\n", SDL_GetError());
+				return;
+			}
+			const char* base_path = SDL_GetBasePath();
+			if (base_path == nullptr) {
+				LOGF("[Trophy] could not locate sound: %s\n", SDL_GetError());
+				return;
+			}
+			const std::string path = std::string(base_path) + "assets/sounds/trophy-unlock.wav";
+			SDL_AudioSpec     spec {};
+			if (!SDL_LoadWAV(path.c_str(), &spec, &trophy_sound_data, &trophy_sound_size)) {
+				LOGF("[Trophy] could not load %s: %s\n", path.c_str(), SDL_GetError());
+				return;
+			}
+			if (trophy_sound_size > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+				LOGF("[Trophy] sound is too large: %s\n", path.c_str());
+				return;
+			}
+			trophy_sound_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+			                                                &spec, nullptr, nullptr);
+			if (trophy_sound_stream == nullptr) {
+				LOGF("[Trophy] could not open audio stream: %s\n", SDL_GetError());
+				return;
+			}
+		}
+		if (trophy_sound_stream != nullptr &&
+		    (!SDL_PutAudioStreamData(trophy_sound_stream, trophy_sound_data,
+		                             static_cast<int>(trophy_sound_size)) ||
+		     !SDL_ResumeAudioStreamDevice(trophy_sound_stream))) {
+			LOGF("[Trophy] could not play sound: %s\n", SDL_GetError());
+		}
+	}
+
+	std::unique_ptr<ImTextureData> LoadTrophyIcon(std::span<const std::byte> encoded) {
+		if (encoded.empty() ||
+		    encoded.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+			return nullptr;
+		}
+
+		const auto* data   = reinterpret_cast<const stbi_uc*>(encoded.data());
+		const int   size   = static_cast<int>(encoded.size());
+		int         width  = 0;
+		int         height = 0;
+		if (!stbi_info_from_memory(data, size, &width, &height, nullptr) || width <= 0 ||
+		    height <= 0 || width > 512 || height > 512) {
+			LOGF("[Trophy] invalid icon or dimensions exceed 512x512\n");
+			return nullptr;
+		}
+		auto* pixels = stbi_load_from_memory(data, size, &width, &height, nullptr, 4);
+		if (pixels == nullptr) {
+			LOGF("[Trophy] could not decode trophy icon: %s\n", stbi_failure_reason());
+			return nullptr;
+		}
+
+		auto texture = std::make_unique<ImTextureData>();
+		texture->Create(ImTextureFormat_RGBA32, width, height);
+		std::memcpy(texture->Pixels, pixels,
+		            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+		texture->UseColors = true;
+		stbi_image_free(pixels);
+		ImGui::RegisterUserTexture(texture.get());
+		return texture;
 	}
 
 	void EnsureVulkan(vk::Format format, uint32_t image_count) {
@@ -952,9 +1060,116 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now) {
+		std::erase_if(retired_trophy_images, [](const auto& texture) {
+			if (texture->Status != ImTextureStatus_Destroyed) {
+				return false;
+			}
+			ImGui::UnregisterUserTexture(texture.get());
+			return true;
+		});
+		constexpr float TOAST_LIFETIME = 5.0f;
+		if (trophy_notification &&
+		    std::chrono::duration<float>(now - trophy_notification_born).count() >=
+		        TOAST_LIFETIME) {
+			trophy_notification.reset();
+			if (trophy_notification_image) {
+				// Keep the texture registered until the backend retires in-flight frames.
+				trophy_notification_image->WantDestroyNextFrame = true;
+				retired_trophy_images.push_back(std::move(trophy_notification_image));
+			}
+		}
+		if (!trophy_notification) {
+			{
+				std::scoped_lock lock(g_trophy_notification_mutex);
+				if (g_trophy_notifications.empty()) {
+					g_trophy_notification_active.store(!retired_trophy_images.empty(),
+					                                   std::memory_order_release);
+					return;
+				}
+				trophy_notification = std::move(g_trophy_notifications.front());
+				g_trophy_notifications.pop_front();
+			}
+			trophy_notification_born  = now;
+			trophy_notification_image = LoadTrophyIcon(trophy_notification->icon_png);
+			PlayTrophySound();
+		}
+		const float age = std::chrono::duration<float>(now - trophy_notification_born).count();
+		const float screen_scale =
+		    std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                        static_cast<float>(frame_extent.height) / 1080.0f),
+		               0.65f, 1.25f);
+		const float width = std::max(
+		    0.0f, std::min(520.0f * screen_scale, static_cast<float>(frame_extent.width) - 32.0f));
+		const float  height   = 104.0f * screen_scale;
+		const float  rounding = 14.0f * screen_scale;
+		const float  fade_in  = std::clamp(age / 0.22f, 0.0f, 1.0f);
+		const float  fade_out = std::clamp((TOAST_LIFETIME - age) / 0.4f, 0.0f, 1.0f);
+		const float  alpha    = std::min(fade_in, fade_out);
+		const float  slide    = (1.0f - fade_in) * (width + 24.0f);
+		const ImVec2 top_left {static_cast<float>(frame_extent.width) - 32.0f - width + slide,
+		                       32.0f};
+		const ImVec2 bottom_right {top_left.x + width, top_left.y + height};
+		auto*        draw = ImGui::GetForegroundDrawList();
+		const auto   fade = [alpha](int r, int g, int b, int a) {
+            return IM_COL32(r, g, b, static_cast<int>(static_cast<float>(a) * alpha));
+		};
+		draw->AddRectFilled({top_left.x + 3.0f, top_left.y + 5.0f},
+		                    {bottom_right.x + 3.0f, bottom_right.y + 5.0f}, fade(0, 0, 0, 90),
+		                    rounding);
+		draw->AddRectFilled(top_left, bottom_right, fade(24, 26, 32, 235), rounding);
+		draw->AddRect(top_left, bottom_right, fade(255, 255, 255, 28), rounding,
+		              ImDrawFlags_RoundCornersAll, 1.0f);
+
+		const float pad       = 10.0f * screen_scale;
+		const float icon_size = height - 2.0f * pad;
+		float       text_left = top_left.x + 20.0f * screen_scale;
+		if (trophy_notification_image != nullptr) {
+			const ImVec2 icon_min {top_left.x + pad, top_left.y + pad};
+			const ImVec2 icon_max {icon_min.x + icon_size, icon_min.y + icon_size};
+			draw->AddImageRounded(trophy_notification_image->GetTexRef(), icon_min, icon_max,
+			                      {0, 0}, {1, 1}, fade(255, 255, 255, 255), 8.0f * screen_scale);
+			draw->AddRect(icon_min, icon_max, fade(255, 255, 255, 40), 8.0f * screen_scale,
+			              ImDrawFlags_RoundCornersAll, 1.0f);
+			text_left = icon_max.x + 18.0f * screen_scale;
+		}
+
+		constexpr std::array GRADE_COLORS {IM_COL32(161, 225, 245, 255), IM_COL32(255, 207, 82, 255),
+		                                   IM_COL32(211, 220, 232, 255),
+		                                   IM_COL32(211, 142, 91, 255)};
+		const int            grade     = trophy_notification->grade;
+		const float          title_y   = top_left.y + height * 0.5f - 25.0f * screen_scale;
+		float                title_x   = text_left;
+		if (grade > 0 && grade <= static_cast<int>(GRADE_COLORS.size())) {
+			// Small cup glyph tinted with the trophy grade.
+			const ImU32 cup = ImGui::GetColorU32(GRADE_COLORS[grade - 1], alpha);
+			const float u   = screen_scale;
+			const float cx  = text_left + 9.0f * u;
+			const float cy  = title_y + 15.0f * u;
+			draw->AddRectFilled({cx - 8.0f * u, cy - 11.0f * u}, {cx + 8.0f * u, cy + 2.0f * u},
+			                    cup, 2.0f * u, ImDrawFlags_RoundCornersBottom);
+			draw->AddRect({cx - 11.0f * u, cy - 9.0f * u}, {cx - 6.0f * u, cy - 3.0f * u}, cup,
+			              2.0f * u, ImDrawFlags_RoundCornersLeft, 1.8f * u);
+			draw->AddRect({cx + 6.0f * u, cy - 9.0f * u}, {cx + 11.0f * u, cy - 3.0f * u}, cup,
+			              2.0f * u, ImDrawFlags_RoundCornersRight, 1.8f * u);
+			draw->AddRectFilled({cx - 1.5f * u, cy + 2.0f * u}, {cx + 1.5f * u, cy + 7.0f * u}, cup);
+			draw->AddRectFilled({cx - 5.0f * u, cy + 7.0f * u}, {cx + 5.0f * u, cy + 10.0f * u}, cup,
+			                    1.5f * u);
+			title_x += 30.0f * u;
+		}
+		draw->PushClipRect(top_left, {bottom_right.x - 16.0f * screen_scale, bottom_right.y}, true);
+		draw->AddText(nullptr, 26.0f * screen_scale, {title_x, title_y},
+		              fade(255, 255, 255, 255), trophy_notification->name.c_str());
+		draw->AddText(nullptr, 20.0f * screen_scale, {text_left, title_y + 38.0f * screen_scale},
+		              fade(176, 180, 192, 255), "Trophy earned!");
+		draw->PopClipRect();
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
-		if (!GetOverlaySnapshot(&snapshot)) {
+		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
+		const auto now = Clock::now();
+		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire)) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -977,7 +1192,6 @@ struct SystemOverlay::Impl {
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
 		                  static_cast<float>(frame_extent.height)};
-		const auto now = std::chrono::steady_clock::now();
 		io.DeltaTime   = last_frame == std::chrono::steady_clock::time_point {}
 		                     ? 1.0f / 60.0f
 		                     : std::clamp(std::chrono::duration<float>(now - last_frame).count(),
@@ -985,15 +1199,19 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
+		GetOverlaySnapshot(&snapshot);
+		if (snapshot.session != prepared_session) {
 			ImGui::EndFrame();
 			return false;
 		}
-		if (snapshot.session.kind == OverlayKind::Dialog) {
-			DrawDialog(snapshot.dialog, frame_extent);
-		} else {
-			DrawIme(snapshot.ime, frame_extent);
+		if (has_overlay) {
+			if (snapshot.session.kind == OverlayKind::Dialog) {
+				DrawDialog(snapshot.dialog, frame_extent);
+			} else {
+				DrawIme(snapshot.ime, frame_extent);
+			}
 		}
+		DrawTrophyNotification(frame_extent, now);
 		ImGui::Render();
 		extent = frame_extent;
 		return true;
@@ -1040,9 +1258,18 @@ struct SystemOverlay::Impl {
 	float                                 button_height      = 42.0f;
 	ImVec2                                panel_offset {};
 	ImVec2                                right_stick {};
-	OverlaySession                        session;
-	vk::Extent2D                          extent {};
-	std::chrono::steady_clock::time_point last_frame;
+	OverlaySession                              session;
+	std::unique_ptr<ImTextureData>              trophy_notification_image;
+	std::optional<TrophyNotification>           trophy_notification;
+	Clock::time_point                           trophy_notification_born;
+	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;
+	SDL_AudioStream*                            trophy_sound_stream      = nullptr;
+	uint8_t*                                    trophy_sound_data        = nullptr;
+	uint32_t                                    trophy_sound_size        = 0;
+	bool                                        trophy_sound_attempted   = false;
+	bool                                        trophy_sound_initialized = false;
+	vk::Extent2D                                extent {};
+	std::chrono::steady_clock::time_point       last_frame;
 };
 
 SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<Impl>(graphics)) {}

@@ -503,6 +503,7 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.dst).c_str(),
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_ABS_I32:
+		case Opcode::S_SEXT_I32_I16:
 		case Opcode::S_BREV_B32:
 		case Opcode::S_BREV_B64:
 		case Opcode::S_BCNT1_I32_B32:
@@ -535,6 +536,11 @@ std::string InstructionToString(const Instruction& inst) {
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str(),
 			                                               OperandToString(inst.src1).c_str()));
+		case Opcode::S_WAITCNT_VSCNT:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.src0),
+			                                               OperandToString(inst.src1)));
 		case Opcode::S_NOP:
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
@@ -658,6 +664,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::FLAT_LOAD_SBYTE:
 		case Opcode::FLAT_LOAD_USHORT:
 		case Opcode::FLAT_LOAD_SSHORT:
+		case Opcode::FLAT_LOAD_SHORT_D16:
 		case Opcode::FLAT_LOAD_DWORD:
 		case Opcode::FLAT_LOAD_DWORDX2:
 		case Opcode::FLAT_LOAD_DWORDX3:
@@ -692,10 +699,12 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_OR_RTN_B32:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
+		case Opcode::DS_MSKOR_B32:
 		case Opcode::DS_WRXCHG_RTN_B32:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
 		case Opcode::DS_SWIZZLE_B32:
+		case Opcode::DS_PERMUTE_B32:
 		case Opcode::DS_BPERMUTE_B32:
 		case Opcode::DS_READ_I8:
 		case Opcode::DS_READ_U8:

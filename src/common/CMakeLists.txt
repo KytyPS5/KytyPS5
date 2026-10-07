@@ -24,6 +24,7 @@ target_link_libraries(common
 		kyty_git_version
 		spdlog::spdlog
 		ZArchive::zarchive
+		nlohmann_json::nlohmann_json
 )
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)

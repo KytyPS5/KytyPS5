@@ -293,6 +293,88 @@ void TestAioBatches() {
   Check(FileSystem::KernelClose(fd) == OK, "close AIO read fixture");
 }
 
+void TestFsyncChmod(const std::filesystem::path &root) {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto find = [&](const char *nid) -> uint64_t {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "file sync and mode export is registered");
+    return symbol != nullptr ? symbol->vaddr : 0;
+  };
+  using FdCall = int(KYTY_SYSV_ABI *)(int);
+  using FdMode = int(KYTY_SYSV_ABI *)(int, uint16_t);
+  using PathMode = int(KYTY_SYSV_ABI *)(const char *, uint16_t);
+  using PathCall = int(KYTY_SYSV_ABI *)(const char *);
+  const auto kernel_fsync = reinterpret_cast<FdCall>(find("fTx66l5iWIA"));
+  const auto kernel_fdatasync = reinterpret_cast<FdCall>(find("30Rh4ixbKy4"));
+  const auto posix_fsync = reinterpret_cast<FdCall>(find("juWbTNM+8hw"));
+  const auto posix_fdatasync = reinterpret_cast<FdCall>(find("KIbJFQ0I1Cg"));
+  const auto kernel_chmod = reinterpret_cast<PathMode>(find("fgIsQ10xYVA"));
+  const auto posix_chmod = reinterpret_cast<PathMode>(find("z0dtnPxYgtg"));
+  const auto kernel_fchmod = reinterpret_cast<FdMode>(find("UtszJWHrDcA"));
+  const auto posix_fchmod = reinterpret_cast<FdMode>(find("n01yNbQO5W4"));
+  const auto posix_rmdir = reinterpret_cast<PathCall>(find("c7ZnT7V1B98"));
+  auto *error = Libs::Posix::GetErrorAddr();
+
+  constexpr char Path[] = "/savedata0/fsync.dat";
+  constexpr char Payload[] = "durable";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, 7) == 7,
+        "write fsync fixture");
+  Check(kernel_fsync(fd) == OK &&
+            std::filesystem::file_size(root / "fsync.dat") == 7,
+        "sceKernelFsync flushes buffered writes to the host file");
+  Check(kernel_fdatasync(fd) == OK && posix_fsync(fd) == 0 &&
+            posix_fdatasync(fd) == 0 && posix_fsync(1) == 0,
+        "fsync variants accept writable files and the standard streams");
+  Check(kernel_fsync(-1) == Kernel::KERNEL_ERROR_EBADF &&
+            kernel_fsync(4096) == Kernel::KERNEL_ERROR_EBADF &&
+            posix_fsync(4096) == -1 && *error == Libs::Posix::POSIX_EBADF,
+        "fsync rejects bad descriptors");
+
+  Check(kernel_chmod(Path, 0444) == OK && posix_chmod(Path, 0600) == 0 &&
+            kernel_chmod("/savedata0", 0755) == OK &&
+            kernel_fchmod(fd, 0644) == OK && posix_fchmod(fd, 0644) == 0,
+        "chmod and fchmod accept existing files and directories");
+  Check(kernel_chmod("/savedata0/missing.dat", 0644) ==
+                Kernel::KERNEL_ERROR_ENOENT &&
+            posix_chmod("/savedata0/missing.dat", 0644) == -1 &&
+            *error == Libs::Posix::POSIX_ENOENT &&
+            kernel_chmod(nullptr, 0644) == Kernel::KERNEL_ERROR_EFAULT &&
+            kernel_chmod("/nowhere/file.dat", 0644) ==
+                Kernel::KERNEL_ERROR_ENOENT,
+        "chmod rejects missing, null and unmapped paths");
+  Check(kernel_fchmod(-1, 0644) == Kernel::KERNEL_ERROR_EBADF &&
+            posix_fchmod(4096, 0644) == -1 &&
+            *error == Libs::Posix::POSIX_EBADF,
+        "fchmod rejects bad descriptors");
+  Check(FileSystem::KernelClose(fd) == OK, "close fsync fixture");
+  const int reader = FileSystem::KernelOpen(Path, 0, 0);
+  Check(reader >= 3 && kernel_fsync(reader) == OK &&
+            FileSystem::KernelClose(reader) == OK,
+        "fsync accepts a read-only descriptor");
+
+  constexpr char Directory[] = "/savedata0/rmdir-test";
+  constexpr char Child[] = "/savedata0/rmdir-test/child.dat";
+  Check(FileSystem::KernelMkdir(Directory, 0777) == OK, "create rmdir fixture");
+  const int child = FileSystem::KernelOpen(Child, 0x602, 0777);
+  Check(child >= 3 && FileSystem::KernelClose(child) == OK,
+        "create rmdir child");
+  Check(posix_rmdir(Directory) == -1 &&
+            *error == Libs::Posix::POSIX_ENOTEMPTY &&
+            std::filesystem::exists(root / "rmdir-test" / "child.dat"),
+        "rmdir keeps a non-empty directory");
+  Check(posix_rmdir(Child) == -1 && *error == Libs::Posix::POSIX_ENOTDIR,
+        "rmdir rejects a regular file");
+  Check(FileSystem::KernelUnlink(Child) == OK && posix_rmdir(Directory) == 0 &&
+            !std::filesystem::exists(root / "rmdir-test"),
+        "rmdir removes an empty directory");
+  Check(posix_rmdir(Directory) == -1 && *error == Libs::Posix::POSIX_ENOENT,
+        "rmdir reports a missing directory");
+  Check(FileSystem::KernelUnlink(Path) == OK, "remove fsync fixture");
+}
+
 void TestNpWebApi2Memory() {
   Loader::SymbolDatabase symbols;
   Libs::LibNpWebApi2::InitNet_1_NpWebApi2(&symbols);
@@ -522,6 +604,15 @@ void CheckArchiveMount(const std::filesystem::path &root) {
             FileSystem::KernelRename(GuestMember, "/app0/renamed.bin") ==
                 Libs::LibKernel::KERNEL_ERROR_EROFS,
         "archive mount rejects path mutations");
+  Check(FileSystem::KernelChmod(GuestMember, 0644) ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelChmod("/app0/missing.bin", 0644) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "archive mount rejects chmod");
+  Check(FileSystem::KernelFchmod(fd, 0644) ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelFsync(fd) == OK,
+        "archive descriptors reject fchmod and accept fsync");
   FileSystem::Umount("/app0");
   Check(FileSystem::GetRealFilename(GuestMember).empty() &&
             FileSystem::KernelOpen(GuestMember, 0, 0) == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
@@ -1544,6 +1635,7 @@ int main(int, char**) {
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestAioBatches();
+  TestFsyncChmod(temporary.Path());
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();

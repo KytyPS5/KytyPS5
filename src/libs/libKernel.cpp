@@ -1341,14 +1341,6 @@ static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI KernelFsync(int fd) {
-	PRINT_NAME();
-
-	LOGF("\t fd = %d\n", fd);
-
-	return OK;
-}
-
 static void KYTY_SYSV_ABI KernelSync() {
 	PRINT_NAME();
 }
@@ -1986,6 +1978,36 @@ int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelFtruncate(d, length));
 }
 
+int KYTY_SYSV_ABI fsync(int d) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFsync(d));
+}
+
+int KYTY_SYSV_ABI fdatasync(int d) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFsync(d));
+}
+
+int KYTY_SYSV_ABI chmod(const char* path, uint16_t mode) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelChmod(path, mode));
+}
+
+int KYTY_SYSV_ABI fchmod(int d, uint16_t mode) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFchmod(d, mode));
+}
+
+int KYTY_SYSV_ABI rmdir(const char* path) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelRmdir(path));
+}
+
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -2170,6 +2192,10 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
 	LIB_FUNC("8nY19bKoiZk", Posix::fcntl);
+	LIB_FUNC("juWbTNM+8hw", Posix::fsync);
+	LIB_FUNC("KIbJFQ0I1Cg", Posix::fdatasync);
+	LIB_FUNC("n01yNbQO5W4", Posix::fchmod);
+	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);
@@ -2809,12 +2835,6 @@ int32_t KYTY_SYSV_ABI FiberGetThreadFramePointerAddress(uint64_t* addr_frame_poi
 
 } // namespace Fiber
 
-int chmod(const char* path, int mode) {
-	PRINT_NAME();
-
-	return OK;
-}
-
 int KYTY_SYSV_ABI KernelAioInitializeImpl(void* param, int32_t size) {
 	PRINT_NAME();
 
@@ -3125,6 +3145,9 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("1-LFLmRFxxM", FileSystem::KernelMkdir);
 	LIB_FUNC("naInUjYt3so", FileSystem::KernelRmdir);
 	LIB_FUNC("uWyW3v98sU4", FileSystem::KernelCheckReachability);
+	LIB_FUNC("30Rh4ixbKy4", FileSystem::KernelFsync);
+	LIB_FUNC("fgIsQ10xYVA", FileSystem::KernelChmod);
+	LIB_FUNC("UtszJWHrDcA", FileSystem::KernelFchmod);
 }
 
 LIB_DEFINE(InitLibKernel_1_Mem) {
@@ -3337,7 +3360,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("9eMlfusH4sU", Posix::flock);
 	LIB_FUNC("mqQMh1zPPT8", Posix::fstat);
 
-	LIB_FUNC("z0dtnPxYgtg", chmod);
+	LIB_FUNC("z0dtnPxYgtg", Posix::chmod);
 	LIB_FUNC("VAzswvTOCzI", FileSystem::KernelUnlink);
 	LIB_FUNC("JGMio+21L4c", Posix::mkdir);
 	LIB_FUNC("wuCroIGjt2g", FileSystem::KernelOpen);
@@ -3385,7 +3408,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
 	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
-	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
+	LIB_FUNC("fTx66l5iWIA", FileSystem::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);
 	LIB_FUNC("9BcDykPmo1I", LibKernel::get_error_addr);

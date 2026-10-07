@@ -28,9 +28,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -39,6 +41,7 @@
 #endif
 #include <windows.h>
 #else
+#include <dlfcn.h>
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -656,6 +659,28 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Names the host module containing `address`, so host crashes in a driver or system library are
+// distinguishable from crashes in the emulator itself.
+static std::string HostModuleName(uint64_t address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HMODULE module = nullptr;
+	char    path[MAX_PATH] {};
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCSTR>(address), &module) != 0 &&
+	    GetModuleFileNameA(module, path, sizeof(path)) != 0) {
+		return fmt::format("{}+0x{:x}", path, address - reinterpret_cast<uint64_t>(module));
+	}
+#else
+	Dl_info dl_info {};
+	if (dladdr(reinterpret_cast<void*>(address), &dl_info) != 0 && dl_info.dli_fname != nullptr) {
+		return fmt::format("{}+0x{:x}", dl_info.dli_fname,
+		                   address - reinterpret_cast<uint64_t>(dl_info.dli_fbase));
+	}
+#endif
+	return "(no host module)";
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -687,32 +712,36 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 			}
 		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
+		// Goes through the log so it also reaches the log file when one is configured.
+		std::string report;
+		auto        out = std::back_inserter(report);
+		fmt::format_to(out, "--- Guest fault context ---\nthread: {}\n", thread_name);
+		fmt::format_to(out,
+		               "rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
+		               "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
+		               "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
+		               "r12={:016x} r13={:016x} r14={:016x} r15={:016x}\n",
+		               info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+		               info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+		               info->r14, info->r15);
+		fmt::format_to(out, "module: {}\n", HostModuleName(info->exception_address));
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
+			fmt::format_to(out, "code (pc-48 .. pc+48, fault at byte 48):");
 			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+				fmt::format_to(out, "{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
-			std::printf("\n");
+			report += '\n';
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
+			fmt::format_to(out, "stack:");
 			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				fmt::format_to(out, "{} {:016x}", (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
-			std::printf("\n");
+			report += '\n';
 		}
-		std::fflush(stdout);
+		Log::WriteFatal(report);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",

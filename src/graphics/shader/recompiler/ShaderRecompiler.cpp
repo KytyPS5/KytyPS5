@@ -669,7 +669,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 
-	IR::CollectShaderInfo(ir, options.input_info);
+	IR::CollectShaderInfo(ir, options.input_info, options.fragment_shader_barycentric);
 	IR::AllocateBindings(ir, push_data_start_dword,
 	                     ir.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
 	                         options.input_info.compute->lds_storage);

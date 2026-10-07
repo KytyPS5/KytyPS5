@@ -88,8 +88,8 @@ static void PrintUsage() {
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf(
-	    "  --skip-notice-screen <true|false>    Report the notice screen as skipped, so games\n"
-	    "                                       that check it skip boot logos. Default: false.\n");
+	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
+	    "                                      Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif

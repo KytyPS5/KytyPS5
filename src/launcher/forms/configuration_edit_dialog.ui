@@ -181,7 +181,7 @@
         </item>
         <item row="9" column="1">
          <widget class="QCheckBox" name="checkBox_skip_notice_screen">
-          <property name="toolTip"><string>Report the PS5 notice screen as already shown. Games that check this skip their boot logo movies.</string></property>
+          <property name="toolTip"><string>Skip startup logos and notices in supported games.</string></property>
           <property name="text"><string>Skip boot logos</string></property>
          </widget>
         </item>

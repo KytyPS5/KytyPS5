@@ -420,11 +420,19 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 
+	// A buffer may cover non-resident pages of a PRT aperture, which read as zero; a host
+	// read there would fault back into the tracker from inside its upload callback.
+	const auto read_guest = [](void* destination, uint64_t address, uint64_t size) {
+		if (!LibKernel::Memory::TryReadBacking(address, destination, size) &&
+		    !LibKernel::Memory::TryReadSparseBacking(address, destination, size)) {
+			std::memcpy(destination, reinterpret_cast<const void*>(address), size);
+		}
+	};
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			read_guest(mapped + copy.srcOffset, address, copy.size);
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -435,8 +443,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		read_guest(temporary->Mapped().data() + copy.srcOffset, address, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();

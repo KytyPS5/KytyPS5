@@ -1062,6 +1062,76 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
 }
 #endif
 
+
+void CheckGuestUdpLobbySocket() {
+  namespace Net = Libs::Network::Net;
+  Loader::SymbolDatabase symbols;
+  Libs::LibNet::InitNet_1_Net(&symbols);
+  const auto* send_symbol = symbols.Find({"gvD1greCu0A", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto* recv_symbol = symbols.Find({"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto* errno_symbol = symbols.Find({"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  Check(send_symbol && recv_symbol && errno_symbol, "UDP guest exports resolve");
+  using SendTo = int (KYTY_SYSV_ABI *)(int, const void*, size_t, int, const void*, uint32_t);
+  using RecvFrom = int (KYTY_SYSV_ABI *)(int, void*, size_t, int, void*, uint32_t*);
+  using Errno = int* (KYTY_SYSV_ABI *)();
+  const auto send_to = reinterpret_cast<SendTo>(send_symbol->vaddr);
+  const auto recv_from = reinterpret_cast<RecvFrom>(recv_symbol->vaddr);
+  auto* net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
+  const int socket = Net::Socket(2, 2, 0);
+  Check(socket >= 0, "create local lobby UDP socket");
+  const int broadcast = 1;
+  int actual_broadcast = 0;
+  uint32_t broadcast_size = sizeof(actual_broadcast);
+  Check(Net::Setsockopt(socket, 0xffff, 0x10000, &broadcast, sizeof(broadcast)) == 0 &&
+        Net::Getsockopt(socket, 0xffff, 0x10000, &actual_broadcast, &broadcast_size) == 0 &&
+        actual_broadcast != 0, "enable guest all-ones broadcast route");
+  for (const int option : {0x1105, 0x1106}) {
+    const int timeout = 200000;
+    int actual = -1;
+    uint32_t size = sizeof(actual);
+    Check(Net::Setsockopt(socket, 0xffff, option, &timeout, sizeof(timeout)) == 0 &&
+          Net::Getsockopt(socket, 0xffff, option, &actual, &size) == 0 && actual == timeout,
+          "guest microsecond socket timeout round trips");
+    const int negative = -1;
+    Check(option == 0x1105 || (Net::Setsockopt(socket, 0xffff, option, &negative, sizeof(negative)) == -1 &&
+          *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL),
+          "negative receive timeout is rejected");
+    Check(Net::Setsockopt(socket, 0xffff, option, &timeout, 1) == -1,
+          "short guest timeout is rejected");
+#if defined(_WIN32)
+    const int short_timeout = 1;
+    Check(Net::Setsockopt(socket, 0xffff, option, &short_timeout, sizeof(short_timeout)) == 0 &&
+          Net::Getsockopt(socket, 0xffff, option, &actual, &size) == 0 && actual == 1000,
+          "sub-millisecond timeout rounds up rather than waiting forever");
+    Check(Net::Setsockopt(socket, 0xffff, option, &timeout, sizeof(timeout)) == 0,
+          "restore bounded timeout");
+#endif
+  }
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  uint32_t size = address.size();
+  Check(Net::Bind(socket, address.data(), size) == 0 &&
+        Net::Getsockname(socket, address.data(), &size) == 0, "bind lobby to local ephemeral port");
+  const char packet[] = "local-player-handshake";
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(send_to(socket, packet, sizeof(packet), 0, address.data(), size) == sizeof(packet),
+        "guest UDP send reaches the same local lobby socket");
+  char received[sizeof(packet)] {};
+  std::array<uint8_t, 16> peer {};
+  uint32_t peer_size = peer.size();
+  Check(recv_from(socket, received, sizeof(received), 0, peer.data(), &peer_size) == sizeof(packet) &&
+        std::memcmp(packet, received, sizeof(packet)) == 0 && peer == address &&
+        *net_errno == Libs::Posix::POSIX_EINVAL,
+        "guest UDP receive preserves payload, source address and success errno");
+  const int enabled = 1;
+  Check(Net::Setsockopt(socket, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+        recv_from(socket, received, sizeof(received), 0, nullptr, nullptr) == Libs::Network::NET_ERROR_EWOULDBLOCK &&
+        *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+        "empty nonblocking guest UDP receive reports would-block");
+  Check(send_to(-1, packet, sizeof(packet), 0, address.data(), size) == Libs::Network::NET_ERROR_EBADF,
+        "guest UDP send translates invalid descriptor");
+  Check(Net::SocketClose(socket) == 0, "close lobby fixture");
+}
+
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
@@ -1356,6 +1426,7 @@ int main(int, char**) {
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
+  CheckGuestUdpLobbySocket();
   TestNpWebApi2Memory();
   graphics.reset();
   subsystems.Destroy();

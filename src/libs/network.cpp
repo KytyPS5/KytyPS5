@@ -1070,6 +1070,9 @@ static int ConvertSocketOptionLevel(int level) {
 
 static int ConvertSocketOptionName(int level, int option) {
 	if (level == 0xffff) {
+		// Guest SOL_SOCKET option IDs fit in 16 bits. SO_ONESBCAST is
+		// handled separately before translation; do not pass invalid IDs to Winsock.
+		if (option < 0 || option > 0xffff) return -1;
 		switch (option) {
 			case 0x0020: return SO_BROADCAST;
 			case 0x1001: return SO_SNDBUF;
@@ -2171,6 +2174,40 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 		return 0;
 	}
 
+#if defined(_WIN32)
+	if (level == 0xffff && optname == 0x10000) {
+		SocketLength size = static_cast<SocketLength>(*optlen);
+		if (::getsockopt(socket, SOL_SOCKET, SO_BROADCAST, static_cast<char*>(optval), &size) != 0)
+			return SetHostSocketError();
+		*optlen = static_cast<uint32_t>(size);
+		return 0;
+	}
+
+	// Guest timeouts are 32-bit microseconds, unlike Winsock's milliseconds.
+	if (level == 0xffff && optname == 0x1106) {
+		if (*optlen < sizeof(int32_t)) return SetGuestSocketError(Posix::POSIX_EINVAL);
+#if defined(_WIN32)
+		DWORD timeout {};
+#else
+		timeval timeout {};
+#endif
+		SocketLength size = sizeof(timeout);
+		if (::getsockopt(socket, SOL_SOCKET, optname == 0x1105 ? SO_SNDTIMEO : SO_RCVTIMEO,
+		                 reinterpret_cast<char*>(&timeout), &size) != 0) return SetHostSocketError();
+#if defined(_WIN32)
+		const int64_t microseconds = static_cast<int64_t>(timeout) * 1000;
+#else
+		const int64_t microseconds = static_cast<int64_t>(timeout.tv_sec) * 1000000 + timeout.tv_usec;
+#endif
+		const auto value = static_cast<int32_t>(std::min<int64_t>(microseconds, INT32_MAX));
+		std::memcpy(optval, &value, sizeof(value));
+		*optlen = sizeof(value);
+		return 0;
+	}
+
+	// Guest socket options: SOL_SOCKET=0xffff, SO_ERROR=0x1007.
+#else
+#endif
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
 	const bool send_timeout = (level == 0xffff && optname == 0x1105);
 	optname                = ConvertSocketOptionName(level, optname);
@@ -2257,6 +2294,32 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 
+#if defined(_WIN32)
+	if (level == 0xffff && optname == 0x1106) {
+		if (optlen != sizeof(int32_t)) return SetGuestSocketError(Posix::POSIX_EINVAL);
+		int32_t microseconds = 0;
+		std::memcpy(&microseconds, optval, sizeof(microseconds));
+		if (microseconds < 0) return SetGuestSocketError(Posix::POSIX_EINVAL);
+#if defined(_WIN32)
+		// Round up so a sub-millisecond timeout cannot become an infinite wait.
+		const DWORD timeout = (static_cast<uint64_t>(microseconds) + 999) / 1000;
+#else
+		const timeval timeout {microseconds / 1000000, microseconds % 1000000};
+#endif
+		if (::setsockopt(socket, SOL_SOCKET, optname == 0x1105 ? SO_SNDTIMEO : SO_RCVTIMEO,
+		                 reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0)
+			return SetHostSocketError();
+		return 0;
+	}
+
+	// SO_ONESBCAST requests the all-ones broadcast route. Native UDP uses
+	// that route for 255.255.255.255; it only needs broadcast permission.
+	if (level == 0xffff && optname == 0x10000) {
+		if (optlen != sizeof(int)) return SetGuestSocketError(Posix::POSIX_EINVAL);
+		return ::setsockopt(socket, SOL_SOCKET, SO_BROADCAST,
+		                    static_cast<const char*>(optval), optlen) != 0 ? SetHostSocketError() : 0;
+	}
+#else
 #if defined(__linux__)
 	if (level == 0xffff && optname == 0x10000) {
 		if (optlen != sizeof(int)) {
@@ -2267,6 +2330,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		// Native sends preserve 255.255.255.255 without changing broadcast permission.
 		return enabled != 0 ? 0 : SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
+#endif
 #endif
 
 	constexpr int ORBIS_SO_NBIO = 0x1200;

@@ -1266,6 +1266,15 @@ void CheckSocketWakeup() {
             Libs::Network::NET_ERROR_ENOPROTOOPT &&
             *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
         "Net unknown socket options return protocol-option errors");
+#if defined(_WIN32)
+  int socket_type = -1, reuse = -1;
+  uint32_t type_size = sizeof(socket_type), reuse_size = sizeof(reuse);
+  Check(net_getsockopt(datagram, 0xffff, 0x1008, &socket_type, &type_size) == 0 &&
+            socket_type == 2 &&
+            net_setsockopt(datagram, 0xffff, 0x0004, &enabled, sizeof(enabled)) == 0 &&
+            net_getsockopt(datagram, 0xffff, 0x0004, &reuse, &reuse_size) == 0 && reuse != 0,
+        "Net socket options with shared BSD numbers still reach Winsock");
+#endif
 #if defined(__linux__)
   Check(net_setsockopt(datagram, 0xffff, 0x1007, &timeout, option_size) ==
             Libs::Network::NET_ERROR_ENOPROTOOPT &&

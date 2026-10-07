@@ -1076,7 +1076,24 @@ static int ConvertSocketOptionName(int level, int option) {
 			case 0x1002: return SO_RCVBUF;
 			case 0x1007: return SO_ERROR;
 			case 0x1105: return SO_SNDTIMEO;
-			default: break;
+#if defined(_WIN32)
+			// Winsock numbers its remaining BSD socket-level options like the guest. It reports any
+			// other option as WSAEINVAL instead of WSAENOPROTOOPT, so keep those from the host.
+			case SO_DEBUG:
+			case SO_ACCEPTCONN:
+			case SO_REUSEADDR:
+			case SO_KEEPALIVE:
+			case SO_DONTROUTE:
+			case SO_USELOOPBACK:
+			case SO_LINGER:
+			case SO_OOBINLINE:
+			case SO_SNDLOWAT:
+			case SO_RCVLOWAT:
+			case SO_SNDTIMEO:
+			case SO_RCVTIMEO:
+			case SO_TYPE: return option;
+#endif
+			default: return -1;
 		}
 	} else if (level == 6 && option == 1) {
 		return TCP_NODELAY;

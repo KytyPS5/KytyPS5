@@ -1761,6 +1761,25 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 	prepared.table_visits = m_table_marked;
 }
 
+void RenderExecutor::FlushDeferredDispatchBarrier() {
+	m_dispatch_chained = false;
+	if (!m_deferred_barrier) {
+		return;
+	}
+	m_deferred_barrier = false;
+	ShaderAccessBarrier(m_context.GetCommandScheduler().Current().Handle(),
+	                    vk::PipelineStageFlagBits::eComputeShader);
+}
+
+void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync) {
+	m_guest_queue = queue;
+	if (m_deferred_barrier && dispatch_direct && !guest_sync && queue == m_deferred_barrier_queue) {
+		m_dispatch_chained = true;
+		return;
+	}
+	FlushDeferredDispatchBarrier();
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (!id) {
 		return;

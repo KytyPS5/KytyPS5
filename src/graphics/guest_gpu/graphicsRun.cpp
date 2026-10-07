@@ -209,6 +209,7 @@ void GuestGpu::RunUrgentCommands() {
 		return;
 	}
 	m_renderer.GetRenderExecutor().InvalidateRenderTargetMemo();
+	m_renderer.GetRenderExecutor().FlushDeferredDispatchBarrier();
 	// Unmaps free memory that copies of executed draws may still read.
 	if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
 		copies->Drain();
@@ -504,6 +505,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.submit_id     = m_submit_id;
 	operation.num_instances = m_num_instances;
 	operation.after_wait    = std::exchange(m_wait_since_operation, false);
+	operation.guest_sync    = std::exchange(m_acquire_since_operation, false) || operation.after_wait;
 	if (m_pipeline == nullptr) {
 		operation.state = {&m_ctx, &m_ucfg, &m_sh_ctx};
 	} else if (kind == GpuOperationKind::Callback) {
@@ -593,6 +595,9 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	m_renderer.NoteOperation(operation.submit_id, operation.after_wait);
 	auto& executor = m_renderer.GetRenderExecutor();
 	executor.UseContextId(operation.state.context_id);
+	executor.BeginGuestOperation(static_cast<uint32_t>(m_interrupt_event_id),
+	                             operation.kind == GpuOperationKind::DispatchDirect,
+	                             operation.guest_sync);
 	if (operation.after_wait) {
 		executor.InvalidateRenderTargetMemo();
 	}

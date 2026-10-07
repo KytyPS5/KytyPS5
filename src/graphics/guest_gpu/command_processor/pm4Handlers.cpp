@@ -435,6 +435,7 @@ KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
+	cp.NoteAcquireMem();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
 	// GCR_CNTL GL2_WB (bit 15) over the whole GL2 (GL2_RANGE, bits 11-12, zero) makes GPU writes

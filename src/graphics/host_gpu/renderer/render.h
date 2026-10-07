@@ -231,6 +231,12 @@ public:
 	// Execution thread: the context register snapshot of the operation about to execute (0 for
 	// live registers); operations with the same id see the same context registers.
 	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
+	// Execution thread: an operation of guest queue `queue` is about to execute. The barrier
+	// after a direct dispatch is deferred to the next operation, unless that is a direct dispatch
+	// of the same queue the guest did not order after it (see DispatchDirect()).
+	void BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync);
+	// Records the barrier a direct dispatch deferred, if any.
+	void FlushDeferredDispatchBarrier();
 	// Execution thread: an operation other than a draw is about to execute (see
 	// RenderTargetMemo).
 	void InvalidateRenderTargetMemo() noexcept;
@@ -625,6 +631,11 @@ private:
 	// index: their binding state is the operation's.
 	std::vector<uint64_t>                              m_bound_image_marks;
 	uint64_t                                           m_bound_image_stamp = 0;
+	// See BeginGuestOperation().
+	uint32_t                                           m_guest_queue             = 0;
+	bool                                               m_deferred_barrier        = false;
+	uint32_t                                           m_deferred_barrier_queue  = 0;
+	bool                                               m_dispatch_chained        = false;
 	// Reused by every draw; see AcquireDrawRenderState().
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};

@@ -239,6 +239,13 @@ private:
 	std::atomic<uint32_t> m_deferred_labels {0};
 	// A WAIT_REG_MEM was processed since the last operation was made.
 	bool m_wait_since_operation = false;
+	// An ACQUIRE_MEM since the last operation.
+	bool m_acquire_since_operation = true;
+
+public:
+	void NoteAcquireMem() noexcept { m_acquire_since_operation = true; }
+
+private:
 
 	// State of the execution side, on cache lines of its own.
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;

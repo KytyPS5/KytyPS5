@@ -95,6 +95,9 @@ struct GpuOperation {
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;
+	// The guest ordered the operation after the earlier work of its queue (ACQUIRE_MEM or
+	// WAIT_REG_MEM since the operation before).
+	bool guest_sync = true;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

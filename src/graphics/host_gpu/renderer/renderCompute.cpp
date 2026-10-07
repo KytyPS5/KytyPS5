@@ -446,7 +446,15 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const auto vk_buffer = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	if (HasStorageWrites(input_info, bindings, indirect_writes)) {
+	bool has_storage_writes = HasStorageWrites(input_info, bindings, indirect_writes);
+	// On the guest's GPU, dispatches of one queue overlap unless the guest orders them (a wait,
+	// a partial flush, an ACQUIRE_MEM; the operations other than dispatches record their own
+	// barriers). Without such an order since the previous direct dispatch of its queue, nothing
+	// was recorded after that one and its barrier is still deferred: the barrier before the
+	// earlier dispatch already ordered everything before it, so neither is needed and the two
+	// overlap. GTA V's ray tracing structure builds run hundreds of such dispatches per frame.
+	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
+	if (has_storage_writes && !chained) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -537,9 +545,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	m_context.GetOcclusionQueries().WriteForReaders();
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// The removed host fence also ordered read-only dispatches before later writers. Recorded
+	// before the next operation, unless that is a dispatch the guest did not order after this one.
+	m_deferred_barrier       = true;
+	m_deferred_barrier_queue = m_guest_queue;
 	ResetBindings();
 }
 
@@ -803,13 +812,27 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	if (HasStorageWrites(input_info, bindings, indirect_writes)) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// As DispatchDirect(): without a guest order since the previous dispatch of its queue, the barrier before that
+	// dispatch already ordered everything before it (the arguments included) and the two overlap on the guest's GPU.
+	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
+	if (!chained) {
+		if (HasStorageWrites(input_info, bindings, indirect_writes)) {
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                              vk::PipelineStageFlagBits::eComputeShader |
+		                              vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {},
+		                          1, &barrier, 0, nullptr, 0, nullptr);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	m_deferred_barrier       = true;
+	m_deferred_barrier_queue = m_guest_queue;
 	ResetBindings();
 }
 

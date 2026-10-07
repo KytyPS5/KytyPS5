@@ -857,6 +857,36 @@ void CheckAprPaths(const std::filesystem::path &root) {
             ids[0] == 0xffffffffu && ids[1] == expected_id && sizes[0] == 0 && sizes[1] == 3,
         "APR foreach reports a missing path and continues to the valid file");
 
+  // These paths share the old 31-bit FNV-1a ID (0x122d1544).
+  const char *collision_paths[] = {"perf-audit/test_00015ddf.bin",
+                                   "perf-audit/test_000389b8.bin"};
+  Check(std::filesystem::create_directory(root / "perf-audit"), "create APR collision directory");
+  for (size_t i = 0; i < 2; ++i) {
+    Check(fixture.Create(root / collision_paths[i]), "create APR collision fixture");
+    fixture.Write(i == 0 ? "APR" : "OTHER", i == 0 ? 3 : 5);
+    fixture.Close();
+  }
+  uint32_t collision_ids[2] = {};
+  Check(resolve("/app0/", collision_paths, 2, collision_ids, sizes, &error_index) == OK &&
+            collision_ids[0] != collision_ids[1] && collision_ids[0] != 0xffffffffu &&
+            collision_ids[1] != 0xffffffffu && sizes[0] == 3 && sizes[1] == 5,
+        "APR assigns distinct valid IDs to colliding paths");
+  const auto *stat_symbol = symbols.FindByNid("ApkYaHb8Sek", Loader::SymbolType::Func);
+  const auto *size_symbol = symbols.FindByNid("WvEu7yl3Ivg", Loader::SymbolType::Func);
+  Check(stat_symbol && size_symbol, "APR file metadata exports are registered");
+  using Stat = int (KYTY_SYSV_ABI *)(uint32_t, FileSystem::FileStat *);
+  using Size = int (KYTY_SYSV_ABI *)(uint32_t, uint64_t *);
+  for (size_t i = 0; i < 2; ++i) {
+    FileSystem::FileStat stat {};
+    uint64_t size = 0;
+    Check(resolve("/app0/", &collision_paths[i], 1, ids, nullptr, &error_index) == OK &&
+              ids[0] == collision_ids[i] &&
+              reinterpret_cast<Stat>(stat_symbol->vaddr)(ids[0], &stat) == OK &&
+              reinterpret_cast<Size>(size_symbol->vaddr)(ids[0], &size) == OK &&
+              stat.st_size == static_cast<int64_t>(sizes[i]) && size == sizes[i],
+          "APR re-resolution preserves each file's ID, host path and cached size");
+  }
+
   // PATH_MAX includes NUL; all components remain below NAME_MAX (255).
   std::string longest = "/app0/";
   for (int i = 0; i < 3; ++i) {
@@ -880,7 +910,7 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
-  CheckAmprOrdering(symbols, expected_id);
+  CheckAmprOrdering(symbols, collision_ids[0]);
   FileSystem::Umount("/app0");
 }
 

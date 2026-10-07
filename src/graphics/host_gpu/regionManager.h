@@ -60,7 +60,9 @@ private:
 		return GetCurrentThreadId();
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
-		return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+		static thread_local const uint32_t tid =
+		    static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+		return tid;
 #elif defined(__linux__)
 		static thread_local const uint32_t tid = static_cast<uint32_t>(::syscall(SYS_gettid));
 		return tid;

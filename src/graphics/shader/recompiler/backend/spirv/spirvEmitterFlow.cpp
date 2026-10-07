@@ -699,7 +699,36 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.other_half == nullptr) return ctx.Arg(inst, 0);
+	if (ctx.other_half == nullptr) {
+		const auto kind = inst.Flags<CFG::BranchCondition>();
+		const bool zero =
+		    kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero;
+		const bool nonzero =
+		    kind == CFG::BranchCondition::ExecNonZero || kind == CFG::BranchCondition::VccNonZero;
+		if (!zero && !nonzero) return ctx.Arg(inst, 0);
+		// A vector-mask branch is one decision for the whole wave, including lanes whose EXEC
+		// bit is clear; "all lanes" is "no active invocation disagrees".
+		auto& state     = ctx.state;
+		auto  predicate = ctx.Arg(inst, 0);
+		if (zero) {
+			const auto negated = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), negated, predicate);
+			predicate = negated;
+		}
+		const auto ballot   = state.builder.AllocateId();
+		const auto low      = state.builder.AllocateId();
+		const auto high     = state.builder.AllocateId();
+		const auto combined = state.builder.AllocateId();
+		const auto result   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+		                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+		state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), combined, low, high);
+		state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result,
+		                          combined, ConstantU32(state, 0u));
+		return result;
+	}
 	// A native scalar branch makes one decision for both emulated wave halves.
 	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();

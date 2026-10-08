@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <bit>
 #include <functional>
+#include <map>
 #include <optional>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -465,31 +467,54 @@ bool EmitSharedBoundedBufferMemory(ValueEmitContext& ctx, const IR::Inst& inst,
 	state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexingEXT);
 	const auto merge = state.builder.AllocateId();
 	const auto invalid = state.builder.AllocateId();
-	std::vector<uint32_t> labels;
+	// Retain every valid selector literal, but share a block for each semantic
+	// class. Native indices are an affine remap within a class; byte offsets
+	// and bounds still come from the selected resource's renderer-published data.
+	using MetadataKey = std::tuple<uint32_t, uint32_t, bool, bool>;
+	struct MetadataClass { uint32_t label = 0; uint32_t resource = 0; uint32_t count = 0; };
+	std::map<MetadataKey, MetadataClass> classes;
 	std::vector<uint32_t> words {OpSwitch, selected, invalid};
 	std::array<std::vector<uint32_t>, 5> phis;
 	for (size_t i = 0; i < phis.size(); ++i)
 		phis[i] = {OpPhi, i == 4u ? TypeBool(state) : TypeU32(state), state.builder.AllocateId()};
 	for (const auto resource: table.resources) {
-		labels.push_back(state.builder.AllocateId());
-		words.insert(words.end(), {resource, labels.back()});
+		const auto native = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, resource);
+		const auto& descriptor = state.program.info.buffers[resource];
+		const MetadataKey key {native - resource, descriptor.packed_stride,
+		                       descriptor.zero_stride_oob, compatible(resource)};
+		auto [found, inserted] = classes.try_emplace(key);
+		if (inserted) found->second = {state.builder.AllocateId(), resource, 0u};
+		++found->second.count;
+		words.insert(words.end(), {resource, found->second.label});
 	}
 	state.builder.AddFunction({OpSelectionMerge, merge, SelectionControlNone});
 	state.builder.AddFunction(words);
 	EmitLabel(state, invalid);
 	state.builder.AddFunction({OpUnreachable});
-	for (size_t i = 0; i < table.resources.size(); ++i) {
-		EmitLabel(state, labels[i]);
-		const auto resource = table.resources[i];
-		const auto native = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, resource);
-		const std::array values {ConstantU32(state, native),
-		                        ConstantU32(state, state.program.info.buffers[resource].packed_stride),
-		                        state.memory_byte_offsets[native],
-		                        state.program.info.buffers[resource].zero_stride_oob
-		                            ? ConstantU32(state, 0u) : state.memory_byte_limits[native],
-		                        ConstantBool(state, compatible(resource))};
+	for (const auto& [key, metadata]: classes) {
+		EmitLabel(state, metadata.label);
+		const auto [delta, stride, zero_oob, shared] = key;
+		std::array<uint32_t, 5> values;
+		if (metadata.count == 1u) {
+			const auto native = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, metadata.resource);
+			values = {ConstantU32(state, native), ConstantU32(state, stride), state.memory_byte_offsets[native],
+			          zero_oob ? ConstantU32(state, 0u) : state.memory_byte_limits[native], ConstantBool(state, shared)};
+		} else {
+			const auto native = delta == 0u ? selected : EmitAddU32(state, selected, ConstantU32(state, delta));
+			const auto offset_word_index = EmitAddU32(state,
+			    EmitBinaryU32(state, OpShiftRightLogical, native, ConstantU32(state, 2u)),
+			    ConstantU32(state, state.program.bindings.memory_offset_dword));
+			const auto offset_word = EmitShaderDataDwordLoadDynamic(state, offset_word_index);
+			const auto offset_shift = EmitBinaryU32(state, OpShiftLeftLogical,
+			    EmitBinaryU32(state, OpBitwiseAnd, native, ConstantU32(state, 3u)), ConstantU32(state, 3u));
+			const auto offset = EmitBinaryU32(state, OpBitwiseAnd,
+			    EmitBinaryU32(state, OpShiftRightLogical, offset_word, offset_shift), ConstantU32(state, 0xffu));
+			const auto limit = zero_oob ? ConstantU32(state, 0u) : EmitShaderDataDwordLoadDynamic(state,
+			    EmitAddU32(state, native, ConstantU32(state, state.program.bindings.memory_limit_dword)));
+			values = {native, ConstantU32(state, stride), offset, limit, ConstantBool(state, shared)};
+		}
 		for (size_t field = 0; field < phis.size(); ++field)
-			phis[field].insert(phis[field].end(), {values[field], labels[i]});
+			phis[field].insert(phis[field].end(), {values[field], state.current_label});
 		state.builder.AddFunction({OpBranch, merge});
 	}
 	EmitLabel(state, merge);

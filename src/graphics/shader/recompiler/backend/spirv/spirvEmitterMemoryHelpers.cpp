@@ -2,6 +2,27 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+uint32_t EmitShaderDataDwordLoadDynamic(EmitterState& state, uint32_t index) {
+	if (state.program.bindings.UsesPushData()) {
+		index = EmitAddU32(state, index, ConstantU32(state, state.program.bindings.push_data_start_dword));
+		const auto pointer = state.builder.AllocateId();
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0), index);
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	}
+	if (state.shader_data_storage_variable != 0) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.shader_data_storage_variable, ConstantU32(state, 0), index);
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	}
+	return ConstantU32(state, 0);
+}
+
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	if (state.program.bindings.UsesPushData()) {
 		dword_index += state.program.bindings.push_data_start_dword;

@@ -33666,6 +33666,61 @@ TestCase SharedBoundedBufferByteAccess(bool formatted = false, u32 rows = 515u,
   return test;
 }
 
+// Unique record bounds retain every descriptor; only three stride classes exist.
+// The independent byte oracle also covers a signed formatted fallback and stores.
+TestCase CompactBoundedBufferMetadata(bool formatted=false) {
+  constexpr u32 rows=63u, table_base=16384u;
+  auto test=SharedBoundedBufferByteAccess(formatted,rows);
+  test.name=formatted?"CompactBoundedFormattedMetadata":"CompactBoundedRawMetadata";
+  std::vector<u32> bounded_code;
+  for(const auto word:test.code){
+    if(word==EncodeVop1(0x02,20,Vgpr(4))){
+      bounded_code.push_back(EncodeVop2(0x1b,4,255,4));
+      bounded_code.push_back(63u);
+    }
+    bounded_code.push_back(word);
+  }
+  test.code=std::move(bounded_code);
+  test.opcodes.push_back(ShaderOpcode::V_AND_B32);
+  for(u32 index=32u;index<48u;++index)
+    test.initial[index]=0x80abcdefu ^ (index*0x13579bdfu);
+  for(u32 row=0;row<rows;++row){
+    test.initial[table_base/4u+row*4u+1u]=(4u*(row%3u+1u))<<16u;
+    test.initial[table_base/4u+row*4u+2u]=row==rows-1u?2u:row+4u;
+  }
+  test.expected=test.initial;
+  const std::array<u32,4> keys{0u,rows/2u,rows-1u,rows};
+  for(u32 step=0;step<4u;++step){
+    const u32 row=keys[step],records=row==rows-1u?2u:row+4u;
+    for(u32 lane=0;lane<4u;++lane){
+      u32 value=0u;
+      if(row<rows && lane<records){
+        const u32 index=32u+row%4u+(row%3u+1u)*lane;
+        value=(test.initial[index]>>8u)&255u;
+        if(formatted && row==rows-1u && value>=128u)value|=0xffffff00u;
+      }
+      test.expected[step*4u+lane]=value;
+    }
+    if(step==2u)for(u32 lane=0;lane<2u;++lane){
+      auto& word=test.expected[32u+row%4u+(row%3u+1u)*lane];
+      word=(word&~0xff00u)|(((700u+lane)&255u)<<8u);
+    }
+  }
+  return test;
+}
+
+void CheckCompactBoundedBufferMetadata() {
+  ShaderRecompiler::ShaderHostProfile profile{};
+  profile.known=true;profile.storage_buffer_nonuniform_indexing=true;
+  const auto shader=CompileCase(CompactBoundedBufferMetadata(),{},profile);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);std::string text;
+  Require("CompactBoundedMetadata","disassembly",tools.Disassemble(shader.spirv,&text),"disassembly failed");
+  const auto labels=CountText(text,"OpLabel");
+  std::fprintf(stderr,"compact metadata labels=%zu words=%zu\n",labels,shader.spirv.size());
+  Require("CompactBoundedMetadata","metadata CFG budget",labels<256u,
+          "descriptor rows expanded metadata control flow beyond semantic class budget");
+}
+
 TestCase BoundedBufferScalarLoopStore(u32 count, bool sparse) {
   using O = ShaderOpcode;
   TestCase test;
@@ -49417,6 +49472,21 @@ if (argc == 1) {
     test.fragment_code[test.fragment_code.size()-3u]=EncodeExp0(0u,1u);
     (void)CompileFragmentCase(test);
     return 1;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compact-bounded-metadata-only") == 0) {
+    CheckCompactBoundedBufferMetadata();return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compact-bounded-metadata-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan,CompactBoundedBufferMetadata());
+    RunCase(&vulkan,CompactBoundedBufferMetadata(true));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shared-bounded-metadata-neighbors-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan,SharedBoundedBufferByteAccess());
+    RunCase(&vulkan,SharedBoundedBufferByteAccess(false,515u,true));
+    RunCase(&vulkan,SharedBoundedBufferByteAccess(true));return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-bounded-readonly-spirv-only") == 0) {
     const auto shader=CompileFragmentCase(PixelBoundedFormattedLoop(3u));

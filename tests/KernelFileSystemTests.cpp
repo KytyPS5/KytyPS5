@@ -1691,6 +1691,21 @@ void CheckSocketWakeup() {
         "closed descriptor fails without clearing input fd_set");
 }
 
+void CheckSocketShutdown() {
+  namespace Net = Libs::Network::Net;
+  auto *error = Libs::Posix::GetErrorAddr();
+  const auto [reader, writer] = CreateTcpPair();
+  const int unconnected = Net::Socket(2, 1, 0);
+  Check(unconnected >= 0 && Net::Shutdown(unconnected, 2) == -1 &&
+            *error == Libs::Posix::POSIX_ENOTCONN,
+        "Net shutdown reports an unconnected socket");
+  Check(Net::Shutdown(writer, 1) == 0 && Net::Shutdown(reader, 2) == 0,
+        "Net shutdown accepts connected sockets");
+  Check(Net::SocketClose(unconnected) == 0 && Net::SocketClose(reader) == 0 &&
+            Net::SocketClose(writer) == 0,
+        "close shutdown fixtures");
+}
+
 } // namespace
 
 int main(int, char**) {
@@ -1732,6 +1747,7 @@ int main(int, char**) {
   FileSystem::Shutdown();
   CheckSocketWakeup();
   CheckEtherAddressFormatting();
+  CheckSocketShutdown();
   TestNpWebApi2Memory();
   TestNpCommerceDialog();
   graphics.reset();

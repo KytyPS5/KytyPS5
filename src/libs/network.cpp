@@ -2098,12 +2098,13 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 	if (how == SD_RECEIVE || how == SD_BOTH) {
 		transport->receive_shutdown.store(true, std::memory_order_relaxed);
 	}
+#else
+	if (::shutdown(socket, how) != 0) {
+		return SetHostSocketError();
+	}
+#endif
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {

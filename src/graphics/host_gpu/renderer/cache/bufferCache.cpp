@@ -535,7 +535,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	if (is_gds) {
 		if (vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - vaddr) {
-			EXIT("BufferCache: GDS fill range is out of bounds\n");
+		EXIT("BufferCache: GDS fill range is out of bounds, vaddr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " gds_size=0x%016" PRIx64 "\n",
+		     vaddr, size, m_gds_buffer.Size());
 		}
 		m_gds_buffer.Fill(vaddr, size, value);
 		return;

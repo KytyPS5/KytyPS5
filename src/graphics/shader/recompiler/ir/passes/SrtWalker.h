@@ -57,6 +57,7 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	uint64_t                        m_cycle_count = 0;
 	ResourcePlan::EvaluationContext& m_context;
 };
 

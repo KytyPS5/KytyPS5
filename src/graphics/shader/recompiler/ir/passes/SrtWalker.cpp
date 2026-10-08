@@ -7,7 +7,9 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -179,12 +181,21 @@ private:
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
+		// Uniform checks depend on the active EXEC mask; reuse a success under the same mask.
+		// Without this, shared subexpressions are revalidated once per path (exponential).
+		if (require_uniform) {
+			if (const auto it = m_validated_uniform.find(inst); it != m_validated_uniform.end() &&
+			    std::find(it->second.begin(), it->second.end(), m_active_mask) != it->second.end()) {
+				return true;
+			}
+		}
 		if (!m_visiting.insert(inst).second) {
 			return !require_uniform;
 		}
 		const auto finish = [&](bool valid) {
 			m_visiting.erase(inst);
 			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			if (valid && require_uniform) m_validated_uniform[inst].push_back(m_active_mask);
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -318,6 +329,7 @@ private:
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
+	std::unordered_map<const Inst*, std::vector<Value>> m_validated_uniform;
 };
 
 
@@ -346,7 +358,7 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& p
 		program.evaluation_contexts.emplace_back();
 	}
 	auto& context = program.evaluation_contexts[program.evaluation_depth++];
-	context.generation += 2;
+	context.generation += 4;
 	return context;
 }
 
@@ -387,17 +399,24 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		result = m_context.values[index].value;
 		return true;
 	}
-	// The low generation bit marks an instruction that is still being evaluated.
+	// The low bits distinguish in-progress and failed evaluations in this session.
 	if (m_context.values[index].generation == (m_context.generation | 1u)) {
+		++m_cycle_count;
+		return false;
+	}
+	if (m_context.values[index].generation == (m_context.generation | 2u)) {
 		return false;
 	}
 	m_context.values[index].generation = m_context.generation | 1u;
 	uint64_t out = 0;
+	const auto cycles_before = m_cycle_count;
 	const bool evaluated = EvaluateInst(*inst, out);
 	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
-		memo.generation = 0;
+		// Cyclic dependencies may become evaluable after another node completes.
+		// Only retain failures independent of an in-progress evaluation.
+		memo.generation = cycles_before == m_cycle_count ? m_context.generation | 2u : 0;
 		return false;
 	}
 	memo.value      = out;

@@ -712,6 +712,42 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Unwind the faulting host stack and print module+offset per frame.
+		if (info->native_context != nullptr) {
+			CONTEXT ctx = *static_cast<const CONTEXT*>(info->native_context);
+			std::printf("host backtrace:\n");
+			for (int frame = 0; frame < 48 && ctx.Rip != 0; frame++) {
+				HMODULE module = nullptr;
+				char    module_name[MAX_PATH] = "?";
+				if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                       reinterpret_cast<LPCSTR>(ctx.Rip), &module) &&
+				    module != nullptr) {
+					GetModuleFileNameA(module, module_name, MAX_PATH);
+				}
+				const char* short_name = std::strrchr(module_name, '\\');
+				short_name             = short_name != nullptr ? short_name + 1 : module_name;
+				std::printf("  #%02d %016" PRIx64 " %s+0x%" PRIx64 "\n", frame, ctx.Rip, short_name,
+				            module != nullptr ? ctx.Rip - reinterpret_cast<uint64_t>(module) : 0);
+				DWORD64 image_base = 0;
+				auto*   entry      = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+				if (entry == nullptr) {
+					// Leaf function: return address is at [rsp].
+					if (!IsReadableRange(ctx.Rsp, sizeof(uint64_t))) {
+						break;
+					}
+					ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+					ctx.Rsp += 8;
+					continue;
+				}
+				void*   handler_data     = nullptr;
+				DWORD64 establisher_frame = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data,
+				                 &establisher_frame, nullptr);
+			}
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64

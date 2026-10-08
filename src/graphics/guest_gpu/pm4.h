@@ -836,6 +836,8 @@ constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_0                   = 0xB2;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_3                   = 0xB5;
 constexpr uint32_t SPI_SHADER_PGM_LO_ES                           = 0xC8;
 constexpr uint32_t SPI_SHADER_PGM_HI_ES                           = 0xC9;
+constexpr uint32_t SPI_SHADER_PGM_RSRC1_ES                        = 0xCA;
+constexpr uint32_t SPI_SHADER_PGM_RSRC2_ES                        = 0xCB;
 // Private AGC registers used by shader binaries submitted through SET_SH_REG_INDIRECT.
 constexpr uint32_t SPI_SHADER_PGM_CHKSUM_HS                       = 0x100;
 constexpr uint32_t SPI_SHADER_PGM_RSRC4_HS                        = 0x101;
@@ -883,6 +885,8 @@ constexpr uint32_t SPI_SHADER_USER_ACCUM_LSHS_0                   = 0x132;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_LSHS_3                   = 0x135;
 constexpr uint32_t SPI_SHADER_PGM_LO_LS                           = 0x148;
 constexpr uint32_t SPI_SHADER_PGM_HI_LS                           = 0x149;
+constexpr uint32_t SPI_SHADER_PGM_RSRC1_LS                        = 0x14A;
+constexpr uint32_t SPI_SHADER_PGM_RSRC2_LS                        = 0x14B;
 constexpr uint32_t COMPUTE_START_X                                = 0x204;
 constexpr uint32_t COMPUTE_START_Y                                = 0x205;
 constexpr uint32_t COMPUTE_START_Z                                = 0x206;

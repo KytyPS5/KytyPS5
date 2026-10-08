@@ -1138,7 +1138,7 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		cp.GetShCtxForWrite(cmd_offset + i).SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
@@ -1441,7 +1441,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	if (cp.PeekGuest(reinterpret_cast<const volatile uint32_t*>(addr)) == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1475,7 +1475,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(cp.PeekGuest(compare_addr), reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -1975,6 +1975,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// Read the requested register bytes, rather than faulting on a GPU-owned page.
+	// The helper downloads actual overlapping GPU writes before exposing backing memory.
+	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
+	                                          backing_registers.data(),
+	                                          backing_registers.size() * sizeof(uint32_t))) {
+		indirect_buffer = backing_registers.data();
+		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+		if (!reported.test_and_set(std::memory_order_relaxed)) {
+			std::printf("NHL26MENU: indirect register backing read active\n");
+			std::fflush(stdout);
+		}
+	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2047,6 +2060,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
+	// Read the requested register bytes, rather than faulting on a GPU-owned page.
+	// The helper downloads actual overlapping GPU writes before exposing backing memory.
+	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
+	                                          backing_registers.data(),
+	                                          backing_registers.size() * sizeof(uint32_t))) {
+		indirect_buffer = backing_registers.data();
+		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+		if (!reported.test_and_set(std::memory_order_relaxed)) {
+			std::printf("NHL26MENU: indirect register backing read active\n");
+			std::fflush(stdout);
+		}
+	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2107,6 +2133,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	}
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
+	}
+	// Read the requested register bytes, rather than faulting on a GPU-owned page.
+	// The helper downloads actual overlapping GPU writes before exposing backing memory.
+	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
+	                                          backing_registers.data(),
+	                                          backing_registers.size() * sizeof(uint32_t))) {
+		indirect_buffer = backing_registers.data();
+		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+		if (!reported.test_and_set(std::memory_order_relaxed)) {
+			std::printf("NHL26MENU: indirect UC register backing read active\n");
+			std::fflush(stdout);
+		}
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -3599,7 +3638,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
 			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
-			    cp.GetShCtx().SetGsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.GetShCtxForWrite(cmd_offset).SetGsUserSgpr(sgpr, value, cp.GetUserDataMarker());
 			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] =
@@ -3731,6 +3770,17 @@ void GraphicsInitJmpTablesShIndirect() {
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
 		cp.GetShCtx().SetLsShaderBase(base);
 	};
+
+	// RDNA merges LS into HS and ES into GS; the merged stages run with the HS/GS RSRC registers,
+	// so the legacy LS/ES resource registers carry no state. Accept and ignore writes to them.
+	for (const auto legacy: {Pm4::SPI_SHADER_PGM_RSRC1_LS, Pm4::SPI_SHADER_PGM_RSRC2_LS,
+	                         Pm4::SPI_SHADER_PGM_RSRC1_ES, Pm4::SPI_SHADER_PGM_RSRC2_ES}) {
+		g_hw_sh_indirect_func[legacy] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			(void)cp;
+			(void)cmd_offset;
+			(void)value;
+		};
+	}
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().es_regs.data_addr;

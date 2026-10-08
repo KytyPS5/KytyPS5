@@ -16,6 +16,23 @@
 
 namespace Libs::Graphics {
 
+struct GraphicContext;
+
+// NHL26 debugging: GPU breadcrumbs (VK_AMD_buffer_marker). BreadcrumbBegin writes the command's
+// id at top-of-pipe before it, BreadcrumbEnd writes it at bottom-of-pipe after it; on a device
+// loss the ids between the two markers are the commands that never finished.
+//
+// The same hooks also drive the KYTY_PERF_GPU_TIMING=1 per-draw/dispatch GPU timing profiler
+// (timestamp queries, summarised every few seconds as NHL27GPU lines). The returned handle packs the
+// breadcrumb id and the timing slot; pass it unchanged to BreadcrumbEnd.
+uint64_t BreadcrumbBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
+                         uint64_t hash_a, uint64_t hash_b, uint64_t info = 0);
+void     BreadcrumbEnd(GraphicContext& graphics, vk::CommandBuffer cmd, uint64_t id);
+// Reads back finished GPU timing samples without waiting; called after every queue submit.
+void     GpuTimingPoll();
+// Prints breadcrumbs and VK_EXT_device_fault info; call when any Vulkan call reports device loss.
+void     ReportDeviceLost(GraphicContext& graphics);
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);

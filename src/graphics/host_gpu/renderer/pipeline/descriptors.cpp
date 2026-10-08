@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdio>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -379,6 +380,14 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
+	// Depth-compare samples need a depth view even for a null slot; sampling an R32F color
+	// view with a comparison is invalid and hangs AMD GPUs (NHL 26 shadow-map arrays).
+	if (resource.depth_compare && binding == TextureCache::BindingType::Texture &&
+	    resource.numeric_class == Prospero::TextureNumericClass::Float) {
+		desc.info.pixel_format = vk::Format::eD32Sfloat;
+		desc.view_info.format  = vk::Format::eD32Sfloat;
+		desc.view_info.aspect  = vk::ImageAspectFlagBits::eDepth;
+	}
 	desc.type                 = binding;
 	return desc;
 }
@@ -547,6 +556,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	if (resource.r128) {
+		// R128 image instructions fetch only dwords 0-3; whatever follows in memory is ignored.
+		descriptor.fields[4] = descriptor.fields[5] = descriptor.fields[6] = descriptor.fields[7] = 0;
+	}
 	const bool storage = resource.written;
 	if (storage) {
 		ValidateStorageImageResource(resource);
@@ -711,6 +724,21 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
 	} else if (storage) {
+		// Block-compressed images whose format has no storage support on this device (e.g.
+		// BC6H on AMD) are created without STORAGE usage; a storage view on them is invalid and
+		// hangs the GPU. Drop the guest's writes into a null storage image instead.
+		if (image->backing.image != nullptr &&
+		    !(image->backing.usage & vk::ImageUsageFlagBits::eStorage)) {
+			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+			if (!warned.test_and_set(std::memory_order_relaxed)) {
+				std::printf("Warning: dropping storage writes to %s image without storage usage\n",
+				            vk::to_string(image->info.pixel_format).c_str());
+				std::fflush(stdout);
+			}
+			auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Storage);
+			const auto null_id   = texture_cache.FindImage(null_desc);
+			return {null_id, nullptr, std::move(null_desc)};
+		}
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
@@ -866,6 +894,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != layout.memory_offset_count);
 
+	m_context.GetBufferCache().SetWriterTag(
+	    program.stage == ShaderType::Compute ? "cs-storage" : "gfx-storage", program.shader_hash);
 	prepared.buffers.clear();
 	prepared.buffers.reserve(layout.memory_offset_count);
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());

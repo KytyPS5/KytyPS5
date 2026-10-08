@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -105,6 +106,16 @@
 #endif
 
 namespace Libs::Graphics {
+struct CommandProcessorTestAccess {
+  static void Pending(CommandProcessor& cp, NativeIndirectDraw source) {
+    cp.m_pending_instances.push_back(std::move(source));
+  }
+  static uint32_t Instances(CommandProcessor& cp) { return cp.ResolveNumInstances(); }
+  static void PendingShader(CommandProcessor& cp, NativeIndirectDraw source) {
+    cp.m_pending_shader_offsets.push_back(std::move(source));
+  }
+};
+
 
 template <typename Cache>
 concept HasGetDownloadBuffer =
@@ -3948,6 +3959,120 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckInlineLabelWrites() {
+    constexpr const char *name = "InlineLabelWrites";
+    constexpr uintptr_t base = 0x0000000200900000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint32_t pattern = 0xaabbccddu;
+    constexpr uint32_t label32 = 0x12345678u;
+    constexpr uint64_t label64 = 0x1020304050607080ull;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "allocation", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+        &direct_offset) == 0, "label allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, direct_offset, size) == 0 &&
+        mapped == reinterpret_cast<void *>(base), "label mapping failed");
+    std::memset(mapped, 0, size);
+    context.MapMemory(base, size);
+    Libs::LibKernel::Memory::InstallGpuResources(&context);
+    auto &cache = context.GetBufferCache();
+    auto allocation = cache.ObtainBuffer(base, 0x1000, true, false);
+    allocation.first->Fill(allocation.second, 0x1000, pattern);
+    const auto tick = scheduler.CurrentTick();
+    Require(name, "label writes", cache.TryWriteLabel(base + 4, &label32, 4) &&
+        cache.TryWriteLabel(base + 8, &label64, 8), "cached label write rejected");
+    uint32_t cpu32 = 0, untouched = 99;
+    uint64_t cpu64 = 0;
+    Require(name, "immediate backing", Libs::LibKernel::Memory::TryReadBacking(
+        base + 4, &cpu32, 4) && Libs::LibKernel::Memory::TryReadBacking(
+        base + 8, &cpu64, 8) && Libs::LibKernel::Memory::TryReadBacking(
+        base, &untouched, 4) && cpu32 == label32 && cpu64 == label64 && untouched == 0,
+        "labels were not published or unrelated GPU data was downloaded");
+    Require(name, "no submission", scheduler.CurrentTick() == tick &&
+        cache.HasGpuDirtyBytes(base, 4), "label write submitted or lost neighboring GPU ownership");
+    uint64_t host_label = 0;
+    Require(name, "fallback", !cache.TryWriteLabel(
+        reinterpret_cast<uint64_t>(&host_label), &label64, 8) && host_label == 0 &&
+        !cache.TryWriteLabel(base + 1, &label32, 4), "unsupported label destination accepted");
+    cache.ReadMemory(base, 0x1000);
+    Require(name, "GPU coherence", Libs::LibKernel::Memory::TryReadBacking(base, &untouched, 4) &&
+        Libs::LibKernel::Memory::TryReadBacking(base + 4, &cpu32, 4) &&
+        Libs::LibKernel::Memory::TryReadBacking(base + 8, &cpu64, 8) &&
+        untouched == pattern && cpu32 == label32 && cpu64 == label64,
+        "later download lost the labels or neighboring GPU writes");
+    // A clean register list shares a page with a separately GPU-written word.
+    const std::array<uint32_t, 2> register_pair{Pm4::DB_DEPTH_CONTROL, 0x4070078du};
+    Require(name, "register initialization", cache.TryWriteLabel(
+        base + 0x100, register_pair.data(), sizeof(register_pair)), "register initialization failed");
+    auto neighbor = cache.ObtainBuffer(base, 4, true, false);
+    neighbor.first->Fill(neighbor.second, 4, pattern);
+    GraphicsInitJmpTables();
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      const auto address = base + 0x100;
+      const std::array<uint32_t, 5> packet{
+          KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG_INDIRECT, Pm4::R_ZERO),
+          static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+          0x80000000u, 1u};
+      const auto before = scheduler.CurrentTick();
+      Pm4Execution execution;
+      Require(name, "clean indirect register read",
+          processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
+          processor.GetCtx().GetDepthControl().stencil_enable &&
+          processor.GetCtx().GetDepthControl().z_write_enable &&
+          scheduler.CurrentTick() == before && cache.HasGpuDirtyBytes(base, 4),
+          "indirect register read waited for neighboring GPU data or decoded stale values");
+      const std::array<uint32_t, 2> uc_pair{Pm4::VGT_OBJECT_ID, 0x11223344u};
+      Require(name, "UC initialization", cache.TryWriteLabel(base + 0x200,
+          uc_pair.data(), sizeof(uc_pair)), "UC register initialization failed");
+      const auto uc_address = base + 0x200;
+      const std::array<uint32_t, 5> uc_packet{
+          KYTY_PM4(5, Pm4::IT_SET_UCONFIG_REG_INDIRECT, Pm4::R_ZERO),
+          static_cast<uint32_t>(uc_address), static_cast<uint32_t>(uc_address >> 32u),
+          0x80000000u, 1u};
+      const auto uc_tick = scheduler.CurrentTick();
+      Pm4Execution uc_execution;
+      Require(name, "clean indirect UC read",
+          processor.Process(uc_execution, uc_packet) == Pm4ProcessResult::Complete &&
+          processor.GetUcfg().GetObjectId() == uc_pair[1] &&
+          scheduler.CurrentTick() == uc_tick && cache.HasGpuDirtyBytes(base, 4),
+          "UC register read waited for unrelated GPU data or decoded stale data");
+      auto changed_uc = cache.ObtainBuffer(uc_address + 4, 4, true, false);
+      changed_uc.first->Fill(changed_uc.second, 4, 0);
+      Pm4Execution changed_uc_execution;
+      Require(name, "GPU-written UC register",
+          processor.Process(changed_uc_execution, uc_packet) == Pm4ProcessResult::Complete &&
+          processor.GetUcfg().GetObjectId() == 0,
+          "UC backing read ignored overlapping GPU writes");
+      // Updating the register pair on the GPU must still synchronize before decoding.
+      auto changed = cache.ObtainBuffer(address + 4, 4, true, false);
+      changed.first->Fill(changed.second, 4, 0);
+      Pm4Execution changed_execution;
+      Require(name, "GPU-written indirect registers",
+          processor.Process(changed_execution, packet) == Pm4ProcessResult::Complete &&
+          !processor.GetCtx().GetDepthControl().stencil_enable &&
+          !processor.GetCtx().GetDepthControl().z_write_enable,
+          "direct register backing read ignored overlapping GPU writes");
+    });
+    scheduler.Finish();
+    context.UnmapMemory(base, size);
+    Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+        "label unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+        direct_offset, size) == 0, "label release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -40596,6 +40721,148 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4WaitPackets");
 }
 
+void CheckNativeDrawShaderOffsets() {
+  for (const bool indexed : {false, true}) {
+    std::vector<u32> code {
+      EncodeVop1(0x01, 0, 10), EncodeVop1(0x01, 1, 11), EncodeVop1(0x01, 2, 12),
+      EncodeVop1(0x01, 3, InlineU32(1)), EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3)};
+    AppendEnd(&code);
+    std::array<u32, 5> user_data {0, 0, 0, 0, 0};
+    ShaderVertexInputInfo vertex;
+    vertex.native_draw = {.registers = {10, 11, 12}, .indexed = indexed};
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Vertex;
+    options.user_data_base = 8;
+    options.user_data = user_data;
+    options.input_info.vertex = &vertex;
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime {.user_data = user_data};
+    Require("NativeShaderOffsets", "resources", ShaderRecompiler::IR::MaterializeResources(
+        plan, runtime, resources, specialization), "could not materialize simple vertex resources");
+    auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    ValidateSpirv("NativeShaderOffsets", compiled.spirv);
+    Require("NativeShaderOffsets", "runtime parameters",
+        compiled.program.info.native_draw && compiled.program.bindings.native_draw_dword != ShaderRecompiler::IR::PushData::NoStart,
+        "per-draw parameter storage was missing");
+  }
+  std::printf("[host]    %-32s ok\n", "NativeShaderOffsets");
+}
+
+void CheckNativeIndexedPreparation(RenderContext& renderer) {
+  GraphicsInitJmpTables();
+  auto& scheduler = renderer.GetCommandScheduler();
+  HW::Context registers;
+  HW::UserConfig user_config;
+  HW::Shader shaders;
+  scheduler.Begin(registers, user_config, shaders);
+  CommandProcessor processor(renderer, 0);
+  NativeIndirectDraw source {.max_count = 2, .stride = 32, .indexed = true,
+      .index_count_limit = 5,
+      .shader_regs = {Pm4::SPI_SHADER_USER_DATA_GS_0 + 5, Pm4::SPI_SHADER_USER_DATA_GS_0 + 6, Pm4::SPI_SHADER_USER_DATA_GS_0 + 7},
+      .shader_marker = static_cast<uint32_t>(HW::UserSgprType::Region)};
+  source.snapshot = std::make_shared<Buffer>(renderer.GetGraphics(), scheduler, MemoryUsage::Download,
+      0, AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, source.ArgsSize() + 4);
+  std::array<uint32_t, 14> data {};
+  data[0] = 99; data[1] = 11; data[2] = 2; data[3] = static_cast<uint32_t>(-17); data[4] = 43;
+  data[8] = 12; data[9] = 23; data[10] = 7; data[11] = static_cast<uint32_t>(-99); data[12] = 88;
+  data[13] = 3;
+  scheduler.Current().Handle().updateBuffer(source.snapshot->Handle(), 0, sizeof(data), data.data());
+  NativeIndirectPrep prep(renderer.GetGraphics());
+  prep.Record(scheduler.Current(), source);
+  vk::MemoryBarrier ready {};
+  ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+  ready.dstAccessMask = vk::AccessFlagBits::eHostRead;
+  scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+      vk::PipelineStageFlagBits::eHost, {}, 1, &ready, 0, nullptr, 0, nullptr);
+  CommandProcessorTestAccess::Pending(processor, source);
+  CommandProcessorTestAccess::PendingShader(processor, source);
+  Require("NativeIndexedPrep", "indexed instance count", CommandProcessorTestAccess::Instances(processor) == 23,
+      "indexed stride/count clamp corrupted instance state");
+  source.snapshot->Invalidate(0, source.snapshot->Size());
+  std::array<uint32_t, 14> result {};
+  std::memcpy(result.data(), source.snapshot->Mapped().data(), sizeof(result));
+  Require("NativeIndexedPrep", "GPU index-count clamp",
+      result[0] == 5 && result[8] == 5 && result[3] == data[3] && result[11] == data[11] && result[13] == 3,
+      "GPU preparation changed offset/count bytes or missed indexed clamping");
+  processor.SetUserDataMarker(HW::UserSgprType::Vsharp);
+  const auto& gs = processor.GetShCtx().GetVs().gs_user_sgpr;
+  Require("NativeIndexedPrep", "deferred shader offsets",
+      gs.value[5] == static_cast<uint32_t>(-99) && gs.value[6] == 88 && gs.value[7] == 7 && gs.type[5] == HW::UserSgprType::Region &&
+      processor.GetUserDataMarker() == HW::UserSgprType::Vsharp,
+      "deferred register writes lost signed offsets, first index, first instance, or provenance");
+  source.shader_regs.fill(Pm4::SPI_SHADER_USER_DATA_GS_0 + 5);
+  CommandProcessorTestAccess::PendingShader(processor, source);
+  Require("NativeIndexedPrep", "aliased destinations",
+      processor.GetShCtx().GetVs().gs_user_sgpr.value[5] == 7, "last CP field did not win for aliased registers");
+  NativeIndirectDraw empty = source;
+  empty.snapshot = std::make_shared<Buffer>(renderer.GetGraphics(), scheduler, MemoryUsage::Download, 0, AllFlags, empty.ArgsSize() + 4);
+  std::array<uint32_t, 14> zero {};
+  scheduler.Current().Handle().updateBuffer(empty.snapshot->Handle(), 0, sizeof(zero), zero.data());
+  CommandProcessorTestAccess::PendingShader(processor, source);
+  CommandProcessorTestAccess::PendingShader(processor, empty);
+  Require("NativeIndexedPrep", "empty draw preserves shader state",
+      processor.GetShCtx().GetVs().gs_user_sgpr.value[5] == 7, "empty draw overwrote a prior shader offset");
+  source.shader_regs = {Pm4::SPI_SHADER_USER_DATA_GS_0 + 5, Pm4::SPI_SHADER_USER_DATA_GS_0 + 6, Pm4::SPI_SHADER_USER_DATA_GS_0 + 7};
+  scheduler.Current().Handle().updateBuffer(source.snapshot->Handle(), 0, sizeof(data), data.data());
+  CommandProcessorTestAccess::PendingShader(processor, source);
+  const auto tick = scheduler.CurrentTick();
+  for (uint32_t slot = 5; slot <= 7; ++slot) {
+    processor.GetShCtxForWrite(Pm4::SPI_SHADER_USER_DATA_GS_0 + slot).SetGsUserSgpr(slot, 100 + slot, HW::UserSgprType::Unknown);
+  }
+  const auto& overwritten = processor.GetShCtx().GetVs().gs_user_sgpr;
+  Require("NativeIndexedPrep", "explicit writes cancel pending offsets without a drain",
+      overwritten.value[5] == 105 && overwritten.value[6] == 106 && overwritten.value[7] == 107 && scheduler.CurrentTick() == tick,
+      "pending offsets overwrote explicit writes or forced a GPU drain");
+  scheduler.Finish();
+  std::printf("[gpu]     %-32s ok\n", "NativeIndexedPrep");
+}
+
+void CheckNativeIndirectInstanceSnapshots(RenderContext& renderer) {
+  auto& scheduler = renderer.GetCommandScheduler();
+  HW::Context registers;
+  HW::UserConfig user_config;
+  HW::Shader shaders;
+  scheduler.Begin(registers, user_config, shaders);
+  CommandProcessor processor(renderer, 0);
+  processor.SetNumInstances(7);
+  const auto append = [&](uint32_t count, uint32_t first, uint32_t last) {
+    NativeIndirectDraw source {.max_count = 2, .stride = 32};
+    source.snapshot = std::make_shared<Buffer>(renderer.GetGraphics(), scheduler,
+        MemoryUsage::Download, 0, AllFlags, source.ArgsSize() + 4);
+    // Padded argument records and a GPU count larger than max exercise clamping/stride.
+    std::array<uint32_t, 13> data {};
+    data[0] = 3; data[1] = first;
+    data[8] = 6; data[9] = last;
+    data[12] = count;
+    scheduler.Current().Handle().updateBuffer(source.snapshot->Handle(), 0,
+                                              sizeof(data), data.data());
+    vk::MemoryBarrier barrier {};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    scheduler.DeferOperation([snapshot = source.snapshot] {});
+    CommandProcessorTestAccess::Pending(processor, std::move(source));
+  };
+  append(3, 11, 23);
+  append(0, 99, 99);
+  Require("NativeIndirectInstances", "zero count preserves prior source",
+      CommandProcessorTestAccess::Instances(processor) == 23,
+      "empty packet lost prior count, stride or maximum clamp");
+  append(1, 31, 71);
+  Require("NativeIndirectInstances", "first record",
+      CommandProcessorTestAccess::Instances(processor) == 31, "wrong single-record instance count");
+  append(2, 91, 92);
+  processor.SetNumInstances(5);
+  Require("NativeIndirectInstances", "explicit count overrides pending GPU state",
+      CommandProcessorTestAccess::Instances(processor) == 5, "pending state overrode SET_NUM_INSTANCES");
+  scheduler.Finish();
+  std::printf("[gpu]     %-32s ok\n", "NativeIndirectInstances");
+}
+
 void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -41685,6 +41952,18 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuTilerCpuParity();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-register-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4IndirectShaderRegisters(vulkan.RuntimeRenderer());
+    CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+    CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--inline-label-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckInlineLabelWrites();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
@@ -41830,6 +42109,13 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--native-indirect-state-only") == 0) {
+    VulkanHarness vulkan;
+    CheckNativeDrawShaderOffsets();
+    CheckNativeIndirectInstanceSnapshots(vulkan.RuntimeRenderer());
+    CheckNativeIndexedPreparation(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-draw-multi-only") == 0) {

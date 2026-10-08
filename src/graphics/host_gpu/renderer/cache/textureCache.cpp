@@ -18,8 +18,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -684,16 +686,45 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
 	// PPSA04264
+	// PPSA26785: the HTile of the depth source does not matter here, since CopyD16 reads the
+	// already-resolved Vulkan depth aspect.
+	const bool raw_d16_candidate = binding == BindingType::Texture && cached.info.IsDepth() &&
+	                               requested.pixel_format == vk::Format::eR16Uint;
 	const bool raw_d16_texture =
-	    binding == BindingType::Texture && cached.info.IsDepth() &&
-	    cached.info.guest_format == Prospero::BufferFormat::k16UNorm &&
-	    requested.guest_format == Prospero::BufferFormat::k16UInt &&
-	    requested.pixel_format == vk::Format::eR16Uint && cached.backing.samples == 1 &&
-	    requested.samples == 1 && requested.data == cached.info.data &&
-	    requested.extent == cached.info.extent && requested.resources == cached.info.resources &&
-	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
-	    !cached.info.HasMetadata();
+	    raw_d16_candidate && cached.info.guest_format == Prospero::BufferFormat::k16UNorm &&
+	    requested.guest_format == Prospero::BufferFormat::k16UInt && cached.backing.samples == 1 &&
+	    requested.samples == 1 && requested.data.address == cached.info.data.address &&
+	    requested.data.size <= cached.info.data.size && requested.extent == cached.info.extent &&
+	    requested.resources == cached.info.resources && requested.type == cached.info.type &&
+	    requested.pitch == cached.info.pitch && !requested.HasStencil() &&
+	    !cached.info.HasStencil() && !requested.HasMetadata() &&
+	    (cached.info.metadata.kind == ImageMetadataKind::None ||
+	     cached.info.metadata.kind == ImageMetadataKind::Htile);
+	if (raw_d16_candidate && !raw_d16_texture) {
+		static std::atomic<int> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("NHL26DBG: raw D16 texture rejected: guest_fmt=%u/%u backing=%d samples=%u/%u "
+			            "addr=0x%llx/0x%llx size=0x%llx/0x%llx extent=%ux%ux%u/%ux%ux%u "
+			            "res=%u,%u/%u,%u type=%d/%d pitch=%u/%u stencil=%d/%d meta=%d/%d\n",
+			            static_cast<uint32_t>(cached.info.guest_format),
+			            static_cast<uint32_t>(requested.guest_format),
+			            static_cast<int>(cached.backing.format),
+			            static_cast<uint32_t>(cached.backing.samples), requested.samples,
+			            static_cast<unsigned long long>(cached.info.data.address),
+			            static_cast<unsigned long long>(requested.data.address),
+			            static_cast<unsigned long long>(cached.info.data.size),
+			            static_cast<unsigned long long>(requested.data.size),
+			            cached.info.extent.width, cached.info.extent.height, cached.info.extent.depth,
+			            requested.extent.width, requested.extent.height, requested.extent.depth,
+			            cached.info.resources.levels, cached.info.resources.layers,
+			            requested.resources.levels, requested.resources.layers,
+			            static_cast<int>(cached.info.type), static_cast<int>(requested.type),
+			            cached.info.pitch, requested.pitch, cached.info.HasStencil(),
+			            requested.HasStencil(), static_cast<int>(cached.info.metadata.kind),
+			            static_cast<int>(requested.metadata.kind));
+			std::fflush(stdout);
+		}
+	}
 	// PPSA04264, PPSA04288
 	// A partial view retains the entire matching array layout. HTile belongs to
 	// the depth source, independently of the data slices copied into color storage.
@@ -1164,16 +1195,35 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
-	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
-	}
+	// Only the selected slices are inspected below. Synchronize actual dirty bytes in that
+	// interval, rather than other layers or unrelated GPU-owned bytes on tracked pages.
 	const auto slice_size = range.size / layers;
+	const auto selected_address = range.address + slice_size * first;
+	const auto selected_size = slice_size * count;
+	// KYTY_PERF_NO_SYNC_READBACK: when the GPU wrote these slices with a uniform dword fill that
+	// the buffer cache recorded, the clear code is known without draining the GPU queue. The
+	// fill is dropped by any later write, download or invalidation of the range.
+	uint32_t shadow_value = 0;
+	const bool shadowed = selected_size != 0 && desc.type != BindingType::VideoOut &&
+	                      BufferCache::PerfNoSyncReadback() &&
+	                      m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
+	                      m_buffer_cache.TryGetGpuFill(selected_address, selected_size, shadow_value);
+	if (shadowed) {
+		BufferCache::PerfCount(BufferCache::PerfEvent::ColorClearShadowHit);
+	}
+	// This may submit; never hold the texture lock across the readback.
+	if (!shadowed && selected_size != 0 &&
+	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size)) {
+		m_buffer_cache.ReadMemory(selected_address, selected_size, false,
+		                          BufferCache::ReadCaller::ColorClear);
+	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+		if (shadowed) {
+			// Slices are 4 KiB aligned, so the first byte is the fill's low byte.
+			code = static_cast<uint8_t>(shadow_value >> (((address - selected_address) & 3u) * 8u));
+		} else if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
@@ -1181,11 +1231,19 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			continue;
+		if (shadowed) {
+			// A repeated dword is one repeated byte only when all four of its bytes agree.
+			if (shadow_value != static_cast<uint32_t>(code) * 0x01010101u) {
+				continue;
+			}
+		} else {
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read color metadata slice\n");
+			}
+			if (!std::all_of(bytes.begin(), bytes.end(),
+			                 [code](uint8_t byte) { return byte == code; })) {
+				continue;
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1197,6 +1255,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			if (shadowed) {
+				// The expanded keys below replace the GPU's fill, so there is nothing to download.
+				m_buffer_cache.DiscardGpuModified(address, slice_size);
+			}
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
@@ -1280,9 +1342,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
+		// A color render target can alias a depth buffer's stencil plane (games write stencil via an
+		// R8 color target). Stencil association records have no native image, so never hand one
+		// out as a color target; a separate color image is created for that memory instead.
+		const auto skip_candidate = [&](ImageId id) {
+			return desc.type == BindingType::RenderTarget && m_slot_images[id].depth_id;
+		};
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
+			if (!skip_candidate(id) && SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
 		}
@@ -1291,6 +1359,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		int32_t view_layer = -1;
 		if (!result) {
 			for (const auto candidate: candidates) {
+				if (skip_candidate(candidate)) {
+					continue;
+				}
 				view_mip                = -1;
 				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;

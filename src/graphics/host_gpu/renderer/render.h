@@ -11,6 +11,7 @@
 
 #include <array>
 #include <optional>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -33,6 +34,7 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class NativeIndirectPrep;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -63,6 +65,29 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+};
+
+class Buffer;
+
+// Frozen argument bytes also retain the NUM_INSTANCES value for later inherited draws.
+struct NativeIndirectDraw {
+	uint64_t args_addr = 0;
+	uint64_t count_addr = 0;
+	uint32_t max_count = 0;
+	uint32_t stride = 0;
+	bool indexed = false;
+	uint64_t index_base = 0;
+	uint32_t index_count_limit = 0;
+	uint32_t index_type = 0;
+	std::array<uint32_t, 3> shader_regs {0x280, 0x280, 0x280};
+	uint32_t shader_marker = 0;
+	[[nodiscard]] uint32_t RecordSize() const {
+		return indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+	}
+	std::shared_ptr<Buffer> snapshot;
+	[[nodiscard]] uint64_t ArgsSize() const {
+		return static_cast<uint64_t>(max_count - 1u) * stride + RecordSize();
+	}
 };
 
 struct DrawAutoArgs {
@@ -148,6 +173,7 @@ private:
 	HW::Shader*         m_shaders     = nullptr;
 
 	friend class CommandScheduler;
+class NativeIndirectPrep;
 };
 
 class RenderExecutor {
@@ -171,6 +197,7 @@ public:
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	bool DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer, NativeIndirectDraw& source);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -211,6 +238,7 @@ private:
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
+	std::shared_ptr<NativeIndirectPrep> m_native_indirect_prep;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;

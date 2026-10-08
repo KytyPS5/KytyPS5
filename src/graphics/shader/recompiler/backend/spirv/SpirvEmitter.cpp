@@ -90,11 +90,14 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 	const auto user_data_dwords = program.bindings.user_data_registers.size();
 	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+	const bool has_native_draw = program.bindings.native_draw_dword != IR::PushData::NoStart;
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
-	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
+	    has_native_draw != program.info.native_draw ||
+	    (has_native_draw && (program.stage != ShaderType::Vertex || program.bindings.native_draw_dword != user_data_dwords)) ||
+	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) + (has_native_draw ? 3u : 0u) ||
 	    program.bindings.memory_offset_count != buffers.size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),

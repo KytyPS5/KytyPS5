@@ -2,6 +2,8 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -20,6 +22,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <span>
@@ -62,6 +66,11 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
 	const auto  predecessors = block != nullptr ? block->predecessors.size() : 0u;
 	const auto  successors   = block != nullptr ? block->successors.size() : 0u;
+	std::printf("NHL27CFG: dispatcher fallback hash=0x%016" PRIx64 " stage=%s blocks=%" PRIu64
+	            " reason=%s phase=%s failure_block=%" PRIu32 "\n",
+	            options.shader_hash, StageName(options.stage), static_cast<uint64_t>(cfg.blocks.size()),
+	            cfg.unsupported_reason.c_str(), phase, cfg.failure_block);
+	std::fflush(stdout);
 	LOGF("%s CFG dispatcher fallback: stage=%s hash=0x%016" PRIx64
 	     " phase=%s failure=%s block=%" PRIu32 " pc=0x%08" PRIx32 "..0x%08" PRIx32 " preds=%" PRIu64
 	     " succs=%" PRIu64 " blocks=%" PRIu64 " loops=%" PRIu64 " back_edges=%" PRIu64
@@ -71,6 +80,46 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
+}
+
+// NHL debugging: report a CFG build failure with the shader hash, the original binary and a decoded
+// listing around the failing pc. Returns true when KYTY_DBG_SKIP_BAD_SHADERS asks to skip the shader.
+bool ReportCfgBuildFailure(std::span<const uint32_t> binary, const CompileOptions& options,
+                           const Decoder::Program& decoded, const CFG::Graph& cfg) {
+	std::printf("NHL26DBG: CFG failure shader_hash=0x%016" PRIx64 " stage=%s reason=%s\n",
+	            options.shader_hash, StageName(options.stage), cfg.unsupported_reason.c_str());
+	const auto path =
+	    Config::GetShaderLogFolder() / fmt::format("cfgfail_{:016x}.bin", options.shader_hash);
+	Common::File::CreateDirectories(path.parent_path());
+	Common::File file(path);
+	if (file.IsInvalid()) {
+		std::printf("NHL26DBG: CFG failure: can't create dump file\n");
+	} else {
+		file.Write(binary.data(), binary.size_bytes());
+		const auto path_text = Common::PathToString(path);
+		std::printf("NHL26DBG: CFG failure: wrote %" PRIu64 " bytes to %s\n",
+		            static_cast<uint64_t>(binary.size_bytes()), path_text.c_str());
+	}
+	const auto& insts = decoded.instructions;
+	const auto  fail  = std::find_if(insts.begin(), insts.end(), [&](const Decoder::Instruction& inst) {
+        return inst.pc == cfg.failure_pc;
+    });
+	if (fail == insts.end()) {
+		std::printf("NHL26DBG: CFG failure: failing pc 0x%08" PRIx32 " is not an instruction\n",
+		            cfg.failure_pc);
+	} else {
+		const auto index = static_cast<size_t>(fail - insts.begin());
+		const auto first = index > 40u ? index - 40u : 0u;
+		const auto last  = std::min(insts.size(), index + 11u);
+		std::printf("NHL26DBG: CFG failure listing (failing pc 0x%08" PRIx32 "):\n", cfg.failure_pc);
+		for (auto i = first; i < last; i++) {
+			std::printf("NHL26DBG: %s %s\n", i == index ? ">>" : "  ",
+			            Decoder::InstructionToString(insts[i]).c_str());
+		}
+	}
+	std::fflush(stdout);
+	const char* skip = std::getenv("KYTY_DBG_SKIP_BAD_SHADERS");
+	return skip != nullptr && skip[0] == '1';
 }
 
 enum class EmbeddedFetchValueType {
@@ -533,6 +582,16 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
+	if (native_cfg.unsupported) {
+		// NHL debugging: BuildGraph only leaves unsupported set for hard build failures.
+		if (!ReportCfgBuildFailure(joined_code.empty() ? code : std::span<const uint32_t>(joined_code),
+		                           options, decoded, native_cfg)) {
+			EXIT("shader CFG build failed: %s", native_cfg.unsupported_reason.c_str());
+		}
+		TranslateResult failed;
+		failed.build_failed = true;
+		return failed;
+	}
 	CFG::Graph structured_cfg;
 	auto* selected_cfg = &native_cfg;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64

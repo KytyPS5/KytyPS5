@@ -19,14 +19,16 @@ enum class BranchCondition {
 	ExecNonZero,
 	ScalarInstruction,
 	Expression,
+	// Scalar selector (indirect_selector_code) equals compare_value; a lowered jump-table compare.
+	SelectorEq,
 	Unknown
 };
 
 struct ConditionExpression {
-	enum class Op { Constant, Variable, Native, Not, Or };
+	enum class Op { Constant, Variable, Native, Not, Or, SelectorEq };
 	Op       op;
 	uint32_t lhs;
-	uint32_t rhs = UINT32_MAX;
+	uint32_t rhs = UINT32_MAX; // SelectorEq: lhs = scalar code, rhs = compared constant
 };
 
 enum class TerminatorKind { Branch, ConditionalBranch, IndirectBranch, Return, Unsupported };
@@ -55,6 +57,7 @@ struct Terminator {
 	std::vector<uint32_t> indirect_targets;
 	std::vector<uint32_t> indirect_selector_values;
 	std::vector<uint32_t> indirect_selector_targets;
+	uint32_t              compare_value = 0;
 	uint32_t              expression    = UINT32_MAX;
 	bool                  loop_header   = false;
 };
@@ -103,6 +106,8 @@ struct Graph {
 	bool                                    unsupported   = false;
 	FailureKind                             failure_kind  = FailureKind::None;
 	uint32_t                                failure_block = UINT32_MAX;
+	// NHL debugging: guest pc of the instruction that failed the build, or UINT32_MAX.
+	uint32_t                                failure_pc    = UINT32_MAX;
 	std::string                             unsupported_reason;
 
 	const BasicBlock* FindBlock(uint32_t id) const;
@@ -112,6 +117,8 @@ struct Graph {
 	bool              Dominates(uint32_t dominator, uint32_t block) const;
 };
 
+// Build failures are reported through graph.unsupported (with failure_pc when known); the caller
+// decides whether they are fatal.
 Graph       BuildGraph(const Decoder::Program& program);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.

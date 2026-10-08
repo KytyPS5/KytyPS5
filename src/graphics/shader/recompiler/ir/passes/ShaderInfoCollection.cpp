@@ -424,6 +424,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	ValidateValueReferences(program, input_info);
 
 	auto& next = program.info;
+	next.native_draw = program.stage == ShaderType::Vertex && input_info.vertex->native_draw.Enabled();
 	next.inputs.clear();
 	next.outputs.clear();
 	next.has_bitwise_xor =

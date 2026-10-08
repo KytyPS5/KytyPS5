@@ -23,8 +23,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -110,9 +112,27 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// NHL26 debugging: KYTY_DBG_DUMP_SHADERS=<hex>[,<hex>...] dumps just those shaders.
+static bool ForceDumpShader(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		if (const char* v = std::getenv("KYTY_DBG_DUMP_SHADERS"); v != nullptr) {
+			for (const char* p = v; *p != '\0';) {
+				char*      end   = nullptr;
+				const auto value = std::strtoull(p, &end, 16);
+				if (end == p) break;
+				list.push_back(value);
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return list;
+	}();
+	return std::find(hashes.begin(), hashes.end(), shader_hash) != hashes.end();
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() && !ForceDumpShader(shader_hash)) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -130,7 +150,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() && !ForceDumpShader(shader_hash)) {
 		return;
 	}
 	EXIT_IF(code.empty());
@@ -292,6 +312,18 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		// NHL debugging: shaders whose CFG build failed under KYTY_DBG_SKIP_BAD_SHADERS=1.
+		if (!failed_shaders.empty()) {
+			if (const auto failed = failed_shaders.find(params.hash); failed != failed_shaders.end()) {
+				if (failed->second++ < 4u) {
+					std::printf("NHL26DBG: skipping use of shader 0x%016" PRIx64
+					            " (CFG build failed)\n", params.hash);
+					std::fflush(stdout);
+				}
+				return {};
+			}
+		}
+
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -307,7 +339,20 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
+		const auto native_plan_safe = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+				if (input_info.native_draw.Enabled()) {
+					for (const auto& value: plan.value_storage) {
+						if (value.GetOpcode() != ShaderRecompiler::IR::ValueOpcode::GetUserData) continue;
+						const auto reg = ShaderRecompiler::IR::RegIndex(value.Arg(0).ScalarRegister());
+						if (std::ranges::find(input_info.native_draw.registers, reg) != input_info.native_draw.registers.end()) return false;
+					}
+				}
+			}
+			return true;
+		};
 		if (entry != programs.end()) {
+			if (!native_plan_safe(entry->second.resource_plan)) return {};
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
@@ -369,9 +414,15 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (translated.build_failed) {
+			// NHL debugging: KYTY_DBG_SKIP_BAD_SHADERS=1 turned the CFG failure into a skipped draw.
+			failed_shaders.emplace(params.hash, 0u);
+			return {};
+		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			if (!native_plan_safe(entry->second.resource_plan)) return {};
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
@@ -414,6 +465,8 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+	// NHL debugging: shader hash -> number of skip warnings printed.
+	std::unordered_map<uint64_t, uint32_t>                      failed_shaders;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -454,7 +507,8 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
+	const char* allow_dirty = std::getenv("KYTY_PIPELINE_CACHE_DIRTY");
+	if (git_hash.ends_with("-dirty") && !(allow_dirty != nullptr && allow_dirty[0] == '1')) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
@@ -525,6 +579,24 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+void PipelineCache::AutoSave() {
+	if (m_driver_cache == nullptr) {
+		return;
+	}
+	m_unsaved_pipelines++;
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (m_last_save_ms == 0) {
+		m_last_save_ms = now;
+	}
+	if (now - m_last_save_ms >= 30000) {
+		Save();
+		m_unsaved_pipelines = 0;
+		m_last_save_ms      = now;
+	}
+}
+
 void PipelineCache::Save() {
 	if (m_driver_cache == nullptr) {
 		return;
@@ -587,7 +659,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, const NativeDrawShaderInfo& native_draw) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -595,6 +667,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
+	if (vertex_info[0].logical_stage == ShaderType::Vertex) vertex_info[0].native_draw = native_draw;
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
@@ -669,13 +742,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	bool              build_failed = false;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		build_failed |= !result.pixel;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		build_failed |= !result.vertex[i];
 	}
-	return result;
+	// NHL debugging: an empty vertex[0] tells the draw path to skip the draw.
+	return build_failed ? GraphicsPrograms {} : result;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -887,6 +964,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	AutoSave();
 
 	return *iter->second;
 }
@@ -915,6 +993,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	AutoSave();
 
 	return *iter->second;
 }

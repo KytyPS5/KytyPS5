@@ -71,7 +71,8 @@ public:
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
-	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	HW::Shader&     GetShCtx() { ResolveNativeShaderRegisters(); return m_sh_ctx; }
+	HW::Shader& GetShCtxForWrite(uint32_t location) { CancelNativeShaderRegister(location); return m_sh_ctx; }
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);
@@ -126,6 +127,17 @@ public:
 	void WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num);
 	void DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num);
 
+	// KYTY_PERF_NO_SYNC_READBACK: reads guest memory the CP polls or branches on without faulting
+	// into a page download when the exact bytes are not GPU-dirty (they are current in the backing).
+	[[nodiscard]] bool TryPeekGuest(const volatile void* addr, void* out, uint64_t size);
+	template <typename T>
+	[[nodiscard]] T PeekGuest(const volatile T* addr) {
+		T value {};
+		if (!TryPeekGuest(addr, &value, sizeof(T))) {
+			value = *addr;
+		}
+		return value;
+	}
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
@@ -172,6 +184,12 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	friend struct CommandProcessorTestAccess;
+	uint32_t ResolveNumInstances();
+	std::vector<NativeIndirectDraw> m_pending_instances;
+	void ResolveNativeShaderRegisters();
+	void CancelNativeShaderRegister(uint32_t location);
+	std::vector<NativeIndirectDraw> m_pending_shader_offsets;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

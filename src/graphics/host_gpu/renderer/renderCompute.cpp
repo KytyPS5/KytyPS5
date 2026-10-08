@@ -30,6 +30,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -298,6 +299,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program) {
+		// NHL debugging: the shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the dispatch.
+		ResetBindings();
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -312,6 +318,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                 thread_group_z, mode))) {
 		ResetBindings();
 		return;
+	}
+
+	// KYTY_PERF_NO_SYNC_READBACK: a proven uniform dword fill that still executes (e.g. a DCC or
+	// CMASK clear) is remembered so color-clear decoding need not read the metadata back.
+	uint64_t known_fill_address = 0;
+	uint64_t known_fill_size    = 0;
+	uint32_t known_fill_value   = 0;
+	if (BufferCache::PerfNoSyncReadback() && resources.specialization_reads.empty()) {
+		ShaderBufferResource fill_descriptor;
+		if (ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z,
+		                             mode, fill_descriptor, known_fill_value, known_fill_size)) {
+			known_fill_address = fill_descriptor.Base48();
+		}
 	}
 
 	if (use_thread_dimensions) {
@@ -429,11 +448,54 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	// NHL26 debugging: KYTY_DBG_SKIP_CS=<hex hash>[,<hex hash>...] skips those compute shaders.
+	static const std::vector<uint64_t> skip_cs = [] {
+		std::vector<uint64_t> list;
+		const char*           v = std::getenv("KYTY_DBG_SKIP_CS");
+		while (v != nullptr && *v != '\0') {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(v, &end, 16);
+			if (end == v) {
+				break;
+			}
+			list.push_back(hash);
+			v = (*end == ',') ? end + 1 : end;
+		}
+		return list;
+	}();
+	if (const auto skip = std::find(skip_cs.begin(), skip_cs.end(), program.shader_hash);
+	    skip != skip_cs.end()) {
+		// Dispatch holds the context mutex; give each skipped shader its own log budget.
+		static std::vector<uint32_t> skipped(skip_cs.size(), 0);
+		if (skipped[static_cast<size_t>(skip - skip_cs.begin())]++ < 8) {
+			std::printf("NHL26GDSCS: skipping CS 0x%016llx groups=%ux%ux%u "
+			            "threads=%ux%ux%u wave=%u host_subgroup=%u lds_dwords=%u\n",
+			            static_cast<unsigned long long>(program.shader_hash),
+			            thread_group_x, thread_group_y, thread_group_z,
+			            input_info.threads_num[0], input_info.threads_num[1],
+			            input_info.threads_num[2], program.wave_size,
+			            input_info.host_subgroup_size, input_info.lds_size_dwords);
+			std::fflush(stdout);
+		}
+		ResetBindings();
+		return;
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch",
+	                                   program.shader_hash,
+	                                   (static_cast<uint64_t>(thread_group_x) << 40u) |
+	                                       (static_cast<uint64_t>(thread_group_y) << 20u) |
+	                                       thread_group_z);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (known_fill_size != 0) {
+		// Recorded after the bindings marked the range GPU-written, which clears older records.
+		m_context.GetBufferCache().RecordGpuFill(known_fill_address, known_fill_size,
+		                                         known_fill_value);
+	}
 	ResetBindings();
 }
 
@@ -453,6 +515,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (!compute_program) {
+		// NHL debugging: the shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the dispatch.
+		ResetBindings();
+		return;
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
@@ -491,7 +558,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch-indirect",
+	                                   program.shader_hash, args_addr);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

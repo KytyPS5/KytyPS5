@@ -14,9 +14,15 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,7 +33,195 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+bool EnvFlag(const char* name) {
+	const char* setting = std::getenv(name);
+	return setting != nullptr && setting[0] == '1';
+}
+
+// KYTY_PERF_STATS=1: count synchronous GPU->CPU readbacks (ReadMemory -> DownloadBufferMemory).
+constexpr size_t PerfBuckets = 4; // color clear, fault, invalidate (CPU write), other
+struct PerfStats {
+	std::atomic<uint64_t> waits[PerfBuckets] {};
+	std::atomic<uint64_t> wait_ns[PerfBuckets] {};
+	std::atomic<uint64_t> events[2] {};
+	std::atomic<uint32_t> pm4_op {0};
+	// Only touched from the GPU thread.
+	uint64_t                              last_waits[PerfBuckets] {};
+	uint64_t                              last_wait_ns[PerfBuckets] {};
+	uint64_t                              last_events[2] {};
+	std::chrono::steady_clock::time_point last_print {};
+};
+PerfStats g_perf;
+
+// Per-4KiB-page statistics of fault-triggered downloads; GPU thread only, reset every print.
+struct FaultPageStat {
+	uint64_t    count       = 0;
+	uint64_t    bytes       = 0;
+	uint64_t    exact       = 0; // faulting byte itself was GPU-dirty
+	uint64_t    tid         = 0;
+	bool        gpu_thread  = false;
+	const char* writer      = "?";
+	uint64_t    writer_hash = 0;
+	double      ms          = 0;
+	uint32_t    pm4_op      = 0; // PM4 opcode being processed when the GPU thread itself faulted
+};
+std::unordered_map<uint64_t, FaultPageStat> g_fault_pages;
+
+bool PerfStatsEnabled() {
+	static const bool enabled = EnvFlag("KYTY_PERF_STATS");
+	return enabled;
+}
+
 } // namespace
+
+bool BufferCache::PerfNoSyncReadback() {
+	static const bool enabled = EnvFlag("KYTY_PERF_NO_SYNC_READBACK");
+	return enabled;
+}
+
+void BufferCache::PerfSetPm4Op(uint32_t opcode) {
+	if (PerfStatsEnabled()) {
+		g_perf.pm4_op.store(opcode, std::memory_order_relaxed);
+	}
+}
+
+void BufferCache::PerfCount(PerfEvent event) {
+	if (PerfStatsEnabled()) {
+		g_perf.events[static_cast<size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void BufferCache::PerfMaybePrint() {
+	if (!PerfStatsEnabled()) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (g_perf.last_print == std::chrono::steady_clock::time_point {}) {
+		g_perf.last_print = now;
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - g_perf.last_print).count();
+	if (seconds < 5.0) {
+		return;
+	}
+	g_perf.last_print = now;
+	uint64_t waits[PerfBuckets] {};
+	double   ms[PerfBuckets] {};
+	uint64_t total_waits = 0;
+	double   total_ms    = 0;
+	for (size_t i = 0; i < PerfBuckets; ++i) {
+		const auto count_now = g_perf.waits[i].load(std::memory_order_relaxed);
+		const auto ns_now    = g_perf.wait_ns[i].load(std::memory_order_relaxed);
+		waits[i]             = count_now - g_perf.last_waits[i];
+		ms[i]                = static_cast<double>(ns_now - g_perf.last_wait_ns[i]) / 1e6;
+		g_perf.last_waits[i]   = count_now;
+		g_perf.last_wait_ns[i] = ns_now;
+		total_waits += waits[i];
+		total_ms += ms[i];
+	}
+	uint64_t events[2] {};
+	for (size_t i = 0; i < 2; ++i) {
+		const auto now_count = g_perf.events[i].load(std::memory_order_relaxed);
+		events[i]            = now_count - g_perf.last_events[i];
+		g_perf.last_events[i] = now_count;
+	}
+	std::printf("NHL27PERF: %.1fs sync_waits=%llu wait_ms=%.1f | color_clear=%llu (%.1f ms) "
+	            "fault=%llu (%.1f ms) invalidate=%llu (%.1f ms) other=%llu (%.1f ms) | "
+	            "avoided: color_clear_shadow=%llu wait_reg_mem_backing=%llu | no_sync=%d\n",
+	            seconds, static_cast<unsigned long long>(total_waits), total_ms,
+	            static_cast<unsigned long long>(waits[0]), ms[0],
+	            static_cast<unsigned long long>(waits[1]), ms[1],
+	            static_cast<unsigned long long>(waits[2]), ms[2],
+	            static_cast<unsigned long long>(waits[3]), ms[3],
+	            static_cast<unsigned long long>(events[0]),
+	            static_cast<unsigned long long>(events[1]), PerfNoSyncReadback() ? 1 : 0);
+	std::vector<std::pair<uint64_t, FaultPageStat>> pages(g_fault_pages.begin(), g_fault_pages.end());
+	std::sort(pages.begin(), pages.end(),
+	          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+	for (size_t i = 0; i < pages.size() && i < 8; ++i) {
+		const auto& [page, stat] = pages[i];
+		std::printf("NHL27PERF: fault page=0x%llx count=%llu bytes=%llu exact=%llu ms=%.1f "
+		            "thread=%s tid=%llu pm4_op=0x%x writer=%s hash=%016llx\n",
+		            static_cast<unsigned long long>(page),
+		            static_cast<unsigned long long>(stat.count),
+		            static_cast<unsigned long long>(stat.bytes),
+		            static_cast<unsigned long long>(stat.exact), stat.ms,
+		            stat.gpu_thread ? "gpu-cp" : "guest-cpu",
+		            static_cast<unsigned long long>(stat.tid), stat.pm4_op, stat.writer,
+		            static_cast<unsigned long long>(stat.writer_hash));
+	}
+	if (!pages.empty()) {
+		uint64_t gpu_count = 0, cpu_count = 0, unique_pages = pages.size();
+		double   gpu_ms = 0, cpu_ms = 0;
+		for (const auto& [page, stat]: pages) {
+			(stat.gpu_thread ? gpu_count : cpu_count) += stat.count;
+			(stat.gpu_thread ? gpu_ms : cpu_ms) += stat.ms;
+		}
+		std::printf("NHL27PERF: fault totals pages=%llu gpu-cp=%llu (%.1f ms) guest-cpu=%llu (%.1f ms)\n",
+		            static_cast<unsigned long long>(unique_pages),
+		            static_cast<unsigned long long>(gpu_count), gpu_ms,
+		            static_cast<unsigned long long>(cpu_count), cpu_ms);
+	}
+	g_fault_pages.clear();
+	std::fflush(stdout);
+}
+
+void BufferCache::LogGpuWrite(uint64_t vaddr, uint64_t size) {
+	constexpr size_t MaxRecords = 512;
+	const WriterRecord record {vaddr, vaddr + size, m_writer_hash, m_writer_kind};
+	if (m_writer_log.size() < MaxRecords) {
+		m_writer_log.push_back(record);
+	} else {
+		m_writer_log[m_writer_head] = record;
+		m_writer_head               = (m_writer_head + 1) % MaxRecords;
+	}
+}
+
+void BufferCache::DropGpuFills(uint64_t vaddr, uint64_t size) {
+	if (m_gpu_fills.empty()) {
+		return;
+	}
+	const auto end = vaddr + size;
+	std::erase_if(m_gpu_fills, [&](const GpuFill& fill) { return fill.begin < end && vaddr < fill.end; });
+}
+
+void BufferCache::RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+	if (!PerfNoSyncReadback() || (vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 ||
+	    size > UINT64_MAX - vaddr) {
+		return;
+	}
+	DropGpuFills(vaddr, size);
+	constexpr size_t MaxFills = 64;
+	if (m_gpu_fills.size() >= MaxFills) {
+		m_gpu_fills.erase(m_gpu_fills.begin());
+	}
+	m_gpu_fills.push_back({vaddr, vaddr + size, value});
+}
+
+bool BufferCache::TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) const {
+	if (size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+	for (const auto& fill: m_gpu_fills) {
+		if (vaddr >= fill.begin && vaddr + size <= fill.end && ((vaddr - fill.begin) & 3u) == 0) {
+			value = fill.value;
+			return true;
+		}
+	}
+	return false;
+}
+
+void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
+	// Without whole pages the tracker could drop ownership of unrelated bytes. Leave the range
+	// dirty instead; the caller's invalidation then performs the ordinary download.
+	if (size == 0 || (vaddr & (TRACKER_PAGE_SIZE - 1)) != 0 || (size & (TRACKER_PAGE_SIZE - 1)) != 0 ||
+	    !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	DropGpuFills(vaddr, size);
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+}
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
@@ -112,6 +306,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	DropGpuFills(vaddr, size);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -126,8 +321,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
+	m_last_download_bytes = 0;
 	if (copies.empty()) {
 		return false;
+	}
+	for (const auto& copy: copies) {
+		m_last_download_bytes += copy.size;
 	}
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
@@ -238,27 +437,93 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
+bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size) {
+	if ((size != 4 && size != 8) || (vaddr & (size - 1)) != 0 || data == nullptr ||
+	    !GuestRange {vaddr, size}.Valid()) return false;
+	// Labels fit within one cache page. Do not create a buffer or change page ownership.
+	const auto found = m_buffers.upper_bound(vaddr);
+	if (found == m_buffers.begin()) return false;
+	auto& buffer = m_slot_buffers[std::prev(found)->second];
+	if (vaddr < buffer.CpuAddress() || vaddr - buffer.CpuAddress() > buffer.Size() ||
+	    size > buffer.Size() - (vaddr - buffer.CpuAddress())) return false;
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) return false;
+	DropGpuFills(vaddr, size);
+	// Keep the GPU copy coherent so a later download cannot restore an old label.
+	// Other GPU-owned bytes on the page are untouched and remain tracked as dirty.
+	WriteDataBuffer(buffer, vaddr, data, size);
+	TouchBuffer(buffer);
+	return true;
+}
+
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	DropGpuFills(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	const bool     on_gpu = GuestGpu::IsGpuThread();
+	const uint64_t tid    = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		const bool timed = PerfStatsEnabled();
+		const auto start = timed ? std::chrono::steady_clock::now()
+		                         : std::chrono::steady_clock::time_point {};
+		const bool exact_dirty =
+		    timed && caller == ReadCaller::Fault && !is_write && HasGpuDirtyBytes(vaddr, 1);
+		const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
+		if (timed) {
+			if (downloaded && caller == ReadCaller::Fault && !is_write) {
+				const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+				auto&      stat = g_fault_pages[page];
+				stat.count++;
+				stat.bytes += m_last_download_bytes;
+				stat.exact += exact_dirty ? 1 : 0;
+				stat.tid        = tid;
+				stat.gpu_thread = on_gpu;
+				stat.pm4_op     = on_gpu ? g_perf.pm4_op.load(std::memory_order_relaxed) : 0;
+				stat.ms += static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				               std::chrono::steady_clock::now() - start).count()) / 1e6;
+				stat.writer = "unknown";
+				stat.writer_hash = 0;
+				for (size_t n = 0; n < m_writer_log.size(); ++n) {
+					const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
+					                               m_writer_log.size()];
+					if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
+						stat.writer      = rec.kind;
+						stat.writer_hash = rec.hash;
+						break;
+					}
+				}
+			}
+			if (downloaded) {
+				const auto bucket = is_write                         ? size_t {2}
+				                    : caller == ReadCaller::ColorClear ? size_t {0}
+				                    : caller == ReadCaller::Fault      ? size_t {1}
+				                                                       : size_t {3};
+				// Buckets: 0 color clear, 1 fault, 2 invalidate (CPU write), 3 other.
+				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                    std::chrono::steady_clock::now() - start)
+				                    .count();
+				g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
+				g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
+				                                 std::memory_order_relaxed);
+			}
+			PerfMaybePrint();
+		}
+		if (downloaded) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
@@ -471,7 +736,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (is_written || is_texel_buffer) {
+		DropGpuFills(vaddr, size);
+	}
 	if (is_written) {
+		if (PerfStatsEnabled()) {
+			LogGpuWrite(vaddr, size);
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -525,8 +796,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	SetWriterTag("fill", 0);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	// The GPU now holds one repeated dword here; color-clear decoding can use it without a download.
+	RecordGpuFill(vaddr, size, value);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -550,6 +824,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 
 	auto& command = m_scheduler.Current();
+	SetWriterTag("copy", 0);
 	if (dst_memory) {
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
 	}
@@ -589,6 +864,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	PerfMaybePrint();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

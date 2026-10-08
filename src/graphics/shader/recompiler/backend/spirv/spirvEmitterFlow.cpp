@@ -57,7 +57,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		                          ConstantU32(state, 0x3f800000u), ConstantU32(state, 0xbf800000u));
 		return bits;
 	}
-	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
+	if (kind == IR::StageInputKind::DrawIndex || kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
 	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
 	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
 		const auto value = state.builder.AllocateId();
@@ -661,7 +661,36 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
-
+	if (state.program.info.native_draw) {
+		const auto& native = state.input_info.vertex->native_draw;
+		// Match the CP's write order when multiple fields name the same SGPR.
+		for (int field = 2; field >= 0; --field) {
+			if (native.registers[field] != IR::RegIndex(reg)) continue;
+			if (!native.indexed && field == 2) return ConstantU32(state, 0);
+			const uint32_t fields_indexed[] {3, 4, 2};
+			const uint32_t fields_auto[] {2, 3, 0};
+			const auto start = state.program.bindings.native_draw_dword;
+			const auto low = EmitShaderDataDwordLoad(state, start);
+			const auto high = EmitShaderDataDwordLoad(state, start + 1);
+			const auto stride = EmitShaderDataDwordLoad(state, start + 2);
+			const auto pair = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), pair, low, high);
+			const auto base = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeU64(state), base, pair);
+			const auto draw = EmitBuiltinU32(state, IR::StageInputKind::DrawIndex, 0);
+			const auto bytes = EmitAddU32(state, EmitBinaryU32(state, spv::OpIMul, draw, stride),
+			    ConstantU32(state, 4u * (native.indexed ? fields_indexed[field] : fields_auto[field])));
+			const auto wide = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpUConvert, TypeU64(state), wide, bytes);
+			const auto address = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpIAdd, TypeU64(state), address, base, wide);
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, spv::MemoryAccessAlignedMask, 4u);
+			return value;
+		}
+	}
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {
 		return ConstantU32(state, 0);

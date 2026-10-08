@@ -999,6 +999,47 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 	return bytes_written;
 }
 
+// NHL debugging: bounded trace of savedata writev/truncate, to see how NHL 27 writes its INDEX file.
+static void TraceSaveDataFileOp(const char* op, const std::string& name, int64_t value) {
+	static std::atomic_int g_count {0};
+	if (name.starts_with("/savedata") && g_count.fetch_add(1) < 200) {
+		std::printf("NHL debugging: %s %s value=%" PRId64 "\n", op, name.c_str(), value);
+		std::fflush(stdout);
+	}
+}
+
+// sceKernelWritev (kAt6VDbHmro) was unresolved, so NHL 27 never wrote its savedata INDEX file.
+int64_t KYTY_SYSV_ABI KernelWritev(int d, const KernelIovec* iov, int iovcnt) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, 0, &buffers, &total);
+	if (error != OK) {
+		return error;
+	}
+
+	int64_t bytes_written = 0;
+	for (const auto& buffer: buffers) {
+		if (buffer.iov_len == 0) {
+			continue;
+		}
+		const auto result = KernelWrite(d, buffer.iov_base, buffer.iov_len);
+		if (result < 0) {
+			return bytes_written != 0 ? bytes_written : result;
+		}
+		bytes_written += result;
+		if (static_cast<size_t>(result) < buffer.iov_len) {
+			break;
+		}
+	}
+
+	if (const auto* file = g_files->GetFile(d); file != nullptr) {
+		TraceSaveDataFileOp("writev", file->name, bytes_written); // NHL debugging
+	}
+	return bytes_written;
+}
+
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
@@ -1219,6 +1260,42 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 
 	LOGF("\tFtruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(file->real_name).c_str());
+
+	return OK;
+}
+
+// sceKernelTruncate (WlyEA-sLDf0) was unresolved.
+int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
+	PRINT_NAME();
+
+	if (path == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (length < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto real_file_name = g_mount_points->ResolvePath(path);
+	if (real_file_name.empty()) {
+		return KERNEL_ERROR_ENOENT;
+	}
+	if (Common::IsArchivePath(real_file_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
+	if (Common::File::IsDirectoryExisting(real_file_name)) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (!Common::File::IsFileExisting(real_file_name)) {
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	Common::File file(real_file_name, Common::File::Mode::ReadWrite);
+	if (file.IsInvalid() || !file.Truncate(static_cast<uint64_t>(length))) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	TraceSaveDataFileOp("truncate", path, length); // NHL debugging
+	LOGF("\tKernelTruncate (size = %" PRId64 ") file: %s\n", length, path);
 
 	return OK;
 }

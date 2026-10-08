@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <type_traits>
@@ -97,10 +98,54 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// NHL debugging: KYTY_DBG_LOOP_CAP=<n> gives each invocation a budget of n loop-header passes.
+// Once exhausted, every branch to a loop merge block (a break) is taken, so runaway
+// data-dependent loops end instead of triggering a GPU timeout.
+uint32_t LoopCapValue() {
+	static const uint32_t cap = [] {
+		const char* v = std::getenv("KYTY_DBG_LOOP_CAP");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+	}();
+	return cap;
+}
+
+bool IsLoopMergeBlock(const IR::Program& program, uint32_t id) {
+	return std::ranges::any_of(program.block_info, [&](const IR::BlockInfo& other) {
+		return other.terminator.loop_header && other.terminator.merge_block == id;
+	});
+}
+
+uint32_t LoopBudgetExhausted(EmitterState& state) {
+	const auto budget = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), budget, state.loop_budget_variable);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), exhausted, budget,
+	                          ConstantU32(state, 0));
+	return exhausted;
+}
+
+void DecrementLoopBudget(EmitterState& state) {
+	const auto budget = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), budget, state.loop_budget_variable);
+	const auto nonzero = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), nonzero, budget,
+	                          ConstantU32(state, 0));
+	const auto step = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), step, nonzero, ConstantU32(state, 1),
+	                          ConstantU32(state, 0));
+	const auto next = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpISub, TypeU32(state), next, budget, step);
+	state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, next);
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& program = ctx.state.program;
 	const auto& term       = info.terminator;
+	const bool  loop_cap   = ctx.state.loop_budget_variable != 0;
+	if (loop_cap && term.loop_header) {
+		DecrementLoopBudget(ctx.state);
+	}
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
 			const auto* merge = TargetBlock(program, term.merge_block);
@@ -136,7 +181,25 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(info.condition);
+			auto condition = ctx.Def(info.condition);
+			if (loop_cap) {
+				const bool true_breaks  = IsLoopMergeBlock(program, term.true_block);
+				const bool false_breaks = IsLoopMergeBlock(program, term.false_block);
+				if (true_breaks != false_breaks) {
+					const auto exhausted = LoopBudgetExhausted(ctx.state);
+					auto       forced    = exhausted;
+					if (false_breaks) {
+						forced = ctx.state.builder.AllocateId();
+						ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), forced,
+						                              exhausted);
+					}
+					const auto combined = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    true_breaks ? spv::OpLogicalOr : spv::OpLogicalAnd, TypeBool(ctx.state),
+					    combined, condition, forced);
+					condition = combined;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              ctx.Label(true_block), ctx.Label(false_block));
@@ -157,19 +220,60 @@ void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& 
 	}
 }
 
+// NHL debugging: KYTY_DBG_LOOP_CAP in dispatcher form. A target "loops" when it is a back-edge
+// (block id not after the current one) or a latch block that branches straight back.
+bool DispatcherTargetLoops(const IR::Program& program, uint32_t from_id, uint32_t target_id) {
+	if (target_id <= from_id) {
+		return true;
+	}
+	const auto found = std::ranges::find_if(
+	    program.block_info, [&](const IR::BlockInfo& other) { return other.id == target_id; });
+	return found != program.block_info.end() &&
+	       found->terminator.kind == CFG::TerminatorKind::Branch &&
+	       found->terminator.true_block <= target_id;
+}
+
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                               const IR::Block* block, const IR::BlockInfo& info) {
-	const auto& term = info.terminator;
+	const auto& term     = info.terminator;
+	const bool  loop_cap = ctx.state.loop_budget_variable != 0;
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
+			if (loop_cap && term.true_block <= info.id) {
+				DecrementLoopBudget(ctx.state);
+			}
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
 			return ConstantU32(ctx.state, term.true_block);
 		case CFG::TerminatorKind::ConditionalBranch: {
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
+			auto condition = ctx.Def(info.condition);
+			if (loop_cap) {
+				const auto& program    = ctx.state.program;
+				const bool  true_loops = DispatcherTargetLoops(program, info.id, term.true_block);
+				const bool  false_loops =
+				    DispatcherTargetLoops(program, info.id, term.false_block);
+				if (true_loops != false_loops) {
+					if (term.true_block <= info.id || term.false_block <= info.id) {
+						DecrementLoopBudget(ctx.state);
+					}
+					const auto exhausted = LoopBudgetExhausted(ctx.state);
+					auto       forced    = exhausted;
+					if (true_loops) {
+						forced = ctx.state.builder.AllocateId();
+						ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), forced,
+						                              exhausted);
+					}
+					const auto combined = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    true_loops ? spv::OpLogicalAnd : spv::OpLogicalOr, TypeBool(ctx.state),
+					    combined, condition, forced);
+					condition = combined;
+				}
+			}
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(
-			    spv::OpSelect, TypeU32(ctx.state), selected, ctx.Def(info.condition),
+			    spv::OpSelect, TypeU32(ctx.state), selected, condition,
 			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
 			return selected;
 		}
@@ -741,6 +845,12 @@ void EmitProgram(EmitterState& state) {
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
+	if (LoopCapValue() != 0) {
+		state.loop_budget_variable = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_budget_variable, spv::StorageClassFunction);
+	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
@@ -749,6 +859,10 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.loop_budget_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable,
+		                          ConstantU32(state, LoopCapValue()));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x=64) in;
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Arguments { uint words[]; };
+layout(push_constant, std430) uniform Params {
+ uint64_t address;
+ uint stride;
+ uint maximum;
+ uint limit;
+ uint reserved;
+} p;
+void main() {
+ uint record = gl_GlobalInvocationID.x;
+ if (record >= p.maximum) return;
+ Arguments args = Arguments(p.address);
+ uint offset = record * p.stride;
+ args.words[offset] = min(args.words[offset], p.limit);
+}

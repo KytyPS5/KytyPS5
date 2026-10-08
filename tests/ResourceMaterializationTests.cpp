@@ -217,6 +217,57 @@ void TestIntegerRuntimeValueFollowsSrtReads() {
         "cyclic SRT read-first-lane dependency was accepted");
 }
 
+void TestFailedRuntimeReadIsMemoizedPerRefresh() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  auto &block = AddValueBlock(program);
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+      {Value(0x1000u), Value(0u)});
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(0u), Value(0u), Value(true)});
+  read.SetFlags(MemoryFlags{.index = 0});
+  struct Reads { uint32_t count = 0; bool available = false; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t> words) {
+        auto &state = *static_cast<Reads *>(data);
+        ++state.count;
+        if (!state.available) return false;
+        words[0] = 42u;
+        return true;
+      },
+      .userdata = &reads};
+  uint32_t result = 0;
+  {
+    SrtWalker walker(program, runtime);
+    for (uint32_t i = 0; i < 32; ++i)
+      Check(!walker.Evaluate(Value(&read), result), "unavailable runtime read was accepted");
+    Check(reads.count == 1, "failed runtime read was retried within one refresh");
+    // Another evaluation context must not inherit the failed result.
+    reads.available = true;
+    SrtWalker nested(program, runtime);
+    Check(nested.Evaluate(Value(&read), result) && result == 42u && reads.count == 2,
+          "nested runtime evaluation inherited a failed result");
+  }
+  Check(SrtWalker(program, runtime).Evaluate(Value(&read), result) &&
+            result == 42u && reads.count == 3,
+        "next refresh retained a failed runtime result");
+}
+void TestCyclicRuntimeFailureCanRecover() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  auto &block = AddValueBlock(program);
+  auto &root = block.AppendNewInst(ValueOpcode::ConditionRef, {Value(false)});
+  auto &inverse = block.AppendNewInst(ValueOpcode::LogicalNot, {Value(&root)});
+  auto &either = block.AppendNewInst(ValueOpcode::LogicalOr, {Value(&inverse), Value(true)});
+  root.SetArg(0, Value(&either));
+  SrtWalker walker(program, {});
+  uint32_t result = 0;
+  Check(walker.Evaluate(Value(&root), result) && result == 1u,
+        "short-circuit evaluation failed to resolve a cyclic predicate");
+  Check(walker.Evaluate(Value(&inverse), result) && result == 0u,
+        "temporary cyclic failure prevented later predicate evaluation");
+}
 void TestUniformVectorDescriptorRead() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -567,6 +618,8 @@ void DbgExit(int) { std::abort(); }
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
+  TestFailedRuntimeReadIsMemoizedPerRefresh();
+  TestCyclicRuntimeFailureCanRecover();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();

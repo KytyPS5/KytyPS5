@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
@@ -10,6 +11,8 @@
 #include <map>
 #include <set>
 #include <span>
+#include <string_view>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -35,11 +38,13 @@ void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::st
 	graph.unsupported_reason = message;
 }
 
-[[noreturn]] void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
-                                   const std::string& message) {
+// NHL debugging: BuildGraph reports hard failures through graph.unsupported so that the caller can
+// print diagnostics (or skip the shader) before deciding whether the failure is fatal.
+Graph BuildFailure(Graph& graph, FailureKind kind, uint32_t block_id, uint32_t pc,
+                   const std::string& message) {
 	SetFailure(graph, kind, block_id, message);
-	EXIT("shader CFG build failed: %s", message.c_str());
-	std::abort();
+	graph.failure_pc = pc;
+	return std::move(graph);
 }
 
 uint32_t InstructionEndPc(const Instruction& inst) {
@@ -1327,7 +1332,8 @@ private:
 					const auto& previous = m_graph.blocks[current];
 					// Route assignments cannot observe guest writes; native predicates must stay at their original Code.
 					const bool captures_native = std::ranges::any_of(previous.assignments, [&](const auto& assignment) {
-						return m_graph.expressions[assignment.expression].op == ExprOp::Native;
+						const auto op = m_graph.expressions[assignment.expression].op;
+						return op == ExprOp::Native || op == ExprOp::SelectorEq;
 					});
 					if (captures_native ||
 					    (previous.inst_begin != previous.inst_end && previous.inst_end != source.inst_begin)) {
@@ -1341,8 +1347,12 @@ private:
 					block.end_pc = source.end_pc;
 					block.inst_end = source.inst_end;
 					if (source.terminator.kind == TerminatorKind::ConditionalBranch) {
-						block.assignments.push_back({CaptureVariable(source.id),
-						    Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition))});
+						// A lowered jump-table compare reads its selector SGPR where the Code sits.
+						const auto condition = source.terminator.condition == BranchCondition::SelectorEq
+						    ? Expression(ExprOp::SelectorEq, source.terminator.indirect_selector_code,
+						                 source.terminator.compare_value)
+						    : Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition));
+						block.assignments.push_back({CaptureVariable(source.id), condition});
 					}
 					break;
 				}
@@ -1445,11 +1455,153 @@ private:
 
 } // namespace
 
+namespace {
+
+bool JumpTableLoweringEnabled() {
+	const char* value = std::getenv("KYTY_CFG_LOWER_JUMP_TABLES");
+	return value == nullptr || std::string_view(value) != "0";
+}
+
+struct JumpTableEntry {
+	uint32_t value;
+	uint32_t target;
+};
+
+// Reduces a resolved jump table to the (value, target) pairs EmitDispatcherNextPc would select:
+// a later entry wins over an earlier one with the same value. The last entry is the default.
+bool JumpTableEntries(const Terminator& terminator, std::vector<JumpTableEntry>& entries) {
+	const auto& values  = terminator.indirect_selector_values;
+	const auto& targets = terminator.indirect_selector_targets;
+	entries.clear();
+	if (terminator.kind != TerminatorKind::IndirectBranch ||
+	    terminator.indirect_selector_code == UINT32_MAX || values.empty() ||
+	    values.size() != targets.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < values.size(); i++) {
+		if (std::find(values.begin() + i + 1, values.end(), values[i]) == values.end()) {
+			entries.push_back({values[i], targets[i]});
+		}
+	}
+	// Entries that reach the default target anyway need no compare.
+	const auto fallback = entries.back().target;
+	entries.erase(std::remove_if(entries.begin(), entries.end() - 1,
+	                             [&](const JumpTableEntry& entry) { return entry.target == fallback; }),
+	              entries.end() - 1);
+	return true;
+}
+
+// Lowers every resolved jump table into a chain of binary SelectorEq conditional branches so the
+// graph can be structurized instead of using the dispatcher. The chain head is the table block
+// itself; the following compare blocks are empty and get ids right after it. Returns false and
+// leaves the graph untouched when any IndirectBranch cannot be lowered.
+bool LowerJumpTables(Graph& graph) {
+	std::vector<std::vector<JumpTableEntry>> tables(graph.blocks.size());
+	bool                                     any = false;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind != TerminatorKind::IndirectBranch) {
+			continue;
+		}
+		if (block.id >= tables.size() || !JumpTableEntries(block.terminator, tables[block.id])) {
+			return false;
+		}
+		any = true;
+	}
+	if (!any) {
+		return false;
+	}
+
+	std::vector<uint32_t> id_map(graph.blocks.size());
+	uint32_t              next_id = 0;
+	for (const auto& block: graph.blocks) {
+		const auto compares = static_cast<uint32_t>(tables[block.id].size());
+		id_map[block.id]    = next_id;
+		next_id += compares > 2u ? compares - 1u : 1u;
+	}
+
+	std::vector<BasicBlock> blocks;
+	blocks.reserve(next_id);
+	for (auto& source: graph.blocks) {
+		const auto& entries = tables[source.id];
+		auto        block   = std::move(source);
+		block.id            = id_map[block.id];
+		block.predecessors.clear();
+		block.dominators.clear();
+		RemapIds(block.successors, id_map);
+		auto& terminator          = block.terminator;
+		terminator.true_block     = RemapId(terminator.true_block, id_map);
+		terminator.false_block    = RemapId(terminator.false_block, id_map);
+		terminator.merge_block    = RemapId(terminator.merge_block, id_map);
+		terminator.continue_block = RemapId(terminator.continue_block, id_map);
+		for (auto& target: terminator.indirect_targets) {
+			target = RemapId(target, id_map);
+		}
+		for (auto& target: terminator.indirect_selector_targets) {
+			target = RemapId(target, id_map);
+		}
+		if (entries.empty()) {
+			blocks.push_back(std::move(block));
+			continue;
+		}
+
+		const auto selector = terminator.indirect_selector_code;
+		const auto first_id = block.id;
+		const auto pc       = block.end_pc;
+		const auto inst     = block.inst_end;
+		terminator          = {};
+		if (entries.size() == 1u) {
+			terminator.kind       = TerminatorKind::Branch;
+			terminator.condition  = BranchCondition::Always;
+			terminator.true_block = id_map[entries[0].target];
+			block.successors      = {terminator.true_block};
+			blocks.push_back(std::move(block));
+			continue;
+		}
+
+		// Compare k tests entry k; its false edge reaches compare k + 1, or the default target.
+		const auto compares = static_cast<uint32_t>(entries.size()) - 1u;
+		for (uint32_t k = 0; k < compares; k++) {
+			BasicBlock compare;
+			if (k == 0) {
+				compare = std::move(block);
+			} else {
+				compare.id         = first_id + k;
+				compare.start_pc   = pc;
+				compare.end_pc     = pc;
+				compare.inst_begin = inst;
+				compare.inst_end   = inst;
+			}
+			auto& branch                  = compare.terminator;
+			branch                        = {};
+			branch.kind                   = TerminatorKind::ConditionalBranch;
+			branch.condition              = BranchCondition::SelectorEq;
+			branch.indirect_selector_code = selector;
+			branch.compare_value          = entries[k].value;
+			branch.true_block             = id_map[entries[k].target];
+			branch.false_block =
+			    k + 1u < compares ? first_id + k + 1u : id_map[entries[compares].target];
+			compare.successors = {branch.true_block, branch.false_block};
+			blocks.push_back(std::move(compare));
+		}
+	}
+
+	graph.entry_block   = RemapId(graph.entry_block, id_map);
+	graph.failure_block = RemapId(graph.failure_block, id_map);
+	graph.blocks        = std::move(blocks);
+	graph.back_edges.clear();
+	graph.natural_loops.clear();
+	graph.components.clear();
+	RebuildPredecessors(graph);
+	return true;
+}
+
+} // namespace
+
 Graph BuildGraph(const Decoder::Program& program) {
 	Graph graph;
 	if (program.instructions.empty()) {
-		ExitBuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
-		                 "cannot build CFG for empty shader");
+		return BuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX, UINT32_MAX,
+		                    "cannot build CFG for empty shader");
 	}
 
 	const auto first_pc = program.instructions.front().pc;
@@ -1459,8 +1611,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 	for (const auto& inst: program.instructions) {
 		instruction_pcs.insert(inst.pc);
 		if (inst.opcode == Opcode::UNSUPPORTED) {
-			ExitBuildFailure(
-			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
+			return BuildFailure(
+			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX, inst.pc,
 			    fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}", inst.pc,
 			                Decoder::InstructionToString(inst).c_str()));
 		}
@@ -1476,9 +1628,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto  next_pc = InstructionEndPc(inst);
 		if (Decoder::IsDirectBranch(inst.opcode)) {
 			if (!IsValidTarget(inst.branch_target, instruction_pcs, first_pc, end_pc)) {
-				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
-				                             inst.pc, inst.branch_target));
+				return BuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX, inst.pc,
+				                    fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
+				                                inst.pc, inst.branch_target));
 			}
 			labels.insert(inst.branch_target);
 			if (next_pc <= end_pc) {
@@ -1487,8 +1639,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
-				ExitBuildFailure(
-				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+				return BuildFailure(
+				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX, inst.pc,
 				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
 			}
 			const auto target_pcs = target_info.indirect
@@ -1496,8 +1648,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 			                            : std::span<const uint32_t>(&target_info.target, 1);
 			for (const auto target: target_pcs) {
 				if (!IsValidTarget(target, instruction_pcs, first_pc, end_pc)) {
-					ExitBuildFailure(
-					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+					return BuildFailure(
+					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX, inst.pc,
 					    fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
 					                inst.pc, target));
 				}
@@ -1519,8 +1671,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 			continue;
 		}
 		if (start != end_pc && !instruction_pcs.contains(start)) {
-			ExitBuildFailure(
-			    graph, FailureKind::InvalidLabel, UINT32_MAX,
+			return BuildFailure(
+			    graph, FailureKind::InvalidLabel, UINT32_MAX, start,
 			    fmt::format("CFG label does not start on an instruction: 0x{:08x}", start));
 		}
 
@@ -1591,8 +1743,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 			block.terminator.true_block = pc_to_block.at(last.branch_target);
 			const auto fallthrough      = pc_to_block.find(next_pc);
 			if (fallthrough == pc_to_block.end()) {
-				ExitBuildFailure(
-				    graph, FailureKind::MissingFallthrough, block.id,
+				return BuildFailure(
+				    graph, FailureKind::MissingFallthrough, block.id, last.pc,
 				    fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
 				                last.pc));
 			}
@@ -1653,6 +1805,11 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 	SortUnique(graph.code_table_load_pcs);
 
+	// Resolved jump tables become compare chains; only unresolved ones need the dispatcher.
+	if (indirect_setpc && JumpTableLoweringEnabled() && LowerJumpTables(graph)) {
+		indirect_setpc = false;
+	}
+
 	RecomputeAnalyses(graph);
 
 	if (indirect_setpc) {
@@ -1694,6 +1851,7 @@ std::string BranchConditionToString(BranchCondition condition) {
 		case BranchCondition::ExecNonZero: return "execnz";
 		case BranchCondition::ScalarInstruction: return "scalar_instruction";
 		case BranchCondition::Expression: return "expression";
+		case BranchCondition::SelectorEq: return "selector_eq";
 		default: return "unknown";
 	}
 }

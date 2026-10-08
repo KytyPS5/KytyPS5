@@ -185,6 +185,7 @@ enum class TessellationAttribute {
 };
 
 enum class StageInputKind {
+	DrawIndex,
 	VertexIndex,
 	InvocationId,
 	PrimitiveId,
@@ -434,6 +435,7 @@ struct DescriptorBinding {
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;
+	uint32_t native_draw_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;
@@ -471,6 +473,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	bool native_draw = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

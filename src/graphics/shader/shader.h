@@ -123,7 +123,16 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_topology       = 0;
 };
 
+struct NativeDrawShaderInfo {
+	std::array<uint32_t, 3> registers {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+	bool indexed = false;
+	[[nodiscard]] bool Enabled() const {
+		return registers[0] != UINT32_MAX || registers[1] != UINT32_MAX || registers[2] != UINT32_MAX;
+	}
+};
+
 struct ShaderVertexInputInfo {
+	NativeDrawShaderInfo native_draw;
 	static constexpr int RES_MAX = 32;
 
 	ShaderBufferResource    resources[RES_MAX];

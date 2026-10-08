@@ -43,6 +43,10 @@ void CollectShaderData(const Program& program, BindingLayout& layout) {
 		}
 	}
 	layout.memory_offset_dword = static_cast<uint32_t>(layout.user_data_registers.size());
+	if (program.info.native_draw) {
+		layout.native_draw_dword = layout.memory_offset_dword;
+		layout.memory_offset_dword += 3u;
+	}
 	if (uses_dispatch_threads) {
 		layout.dispatch_thread_dword = layout.memory_offset_dword;
 		layout.memory_offset_dword += 3u;

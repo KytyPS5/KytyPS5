@@ -404,6 +404,7 @@ namespace {
 
 uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	switch (kind) {
+		case IR::StageInputKind::DrawIndex: return spv::BuiltInDrawIndex;
 		case IR::StageInputKind::VertexIndex: return spv::BuiltInVertexIndex;
 		case IR::StageInputKind::InvocationId: return spv::BuiltInInvocationId;
 		case IR::StageInputKind::PrimitiveId: return spv::BuiltInPrimitiveId;
@@ -441,6 +442,10 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
+	if (state.program.info.native_draw) {
+		state.builder.RequireCapability(spv::CapabilityDrawParameters);
+		add_builtin(IR::StageInputKind::DrawIndex, 1, "gl_DrawID");
+	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
@@ -465,6 +470,7 @@ void DefineInputs(EmitterState& state) {
 		}
 		uint32_t type = TypeU32(state);
 		switch (input.kind) {
+			case IR::StageInputKind::DrawIndex:
 			case IR::StageInputKind::VertexIndex:
 			case IR::StageInputKind::InvocationId:
 			case IR::StageInputKind::PrimitiveId:
@@ -682,7 +688,7 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma) {
+	if (state.program.info.uses_dma || state.program.info.native_draw) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -743,7 +749,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel((state.program.info.uses_dma || state.program.info.native_draw)
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);

@@ -28,6 +28,8 @@ struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	// NHL debugging: set when the CFG build failed and KYTY_DBG_SKIP_BAD_SHADERS asked to skip it.
+	bool build_failed = false;
 };
 
 struct CompileResult {

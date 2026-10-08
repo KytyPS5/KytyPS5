@@ -25,10 +25,13 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -490,13 +493,25 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	features12.hostQueryReset           = supported_features12.hostQueryReset;
+	features12.drawIndirectCount = supported_features12.drawIndirectCount;
+	graphics.native_indirect_enabled = supported_features12.drawIndirectCount &&
+	    supported_features2.features.multiDrawIndirect &&
+	    supported_features2.features.drawIndirectFirstInstance;
+	graphics.host_query_reset_enabled   = supported_features12.hostQueryReset != VK_FALSE;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
 	workgroup_layout.pNext = &depth_clip_control;
 	features12.pNext = workgroup_layout_extension ? static_cast<void*>(&workgroup_layout)
 	                                             : static_cast<void*>(&depth_clip_control);
+	vk::PhysicalDeviceVulkan11Features native_supported11 {};
+	vk::PhysicalDeviceFeatures2 native_supported2 {};
+	native_supported2.pNext = &native_supported11;
+	physical_device.getFeatures2(&native_supported2);
 	auto features11 = WindowContext::RequiredVulkan11Features();
+	features11.shaderDrawParameters = native_supported11.shaderDrawParameters;
+	graphics.native_draw_parameters_enabled = native_supported11.shaderDrawParameters != VK_FALSE;
 	features11.pNext = features12.pNext;
 	features12.pNext = &features11;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
@@ -559,6 +574,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
+	device_features.multiDrawIndirect = supported_features2.features.multiDrawIndirect;
+	device_features.drawIndirectFirstInstance = supported_features2.features.drawIndirectFirstInstance;
 	device_features.robustBufferAccess       = VK_TRUE;
 #if !defined(__APPLE__)
 	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
@@ -637,6 +654,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
+	}
+	// VK_EXT_device_fault: lets a device loss report the faulting GPU address.
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		device_fault.pNext       = const_cast<void*>(create_info.pNext);
+		device_fault.deviceFault = VK_TRUE;
+		create_info.pNext        = &device_fault;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -776,6 +800,30 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
+	// NHL26 debugging: KYTY_DBG_VALIDATION_NONFATAL=1 logs validation errors (once per message
+	// id) to stdout instead of exiting, so one run collects everything up to a device loss.
+	static const bool nonfatal = [] {
+		const char* v = std::getenv("KYTY_DBG_VALIDATION_NONFATAL");
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
+	}();
+	if (error && nonfatal) {
+		static std::mutex                      seen_mutex;
+		static std::unordered_set<std::string> seen;
+		const std::string id = callback_data->pMessageIdName != nullptr
+		                           ? callback_data->pMessageIdName
+		                           : std::string(callback_data->pMessage).substr(0, 120);
+		bool first = false;
+		{
+			std::lock_guard lock(seen_mutex);
+			first = seen.insert(id).second;
+		}
+		if (first) {
+			std::printf("NHL26VAL: [%s] %s\n", id.c_str(), callback_data->pMessage);
+			std::fflush(stdout);
+		}
+		error = false;
+		skip  = true;
+	}
 	if (error) {
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
@@ -1006,7 +1054,9 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+	                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
+	                             VK_AMD_BUFFER_MARKER_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

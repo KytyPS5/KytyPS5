@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1001,8 +1002,21 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	Value unknown;
+	// Predicates share subterms; memoize per instruction so the walk stays linear in DAG size.
+	std::unordered_map<const Inst*, Value> cloned_predicates;
+	std::function<Value(Value)> ClonePredicateImpl;
 	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
 		value = value.Resolve();
+		const auto* key = value.IsEmpty() ? nullptr : value.TryInstruction();
+		if (key == nullptr) return ClonePredicateImpl(value);
+		if (const auto it = cloned_predicates.find(key); it != cloned_predicates.end()) {
+			return it->second;
+		}
+		auto result = ClonePredicateImpl(value);
+		cloned_predicates.emplace(key, result);
+		return result;
+	};
+	ClonePredicateImpl = [&](Value value) -> Value {
 		if (value.IsEmpty()) return {};
 		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) return Clone(value);
 		const auto* inst = value.TryInstruction();

@@ -754,6 +754,9 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		}
 		return IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
 	};
+	const auto selector_eq = [&](uint32_t code, uint32_t value) -> IR::U1 {
+		return ir.IEqual(ReadScalarCode(code), IR::U32(IR::Value(value)));
+	};
 	const auto expression = [&](auto&& self, uint32_t index) -> IR::U1 {
 		const auto& value = graph.expressions.at(index);
 		switch (value.op) {
@@ -761,6 +764,7 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 			case CFG::ConditionExpression::Op::Variable: return ir.GetGotoVariable(value.lhs);
 			case CFG::ConditionExpression::Op::Native:
 				return native_condition(static_cast<CFG::BranchCondition>(value.lhs));
+			case CFG::ConditionExpression::Op::SelectorEq: return selector_eq(value.lhs, value.rhs);
 			case CFG::ConditionExpression::Op::Not: return ir.LogicalNot(self(self, value.lhs));
 			case CFG::ConditionExpression::Op::Or:
 				return ir.LogicalOr(self(self, value.lhs), self(self, value.rhs));
@@ -785,6 +789,8 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
 		const auto condition = term.expression != UINT32_MAX
 		                           ? expression(expression, term.expression)
+		                       : term.condition == CFG::BranchCondition::SelectorEq
+		                           ? selector_eq(term.indirect_selector_code, term.compare_value)
 		                           : native_condition(term.condition);
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});

@@ -50,8 +50,30 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
+	// Writes a small CPU-visible label into an existing buffer without a page readback.
+	bool                   TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size);
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Only used to attribute synchronous readbacks in the KYTY_PERF_STATS output.
+	enum class ReadCaller : uint8_t { Other, ColorClear, Fault };
+	enum class PerfEvent : uint8_t { ColorClearShadowHit, WaitRegMemBackingRead };
+	// KYTY_PERF_NO_SYNC_READBACK=1 enables the readback-avoidance paths (default: off).
+	[[nodiscard]] static bool PerfNoSyncReadback();
+	static void               PerfCount(PerfEvent event);
+	static void               PerfSetPm4Op(uint32_t opcode);
+	// Labels the next GPU writes (KYTY_PERF_STATS fault diagnostics only).
+	void SetWriterTag(const char* kind, uint64_t hash) {
+		m_writer_kind = kind;
+		m_writer_hash = hash;
+	}
+	void ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                ReadCaller caller = ReadCaller::Other);
+	// Remembers that the GPU filled [vaddr, vaddr + size) with one repeated dword. The record
+	// lives only until any other write, download or invalidation touches the range.
+	void RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	[[nodiscard]] bool TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
+	// Drops GPU ownership of whole pages without a download. The caller must be about to
+	// overwrite the CPU backing of the range and mark it CPU-modified.
+	void DiscardGpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -103,6 +125,9 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	void DropGpuFills(uint64_t vaddr, uint64_t size);
+	void LogGpuWrite(uint64_t vaddr, uint64_t size);
+	void PerfMaybePrint();
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -137,6 +162,23 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
+	struct GpuFill {
+		uint64_t begin;
+		uint64_t end;
+		uint32_t value;
+	};
+	std::vector<GpuFill>                              m_gpu_fills;
+	struct WriterRecord {
+		uint64_t    begin;
+		uint64_t    end;
+		uint64_t    hash;
+		const char* kind;
+	};
+	std::vector<WriterRecord>                         m_writer_log;
+	size_t                                            m_writer_head       = 0;
+	const char*                                       m_writer_kind       = "storage";
+	uint64_t                                          m_writer_hash       = 0;
+	uint64_t                                          m_last_download_bytes = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

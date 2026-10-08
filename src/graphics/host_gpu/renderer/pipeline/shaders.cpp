@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -19,6 +20,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <span>
 #include <vector>
@@ -544,6 +546,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
+	if (result != vk::Result::eSuccess) {
+		std::printf("vkCreateGraphicsPipelines failed: %s\n", vk::to_string(result).c_str());
+		std::fflush(stdout);
+		if (result == vk::Result::eErrorDeviceLost) {
+			ReportDeviceLost(graphics);
+		}
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
@@ -613,6 +622,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                                                &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	if (result != vk::Result::eSuccess) {
+		std::printf("vkCreateComputePipelines failed: %s (CS hash 0x%016llx)\n",
+		            vk::to_string(result).c_str(),
+		            static_cast<unsigned long long>(input_info.stage.program->shader_hash));
+		std::fflush(stdout);
+		if (result == vk::Result::eErrorDeviceLost) {
+			ReportDeviceLost(graphics);
+		}
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

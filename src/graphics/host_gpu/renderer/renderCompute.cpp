@@ -352,6 +352,30 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	// KYTY_DBG_GDS_TRACE=1: log GDS[0..3] around dispatches that bind GDS. Debug-only: waits for
+	// the GPU before recording (so "before" is exact) and again after the dispatch.
+	static const bool gds_trace = [] {
+		const char* v = std::getenv("KYTY_DBG_GDS_TRACE");
+		return v != nullptr && v[0] == '1';
+	}();
+	bool     gds_trace_now = false;
+	uint32_t gds_before[4] {};
+	const auto read_gds = [&](uint32_t (&out)[4]) {
+		const auto gds = m_context.GetBufferCache().GetGdsBuffer()->Mapped();
+		if (gds.size() >= sizeof(out)) std::memcpy(out, gds.data(), sizeof(out));
+	};
+	if (gds_trace &&
+	    ShaderRecompiler::IR::FindBinding(program.bindings,
+	                                      ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
+		static uint64_t gds_dispatches = 0;
+		const auto      n              = ++gds_dispatches;
+		if (n <= 200 || n % 100 == 0) {
+			gds_trace_now = true;
+			m_context.GetCommandScheduler().Wait(m_context.GetCommandScheduler().CurrentTick());
+			read_gds(gds_before);
+		}
+	}
+
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
@@ -495,6 +519,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// Recorded after the bindings marked the range GPU-written, which clears older records.
 		m_context.GetBufferCache().RecordGpuFill(known_fill_address, known_fill_size,
 		                                         known_fill_value);
+	}
+	if (gds_trace_now) {
+		uint32_t gds_after[4] {};
+		m_context.GetCommandScheduler().Wait(m_context.GetCommandScheduler().CurrentTick());
+		read_gds(gds_after);
+		std::printf("NHL27GDS: cs=0x%016llx groups=%ux%ux%u gds[0..3] before=%u,%u,%u,%u "
+		            "after=%u,%u,%u,%u
+",
+		            static_cast<unsigned long long>(program.shader_hash), thread_group_x,
+		            thread_group_y, thread_group_z, gds_before[0], gds_before[1], gds_before[2],
+		            gds_before[3], gds_after[0], gds_after[1], gds_after[2], gds_after[3]);
+		std::fflush(stdout);
 	}
 	ResetBindings();
 }

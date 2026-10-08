@@ -444,7 +444,18 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 			const bool report_new = unseen && gds_regions.size() < 256;
 			if (report_new) gds_regions.push_back(region);
 			const auto packet = ++gds_packets;
-			if (packet <= 48 || report_new) {
+			// KYTY_DBG_GDS_TRACE=1: also log every DMA touching GDS bytes 0..15 (rate-limited).
+			static const bool gds_trace = [] {
+				const char* v = std::getenv("KYTY_DBG_GDS_TRACE");
+				return v != nullptr && v[0] == '1';
+			}();
+			static uint64_t gds_low_packets = 0;
+			bool            low_gds = false;
+			if (gds_trace && dst_gds && dst_address_or_offset < 16) {
+				const auto n = ++gds_low_packets;
+				low_gds      = n <= 400 || n % 50 == 0;
+			}
+			if (packet <= 48 || report_new || low_gds) {
 				std::printf("NHL26GDSW: dma dst_sel=%u src_sel=%u dst=0x%llx src=0x%llx bytes=%u\n",
 				            static_cast<uint32_t>(dst_sel), static_cast<uint32_t>(src_sel),
 				            static_cast<unsigned long long>(dst_address_or_offset),

@@ -10878,6 +10878,27 @@ public:
               "a texture binding read drawn texels of a fast-cleared target");
         }
         bind();
+        // A texture view carrying the target's metadata, without the clear
+        // registers a T# lacks, still uses the target's registers. The target
+        // is unprogrammed during the fill so only the view can apply the clear.
+        paint();
+        registers.SetColorBase(0, {.addr = 0});
+        fill_metadata(metadata_words);
+        registers.SetColorBase(0, {.addr = base});
+        {
+          ImageDesc sampled = color.desc;
+          sampled.type = BindingType::Texture;
+          sampled.info.metadata.clear_register_valid = false;
+          sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          RenderExecutorTestAccess::ResetBindings(executor);
+          const auto sampled_id = texture_cache.FindImage(sampled);
+          (void)texture_cache.FindTexture(sampled_id, sampled);
+          Require(name, "metadata texture view sees target clear",
+                  sampled_id == color.image_id && read_texel() == expected,
+                  "a texture view with metadata lost the target's clear "
+                  "registers");
+        }
+        bind();
         // The metadata fill of a programmed target clears it even without a
         // draw; the second dispatch stands for any later GPU work.
         paint();

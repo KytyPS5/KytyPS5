@@ -454,15 +454,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 // Clear the color targets whose fast-clear metadata was rewritten by a shader, with or
 // without a draw: the texture reads that follow expect the cleared color.
 void RenderExecutor::ResolvePendingMetaClears(CommandBuffer& buffer) {
-	if (m_pending_meta_fills.empty()) return;
+	if (m_pending_meta_fills.empty()) {
+		return;
+	}
 	const auto& hw = buffer.GetRegisters();
 	for (uint32_t slot = 0; slot < 8; slot++) {
 		const auto& rt = hw.GetRenderTarget(slot);
-		if (rt.base.addr == 0 ||
-		    !(rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable))
+		// Same eligibility as ResolveRenderColorTarget, so a fill is only consumed when the
+		// target can attach the rewritten metadata.
+		const bool dcc = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
+		const bool cmask =
+		    !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
+		    rt.cmask.addr != 0 && render_sample_count(rt.attrib.num_fragments) == 1 &&
+		    !rt.info.fmask_compression_enable && !rt.attrib3.write_vrs_rate_hint_to_cmask;
+		if (rt.base.addr == 0 || (!dcc && !cmask)) {
 			continue;
-		const auto meta = rt.info.dcc_compression_enable ? rt.dcc_addr.addr : rt.cmask.addr;
-		if (m_pending_meta_fills.erase(meta) == 0) continue;
+		}
+		if (m_pending_meta_fills.erase(dcc ? rt.dcc_addr.addr : rt.cmask.addr) == 0) {
+			continue;
+		}
 		RenderColorInfo color {};
 		ResolveRenderColorTarget(buffer, color, 0, slot, true, false);
 	}

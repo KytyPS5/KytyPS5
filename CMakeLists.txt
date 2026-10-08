@@ -589,6 +589,16 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+# Common::SoftExitScope turns a fatal error of the current thread into a C++ exception: its
+# thrower and the renderer code that catches it need exceptions where they are off by default.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(common PRIVATE -fexceptions)
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
+endif()
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests

@@ -339,10 +339,16 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                              uint32_t array_index = 0);
 
+// Loads a runtime, possibly non-uniform, element of the resource's sampled image descriptor
+// array instead of the resource's own element.
+uint32_t LoadImageTableElement(EmitterState& state, uint32_t resource, uint32_t element);
+
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
+// A nonzero element id samples a runtime element of the descriptor array (LoadImageTableElement).
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
-                          uint32_t mip = 0, uint32_t array_index = 0);
+                          uint32_t mip = 0, uint32_t array_index = 0,
+                          uint32_t element = 0);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);

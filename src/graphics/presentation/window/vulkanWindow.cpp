@@ -507,6 +507,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	// Bindless image tables index sampled image arrays per lane.
+	features12.shaderSampledImageArrayNonUniformIndexing =
+	    supported_features12.shaderSampledImageArrayNonUniformIndexing;
+	if (supported_features12.shaderSampledImageArrayNonUniformIndexing != VK_TRUE ||
+	    supported_features2.features.shaderSampledImageArrayDynamicIndexing != VK_TRUE) {
+		LOGF("WARNING: non-uniform sampled image indexing is not supported; bindless image "
+		     "tables will not work\n");
+	}
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -565,6 +573,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	device_features.shaderSampledImageArrayDynamicIndexing =
+	    supported_features2.features.shaderSampledImageArrayDynamicIndexing;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;

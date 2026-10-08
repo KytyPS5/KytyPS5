@@ -247,6 +247,9 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	const auto epoch = ++m_image_set_epoch;
+	ForEachPage(image.info.data.address, image.info.data.size,
+	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -273,6 +276,24 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	const auto epoch = ++m_image_set_epoch;
+	ForEachPage(image.info.data.address, image.info.data.size,
+	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
+}
+
+uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return UINT64_MAX;
+	}
+	std::scoped_lock lock {m_lock};
+	uint64_t         epoch = 0;
+	ForEachPage(address, size, [&](uint64_t page) {
+		if (const auto* page_epoch = m_image_page_epochs.Find(page)) {
+			epoch = std::max(epoch, *page_epoch);
+		}
+	});
+	return epoch;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -674,12 +695,12 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
-ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
-                                          ImageId cached_id) {
-	auto& cached = m_slot_images[cached_id];
+bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, BindingType binding,
+                                             const Image& cached) {
+	// Mirrors ResolveDepthOverlap, which leaves other tile modes to the generic overlap path.
 	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
 	    cached.info.tile_mode != requested.tile_mode) {
-		return {};
+		return false;
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
@@ -694,6 +715,31 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    !cached.info.HasMetadata();
+	bool recreate = cached.info.resources < requested.resources ||
+	                requested.IsVolume() != cached.info.IsVolume();
+	switch (binding) {
+		case BindingType::Texture:
+			recreate |= requested.IsDepth() && !cached.info.IsDepth();
+			recreate |= raw_d16_texture;
+			break;
+		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
+		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
+		case BindingType::DepthTarget:
+			recreate |= !cached.info.IsDepth();
+			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			break;
+		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
+	}
+	return recreate;
+}
+
+ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
+                                          ImageId cached_id) {
+	auto& cached = m_slot_images[cached_id];
+	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
+	    cached.info.tile_mode != requested.tile_mode) {
+		return {};
+	}
 	// PPSA04264, PPSA04288
 	// A partial view retains the entire matching array layout. HTile belongs to
 	// the depth source, independently of the data slices copied into color storage.
@@ -717,22 +763,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
-	bool recreate = cached.info.resources < requested.resources ||
-	                requested.IsVolume() != cached.info.IsVolume();
-	switch (binding) {
-		case BindingType::Texture:
-			recreate |= requested.IsDepth() && !cached.info.IsDepth();
-			recreate |= raw_d16_texture;
-			break;
-		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
-		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
-		case BindingType::DepthTarget:
-			recreate |= !cached.info.IsDepth();
-			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
-			break;
-		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
-	}
-	if (!recreate) {
+	if (!DepthOverlapNeedsRecreate(requested, binding, cached)) {
 		return cached_id;
 	}
 	RefreshImage(cached_id);
@@ -780,7 +811,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
-                                                         ImageId merged_id) {
+                                                         ImageId merged_id, bool speculative) {
 	auto owner = m_slot_images.try_get(cached_id);
 	if (owner == nullptr) {
 		return {merged_id};
@@ -794,6 +825,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
+		if (speculative && (cached.info.IsDepth() || requested.IsDepth()) &&
+		    DepthOverlapNeedsRecreate(requested, binding, cached)) {
+			return {.rejected = true};
+		}
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
@@ -1263,6 +1298,14 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	return FindImageImpl(desc, exact_format, false);
+}
+
+ImageId TextureCache::FindImageSpeculative(ImageDesc& desc, bool exact_format) {
+	return FindImageImpl(desc, exact_format, true);
+}
+
+ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1294,7 +1337,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				view_mip                = -1;
 				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+				const auto  overlap =
+				    ResolveOverlap(merged_info, desc.type, candidate, result, speculative);
+				if (overlap.rejected) {
+					return {};
+				}
 				if (overlap.image) {
 					result     = overlap.image;
 					view_mip   = overlap.mip;
@@ -1964,6 +2011,20 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	return !FindImagesInRegion(address, size, false).empty();
+}
+
+bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty()) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {

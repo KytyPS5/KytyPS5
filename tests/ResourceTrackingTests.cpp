@@ -207,7 +207,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t table_offset = 0,
-                         uint32_t table_shader_offset = 0, bool nested = false) {
+                         uint32_t table_shader_offset = 0, bool nested = false,
+                         uint32_t heap_mask = UINT32_MAX) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -245,6 +246,8 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
       fixture->Emit(ValueOpcode::ReadConstBuffer, {material, member},
                     fixture->AddMemory(material_scalar, 0x10d8));
   auto heap_offset = fixture->Emit(ValueOpcode::IMul32, {key, Value(table_stride)});
+  if (heap_mask != UINT32_MAX)
+    heap_offset = fixture->Emit(ValueOpcode::BitwiseAnd32, {heap_offset, Value(heap_mask)});
   if (table_shader_offset != 0u)
     heap_offset = fixture->Emit(ValueOpcode::IAdd32, {heap_offset, Value(table_shader_offset)});
   std::array<Value, 8> image_words;
@@ -3198,6 +3201,81 @@ void TestConservativeBufferReachability() {
   }
 }
 
+void TestBindlessImageTable() {
+  // A key the host cannot probe binds every distinct T# of the table, as GTA V (PPSA04263)
+  // CS 0xc6c91cf1882cdc3b samples material textures by a GPU-written index, masking the
+  // table offset with 0x1fffffe0.
+  auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, 0x1fffffe0u);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 9> user_data{0x1000u, 224u << 16u, 2u, 0u, 0x2000u,
+                                    0u,      128u,        0u, 7u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> first{};
+  first[0] = 0x20u;
+  first[1] = static_cast<uint32_t>(
+                 Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+             << 20u;
+  first[2] = 3u | (3u << 14u);
+  first[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+             (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+              << 28u);
+  auto second = first;
+  second[0] = 0x40u;
+  const auto entry = [&](uint32_t index) {
+    return memory.words.begin() + (0x2000u - memory.base) / 4u + index * 8u;
+  };
+  std::copy(first.begin(), first.end(), entry(0));
+  std::copy(first.begin(), first.end(), entry(1));
+  std::copy(second.begin(), second.end(), entry(3));
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto mapping_of = [&](const ResourceSpecialization &value) {
+    const auto offset = value.images[0].table_mapping_offset;
+    return std::vector<uint32_t>(snapshot.flattened_srt.begin() + offset,
+                                 snapshot.flattened_srt.begin() + offset + 5u);
+  };
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.image_tables.size() == 1 &&
+            snapshot.image_tables[0].slots.size() == 3 &&
+            std::equal(first.begin(), first.end(),
+                       snapshot.image_tables[0].slots[1].dwords.begin()) &&
+            std::equal(second.begin(), second.end(),
+                       snapshot.image_tables[0].slots[2].dwords.begin()) &&
+            mapping_of(specialization) == std::vector<uint32_t>{4u, 1u, 1u, 0u, 2u} &&
+            specialization.images[0].table == 0 &&
+            specialization.images[0].table_capacity == 256u &&
+            specialization.images[0].table_entry_mask == 0x00ffffffu &&
+            std::equal(first.begin(), first.end(), snapshot.images[0].dwords.begin()),
+        "bindless table did not deduplicate its T#s into slots");
+  const auto stable = specialization;
+  std::copy(first.begin(), first.end(), entry(3));
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.image_tables[0].slots.size() == 2 &&
+            mapping_of(specialization) == std::vector<uint32_t>{4u, 1u, 1u, 0u, 1u} &&
+            specialization == stable,
+        "bindless table refresh kept stale slots or changed the shader permutation");
+
+  ApplyResourceSpecialization(fixture->program, specialization);
+  EliminateDeadCode(fixture->program.blocks);
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture->program, {.compute = &compute});
+  AllocateBindings(fixture->program);
+  const auto kind = DescriptorBindingForImage(fixture->program.info.images[0]);
+  const auto *binding =
+      kind.has_value() ? FindBinding(fixture->program.bindings, *kind) : nullptr;
+  Check(binding != nullptr && binding->resources.size() == 1 &&
+            binding->tables.size() == 1 && binding->tables[0].capacity == 256u &&
+            binding->tables[0].root == 0 && binding->TableBase(0) == 1u &&
+            binding->ElementCount() == 257u &&
+            FindBinding(fixture->program.bindings, DescriptorBindingKind::FlattenedSrt) !=
+                nullptr,
+        "bindless table descriptors were not appended to the root's binding");
+}
+
 void TestConditionalIndirectImageMaterialization() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = MakeIndirectImageFixture(false);
@@ -3565,6 +3643,7 @@ int main() {
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+    Run("bindless image table", TestBindlessImageTable);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);

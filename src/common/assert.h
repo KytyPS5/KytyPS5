@@ -5,9 +5,28 @@
 #include "common/logging/log.h"
 
 #include <cstdlib>
+#include <stdexcept>
 #include <string_view>
 
 namespace Common {
+
+// While a SoftExitScope is enabled on this thread, fatal errors throw SoftExitError instead of
+// terminating, so a caller can reject one unit of work (e.g. an unsupported shader).
+class SoftExitError: public std::runtime_error {
+public:
+	using std::runtime_error::runtime_error;
+};
+
+class SoftExitScope {
+public:
+	explicit SoftExitScope(bool enable);
+	~SoftExitScope();
+	SoftExitScope(const SoftExitScope&)            = delete;
+	SoftExitScope& operator=(const SoftExitScope&) = delete;
+
+private:
+	bool m_enable;
+};
 
 #ifdef __clang__
 int DbgExitHandler(char const* file, int line, std::string_view text)

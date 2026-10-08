@@ -906,6 +906,7 @@ private:
 				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
 				    a.table_stride != b.table_stride ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
+				    a.table_mask != b.table_mask || a.table_array != b.table_array ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1062,8 +1063,14 @@ private:
 		return axis;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
+	// Matches key * stride + offset. With a mask output it also accepts an outermost
+	// ((key * stride) & mask) + offset, as a shader clamps a key's bits before indexing.
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride,
+	                      uint32_t* mask = nullptr) const {
 		offset = 0;
+		if (mask != nullptr) {
+			*mask = UINT32_MAX;
+		}
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
@@ -1082,7 +1089,20 @@ private:
 				else return false;
 				return stride != 0u && key.GetType() == Type::U32;
 			}
-			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
+			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && mask != nullptr &&
+			    *mask == UINT32_MAX) {
+				if (ImmediateU32(inst->Arg(1), immediate)) {
+					value = inst->Arg(0);
+				} else if (ImmediateU32(inst->Arg(0), immediate)) {
+					value = inst->Arg(1);
+				} else {
+					return false;
+				}
+				*mask = immediate;
+				continue;
+			}
+			// An addition inside the mask would be masked too.
+			if (inst->GetOpcode() != ValueOpcode::IAdd32 || (mask != nullptr && *mask != UINT32_MAX)) {
 				return false;
 			}
 			if (ImmediateU32(inst->Arg(0), immediate)) {
@@ -1623,7 +1643,8 @@ private:
 	bool MatchDescriptorTable(Inst& handle, const DescriptorSource& descriptor,
 	                          IndirectDescriptorPlan& plan,
 	                          DescriptorSource& table_source, Value& key, uint32_t& table_offset,
-	                          uint32_t& table_stride, uint32_t& table_immediate) {
+	                          uint32_t& table_stride, uint32_t& table_immediate,
+	                          uint32_t* table_mask = nullptr) {
 		Inst* table_handle = nullptr;
 		Value table_guard;
 		for (uint32_t dword = 0; dword < handle.NumArgs(); ++dword) {
@@ -1665,6 +1686,7 @@ private:
 			Value current_key;
 			uint32_t offset = 0;
 			uint32_t stride = 0;
+			uint32_t mask   = UINT32_MAX;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1672,7 +1694,9 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    (!indexed && !MatchTableOffset(read->Arg(1), current_key, offset, stride))) {
+			    (!indexed && !MatchTableOffset(read->Arg(1), current_key, offset, stride,
+			                                   table_mask != nullptr ? &mask : nullptr)) ||
+			    (dword != 0u && table_mask != nullptr && mask != *table_mask)) {
 				return false;
 			}
 			if (indexed) {
@@ -1686,6 +1710,7 @@ private:
 				table_offset = offset;
 				table_immediate = memory->offset;
 				table_stride = stride;
+				if (table_mask != nullptr) *table_mask = mask;
 			} else if (plan.table_indexed != indexed || table_stride != stride ||
 			           !EquivalentValue(m_program, key, current_key) ||
 			           uint64_t {table_offset} + table_immediate + dword * sizeof(uint32_t) !=
@@ -1723,20 +1748,23 @@ private:
 		uint32_t table_offset = 0;
 		uint32_t table_stride = 0;
 		uint32_t table_immediate = 0;
+		uint32_t table_mask = UINT32_MAX;
 		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset,
-		                          table_stride, table_immediate)) return false;
+		                          table_stride, table_immediate, &table_mask)) return false;
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
 		indirect.table_immediate = table_immediate;
 		indirect.table_stride = table_stride;
+		indirect.table_mask   = table_mask;
 		indirect.workgroup_axis = WorkgroupAxis(key);
-		if (indirect.workgroup_axis != UINT32_MAX && !plan.table_indexed) {
+		// A masked table maps key & mask to its T#s; the workgroup projection would drop the mask.
+		if (indirect.workgroup_axis != UINT32_MAX && !plan.table_indexed && table_mask == UINT32_MAX) {
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.retain_reads = true;
 		} else if (table_source.dword_count == 2u) {
-			if (table_stride != 32u) return false;
+			if (table_stride != 32u || table_mask != UINT32_MAX) return false;
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
 			    selector->NumArgs() == 1u && !m_shader_writes &&
@@ -1754,17 +1782,47 @@ private:
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 		} else {
-			// A bounded V# supplies the complete image table. Leave every GPU selector
-			// and descriptor read in the shader; the host only translates table bytes.
-			if (plan.split_offsets) return false;
-			indirect.table_stride = 0u;
-			indirect.table_offset = 0u;
-			indirect.table_immediate = 0u;
-			indirect.workgroup_axis = UINT32_MAX;
-			plan.table_read = plan.reads[0];
-			if (plan.table_indexed) indirect.table_record_bytes = table_immediate + 32u;
-			else indirect.table_scalar = true;
-			plan.retain_reads = true;
+			// A 32-byte T# table read through scalar loads at (key * 32) & mask, such as a bindless
+			// heap indexed by a material word or by a bitfield of GPU-written material data: bind
+			// every T# of the table and let the shader map entry key & mask to its descriptor. This
+			// reads only the table, never the material data. The direct image-table lookup below
+			// would make each distinct T# its own specialized image instead: GTA V's ray tracing
+			// heaps hold thousands of T#s (and words that only look like T#s), and a specialization
+			// with one image per material T# took the driver minutes to compile.
+			const auto* address = !plan.table_indexed && plan.reads[0] != nullptr
+			                          ? plan.reads[0]->Arg(1).Resolve().TryInstruction() : nullptr;
+			const auto* key_read = key.Resolve().TryInstruction();
+			uint32_t    key_memory_index = 0;
+			const auto* key_memory =
+			    key_read != nullptr ? ScalarReadMemory(*key_read, key_memory_index) : nullptr;
+			const auto table_base = uint64_t {table_offset} + table_immediate;
+			const bool table_array =
+			    indirect.workgroup_axis == UINT32_MAX && table_stride == 32u &&
+			    (key_memory == nullptr || key_memory->offset <= INT32_MAX) &&
+			    table_base <= UINT32_MAX && (table_base & 31u) == 0u && address != nullptr &&
+			    std::ranges::all_of(plan.reads, [&](const Inst* read) {
+				    return read != nullptr && UsesOnlyImageDescriptors(*read);
+			    }) &&
+			    std::ranges::all_of(address->Uses(), [&](const Use& use) {
+				    return std::ranges::find(plan.reads, use.user) != plan.reads.end();
+			    });
+			if (table_array) {
+				indirect.table_offset    = static_cast<uint32_t>(table_base);
+				indirect.table_immediate = 0u;
+				indirect.table_array     = true;
+			} else {
+				// A bounded V# supplies the complete image table. Leave every GPU selector
+				// and descriptor read in the shader; the host only translates table bytes.
+				if (plan.split_offsets) return false;
+				indirect.table_stride = 0u;
+				indirect.table_offset = 0u;
+				indirect.table_immediate = 0u;
+				indirect.workgroup_axis = UINT32_MAX;
+				plan.table_read = plan.reads[0];
+				if (plan.table_indexed) indirect.table_record_bytes = table_immediate + 32u;
+				else indirect.table_scalar = true;
+				plan.retain_reads = true;
+			}
 		}
 
 		if (plan.retain_reads) plan.reads.fill(nullptr);

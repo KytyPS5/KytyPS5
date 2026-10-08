@@ -21,6 +21,10 @@ public:
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
 
+	// Sampled images of one pool; bindless image tables take tens of thousands of them per set
+	// (GTA V's ray tracing table: ~82000).
+	static constexpr uint32_t MaxSampledImages = 262144;
+
 private:
 	static constexpr uint32_t DescriptorSetBatch = 32;
 

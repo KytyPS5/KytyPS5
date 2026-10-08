@@ -221,7 +221,7 @@ void DefineDescriptors(EmitterState& state) {
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
 			    spv::OpTypeArray, type,
-			    ConstantU32(state, static_cast<uint32_t>(binding.resources.size())));
+			    ConstantU32(state, binding.ElementCount()));
 		};
 		switch (binding.kind) {
 			case IR::DescriptorBindingKind::Buffers:
@@ -292,6 +292,14 @@ void DefineDescriptors(EmitterState& state) {
 				state.image_variables[IR::ImageBindingIndex(binding.kind)] =
 				    Define(ArrayType(ImageType(state, image)), name.c_str(),
 				           spv::StorageClassUniformConstant);
+				if (!binding.tables.empty()) {
+					// Bindless table descriptors are indexed per lane.
+					state.builder.RequireVersion(0x00010500u);
+					state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+					state.builder.RequireCapability(spv::CapabilitySampledImageArrayDynamicIndexing);
+					state.builder.RequireCapability(
+					    spv::CapabilitySampledImageArrayNonUniformIndexing);
+				}
 				if (image.dimension == ImageDimension::Dim1D ||
 				    image.dimension == ImageDimension::Dim1DArray) {
 					state.builder.RequireCapability(image.resource_class ==

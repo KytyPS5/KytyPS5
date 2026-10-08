@@ -39337,7 +39337,6 @@ void CheckImageSamplerSpecialization() {
                                EncodeVop1(0x02, 20, Vgpr(15)), EncodeVopc(0xd2, 20, 15)});
     code.insert(code.end(), {EncodeSop2(0x1e, 20, 20, InlineU32(5)),
                              EncodeSmem0(0x0b, 12), EncodeSmem1(0, 20)});
-    const auto table_read_end = code.size();
     code.insert(code.end(), {EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 3, 2)});
     AppendBufferStoreDword(&code, 4, 0);
     if (!scalar) {
@@ -39389,62 +39388,19 @@ void CheckImageSamplerSpecialization() {
     ResourceSpecialization specialization;
     const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
                              .userdata = &memory, .read_specialization_memory = ReadTestMemory};
-    Require(name, "bounded native material plan",
-            plan.capture_specialization_reads && !translated.program.has_address_writes &&
+    // GPU-selected material T#s bind the whole T# table (bindless) instead of expanding the
+    // bounded material keys: GTA V's ray tracing shaders select among ~500 material T#s, and
+    // one image per key took the driver minutes to compile.
+    Require(name, "bindless table material plan",
+            !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
-            "GPU-selected material descriptors did not expand beyond native root capacity");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
-    const auto ordinal = [&](u32 byte_offset) {
-      const auto word = byte_offset >> 2u;
-      return word < snapshot.flattened_srt[offset]
-                 ? snapshot.flattened_srt[offset + 1u + word] : 0u;
-    };
-    Require(name, "dense table map and coherent snapshot",
-            specialization.images[0].indirect_search_iterations == 0u &&
-                snapshot.flattened_srt[offset] == (count - 1u) * 8u + 1u &&
-                ordinal(32u) != 0u &&
-                ordinal(count * 32u) == 0u && snapshot.images[0].dwords[0] == 0u &&
-                snapshot.specialization_reads ==
-                    std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
-            "image table lost its dense offsets, explicit null or single coherent read");
-    const auto previous = specialization;
-    memory[table_base / 4u + 8u] += 0x10000u;
-    Require(name, "runtime descriptor refresh",
-            MaterializeResources(plan, runtime, snapshot, specialization) &&
-                specialization == previous && snapshot.images[ordinal(32u)].dwords[0] == 0x11100u,
-            "descriptor addresses were frozen or entered the shader specialization");
+                !specialization.images.empty() &&
+                std::ranges::any_of(specialization.images,
+                                    [](const auto &image) { return image.table_capacity != 0u; }) &&
+                snapshot.image_tables.size() == 1u &&
+                snapshot.image_tables[0].mapping.size() == count + 1u,
+            "GPU-selected material descriptors did not bind the T# table");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
-    ValidateSpirv(name, compiled.spirv);
-    if (!scalar) {
-      user_data[4] += 1u;
-      Require(name, "GPU material reads remain on GPU",
-              MaterializeResources(plan, runtime, snapshot, specialization) &&
-                  specialization == previous && snapshot.specialization_reads ==
-                      std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
-              "GPU material addressing reentered host descriptor selection");
-      user_data[4] -= 1u;
-    }
-    auto dirty = runtime;
-    dirty.read_specialization_memory = +[](void*, uint64_t, std::span<u32>) { return false; };
-    Require(name, "unreadable image table rejection",
-            !MaterializeResources(plan, dirty, snapshot, specialization),
-            "GPU-selected texture materialization bypassed strict read provenance");
-    if (scalar) {
-      code.insert(code.begin() + table_read_end, EncodeVop1(0x01, 18, 12));
-      code.pop_back();
-      AppendBufferStoreDword(&code, 18, 0);
-      code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
-      AppendEnd(&code);
-    } else {
-      code[2] = EncodeSopp(0x00, 0); // GPU selectors do not need a host nonempty-EXEC witness.
-    }
-    auto retained = ShaderRecompiler::TranslateProgram(code, options);
-    auto retained_plan = ExtractResourcePlan(retained.program);
-    Require(name, "retained descriptor consumers",
-            MaterializeResources(retained_plan, runtime, snapshot, specialization),
-            "retained GPU descriptor reads could not use the shared image table");
-    compiled = ShaderRecompiler::CompileProgram(std::move(retained), options, specialization);
     ValidateSpirv(name, compiled.spirv);
   }
 

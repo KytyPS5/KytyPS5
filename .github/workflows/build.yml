@@ -137,6 +137,7 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
+    if: false # disabled in this fork: Windows build only
     needs: metadata
     runs-on: macos-15
 
@@ -291,6 +292,7 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
+    if: false # disabled in this fork: Windows build only
     needs: metadata
     runs-on: ubuntu-24.04
 

@@ -11,6 +11,8 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -26,6 +28,7 @@ struct ImageMetadataInfo {
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
 	uint32_t            control              = 0;
 	uint32_t            clear_word           = 0;
+	uint32_t            clear_word1          = 0;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
@@ -455,6 +458,75 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 			next.float32[3] = static_cast<float>((packed >> 30u) & 0x3u) / 3.0f;
 			break;
 		default: return false;
+	}
+	clear = next;
+	return true;
+}
+
+// KYTY_CLEAR_REGISTER_WIDE=1: register fast clears for formats whose pixel is not exactly the
+// first 32-bit CB_COLORn_CLEAR_WORD0 as handled by DecodePackedColorClear: 64-bit pixels
+// (R16G16B16A16, R32G32) use WORD0 and WORD1, and R8, R8G8 and B10G11R11 were dropped.
+[[nodiscard]] inline bool DecodeRegisterColorClear(vk::Format format, uint32_t word0,
+                                                   uint32_t word1, vk::ClearColorValue& clear) {
+	static const bool wide = [] {
+		const char* v = std::getenv("KYTY_CLEAR_REGISTER_WIDE");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (!wide) {
+		return DecodePackedColorClear(format, word0, clear);
+	}
+	const auto float16 = [](uint32_t value) {
+		const auto sign     = (value & 0x8000u) << 16u;
+		const auto exponent = (value >> 10u) & 0x1fu;
+		const auto mantissa = value & 0x3ffu;
+		if (exponent == 0) {
+			return std::copysign(static_cast<float>(mantissa) * 0x1p-24f,
+			                     std::bit_cast<float>(sign));
+		}
+		return std::bit_cast<float>(sign | ((exponent == 31 ? 255u : exponent + 112u) << 23u) |
+		                            (mantissa << 13u));
+	};
+	// Unsigned small float with 5 exponent bits and the given mantissa width.
+	const auto ufloat = [](uint32_t exponent, uint32_t mantissa, uint32_t mantissa_bits) {
+		if (exponent == 0) {
+			return static_cast<float>(mantissa) * std::ldexp(1.0f, -14 - static_cast<int>(mantissa_bits));
+		}
+		if (exponent == 31) {
+			return mantissa == 0 ? std::numeric_limits<float>::infinity()
+			                     : std::numeric_limits<float>::quiet_NaN();
+		}
+		return std::ldexp(1.0f + static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits),
+		                  static_cast<int>(exponent) - 15);
+	};
+	vk::ClearColorValue next {};
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+			next.float32[0] = float16(word0);
+			next.float32[1] = float16(word0 >> 16u);
+			next.float32[2] = float16(word1);
+			next.float32[3] = float16(word1 >> 16u);
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[0] = static_cast<float>(word0 & 0xffffu) / 65535.0f;
+			next.float32[1] = static_cast<float>(word0 >> 16u) / 65535.0f;
+			next.float32[2] = static_cast<float>(word1 & 0xffffu) / 65535.0f;
+			next.float32[3] = static_cast<float>(word1 >> 16u) / 65535.0f;
+			break;
+		case vk::Format::eR32G32Sfloat:
+			next.float32[0] = std::bit_cast<float>(word0);
+			next.float32[1] = std::bit_cast<float>(word1);
+			break;
+		case vk::Format::eR8Unorm: next.float32[0] = static_cast<float>(word0 & 0xffu) / 255.0f; break;
+		case vk::Format::eR8G8Unorm:
+			next.float32[0] = static_cast<float>(word0 & 0xffu) / 255.0f;
+			next.float32[1] = static_cast<float>((word0 >> 8u) & 0xffu) / 255.0f;
+			break;
+		case vk::Format::eB10G11R11UfloatPack32:
+			next.float32[0] = ufloat((word0 >> 6u) & 0x1fu, word0 & 0x3fu, 6);
+			next.float32[1] = ufloat((word0 >> 17u) & 0x1fu, (word0 >> 11u) & 0x3fu, 6);
+			next.float32[2] = ufloat((word0 >> 27u) & 0x1fu, (word0 >> 22u) & 0x1fu, 5);
+			break;
+		default: return DecodePackedColorClear(format, word0, clear);
 	}
 	clear = next;
 	return true;

@@ -137,20 +137,41 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
+	auto             result       = static_cast<vk::Result>(
+        vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+                       &alloc_info, &native_image, &image.allocation, nullptr));
 	if (result != vk::Result::eSuccess) {
-		std::printf("vmaCreateImage failed: %s (%d), extent=%ux%ux%u format=%d levels=%u layers=%u\n",
+		std::printf("vmaCreateImage failed: %s (%d), extent=%ux%ux%u format=%d levels=%u "
+		            "layers=%u; retrying without requiring device-local memory\n",
 		            vk::to_string(result).c_str(), static_cast<int>(result), image_info.extent.width,
 		            image_info.extent.height, image_info.extent.depth,
 		            static_cast<int>(image_info.format), image_info.mipLevels,
 		            image_info.arrayLayers);
 		std::fflush(stdout);
 		LogMemoryBudget();
-		return false;
+
+		// Fallback: let VMA pick any memory type (device-local preferred). A hard DEVICE_LOCAL
+		// requirement can fail even when VRAM looks free (driver/OS budget limits, allocation
+		// count limits, or a heap that does not report DEVICE_LOCAL on some GPUs).
+		VmaAllocationCreateInfo fallback_info {};
+		fallback_info.usage         = VMA_MEMORY_USAGE_AUTO;
+		fallback_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		native_image                = VK_NULL_HANDLE;
+		image.allocation            = nullptr;
+		result                      = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+            &fallback_info, &native_image, &image.allocation, nullptr));
+		if (result != vk::Result::eSuccess) {
+			std::printf("vmaCreateImage fallback failed: %s (%d)\n", vk::to_string(result).c_str(),
+			            static_cast<int>(result));
+			std::fflush(stdout);
+			image.image = nullptr;
+			return false;
+		}
+		std::printf("vmaCreateImage fallback succeeded\n");
+		std::fflush(stdout);
 	}
+	image.image = native_image;
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;

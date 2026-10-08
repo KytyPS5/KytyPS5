@@ -471,8 +471,23 @@ uint32_t Image::CopyExtent(uint32_t source, uint32_t destination, uint32_t sourc
 	}
 	// Copy regions are measured in source texels and scaled by the block ratio on the
 	// destination, so keep the region inside both images.
-	const auto fit = static_cast<uint64_t>(destination) * source_block / destination_block;
-	return static_cast<uint32_t>(std::min<uint64_t>(source, fit));
+	const auto fit    = static_cast<uint64_t>(destination) * source_block / destination_block;
+	const auto extent = static_cast<uint32_t>(std::min<uint64_t>(source, fit));
+	if (extent % source_block == 0) {
+		return extent;
+	}
+	// A region may end inside a block only at the edge of an image. Keep a partial source block
+	// when it is the source edge and the destination region is whole blocks or ends at its edge.
+	if (extent == source) {
+		const uint64_t written = source_block == destination_block
+		                             ? extent
+		                             : (static_cast<uint64_t>(extent) + source_block - 1) /
+		                                   source_block * destination_block;
+		if (written == destination || (written < destination && written % destination_block == 0)) {
+			return extent;
+		}
+	}
+	return extent - extent % source_block;
 }
 
 uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) noexcept {
@@ -527,6 +542,9 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 		const auto height = CopyExtent(std::max(source.backing.extent.height >> level, 1u),
 		                               std::max(backing.extent.height >> level, 1u), source_block,
 		                               destination_block);
+		if (width == 0 || height == 0) {
+			continue;
+		}
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;

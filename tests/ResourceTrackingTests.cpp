@@ -3114,8 +3114,7 @@ void TestBoundedSrtTrackingProofBoundaries() {
                         BoundedSrtScenario::UnknownBound,
                         BoundedSrtScenario::ReadBeforeGuard, BoundedSrtScenario::WrongSuccessEdge,
                         BoundedSrtScenario::NonlinearOffset, BoundedSrtScenario::DynamicPointer,
-                        BoundedSrtScenario::GuardedPointerLoad, BoundedSrtScenario::MixedDescriptorColumns,
-                        BoundedSrtScenario::VertexStage}) {
+                        BoundedSrtScenario::GuardedPointerLoad, BoundedSrtScenario::MixedDescriptorColumns}) {
     auto fixture = MakeBoundedSrtTrackingFixture(scenario);
     BuildSrtPlan(fixture.fixture->program);
     CheckFatal([&] { TrackResources(fixture.fixture->program); },
@@ -3125,10 +3124,10 @@ void TestBoundedSrtTrackingProofBoundaries() {
               fixture.fixture->program.descriptor_sources.empty(),
           "rejected scalar descriptor loop mutated the tracked resource plan");
   }
-  std::cout << "bounded SRT rejection boundaries passed: 10\n";
+  std::cout << "bounded SRT rejection boundaries passed: 9\n";
   for (auto scenario : {BoundedSrtScenario::Valid, BoundedSrtScenario::ReversedGuard,
                         BoundedSrtScenario::WrappedOffset, BoundedSrtScenario::SparseBlockIds,
-                        BoundedSrtScenario::SignedGuard}) {
+                        BoundedSrtScenario::SignedGuard, BoundedSrtScenario::VertexStage}) {
     auto fixture = MakeBoundedSrtTrackingFixture(scenario);
     fixture.fixture->PlanAndTrack();
     const auto &program = fixture.fixture->program;
@@ -7071,8 +7070,8 @@ void CheckBoundedSrtSplitHeader(bool memory_bound) {
   }
 }
 
-void TestPixelBoundedFormattedDescriptorLoop() {
-  Fixture fixture(ShaderType::Pixel);
+void CheckGraphicsBoundedDescriptorLoop(ShaderType stage, bool raw_byte) {
+  Fixture fixture(stage);
   auto* entry=fixture.block;auto* header=fixture.AddBlock();
   auto* body=fixture.AddBlock();auto* exit=fixture.AddBlock();
   entry->AddBranch(header);body->AddBranch(header);
@@ -7094,15 +7093,17 @@ void TestPixelBoundedFormattedDescriptorLoop() {
     words[word]=fixture.Emit(ValueOpcode::ReadConstBuffer,{table,offset},fixture.AddMemory(read,0x50u),body);
   }
   const auto handle=fixture.Emit(ValueOpcode::GetBufferResource,{words[0],words[1],words[2],words[3]},MemoryFlags{0,0x60u},body);
-  const auto value=fixture.Emit(ValueOpcode::LoadBufferU32,{handle,Value(0u),Value(0u),Value(0u),Value(true)},
-      fixture.AddMemory({.kind=ResourceKind::Buffer,.formatted=true},0x60u),body);
-  fixture.Emit(ValueOpcode::ReferenceU32,{value},0,body);
+  const auto value=fixture.Emit(raw_byte?ValueOpcode::LoadBufferU8:ValueOpcode::LoadBufferU32,{handle,Value(0u),Value(0u),Value(0u),Value(true)},
+      fixture.AddMemory({.kind=ResourceKind::Buffer,.formatted=!raw_byte,.data_bits=raw_byte?8u:32u},0x60u),body);
+  const auto observed=raw_byte?fixture.Emit(ValueOpcode::ConvertU32U8,{value},0,body):value;
+  fixture.Emit(ValueOpcode::ReferenceU32,{observed},0,body);
   fixture.PlanAndTrack();
   Check(fixture.program.info.buffers.size()==1u && fixture.program.info.buffer_tables.empty(),
         "pixel loop did not retain its logical descriptor source before materialization");
   auto plan=ExtractResourcePlan(fixture.program);
   const auto table_format=uint32_t(Libs::Graphics::Prospero::BufferFormat::k32UInt)<<12u;
-  const auto payload_format=uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float)<<12u;
+  const auto format=raw_byte?Libs::Graphics::Prospero::BufferFormat::k8UInt:Libs::Graphics::Prospero::BufferFormat::k32Float;
+  const auto payload_format=uint32_t(format)<<12u;
   const std::array<uint32_t,5> data{0x1000u,0u,1024u,table_format,3u};
   BoundedSnapshotReader reader;
   for(uint32_t row=0;row<3u;++row){
@@ -7117,7 +7118,7 @@ void TestPixelBoundedFormattedDescriptorLoop() {
             specialization.buffer_tables.size()==1u && specialization.buffer_tables[0].count==3u,
         "pixel table lost its count, coherent snapshot or exact descriptor footprint");
   for(const auto& descriptor:snapshot.buffers)
-    Check(((descriptor.dwords[3]>>12u)&0x7fu)==uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float),
+    Check(((descriptor.dwords[3]>>12u)&0x7fu)==uint32_t(format),
           "pixel table lost the formatted payload class");
   const auto saved_snapshot=snapshot;
   const auto saved_specialization=specialization;
@@ -7133,6 +7134,18 @@ void TestPixelBoundedFormattedDescriptorLoop() {
   Check(empty_reader.reads.empty() && empty_reader.ordinary_reads==0u &&
             specialization.buffer_tables.size()==1u && specialization.buffer_tables[0].count==0u,
         "zero-trip pixel descriptor loop read payloads or retained stale rows");
+}
+
+void TestPixelBoundedFormattedDescriptorLoop() { CheckGraphicsBoundedDescriptorLoop(ShaderType::Pixel,false); }
+void TestVertexBoundedByteDescriptorLoop() {
+  CheckGraphicsBoundedDescriptorLoop(ShaderType::Vertex,true);
+  Fixture workgroup(ShaderType::Vertex);
+  const auto handle=workgroup.Address(workgroup.UserData(0u),workgroup.UserData(1u));
+  const auto index=workgroup.Emit(ValueOpcode::GetBuiltin,{Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)),Value(0u)});
+  const auto read=workgroup.Emit(ValueOpcode::LoadAddressU32,{handle,index,Value(0u),Value(true)},
+      workgroup.AddMemory({.kind=ResourceKind::ScalarAddress},0x10u));
+  Check(!ProveBoundedSrtRead(workgroup.program,*read.ResolveInstruction()),
+        "vertex workgroup selector escaped compute-only proof restriction");
 }
 
 void TestBoundedSrtSplitHeaderUniformCount() { CheckBoundedSrtSplitHeader(false); }
@@ -7944,8 +7957,7 @@ void TestFiniteSelectorSrtProof() {
         "finite selector pruned an undefined lane0 value under possibly empty EXEC");
   for (auto scenario : {FiniteSelectorScenario::UnknownArm, FiniteSelectorScenario::UndefArm,
                         FiniteSelectorScenario::CyclicPhi, FiniteSelectorScenario::ConditionalRoot,
-                        FiniteSelectorScenario::MixedColumns, FiniteSelectorScenario::MixedIndex,
-                        FiniteSelectorScenario::VertexStage}) {
+                        FiniteSelectorScenario::MixedColumns, FiniteSelectorScenario::MixedIndex}) {
     auto test = MakeFiniteSelectorFixture(scenario);
     auto& program = test.fixture->program;
     if (scenario != FiniteSelectorScenario::MixedColumns && scenario != FiniteSelectorScenario::MixedIndex)
@@ -7958,9 +7970,9 @@ void TestFiniteSelectorSrtProof() {
               program.descriptor_sources.empty(),
           "rejected finite descriptor changed the committed resource plan");
   }
-  std::cout << "finite selector rejection boundaries passed: 8\n";
+  std::cout << "finite selector rejection boundaries passed: 7\n";
   for (auto scenario : {FiniteSelectorScenario::Select, FiniteSelectorScenario::Phi,
-                        FiniteSelectorScenario::CarryOffset}) {
+                        FiniteSelectorScenario::CarryOffset, FiniteSelectorScenario::VertexStage}) {
     auto test = MakeFiniteSelectorFixture(scenario);
     auto& program = test.fixture->program;
     const auto proof = ProveBoundedSrtRead(program, *test.words[0].ResolveInstruction());
@@ -7986,7 +7998,7 @@ void TestFiniteSelectorSrtProof() {
       Check(word.ResolveInstruction()->HasUses(),
             "finite descriptor snapshot lost an ordinary shader consumer during DCE");
   }
-  std::cout << "finite selector proof positives passed: 3\n";
+  std::cout << "finite selector proof positives passed: 4\n";
 }
 
 void TestFiniteSelectorSrtMaterialization() {
@@ -9146,6 +9158,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_FORMATTED_SCALAR_NESTED_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--vertex-bounded-byte-loop-only") == 0) {
+      TestVertexBoundedByteDescriptorLoop();
+      std::cout << "KYTY_VERTEX_BOUNDED_BYTE_LOOP_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--pixel-bounded-formatted-loop-only") == 0) {
       TestPixelBoundedFormattedDescriptorLoop();
       std::cout << "KYTY_PIXEL_BOUNDED_FORMATTED_LOOP_PASS\n";
@@ -9300,6 +9317,7 @@ int main(int argc, char** argv) {
       }
     };
     Run("pixel bounded formatted loop", TestPixelBoundedFormattedDescriptorLoop);
+    Run("vertex bounded byte loop", TestVertexBoundedByteDescriptorLoop);
     Run("GPU-selected raw buffers", TestGpuSelectedRawBufferAdmission);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);

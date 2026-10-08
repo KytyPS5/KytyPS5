@@ -713,6 +713,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compact-bounded-metadata-gpu-only)
 	set_tests_properties(compact_bounded_metadata PROPERTIES TIMEOUT 60)
 	set_tests_properties(compact_bounded_metadata_gpu PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+	add_test(NAME vertex_bounded_byte_loop
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --vertex-bounded-byte-loop-only)
+	add_test(NAME vertex_bounded_byte_loop_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vertex-bounded-byte-gpu-only)
+	set_tests_properties(vertex_bounded_byte_loop PROPERTIES TIMEOUT 60)
+	set_tests_properties(vertex_bounded_byte_loop_gpu PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	add_test(NAME pixel_bounded_formatted_loop
 		COMMAND $<TARGET_FILE:resource_tracking_tests> --pixel-bounded-formatted-loop-only)
 	add_test(NAME pixel_bounded_readonly_spirv

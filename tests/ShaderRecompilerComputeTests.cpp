@@ -47,6 +47,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -974,19 +975,23 @@ std::string Hex(u32 value) {
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
 
-void EnsureConfigInitialized() {
+void EnsureConfigInitialized(bool guest_memory = true) {
+  static Common::Subsystems subsystems;
   static bool config_initialized = false;
+  static bool guest_initialized = false;
   if (!config_initialized) {
-    static Common::Subsystems subsystems;
     Common::InitializeThreads();
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
+    config_initialized = true;
+  }
+  if (guest_memory && !guest_initialized) {
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
     ShaderInit();
-    config_initialized = true;
+    guest_initialized = true;
   }
 }
 
@@ -1454,6 +1459,7 @@ struct GraphicsCase {
   Prospero::ColorComponentMapping target_mapping;
   std::vector<u32> expected_mrt0;
   std::vector<u32> fragment_buffer_data;
+  std::vector<u32> vertex_buffer_data;
 };
 
 struct CompiledShader {
@@ -2228,13 +2234,20 @@ constexpr std::array ImmutableSrtScenarios {
     ImmutableSrtScenario{"pixel-buffer-overlap", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"pixel-buffer-atomic-overlap", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"pixel-buffer-overlap-ordered", "immutable SRT snapshot overlaps writable resource"},
-    ImmutableSrtScenario{"pixel-dma-write", "immutable SRT snapshot requires compute or pixel owners without DMA writes"},
+    ImmutableSrtScenario{"pixel-dma-write", "immutable SRT snapshot requires compute, pixel or vertex owners without DMA writes"},
     ImmutableSrtScenario{"vs-buffer-ps-snapshot-disjoint", "", true},
     ImmutableSrtScenario{"vs-buffer-ps-snapshot-overlap", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"vs-buffer-ps-snapshot-overlap-ordered", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"dma-read", "", true},
-    ImmutableSrtScenario{"dma-write", "immutable SRT snapshot requires compute or pixel owners without DMA writes"},
-    ImmutableSrtScenario{"vertex-snapshot", "immutable SRT snapshot requires compute or pixel owners without DMA writes"},
+    ImmutableSrtScenario{"dma-write", "immutable SRT snapshot requires compute, pixel or vertex owners without DMA writes"},
+    ImmutableSrtScenario{"vertex-snapshot", "", true},
+    ImmutableSrtScenario{"mesh-snapshot", "immutable SRT snapshot requires compute, pixel or vertex owners without DMA writes"},
+    ImmutableSrtScenario{"vertex-buffer-disjoint", "", true},
+    ImmutableSrtScenario{"vertex-buffer-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"vertex-buffer-overlap-ordered", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"ps-buffer-vs-snapshot-disjoint", "", true},
+    ImmutableSrtScenario{"ps-buffer-vs-snapshot-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"ps-buffer-vs-snapshot-overlap-ordered", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"buffer-disjoint", "", true},
     ImmutableSrtScenario{"buffer-stride-zero-disjoint", "", true},
     ImmutableSrtScenario{"buffer-stride-zero-overlap", "", true},
@@ -14040,6 +14053,7 @@ void CheckSampledHtileArrayClearDiscovery() {
   }
 
   void CheckImmutableSrtBindingCase(const char* mode) {
+    EnsureConfigInitialized();
     using namespace ShaderRecompiler::IR;
     constexpr const char* name = "ImmutableSrtBindingAdmission";
     const auto found = std::ranges::find_if(ImmutableSrtScenarios,
@@ -14049,9 +14063,10 @@ void CheckSampledHtileArrayClearDiscovery() {
     const auto scenario = *found;
     const std::string_view selected(mode);
     const bool image_writer = selected.starts_with("image-padding-");
-    const bool cross_stage = selected.starts_with("vs-buffer-ps-snapshot-");
+    const bool reversed_cross_stage = selected.starts_with("ps-buffer-vs-snapshot-");
+    const bool cross_stage = selected.starts_with("vs-buffer-ps-snapshot-") || reversed_cross_stage;
     const bool pixel_owner = selected.starts_with("pixel-");
-    const bool buffer_writer = selected.starts_with("buffer-") || selected.starts_with("pixel-buffer-") || cross_stage;
+    const bool buffer_writer = selected.starts_with("buffer-") || selected.starts_with("pixel-buffer-") || selected.starts_with("vertex-buffer-") || cross_stage;
     const bool stride_zero_writer = selected == "buffer-stride-zero-disjoint" ||
                                     selected == "buffer-stride-zero-overlap";
     const bool stride_zero_overlap = selected == "buffer-stride-zero-overlap";
@@ -14059,8 +14074,9 @@ void CheckSampledHtileArrayClearDiscovery() {
     const bool ordered_overlap = selected == "buffer-overlap-ordered" ||
                                  selected == "image-padding-selector-ordered" ||
                                  selected == "buffer-selector-ordered" || selected == "pixel-buffer-overlap-ordered" ||
-                                 selected == "vs-buffer-ps-snapshot-overlap-ordered";
-    const bool graphics = selected == "vertex-snapshot" || cross_stage;
+                                 selected == "vs-buffer-ps-snapshot-overlap-ordered" || selected == "ps-buffer-vs-snapshot-overlap-ordered" ||
+                                 selected == "vertex-buffer-overlap-ordered";
+    const bool graphics = selected.starts_with("vertex-") || cross_stage;
     constexpr uintptr_t base = 0x0000000205200000ull;
     constexpr uint64_t allocation_size = 0x20000u;
     constexpr uint64_t allocation_alignment = 0x10000u;
@@ -14100,7 +14116,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       auto& executor = context.GetRenderExecutor();
 
       Program program{};
-      program.stage = graphics ? ShaderType::Vertex : pixel_owner ? ShaderType::Pixel : ShaderType::Compute;
+      program.stage = reversed_cross_stage || pixel_owner ? ShaderType::Pixel : graphics ? ShaderType::Vertex : selected=="mesh-snapshot" ? ShaderType::Mesh : ShaderType::Compute;
       program.resource_tracking_complete = true;
       program.shader_info_complete = true;
       program.info.uses_dma = selected == "dma-read" || selected == "dma-write" || selected == "pixel-dma-write";
@@ -14183,13 +14199,13 @@ void CheckSampledHtileArrayClearDiscovery() {
       info.bindings=std::move(program.bindings);
       runtime.program=&info;
       Program pixel_program{};
-      pixel_program.stage=ShaderType::Pixel;
+      pixel_program.stage=reversed_cross_stage?ShaderType::Vertex:ShaderType::Pixel;
       pixel_program.resource_tracking_complete=true;
       pixel_program.shader_info_complete=true;
       if (cross_stage) pixel_program.info.bounded_srt_reads.push_back({1u,0u});
       AllocateBindings(pixel_program);
       CompiledShaderInfo pixel_info{};
-      pixel_info.stage=ShaderType::Pixel;
+      pixel_info.stage=pixel_program.stage;
       pixel_info.info=std::move(pixel_program.info);
       pixel_info.bindings=std::move(pixel_program.bindings);
       ShaderRecompiler::IR::ResourceSnapshot pixel_snapshot;
@@ -14201,13 +14217,15 @@ void CheckSampledHtileArrayClearDiscovery() {
       std::printf("KYTY_IMMUTABLE_SRT_READY %s\n",mode);
       std::fflush(stdout);
       if (graphics) {
-        auto bindings=RenderExecutorTestAccess::PrepareGraphicsBindings(executor,runtime,pixel_runtime,true);
+        auto bindings=reversed_cross_stage?RenderExecutorTestAccess::PrepareGraphicsBindings(executor,pixel_runtime,runtime,true):RenderExecutorTestAccess::PrepareGraphicsBindings(executor,runtime,pixel_runtime,true);
         if (scenario.allowed && cross_stage) {
-          Require(name,mode,bindings.vertex[0].buffers.size()==1u &&
-                    bindings.vertex[0].buffers[0].buffer!=nullptr &&
-                    bindings.vertex[0].buffers[0].range==buffer_size &&
-                    bindings.pixel->flattened_srt.buffer!=nullptr &&
-                    bindings.pixel->flattened_srt.range==sizeof(uint32_t),
+          const auto& writer=reversed_cross_stage?*bindings.pixel:bindings.vertex[0];
+          const auto& reader=reversed_cross_stage?bindings.vertex[0]:*bindings.pixel;
+          Require(name,mode,writer.buffers.size()==1u &&
+                    writer.buffers[0].buffer!=nullptr &&
+                    writer.buffers[0].range==buffer_size &&
+                    reader.flattened_srt.buffer!=nullptr &&
+                    reader.flattened_srt.range==sizeof(uint32_t),
                   "graphics companion writer or pixel immutable upload was omitted");
         }
       } else {
@@ -19935,27 +19953,43 @@ void CheckSampledHtileArrayClearDiscovery() {
               image_count == vertex_fixture->program.info.images.size() &&
                   sampler_count == vertex_fixture->program.info.samplers.size() &&
                   buffer_count == vertex_fixture->program.info.buffers.size() &&
-                  has_mapping,
+                  (has_mapping || (!test.vertex_buffer_data.empty() && vertex_fixture->resources.flattened_srt.empty())),
               "wide image fixture did not allocate every descriptor");
-      vertex_mapping_buffer = CreateStorageBuffer(
-          test.name, vertex_fixture->resources.flattened_srt,
-          vertex_fixture->resources.flattened_srt.size());
+      if (has_mapping) {
+        vertex_mapping_buffer = CreateStorageBuffer(
+            test.name, vertex_fixture->resources.flattened_srt,
+            vertex_fixture->resources.flattened_srt.size());
+      }
       if (buffer_count != 0) {
-        constexpr std::array<u32, 13> values{
-            1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 1u, 2u, 4u, 8u, 240u};
-        Require(test.name, "vertex buffer fixture", buffer_count == values.size(),
-                "synthetic vertex shader must read all thirteen buffers");
-        std::vector<u32> words(buffer_count * 64u, 0u);
-        for (size_t slot = 0; slot < buffer_count; ++slot)
-          words[slot * 64u] = values[slot];
-        vertex_data_buffer = CreateHostBuffer(
-            test.name, words.size() * sizeof(u32),
-            vk::BufferUsageFlagBits::eStorageBuffer, words);
-        buffer_infos.resize(buffer_count);
-        for (size_t slot = 0; slot < buffer_count; ++slot)
-          buffer_infos[slot] = {vertex_data_buffer.buffer,
-                                static_cast<vk::DeviceSize>(slot * 256u),
-                                sizeof(u32)};
+        if (!test.vertex_buffer_data.empty()) {
+          vertex_data_buffer=CreateHostBuffer(test.name,test.vertex_buffer_data.size()*sizeof(u32),
+              vk::BufferUsageFlagBits::eStorageBuffer,test.vertex_buffer_data);
+          const auto* buffers=ShaderRecompiler::IR::FindBinding(vertex_fixture->program.bindings,Kind::Buffers);
+          for(const auto resource:buffers->resources){
+            const auto& words=vertex_fixture->resources.buffers.at(resource).dwords;
+            const uint64_t base=uint64_t(words[0])|((uint64_t(words[1])&0xffffu)<<32u);
+            const uint64_t stride=(words[1]>>16u)&0x3fffu;
+            const uint64_t bytes=uint64_t(words[2])*(stride?stride:1u);
+            Require(test.name,"vertex payload bounds",bytes && base+bytes<=vertex_data_buffer.size,"vertex payload escaped fixture backing");
+            buffer_infos.push_back({vertex_data_buffer.buffer,base,bytes});
+          }
+        } else {
+          constexpr std::array<u32, 13> values{
+              1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 1u, 2u, 4u, 8u, 240u};
+          Require(test.name, "vertex buffer fixture", buffer_count == values.size(),
+                  "synthetic vertex shader must read all thirteen buffers");
+          std::vector<u32> words(buffer_count * 64u, 0u);
+          for (size_t slot = 0; slot < buffer_count; ++slot)
+            words[slot * 64u] = values[slot];
+          vertex_data_buffer = CreateHostBuffer(
+              test.name, words.size() * sizeof(u32),
+              vk::BufferUsageFlagBits::eStorageBuffer, words);
+          buffer_infos.resize(buffer_count);
+          for (size_t slot = 0; slot < buffer_count; ++slot)
+            buffer_infos[slot] = {vertex_data_buffer.buffer,
+                                  static_cast<vk::DeviceSize>(slot * 256u),
+                                  sizeof(u32)};
+        }
       }
       vk::DescriptorBufferInfo mapping_info{vertex_mapping_buffer.buffer, 0,
                                             vertex_mapping_buffer.size};
@@ -20211,6 +20245,9 @@ void CheckSampledHtileArrayClearDiscovery() {
                              0, 1, &vertex_descriptor_set, 0, nullptr);
     if (vertex_fixture != nullptr && vertex_bind.ShaderDataDwords() != 0) {
       ShaderRecompiler::IR::PushData push_data;
+      if (!test.vertex_buffer_data.empty())
+        std::copy(vertex_fixture->packed_user_data.begin(),vertex_fixture->packed_user_data.end(),
+                  push_data.dwords.begin()+vertex_bind.push_data_start_dword);
       for (u32 slot = 0; slot < vertex_bind.memory_offset_count; ++slot)
         push_data.dwords[vertex_bind.push_data_start_dword +
                          vertex_bind.memory_limit_dword + slot] = sizeof(u32);
@@ -22461,6 +22498,65 @@ GraphicsCase PixelBoundedFormattedLoop(u32 count) {
   const auto expected=std::bit_cast<u32>(float(count*(count+1u)/2u));
   test.expected_pixel={expected,expected,expected,expected};
   return test;
+}
+
+CompiledShader CompileVertexBoundedByteLoop(u32 count,u32 byte_offset,std::vector<u32>& backing) {
+  using namespace ShaderRecompiler::IR;
+  Program program{};program.stage=ShaderType::Vertex;program.wave_size=32u;
+  for(u32 n=0;n<4u;++n){program.block_storage.push_back(std::make_unique<Block>());program.blocks.push_back(program.block_storage.back().get());program.block_info.push_back({.id=n});}
+  auto* entry=program.blocks[0];auto* header=program.blocks[1];auto* body=program.blocks[2];auto* exit=program.blocks[3];
+  entry->AddBranch(header);header->AddBranch(body);header->AddBranch(exit);body->AddBranch(header);
+  program.block_info[0].terminator={.kind=ShaderRecompiler::CFG::TerminatorKind::Branch,.true_block=1u};
+  program.block_info[1].terminator={.kind=ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch,.true_block=2u,.false_block=3u,.merge_block=3u,.continue_block=2u,.loop_header=true};
+  program.block_info[2].terminator={.kind=ShaderRecompiler::CFG::TerminatorKind::Branch,.true_block=1u};
+  program.block_info[3].terminator.kind=ShaderRecompiler::CFG::TerminatorKind::Return;
+  const auto emit=[](Block* b,ValueOpcode op,std::initializer_list<Value> args){return Value(&b->AppendNewInst(op,args));};
+  std::array<Value,4> root;
+  for(u32 n=0;n<4u;++n)root[n]=emit(entry,ValueOpcode::GetUserData,{Value(static_cast<ScalarReg>(n))});
+  const auto table=emit(entry,ValueOpcode::GetBufferResource,{root[0],root[1],root[2],root[3]});
+  const auto limit=emit(entry,ValueOpcode::GetUserData,{Value(static_cast<ScalarReg>(4u))});
+  auto& index=header->AppendNewInst(ValueOpcode::Phi,{},uint64_t(Type::U32));
+  auto& sum=header->AppendNewInst(ValueOpcode::Phi,{},uint64_t(Type::U32));
+  const auto condition=emit(header,ValueOpcode::ULessThan32,{Value(&index),limit});
+  program.block_info[1].condition=condition;emit(header,ValueOpcode::Reference,{condition});
+  const auto offset=emit(body,ValueOpcode::IMul32,{Value(&index),Value(196u)});
+  const auto memory=[&](MemoryInfo info,u32 pc){const MemoryFlags flags{static_cast<u32>(program.memory_info.size()),pc};program.memory_info.push_back(info);uint64_t bits=0;std::memcpy(&bits,&flags,sizeof(flags));return bits;};
+  std::array<Value,4> words;
+  for(u32 n=0;n<4u;++n)words[n]=Value(&body->AppendNewInst(ValueOpcode::ReadConstBuffer,{table,offset},memory({.kind=ResourceKind::ScalarBuffer,.offset=16u+n*4u,.component_index=n,.component_count=4u},0x40u)));
+  const auto descriptor=emit(body,ValueOpcode::GetBufferResource,{words[0],words[1],words[2],words[3]});
+  const auto byte=Value(&body->AppendNewInst(ValueOpcode::LoadBufferU8,{descriptor,Value(0u),Value(0u),Value(0u),Value(true)},memory({.kind=ResourceKind::Buffer,.offset=byte_offset,.data_bits=8u},0x60u)));
+  const auto unsigned_byte=emit(body,ValueOpcode::ConvertU32U8,{byte});
+  const auto next_sum=emit(body,ValueOpcode::IAdd32,{Value(&sum),unsigned_byte});
+  const auto next_index=emit(body,ValueOpcode::IAdd32,{Value(&index),Value(1u)});
+  index.AddPhiOperand(entry,Value(0u));index.AddPhiOperand(body,next_index);
+  sum.AddPhiOperand(entry,Value(0u));sum.AddPhiOperand(body,next_sum);
+  const auto x=emit(exit,ValueOpcode::GetAttribute,{Value(0u),Value(0u)});
+  const auto y=emit(exit,ValueOpcode::GetAttribute,{Value(0u),Value(1u)});
+  const auto position=emit(exit,ValueOpcode::CompositeConstructU32x4,{x,y,Value(0u),Value(std::bit_cast<u32>(1.f))});
+  program.export_info.push_back({.kind=ExportTargetKind::Position,.target=0xcu,.index=0u,.en=0xfu});
+  program.export_info.push_back({.kind=ExportTargetKind::Parameter,.target=0x20u,.index=0u,.en=0xfu});
+  exit->AppendNewInst(ValueOpcode::SetAttribute,{position,Value(true)}).SetFlags<ExportFlags>({.index=0u});
+  const auto color=emit(exit,ValueOpcode::BitCastU32F32,{emit(exit,ValueOpcode::ConvertF32U32,{Value(&sum)})});
+  const auto rgba=emit(exit,ValueOpcode::CompositeConstructU32x4,{color,color,color,color});
+  exit->AppendNewInst(ValueOpcode::SetAttribute,{rgba,Value(true)}).SetFlags<ExportFlags>({.index=1u});
+  TrackResources(program);
+  auto plan=ExtractResourcePlan(program);
+  std::array<u32,5> data{512u,0u,1024u,BufferFormat(Prospero::BufferFormat::k32UInt)<<12u,count};
+  backing.assign(800u,0xdeadbeefu);
+  constexpr std::array<u32,3> values{17u,43u,199u};
+  for(u32 row=0;row<3u;++row){const std::array<u32,4> desc{2048u+row*256u,4u<<16u,1u,(BufferFormat(Prospero::BufferFormat::k8UInt)<<12u)|DstSel(4,5,6,7)};std::copy(desc.begin(),desc.end(),backing.begin()+(512u+16u+row*196u)/4u);backing[(2048u+row*256u)/4u]=0xab0000cdu|(values[row]<<8u);}
+  ResourceSnapshot snapshot;ResourceSpecialization specialization;
+  const SrtRuntime runtime{.user_data=data,.read_memory=ReadTestMemory,.userdata=&backing,.read_specialization_memory=ReadTestMemory};
+  Require("VertexBoundedByte","materialization",MaterializeResources(plan,runtime,snapshot,specialization),"vertex table materialization failed");
+  ShaderVertexInputInfo vertex_info{};vertex_info.resources_num=1u;vertex_info.wave_size=32u;
+  ShaderRecompiler::CompileOptions options;options.stage=ShaderType::Vertex;options.wave_size=32u;options.user_data=data;options.input_info.vertex=&vertex_info;
+  ShaderRecompiler::TranslateResult translated;translated.program=std::move(program);
+  auto result=ShaderRecompiler::CompileProgram(std::move(translated),options,specialization);
+  ValidateSpirv("VertexBoundedByte",result.spirv);
+  std::vector<u32> packed;
+  for(auto reg:result.program.bindings.user_data_registers)packed.push_back(snapshot.user_data.at(reg));
+  packed.resize(result.program.bindings.ShaderDataDwords());
+  return {std::move(result.spirv),std::move(result.program),std::move(snapshot),std::move(packed)};
 }
 
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test,
@@ -49079,7 +49175,12 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  EnsureConfigInitialized();
+  const bool admission_parent=argc==2 &&
+      (std::strcmp(argv[1],"--immutable-srt-binding-admission-only")==0 ||
+       std::strcmp(argv[1],"--scalar-selector-write-admission-only")==0);
+  // Child workers each need the real guest arena. The supervising process
+  // must not reserve another 13.5 GiB before they run sequentially.
+  EnsureConfigInitialized(!admission_parent);
   if (argc == 2 && std::strcmp(argv[1], "--ajm-at9-multistream-only") == 0) {
     CheckAjmAt9Multistream();
     return 0;
@@ -49516,6 +49617,16 @@ if (argc == 1) {
     test.fragment_code[test.fragment_code.size()-3u]=EncodeExp0(0u,1u);
     (void)CompileFragmentCase(test);
     return 1;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--vertex-bounded-byte-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    for(u32 count:{0u,1u,2u,3u})for(u32 offset:{1u,4u}){
+      auto test=GraphicsInterpolationExport();test.name="VertexBoundedByteReadback";
+      auto vertex=CompileVertexBoundedByteLoop(count,offset,test.vertex_buffer_data);
+      const std::array<u32,4> sums{0u,17u,60u,259u};const auto expected=std::bit_cast<u32>(float(offset==4u?0u:sums[count]));
+      test.expected_pixel={expected,expected,std::bit_cast<u32>(0.75f),std::bit_cast<u32>(1.f)};RunGraphicsCase(&vulkan,test,&vertex);
+    }
+    return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--performance-optimization-readback-only") == 0) {
     VulkanHarness vulkan;

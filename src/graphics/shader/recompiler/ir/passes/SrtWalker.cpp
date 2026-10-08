@@ -594,7 +594,7 @@ public:
 	explicit BoundedReadProof(const Program& program): m_program(program) {}
 
 	std::optional<BoundedSrtReadProof> Run(const Inst& read) {
-		if ((m_program.stage != ShaderType::Compute && m_program.stage != ShaderType::Pixel) ||
+		if ((m_program.stage != ShaderType::Compute && m_program.stage != ShaderType::Pixel && m_program.stage != ShaderType::Vertex) ||
 		    m_program.blocks.empty() || m_program.blocks.size() != m_program.block_info.size())
 			return {};
 		const auto opcode = read.GetOpcode();

@@ -897,8 +897,8 @@ void RenderExecutor::ValidateImmutableSrtBindings(
 		const auto& info = stage->program->info;
 		const bool snapshot_owner = !stage->resources->immutable_srt_ranges.empty();
 		if ((snapshot_owner && stage->program->stage != ShaderType::Compute &&
-		     stage->program->stage != ShaderType::Pixel) || info.writes_dma) {
-			EXIT("immutable SRT snapshot requires compute or pixel owners without DMA writes: stage=%u dma_write=%d\n",
+		     stage->program->stage != ShaderType::Pixel && stage->program->stage != ShaderType::Vertex) || info.writes_dma) {
+			EXIT("immutable SRT snapshot requires compute, pixel or vertex owners without DMA writes: stage=%u dma_write=%d\n",
 			     static_cast<uint32_t>(stage->program->stage), info.writes_dma);
 		}
 		if (stage->resources->buffers.size() != info.buffers.size() ||

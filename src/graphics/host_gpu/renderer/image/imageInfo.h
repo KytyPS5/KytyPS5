@@ -28,6 +28,7 @@ struct ImageMetadataInfo {
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
 	uint32_t            control              = 0;
 	uint64_t            clear_word           = 0;
+	vk::Format          clear_format         = vk::Format::eUndefined;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;

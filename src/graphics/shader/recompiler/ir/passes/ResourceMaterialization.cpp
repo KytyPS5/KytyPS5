@@ -335,8 +335,21 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			             UINT32_MAX + 1ull)) {
 				return false;
 			}
-			keys.resize(key_count);
-			std::iota(keys.begin(), keys.end(), 0u);
+			keys.clear();
+			uint32_t scanned = 0;
+			if (!indirect.selector_mask.IsEmpty()) {
+				// A bit scan selects keys from the set bits of its mask only; the other
+				// slots belong to records the shader never reads.
+				if (key_count > 32u || !clean.Evaluate(indirect.selector_mask, scanned))
+					return false;
+				if (key_count < 32u) scanned &= (1u << key_count) - 1u;
+				for (auto bits = scanned; bits != 0u; bits &= bits - 1u) {
+					keys.push_back(static_cast<uint32_t>(std::countr_zero(bits)));
+				}
+			} else {
+				keys.resize(key_count);
+				std::iota(keys.begin(), keys.end(), 0u);
+			}
 		} else if (!indirect.selector_first.IsEmpty()) {
 			ShaderBufferResource material;
 			uint32_t             first = 0, count = 0;

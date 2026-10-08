@@ -434,7 +434,7 @@ void TestBoundedImageViewEligibility() {
     plan.descriptor_sources.push_back(source);
   }
   plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
-  // A plain sample reads it with its own type, as the T# drives the hardware.
+  // A plain sample reads it with its own dimension, as the T# drives the hardware.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 2u &&
             snapshot.images[1].dwords == descriptor(0x30u, Type::kColor3D) &&
@@ -455,6 +455,20 @@ void TestBoundedImageViewEligibility() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected multisampled descriptor was sampled");
   sources[1] = volume;
+  // A record of another numeric class would need another sampler variant: refused too.
+  auto floating = descriptor(0x32u, Type::kColor2D);
+  floating[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                << 20u;
+  DescriptorSource other_class;
+  other_class.dword_count = 8u;
+  for (uint32_t word = 0; word < floating.size(); ++word)
+    other_class.dwords[word] = Value(floating[word]);
+  plan.descriptor_sources.push_back(other_class);
+  plan.descriptor_sources[image_source].indirect_descriptor->sources[1] =
+      static_cast<uint32_t>(plan.descriptor_sources.size() - 1u);
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "explicitly selected descriptor of another numeric class was sampled");
+  plan.descriptor_sources[image_source].indirect_descriptor->sources[1] = volume;
   // Derivatives are laid out for one dimension: the mixed table is refused.
   for (auto &memory : plan.memory_info) {
     if (memory.kind == ResourceKind::Image && memory.resource == 0u)

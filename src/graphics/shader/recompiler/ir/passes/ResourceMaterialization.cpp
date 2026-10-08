@@ -612,9 +612,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2DMsaa ||
 			       dimension == Decoder::ImageDimension::Dim2DMsaaArray;
 		};
-		// A plain sample reads the selected record with the record's own type, as the T#
-		// drives the hardware: records of another dimension or numeric class stay candidates.
-		// Derivatives, offsets and gathers are laid out for one dimension only.
+		// A plain sample reads the selected record with the record's own dimension, as the T#
+		// drives the hardware; derivatives, offsets and gathers are laid out for one dimension.
+		// Candidates keep one numeric class, which selects the table's sampler variant.
 		const auto& base_root    = program.info.images[root_index];
 		uint32_t    sample_flags = 0;
 		for (const auto& memory: program.memory_info) {
@@ -627,7 +627,6 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    !base_root.atomic &&
 		    (sample_flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagOffset |
 		                     Decoder::ImageSampleFlagGatherHorizontal)) == 0u;
-		const bool mixed_classes = mixed_dimensions && !base_root.depth_compare;
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -643,8 +642,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
-			if (is_msaa(image.dimension) ||
-			    (image.numeric_class != image_class.numeric_class && !mixed_classes) ||
+			if (is_msaa(image.dimension) || image.numeric_class != image_class.numeric_class ||
 			    (!same_coordinates && !mixed_dimensions &&
 			     !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||

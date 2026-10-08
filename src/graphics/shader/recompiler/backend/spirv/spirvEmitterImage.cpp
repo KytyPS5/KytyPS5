@@ -918,15 +918,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);
 			const auto sample = state.builder.AllocateId();
-			// A record of another numeric class is read as its own type, like the T# on
-			// hardware; its lanes reach the shader as raw bits.
-			const auto sample_type =
-			    dref ? result_type : ImageVectorType(state, candidate.numeric_class, 4);
-			state.builder.AddFunction(opcode, sample_type, sample, sampled, coord,
+			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
 			                          std::span<const uint32_t>(operands).first(operand_count));
-			return sample_type == result_type ? sample
-			                                  : Unary(state, spv::OpBitcast, result_type, sample);
+			return sample;
 		};
 		auto result = EmitImageAccess(ctx, inst, result_type, EmitSample);
 		if (!dref) {

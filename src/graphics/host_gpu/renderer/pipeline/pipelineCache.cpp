@@ -841,7 +841,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
+	const auto& vp           = ctx.GetScreenViewport();
+	const bool  y_inverted   = !ctx.GetClipControl().clip_disable && vp.viewports[0].yscale < 0.0f;
+	static_params.face       = y_inverted ? !mc.face : mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);

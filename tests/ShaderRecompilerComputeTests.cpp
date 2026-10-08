@@ -10856,6 +10856,38 @@ public:
         Require(name, "complete fill after partial fill",
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
+        // A texture view of the fast-cleared target sees the clear without a
+        // color bind.
+        paint();
+        fill_metadata(metadata_words);
+        {
+          ImageDesc sampled = color.desc;
+          sampled.type = BindingType::Texture;
+          sampled.info.metadata = {};
+          sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          RenderExecutorTestAccess::ResetBindings(executor);
+          const auto sampled_id = texture_cache.FindImage(sampled);
+          (void)texture_cache.FindTexture(sampled_id, sampled);
+          Require(name, "texture view reuses target image",
+                  sampled_id == color.image_id,
+                  "a texture view of the fast-cleared target created another "
+                  "image");
+          Require(
+              name, "texture view sees metadata clear",
+              read_texel() == expected,
+              "a texture binding read drawn texels of a fast-cleared target");
+        }
+        bind();
+        // The metadata fill of a programmed target clears it even without a
+        // draw; the second dispatch stands for any later GPU work.
+        paint();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        fill_metadata(metadata_words);
+        fill_metadata(metadata_words);
+        Require(name, "metadata fill clears without a draw",
+                read_texel() == expected,
+                "a metadata fill without a following draw left drawn texels");
+        bind();
 
         // Consuming a clear key updates metadata backing without invalidating
         // a pooled image whose first texel precedes the metadata range.

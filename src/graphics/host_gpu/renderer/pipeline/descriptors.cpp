@@ -905,6 +905,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
+		} else {
+			texture_cache.MaterializeViewClear(images[i].image_id, images[i].desc);
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();

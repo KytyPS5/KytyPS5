@@ -144,6 +144,9 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 struct ReadCapture {
 	SrtRuntime                                  source;
 	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
+	std::vector<uint32_t>&                      slots;
+	// Set by the walkers around the load of a flattened scalar read.
+	uint32_t                                    slot = NoSrtSlot;
 };
 
 bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -152,6 +155,7 @@ bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> val
 		return false;
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
+	capture.slots.push_back(capture.slot);
 	return true;
 }
 
@@ -163,6 +167,7 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
+	capture.slots.push_back(capture.slot);
 	return true;
 }
 
@@ -1077,10 +1082,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;
 	reads.clear();
-	ReadCapture capture {runtime, reads};
+	snapshot.specialization_read_slots.clear();
+	ReadCapture capture {runtime, reads, snapshot.specialization_read_slots};
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
 		observed.userdata = &capture;
+		observed.read_slot = &capture.slot;
 		observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
 		                                         ? CaptureStrictRead : nullptr;
 		observed.read_memory = CaptureOrdinaryRead;

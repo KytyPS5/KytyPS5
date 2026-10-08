@@ -18,6 +18,8 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// When set, holds the flat SRT slot whose scalar load is reading memory, or NoSrtSlot.
+	uint32_t*                 read_slot                  = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

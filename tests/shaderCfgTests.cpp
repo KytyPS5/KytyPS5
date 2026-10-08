@@ -11591,6 +11591,29 @@ void TestPlainSetpcThroughS6DecodesFollowingCode() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestSwappcAcceptsEveryHit() {
+  using namespace ShaderRecompiler::Decoder;
+  const uint32_t shader[] = {
+      EncodeSMovB32(4, 255), 0xb7cb0000u, // s_mov_b32 s4, lo(target)
+      EncodeSMovB32(5, 255), 0x20u,       // s_mov_b32 s5, hi(target)
+      EncodeSop1(0x21, 14, 4),            // s_swappc_b64 s[14:15], s[4:5]
+      EncodeSMovB32(0, 16),               // s_mov_b32 s0, s16
+      0xbf810000u,
+  };
+  Program program;
+  DecodeProgram(shader, program);
+  Check(program.instructions[2].opcode == Opcode::S_SWAPPC_B64 &&
+            program.instructions[2].dst.kind == OperandKind::Sgpr &&
+            program.instructions[2].dst.reg == 14u,
+        "s_swappc_b64 did not decode as a call through s[14:15]");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(!result.spirv.empty() && result.program.uses_call_stub,
+        "a shader calling an any-hit function was not compiled with the call stubbed");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestFrontHalfDecodeStopsAtHandoff() {
   using namespace ShaderRecompiler::Decoder;
   // The dumped front half of ms_da5652193151de2c: s_setpc_b64 s6 at word 103, then padding and
@@ -17229,6 +17252,7 @@ int main() {
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestPlainSetpcThroughS6DecodesFollowingCode();
+  TestSwappcAcceptsEveryHit();
   TestFrontHalfDecodeStopsAtHandoff();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();

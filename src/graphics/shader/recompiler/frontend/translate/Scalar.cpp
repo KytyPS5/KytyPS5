@@ -10,8 +10,15 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_MOV_B64: S_MOV_B64(inst); return;
 		case O::S_WQM_B32: S_WQM(inst, false); return;
 		case O::S_WQM_B64: S_WQM(inst, true); return;
-		case O::S_GETPC_B64:
-		case O::S_SWAPPC_B64: S_GETPC_B64(inst); return;
+		case O::S_GETPC_B64: S_GETPC_B64(inst); return;
+		case O::S_SWAPPC_B64:
+			// A linked leaf is control flow in this program; an unlinked call keeps the stub.
+			if (inst.branch_target != UINT32_MAX) {
+				S_GETPC_B64(inst);
+			} else {
+				S_SWAPPC_B64(inst);
+			}
+			return;
 		case O::S_SETPC_B64: return;
 		case O::S_SUBVECTOR_LOOP_BEGIN: S_SUBVECTOR_LOOP(inst, true); return;
 		case O::S_SUBVECTOR_LOOP_END: S_SUBVECTOR_LOOP(inst, false); return;

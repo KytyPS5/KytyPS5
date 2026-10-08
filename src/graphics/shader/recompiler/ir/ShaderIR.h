@@ -883,6 +883,8 @@ struct Program: ResourcePlan {
 	// Set when a hardware ray-tracing intersect was lowered to a constant miss. Purely
 	// diagnostic: the caller reports the shader once so the log shows which output is a lie.
 	bool                   uses_bvh_intersect_stub = false;
+	// Set when an S_SWAPPC_B64 call was replaced by an any-hit that accepts every hit.
+	bool                   uses_call_stub          = false;
 	CFG::FailureKind       cfg_failure_kind        = CFG::FailureKind::None;
 	std::string            fallback_reason;
 	std::vector<BlockInfo> block_info;

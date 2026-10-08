@@ -718,6 +718,14 @@ struct PipelineCache::ProgramCache {
 		                 hash, StageShortName(stage));
 	}
 
+	void ReportCallStubbed(ShaderType stage, uint64_t hash) {
+		if (!call_stubbed_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("any-hit calls stubbed to accept every hit: hash=0x{:016x} stage={}", hash,
+		                 StageShortName(stage));
+	}
+
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
 			std::size_t hash = static_cast<std::size_t>(key.stage);
@@ -986,6 +994,9 @@ struct PipelineCache::ProgramCache {
 		if (translated.program.uses_bvh_intersect_stub) {
 			ReportStubbed(stage, params.hash);
 		}
+		if (translated.program.uses_call_stub) {
+			ReportCallStubbed(stage, params.hash);
+		}
 		if (entry == programs.end()) {
 			entry = programs
 			            .try_emplace(lookup_key,
@@ -1153,6 +1164,7 @@ struct PipelineCache::ProgramCache {
 	// transient. Kept apart from skipped_shaders so a transient failure does not disable a shader.
 	std::unordered_set<uint64_t> reported_shaders;
 	std::unordered_set<uint64_t> stubbed_shaders;
+	std::unordered_set<uint64_t> call_stubbed_shaders;
 	ProgramKey                   lookup_key;
 	// A vertex or pixel stage has no workgroup input to carry the host subgroup width, and the
 	// translator needs it to know whether a wave64 guest mask has an upper half at all.

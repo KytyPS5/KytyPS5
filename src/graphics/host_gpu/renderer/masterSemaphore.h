@@ -10,6 +10,15 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 
+// Small in-memory history of the most recent GPU submits. It is dumped when the Vulkan device is
+// lost so the log shows what the GPU was working on right before the failure.
+void RecordSubmitHistory(uint64_t tick, uint32_t debug_op, uint64_t submit_id, uint32_t arg0,
+                         uint32_t arg1, uint32_t arg2, uint32_t arg3, uint64_t arg4);
+void DumpSubmitHistory();
+// True when the KYTY_GPU_SYNC environment variable is set: every submit is waited on so a GPU
+// hang is attributed to the exact submit that caused it.
+bool GpuSyncDebugEnabled();
+
 class MasterSemaphore {
 public:
 	explicit MasterSemaphore(GraphicContext& graphics);

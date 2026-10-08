@@ -24063,6 +24063,32 @@ TestCase NativeAndSdwa16BitDestinationWrites() {
            O::S_ENDPGM}};
 }
 
+TestCase VectorMinMaxMed3F16Clamp() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x40003c00u);
+  AppendVMovLiteral(&code, 1, 0x44004200u);
+  AppendVMovLiteral(&code, 2, 0xc8004000u);
+  AppendVMovLiteral(&code, 10, 0xaaaa5555u);
+  AppendVMovLiteral(&code, 11, 0x12345678u);
+  AppendVMovLiteral(&code, 12, 0x77772222u);
+  AppendVop3(&code, 0x354, 10, Vgpr(0), Vgpr(1), Vgpr(2), 0, 0, true);
+  AppendVop3(&code, 0x351, 11, Vgpr(0), Vgpr(1), Vgpr(2), 0, 0xf, true);
+  AppendVop3(&code, 0x357, 12, Vgpr(0), Vgpr(1), Vgpr(2), 0, 0, true);
+  for (u32 i = 0; i < 3; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"VectorMinMaxMed3F16Clamp",
+          code,
+          {},
+          {0xaaaa3c00u, 0x00005678u, 0x77773c00u},
+          {O::V_MOV_B32, O::V_MIN3_F16, O::V_MAX3_F16, O::V_MED3_F16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase VectorMinMaxMed3F16Ops() {
   using O = ShaderOpcode;
 
@@ -36457,6 +36483,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
   AddCase(VectorMinMaxMed3F16Ops);
+  AddCase(VectorMinMaxMed3F16Clamp);
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorFractF16CapturedAndEdges);
   AddCase(VectorFractF16Modifiers);
@@ -42414,6 +42441,12 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, false));
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, true));
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--minmax3-f16-clamp-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMinMaxMed3F16Ops());
+    RunCase(&vulkan, VectorMinMaxMed3F16Clamp());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {

@@ -4,6 +4,7 @@
 #include "common/common.h"
 
 #include <ctime>
+#include <limits>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -55,10 +56,21 @@ inline void SysFileToSystemTimeUtc(const SysFileTimeStruct& f, SysTimeStruct& t)
 	t.Milliseconds = s.wMilliseconds;
 }
 
+/// Convert Unix seconds to UTC without truncating 64-bit timestamps.
 // NOLINTNEXTLINE(google-runtime-references)
 inline void SysTimeTToSystem(time_t t, SysTimeStruct& s) {
+	constexpr int64_t ticks_per_second = 10000000;
+	constexpr int64_t epoch_offset     = 116444736000000000;
+	constexpr int64_t min_seconds      = -epoch_offset / ticks_per_second;
+	constexpr int64_t max_seconds =
+	    (std::numeric_limits<int64_t>::max() - epoch_offset) / ticks_per_second;
+	if (t < min_seconds || t > max_seconds) {
+		s.is_invalid = true;
+		return;
+	}
+
 	SysFileTimeStruct ft {};
-	LONGLONG          ll   = Int32x32To64(t, 10000000) + 116444736000000000;
+	const auto        ll   = static_cast<int64_t>(t) * ticks_per_second + epoch_offset;
 	ft.time.dwLowDateTime  = static_cast<DWORD>(ll);
 	ft.time.dwHighDateTime = static_cast<DWORD>(static_cast<uint64_t>(ll) >> 32u);
 	ft.is_invalid          = false;

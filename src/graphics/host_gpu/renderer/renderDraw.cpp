@@ -1156,6 +1156,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
+	m_context.GetBufferCache().RecordPendingWrites(
+	    std::any_of(stages.begin(), stages.end(), [](const PreparedBindings* stage) {
+		    return stage->runtime->program->has_address_writes;
+	    }));
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

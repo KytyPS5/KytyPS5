@@ -82,6 +82,9 @@ public:
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	// Called after recording a draw or dispatch: the ranges bound for writing, and any address
+	// writes (which can reach untracked ranges), belong to the current command buffer.
+	void RecordPendingWrites(bool address_writes = false);
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -120,6 +123,12 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// GPU writes of the current command buffer, and bound writes not recorded yet.
+	void               MarkUnsubmittedWrite(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasPendingWrite(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool HasUnsubmittedWrite(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool CanDownloadDetached(uint64_t                        buffer_address,
+	                                       std::span<const vk::BufferCopy> copies);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -131,6 +140,10 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	RangeSet                                           m_unsubmitted_writes;
+	RangeSet                                           m_pending_writes;
+	uint64_t                                           m_unsubmitted_tick   = 0;
+	uint64_t                                           m_address_write_tick = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

@@ -100,6 +100,55 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_detached_pool != nullptr) {
+		m_graphics.device.destroyFence(m_detached_fence, nullptr);
+		m_graphics.device.destroyCommandPool(m_detached_pool, nullptr);
+	}
+}
+
+vk::CommandBuffer CommandScheduler::BeginDetached() {
+	CheckActive();
+	auto& device = m_graphics.device;
+	if (m_detached_pool == nullptr) {
+		vk::CommandPoolCreateInfo create {};
+		create.queueFamilyIndex = m_graphics.queue_family;
+		create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		EXIT_NOT_IMPLEMENTED(device.createCommandPool(&create, nullptr, &m_detached_pool) !=
+		                     vk::Result::eSuccess);
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_detached_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		EXIT_NOT_IMPLEMENTED(device.allocateCommandBuffers(&allocate, &m_detached_command) !=
+		                     vk::Result::eSuccess);
+		vk::FenceCreateInfo fence {};
+		EXIT_NOT_IMPLEMENTED(device.createFence(&fence, nullptr, &m_detached_fence) !=
+		                     vk::Result::eSuccess);
+	}
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_NOT_IMPLEMENTED(m_detached_command.begin(&begin) != vk::Result::eSuccess);
+	return m_detached_command;
+}
+
+void CommandScheduler::EndDetached() {
+	EXIT_NOT_IMPLEMENTED(m_detached_command.end() != vk::Result::eSuccess);
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		vk::SubmitInfo    submit_info {};
+		submit_info.commandBufferCount = 1;
+		submit_info.pCommandBuffers    = &m_detached_command;
+		result                         = m_graphics.queue.submit(1, &submit_info, m_detached_fence);
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// A queue-submission fence also covers every batch submitted earlier on this queue.
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.waitForFences(1, &m_detached_fence, VK_TRUE,
+	                                                     UINT64_MAX) != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.resetFences(1, &m_detached_fence) !=
+	                     vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(m_detached_command.reset({}) != vk::Result::eSuccess);
 }
 
 void CommandScheduler::Shutdown() {
@@ -252,6 +301,13 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	}
 	lock.unlock();
 	operation();
+}
+
+bool CommandScheduler::HasPriorityOperationsSince(uint64_t tick) {
+	std::lock_guard lock(m_operation_mutex);
+	// Operations are queued in tick order, so the newest one is at the back.
+	return (!m_priority_operations.empty() && m_priority_operations.back().tick >= tick) ||
+	       (m_priority_active && m_priority_active_tick >= tick);
 }
 
 bool CommandScheduler::HasPendingPriorityOperations() {

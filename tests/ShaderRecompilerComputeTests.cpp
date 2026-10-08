@@ -1618,7 +1618,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
-  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  ShaderRecompiler::IR::ResourceSpecialization specialization {};
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(test.code.data()),
@@ -1796,7 +1796,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
-  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  ShaderRecompiler::IR::ResourceSpecialization specialization {};
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(test.fragment_code.data()),
@@ -34024,7 +34024,7 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   struct CountMemory { u32 value = 72; u32 reads = 0; bool clean = true; } memory;
   SrtRuntime runtime{.user_data = test.user_data, .userdata = &memory};
   ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
+  ResourceSpecialization specialization {};
   Require(test.name, "strict reader required",
           !MaterializeResources(plan, runtime, snapshot, specialization),
           "vector descriptor input bypassed the clean-memory reader");
@@ -36412,7 +36412,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     auto resource_plan =
         ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
     ShaderRecompiler::IR::ResourceSnapshot resources;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    ShaderRecompiler::IR::ResourceSpecialization specialization {};
     const ShaderRecompiler::IR::SrtRuntime runtime{
         .user_data = options.user_data,
         .shader_base = reinterpret_cast<uint64_t>(code.data()),
@@ -36833,7 +36833,7 @@ void CheckEmbeddedFetchVertexOffset() {
     auto resource_plan =
         ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
     ShaderRecompiler::IR::ResourceSnapshot resources;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    ShaderRecompiler::IR::ResourceSpecialization specialization {};
     const ShaderRecompiler::IR::SrtRuntime runtime{
         .user_data = options.user_data,
         .shader_base = reinterpret_cast<uint64_t>(code.data()),
@@ -38841,7 +38841,7 @@ void CheckImageSamplerSpecialization() {
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
-    ResourceSpecialization specialization;
+    ResourceSpecialization specialization {};
     const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
                              .userdata = &memory, .read_specialization_memory = ReadTestMemory};
     Require(name, "bounded native material plan",
@@ -38932,7 +38932,7 @@ void CheckResourcePlanHandoff() {
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
-    ResourceSpecialization specialization;
+    ResourceSpecialization specialization {};
     const SrtRuntime runtime{.user_data = user_data,
                              .read_memory = ReadTestMemory,
                              .userdata = &memory,
@@ -39052,7 +39052,7 @@ void CheckShaderRecompilerFatalContracts() {
     program.srt_plan_complete = true;
     auto plan = ShaderRecompiler::IR::ExtractResourcePlan(program);
     ShaderRecompiler::IR::ResourceSnapshot snapshot;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    ShaderRecompiler::IR::ResourceSpecialization specialization {};
     Require("PackedAtomicImageRejection", "resource materialization",
             !ShaderRecompiler::IR::MaterializeResources(
                 plan, {}, snapshot, specialization),
@@ -39789,7 +39789,7 @@ void CheckEmbeddedFetchLaneSpill() {
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
-  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  ShaderRecompiler::IR::ResourceSpecialization specialization {};
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(code.data()),
@@ -40738,7 +40738,7 @@ void CheckNativeDrawShaderOffsets() {
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
     auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
     ShaderRecompiler::IR::ResourceSnapshot resources;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    ShaderRecompiler::IR::ResourceSpecialization specialization {};
     const ShaderRecompiler::IR::SrtRuntime runtime {.user_data = user_data};
     Require("NativeShaderOffsets", "resources", ShaderRecompiler::IR::MaterializeResources(
         plan, runtime, resources, specialization), "could not materialize simple vertex resources");
@@ -41471,6 +41471,45 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 3 && std::strcmp(argv[1], "--decode-bin") == 0) {
+    // Debug: print the decoded guest ISA of a dumped shader binary.
+    std::FILE *f = std::fopen(argv[2], "rb");
+    if (f == nullptr) return 2;
+    std::vector<uint32_t> words;
+    uint32_t w;
+    while (std::fread(&w, 4, 1, f) == 1) words.push_back(w);
+    std::fclose(f);
+    ShaderRecompiler::Decoder::Program program;
+    ShaderRecompiler::Decoder::DecodeProgram(words, program);
+    std::printf("%s", ShaderRecompiler::Decoder::ProgramToString(program).c_str());
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--ir-bin-ps") == 0) {
+    // Debug: print the native IR of a dumped pixel shader binary.
+    std::FILE *f = std::fopen(argv[2], "rb");
+    if (f == nullptr) return 2;
+    std::vector<uint32_t> words;
+    uint32_t w;
+    while (std::fread(&w, 4, 1, f) == 1) words.push_back(w);
+    std::fclose(f);
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Pixel;
+    options.wave_size = 64;
+    ShaderPixelInputInfo pixel_info;
+    pixel_info.input_num = 8;
+    pixel_info.ps_pos_x = pixel_info.ps_pos_y = true;
+    options.input_info.pixel = &pixel_info;
+    auto translated = ShaderRecompiler::TranslateProgram(words, options);
+    std::printf("%s", ShaderRecompiler::IR::ProgramToString(translated.program).c_str());
+    if (std::getenv("KYTY_IR_BIN_COMPILE") != nullptr) {
+      ShaderRecompiler::IR::ResourceSpecialization specialization {};
+      auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+      const bool valid = tools.Validate(compiled.spirv);
+      std::printf("SPIRV words=%zu valid=%d\n", compiled.spirv.size(), valid ? 1 : 0);
+    }
+    return 0;
+  }
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;

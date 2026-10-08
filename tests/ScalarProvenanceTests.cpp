@@ -1,11 +1,16 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/PartialWaveReduction.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cstdlib>
+#include <cstring>
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
@@ -591,6 +596,193 @@ void TestReadLaneElimination() {
   fixture.Emit(ValueOpcode::IAdd32, {dynamic, Value(1u)});
   Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 0,
         "dynamic-lane read was rewritten unsafely");
+}
+
+
+template <typename T> uint64_t FlagBits(T value) {
+  uint64_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(value));
+  return bits;
+}
+
+struct ReductionIr {
+  Value read31;
+  Value read63;
+  Value read5;
+};
+
+// Builds the exact shape the AMD compiler emitted for the NHL tile-light loop (ps 1da1fd...):
+// Z = exec ? v : neutral; four DPP row_shr steps; permlanex16(-1,-1); min; readlane 31 / 63.
+ReductionIr BuildReduction(Fixture &fixture, ValueOpcode op, uint32_t neutral,
+                           bool bounded_condition = true,
+                           uint32_t perm_select = 0xffffffffu) {
+  const auto exec = fixture.Emit(ValueOpcode::LogicalAnd, {Value(true), Value(true)});
+  const auto not_exec = fixture.Emit(ValueOpcode::LogicalNot, {exec});
+  const auto whole = fixture.Emit(ValueOpcode::LogicalOr, {not_exec, exec});
+  const auto data = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(4))});
+  Value condition = exec;
+  if (!bounded_condition) {
+    condition = fixture.Emit(ValueOpcode::IEqual32, {data, Value(7u)});
+  }
+  Value current = fixture.Emit(ValueOpcode::SelectU32, {condition, data, Value(neutral)});
+  for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
+    DppMoveFlags flags;
+    flags.control = 0x110u + shift;
+    const auto moved = fixture.Emit(ValueOpcode::DppMoveU32, {current, whole}, FlagBits(flags));
+    const auto combined = fixture.Emit(op, {moved, current});
+    current = fixture.Emit(ValueOpcode::DppUpdateU32, {combined, current, whole},
+                           FlagBits(flags));
+  }
+  PermlaneFlags perm;
+  perm.x16 = true;
+  const auto swapped = fixture.Emit(ValueOpcode::Permlane16U32,
+                                    {current, Value(perm_select), Value(perm_select), whole},
+                                    FlagBits(perm));
+  const auto fetched = fixture.Emit(ValueOpcode::SelectU32, {whole, swapped, data});
+  const auto combined = fixture.Emit(op, {current, fetched});
+  const auto result = fixture.Emit(ValueOpcode::SelectU32, {whole, combined, current});
+  ReductionIr ir;
+  ir.read31 = fixture.Emit(ValueOpcode::ReadLane, {result, Value(31u)});
+  ir.read63 = fixture.Emit(ValueOpcode::ReadLane, {result, Value(63u)});
+  ir.read5 = fixture.Emit(ValueOpcode::ReadLane, {result, Value(5u)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {ir.read31});
+  fixture.Emit(ValueOpcode::ReferenceU32, {ir.read63});
+  fixture.Emit(ValueOpcode::ReferenceU32, {ir.read5});
+  return ir;
+}
+
+void TestPartialWaveReductionStructure() {
+  struct Case { ValueOpcode op; uint32_t neutral; WaveReduceOp reduce; };
+  const Case cases[] = {
+      {ValueOpcode::UMin32, 0xffffffffu, WaveReduceOp::UMin},
+      {ValueOpcode::SMin32, 0x7fffffffu, WaveReduceOp::SMin},
+      {ValueOpcode::UMax32, 0u, WaveReduceOp::UMax},
+      {ValueOpcode::SMax32, 0x80000000u, WaveReduceOp::SMax},
+      {ValueOpcode::BitwiseOr32, 0u, WaveReduceOp::Or},
+      {ValueOpcode::BitwiseAnd32, 0xffffffffu, WaveReduceOp::And},
+  };
+  for (const auto &test : cases) {
+    Fixture fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    BuildReduction(fixture, test.op, test.neutral);
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 2,
+          "lane 31 and 63 reductions were not both recognised");
+    uint32_t reduces = 0;
+    for (const auto &inst : fixture.BlockAt().Instructions()) {
+      if (inst.GetOpcode() == ValueOpcode::WaveReduceU32) {
+        reduces++;
+        Check(inst.Flags<WaveReduceOp>() == test.reduce, "wrong reduction operation");
+      }
+    }
+    Check(reduces == 2, "expected two subgroup reductions");
+    uint32_t reference_users = 0;
+    for (const auto &inst : fixture.BlockAt().Instructions()) {
+      if (inst.GetOpcode() != ValueOpcode::ReferenceU32) continue;
+      const auto *source = inst.Arg(0).ResolveInstruction();
+      if (source->GetOpcode() == ValueOpcode::WaveReduceU32) {
+        reference_users++;
+      } else {
+        Check(source->GetOpcode() == ValueOpcode::ReadLane &&
+                  source->Arg(1).Resolve() == Value(5u),
+              "only the arbitrary lane read may remain");
+      }
+    }
+    Check(reference_users == 2, "lane 31/63 users were not redirected");
+  }
+}
+
+void TestPartialWaveReductionRejectsUnprovenPatterns() {
+  {
+    Fixture fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    BuildReduction(fixture, ValueOpcode::UMin32, 0u);  // wrong neutral
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 0,
+          "non-neutral initializer was accepted");
+  }
+  {
+    Fixture fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu, false);
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 0,
+          "initializer condition not bounded by EXEC was accepted");
+  }
+  {
+    Fixture fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu, true, 0x76543210u);
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 0,
+          "non-lane-15 permlane selector was accepted");
+  }
+  {
+    Fixture fixture;  // compute waves are launched whole
+    BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu);
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 0,
+          "compute reduction was rewritten");
+  }
+}
+
+// Hardware model: all 64 lanes exist; lanes that were never launched hold the neutral element.
+// This is the value V_READLANE 31 / 63 read in the original shader.
+uint32_t Apply(WaveReduceOp op, uint32_t a, uint32_t b) {
+  switch (op) {
+  case WaveReduceOp::UMin: return std::min(a, b);
+  case WaveReduceOp::UMax: return std::max(a, b);
+  case WaveReduceOp::SMin: return static_cast<uint32_t>(std::min(static_cast<int32_t>(a), static_cast<int32_t>(b)));
+  case WaveReduceOp::SMax: return static_cast<uint32_t>(std::max(static_cast<int32_t>(a), static_cast<int32_t>(b)));
+  case WaveReduceOp::Or: return a | b;
+  case WaveReduceOp::And: return a & b;
+  }
+  return 0;
+}
+
+uint32_t NeutralOfOp(WaveReduceOp op) {
+  switch (op) {
+  case WaveReduceOp::UMin: return 0xffffffffu;
+  case WaveReduceOp::SMin: return 0x7fffffffu;
+  case WaveReduceOp::UMax: return 0u;
+  case WaveReduceOp::SMax: return 0x80000000u;
+  case WaveReduceOp::Or: return 0u;
+  case WaveReduceOp::And: return 0xffffffffu;
+  }
+  return 0;
+}
+
+void TestPartialWaveReductionEquivalence() {
+  const WaveReduceOp ops[] = {WaveReduceOp::UMin, WaveReduceOp::SMin, WaveReduceOp::UMax,
+                              WaveReduceOp::SMax, WaveReduceOp::Or,  WaveReduceOp::And};
+  uint32_t seed = 0x1234567u;
+  const auto next = [&seed] { seed = seed * 1664525u + 1013904223u; return seed; };
+  for (const auto op : ops) {
+    for (const uint32_t covered : {1u, 3u, 7u, 17u, 31u, 32u, 33u, 63u, 64u}) {
+      for (uint32_t trial = 0; trial < 20; trial++) {
+        std::array<uint32_t, 64> z{};
+        for (uint32_t lane = 0; lane < 64; lane++) {
+          z[lane] = lane < covered ? next() : NeutralOfOp(op);
+        }
+        // row_shr 1, 2, 4, 8 with bound_ctrl=0: lanes that would read outside the row keep value.
+        auto v = z;
+        for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
+          auto old = v;
+          for (uint32_t lane = 0; lane < 64; lane++) {
+            if ((lane & 15u) >= shift) v[lane] = Apply(op, old[lane - shift], old[lane]);
+          }
+        }
+        // v_permlanex16(-1, -1): lane reads lane 15 of the opposite row of its pair.
+        auto result = v;
+        for (uint32_t lane = 0; lane < 64; lane++) {
+          result[lane] = Apply(op, v[lane], v[((lane & ~15u) ^ 16u) | 15u]);
+        }
+        uint32_t half0 = NeutralOfOp(op), half1 = NeutralOfOp(op);
+        for (uint32_t lane = 0; lane < covered; lane++) {
+          auto &half = lane < 32 ? half0 : half1;
+          half = Apply(op, half, z[lane]);
+        }
+        Check(result[31] == half0 && result[63] == half1,
+              "DPP/permlane lane 31/63 differs from the reduction over existing lanes");
+      }
+    }
+  }
 }
 
 void TestOptimizationPipeline() {

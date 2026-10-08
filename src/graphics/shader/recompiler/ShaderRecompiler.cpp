@@ -13,6 +13,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/PartialWaveReduction.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -665,6 +666,21 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (IR::PartialWaveReductionEnabled()) {
+		const auto reduction_stats = IR::LowerPartialWaveReductions(ir);
+		if (reduction_stats.rewritten_reads != 0) {
+			LOGF("%s partial-wave reductions: reads=%" PRIu32 "\n", GetDumpLabel(options),
+			     reduction_stats.rewritten_reads);
+			std::printf("NHL27REDUCE: hash=0x%016" PRIx64 " stage=%s reductions=%" PRIu32 "\n",
+			            options.shader_hash, StageName(options.stage),
+			            reduction_stats.rewritten_reads);
+			std::fflush(stdout);
+			IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+			IR::ResolveControlFlowIdentities(ir);
+			IR::RemoveIdentities(ir.blocks);
+			IR::EliminateDeadCode(ir.blocks);
+		}
 	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;

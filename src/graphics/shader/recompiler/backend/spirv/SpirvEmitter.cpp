@@ -298,6 +298,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					}
 					break;
 				}
+				case IR::ValueOpcode::WaveReduceU32:
+					requirements.subgroup_arithmetic = true;
+					break;
 				case IR::ValueOpcode::DppUpdateU32:
 				case IR::ValueOpcode::WriteLane: {
 					requirements.subgroup_ballot              = true;

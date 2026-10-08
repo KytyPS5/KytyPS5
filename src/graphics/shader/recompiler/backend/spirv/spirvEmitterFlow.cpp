@@ -770,6 +770,23 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 
+uint32_t EmitWaveReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	spv::Op op  = spv::OpGroupNonUniformUMin;
+	switch (inst.Flags<IR::WaveReduceOp>()) {
+		case IR::WaveReduceOp::UMin: op = spv::OpGroupNonUniformUMin; break;
+		case IR::WaveReduceOp::SMin: op = spv::OpGroupNonUniformSMin; break;
+		case IR::WaveReduceOp::UMax: op = spv::OpGroupNonUniformUMax; break;
+		case IR::WaveReduceOp::SMax: op = spv::OpGroupNonUniformSMax; break;
+		case IR::WaveReduceOp::Or: op = spv::OpGroupNonUniformBitwiseOr; break;
+		case IR::WaveReduceOp::And: op = spv::OpGroupNonUniformBitwiseAnd; break;
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(op, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup),
+	                          ConstantU32(state, spv::GroupOperationReduce), ctx.Arg(inst, 0));
+	return result;
+}
+
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto hit   = state.builder.AllocateId();

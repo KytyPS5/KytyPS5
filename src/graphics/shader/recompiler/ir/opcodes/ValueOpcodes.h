@@ -44,6 +44,9 @@ struct DppMoveFlags {
 static_assert(sizeof(DppMoveFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<DppMoveFlags>);
 
+// Subgroup reduction over the invocations that exist (flags of WaveReduceU32).
+enum class WaveReduceOp : uint32_t { UMin, SMin, UMax, SMax, Or, And };
+
 struct PermlaneFlags {
 	bool x16            = false;
 	bool fetch_inactive = false;

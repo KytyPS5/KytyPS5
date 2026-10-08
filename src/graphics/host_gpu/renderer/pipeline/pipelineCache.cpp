@@ -103,11 +103,33 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// Resource tables can hold a stale or null pointer that the shader only follows on paths the
+// game never takes. Unmapped memory reads as zero (a null descriptor) instead of failing, or
+// faulting on the host.
+bool ReadUnmappedShaderMemory(uint64_t address, std::span<uint32_t> values) {
+	if (Libs::LibKernel::Memory::IsGpuMapped(address, values.size_bytes())) {
+		return false;
+	}
+	std::ranges::fill(values, 0u);
+	return true;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	return !values.empty() && (Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                                         values.size_bytes()) ||
+	                           ReadUnmappedShaderMemory(address, values));
+}
+
+bool ReadShaderOrdinaryMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	if (!ReadUnmappedShaderMemory(address, values)) {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -302,6 +324,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderOrdinaryMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {

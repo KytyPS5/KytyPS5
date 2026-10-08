@@ -65,6 +65,23 @@ public:
 		return it != m_ranges.end() && it->first < end;
 	}
 
+	// The range holding all of [address, address + size), as [begin, last).
+	[[nodiscard]] bool FindContaining(uint64_t address, uint64_t size, uint64_t& begin,
+	                                  uint64_t& last) const {
+		const auto end = End(address, size);
+		auto       it  = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return false;
+		}
+		--it;
+		if (it->first > address || it->second < end) {
+			return false;
+		}
+		begin = it->first;
+		last  = it->second;
+		return true;
+	}
+
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);

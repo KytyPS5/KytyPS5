@@ -83,8 +83,27 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
+	// Shader resource evaluation asks about many small reads inside the same mapping.
+	struct Cached {
+		const RenderContext* owner      = nullptr;
+		uint64_t             begin      = 0;
+		uint64_t             end        = 0;
+		uint64_t             generation = 0;
+	};
+	thread_local Cached cached;
+	if (cached.owner == this && vaddr >= cached.begin && vaddr < cached.end &&
+	    size <= cached.end - vaddr &&
+	    cached.generation == m_unmap_generation.load(std::memory_order_acquire)) {
+		return true;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	return m_mapped_ranges.Contains(vaddr, size);
+	uint64_t         begin = 0;
+	uint64_t         end   = 0;
+	if (!m_mapped_ranges.FindContaining(vaddr, size, begin, end)) {
+		return false;
+	}
+	cached = {this, begin, end, m_unmap_generation.load(std::memory_order_relaxed)};
+	return true;
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
@@ -113,6 +132,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_unmap_generation.fetch_add(1, std::memory_order_release);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.

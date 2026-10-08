@@ -4,10 +4,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
 
+using OwnershipCache = Common::LeastRecentlyUsedCache<std::string, uint64_t>;
+static_assert(!std::is_copy_constructible_v<OwnershipCache>);
+static_assert(!std::is_copy_assignable_v<OwnershipCache>);
+static_assert(std::is_move_constructible_v<OwnershipCache>);
+static_assert(std::is_nothrow_move_assignable_v<OwnershipCache>);
+
+/// Report a failed test condition and terminate the test executable.
 void Check(bool value, const char *message) {
   if (!value) {
     std::fprintf(stderr, "LruCacheTests: failed: %s\n", message);
@@ -15,7 +24,7 @@ void Check(bool value, const char *message) {
   }
 }
 
-// Collect the objects reachable through ForEachItemBelow(), in visit order.
+/// Collect the objects reachable through ForEachItemBelow(), in visit order.
 std::vector<std::string> Collect(Common::LeastRecentlyUsedCache<std::string, uint64_t> &cache,
                                  uint64_t tick) {
   std::vector<std::string> visited;
@@ -23,6 +32,7 @@ std::vector<std::string> Collect(Common::LeastRecentlyUsedCache<std::string, uin
   return visited;
 }
 
+/// Verify insertion order and timestamp cutoffs.
 void TestInsertAndVisitOrder() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -43,6 +53,7 @@ void TestInsertAndVisitOrder() {
   Check(none.empty(), "ForEachItemBelow visited items below an empty tick");
 }
 
+/// Verify bool callbacks can stop or continue iteration.
 void TestEarlyExitCallback() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   (void)cache.Insert("a", 10);
@@ -64,6 +75,7 @@ void TestEarlyExitCallback() {
   Check(all_visited.size() == 3, "false-returning callback did not visit every item");
 }
 
+/// Verify timestamps and list order after touching entries.
 void TestTouchReordersAndSkips() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -103,6 +115,7 @@ void TestTouchReordersAndSkips() {
         "touching a middle item did not move it to the end");
 }
 
+/// Verify removal, ID reuse and rebuilding an emptied cache.
 void TestFreeAndIdReuse() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -144,9 +157,101 @@ void TestFreeAndIdReuse() {
   Check(Collect(cache, 70).size() == 1, "touching a rebuilt item failed");
 }
 
+/// Moving a populated cache must preserve IDs and leave an independent empty source.
+void TestMoveConstruction() {
+  using Cache = Common::LeastRecentlyUsedCache<std::string, uint64_t>;
+  Cache source;
+  const auto a = source.Insert("a", 10);
+  const auto hole = source.Insert("hole", 20);
+  const auto b = source.Insert("b", 30);
+  source.Free(hole);
+  Cache destination(std::move(source));
+  Check(Collect(destination, UINT64_MAX) == std::vector<std::string>{"a", "b"},
+        "move construction lost live entries");
+  Check(Collect(source, UINT64_MAX).empty(), "moved-from cache still visits transferred entries");
+  (void)source.Insert("source", 5);
+  Check(Collect(source, UINT64_MAX) == std::vector<std::string>{"source"},
+        "moved-from cache cannot be reused independently");
+  Check(destination.Insert("reused", 40) == hole, "move lost reusable IDs");
+  destination.Touch(a, 50);
+  destination.Free(b);
+  Check(Collect(destination, UINT64_MAX) == std::vector<std::string>{"reused", "a"},
+        "transferred IDs do not address the destination entries");
+  Check(Collect(source, UINT64_MAX) == std::vector<std::string>{"source"},
+        "destination mutation changed the source");
+}
+
+/// Move assignment replaces old contents and survives source destruction and self-move.
+void TestMoveAssignment() {
+  using Cache = Common::LeastRecentlyUsedCache<std::string, uint64_t>;
+  Cache destination;
+  (void)destination.Insert("discarded", 1);
+  size_t live = 0;
+  size_t hole = 0;
+  {
+    Cache source;
+    live = source.Insert("live", 10);
+    hole = source.Insert("hole", 20);
+    source.Free(hole);
+    destination = std::move(source);
+    Check(Collect(source, UINT64_MAX).empty(), "move assignment retained source links");
+    (void)source.Insert("independent", 1);
+  }
+  Check(Collect(destination, UINT64_MAX) == std::vector<std::string>{"live"},
+        "source destruction invalidated transferred contents");
+  Check(destination.Insert("reused", 20) == hole, "move assignment lost free IDs");
+  auto* self = &destination;
+  destination = std::move(*self);
+  destination.Touch(live, 30);
+  Check(Collect(destination, UINT64_MAX) == std::vector<std::string>{"reused", "live"},
+        "self-move corrupted the cache");
+  destination.Free(live);
+  destination.Free(hole);
+  Check(Collect(destination, UINT64_MAX).empty(), "transferred IDs cannot be freed");
+}
+
+/// Destroying the destination must not leave dangling links in the moved-from cache.
+void TestDestinationLifetime() {
+  Common::LeastRecentlyUsedCache<std::string, uint64_t> source;
+  (void)source.Insert("transferred", 10);
+  {
+    auto destination = std::move(source);
+    Check(Collect(destination, UINT64_MAX).size() == 1, "move lost the entry");
+  }
+  Check(Collect(source, UINT64_MAX).empty(), "source links outlived destination storage");
+  (void)source.Insert("fresh", 20);
+  Check(Collect(source, UINT64_MAX) == std::vector<std::string>{"fresh"},
+        "source reuse depends on destination lifetime");
+}
+
+/// Empty and fully freed caches remain reusable after moving in either direction.
+void TestMoveEmptyCaches() {
+  using Cache = Common::LeastRecentlyUsedCache<std::string, uint64_t>;
+  Cache source;
+  Cache destination(std::move(source));
+  const auto id = source.Insert("freed", 1);
+  source.Free(id);
+  destination = std::move(source);
+  Check(destination.Insert("reused", 2) == id, "moving an empty cache lost free slots");
+  Cache empty;
+  destination = std::move(empty);
+  Check(Collect(destination, UINT64_MAX).empty(), "empty move did not replace old entries");
+  (void)empty.Insert("source", 1);
+  (void)destination.Insert("destination", 1);
+  Check(Collect(empty, UINT64_MAX) == std::vector<std::string>{"source"},
+        "empty source is not reusable");
+  Check(Collect(destination, UINT64_MAX) == std::vector<std::string>{"destination"},
+        "empty destination is not reusable");
+}
+
 } // namespace
 
+/// Run ownership, ordering and ID reuse regressions.
 int main() {
+  TestMoveConstruction();
+  TestMoveAssignment();
+  TestMoveEmptyCaches();
+  TestDestinationLifetime();
   TestInsertAndVisitOrder();
   TestEarlyExitCallback();
   TestTouchReordersAndSkips();

@@ -104,32 +104,52 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 // Resource tables can hold a stale or null pointer that the shader only follows on paths the
-// game never takes. Unmapped memory reads as zero (a null descriptor) instead of failing, or
-// faulting on the host.
-bool ReadUnmappedShaderMemory(uint64_t address, std::span<uint32_t> values) {
-	if (Libs::LibKernel::Memory::IsGpuMapped(address, values.size_bytes())) {
+// game never takes. Words the guest has not mapped for the GPU read as zero (a null descriptor)
+// instead of failing, or faulting on the host. A read that crosses the end of a mapping keeps
+// its mapped words.
+template <typename ReadMapped>
+bool ReadShaderMemory(uint64_t address, std::span<uint32_t> values, ReadMapped&& read_mapped) {
+	using Libs::LibKernel::Memory::IsGpuMapped;
+	if (values.empty()) {
 		return false;
 	}
-	std::ranges::fill(values, 0u);
+	if (IsGpuMapped(address, values.size_bytes())) {
+		return read_mapped(address, values);
+	}
+	const auto word_mapped = [&](size_t index) {
+		return IsGpuMapped(address + index * sizeof(uint32_t), sizeof(uint32_t));
+	};
+	for (size_t begin = 0; begin < values.size();) {
+		const bool mapped = word_mapped(begin);
+		size_t     end    = begin + 1;
+		while (end < values.size() && word_mapped(end) == mapped) {
+			++end;
+		}
+		const auto segment = values.subspan(begin, end - begin);
+		if (!mapped) {
+			std::ranges::fill(segment, 0u);
+		} else if (!read_mapped(address + begin * sizeof(uint32_t), segment)) {
+			return false;
+		}
+		begin = end;
+	}
 	return true;
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
-	return !values.empty() && (Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
-	                                                                         values.size_bytes()) ||
-	                           ReadUnmappedShaderMemory(address, values));
+	return ReadShaderMemory(address, values, [](uint64_t mapped, std::span<uint32_t> words) {
+		return Libs::LibKernel::Memory::TryReadBufferBacking(mapped, words.data(),
+		                                                     words.size_bytes());
+	});
 }
 
 bool ReadShaderOrdinaryMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	if (values.empty()) {
-		return false;
-	}
-	if (!ReadUnmappedShaderMemory(address, values)) {
-		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
-	}
-	return true;
+	return ReadShaderMemory(address, values, [](uint64_t mapped, std::span<uint32_t> words) {
+		std::memcpy(words.data(), reinterpret_cast<const void*>(mapped), words.size_bytes());
+		return true;
+	});
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,

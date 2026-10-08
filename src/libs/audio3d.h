@@ -14,6 +14,7 @@ int KYTY_SYSV_ABI  Audio3dInitialize(int64_t reserved);
 void KYTY_SYSV_ABI Audio3dGetDefaultOpenParameters(Audio3dOpenParameters* p);
 int KYTY_SYSV_ABI  Audio3dPortOpen(int user_id, const Audio3dOpenParameters* parameters,
                                    uint32_t* id);
+int KYTY_SYSV_ABI  Audio3dPortClose(uint32_t port_id);
 int KYTY_SYSV_ABI  Audio3dPortSetAttribute(uint32_t port_id, uint32_t attribute_id,
                                            const void* attribute, size_t attribute_size);
 int KYTY_SYSV_ABI  Audio3dPortGetQueueLevel(uint32_t port_id, uint32_t* queue_level,

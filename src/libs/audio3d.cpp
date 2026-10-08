@@ -45,7 +45,8 @@ struct Audio3dInternal {
 	int                   downmix_spread_height_aware = 0;
 	uint32_t              data_index                  = 0;
 	bool                  used                        = false;
-	std::atomic_bool      playback_finished           = false;
+	std::atomic_bool      closing                     = false;
+	Common::Thread*       playback_thread             = nullptr;
 };
 
 constexpr uint32_t MAX_PORTS = 4;
@@ -61,7 +62,7 @@ static void playback_simulate(void* arg) {
 	for (;;) {
 		int result = Semaphore::KernelWaitSema(port->playback_sema, 1, nullptr);
 
-		if (result != OK) {
+		if (result != OK || port->closing) {
 			break;
 		}
 
@@ -88,8 +89,6 @@ static void playback_simulate(void* arg) {
 			play_data->state = Audio3dData::State::Empty;
 		}
 	}
-
-	port->playback_finished = true;
 }
 
 int KYTY_SYSV_ABI Audio3dInitialize(int64_t reserved) {
@@ -158,11 +157,50 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
 	                                         static_cast<int>(parameters->queue_depth), nullptr);
 	EXIT_NOT_IMPLEMENTED(result != OK);
 
-	g_ports[port].playback_finished = false;
-	Common::Thread playback_thread(playback_simulate, &g_ports[port]);
-	playback_thread.Detach();
+	g_ports[port].closing = false;
+	g_ports[port].playback_thread = new Common::Thread(playback_simulate, &g_ports[port]);
 
 	*id = port;
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI Audio3dPortClose(uint32_t port_id) {
+	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(port_id >= MAX_PORTS);
+	EXIT_NOT_IMPLEMENTED(!g_ports[port_id].used);
+
+	auto* port = &g_ports[port_id];
+
+	port->closing = true;
+
+	if (port->playback_sema != nullptr) {
+		Semaphore::KernelSignalSema(port->playback_sema, 1);
+	}
+
+	if (port->playback_thread != nullptr) {
+		port->playback_thread->Join();
+		delete port->playback_thread;
+		port->playback_thread = nullptr;
+	}
+
+	if (port->playback_sema != nullptr) {
+		Semaphore::KernelDeleteSema(port->playback_sema);
+		port->playback_sema = nullptr;
+	}
+
+	if (port->data != nullptr) {
+		delete[] port->data;
+		port->data = nullptr;
+	}
+
+	if (port->data_mutex != nullptr) {
+		delete port->data_mutex;
+		port->data_mutex = nullptr;
+	}
+
+	port->used = false;
 
 	return OK;
 }

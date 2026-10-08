@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace Libs {
@@ -341,6 +342,17 @@ static int GetFormatDateTime(const RtcTick* utc, int time_zone_minutes, RtcDateT
 	return RtcSetTick(time, &tick);
 }
 
+// Copies a string a formatter built in its 32-byte local buffer to the guest buffer. A string
+// that did not fit (len is snprintf's result) returns RTC_ERROR_INVALID_VALUE and writes nothing.
+template <size_t N>
+static int CopyFormatted(char* date_time, const char (&buf)[N], int len) {
+	if (len < 0 || static_cast<size_t>(len) >= N) {
+		return RTC_ERROR_INVALID_VALUE;
+	}
+	std::memcpy(date_time, buf, static_cast<size_t>(len) + 1);
+	return OK;
+}
+
 static int KYTY_SYSV_ABI RtcFormatRFC3339(char* date_time, const RtcTick* utc,
                                           int time_zone_minutes) {
 	PRINT_NAME();
@@ -362,17 +374,21 @@ static int KYTY_SYSV_ABI RtcFormatRFC3339(char* date_time, const RtcTick* utc,
 		const auto sign    = (time_zone_minutes < 0 ? '-' : '+');
 		const auto minutes = (time_zone_minutes < 0 ? -static_cast<int64_t>(time_zone_minutes)
 		                                            : static_cast<int64_t>(time_zone_minutes));
-		std::snprintf(zone, sizeof(zone), "%c%02d:%02d", sign, static_cast<int>(minutes / 60),
-		              static_cast<int>(minutes % 60));
+		const auto len =
+		    std::snprintf(zone, sizeof(zone), "%c%02d:%02d", sign, static_cast<int>(minutes / 60),
+			              static_cast<int>(minutes % 60));
+		if (len < 0 || static_cast<size_t>(len) >= sizeof(zone)) {
+			return RTC_ERROR_INVALID_VALUE;
+		}
 	}
 
-	std::snprintf(date_time, 32, "%04u-%02u-%02uT%02u:%02u:%02u.%02u%s",
-	              static_cast<unsigned>(time.year), static_cast<unsigned>(time.month),
-	              static_cast<unsigned>(time.day), static_cast<unsigned>(time.hour),
-	              static_cast<unsigned>(time.minute), static_cast<unsigned>(time.second),
-	              static_cast<unsigned>(time.microsecond / 10000), zone);
-
-	return OK;
+	char       buf[32] {};
+	const auto len = std::snprintf(
+	    buf, sizeof(buf), "%04u-%02u-%02uT%02u:%02u:%02u.%02u%s", static_cast<unsigned>(time.year),
+	    static_cast<unsigned>(time.month), static_cast<unsigned>(time.day),
+	    static_cast<unsigned>(time.hour), static_cast<unsigned>(time.minute),
+	    static_cast<unsigned>(time.second), static_cast<unsigned>(time.microsecond / 10000), zone);
+	return CopyFormatted(date_time, buf, len);
 }
 
 static int KYTY_SYSV_ABI RtcFormatRFC3339LocalTime(char* date_time, const RtcTick* utc) {
@@ -407,13 +423,14 @@ static int KYTY_SYSV_ABI RtcFormatRFC2822(char* date_time, const RtcTick* utc,
 	const auto minutes = (time_zone_minutes < 0 ? -static_cast<int64_t>(time_zone_minutes)
 	                                            : static_cast<int64_t>(time_zone_minutes));
 
-	std::snprintf(date_time, 32, "%s, %02u %s %04u %02u:%02u:%02u %c%02d%02d", WEEK_DAYS[dow],
-	              static_cast<unsigned>(time.day), MONTHS[time.month - 1],
-	              static_cast<unsigned>(time.year), static_cast<unsigned>(time.hour),
-	              static_cast<unsigned>(time.minute), static_cast<unsigned>(time.second), sign,
-	              static_cast<int>(minutes / 60), static_cast<int>(minutes % 60));
-
-	return OK;
+	char       buf[32] {};
+	const auto len =
+	    std::snprintf(buf, sizeof(buf), "%s, %02u %s %04u %02u:%02u:%02u %c%02d%02d",
+		              WEEK_DAYS[dow], static_cast<unsigned>(time.day), MONTHS[time.month - 1],
+		              static_cast<unsigned>(time.year), static_cast<unsigned>(time.hour),
+		              static_cast<unsigned>(time.minute), static_cast<unsigned>(time.second), sign,
+		              static_cast<int>(minutes / 60), static_cast<int>(minutes % 60));
+	return CopyFormatted(date_time, buf, len);
 }
 
 static int KYTY_SYSV_ABI RtcFormatRFC2822LocalTime(char* date_time, const RtcTick* utc) {

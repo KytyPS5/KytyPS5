@@ -101,6 +101,14 @@ void TestRFC2822(FormatFunc format, LocalFormatFunc local) {
 	CHECK(format(buf.data(), &wraps, 1) == Rtc::RTC_ERROR_INVALID_VALUE);
 	CHECK(Untouched(buf, 0));
 
+	// "+9959" is the longest offset that fits; "+10000" would need 32 characters, so it is
+	// rejected instead of truncated, and nothing is written.
+	CheckFormat(format, TEST_TICK, 5999, "Mon, 12 Oct 2026 01:42:05 +9959");
+	CheckFormat(format, TEST_TICK, -5999, "Sat, 03 Oct 2026 17:44:05 -9959");
+	CHECK(format(buf.data(), &utc, 6000) == Rtc::RTC_ERROR_INVALID_VALUE);
+	CHECK(format(buf.data(), &utc, -6000) == Rtc::RTC_ERROR_INVALID_VALUE);
+	CHECK(Untouched(buf, 0));
+
 	// Kyty keeps RTC local time equal to UTC.
 	CHECK(local(buf.data(), &utc) == OK);
 	CHECK(std::strcmp(buf.data(), "Wed, 07 Oct 2026 21:43:05 +0000") == 0);
@@ -126,6 +134,13 @@ void TestRFC3339(FormatFunc format, LocalFormatFunc local) {
 	CHECK(std::strcmp(buf.data(), "2026-10-07T21:43:05.12Z") == 0);
 	CHECK(Untouched(buf, 32));
 	CHECK(local(nullptr, &utc) == Rtc::RTC_ERROR_INVALID_POINTER);
+
+	// An offset whose zone suffix does not fit is rejected instead of truncated.
+	CheckFormat(format, TEST_TICK, 59999, "2026-11-18T13:42:05.12+999:59");
+	buf = MakeBuffer();
+	CHECK(format(buf.data(), &utc, 60000) == Rtc::RTC_ERROR_INVALID_VALUE);
+	CHECK(format(buf.data(), &utc, -60000) == Rtc::RTC_ERROR_INVALID_VALUE);
+	CHECK(Untouched(buf, 0));
 }
 
 } // namespace

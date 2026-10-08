@@ -22,6 +22,7 @@ struct Parameter {
 	uint32_t input_location  = 0;
 	uint32_t output_location = 0;
 	bool     flat            = false;
+	bool     exported        = true;
 };
 
 std::vector<Parameter> GetParameters(const ShaderVertexInputInfo& vertex_info,
@@ -44,10 +45,11 @@ std::vector<Parameter> GetParameters(const ShaderVertexInputInfo& vertex_info,
 	for (const auto input: active_inputs) {
 		const auto input_location = ShaderPixelParameterMappedLocation(*pixel_info, input);
 		const auto output_location = ShaderPixelParameterLocation(*pixel_info, active_inputs, input);
-		if ((vertex_info.stage.program->param_export_mask & (1u << input_location)) != 0 &&
-		    !output_locations[output_location]) {
+		if (!output_locations[output_location]) {
+			const bool exported =
+			    (vertex_info.stage.program->param_export_mask & (1u << input_location)) != 0;
 			parameters.push_back({input_location, output_location,
-			                      ShaderPixelParameterIsFlat(*pixel_info, input)});
+			                      ShaderPixelParameterIsFlat(*pixel_info, input), exported});
 			output_locations[output_location] = true;
 		}
 	}
@@ -143,7 +145,15 @@ public:
 		           Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0))));
 		Store(Access(ptr_output_vec4_float, gl_out, invocation, Int(0)), position);
 
+		const auto float_zero = Constant(float_type, std::bit_cast<uint32_t>(0.0f));
+		const auto vec4_zero =
+		    Result(spv::OpCompositeConstruct, vec4_float_type, float_zero, float_zero, float_zero, float_zero);
+
 		for (uint32_t i = 0; i < parameters.size(); i++) {
+			if (!parameters[i].exported) {
+				Store(Access(ptr_output_vec4_float, outputs[i], invocation), vec4_zero);
+				continue;
+			}
 			const auto input0 =
 			    Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], Int(0)));
 			if (parameters[i].flat) {
@@ -271,6 +281,10 @@ private:
 		inputs.resize(parameters.size());
 		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX> locations {};
 		for (uint32_t i = 0; i < parameters.size(); i++) {
+			if (tess_control && !parameters[i].exported) {
+				inputs[i] = 0;
+				continue;
+			}
 			const auto location =
 			    tess_control ? parameters[i].input_location : parameters[i].output_location;
 			if (tess_control && locations[location] != 0) {

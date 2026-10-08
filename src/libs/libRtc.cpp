@@ -306,14 +306,13 @@ static int KYTY_SYSV_ABI RtcConvertLocalTimeToUtc(const RtcTick* local_time, Rtc
 	return OK;
 }
 
-static int KYTY_SYSV_ABI RtcFormatRFC3339(char* date_time, const RtcTick* utc,
-                                          int time_zone_minutes) {
-	PRINT_NAME();
+// Kyty keeps RTC local time equal to UTC (see RtcConvertUtcToLocalTime), so the *LocalTime
+// formatters use a zero offset and the string they produce still names the right instant.
+constexpr int RTC_LOCAL_TIME_ZONE_MINUTES = 0;
 
-	if (date_time == nullptr) {
-		return RTC_ERROR_INVALID_POINTER;
-	}
-
+// Resolves the tick a formatter prints: the current tick when utc is null, shifted by the
+// time zone offset, and split into calendar fields.
+static int GetFormatDateTime(const RtcTick* utc, int time_zone_minutes, RtcDateTime* time) {
 	RtcTick tick {};
 	if (utc == nullptr) {
 		auto ret = RtcGetCurrentTick(&tick);
@@ -325,13 +324,33 @@ static int KYTY_SYSV_ABI RtcFormatRFC3339(char* date_time, const RtcTick* utc,
 	}
 
 	const auto offset_ticks = static_cast<int64_t>(time_zone_minutes) * 60000000ll;
-	if (offset_ticks < 0 && tick.tick < static_cast<uint64_t>(-offset_ticks)) {
-		return RTC_ERROR_INVALID_VALUE;
+	if (offset_ticks < 0) {
+		const auto sub = static_cast<uint64_t>(-offset_ticks);
+		if (tick.tick < sub) {
+			return RTC_ERROR_INVALID_VALUE;
+		}
+		tick.tick -= sub;
+	} else {
+		const auto add = static_cast<uint64_t>(offset_ticks);
+		if (tick.tick > std::numeric_limits<uint64_t>::max() - add) {
+			return RTC_ERROR_INVALID_VALUE;
+		}
+		tick.tick += add;
 	}
-	tick.tick = static_cast<uint64_t>(static_cast<int64_t>(tick.tick) + offset_ticks);
+
+	return RtcSetTick(time, &tick);
+}
+
+static int KYTY_SYSV_ABI RtcFormatRFC3339(char* date_time, const RtcTick* utc,
+                                          int time_zone_minutes) {
+	PRINT_NAME();
+
+	if (date_time == nullptr) {
+		return RTC_ERROR_INVALID_POINTER;
+	}
 
 	RtcDateTime time {};
-	auto        ret = RtcSetTick(&time, &tick);
+	auto        ret = GetFormatDateTime(utc, time_zone_minutes, &time);
 	if (ret != OK) {
 		return ret;
 	}
@@ -341,8 +360,10 @@ static int KYTY_SYSV_ABI RtcFormatRFC3339(char* date_time, const RtcTick* utc,
 		std::snprintf(zone, sizeof(zone), "Z");
 	} else {
 		const auto sign    = (time_zone_minutes < 0 ? '-' : '+');
-		auto       minutes = (time_zone_minutes < 0 ? -time_zone_minutes : time_zone_minutes);
-		std::snprintf(zone, sizeof(zone), "%c%02d:%02d", sign, minutes / 60, minutes % 60);
+		const auto minutes = (time_zone_minutes < 0 ? -static_cast<int64_t>(time_zone_minutes)
+		                                            : static_cast<int64_t>(time_zone_minutes));
+		std::snprintf(zone, sizeof(zone), "%c%02d:%02d", sign, static_cast<int>(minutes / 60),
+		              static_cast<int>(minutes % 60));
 	}
 
 	std::snprintf(date_time, 32, "%04u-%02u-%02uT%02u:%02u:%02u.%02u%s",
@@ -352,6 +373,53 @@ static int KYTY_SYSV_ABI RtcFormatRFC3339(char* date_time, const RtcTick* utc,
 	              static_cast<unsigned>(time.microsecond / 10000), zone);
 
 	return OK;
+}
+
+static int KYTY_SYSV_ABI RtcFormatRFC3339LocalTime(char* date_time, const RtcTick* utc) {
+	PRINT_NAME();
+
+	return RtcFormatRFC3339(date_time, utc, RTC_LOCAL_TIME_ZONE_MINUTES);
+}
+
+// RFC 2822 date, e.g. "Wed, 07 Oct 2026 21:43:05 -0400" (31 characters plus the terminator).
+static int KYTY_SYSV_ABI RtcFormatRFC2822(char* date_time, const RtcTick* utc,
+                                          int time_zone_minutes) {
+	PRINT_NAME();
+
+	if (date_time == nullptr) {
+		return RTC_ERROR_INVALID_POINTER;
+	}
+
+	RtcDateTime time {};
+	auto        ret = GetFormatDateTime(utc, time_zone_minutes, &time);
+	if (ret != OK) {
+		return ret;
+	}
+
+	static constexpr const char* WEEK_DAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+	static constexpr const char* MONTHS[]    = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	                                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+	// RtcSetTick validated the date, so month is 1..12 and DayOfWeek() is 1..7 (7 = Sunday).
+	const auto dow = Common::Date(time.year, time.month, time.day).DayOfWeek() % 7;
+
+	const auto sign    = (time_zone_minutes < 0 ? '-' : '+');
+	const auto minutes = (time_zone_minutes < 0 ? -static_cast<int64_t>(time_zone_minutes)
+	                                            : static_cast<int64_t>(time_zone_minutes));
+
+	std::snprintf(date_time, 32, "%s, %02u %s %04u %02u:%02u:%02u %c%02d%02d", WEEK_DAYS[dow],
+	              static_cast<unsigned>(time.day), MONTHS[time.month - 1],
+	              static_cast<unsigned>(time.year), static_cast<unsigned>(time.hour),
+	              static_cast<unsigned>(time.minute), static_cast<unsigned>(time.second), sign,
+	              static_cast<int>(minutes / 60), static_cast<int>(minutes % 60));
+
+	return OK;
+}
+
+static int KYTY_SYSV_ABI RtcFormatRFC2822LocalTime(char* date_time, const RtcTick* utc) {
+	PRINT_NAME();
+
+	return RtcFormatRFC2822(date_time, utc, RTC_LOCAL_TIME_ZONE_MINUTES);
 }
 
 static int KYTY_SYSV_ABI RtcParseRFC3339(RtcTick* utc, const char* date_time) {
@@ -553,7 +621,10 @@ LIB_DEFINE(InitRtc_1) {
 	LIB_FUNC("lPEBYdVX0XQ", Rtc::RtcCheckValid);
 	LIB_FUNC("8Yr143yEnRo", Rtc::RtcConvertLocalTimeToUtc);
 	LIB_FUNC("M1TvFst-jrM", Rtc::RtcConvertUtcToLocalTime);
+	LIB_FUNC("eiuobaF-hK4", Rtc::RtcFormatRFC2822);
+	LIB_FUNC("AxHBk3eat04", Rtc::RtcFormatRFC2822LocalTime);
 	LIB_FUNC("WJ3rqFwymew", Rtc::RtcFormatRFC3339);
+	LIB_FUNC("DwuHIlLGW8I", Rtc::RtcFormatRFC3339LocalTime);
 	LIB_FUNC("8lfvnRMqwEM", Rtc::RtcGetCurrentClock);
 	LIB_FUNC("ZPD1YOKI+Kw", Rtc::RtcGetCurrentClockLocalTime);
 	LIB_FUNC("18B2NS1y9UU", Rtc::RtcGetCurrentTick);

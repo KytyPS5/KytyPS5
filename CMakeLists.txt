@@ -527,6 +527,10 @@ add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
 
+add_executable(rtc_format_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/RtcFormatTests.cpp")
+target_link_libraries(rtc_format_tests common fmt::fmt)
+target_include_directories(rtc_format_tests PRIVATE ${inc_headers})
+
 add_executable(save_data_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/dialog.cpp"
@@ -633,6 +637,7 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
+	add_test(NAME rtc_format COMMAND $<TARGET_FILE:rtc_format_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
@@ -709,6 +714,7 @@ if(BUILD_TESTING)
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests
+		rtc_format_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)

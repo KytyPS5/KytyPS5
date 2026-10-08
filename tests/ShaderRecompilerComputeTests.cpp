@@ -185,6 +185,10 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static MemoryTracker &Tracker(BufferCache &cache) {
+    return cache.m_memory_tracker;
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -5119,6 +5123,167 @@ public:
             "a metadata write-only fill was not consumed as a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckBdaIncrementalSweep() {
+    constexpr const char *name = "BdaIncrementalSweep";
+    // Three tracker regions: two written by the CPU, one left idle.
+    constexpr uintptr_t base = 0x0000000209000000ull;
+    constexpr uint64_t allocation_size = 3 * TRACKER_REGION_SIZE;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = TRACKER_PAGE_SIZE;
+    constexpr uint64_t buffer_size = 0x40000;
+    constexpr uint64_t first_offset = 0;
+    constexpr uint64_t late_offset = 0x200000;
+    constexpr uint64_t second_offset = TRACKER_REGION_SIZE;
+    constexpr uint64_t idle_offset = 2 * TRACKER_REGION_SIZE;
+    constexpr uint64_t remap_offset = first_offset + 0x10000;
+    constexpr uint64_t remap_size = 0x10000;
+    constexpr std::array<uint64_t, 3> written_offsets{
+        first_offset + 3 * page, first_offset + 9 * page, second_offset + 7 * page};
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    const auto Initial = [](uint64_t offset) {
+      return 0x10000000u | static_cast<uint32_t>(offset / page);
+    };
+    for (uint64_t offset = 0; offset < allocation_size; offset += page) {
+      const auto value = Initial(offset);
+      std::memcpy(memory + offset, &value, sizeof(value));
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      auto &tracker = BufferCacheTestAccess::Tracker(cache);
+      context.MapMemory(base, allocation_size);
+      const auto CpuWrite = [&](uint64_t offset, uint32_t value) {
+        (void)context.HandleFault(PageFaultAccess::Write, base + offset);
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+      const auto GpuWord = [&](BufferId id, uint64_t offset) {
+        const auto &buffer = cache.GetBuffer(id);
+        auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                         vk::BufferUsageFlagBits::eTransferDst,
+                                         {0xffffffffu});
+        const vk::BufferCopy copy{buffer.Offset(base + offset), 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1,
+                                                &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+            {}, 0, nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        const auto value = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+        return value;
+      };
+
+      const auto first = cache.FindBuffer(base + first_offset, buffer_size);
+      const auto second = cache.FindBuffer(base + second_offset, buffer_size);
+      const auto idle = cache.FindBuffer(base + idle_offset, buffer_size);
+      // The first sweep visits everything; the tracker regions it creates are visited once more.
+      context.PrepareBda();
+      context.PrepareBda();
+      Require(name, "initial sweep",
+              GpuWord(first, first_offset + 5 * page) == Initial(first_offset + 5 * page) &&
+                  GpuWord(idle, idle_offset + page) == Initial(idle_offset + page) &&
+                  !cache.IsRegionCpuModified(base + idle_offset, buffer_size),
+              "the first sweep did not upload every registered buffer");
+
+      // CPU writes to scattered pages, and a buffer registered over pages written while
+      // no buffer covered them.
+      for (size_t i = 0; i < written_offsets.size(); i++) {
+        CpuWrite(written_offsets[i], 0xa0000000u | static_cast<uint32_t>(i));
+      }
+      constexpr uint32_t late_value = 0xb0000001u;
+      std::memcpy(memory + late_offset + page, &late_value, sizeof(late_value));
+      const auto late = cache.FindBuffer(base + late_offset, buffer_size);
+
+      // A region without CPU writes is not visited: its tracker lock stays held meanwhile.
+      std::binary_semaphore idle_locked{0};
+      std::binary_semaphore idle_release{0};
+      std::binary_semaphore sweep_done{0};
+      std::jthread holder([&] {
+        tracker.ForEachUploadRange(
+            base + idle_offset, page, true, [](uint64_t, uint64_t) noexcept {},
+            [&]() noexcept {
+              idle_locked.release();
+              idle_release.acquire();
+            });
+      });
+      idle_locked.acquire();
+      std::jthread sweeper([&] {
+        context.PrepareBda();
+        sweep_done.release();
+      });
+      const bool sweep_skipped_idle = sweep_done.try_acquire_for(std::chrono::seconds(5));
+      idle_release.release();
+      holder.join();
+      sweeper.join();
+      tracker.UnmarkRegionAsGpuModified(base + idle_offset, page);
+      Require(name, "idle region", sweep_skipped_idle,
+              "the sweep visited a region without CPU writes since the previous one");
+      for (size_t i = 0; i < written_offsets.size(); i++) {
+        const auto owner = written_offsets[i] < second_offset ? first : second;
+        Require(name, "scattered CPU writes",
+                GpuWord(owner, written_offsets[i]) == (0xa0000000u | static_cast<uint32_t>(i)),
+                "a page written by the CPU kept stale GPU contents");
+      }
+      Require(name, "unwritten neighbour",
+              GpuWord(first, first_offset + 4 * page) == Initial(first_offset + 4 * page),
+              "an unwritten page changed");
+      Require(name, "late registration", GpuWord(late, late_offset + page) == late_value,
+              "a buffer registered after the previous sweep kept stale GPU contents");
+
+      // Memory unmapped across a sweep, then written and mapped again without a fault.
+      context.UnmapMemory(base + remap_offset, remap_size);
+      context.PrepareBda();
+      constexpr uint32_t remap_value = 0xc0000002u;
+      std::memcpy(memory + remap_offset + page, &remap_value, sizeof(remap_value));
+      context.MapMemory(base + remap_offset, remap_size);
+      context.PrepareBda();
+      Require(name, "mapped again", GpuWord(first, remap_offset + page) == remap_value,
+              "memory mapped again kept the GPU contents from before its unmap");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckBdaPageTableUploads() {
@@ -42572,6 +42737,11 @@ int main(int argc, char **argv) {
     CheckDepthTargetFootprints();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-sweep-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaIncrementalSweep();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
@@ -42785,6 +42955,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaSweepAfterRemap();
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckBdaIncrementalSweep();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

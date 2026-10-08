@@ -4861,6 +4861,7 @@ void TestDecoderRejectsTruncatedInstructions() {
       {Family::VOP1, {0x7e0002f9u}},
       {Family::VOP1, {0x7e0002fau}},
       {Family::VOP1, {0x7e0002e9u}},
+      {Family::VOP1, {0x7e007cfau}},
       {Family::SOP1, {0xbe8003ffu}},
       {Family::SOP2, {0x800000ffu}},
       {Family::DS, {0xd8000000u}},

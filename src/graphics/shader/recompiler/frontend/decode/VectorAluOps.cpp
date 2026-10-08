@@ -779,11 +779,11 @@ void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
 
 void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vdst, Instruction& inst) {
-	if (IsVop1Float64Opcode(inst.opcode)) {
-		SetUnsupported(inst, Family::VOP1, opcode, "FP64 instructions do not support DPP");
+	if (RejectTruncated(inst, pc, Family::VOP1, opcode, code, word_index, 2u)) {
 		return;
 	}
-	if (RejectTruncated(inst, pc, Family::VOP1, opcode, code, word_index, 2u)) {
+	if (IsVop1Float64Opcode(inst.opcode)) {
+		SetUnsupported(inst, Family::VOP1, opcode, "FP64 instructions do not support DPP");
 		return;
 	}
 	const auto modifier = code[word_index + 1u];

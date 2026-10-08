@@ -85,6 +85,12 @@ public:
 		m_memory_tracker.QueueBdaSync(vaddr, size);
 	}
 	void               RunGarbageCollector();
+	// A watched range stays unchanged until a GPU write, upload or invalidation reaches it, or
+	// the CPU dirties it.
+	void               WatchRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsWatchedRangeUnchanged(uint64_t vaddr, uint64_t size);
+	// Shader address writes have no known range.
+	void NotifyAddressWrites();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -124,6 +130,7 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void               NotifyChange(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -135,6 +142,8 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	RangeSet                                           m_watched;
+	RangeSet                                           m_watch_changed;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

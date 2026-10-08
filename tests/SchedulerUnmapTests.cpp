@@ -18,6 +18,8 @@ using namespace Libs::Graphics;
 
 namespace {
 
+/// Keep regression failures effective in Release builds where assert may be compiled out.
+/// Exit immediately on failure; a blocked worker may prevent normal fixture unwinding.
 void Require(bool condition, const char* message) {
 	if (!condition) {
 		std::fprintf(stderr, "FAIL: %s\n", message);
@@ -25,6 +27,7 @@ void Require(bool condition, const char* message) {
 	}
 }
 
+/// Treat missing Vulkan prerequisites as test failures rather than successful skips.
 void RequireVk(vk::Result result, const char* operation) {
 	if (result != vk::Result::eSuccess) {
 		std::fprintf(stderr, "%s: %s\n", operation, vk::to_string(result).c_str());
@@ -34,6 +37,8 @@ void RequireVk(vk::Result result, const char* operation) {
 
 class VulkanContext {
 public:
+	/// Create a real Vulkan fixture without the broader shader harness's optional extensions.
+	/// Requires a graphics queue, timeline semaphores, buffer addresses and push descriptors.
 	VulkanContext() {
 		const auto get_proc =
 		    m_loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
@@ -93,6 +98,8 @@ public:
 		Require(graphics.CreateAllocator(), "create allocator");
 	}
 
+	/// RenderContext must be destroyed first so its queues and allocations are retired
+	/// before the allocator and device are released.
 	~VulkanContext() {
 		graphics.DestroyAllocator();
 		graphics.device.destroy();
@@ -109,6 +116,8 @@ public:
 constexpr uint64_t Base = 0x60000000ull;
 constexpr uint64_t Page = 0x4000;
 
+/// Reproduce the original unrelated-unmap drain through the existing EOP event API.
+/// Submission ticks provide a deterministic oracle without timing the GPU or callback.
 void CheckHostEvent(RenderContext& context) {
 	auto& scheduler = context.GetCommandScheduler();
 	context.MapMemory(Base, Page);
@@ -122,6 +131,9 @@ void CheckHostEvent(RenderContext& context) {
 	std::puts("PASS: host-only event does not drain unrelated unmap");
 }
 
+/// Hold callbacks behind an unsubmitted tick to test pending hazards without races.
+/// Exercise half-open boundaries and multiple entries, then require overlapping unmap
+/// to complete publication before the captured stack storage leaves scope.
 void CheckQueuedRanges(RenderContext& context) {
 	auto&            scheduler = context.GetCommandScheduler();
 	std::atomic<int> completed = 0;
@@ -150,6 +162,8 @@ void CheckQueuedRanges(RenderContext& context) {
 	std::puts("PASS: queued ranges, overlap boundaries and completion");
 }
 
+/// Preserve conservative behavior for callers that cannot declare their guest accesses:
+/// unmap must submit the pending tick and wait for the callback to finish.
 void CheckUnknownRange(RenderContext& context) {
 	auto&             scheduler = context.GetCommandScheduler();
 	std::atomic<bool> completed = false;
@@ -161,6 +175,8 @@ void CheckUnknownRange(RenderContext& context) {
 	std::puts("PASS: unknown range remains conservative");
 }
 
+/// Use real mapped guest backing to verify CPU publication precedes unmap return.
+/// Keep the kernel mapping alive until the value is checked, then release both mappings.
 void CheckGuestWriteback(RenderContext& context) {
 	using namespace Libs::LibKernel::Memory;
 	int64_t offset = -1;
@@ -183,6 +199,8 @@ void CheckGuestWriteback(RenderContext& context) {
 	std::puts("PASS: guest writeback completes before unmap returns");
 }
 
+/// Block an executing callback with semaphores to expose the queue-pop lifetime window.
+/// Its range must remain visible until callback completion, while adjacent unmap stays free.
 void CheckActiveRange(RenderContext& context) {
 	auto&                 scheduler = context.GetCommandScheduler();
 	std::binary_semaphore entered(0);
@@ -213,6 +231,9 @@ void CheckActiveRange(RenderContext& context) {
 
 } // namespace
 
+/// Initialize emulator subsystems and run without proprietary guest files or a window.
+/// Fixture declaration order keeps Vulkan alive through renderer shutdown; CTest bounds
+/// deadlocks with a process timeout rather than introducing timing assertions.
 int main() {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	Common::InitializeThreads();

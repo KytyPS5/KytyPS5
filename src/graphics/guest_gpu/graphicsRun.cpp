@@ -536,6 +536,9 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+/// Advance a submission, retaining command-execution state when processing suspends.
+/// Return whether it completed. Suspend-point notification waits for its GPU tick
+/// but only releases a host semaphore, so it does not retain guest-memory ownership.
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
@@ -1408,6 +1411,8 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	GetScheduler().Flush();
 }
 
+/// Prepare a CPU-requested flip outside an existing command-processor scope and flush it.
+/// The deferred completion owns only host flip state; it does not dereference guest memory.
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
 	if (g_current_processor != nullptr) {

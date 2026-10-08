@@ -1837,6 +1837,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+/// Schedule image writeback only when a safe download and readable backing are available.
+/// Seed staging from guest backing to preserve bytes not overwritten by the transfer.
+/// The declared hazard covers the full backing range written by the completion callback.
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {

@@ -207,6 +207,8 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
+/// Release completed normal callbacks only after priority callbacks through the same tick.
+/// Callbacks run outside the queue lock so resource destruction can enqueue further work.
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
 	for (;;) {
@@ -229,12 +231,17 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	QueueOperation(std::move(operation), false);
 }
 
+/// Schedule a completion at the current GPU tick; captured resources must survive its execution.
+/// The range must cover every guest access, including writes performed after the GPU wait.
+/// An omitted range aliases all guest memory; an empty range promises no guest access.
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
                                               std::optional<GuestRange>      range) {
 	EXIT_IF(range && !range->ValidOrEmpty());
 	QueueOperation(std::move(operation), true, range);
 }
 
+/// Queue work while open, or execute it inline after an external shutdown completes.
+/// A callback already running in this scheduler must not wait on its own shutdown.
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
                                       std::optional<GuestRange> range) {
 	CheckActive();
@@ -257,11 +264,16 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	operation();
 }
 
+/// Include the callback already removed from the queue but still waiting or executing.
+/// This is a snapshot, not a completion wait or a barrier against subsequent enqueues.
 bool CommandScheduler::HasPendingPriorityOperations() {
 	std::lock_guard lock(m_operation_mutex);
 	return !m_priority_operations.empty() || m_priority_active;
 }
 
+/// Query guest-memory hazards for a valid, nonempty half-open range.
+/// Unknown ranges always overlap; host-only callbacks never do. The active callback
+/// remains a hazard until it returns, even after its GPU tick has completed.
 bool CommandScheduler::HasPendingPriorityOperations(GuestRange range) {
 	EXIT_IF(!range.Valid());
 	const auto overlaps = [range](const std::optional<GuestRange>& pending) {
@@ -274,6 +286,9 @@ bool CommandScheduler::HasPendingPriorityOperations(GuestRange range) {
 	                   [&](const auto& operation) { return overlaps(operation.range); });
 }
 
+/// Run priority callbacks in FIFO order after their GPU ticks complete.
+/// Publish the active range under the queue lock before popping becomes observable,
+/// and retain it through the callback so concurrent unmap queries cannot miss writeback.
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;

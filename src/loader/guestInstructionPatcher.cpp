@@ -121,6 +121,7 @@ struct DecodedCodeInstruction {
 struct DecodedFunction {
 	std::map<uintptr_t, DecodedCodeInstruction> instructions;
 	std::set<uintptr_t>                         branch_targets;
+	std::map<uintptr_t, std::vector<uintptr_t>> jump_table_targets;
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
@@ -315,205 +316,537 @@ bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
 	    });
 }
 
+bool IsHighByteRegister(ZydisRegister reg) {
+	return reg == ZYDIS_REGISTER_AH || reg == ZYDIS_REGISTER_BH || reg == ZYDIS_REGISTER_CH ||
+	       reg == ZYDIS_REGISTER_DH;
+}
+
+u16 RegisterWidth(ZydisRegister reg) {
+	return ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, reg);
+}
+
+bool IsCalleeSavedRegister(ZydisRegister reg) {
+	switch (ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg)) {
+		case ZYDIS_REGISTER_RBX:
+		case ZYDIS_REGISTER_RBP:
+		case ZYDIS_REGISTER_R12:
+		case ZYDIS_REGISTER_R13:
+		case ZYDIS_REGISTER_R14:
+		case ZYDIS_REGISTER_R15: return true;
+		default: return false;
+	}
+}
+
+// MOVZX r32, r8/r16 and MOV r32, r32 clear every bit above their source.
+std::optional<ZydisRegister> ZeroExtendingSource(const DecodedCodeInstruction& decoded) {
+	const auto& destination = decoded.operands[0];
+	const auto& source      = decoded.operands[1];
+	if (decoded.instruction.operand_count_visible != 2 ||
+	    destination.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    source.type != ZYDIS_OPERAND_TYPE_REGISTER || IsHighByteRegister(source.reg.value) ||
+	    RegisterWidth(destination.reg.value) != 32) {
+		return std::nullopt;
+	}
+	const auto source_width = RegisterWidth(source.reg.value);
+	const bool zero_extends =
+	    (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOVZX &&
+	     (source_width == 8 || source_width == 16)) ||
+	    (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV && source_width == 32);
+	return zero_extends ? std::optional {source.reg.value} : std::nullopt;
+}
+
+std::optional<uintptr_t> DecodeRipRelativeLea(const DecodedCodeInstruction& decoded,
+                                              ZydisRegister                 reg) {
+	const auto& destination = decoded.operands[0];
+	const auto& source      = decoded.operands[1];
+	if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_LEA ||
+	    destination.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    RegisterWidth(destination.reg.value) != 64 || !IsSameRegister(destination.reg.value, reg) ||
+	    source.type != ZYDIS_OPERAND_TYPE_MEMORY || source.mem.base != ZYDIS_REGISTER_RIP ||
+	    source.mem.index != ZYDIS_REGISTER_NONE) {
+		return std::nullopt;
+	}
+	ZyanU64 absolute_address {};
+	if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &source, decoded.address,
+	                                           &absolute_address))) {
+		return std::nullopt;
+	}
+	return absolute_address;
+}
+
+// Predecessors of every decoded instruction, through fallthrough, direct branches and resolved
+// jump tables.
+class ControlFlowGraph {
+public:
+	explicit ControlFlowGraph(const DecodedFunction& function) {
+		m_addresses.reserve(function.instructions.size());
+		for (const auto& [address, decoded]: function.instructions) {
+			m_addresses.push_back(address);
+			m_instructions.push_back(&decoded);
+		}
+		m_predecessors.resize(m_addresses.size());
+		const auto add_edge = [this](uintptr_t target, u32 source) {
+			if (const auto index = Index(target)) {
+				m_predecessors[*index].push_back(source);
+			}
+		};
+		for (u32 index = 0; index < m_instructions.size(); ++index) {
+			const auto& decoded = *m_instructions[index];
+			const auto& meta    = decoded.instruction.meta;
+			if (!IsControlFlowTerminator(decoded.instruction)) {
+				add_edge(decoded.address + decoded.instruction.length, index);
+			}
+			if (meta.category == ZYDIS_CATEGORY_COND_BR ||
+			    meta.category == ZYDIS_CATEGORY_UNCOND_BR || meta.category == ZYDIS_CATEGORY_CALL) {
+				add_edge(GetRelativeTarget(decoded), index);
+			}
+			if (const auto table = function.jump_table_targets.find(decoded.address);
+			    table != function.jump_table_targets.end()) {
+				for (const uintptr_t target: table->second) {
+					add_edge(target, index);
+				}
+			}
+		}
+	}
+
+	// Instructions that last write `reg` on some path to `address`. Fails when the value can come
+	// from the caller, from a call that clobbers it, or through an edge that is not known.
+	[[nodiscard]] std::optional<std::set<uintptr_t>>
+	ReachingDefinitions(uintptr_t function_start, uintptr_t address, ZydisRegister reg) const {
+		const auto start = Index(address);
+		if (!start) {
+			return std::nullopt;
+		}
+		std::set<uintptr_t> definitions;
+		std::vector<bool>   visited(m_addresses.size());
+		std::vector<u32>    pending {static_cast<u32>(*start)};
+		while (!pending.empty()) {
+			const u32 current = pending.back();
+			pending.pop_back();
+			if (m_addresses[current] == function_start || m_predecessors[current].empty()) {
+				return std::nullopt;
+			}
+			for (const u32 predecessor: m_predecessors[current]) {
+				if (visited[predecessor]) {
+					continue;
+				}
+				visited[predecessor] = true;
+				const auto& decoded  = *m_instructions[predecessor];
+				if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL &&
+				    !IsCalleeSavedRegister(reg)) {
+					return std::nullopt;
+				}
+				if (WritesRegister(decoded, reg)) {
+					definitions.insert(decoded.address);
+				} else {
+					pending.push_back(predecessor);
+				}
+			}
+		}
+		return definitions;
+	}
+
+private:
+	[[nodiscard]] std::optional<size_t> Index(uintptr_t address) const {
+		const auto found = std::ranges::lower_bound(m_addresses, address);
+		return found != m_addresses.end() && *found == address
+		           ? std::optional {static_cast<size_t>(found - m_addresses.begin())}
+		           : std::nullopt;
+	}
+
+	std::vector<uintptr_t>                     m_addresses;
+	std::vector<const DecodedCodeInstruction*> m_instructions;
+	std::vector<std::vector<u32>>              m_predecessors;
+};
+
+// Built on first use; stale edges only make an intermediate match optimistic, and every match
+// is checked again against the final graph.
+class LazyControlFlowGraph {
+public:
+	explicit LazyControlFlowGraph(const DecodedFunction& function): m_function(function) {}
+
+	const ControlFlowGraph& Get() {
+		if (!m_graph) {
+			m_graph.emplace(m_function);
+		}
+		return *m_graph;
+	}
+	void Reset() { m_graph.reset(); }
+
+private:
+	const DecodedFunction&          m_function;
+	std::optional<ControlFlowGraph> m_graph;
+};
+
+struct JumpTableIndex {
+	u64       max_index {};
+	uintptr_t path_start {};
+};
+
+bool StartsStraightPath(const DecodedFunction&                                      function,
+                        std::map<uintptr_t, DecodedCodeInstruction>::const_iterator instruction) {
+	if (function.branch_targets.contains(instruction->first) ||
+	    instruction == function.instructions.begin()) {
+		return true;
+	}
+	const auto previous = std::prev(instruction);
+	return previous->first + previous->second.instruction.length != instruction->first ||
+	       IsControlFlowTerminator(previous->second.instruction);
+}
+
+u64 WidthMask(u16 width) {
+	return width >= 64 ? UINT64_MAX : (u64 {1} << width) - 1u;
+}
+
+std::optional<u64> RegisterBound(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                                 uintptr_t function_start, uintptr_t address, ZydisRegister reg,
+                                 int depth);
+
+// Largest value `reg` can hold after `decoded` writes it: constants, flags, masks, shifts and
+// zero-extending copies of bounded registers. A write narrower than `reg` keeps unknown bits.
+std::optional<u64> DefinitionBound(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                                   uintptr_t function_start, const DecodedCodeInstruction& decoded,
+                                   ZydisRegister reg, int depth) {
+	const auto& destination = decoded.operands[0];
+	const auto& source      = decoded.operands[1];
+	if (depth == 0 || destination.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    !IsSameRegister(destination.reg.value, reg) || IsHighByteRegister(destination.reg.value)) {
+		return std::nullopt;
+	}
+	const auto width = RegisterWidth(destination.reg.value);
+	if (width < RegisterWidth(reg) && width != 32) {
+		return std::nullopt;
+	}
+	const auto source_bound = [&](ZydisRegister source_reg) {
+		return RegisterBound(function, graph, function_start, decoded.address, source_reg,
+		                     depth - 1);
+	};
+	const bool         immediate       = source.type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+	const bool         register_source = source.type == ZYDIS_OPERAND_TYPE_REGISTER;
+	std::optional<u64> bound;
+	switch (decoded.instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_MOV:
+			if (immediate) {
+				bound = source.imm.value.u & WidthMask(width);
+			} else if (register_source && RegisterWidth(source.reg.value) == width) {
+				bound = source_bound(source.reg.value);
+			}
+			break;
+		case ZYDIS_MNEMONIC_MOVZX:
+			if (register_source && !IsHighByteRegister(source.reg.value)) {
+				bound = source_bound(source.reg.value);
+			}
+			break;
+		case ZYDIS_MNEMONIC_AND:
+			if (immediate) {
+				bound = width == 64 && source.imm.value.s < 0
+				            ? std::nullopt
+				            : std::optional {source.imm.value.u & WidthMask(width)};
+			} else if (register_source && !IsHighByteRegister(source.reg.value)) {
+				const auto left  = source_bound(destination.reg.value);
+				const auto right = source_bound(source.reg.value);
+				bound            = left && right ? std::min(*left, *right) : left ? left : right;
+			}
+			break;
+		case ZYDIS_MNEMONIC_SHR:
+			if (immediate) {
+				bound = WidthMask(width) >> (source.imm.value.u & (width - 1u));
+			}
+			break;
+		case ZYDIS_MNEMONIC_XOR:
+			if (register_source && source.reg.value == destination.reg.value) {
+				bound = 0;
+			}
+			break;
+		default:
+			if (decoded.instruction.meta.category == ZYDIS_CATEGORY_SETCC) {
+				bound = 1;
+			}
+			break;
+	}
+	return bound ? std::optional {std::min(*bound, WidthMask(RegisterWidth(reg)))} : std::nullopt;
+}
+
+// Largest value `reg` can hold just before `address`, over every definition reaching it.
+std::optional<u64> RegisterBound(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                                 uintptr_t function_start, uintptr_t address, ZydisRegister reg,
+                                 int depth) {
+	const auto definitions =
+	    depth == 0 ? std::nullopt : graph.Get().ReachingDefinitions(function_start, address, reg);
+	if (!definitions || definitions->empty()) {
+		return std::nullopt;
+	}
+	u64 bound = 0;
+	for (const uintptr_t definition: *definitions) {
+		const auto value = DefinitionBound(function, graph, function_start,
+		                                   function.instructions.at(definition), reg, depth);
+		if (!value) {
+			return std::nullopt;
+		}
+		bound = std::max(bound, *value);
+	}
+	return bound;
+}
+
+// Bounds the table index on the straight path ending at the load. A CMP + JA/JAE guard covers
+// the bits the nearest zero-extending copy reads; otherwise the definitions must bound it.
+std::optional<JumpTableIndex> BoundJumpTableIndex(const DecodedFunction& function,
+                                                  LazyControlFlowGraph&  graph,
+                                                  uintptr_t function_start, uintptr_t load_address,
+                                                  ZydisRegister index_reg) {
+	struct Guard {
+		ZydisRegister reg;
+		u64           max_index;
+	};
+	constexpr size_t             MaxPatternInstructions = 64;
+	constexpr int                MaxBoundDepth          = 4;
+	std::optional<ZydisRegister> compared_reg;
+	std::vector<Guard>           guards;
+	auto                         cursor = function.instructions.find(load_address);
+	for (size_t count = 0; count < MaxPatternInstructions; ++count) {
+		if (StartsStraightPath(function, cursor)) {
+			// Off the straight path, every definition must bound the index on its own.
+			const auto bound = RegisterBound(function, graph, function_start, cursor->first,
+			                                 index_reg, MaxBoundDepth);
+			return bound ? std::optional {JumpTableIndex {*bound, cursor->first}} : std::nullopt;
+		}
+		cursor              = std::prev(cursor);
+		const auto& decoded = cursor->second;
+		const auto& first   = decoded.operands[0];
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_CMP &&
+		    first.type == ZYDIS_OPERAND_TYPE_REGISTER && !IsHighByteRegister(first.reg.value) &&
+		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+		    decoded.operands[1].imm.value.s >= 0) {
+			const auto guard =
+			    function.instructions.find(decoded.address + decoded.instruction.length);
+			const u64          bound = decoded.operands[1].imm.value.u;
+			std::optional<u64> max_index;
+			if (guard != function.instructions.end()) {
+				if (guard->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNBE) {
+					max_index = bound;
+				} else if (guard->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNB && bound != 0) {
+					max_index = bound - 1;
+				}
+			}
+			if (max_index && IsSameRegister(first.reg.value, index_reg)) {
+				if (compared_reg && *compared_reg != first.reg.value) {
+					return std::nullopt;
+				}
+				return JumpTableIndex {*max_index, cursor->first};
+			}
+			if (max_index) {
+				guards.push_back({first.reg.value, *max_index});
+				continue;
+			}
+		}
+		std::erase_if(guards,
+		              [&](const Guard& guard) { return WritesRegister(decoded, guard.reg); });
+		if (!WritesRegister(decoded, index_reg)) {
+			continue;
+		}
+		const auto source = ZeroExtendingSource(decoded);
+		if (!source) {
+			const auto bound =
+			    DefinitionBound(function, graph, function_start, decoded, index_reg, MaxBoundDepth);
+			return bound ? std::optional {JumpTableIndex {*bound, cursor->first}} : std::nullopt;
+		}
+		// A guard checked after this copy bounds the copied register as well.
+		for (const auto& guard: guards) {
+			if (guard.reg == *source) {
+				return JumpTableIndex {guard.max_index, cursor->first};
+			}
+		}
+		index_reg    = *source;
+		compared_reg = *source;
+	}
+	return std::nullopt;
+}
+
+// The table base register must hold one RIP-relative LEA result on every path to the load.
+std::optional<std::pair<uintptr_t, uintptr_t>>
+FindJumpTableAddress(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                     uintptr_t function_start, uintptr_t load_address, ZydisRegister table_reg) {
+	constexpr size_t MaxPatternInstructions = 64;
+	auto             cursor                 = function.instructions.find(load_address);
+	for (size_t count = 0; count < MaxPatternInstructions && !StartsStraightPath(function, cursor);
+	     ++count) {
+		cursor = std::prev(cursor);
+		if (WritesRegister(cursor->second, table_reg)) {
+			const auto address = DecodeRipRelativeLea(cursor->second, table_reg);
+			return address ? std::optional {std::pair {*address, cursor->first}} : std::nullopt;
+		}
+	}
+	const auto definitions =
+	    graph.Get().ReachingDefinitions(function_start, cursor->first, table_reg);
+	if (!definitions || definitions->empty()) {
+		return std::nullopt;
+	}
+	std::optional<uintptr_t> table_address;
+	for (const uintptr_t definition: *definitions) {
+		const auto address = DecodeRipRelativeLea(function.instructions.at(definition), table_reg);
+		if (!address || (table_address && *table_address != *address)) {
+			return std::nullopt;
+		}
+		table_address = address;
+	}
+	return std::pair {*table_address, cursor->first};
+}
+
+// Matches the sum a compiler switch dispatch computes:
+//   movsxd target, dword [table + index * 4]; ... add target, table
+// with a bounded index, and nothing entering the straight path between the bound and the add.
 std::optional<std::vector<uintptr_t>>
-ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_address,
-                        uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
-                        uintptr_t segment_end) {
+ResolveJumpTableSum(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                    uintptr_t add_address, uintptr_t function_start, uintptr_t function_end,
+                    uintptr_t data_start, uintptr_t data_end) {
+	const auto add = function.instructions.find(add_address);
+	if (add == function.instructions.end() ||
+	    add->second.instruction.mnemonic != ZYDIS_MNEMONIC_ADD ||
+	    add->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    add->second.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    RegisterWidth(add->second.operands[0].reg.value) != 64 ||
+	    RegisterWidth(add->second.operands[1].reg.value) != 64) {
+		return std::nullopt;
+	}
+	const ZydisRegister target_reg = add->second.operands[0].reg.value;
+	const ZydisRegister table_reg  = add->second.operands[1].reg.value;
+
+	constexpr size_t MaxPatternInstructions = 64;
+	auto             cursor                 = add;
+	auto             load                   = function.instructions.end();
+	for (size_t count = 0; count < MaxPatternInstructions && load == function.instructions.end();
+	     ++count) {
+		if (StartsStraightPath(function, cursor)) {
+			return std::nullopt;
+		}
+		cursor              = std::prev(cursor);
+		const auto& decoded = cursor->second;
+		const auto& source  = decoded.operands[1];
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOVSXD &&
+		    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		    decoded.operands[0].reg.value == target_reg &&
+		    source.type == ZYDIS_OPERAND_TYPE_MEMORY && source.size == 32 &&
+		    source.mem.segment != ZYDIS_REGISTER_FS && source.mem.segment != ZYDIS_REGISTER_GS &&
+		    source.mem.base == table_reg && source.mem.index != ZYDIS_REGISTER_NONE &&
+		    RegisterWidth(source.mem.index) == 64 && source.mem.scale == sizeof(s32) &&
+		    source.mem.disp.value == 0) {
+			load = cursor;
+		} else if (WritesRegister(decoded, target_reg) || WritesRegister(decoded, table_reg)) {
+			return std::nullopt;
+		}
+	}
+	if (load == function.instructions.end()) {
+		return std::nullopt;
+	}
+
+	const auto index = BoundJumpTableIndex(function, graph, function_start, load->first,
+	                                       load->second.operands[1].mem.index);
+	const auto table =
+	    index ? FindJumpTableAddress(function, graph, function_start, load->first, table_reg)
+	          : std::nullopt;
+	if (!table) {
+		return std::nullopt;
+	}
+	const uintptr_t table_address = table->first;
+	const auto      entered =
+	    function.branch_targets.upper_bound(std::min(index->path_start, table->second));
+	if (entered != function.branch_targets.end() && *entered <= add_address) {
+		return std::nullopt;
+	}
+
+	constexpr u64 MaxJumpTableEntries = 4096;
+	const u64     table_size          = index->max_index + 1;
+	if (index->max_index >= MaxJumpTableEntries || table_address < data_start ||
+	    table_address >= data_end || table_size > (data_end - table_address) / sizeof(s32)) {
+		return std::nullopt;
+	}
+	std::vector<uintptr_t> targets;
+	targets.reserve(table_size);
+	for (u64 entry = 0; entry < table_size; ++entry) {
+		s32 offset;
+		std::memcpy(&offset, reinterpret_cast<const void*>(table_address + entry * sizeof(offset)),
+		            sizeof(offset));
+		const s64 target = static_cast<s64>(table_address) + offset;
+		if (target < static_cast<s64>(function_start) || target >= static_cast<s64>(function_end)) {
+			return std::nullopt;
+		}
+		targets.push_back(static_cast<uintptr_t>(target));
+	}
+	return targets;
+}
+
+// Resolves `jmp reg` when every value reaching it is a jump table sum.
+std::optional<std::vector<uintptr_t>>
+ResolveBoundedJumpTable(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                        uintptr_t branch_address, uintptr_t function_start, uintptr_t function_end,
+                        uintptr_t data_start, uintptr_t data_end) {
 	const auto branch = function.instructions.find(branch_address);
 	if (branch == function.instructions.end() ||
 	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
-	    branch->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER) {
+	    branch->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    RegisterWidth(branch->second.operands[0].reg.value) != 64) {
 		return std::nullopt;
 	}
 	const ZydisRegister target_reg = branch->second.operands[0].reg.value;
 
-	const auto previous_contiguous = [&function](auto instruction) {
-		if (instruction == function.instructions.begin()) {
-			return function.instructions.end();
-		}
-		const auto previous = std::prev(instruction);
-		return previous->first + previous->second.instruction.length == instruction->first
-		           ? previous
-		           : function.instructions.end();
-	};
-
-	constexpr size_t MaxInterveningInstructions = 4;
-	auto             add                        = function.instructions.end();
-	auto             pattern_cursor             = branch;
-	for (size_t count = 0; count <= MaxInterveningInstructions; ++count) {
-		const auto candidate = previous_contiguous(pattern_cursor);
-		if (candidate == function.instructions.end()) {
+	constexpr size_t                   MaxPatternInstructions = 64;
+	std::optional<std::set<uintptr_t>> definitions;
+	auto                               cursor = branch;
+	for (size_t count = 0; count < MaxPatternInstructions && !definitions; ++count) {
+		if (StartsStraightPath(function, cursor)) {
 			break;
 		}
-		const auto& decoded = candidate->second;
-		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_ADD &&
-		    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-		    IsSameRegister(decoded.operands[0].reg.value, target_reg) &&
-		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-			add = candidate;
-			break;
+		cursor = std::prev(cursor);
+		if (WritesRegister(cursor->second, target_reg)) {
+			definitions = std::set {cursor->first};
 		}
-		if (WritesRegister(decoded, target_reg) || IsControlFlowTerminator(decoded.instruction)) {
-			return std::nullopt;
-		}
-		pattern_cursor = candidate;
 	}
-	if (add == function.instructions.end()) {
+	if (!definitions) {
+		definitions = graph.Get().ReachingDefinitions(function_start, cursor->first, target_reg);
+	}
+	if (!definitions || definitions->empty()) {
 		return std::nullopt;
 	}
-	const ZydisRegister table_reg = add->second.operands[1].reg.value;
-
-	const auto load = previous_contiguous(add);
-	if (load == function.instructions.end() ||
-	    load->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD ||
-	    load->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-	    !IsSameRegister(load->second.operands[0].reg.value, target_reg) ||
-	    load->second.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
-	    !IsSameRegister(load->second.operands[1].mem.base, table_reg) ||
-	    load->second.operands[1].mem.index == ZYDIS_REGISTER_NONE ||
-	    load->second.operands[1].mem.scale != sizeof(s32)) {
-		return std::nullopt;
-	}
-	const ZydisRegister index_reg = load->second.operands[1].mem.index;
-
-	constexpr size_t         MaxPatternInstructions = 64;
-	std::optional<size_t>    table_size;
-	std::optional<uintptr_t> guarded_path_start;
-	auto                     cursor = load;
-	for (size_t count = 0; count < MaxPatternInstructions; ++count) {
-		cursor = previous_contiguous(cursor);
-		if (cursor == function.instructions.end()) {
-			break;
-		}
-		const auto& decoded = cursor->second;
-		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_CMP &&
-		    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-		    IsSameRegister(decoded.operands[0].reg.value, index_reg) &&
-		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-			const uintptr_t next_address  = decoded.address + decoded.instruction.length;
-			const auto      bounds_branch = function.instructions.find(next_address);
-			if (bounds_branch == function.instructions.end()) {
-				return std::nullopt;
-			}
-			const s64 bound = decoded.operands[1].imm.is_signed
-			                      ? decoded.operands[1].imm.value.s
-			                      : static_cast<s64>(decoded.operands[1].imm.value.u);
-			if (bound < 0) {
-				return std::nullopt;
-			}
-			if (bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNBE) {
-				table_size = static_cast<size_t>(bound) + 1;
-			} else if (bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNB) {
-				table_size = static_cast<size_t>(bound);
-			} else {
-				return std::nullopt;
-			}
-			guarded_path_start = next_address + bounds_branch->second.instruction.length;
-			break;
-		}
-		if (WritesRegister(decoded, index_reg)) {
+	std::vector<uintptr_t> targets;
+	for (const uintptr_t definition: *definitions) {
+		const auto sum = ResolveJumpTableSum(function, graph, definition, function_start,
+		                                     function_end, data_start, data_end);
+		if (!sum) {
 			return std::nullopt;
 		}
+		targets.insert(targets.end(), sum->begin(), sum->end());
 	}
-	if (!table_size) {
-		return std::nullopt;
-	}
-	if (std::ranges::any_of(function.branch_targets, [&](uintptr_t target) {
-		    return target >= *guarded_path_start && target <= branch_address;
-	    })) {
-		return std::nullopt;
-	}
+	std::ranges::sort(targets);
+	targets.erase(std::ranges::unique(targets).begin(), targets.end());
+	return targets;
+}
 
-	const auto decode_table_address =
-	    [table_reg](const DecodedCodeInstruction& decoded) -> std::optional<uintptr_t> {
-		if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_LEA ||
-		    decoded.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-		    !IsSameRegister(decoded.operands[0].reg.value, table_reg) ||
-		    decoded.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
-			return std::nullopt;
-		}
-		ZyanU64 absolute_address {};
-		if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &decoded.operands[1],
-		                                           decoded.address, &absolute_address))) {
-			return std::nullopt;
-		}
-		return absolute_address;
-	};
-
-	std::set<uintptr_t> table_candidates;
-	cursor = load;
-	for (size_t count = 0; count < MaxPatternInstructions; ++count) {
-		cursor = previous_contiguous(cursor);
-		if (cursor == function.instructions.end()) {
-			break;
-		}
-		if (!WritesRegister(cursor->second, table_reg)) {
-			continue;
-		}
-		if (const auto address = decode_table_address(cursor->second)) {
-			table_candidates.insert(*address);
-		}
-		break;
+// An indirect jump right after the frame pointer is restored leaves the function (tail call).
+bool IsIndirectTailJump(const DecodedFunction& function, uintptr_t branch_address) {
+	const auto branch = function.instructions.find(branch_address);
+	if (branch == function.instructions.end() || branch == function.instructions.begin() ||
+	    function.branch_targets.contains(branch_address)) {
+		return false;
 	}
-	if (table_candidates.empty()) {
-		for (const auto& [address, decoded]: function.instructions) {
-			if (address >= branch_address) {
-				break;
-			}
-			if (const auto table_address = decode_table_address(decoded)) {
-				table_candidates.insert(*table_address);
-			}
-		}
-	}
-	constexpr size_t MaxJumpTableEntries = 4096;
-	if (*table_size == 0 || *table_size > MaxJumpTableEntries) {
-		return std::nullopt;
-	}
-
-	std::optional<std::vector<uintptr_t>> resolved_targets;
-	for (const uintptr_t table_address: table_candidates) {
-		if (table_address < segment_start || table_address > segment_end ||
-		    *table_size > (segment_end - table_address) / sizeof(s32)) {
-			continue;
-		}
-
-		std::vector<uintptr_t> targets;
-		targets.reserve(*table_size);
-		bool valid = true;
-		for (size_t index = 0; index < *table_size; ++index) {
-			s32 offset;
-			std::memcpy(&offset,
-			            reinterpret_cast<const void*>(table_address + index * sizeof(offset)),
-			            sizeof(offset));
-			const s64 target = static_cast<s64>(table_address) + offset;
-			if (target < static_cast<s64>(function_start) ||
-			    target >= static_cast<s64>(function_end)) {
-				valid = false;
-				break;
-			}
-			targets.push_back(static_cast<uintptr_t>(target));
-		}
-		if (!valid) {
-			continue;
-		}
-		std::ranges::sort(targets);
-		targets.erase(std::ranges::unique(targets).begin(), targets.end());
-		if (resolved_targets) {
-			return std::nullopt;
-		}
-		resolved_targets = std::move(targets);
-	}
-	return resolved_targets;
+	const auto  previous = std::prev(branch);
+	const auto& decoded  = previous->second;
+	return previous->first + decoded.instruction.length == branch_address &&
+	       (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEAVE ||
+	        (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POP &&
+	         decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	         decoded.operands[0].reg.value == ZYDIS_REGISTER_RBP));
 }
 
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
-                               uintptr_t segment_start, uintptr_t segment_end) {
+                               uintptr_t data_start, uintptr_t data_end,
+                               bool resolve_jump_tables = true) {
 	DecodedFunction               function;
 	std::vector<uintptr_t>        blocks {function_start};
 	std::unordered_set<uintptr_t> visited;
 	std::set<uintptr_t>           indirect_branches;
 	std::set<uintptr_t>           resolved_indirect_branches;
 
+	LazyControlFlowGraph graph(function);
 	while (true) {
 		while (!blocks.empty()) {
 			uintptr_t address = blocks.back();
@@ -557,30 +890,52 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 			}
 		}
 
-		bool discovered_block = false;
+		bool resolved_branch = false;
+		graph.Reset();
 		for (const uintptr_t branch_address: indirect_branches) {
-			if (resolved_indirect_branches.contains(branch_address)) {
+			if (!resolve_jump_tables || resolved_indirect_branches.contains(branch_address)) {
 				continue;
 			}
-			const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
-			                                             function_end, segment_start, segment_end);
+			const auto targets =
+			    ResolveBoundedJumpTable(function, graph, branch_address, function_start,
+			                            function_end, data_start, data_end);
 			if (!targets) {
 				continue;
 			}
 			resolved_indirect_branches.insert(branch_address);
+			function.jump_table_targets[branch_address] = *targets;
+			resolved_branch                             = true;
 			for (const uintptr_t target: *targets) {
 				function.branch_targets.insert(target);
 				if (!visited.contains(target)) {
 					blocks.push_back(target);
-					discovered_block = true;
 				}
 			}
 		}
-		if (!discovered_block) {
+		if (!resolved_branch) {
 			break;
 		}
 	}
-	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+	// Edges found later may enter an earlier dispatch path, so check every match again. A wrong
+	// table would also decode overlapping instructions; keep only direct control flow then.
+	graph.Reset();
+	const bool consistent =
+	    std::ranges::all_of(function.jump_table_targets,
+	                        [&](const auto& table) {
+		                        return ResolveBoundedJumpTable(
+		                                   function, graph, table.first, function_start,
+		                                   function_end, data_start, data_end) == table.second;
+	                        }) &&
+	    std::ranges::adjacent_find(function.instructions, [](const auto& lhs, const auto& rhs) {
+		    return lhs.first + lhs.second.instruction.length > rhs.first;
+	    }) == function.instructions.end();
+	if (!consistent && resolve_jump_tables) {
+		return DecodeFunction(function_start, function_end, data_start, data_end, false);
+	}
+	function.has_indirect_branch = std::ranges::any_of(indirect_branches, [&](uintptr_t branch) {
+		return !function.jump_table_targets.contains(branch) &&
+		       !IsIndirectTailJump(function, branch);
+	});
 	return function;
 }
 
@@ -652,6 +1007,12 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 				add_successor(branch_target);
 			} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
 				add_successor(branch_target);
+				if (const auto table = function.jump_table_targets.find(decoded.address);
+				    table != function.jump_table_targets.end()) {
+					for (const uintptr_t target: table->second) {
+						add_successor(target);
+					}
+				}
 			} else if (!IsControlFlowTerminator(decoded.instruction)) {
 				add_successor(next_address);
 			}
@@ -1534,7 +1895,9 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		}
 
 		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		auto function =
+		    DecodeFunction(function_start, function_end, reinterpret_cast<uintptr_t>(module->start),
+		                   reinterpret_cast<uintptr_t>(module->end));
 		if (analyze_red_zone) {
 			AnalyzeRedZoneLiveness(function);
 		}

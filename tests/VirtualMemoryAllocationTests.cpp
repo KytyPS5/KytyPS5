@@ -3744,6 +3744,185 @@ void TestPackedReciprocalSquareRoot() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// PS5 executables keep switch tables in read-only data, outside the code segment. A dispatch
+// whose table, index bound and base the patcher can prove, or a tail call, must not leave a
+// four-byte VRSQRTPS on the SIGILL path, and must expose the VRSQRTPS in its cases.
+void TestReciprocalSquareRootBesideJumpTables() {
+	const char* test = "ReciprocalSquareRootBesideJumpTables";
+	constexpr uint64_t module_size = 0x4000;
+	constexpr uint64_t table_offset = 0x3000;
+	constexpr uint64_t allocation_size = module_size * 2;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_table_test");
+	Check(test, mapping != 0, "failed to allocate jump-table test code");
+	InstructionTestScope restore {mapping, allocation_size};
+	restore.InstallHandler(test);
+	using GuestFunction = void(KYTY_SYSV_ABI*)(uint32_t, const uint32_t*, uint32_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const std::array<uintptr_t, 1> function_starts {mapping};
+	auto* table = reinterpret_cast<int32_t*>(mapping + table_offset);
+	const auto tail_target = mapping + 0x800;
+	enum class Dispatch {
+		Bounded,
+		ByteIndex,
+		Masked,
+		HoistedBase,
+		Redispatch,
+		ConstantIndex,
+		TailCall,
+		Unbounded
+	};
+	for (const auto dispatch: {Dispatch::Bounded, Dispatch::ByteIndex, Dispatch::Masked,
+	                           Dispatch::HoistedBase, Dispatch::Redispatch, Dispatch::ConstantIndex,
+	                           Dispatch::TailCall, Dispatch::Unbounded}) {
+		std::memset(reinterpret_cast<void*>(mapping), 0xcc, module_size);
+		*reinterpret_cast<uint8_t*>(tail_target) = 0xc3; // ret
+		Xbyak::CodeGenerator code(0x800, reinterpret_cast<void*>(mapping));
+		Xbyak::Label cases[4];
+		Xbyak::Label fallback;
+		Xbyak::Label done;
+		Xbyak::Label dispatch_jump;
+		Xbyak::Label redispatch;
+		const auto table_address = reinterpret_cast<const void*>(table);
+		const bool hoisted = dispatch == Dispatch::HoistedBase || dispatch == Dispatch::Redispatch;
+		const Xbyak::Reg64 base = hoisted ? code.r12 : code.rcx;
+		code.push(code.rbp);
+		code.mov(code.rbp, code.rsp);
+		code.push(code.r12);
+		code.push(code.rbx);
+		code.mov(code.ebx, 2);
+		// Straight-line site before the dispatch, reached on every call.
+		code.vmovups(code.xmm1, code.ptr[code.rsi]);
+		code.vrsqrtps(code.xmm2, code.xmm1);
+		code.vmovups(code.ptr[code.rdx + 32], code.xmm2);
+		switch (dispatch) {
+			case Dispatch::Bounded:
+			case Dispatch::TailCall:
+				code.cmp(code.edi, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				code.mov(code.eax, code.edi);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				break;
+			case Dispatch::ByteIndex:
+				code.mov(code.eax, code.edi);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				code.cmp(code.al, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				code.movzx(code.eax, code.al);
+				break;
+			case Dispatch::Masked:
+				code.mov(code.eax, code.edi);
+				code.and_(code.eax, 3);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				break;
+			case Dispatch::HoistedBase:
+			case Dispatch::Redispatch:
+				// The base and the masked index reach the dispatch through a branch.
+				code.lea(code.r12, code.ptr[code.rip + table_address]);
+				code.mov(code.eax, code.edi);
+				code.and_(code.eax, 3);
+				code.jmp(dispatch_jump, Xbyak::CodeGenerator::T_NEAR);
+				code.int3();
+				code.L(dispatch_jump);
+				break;
+			case Dispatch::ConstantIndex: {
+				// Every path sets the index from a constant or a flag, as compiled state machines do.
+				Xbyak::Label join;
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				code.mov(code.r12d, 3);
+				code.cmp(code.edi, 3);
+				code.je(join, Xbyak::CodeGenerator::T_NEAR);
+				code.test(code.edi, code.edi);
+				code.setne(code.al);
+				code.movzx(code.r12d, code.al);
+				code.cmp(code.edi, 2);
+				code.jne(join, Xbyak::CodeGenerator::T_NEAR);
+				code.mov(code.r12d, 2);
+				code.L(join);
+				code.mov(code.eax, code.r12d);
+				break;
+			}
+			case Dispatch::Unbounded:
+				code.mov(code.eax, code.edi);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				break;
+		}
+		code.movsxd(code.rax, code.dword[base + code.rax * 4]);
+		code.add(code.rax, base);
+		code.L(redispatch);
+		code.jmp(code.rax);
+		code.L(cases[0]);
+		code.vmovups(code.xmm1, code.ptr[code.rsi]);
+		code.vrsqrtps(code.xmm0, code.xmm1);
+		code.vmovups(code.ptr[code.rdx], code.xmm0);
+		if (dispatch == Dispatch::Redispatch) {
+			// Jump back to the same target until the counter runs out, as state machines do.
+			code.add(code.rdx, 16);
+			code.dec(code.ebx);
+			code.jnz(redispatch, Xbyak::CodeGenerator::T_NEAR);
+		}
+		code.jmp(done, Xbyak::CodeGenerator::T_NEAR);
+		for (uint32_t index = 1; index < 4; ++index) {
+			code.L(cases[index]);
+			code.mov(code.dword[code.rdx], index);
+			code.jmp(done, Xbyak::CodeGenerator::T_NEAR);
+		}
+		code.L(fallback);
+		code.mov(code.dword[code.rdx], 0xffffffffu);
+		code.L(done);
+		code.pop(code.rbx);
+		code.pop(code.r12);
+		if (dispatch == Dispatch::TailCall) {
+			code.mov(code.rax, tail_target);
+			code.pop(code.rbp);
+			code.jmp(code.rax);
+		} else {
+			code.pop(code.rbp);
+			code.ret();
+		}
+		Check(test, Xbyak::GetError() == 0 && code.getSize() < 0x800, "failed to generate jump-table fixture");
+		for (uint32_t index = 0; index < 4; ++index) {
+			table[index] = static_cast<int32_t>(reinterpret_cast<intptr_t>(cases[index].getAddress()) -
+			                                    reinterpret_cast<intptr_t>(table));
+		}
+		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), module_size,
+		                                            reinterpret_cast<void*>(mapping + module_size), module_size);
+		const auto result = Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, true);
+		// Unproven dispatches keep the trap for the straight-line site and hide their cases.
+		const bool proven = dispatch != Dispatch::Unbounded;
+		Check(test, Xbyak::GetError() == 0 && result.reciprocal_sqrt.found == (proven ? 2u : 1u) &&
+		                result.reciprocal_sqrt.native == (proven ? 2u : 0u) &&
+		                result.reciprocal_sqrt.trapped == (proven ? 0u : 1u),
+		      "a provable dispatch or tail call kept VRSQRTPS on the trap path");
+		const std::array<uint32_t, 4> input {0x40800000, 0x3f800000, 0x41800000, 0x3e800000};
+		const std::array<uint32_t, 4> roots {0x3f000000, 0x3f800000, 0x3e800000, 0x40000000};
+		const bool bounded = dispatch == Dispatch::Bounded || dispatch == Dispatch::ByteIndex ||
+		                     dispatch == Dispatch::TailCall;
+		for (const uint32_t selector: {0u, 1u, 2u, 3u, 9u}) {
+			if ((selector == 9 && !bounded) || (selector == 0 && !proven)) {
+				continue;
+			}
+			std::array<uint32_t, 12> output {};
+			const auto traps_before = g_instruction_traps;
+			function(selector, input.data(), output.data());
+			const auto traps = static_cast<uint64_t>(g_instruction_traps - traps_before);
+			Check(test, std::equal(roots.begin(), roots.end(), output.begin() + 8) &&
+			                traps == (proven ? 0u : 1u),
+			      "straight-line reciprocal root lost exact results or its patch");
+			if (selector == 0) {
+				Check(test, std::equal(roots.begin(), roots.end(), output.begin()) &&
+				                (dispatch != Dispatch::Redispatch ||
+				                 std::equal(roots.begin(), roots.end(), output.begin() + 4)),
+				      "dispatched reciprocal root lost exact results");
+			} else {
+				Check(test, output[0] == (selector == 9 ? 0xffffffffu : selector),
+				      "patched dispatch reached the wrong case");
+			}
+		}
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestPackedBitField(bool insert) {
 	const char*        test      = insert ? "PackedBitFieldInsert" : "PackedBitFieldExtract";
 	constexpr uint64_t code_size = 0x80000;
@@ -4451,6 +4630,7 @@ int main(int argc, char** argv) {
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
+		RunTest(TestReciprocalSquareRootBesideJumpTables);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
@@ -4464,6 +4644,7 @@ int main(int argc, char** argv) {
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
+	RunTest(TestReciprocalSquareRootBesideJumpTables);
 	RunTest(TestPackedBitFieldExtract);
 	RunTest(TestCpuExtensionContexts);
 	RunTest(TestPackedBitFieldInsert);

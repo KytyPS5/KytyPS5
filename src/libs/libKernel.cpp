@@ -2170,6 +2170,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
 	LIB_FUNC("8nY19bKoiZk", Posix::fcntl);
+	LIB_FUNC("VW3TVZiM4-E", Posix::ftruncate); // sceKernelFtruncate
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);

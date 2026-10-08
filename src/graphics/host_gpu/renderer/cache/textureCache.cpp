@@ -42,7 +42,7 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
-		       DecodePackedColorClear(format, metadata.clear_word, clear);
+		       DecodeRegisterColorClear(format, metadata.clear_word, metadata.clear_word_hi, clear);
 	}
 	if (cmask) {
 		return false;

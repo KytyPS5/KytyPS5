@@ -26,6 +26,7 @@ struct ImageMetadataInfo {
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
 	uint32_t            control              = 0;
 	uint32_t            clear_word           = 0;
+	uint32_t            clear_word_hi        = 0;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
@@ -458,6 +459,39 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	}
 	clear = next;
 	return true;
+}
+
+// 64-bit targets split their register clear across CB_COLOR*_CLEAR_WORD0 and WORD1.
+[[nodiscard]] inline bool DecodeRegisterColorClear(vk::Format format, uint32_t lo, uint32_t hi,
+                                                   vk::ClearColorValue& clear) {
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat: {
+			vk::ClearColorValue rg {};
+			vk::ClearColorValue ba {};
+			if (!DecodePackedColorClear(vk::Format::eR16G16Sfloat, lo, rg) ||
+			    !DecodePackedColorClear(vk::Format::eR16G16Sfloat, hi, ba)) {
+				return false;
+			}
+			clear.float32 =
+			    std::array<float, 4> {rg.float32[0], rg.float32[1], ba.float32[0], ba.float32[1]};
+			return true;
+		}
+		case vk::Format::eR16G16B16A16Unorm: {
+			clear.float32 = std::array<float, 4> {static_cast<float>(lo & 0xffffu) / 65535.0f,
+			                                      static_cast<float>(lo >> 16u) / 65535.0f,
+			                                      static_cast<float>(hi & 0xffffu) / 65535.0f,
+			                                      static_cast<float>(hi >> 16u) / 65535.0f};
+			return true;
+		}
+		case vk::Format::eR32G32Sfloat:
+			clear.float32 = std::array<float, 4> {std::bit_cast<float>(lo),
+			                                      std::bit_cast<float>(hi), 0.0f, 0.0f};
+			return true;
+		case vk::Format::eR32G32Uint:
+			clear.uint32 = std::array<uint32_t, 4> {lo, hi, 0u, 0u};
+			return true;
+		default: return DecodePackedColorClear(format, lo, clear);
+	}
 }
 
 // Unlike a register clear, a DWORD fill repeats the same word across the entire pixel.

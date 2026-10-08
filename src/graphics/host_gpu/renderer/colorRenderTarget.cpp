@@ -291,6 +291,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
 		desc.info.metadata.clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.clear_word_hi        = rt.clear_word1.word1;
 		desc.info.metadata.clear_register_valid = true;
 	}
 	for (uint32_t level = 0; level < levels; level++) {

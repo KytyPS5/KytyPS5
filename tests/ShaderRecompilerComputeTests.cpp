@@ -10528,6 +10528,16 @@ public:
             DecodePackedColorClear(vk::Format::eR16Sfloat, 0x7e00u, clear) &&
                 std::isnan(clear.float32[0]),
             "half NaN did not remain NaN");
+    Require(name, "64-bit register clear",
+            DecodeRegisterColorClear(vk::Format::eR16G16B16A16Sfloat,
+                                     0xbc003c00u, 0x40003800u, clear) &&
+                std::bit_cast<std::array<uint32_t, 4>>(clear.float32) ==
+                    std::bit_cast<std::array<uint32_t, 4>>(
+                        std::array<float, 4>{1.0f, -1.0f, 0.5f, 2.0f}) &&
+                DecodeRegisterColorClear(vk::Format::eR32G32Sfloat, 0x3f800000u,
+                                         0xc0000000u, clear) &&
+                clear.float32[0] == 1.0f && clear.float32[1] == -2.0f,
+            "64-bit register clear ignored CB_COLOR_CLEAR_WORD1");
     for (const auto format : {vk::Format::eR16Sfloat, vk::Format::eR16Unorm}) {
       Require(name, "R16 DWORD fill",
               !DecodeColorDwordFill(format, 0xbc003c00u, clear) &&

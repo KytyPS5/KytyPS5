@@ -16,6 +16,7 @@ static_assert(!std::is_copy_assignable_v<OwnershipCache>);
 static_assert(std::is_move_constructible_v<OwnershipCache>);
 static_assert(std::is_nothrow_move_assignable_v<OwnershipCache>);
 
+/// Keep regression checks active in release builds where assert may be disabled.
 void Check(bool value, const char *message) {
   if (!value) {
     std::fprintf(stderr, "LruCacheTests: failed: %s\n", message);

@@ -23,12 +23,14 @@ public:
 	LeastRecentlyUsedCache(const LeastRecentlyUsedCache&)            = delete;
 	LeastRecentlyUsedCache& operator=(const LeastRecentlyUsedCache&) = delete;
 
-	/// Transfer storage and links together, leaving the source empty and reusable.
+	/// Existing IDs now belong to the destination; the source is empty and reusable.
+	/// Constructing the empty deques can allocate, so this move is not noexcept.
 	LeastRecentlyUsedCache(LeastRecentlyUsedCache&& other): LeastRecentlyUsedCache() {
 		Swap(other);
 	}
 
-	/// Replace the contents by moving ownership; self-move preserves the cache.
+	/// Invalidates the old destination IDs and destroys its stored objects. Source IDs
+	/// transfer unchanged and the source becomes empty; self-move preserves all entries.
 	LeastRecentlyUsedCache& operator=(LeastRecentlyUsedCache&& other) noexcept {
 		if (this != &other) {
 			m_items.clear();
@@ -40,6 +42,8 @@ public:
 		return *this;
 	}
 
+	/// The tick must not precede the newest live tick: traversal stops at the first
+	/// entry above its cutoff. The returned ID belongs to this cache until Free or a move.
 	[[nodiscard]] size_t Insert(Object object, Tick tick) {
 		const auto id   = Build();
 		auto&      item = m_items[id];
@@ -49,6 +53,8 @@ public:
 		return id;
 	}
 
+	/// Requires a live ID. Older/equal ticks are ignored; an advancing tick must not
+	/// precede the newest live tick, since this entry is appended without sorting.
 	void Touch(size_t id, Tick tick) {
 		auto& item = m_items[id];
 		if (item.tick >= tick) {
@@ -61,6 +67,8 @@ public:
 		}
 	}
 
+	/// Requires a live ID; freeing it twice is invalid. The object remains in storage
+	/// until the slot is reused or its storage is released, but traversal skips it.
 	void Free(size_t id) {
 		auto& item = m_items[id];
 		Detach(item);
@@ -69,6 +77,8 @@ public:
 		m_free.push_back(id);
 	}
 
+	/// The cutoff is inclusive and assumes nondecreasing live ticks. The callback may
+	/// free the current entry; it must not invalidate the next entry saved by this walk.
 	template <typename Function>
 	void ForEachItemBelow(Tick tick, Function&& function) {
 		constexpr bool ReturnsBool = std::is_same_v<std::invoke_result_t<Function, Object>, bool>;
@@ -97,6 +107,8 @@ private:
 		std::swap(m_last, other.m_last);
 	}
 
+	/// A reused slot still contains its previous object and tick. Insert must replace
+	/// both before linking the slot into the live list.
 	[[nodiscard]] size_t Build() {
 		if (m_free.empty()) {
 			const auto id = m_items.size();
@@ -108,6 +120,8 @@ private:
 		return id;
 	}
 
+	/// Requires an item outside the live chain. Storage must remain at
+	/// a stable address while the item is linked.
 	void Attach(Item& item) {
 		if (m_first == nullptr) {
 			m_first = &item;
@@ -122,6 +136,8 @@ private:
 		m_last       = &item;
 	}
 
+	/// Unlinks a live item without recycling its ID or clearing its own links; Touch
+	/// relinks it, whereas Free clears the links before making the slot reusable.
 	void Detach(Item& item) {
 		if (item.prev != nullptr) {
 			item.prev->next = item.next;

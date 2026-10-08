@@ -7,12 +7,16 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/metaClearCheck.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <map>
+#include <memory>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -90,6 +94,18 @@ private:
 		int32_t layer = -1;
 	};
 
+	// Inputs of the last GPU decision over a metadata range; the bytes are watched separately.
+	struct MetaClearDecision {
+		uint64_t                                      size   = 0;
+		vk::Format                                    format = vk::Format::eUndefined;
+		uint32_t                                      level  = 0;
+		std::array<uint8_t, MetaClearCheck::MaxCodes> codes {};
+		std::array<std::array<uint32_t, 4>, MetaClearCheck::MaxCodes> colors {};
+		uint32_t                                                      code_count = 0;
+
+		bool operator==(const MetaClearDecision&) const = default;
+	};
+
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 
@@ -140,6 +156,17 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// Decides and applies the clears of GPU-written metadata slices on the GPU; false when the
+	// CPU must read them back instead.
+	[[nodiscard]] bool MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+	                                              uint32_t image_first, uint64_t address,
+	                                              uint64_t slice_size, uint32_t count,
+	                                              std::span<const uint8_t>             codes,
+	                                              std::span<const vk::ClearColorValue> colors);
+	// Caller holds m_lock. Clears slice s with colors[k] when predicate s * K + k is non-zero.
+	void ClearImageSlicesIf(CommandBuffer& command, ImageId id, const ImageViewInfo& view,
+	                        uint32_t first_layer, uint32_t count,
+	                        std::span<const vk::ClearColorValue> colors, uint64_t predicates);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -176,6 +203,8 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::unique_ptr<MetaClearCheck>                   m_meta_clear_check;
+	std::unordered_map<uint64_t, MetaClearDecision>   m_meta_clear_decisions;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

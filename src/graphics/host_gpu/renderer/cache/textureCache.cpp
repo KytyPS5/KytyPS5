@@ -150,6 +150,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+	if (m_graphics.conditional_rendering_enabled) {
+		m_meta_clear_check = std::make_unique<MetaClearCheck>(graphics, scheduler);
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -1164,12 +1167,33 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	// A slice clears only on a code its target decodes; with none, no slice needs reading.
+	constexpr std::array<uint8_t, 1>              cmask_codes {0x00};
+	constexpr std::array<uint8_t, 5>              dcc_codes {0x20, 0x00, 0x40, 0x80, 0xc0};
+	std::array<uint8_t, MetaClearCheck::MaxCodes> codes {};
+	std::array<vk::ClearColorValue, MetaClearCheck::MaxCodes> colors {};
+	uint32_t                                                  code_count = 0;
+	for (const auto candidate: desc.info.metadata.kind == ImageMetadataKind::Cmask
+	                               ? std::span<const uint8_t>(cmask_codes)
+	                               : std::span<const uint8_t>(dcc_codes)) {
+		if (DecodeColorClear(desc, candidate, colors[code_count])) {
+			codes[code_count++] = candidate;
+		}
+	}
+	if (code_count == 0) {
+		return;
+	}
+	const auto slice_size = range.size / layers;
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		if (MaterializeColorClearOnGpu(id, desc, image_first, range.address + slice_size * first,
+		                               slice_size, count, std::span(codes).first(code_count),
+		                               std::span(colors).first(code_count))) {
+			return;
+		}
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1201,6 +1225,111 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+}
+
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+                                              uint32_t image_first, uint64_t address,
+                                              uint64_t slice_size, uint32_t count,
+                                              std::span<const uint8_t>             codes,
+                                              std::span<const vk::ClearColorValue> colors) {
+	if (m_meta_clear_check == nullptr || desc.type == BindingType::VideoOut) {
+		return false;
+	}
+	const auto& view = desc.view_info;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		if (image.info.IsVolume() || image.info.samples != 1 || image.depth_id ||
+		    image.backing.image == nullptr) {
+			return false;
+		}
+	}
+	MetaClearDecision decision {.size       = slice_size * count,
+	                            .format     = view.format,
+	                            .level      = view.base_level,
+	                            .code_count = static_cast<uint32_t>(codes.size())};
+	for (uint32_t index = 0; index < codes.size(); index++) {
+		decision.codes[index]  = codes[index];
+		decision.colors[index] = std::bit_cast<std::array<uint32_t, 4>>(colors[index].uint32);
+	}
+	// Expanded or undecodable slices keep their result until their bytes change.
+	if (const auto found = m_meta_clear_decisions.find(address);
+	    found != m_meta_clear_decisions.end() && found->second == decision &&
+	    m_buffer_cache.IsWatchedRangeUnchanged(address, decision.size)) {
+		return true;
+	}
+	const auto [metadata, offset] = m_buffer_cache.ObtainBuffer(address, decision.size, true);
+	auto& command                 = m_scheduler.Current();
+	command.EndRendering();
+	const auto predicates = m_meta_clear_check->Record(command.Handle(), *metadata, offset,
+	                                                   slice_size, count, codes, true);
+	{
+		std::scoped_lock lock {m_lock};
+		ClearImageSlicesIf(command, id, view, image_first, count, colors, predicates);
+	}
+	m_buffer_cache.WatchRange(address, decision.size);
+	m_meta_clear_decisions.insert_or_assign(address, decision);
+	return true;
+}
+
+void TextureCache::ClearImageSlicesIf(CommandBuffer& command, ImageId id, const ImageViewInfo& view,
+                                      uint32_t first_layer, uint32_t count,
+                                      std::span<const vk::ClearColorValue> colors,
+                                      uint64_t                             predicates) {
+	auto& image = m_slot_images[id];
+	EXIT_IF(command.IsInvalid() || image.depth_id ||
+	        view.base_level >= image.info.resources.levels || count == 0 ||
+	        first_layer >= image.backing.layers || count > image.backing.layers - first_layer);
+	TrackImage(id);
+	// Unlike a full clear, a skipped clear keeps the guest contents.
+	if (image.IsBufferModified() || image.IsCpuDirty()) {
+		InitializeImage(id);
+		if (image.IsBufferModified() || image.IsCpuDirty()) {
+			EXIT("TextureCache: image clear retained guest ownership\n");
+		}
+	}
+	ImageViewInfo clear_view {};
+	clear_view.format      = view.format;
+	clear_view.type        = count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	clear_view.base_level  = view.base_level;
+	clear_view.base_layer  = first_layer;
+	clear_view.layer_count = count;
+	clear_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentRead |
+	                  vk::AccessFlagBits2::eColorAttachmentWrite,
+	              ImageSubresourceRange {view.base_level, 1, first_layer, count}, command.Handle());
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = image.FindView(clear_view);
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
+	                           std::max(image.info.extent.height >> view.base_level, 1u)};
+	vk::RenderingInfo  rendering {};
+	rendering.renderArea.extent    = extent;
+	rendering.layerCount           = count;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	const auto native              = command.Handle();
+	native.beginRendering(&rendering);
+	for (uint32_t slice = 0; slice < count; slice++) {
+		for (uint32_t code = 0; code < colors.size(); code++) {
+			vk::ConditionalRenderingBeginInfoEXT condition {};
+			condition.buffer = m_meta_clear_check->PredicateBuffer();
+			condition.offset = predicates + (uint64_t {slice} * colors.size() + code) * 4u;
+			native.beginConditionalRenderingEXT(&condition);
+			vk::ClearAttachment clear {};
+			clear.aspectMask       = vk::ImageAspectFlagBits::eColor;
+			clear.colorAttachment  = 0;
+			clear.clearValue.color = colors[code];
+			const vk::ClearRect rect {{{0, 0}, extent}, slice, 1};
+			native.clearAttachments(1, &clear, 1, &rect);
+			native.endConditionalRenderingEXT();
+		}
+	}
+	native.endRendering();
+	CommitGpuWrite(image);
 }
 
 void TextureCache::RefreshImage(ImageId id) {

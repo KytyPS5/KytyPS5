@@ -54,6 +54,9 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	struct BdaPreparationStats { uint64_t scans = 0; uint64_t reused = 0; };
+	// Access only on the serialized GPU command lane.
+	[[nodiscard]] BdaPreparationStats GetBdaPreparationStats() const noexcept { return m_bda_stats; }
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -82,6 +85,11 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	uint64_t                  m_mapping_generation = 1;
+	uint64_t                  m_bda_cpu_generation = 0;
+	uint64_t                  m_bda_registration_generation = 0;
+	uint64_t                  m_bda_mapping_generation = 0;
+	BdaPreparationStats       m_bda_stats;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

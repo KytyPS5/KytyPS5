@@ -370,6 +370,42 @@ void TestConcurrentRegionPublication() {
         "concurrent region publication lost initial CPU ownership");
 }
 
+void TestCpuModificationGeneration() {
+  TrackerHarness harness;
+  auto& tracker = harness.tracker;
+  const auto size = harness.page_manager.GetPageSize();
+  auto* memory = Allocate(harness.page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  auto generation = tracker.CpuModificationGeneration();
+  tracker.ForEachUploadRange(address, size, false,
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(tracker.CpuModificationGeneration() != generation,
+        "initially dirty region publication did not invalidate preparation");
+  generation = tracker.CpuModificationGeneration();
+  tracker.ForEachUploadRange(address, size, false,
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(tracker.CpuModificationGeneration() == generation,
+        "clean upload unnecessarily invalidated preparation");
+  tracker.MarkRegionAsGpuModified(address, size);
+  tracker.UnmarkRegionAsGpuModified(address, size);
+  Check(tracker.CpuModificationGeneration() == generation,
+        "GPU-only ownership changes invalidated CPU upload preparation");
+  tracker.MarkRegionAsCpuModified(address, size);
+  Check(tracker.CpuModificationGeneration() != generation,
+        "CPU write did not invalidate preparation");
+  generation = tracker.CpuModificationGeneration();
+  tracker.ForEachUploadRange(address, size, false,
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  tracker.InvalidateRegion(address, size, [] { Check(false, "clean invalidation flushed"); });
+  Check(tracker.CpuModificationGeneration() != generation,
+        "explicit invalidation did not invalidate preparation");
+  generation = tracker.CpuModificationGeneration();
+  tracker.UntrackMemory(address, size);
+  Check(tracker.CpuModificationGeneration() != generation,
+        "untracking did not invalidate preparation");
+  Release(memory);
+}
+
 void TestCpuDirtyUpload() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1129,6 +1165,7 @@ int main(int argc, char **argv) {
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
+  TestCpuModificationGeneration();
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();

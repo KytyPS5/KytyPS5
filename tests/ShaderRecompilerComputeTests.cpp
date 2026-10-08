@@ -40751,6 +40751,8 @@ void CheckNativeDrawShaderOffsets() {
   std::printf("[host]    %-32s ok\n", "NativeShaderOffsets");
 }
 
+#include "BdaPreparationTests.inc"
+
 void CheckNativeIndexedPreparation(RenderContext& renderer) {
   GraphicsInitJmpTables();
   auto& scheduler = renderer.GetCommandScheduler();
@@ -42109,6 +42111,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-dirty-cache-only") == 0) {
+    VulkanHarness vulkan;
+    CheckBdaPreparationCache(vulkan.RuntimeContext());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-state-only") == 0) {

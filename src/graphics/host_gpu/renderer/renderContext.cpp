@@ -7,6 +7,9 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -90,6 +93,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	++m_mapping_generation;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -113,6 +117,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		++m_mapping_generation;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -128,11 +133,45 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	static const bool cache_enabled = [] {
+		const char* value = std::getenv("KYTY_BDA_DIRTY_CACHE");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	static const bool stats_enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	const auto cpu = m_buffer_cache.CpuModificationGeneration();
+	const auto registrations = m_buffer_cache.RegistrationGeneration();
+	const bool unchanged = cache_enabled && cpu == m_bda_cpu_generation &&
+	                       registrations == m_bda_registration_generation &&
+	                       m_mapping_generation == m_bda_mapping_generation;
+	if (unchanged) {
+		++m_bda_stats.reused;
+	} else {
+		++m_bda_stats.scans;
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		// Save the pre-scan stamps: a CPU write concurrent with the scan must force
+		// another scan, even if it targets a range we already visited.
+		m_bda_cpu_generation = cpu;
+		m_bda_registration_generation = registrations;
+		m_bda_mapping_generation = m_mapping_generation;
+	}
+	// Lazy BDA faults still need processing even when uploads were unchanged.
 	m_fault_process_pending = true;
+	if (stats_enabled && ((m_bda_stats.scans + m_bda_stats.reused) & 4095u) == 0) {
+		static auto last = std::chrono::steady_clock::now();
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(5)) {
+			std::printf("NHL27BDA: cache=%d scans=%llu reused=%llu\n", cache_enabled,
+			            static_cast<unsigned long long>(m_bda_stats.scans),
+			            static_cast<unsigned long long>(m_bda_stats.reused));
+			last = now;
+		}
+	}
 }
 
 void RenderContext::RunGarbageCollector() {

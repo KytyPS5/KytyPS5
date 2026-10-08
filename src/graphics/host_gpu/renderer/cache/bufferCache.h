@@ -103,6 +103,10 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
+		return m_memory_tracker.CpuModificationGeneration();
+	}
+	[[nodiscard]] uint64_t RegistrationGeneration() const noexcept { return m_registration_generation; }
 	void               RunGarbageCollector();
 
 private:
@@ -183,6 +187,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	uint64_t m_registration_generation = 1;
 };
 
 } // namespace Libs::Graphics

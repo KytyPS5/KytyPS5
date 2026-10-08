@@ -29,6 +29,10 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// CPU writes/invalidations and newly published initially-dirty regions invalidate BDA preparation.
+	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
+		return m_cpu_generation.load(std::memory_order_acquire);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -45,6 +49,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				m_cpu_generation.fetch_add(1, std::memory_order_release);
 				return false;
 			}();
 			if (should_flush) {
@@ -147,6 +152,7 @@ private:
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
+	std::atomic_uint64_t m_cpu_generation {1};
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;

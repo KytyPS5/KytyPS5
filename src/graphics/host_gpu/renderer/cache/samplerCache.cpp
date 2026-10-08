@@ -134,6 +134,21 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;
+
+	if (sampler_info.compareEnable) {
+		// Shadow comparison samplers with clamp-to-border must return an unshadowed factor (1.0)
+		// for texels falling outside the cascade or shadow map frustum.
+		if (sampler_info.compareOp == vk::CompareOp::eLessOrEqual ||
+		    sampler_info.compareOp == vk::CompareOp::eLess) {
+			border = integer_border ? vk::BorderColor::eIntOpaqueWhite
+			                        : vk::BorderColor::eFloatOpaqueWhite;
+		} else if (sampler_info.compareOp == vk::CompareOp::eGreaterOrEqual ||
+		           sampler_info.compareOp == vk::CompareOp::eGreater) {
+			border = integer_border ? vk::BorderColor::eIntTransparentBlack
+			                        : vk::BorderColor::eFloatTransparentBlack;
+		}
+	}
+
 	sampler_info.borderColor             = border;
 	sampler_info.unnormalizedCoordinates = (r.ForceUnormCoords() ? VK_TRUE : VK_FALSE);
 

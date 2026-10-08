@@ -712,6 +712,16 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		if (auto* linker = Common::Singleton<RuntimeLinker>::Instance()) {
+			if (const auto* fault_program = linker->FindProgramByAddr(info->exception_address)) {
+				std::printf("module: %s off=0x%016" PRIx64 "\n",
+				            Common::FilenameWithoutDirectory(Common::PathToGenericString(fault_program->file_name)).c_str(),
+				            info->exception_address - fault_program->base_vaddr);
+			} else {
+				std::printf("module: ???\n");
+			}
+			linker->StackTrace(info->rbp, info->rsp);
+		}
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64

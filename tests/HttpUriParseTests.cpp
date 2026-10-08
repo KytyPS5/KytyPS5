@@ -162,8 +162,115 @@ void TestBuildHonoursOption(HttpUriParse parse, HttpUriBuild build) {
   CHECK(BuildWith(build, element, 0) == url);
 }
 
+/// Check pool capacities, including zero, without allowing writes outside the pool.
+void TestParseBufferBounds(HttpUriParse parse) {
+  struct TestCase {
+    const char *url;
+    size_t required;
+  };
+  constexpr TestCase cases[] = {
+      {"", 4},
+      {"http://example.com/path",
+       sizeof("http") + sizeof("example.com") + sizeof("/path") + 1},
+      {"https://user:pw@[::1]:8443/p?q#f",
+       sizeof("https") + sizeof("user") + sizeof("pw") + sizeof("[::1]") +
+           sizeof("/p") + sizeof("?q") + sizeof("#f")},
+      {"mailto:user@example.com",
+       sizeof("mailto") + sizeof("user@example.com") + 1},
+  };
+  constexpr int out_of_memory = -2143088606;
+  for (const auto &test : cases) {
+    size_t required = 0;
+    CHECK(parse(nullptr, test.url, nullptr, &required, 0) == 0);
+    CHECK(required == test.required);
+    for (const size_t capacity : {size_t{0}, size_t{1}, test.required - 1,
+                                 test.required, test.required + 1}) {
+      for (const bool report_size : {false, true}) {
+        std::array<char, 256> pool;
+        pool.fill('!');
+        const auto untouched = pool;
+        SceHttpUriElement element{};
+        size_t reported = 0;
+        const int result = parse(&element, test.url, pool.data() + 1,
+                                 report_size ? &reported : nullptr, capacity);
+        if (report_size) {
+          CHECK(reported == test.required);
+        }
+        if (capacity < test.required) {
+          CHECK(result == out_of_memory);
+          CHECK(pool == untouched);
+        } else {
+          CHECK(result == 0);
+          CHECK(pool.front() == '!');
+          for (size_t i = test.required + 1; i < pool.size(); ++i) {
+            CHECK(pool[i] == '!');
+          }
+          for (const char *part : {element.scheme, element.username,
+                                   element.password, element.hostname,
+                                   element.path, element.query, element.fragment}) {
+            if (part != nullptr) {
+              CHECK(PointsIntoPool(part, pool, test.required + 1));
+              CHECK(part != pool.data());
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Check full, partial and empty builds with undersized and exact output buffers.
+void TestBuildBufferBounds(HttpUriParse parse, HttpUriBuild build) {
+  static constexpr char url[] = "https://user:pw@[::1]:8443/path#frag";
+  std::array<char, 256> pool{};
+  SceHttpUriElement element{};
+  CHECK(parse(&element, url, pool.data(), nullptr, pool.size()) == 0);
+  struct TestCase {
+    uint32_t option;
+    const char *expected;
+  };
+  constexpr TestCase cases[] = {
+      {0, url}, {0xff, url}, {0x01, "https://"}, {0x06, "[::1]:8443"},
+      {0x40, ""},
+  };
+  constexpr int out_of_memory = -2143088606;
+  for (const auto &test : cases) {
+    const size_t expected_size = std::strlen(test.expected) + 1;
+    size_t required = 0;
+    CHECK(build(nullptr, &required, 0, &element, test.option) == 0);
+    CHECK(required == expected_size);
+    for (const size_t capacity : {size_t{0}, size_t{1}, expected_size - 1,
+                                 expected_size, expected_size + 1}) {
+      for (const bool report_size : {false, true}) {
+        std::array<char, 256> buffer;
+        buffer.fill('!');
+        const auto untouched = buffer;
+        size_t reported = 0;
+        const int result = build(buffer.data() + 1,
+                                 report_size ? &reported : nullptr, capacity,
+                                 &element, test.option);
+        if (report_size) {
+          CHECK(reported == expected_size);
+        }
+        if (capacity < expected_size) {
+          CHECK(result == out_of_memory);
+          CHECK(buffer == untouched);
+        } else {
+          CHECK(result == 0);
+          CHECK(std::memcmp(buffer.data() + 1, test.expected, expected_size) == 0);
+          CHECK(buffer.front() == '!');
+          for (size_t i = expected_size + 1; i < buffer.size(); ++i) {
+            CHECK(buffer[i] == '!');
+          }
+        }
+      }
+    }
+  }
+}
+
 } // namespace
 
+/// Run URI parsing, component selection and buffer-capacity regressions.
 int main() {
   Loader::SymbolDatabase symbols;
   Libs::LibHttp::InitNet_1_Http(&symbols);
@@ -176,5 +283,7 @@ int main() {
   TestAbsentQuery(parse);
   TestEmptyUri(parse);
   TestPresentQuery(parse);
+  TestParseBufferBounds(parse);
+  TestBuildBufferBounds(parse, build);
   return failures == 0 ? 0 : 1;
 }

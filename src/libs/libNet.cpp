@@ -325,6 +325,7 @@ static char* CopyUriPart(char*& dst, const UriPart& part) {
 	return out;
 }
 
+/// Store the four empty URI strings only when the supplied pool can hold them.
 static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, size_t prepare) {
 	constexpr size_t needed = 4;
 
@@ -338,7 +339,7 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 	}
 
 	if (out != nullptr && pool != nullptr) {
-		if (prepare != 0 && prepare < needed) {
+		if (prepare < needed) {
 			return HTTP_ERROR_OUT_OF_MEMORY;
 		}
 
@@ -356,6 +357,7 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 	return 0;
 }
 
+/// Report the required pool size and reject undersized pools, including zero capacity.
 static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_url, void* pool,
                                       size_t* require, size_t prepare) {
 	PRINT_NAME();
@@ -526,7 +528,7 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 	}
 
 	if (out != nullptr && pool != nullptr) {
-		if (prepare != 0 && prepare < needed) {
+		if (prepare < needed) {
 			return HTTP_ERROR_OUT_OF_MEMORY;
 		}
 
@@ -605,6 +607,7 @@ static void AppendUriPart(std::string* dst, const char* part) {
 	}
 }
 
+/// Build selected URI components only when the output fits, including its terminator.
 static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare,
                                       const SceHttpUriElement* src_element, uint32_t option) {
 	PRINT_NAME();
@@ -690,7 +693,7 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 	}
 
 	if (out != nullptr) {
-		if (prepare != 0 && prepare < needed) {
+		if (prepare < needed) {
 			return HTTP_ERROR_OUT_OF_MEMORY;
 		}
 

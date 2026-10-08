@@ -313,6 +313,7 @@ static bool IsUriSchemeChar(char c, bool first) {
 	             : (std::isalnum(ch) != 0 || c == '+' || c == '-' || c == '.');
 }
 
+/// Copy a present URI component and its terminator, advancing the pool cursor.
 static char* CopyUriPart(char*& dst, const UriPart& part) {
 	if (part.begin == nullptr) {
 		return nullptr;
@@ -599,6 +600,7 @@ static int KYTY_SYSV_ABI HttpUriEscape(char* out, size_t* require, size_t prepar
 	return 0;
 }
 
+/// Append a URI component when present; absent components contribute no bytes.
 static void AppendUriPart(std::string* dst, const char* part) {
 	EXIT_IF(dst == nullptr);
 

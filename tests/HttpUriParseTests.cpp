@@ -130,6 +130,7 @@ std::string BuildWith(HttpUriBuild build, const SceHttpUriElement &element,
   return std::string(out.data());
 }
 
+/// Verify individual component masks, combined masks and legacy full-URI builds.
 void TestBuildHonoursOption(HttpUriParse parse, HttpUriBuild build) {
   constexpr char url[] =
       "https://user:pw@gssdk1.gamesci.com.cn:8443/VersionServerImpl?x=1#frag";

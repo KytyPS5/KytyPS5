@@ -525,8 +525,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetCommandScheduler().Wait(m_context.GetCommandScheduler().CurrentTick());
 		read_gds(gds_after);
 		std::printf("NHL27GDS: cs=0x%016llx groups=%ux%ux%u gds[0..3] before=%u,%u,%u,%u "
-		            "after=%u,%u,%u,%u
-",
+		            "after=%u,%u,%u,%u\n",
 		            static_cast<unsigned long long>(program.shader_hash), thread_group_x,
 		            thread_group_y, thread_group_z, gds_before[0], gds_before[1], gds_before[2],
 		            gds_before[3], gds_after[0], gds_after[1], gds_after[2], gds_after[3]);

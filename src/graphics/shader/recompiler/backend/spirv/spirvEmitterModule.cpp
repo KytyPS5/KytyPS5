@@ -225,7 +225,7 @@ void DefineDescriptors(EmitterState& state) {
 			    ConstantU32(state, static_cast<uint32_t>(binding.resources.size())));
 		};
 		switch (binding.kind) {
-			case IR::DescriptorBindingKind::Buffers:
+			case IR::DescriptorBindingKind::Buffers: {
 				state.storage_buffer_variable =
 				    Define(ArrayType(StorageBufferType(state)), "buffers");
 				if (state.requirements.buffer_u8) {
@@ -277,6 +277,7 @@ void DefineDescriptors(EmitterState& state) {
 					}
 				}
 				break;
+			}
 			case IR::DescriptorBindingKind::BdaPagetable:
 				state.bda_pagetable_variable = Define(StorageBufferType(state, 64), "bda_pagetable");
 				break;

@@ -11,11 +11,11 @@ void Check(bool condition, const char* message) {
 		std::exit(1);
 	}
 }
-}
+} // namespace
 int main() {
 	constexpr uint64_t frequency = 1000000;
-	FramePacer clock(frequency, 0);
-	uint64_t now = 0;
+	FramePacer         clock(frequency, 0);
+	uint64_t           now = 0;
 	for (int frame = 0; frame < 360; ++frame) {
 		now += clock.Remaining(now);
 		clock.Advance(now + 100, 360);
@@ -24,7 +24,7 @@ int main() {
 
 	FramePacer stalled(frequency, 0);
 	stalled.Advance(100000, 60); // A 100 ms shader/UI stall at the real loop boundary.
-	now = 100000;
+	now              = 100000;
 	int burst_frames = 0;
 	for (int frame = 0; frame < 10; ++frame) {
 		if (stalled.Remaining(now) == 0) ++burst_frames;
@@ -43,8 +43,8 @@ int main() {
 
 	// A ~22 fps guest at 60 Hz lands on 2,3,2,3 vblanks; presents must become even.
 	Libs::Graphics::PresentSmoother smoother;
-	constexpr uint64_t vblank = frequency / 60, cap = vblank * 3 / 4;
-	uint64_t due = 0, previous_present = 0, worst = 0;
+	constexpr uint64_t              vblank = frequency / 60, cap = vblank * 3 / 4;
+	uint64_t                        due = 0, previous_present = 0, worst = 0;
 	for (int frame = 0; frame < 60; ++frame) {
 		due += frame % 2 == 0 ? 2 * vblank : 3 * vblank;
 		const auto delay = smoother.Delay(due, cap);

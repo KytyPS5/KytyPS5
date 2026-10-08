@@ -1,5 +1,4 @@
 #include "graphics/presentation/videoOut.h"
-#include "graphics/presentation/framePacer.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -17,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/dlssFrameGeneration.h"
+#include "graphics/presentation/framePacer.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
@@ -860,15 +860,24 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	EXIT_IF(frequency == 0);
 
 	Graphics::FramePacer pacer(frequency, Common::Timer::QueryPerformanceCounter());
+	const auto           sleep_until = [frequency](uint64_t deadline) {
+        const auto now = Common::Timer::QueryPerformanceCounter();
+        if (deadline <= now) return;
+        const auto remaining_us = ((deadline - now) * 1000000u + frequency - 1) / frequency;
+        Common::Thread::SleepMicro(static_cast<uint32_t>(
+            std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+	};
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		const auto remaining = pacer.Remaining(sleep_begin);
-		if (remaining > 0) {
-			const auto remaining_us =
-			    (remaining * 1000000u + frequency - 1) / frequency;
-			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+		const auto vblank      = sleep_begin + pacer.Remaining(sleep_begin);
+		// Frame Generation shows the real frame between vblanks. A later deadline
+		// waits for the next iteration; a new flip shows it first.
+		if (const auto deferred = m_presenter.DeferredPresentTime();
+		    deferred != 0 && deferred <= vblank) {
+			sleep_until(deferred);
+			m_presenter.PresentDeferred();
 		}
+		sleep_until(vblank);
 		if (token.stop_requested()) {
 			break;
 		}
@@ -1078,7 +1087,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	uint32_t            height  = 0;
 	bool                current = false;
 	bool                premultiplied_alpha = false;
-	bool                process_dlss = false;
+	bool                process_dlss        = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
 		current = cfg->opened && !cfg->closing && cfg->generation == generation;
@@ -1254,7 +1263,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	} else {
 		const auto owner_request = std::find_if(requests.begin(), requests.begin() + count,
 		                                        [group](const auto& r) { return r.id == group; });
-		bool owner_due = false;
+		bool       owner_due     = false;
 		{
 			Common::LockGuard cfg_lock(owner_request->cfg->mutex);
 			owner_due = IsFlipDueLocked(*owner_request->cfg, owner_request->generation);
@@ -1277,8 +1286,20 @@ bool FlipQueue::Flip(uint32_t micros) {
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
 	}
 	if (due) {
+		// Presenting can wait for the swapchain and Frame Generation, while guest
+		// threads reserve the next flip under these port locks. The frames are the
+		// requests' own; Cancel waits for a presenting request before discarding it.
+		for (size_t i = count; i != 0; i--) {
+			requests[i - 1].cfg->mutex.Unlock();
+		}
+		// The hand-off time, not Present's return: FG work there would otherwise
+		// count as spacing and hold every following frame by the full cap.
+		const auto handoff = Common::Timer::QueryPerformanceCounter();
 		m_presenter.Present(std::span(layers.data(), count));
-		if (smooth) m_smoother.Presented(due_time, Common::Timer::QueryPerformanceCounter());
+		if (smooth) m_smoother.Presented(due_time, handoff);
+		for (size_t i = 0; i < count; i++) {
+			requests[i].cfg->mutex.Lock();
+		}
 	}
 
 	m_mutex.Lock();
@@ -1292,15 +1313,19 @@ bool FlipQueue::Flip(uint32_t micros) {
 			continue;
 		}
 		auto& r = *it;
-		r.cfg->flip_status.count++;
-		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
-		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
-		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
-		r.cfg->flip_status.flipArg                  = r.flip_arg;
-		r.cfg->flip_status.currentBuffer            = r.index;
-		r.cfg->flip_status.flipPendingNum--;
-		r.cfg->flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
-		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
+		// A port closed or reopened while presenting takes no status or event.
+		if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
+			r.cfg->flip_status.count++;
+			r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
+			r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
+			r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
+			r.cfg->flip_status.flipArg                  = r.flip_arg;
+			r.cfg->flip_status.currentBuffer            = r.index;
+			r.cfg->flip_status.flipPendingNum--;
+			r.cfg->flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
+			TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip,
+			                      reinterpret_cast<void*>(r.flip_arg));
+		}
 		it = m_requests.erase(it);
 	}
 	m_processing = false;

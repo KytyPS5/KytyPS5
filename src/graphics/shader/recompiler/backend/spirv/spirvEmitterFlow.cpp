@@ -77,12 +77,13 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		if (kind == IR::StageInputKind::FragCoord && component < 2 &&
 		    state.input_info.pixel->raster_scale_dword != UINT32_MAX) {
 			const auto scale_pointer = state.builder.AllocateId();
-			const auto scale_bits = state.builder.AllocateId();
-			const auto scale = state.builder.AllocateId();
-			guest_value = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), scale_pointer,
-			                          state.push_constant_variable, ConstantU32(state, 0),
-			                          ConstantU32(state, state.input_info.pixel->raster_scale_dword + component));
+			const auto scale_bits    = state.builder.AllocateId();
+			const auto scale         = state.builder.AllocateId();
+			guest_value              = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    spv::OpAccessChain, TypePushConstantElementPointer(state), scale_pointer,
+			    state.push_constant_variable, ConstantU32(state, 0),
+			    ConstantU32(state, state.input_info.pixel->raster_scale_dword + component));
 			state.builder.AddFunction(spv::OpLoad, TypeU32(state), scale_bits, scale_pointer);
 			state.builder.AddFunction(spv::OpBitcast, TypeF32(state), scale, scale_bits);
 			state.builder.AddFunction(spv::OpFMul, TypeF32(state), guest_value, value, scale);

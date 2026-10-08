@@ -1,6 +1,3 @@
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_vulkan.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -14,17 +11,21 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/presenter.h"
+#include "graphics/presentation/directUpscaler.h"
 #include "graphics/presentation/dlss.h"
 #include "graphics/presentation/dlssFrameGeneration.h"
+#include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/presentation/xessFrameGeneration.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -154,7 +155,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
                                      const std::vector<const char*>& device_extensions,
                                      SurfaceCapabilities&            out_capabilities,
                                      vk::PhysicalDevice& out_device, uint32_t& out_queue_family,
-                                     std::string& out_rejections) {
+                                     std::string& out_rejections, bool honor_index = true) {
 	EXIT_IF(instance == nullptr);
 	EXIT_IF(surface == nullptr);
 
@@ -164,9 +165,13 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	    });
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
-	if (Config::GetGpuIndex() >= 0) {
+	// The device order can change between runs (hybrid laptops reorder GPUs), so an
+	// index that now names an unsuitable GPU falls back to automatic selection below.
+	bool restricted = false;
+	if (honor_index && Config::GetGpuIndex() >= 0) {
 		if (static_cast<size_t>(Config::GetGpuIndex()) < devices.size()) {
-			devices = {devices[Config::GetGpuIndex()]};
+			devices    = {devices[Config::GetGpuIndex()]};
+			restricted = true;
 		} else {
 			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
 			     Config::GetGpuIndex());
@@ -402,6 +407,15 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 	}
 
+	if (best_device == nullptr && restricted) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Vulkan GPU index {} cannot run the emulator ({}); selecting a GPU automatically\n",
+		    Config::GetGpuIndex(), out_rejections));
+		out_rejections.clear();
+		VulkanFindPhysicalDevice(instance, surface, device_extensions, out_capabilities, out_device,
+		                         out_queue_family, out_rejections, false);
+		return;
+	}
 	out_device       = best_device;
 	out_queue_family = best_queue_family;
 	if (best_device != nullptr) {
@@ -417,9 +431,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
 	const std::array queue_priorities {1.0f, 1.0f};
-	const auto queue_families = physical_device.getQueueFamilyProperties();
-	graphics.present_queue_index = Config::DlssFrameGenerationEnabled() &&
-	    queue_families[queue_family].queueCount > 1 ? 1u : 0u;
+	const auto       queue_families = physical_device.getQueueFamilyProperties();
+	graphics.present_queue_index =
+	    Config::DlssFrameGenerationEnabled() && queue_families[queue_family].queueCount > 1 ? 1u
+	                                                                                        : 0u;
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = graphics.present_queue_index + 1;
@@ -460,6 +475,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_robustness2.pNext = supported_features13.pNext;
 		supported_features13.pNext = &supported_robustness2;
 	}
+	const bool conditional_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT supported_conditional {};
+	if (conditional_extension) {
+		supported_conditional.pNext = supported_features13.pNext;
+		supported_features13.pNext  = &supported_conditional;
+	}
 
 	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
 	vk::PhysicalDeviceMeshShaderFeaturesEXT supported_mesh {};
@@ -495,6 +517,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
+	// FSR/XeSS Vulkan implementations can select half-precision shaders after
+	// querying the physical device. Enable that optional capability when present.
+	if (Config::GetUpscaleBackend() == Config::UpscaleBackend::OptiScaler)
+		features12.shaderFloat16 = supported_features12.shaderFloat16;
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
@@ -585,6 +611,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	if (Config::GetUpscaleBackend() == Config::UpscaleBackend::OptiScaler)
+		device_features.shaderInt16 = supported_features2.features.shaderInt16;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
 	    float_controls.shaderSignedZeroInfNanPreserveFloat64;
@@ -651,6 +679,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional {};
+	graphics.conditional_rendering_enabled =
+	    conditional_extension && supported_conditional.conditionalRendering == VK_TRUE;
+	if (graphics.conditional_rendering_enabled) {
+		conditional.conditionalRendering = VK_TRUE;
+		conditional.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                = &conditional;
+	}
+	// The feature chain belongs to this device creation, including runtime requirements.
+	vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT mutable_descriptor {};
+	if (graphics.dlss_extensions_enabled &&
+	    !DirectUpscaler::EnableDeviceFeatures(graphics, device_features, features11, features12,
+	                                          features13, mutable_descriptor, create_info.pNext)) {
+		graphics.dlss_extensions_enabled = false;
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -662,7 +705,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
 		Log::WriteToConsoleAndLog(fmt::format("vkCreateDevice failed on {}: {}\n",
-		    graphics.physical_device_properties.deviceName.data(), vk::to_string(result)));
+		                                      graphics.physical_device_properties.deviceName.data(),
+		                                      vk::to_string(result)));
 		return nullptr;
 	}
 
@@ -854,12 +898,15 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
-	frame_generation = std::make_unique<DlssFrameGeneration>();
+	frame_generation       = std::make_unique<DlssFrameGeneration>();
 	get_instance_proc_addr = frame_generation->Initialize(get_instance_proc_addr);
-	if (frame_generation->Hooked() && (Config::SpirvDebugPrintfEnabled() || Config::GpuAssistedValidationEnabled())) {
-		LOGF("DLSS Frame Generation unavailable with advanced shader validation; using native Vulkan\n");
+	if (frame_generation->Hooked() &&
+	    (Config::SpirvDebugPrintfEnabled() || Config::GpuAssistedValidationEnabled())) {
+		LOGF("DLSS Frame Generation unavailable with advanced shader validation; using native "
+		     "Vulkan\n");
 		frame_generation->Shutdown();
-		get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+		get_instance_proc_addr =
+		    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
@@ -1022,7 +1069,8 @@ void WindowContext::CreateVulkan() {
 		    !frame_generation->ConfigureDeviceExtensions(available_extensions, device_extensions)) {
 			// Streamline must stop injecting plugin requirements into vkCreateDevice.
 			// Its instance and physical-device handles are native Vulkan handles.
-			get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+			get_instance_proc_addr =
+			    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
 			VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 			VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
 		}
@@ -1030,9 +1078,14 @@ void WindowContext::CreateVulkan() {
 			graphic_ctx.dlss_extensions_enabled =
 			    AppendDlssDeviceExtensions(graphic_ctx, device_extensions, available_extensions);
 		}
+		XessFgBridge::AppendDeviceExtensions(device_extensions, available_extensions);
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		// Lets GPU-written color metadata gate fast-clear materialization without a readback.
+		if (HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
@@ -1057,7 +1110,8 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
-	graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.present_queue_index, &graphic_ctx.present_queue);
+	graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.present_queue_index,
+	                            &graphic_ctx.present_queue);
 	frame_generation->OnDevice(graphic_ctx);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 

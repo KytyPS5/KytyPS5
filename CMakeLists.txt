@@ -318,9 +318,9 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/emulator_dlss_flow.comp"
 	"${gpu_tiler_shader_dir}/emulator_dlss_inputs.comp"
 	"${gpu_tiler_shader_dir}/emulator_dlss_copy.comp"
+	"${gpu_tiler_shader_dir}/color_clear_check.comp"
 )
-foreach(shader_source IN LISTS gpu_blit_shader_sources)
-	get_filename_component(shader_name "${shader_source}" NAME_WE)
+function(add_gpu_blit_shader shader_source shader_name)
 	set(shader_spv "${gpu_blit_generated_dir}/${shader_name}.spv")
 	set(shader_header "${gpu_blit_generated_dir}/${shader_name}_spv.h")
 	string(TOUPPER "${shader_name}_SPV" shader_symbol)
@@ -328,14 +328,19 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
 		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
+		        ${ARGN} "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 		DEPENDS "${shader_source}"
 		VERBATIM
 	)
-	list(APPEND gpu_blit_shader_headers "${shader_header}")
+	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
+endfunction()
+foreach(shader_source IN LISTS gpu_blit_shader_sources)
+	get_filename_component(shader_name "${shader_source}" NAME_WE)
+	add_gpu_blit_shader("${shader_source}" "${shader_name}")
 endforeach()
+add_gpu_blit_shader("${gpu_tiler_shader_dir}/emulator_dlss_inputs.comp" "emulator_dlss_fg_inputs" -DKYTY_FG_INPUTS=1)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -423,6 +428,24 @@ if(KYTY_ENABLE_DLSS)
 	configure_windows_image_layout(dlss_gpu_tests)
 	deploy_kyty_dlss(dlss_gpu_tests)
 	add_test(NAME dlss_gpu COMMAND dlss_gpu_tests)
+	add_test(NAME dlss_optiscaler_unavailable COMMAND dlss_gpu_tests --optiscaler-unavailable)
+	add_test(NAME dlss_optiscaler COMMAND dlss_gpu_tests --optiscaler-gpu)
+	add_test(NAME dlss_optiscaler_presentation COMMAND dlss_gpu_tests --optiscaler-presentation)
+	foreach(backend Fsr XeSS)
+		add_test(NAME dlss_${backend}_presentation COMMAND dlss_gpu_tests --optiscaler-presentation)
+		set_tests_properties(dlss_${backend}_presentation PROPERTIES
+			SKIP_RETURN_CODE 77 LABELS "gpu;upscale" TIMEOUT 120
+			ENVIRONMENT "KYTY_OPTISCALER_TEST_UPSCALER=${backend}")
+	endforeach()
+	set_tests_properties(dlss_optiscaler_presentation PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;upscale" TIMEOUT 120)
+	set_tests_properties(dlss_optiscaler PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;upscale;headless" TIMEOUT 120)
+	add_test(NAME optiscaler_frame_generation COMMAND dlss_gpu_tests --optiscaler-frame-generation)
+	add_test(NAME optiscaler_xess_frame_generation COMMAND dlss_gpu_tests --optiscaler-frame-generation)
+	set_tests_properties(optiscaler_xess_frame_generation PROPERTIES
+		SKIP_RETURN_CODE 77 LABELS "gpu;upscale" TIMEOUT 120
+		ENVIRONMENT "KYTY_OPTISCALER_TEST_FRAME_GENERATION=XeSS")
+	add_test(NAME optiscaler_frame_generation_pixels COMMAND dlss_gpu_tests --optiscaler-frame-generation-gpu)
+	set_tests_properties(optiscaler_frame_generation optiscaler_frame_generation_pixels PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "gpu;optiscaler")
 	add_test(NAME dlss_quality_cost COMMAND dlss_gpu_tests --quality-cost)
 	set_tests_properties(dlss_quality_cost PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss;headless")
 	add_test(NAME dlss_window_device COMMAND dlss_gpu_tests --window-device)
@@ -436,7 +459,7 @@ if(KYTY_ENABLE_DLSS)
 		set_tests_properties(dlss_frame_generation_validation_fallback dlss_frame_generation_extension_fallback PROPERTIES TIMEOUT 60 LABELS "gpu;dlss")
 	endif()
 	add_test(NAME dlss_emulator_presentation COMMAND dlss_gpu_tests --emulator-presentation)
-	foreach(regression srgb fallback pool detail)
+	foreach(regression srgb fallback pool detail spatial)
 		add_test(NAME dlss_presentation_${regression} COMMAND dlss_gpu_tests --presentation-regression ${regression})
 		set_tests_properties(dlss_presentation_${regression} PROPERTIES LABELS "gpu;dlss")
 	endforeach()

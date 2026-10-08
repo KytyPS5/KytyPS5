@@ -61,10 +61,25 @@ static void PrintUsage() {
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
-	::printf("  --dlss <mode>                        Off, Quality, Balanced, Performance, UltraPerformance, DLAA.\n"
-	         "                                       Requires RTX; experimental final-frame reconstruction. Default: Off.\n");
-	::printf("  --render-scale <25-100>             Rasterization resolution percent. Default: 100.\n");
-	::printf("  --dlss-frame-generation <t|f>       NVIDIA DLSS Frame Generation. Default: false.\n");
+	::printf("  --upscale-backend <name>             Native (NGX) or OptiScaler. Default: Native.\n"
+	         "  --optiscaler-path <file>             OptiScaler DLL; default: OptiScaler.dll "
+	         "beside the engine.\n"
+	         "  --optiscaler-upscaler <name>         Auto (OptiScaler INI), Fsr (FidelityFX) or "
+	         "XeSS. Default: Auto.\n"
+	         "  --optiscaler-frame-generation <name> Fsr or XeSS (XeSS-FG through D3D12). Default: "
+	         "Fsr.\n"
+	         "  --upscale-motion <name>              Hybrid (optical flow) or Geometry (lower GPU "
+	         "cost).\n");
+	::printf("  --dlss <mode>                        Off, Quality, Balanced, Performance, "
+	         "UltraPerformance, DLAA.\n"
+	         "                                       Native requires RTX; OptiScaler depends on "
+	         "its selected backend. Default: Off.\n");
+	::printf(
+	    "  --render-scale <25-100>             Rasterization resolution percent. Default: 100.\n");
+	::printf("  --dlss-frame-generation <t|f>       Frame Generation for the selected backend. "
+	         "Default: false.\n");
+	::printf("  --frame-generation-frames <1-4>     Frames generated per real frame, up to the "
+	         "generator's limit. Default: 1.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
@@ -356,6 +371,28 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--upscale-backend") {
+			if (!ParseEnum(value, options.config.upscale_backend)) {
+				::printf("invalid upscale backend: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--upscale-motion") {
+			if (!ParseEnum(value, options.config.upscale_motion)) {
+				::printf("invalid upscale motion: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--optiscaler-path") {
+			options.config.optiscaler_path = value;
+		} else if (arg == "--optiscaler-upscaler") {
+			if (!ParseEnum(value, options.config.optiscaler_upscaler)) {
+				::printf("invalid OptiScaler upscaler: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--optiscaler-frame-generation") {
+			if (!ParseEnum(value, options.config.optiscaler_frame_generation)) {
+				::printf("invalid OptiScaler Frame Generation: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--dlss") {
 			if (!ParseEnum(value, options.config.dlss_mode)) {
 				::printf("invalid DLSS mode: %s\n", value.c_str());
@@ -363,8 +400,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--render-scale") {
 			if (!ParseUint32(value, options.config.render_scale_percent) ||
-			    options.config.render_scale_percent < 25 || options.config.render_scale_percent > 100) {
+			    options.config.render_scale_percent < 25 ||
+			    options.config.render_scale_percent > 100) {
 				::printf("invalid render scale (expected 25-100): %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--frame-generation-frames") {
+			if (!ParseUint32(value, options.config.frame_generation_frames) ||
+			    options.config.frame_generation_frames < 1 ||
+			    options.config.frame_generation_frames > 4) {
+				::printf("invalid Frame Generation frame count (expected 1-4): %s\n",
+				         value.c_str());
 				return false;
 			}
 		} else if (arg == "--dlss-frame-generation") {

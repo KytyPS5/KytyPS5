@@ -236,8 +236,14 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	args << "--dlss" << EnumToText(info.dlss_mode);
+	args << "--upscale-backend" << EnumToText(info.upscale_backend);
+	args << "--upscale-motion" << EnumToText(info.upscale_motion);
+	if (!info.optiscaler_path.isEmpty()) args << "--optiscaler-path" << info.optiscaler_path;
+	args << "--optiscaler-upscaler" << EnumToText(info.optiscaler_upscaler);
+	args << "--optiscaler-frame-generation" << EnumToText(info.optiscaler_frame_generation);
 	args << "--render-scale" << QString::number(info.render_scale_percent);
 	args << "--dlss-frame-generation" << BoolArg(info.dlss_frame_generation);
+	args << "--frame-generation-frames" << QString::number(info.frame_generation_frames);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}

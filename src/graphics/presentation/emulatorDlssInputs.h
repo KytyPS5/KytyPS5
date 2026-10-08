@@ -12,12 +12,14 @@ public:
 	~EmulatorDlssInputs();
 	KYTY_CLASS_NO_COPY(EmulatorDlssInputs);
 	[[nodiscard]] std::optional<DlssFrameInputs> Prepare(CommandBuffer& command, Image& source,
-	                                                   vk::Extent2D input_extent, bool reconstruct_color = true,
-	                                                   Image* geometry_motion_depth = nullptr);
+	                                                     vk::Extent2D input_extent,
+	                                                     bool         reconstruct_color = true,
+	                                                     Image* geometry_motion_depth   = nullptr);
 	// Ordinary color resampling for a rejected DLSS frame. No jitter/history update.
-	[[nodiscard]] bool ResampleColor(CommandBuffer& command, Image& source,
-	                                 VulkanImage& output, vk::ImageView output_view);
-	void Reset();
+	[[nodiscard]] bool ResampleColor(CommandBuffer& command, Image& source, VulkanImage& output,
+	                                 vk::ImageView output_view);
+	void               Reset();
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

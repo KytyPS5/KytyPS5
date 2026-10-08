@@ -93,6 +93,14 @@ public:
 
 	enum class DlssMode { Off, Quality, Balanced, Performance, UltraPerformance, DLAA };
 	Q_ENUM(DlssMode)
+	enum class UpscaleBackend { Native, OptiScaler };
+	Q_ENUM(UpscaleBackend)
+	enum class UpscaleMotion { Hybrid, Geometry };
+	Q_ENUM(UpscaleMotion)
+	enum class OptiScalerUpscaler { Auto, Fsr, XeSS };
+	Q_ENUM(OptiScalerUpscaler)
+	enum class OptiScalerFrameGeneration { Fsr, XeSS };
+	Q_ENUM(OptiScalerFrameGeneration)
 
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
@@ -120,9 +128,15 @@ public:
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
-	DlssMode               dlss_mode                   = DlssMode::Off;
-	int                    render_scale_percent        = 100;
-	bool                   dlss_frame_generation       = false;
+	DlssMode                  dlss_mode                   = DlssMode::Off;
+	UpscaleBackend            upscale_backend             = UpscaleBackend::Native;
+	UpscaleMotion             upscale_motion              = UpscaleMotion::Hybrid;
+	QString                   optiscaler_path;
+	OptiScalerUpscaler        optiscaler_upscaler         = OptiScalerUpscaler::Auto;
+	OptiScalerFrameGeneration optiscaler_frame_generation = OptiScalerFrameGeneration::Fsr;
+	int                       render_scale_percent        = 100;
+	bool                      dlss_frame_generation       = false;
+	int                       frame_generation_frames     = 1;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
@@ -157,8 +171,14 @@ public:
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
 		dlss_mode                   = other.dlss_mode;
+		upscale_backend             = other.upscale_backend;
+		upscale_motion              = other.upscale_motion;
+		optiscaler_path             = other.optiscaler_path;
+		optiscaler_upscaler         = other.optiscaler_upscaler;
+		optiscaler_frame_generation = other.optiscaler_frame_generation;
 		render_scale_percent        = other.render_scale_percent;
 		dlss_frame_generation       = other.dlss_frame_generation;
+		frame_generation_frames     = other.frame_generation_frames;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
@@ -208,8 +228,14 @@ public:
 		KYTY_CFG_SET(audio_input_device);
 		KYTY_CFG_SET(present_mode);
 		KYTY_CFG_SET(dlss_mode);
+		KYTY_CFG_SET(upscale_backend);
+		KYTY_CFG_SET(upscale_motion);
+		KYTY_CFG_SET(optiscaler_path);
+		KYTY_CFG_SET(optiscaler_upscaler);
+		KYTY_CFG_SET(optiscaler_frame_generation);
 		KYTY_CFG_SET(render_scale_percent);
 		KYTY_CFG_SET(dlss_frame_generation);
+		KYTY_CFG_SET(frame_generation_frames);
 		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(hide_cursor_enabled);
@@ -253,11 +279,27 @@ public:
 		KYTY_CFG_GET(present_mode);
 		// Older settings and invalid values must keep DLSS disabled.
 		const auto saved_dlss = TextToEnum<DlssMode>(s->value("dlss_mode", "Off").toString());
-		dlss_mode = EnumToText(saved_dlss).isEmpty() ? DlssMode::Off : saved_dlss;
-		bool scale_ok = false;
-		const auto scale = s->value("render_scale_percent", 100).toInt(&scale_ok);
-		render_scale_percent = scale_ok && scale >= 25 && scale <= 100 ? scale : 100;
-		dlss_frame_generation = s->value("dlss_frame_generation", false).toBool();
+		dlss_mode             = EnumToText(saved_dlss).isEmpty() ? DlssMode::Off : saved_dlss;
+		const auto backend =
+		    TextToEnum<UpscaleBackend>(s->value("upscale_backend", "Native").toString());
+		upscale_backend = EnumToText(backend).isEmpty() ? UpscaleBackend::Native : backend;
+		const auto motion =
+		    TextToEnum<UpscaleMotion>(s->value("upscale_motion", "Hybrid").toString());
+		upscale_motion  = EnumToText(motion).isEmpty() ? UpscaleMotion::Hybrid : motion;
+		optiscaler_path = s->value("optiscaler_path", "").toString();
+		const auto opti_upscaler =
+		    TextToEnum<OptiScalerUpscaler>(s->value("optiscaler_upscaler", "Auto").toString());
+		optiscaler_upscaler =
+		    EnumToText(opti_upscaler).isEmpty() ? OptiScalerUpscaler::Auto : opti_upscaler;
+		const auto opti_fg = TextToEnum<OptiScalerFrameGeneration>(
+		    s->value("optiscaler_frame_generation", "Fsr").toString());
+		optiscaler_frame_generation =
+		    EnumToText(opti_fg).isEmpty() ? OptiScalerFrameGeneration::Fsr : opti_fg;
+		bool       scale_ok     = false;
+		const auto scale        = s->value("render_scale_percent", 100).toInt(&scale_ok);
+		render_scale_percent    = scale_ok && scale >= 25 && scale <= 100 ? scale : 100;
+		dlss_frame_generation   = s->value("dlss_frame_generation", false).toBool();
+		frame_generation_frames = std::clamp(s->value("frame_generation_frames", 1).toInt(), 1, 4);
 		gpu_index = s->value("gpu_index", -1).toInt();
 		if (EnumToText(present_mode).isEmpty()) {
 			present_mode = PresentMode::Mailbox;

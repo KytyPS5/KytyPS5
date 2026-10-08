@@ -6,6 +6,10 @@ option(KYTY_ENABLE_DLSS_FG "Enable NVIDIA DLSS Frame Generation (Streamline Vulk
 set(KYTY_STREAMLINE_SDK_ROOT "${KYTY_THIRD_PARTY_DIR}/Streamline" CACHE PATH "Extracted Streamline SDK release")
 
 add_library(kyty_dlss_sdk INTERFACE)
+# Header-only interfaces of the XeSS and FidelityFX runtimes in an OptiScaler package
+# (MIT; the DLLs are loaded at run time and not distributed).
+target_include_directories(kyty_dlss_sdk SYSTEM INTERFACE
+	"${KYTY_THIRD_PARTY_DIR}/xess/inc" "${KYTY_THIRD_PARTY_DIR}/ffx-api/include")
 if(KYTY_ENABLE_DLSS)
 	if(NOT EXISTS "${KYTY_DLSS_SDK_ROOT}/include/nvsdk_ngx_helpers_vk.h")
 		message(FATAL_ERROR "DLSS SDK not found. Run git submodule update --init --recursive 3rdparty/DLSS, or set KYTY_DLSS_SDK_ROOT to a custom checkout; see docs/dlss.md")

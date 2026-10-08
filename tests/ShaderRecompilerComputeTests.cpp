@@ -222,6 +222,10 @@ struct TextureCacheTestAccess {
     cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
   }
 
+  static uint64_t PendingDestroyBytes(const TextureCache &cache) {
+    return cache.m_pending_destroy_memory.load(std::memory_order_relaxed);
+  }
+
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
                                          uint64_t tick, uint64_t pressure) {
@@ -3929,7 +3933,7 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
-  void CheckBufferCacheDirtyGarbageCollection() {
+  void CheckBufferCacheDirtyGarbageCollection(bool sparse_upload_only = false) {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
     constexpr uint64_t allocation_size = 0x5000000;
@@ -4016,6 +4020,51 @@ public:
         DestroyBuffer(&readback);
         return value;
       };
+
+      if (sparse_upload_only) {
+        // Broad descriptors can span a reserved hole between resident pages.
+        // Exercise the real upload path and verify the bytes read back from Vulkan.
+        constexpr uint64_t gap_page = 0x10000;
+        constexpr uint64_t gap_begin = base + 0x4e00000;
+        std::memset(reinterpret_cast<void *>(gap_begin), 0x3c, gap_page);
+        std::memset(reinterpret_cast<void *>(gap_begin + 2 * gap_page), 0xa7, gap_page);
+        resources.UnmapMemory(gap_begin + gap_page, gap_page);
+        Require(name, "sparse upload unmap",
+                Libs::LibKernel::Memory::KernelMunmap(gap_begin + gap_page, gap_page) == 0,
+                "failed to create a reserved gap in the buffer descriptor");
+        const auto [gap_buffer, gap_offset] =
+            cache.ObtainBuffer(gap_begin, 3 * gap_page, false);
+        Require(name, "sparse GPU upload",
+                ReadNativeValue(*gap_buffer, gap_offset) == 0x3c3c3c3cu &&
+                    ReadNativeValue(*gap_buffer, gap_offset + gap_page) == 0u &&
+                    ReadNativeValue(*gap_buffer, gap_offset + 2 * gap_page) == 0xa7a7a7a7u,
+                "buffer upload did not preserve resident bytes and zero the reserved gap");
+        // Exercise the small streaming path independently of the cached owner.
+        resources.UnmapMemory(gap_begin + gap_page, gap_page);
+        const auto [gap_stream, gap_stream_offset] =
+            cache.ObtainBuffer(gap_begin + gap_page, sizeof(uint32_t), false);
+        Require(name, "sparse stream upload",
+                gap_stream == &cache.GetUtilityBuffer(MemoryUsage::Stream) &&
+                    ReadNativeValue(*gap_stream, gap_stream_offset) == 0u,
+                "stream upload did not zero a reserved guest page");
+        void *gap_mapping = reinterpret_cast<void *>(gap_begin + gap_page);
+        Require(name, "sparse upload remap",
+                Libs::LibKernel::Memory::KernelMapDirectMemory(
+                    &gap_mapping, gap_page, 0x3, 0x10,
+                    direct_offset + gap_begin + gap_page - base, gap_page) == 0,
+                "failed to restore the sparse test mapping");
+        resources.MapMemory(gap_begin + gap_page, gap_page);
+        resources.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+        context.ShutdownGpu();
+        Require(name, "sparse upload cleanup",
+                Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                    Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                        direct_offset, allocation_size) == 0,
+                "failed to release the sparse upload fixture");
+        std::printf("[host]    BufferCacheSparseUpload          ok\n");
+        return;
+      }
 
       constexpr uint64_t stream_pages = base + 0x18000;
       constexpr uint64_t stream_address = stream_pages + 0x4000 - sizeof(uint32_t);
@@ -4613,10 +4662,6 @@ public:
                        sizeof(partial_unmap_survivor_value),
                        partial_unmap_survivor_value, false);
       resources.UnmapMemory(base + 0x8000, 0x4000);
-      uint32_t partial_unmap_survivor_backing = 0;
-      std::memcpy(&partial_unmap_survivor_backing,
-                  memory + partial_unmap_survivor_offset,
-                  sizeof(partial_unmap_survivor_backing));
       Require(
           name, "partial-invalidation ownership",
           !resources.IsMapped(base + 0x8000, 0x4000) &&
@@ -4627,10 +4672,27 @@ public:
                   sizeof(partial_unmap_survivor_value)) &&
               !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
                                       sizeof(partial_unmap_value)) &&
-              !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
-                                      sizeof(partial_unmap_survivor_value)) &&
-              partial_unmap_survivor_backing == partial_unmap_survivor_value,
-          "widened partial invalidation mishandled ownership or backing");
+              cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
+                                     sizeof(partial_unmap_survivor_value)) &&
+              cache.IsRegionGpuModified(base + partial_unmap_survivor_offset,
+                                        sizeof(partial_unmap_survivor_value)),
+          "partial invalidation did not retain GPU ownership of the mapped remainder");
+      // A CPU read of the still-mapped remainder triggers its own fault. This
+      // fixture drives the handler explicitly rather than reading a protected
+      // guest page without the emulator's process-wide exception handler.
+      Require(name, "partial-invalidation survivor fault",
+              resources.HandleFault(PageFaultAccess::Read,
+                                    base + partial_unmap_survivor_offset),
+              "mapped remainder did not download on its CPU read fault");
+      uint32_t partial_unmap_survivor_backing = 0;
+      std::memcpy(&partial_unmap_survivor_backing,
+                  memory + partial_unmap_survivor_offset,
+                  sizeof(partial_unmap_survivor_backing));
+      Require(name, "partial-invalidation survivor publication",
+              partial_unmap_survivor_backing == partial_unmap_survivor_value &&
+                  !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
+                                         sizeof(partial_unmap_survivor_value)),
+              "mapped remainder read fault did not publish its GPU contents");
       resources.MapMemory(base + 0x8000, 0x4000);
       auto survivor =
           cache.ObtainBuffer(base + partial_unmap_survivor_offset,
@@ -4962,6 +5024,20 @@ public:
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
     constexpr uint64_t read_write_meta = 0x0000000204202000ull;
     constexpr uint64_t write_only_meta = 0x0000000204202100ull;
+    // Wider texels hold the fill word in each 32-bit part; infinity/NaN fills stay buffer writes.
+    vk::ClearColorValue fill{};
+    Require(name, "fill clear",
+            DecodeColorDwordFill(vk::Format::eR16G16B16A16Sfloat, 0x3c003800u, fill) &&
+                fill.float32[0] == .5f && fill.float32[1] == 1.f && fill.float32[2] == .5f &&
+                fill.float32[3] == 1.f,
+            "RGBA16F fill was not decoded as a clear");
+    Require(name, "fill clear",
+            !DecodeColorDwordFill(vk::Format::eR16G16B16A16Sfloat, 0x7c000000u, fill),
+            "an RGBA16F infinity fill became a clear");
+    Require(name, "fill clear",
+            DecodeColorDwordFill(vk::Format::eR32G32Uint, 7u, fill) && fill.uint32[0] == 7u &&
+                fill.uint32[1] == 7u,
+            "RG32UI fill was not decoded as a clear");
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -7982,6 +8058,35 @@ public:
                                               &gc_stale_values[index],
                                               sizeof(uint32_t));
       }
+      // More protected old images than a bounded scan can visit in one call.
+      // A clean image after them must eventually be collected, while GPU-current
+      // downloadable images retain their content before memory pressure.
+      scheduler.Finish();
+      std::vector<ImageId> protected_old;
+      for (uint32_t index = 0; index < 45; ++index) {
+        auto desc = gc_image_desc_b;
+        desc.info.data.address = base + 0x380000 + index * 0x1000;
+        auto id = texture_cache.FindImage(desc);
+        texture_cache.MarkGpuWritten(id);
+        protected_old.push_back(id);
+      }
+      auto collectable_desc = gc_image_desc_b;
+      collectable_desc.info.data.address = base + 0x3b0000;
+      const auto collectable = texture_cache.FindImage(collectable_desc);
+      auto oldest = protected_old;
+      oldest.push_back(collectable);
+      TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache, oldest, 100, UINT64_MAX);
+      texture_cache.RunGarbageCollector();
+      Require(name, "bounded GC first batch", TextureCacheTestAccess::Contains(texture_cache, collectable),
+              "GC exceeded its bounded scan before the next collection pass");
+      texture_cache.RunGarbageCollector();
+      Require(name, "GC progresses past protected old images",
+              !TextureCacheTestAccess::Contains(texture_cache, collectable) &&
+              std::ranges::all_of(protected_old, [&](ImageId id) {
+                return TextureCacheTestAccess::Contains(texture_cache, id);
+              }), "ineligible old images blocked reclamation of a later clean image");
+      scheduler.Finish();
+      // Restore ordinary ages before continuing the readback fixture.
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_images, 17, UINT64_MAX);
       texture_cache.RunGarbageCollector();
@@ -7993,9 +8098,13 @@ public:
                                   }),
               "GC retired safely downloadable GPU images before pressure");
       const auto gc_batch_tick = scheduler.CurrentTick();
+      const auto pending_before_gc = TextureCacheTestAccess::PendingDestroyBytes(texture_cache);
       TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache,
                                                          gc_images, 81, 0);
       texture_cache.RunGarbageCollector();
+      Require(name, "GC physical memory pending GPU completion",
+              TextureCacheTestAccess::PendingDestroyBytes(texture_cache) > pending_before_gc,
+              "logical retirement was counted as physical reclamation before GPU completion");
       std::array<uint32_t, 2> gc_before_completion{};
       for (size_t index = 0; index < gc_image_offsets.size(); index++) {
         Libs::LibKernel::Memory::TryReadBacking(base + gc_image_offsets[index],
@@ -8014,6 +8123,9 @@ public:
               "completion");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
+      Require(name, "GC pending memory reclaimed after completion",
+              TextureCacheTestAccess::PendingDestroyBytes(texture_cache) == 0,
+              "completed GPU work retained pending image destruction bytes");
       auto refreshed_buffer_alias = resources.GetBufferCache().ObtainBuffer(
           gc_image_desc_a.info.data.address, gc_image_desc_a.info.data.size,
           false);
@@ -40557,6 +40669,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-sparse-upload-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCacheDirtyGarbageCollection(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {

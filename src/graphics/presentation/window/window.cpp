@@ -1,23 +1,21 @@
 #include "graphics/presentation/window.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/dlssFrameGeneration.h"
+#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -25,13 +23,14 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
 #include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -924,8 +923,8 @@ void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dls
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	double current_fps = 0.0;
-	double display_fps = 0.0;
+	double                   current_fps    = 0.0;
+	double                   display_fps    = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -939,7 +938,7 @@ void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dls
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	const auto fg_display_frames = frame_generation ? frame_generation->TotalPresentedFrames() : 0;
 	if (!title_initialized) {
-		title_fps_start = now;
+		title_fps_start        = now;
 		title_fg_display_start = fg_display_frames;
 	}
 	if (new_guest_frame) {
@@ -952,8 +951,8 @@ void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dls
 		display_fps = static_cast<double>(fg_display_frames - title_fg_display_start) *
 		              static_cast<double>(frequency) / static_cast<double>(now - title_fps_start);
 		title_fg_display_start = fg_display_frames;
-		title_fps_start = now;
-		title_fps_frames = 0;
+		title_fps_start        = now;
+		title_fps_frames       = 0;
 	} else if (title_initialized) {
 		return;
 	}
@@ -962,30 +961,42 @@ void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dls
 	const bool fg_enabled = frame_generation && frame_generation->Enabled();
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	const auto  reconstruction =
+        Config::GetDlssMode() == Config::DlssMode::Off
+	         ? std::string {}
+	         : fmt::format(" [{}: {}]",
+                          Config::GetUpscaleBackend() == Config::UpscaleBackend::OptiScaler
+	                           ? "OptiScaler"
+	                           : "DLSS",
+                          dlss_active     ? "active"
+	                       : dlss_bypassed ? "native, source >= output"
+	                                       : "inactive");
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}{}{}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, title_frame_number, fg_enabled ? display_fps : current_fps,
-	    Config::GetDlssMode() == Config::DlssMode::Off ? "" :
-	        (dlss_active ? " [DLSS: active]" : dlss_bypassed ? " [DLSS: bypassed, source >= output]" : " [DLSS: inactive]"),
-	    fg_enabled ? " [FG]" : "");
+	    reconstruction,
+	    fg_enabled ? (frame_generation->Bridge()
+	                      ? " [OptiScaler FG: XeSS]"
+	                      : (frame_generation->External() ? " [OptiScaler FG: FSR]" : " [FG]"))
+	               : "");
 
 	struct TitleUpdate {
 		SDL_WindowID window_id;
-		std::string text;
+		std::string  text;
 	};
 	// Presentation must not wait for the UI event loop. Own the text until the
 	// callback runs, and resolve the window on the UI thread in case it closed.
 	auto* update = new TitleUpdate {SDL_GetWindowID(window), std::move(text)};
 	if (!SDL_RunOnMainThread(
-	    [](void* data) {
-		    std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
-		    if (auto* target = SDL_GetWindowFromID(title->window_id); target != nullptr) {
-			    SDL_SetWindowTitle(target, title->text.c_str());
-		    }
-	    },
-	    update, false)) {
+	        [](void* data) {
+		        std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		        if (auto* target = SDL_GetWindowFromID(title->window_id); target != nullptr) {
+			        SDL_SetWindowTitle(target, title->text.c_str());
+		        }
+	        },
+	        update, false)) {
 		delete update;
 		EXIT("Could not schedule window title update: %s\n", SDL_GetError());
 	}

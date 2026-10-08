@@ -25,8 +25,8 @@
 #include "loader/systemContent.h"
 #include "loader/timer.h"
 
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <thread>
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

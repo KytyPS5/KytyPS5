@@ -441,16 +441,42 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 
 // Unlike a register clear, a DWORD fill repeats the same word across the entire pixel.
 // Keep this separate: the first register word alone cannot describe a 64-bit color.
+// A uniform 32-bit fill as an image clear: a 32-bit texel is the packed clear, a 64- or
+// 128-bit texel holds the word in each 32-bit part. A clear cannot keep an infinity or NaN
+// bit pattern, so those fills stay buffer writes.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
-	if (format == vk::Format::eR16G16B16A16Sfloat) {
-		if (packed != 0) {
-			return false;
-		}
-		clear = vk::ClearColorValue {};
-		return true;
+	const auto half = [](uint32_t bits) {
+		const uint32_t exponent = (bits >> 10u) & 0x1fu;
+		const uint32_t mantissa = bits & 0x3ffu;
+		const float    value =
+		    std::ldexp(static_cast<float>(exponent != 0 ? mantissa | 0x400u : mantissa),
+		               static_cast<int>(std::max(exponent, 1u)) - 25);
+		return (bits & 0x8000u) != 0 ? -value : value;
+	};
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+			if ((packed & 0x7c00u) == 0x7c00u || (packed & 0x7c000000u) == 0x7c000000u)
+				return false;
+			clear.float32 =
+			    std::array {half(packed), half(packed >> 16u), half(packed), half(packed >> 16u)};
+			return true;
+		case vk::Format::eR16G16B16A16Uint:
+			clear.uint32 =
+			    std::array {packed & 0xffffu, packed >> 16u, packed & 0xffffu, packed >> 16u};
+			return true;
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+			if ((packed & 0x7f800000u) == 0x7f800000u) return false;
+			clear.float32 = std::array {std::bit_cast<float>(packed), std::bit_cast<float>(packed),
+			                            std::bit_cast<float>(packed), std::bit_cast<float>(packed)};
+			return true;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint:
+			clear.uint32 = std::array {packed, packed, packed, packed};
+			return true;
+		default: return DecodePackedColorClear(format, packed, clear);
 	}
-	return DecodePackedColorClear(format, packed, clear);
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

@@ -78,8 +78,9 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	// Driver keys include SPIR-V/state; its version and UUID scope cached binaries.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -448,16 +449,8 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
+	// Bound stale entries accumulated across builds.
+	constexpr uint64_t MaxCacheBytes = 1ull << 30;
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -472,8 +465,7 @@ void PipelineCache::InitializeDriverCache() {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
+		if (file_size >= signature.size() + sizeof(uint64_t) && file_size <= MaxCacheBytes) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
@@ -496,7 +488,8 @@ void PipelineCache::InitializeDriverCache() {
 			}
 		} else {
 			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+			PipelineCacheLog("Vulkan pipeline cache: starting over {} (invalid or above 1 GiB)",
+			                 path);
 		}
 	}
 
@@ -587,7 +580,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, bool allow_geometry_motion) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    bool allow_geometry_motion) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -686,30 +680,38 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	// Reserve spare interfaces only when ordinary guest vertex/fragment stages
 	// leave them unused. This is based on shader interfaces, never title hashes.
 	using namespace ShaderRecompiler;
-	const auto& vs = *vertex_info[0].stage.program;
+	const auto&           vs = *vertex_info[0].stage.program;
 	std::vector<uint32_t> active_pixel_inputs;
 	if (pixel_active) {
-		for (const auto& in : pixel_info.stage.program->info.inputs) {
-			if (in.kind == IR::StageInputKind::Parameter) active_pixel_inputs.push_back(in.location);
+		for (const auto& in: pixel_info.stage.program->info.inputs) {
+			if (in.kind == IR::StageInputKind::Parameter)
+				active_pixel_inputs.push_back(in.location);
 		}
 	}
-	const bool motion_candidate = allow_geometry_motion && pixel_active && !mesh_active && !tess_active &&
-	    (Config::GetDlssMode() != Config::DlssMode::Off || Config::DlssFrameGenerationEnabled()) &&
+	// allow_geometry_motion carries whether presentation consumes temporal inputs.
+	const bool motion_candidate =
+	    allow_geometry_motion && pixel_active && !mesh_active && !tess_active &&
 	    !context.GetClipControl().clip_disable && !pixel_info.dual_source_blending &&
 	    (!context.GetBlendControl(0).enable || context.GetRenderTarget(0).info.blend_bypass) &&
 	    !pixel_info.ps_depth_export_enable && !pixel_info.ps_sample_mask_export_enable &&
 	    !vs.has_address_writes && (vs.param_export_mask & 0xfc000000u) == 0 &&
-	    context.GetRenderTarget(0).attrib.num_fragments == 0 && context.GetDepthZInfo().num_samples == 0 &&
+	    context.GetRenderTarget(0).attrib.num_fragments == 0 &&
+	    context.GetDepthZInfo().num_samples == 0 &&
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxColorAttachments >= 8 &&
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxVertexOutputComponents >= 128 &&
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxFragmentInputComponents >= 128 &&
-	    std::ranges::any_of(vs.info.outputs, [](const auto& out) { return out.kind == IR::StageOutputKind::Position; }) &&
-	    std::ranges::all_of(vs.info.outputs, [](const auto& out) {
-		    return out.kind != IR::StageOutputKind::Layer && out.kind != IR::StageOutputKind::ViewportIndex;
-	    }) &&
-	    std::ranges::all_of(pixel_info.stage.program->info.outputs, [](const auto& out) {
-		    return out.kind != IR::StageOutputKind::Mrt || out.index == 0;
-	    }) &&
+	    std::ranges::any_of(
+	        vs.info.outputs,
+	        [](const auto& out) { return out.kind == IR::StageOutputKind::Position; }) &&
+	    std::ranges::all_of(vs.info.outputs,
+	                        [](const auto& out) {
+		                        return out.kind != IR::StageOutputKind::Layer &&
+		                               out.kind != IR::StageOutputKind::ViewportIndex;
+	                        }) &&
+	    std::ranges::all_of(pixel_info.stage.program->info.outputs,
+	                        [](const auto& out) {
+		                        return out.kind != IR::StageOutputKind::Mrt || out.index == 0;
+	                        }) &&
 	    std::ranges::all_of(pixel_info.stage.program->info.inputs, [&](const auto& in) {
 		    return in.kind != IR::StageInputKind::Parameter ||
 		           ShaderPixelParameterLocation(pixel_info, active_pixel_inputs, in.location) < 26;
@@ -721,7 +723,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.raster_scale_dword = push_data_cursor;
 			push_data_cursor += 2;
 		}
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel     = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 		result.vertex[0] = m_program_cache->Get(vertex_params[0], vertex_info[0], push_data_cursor);
 	}
 	return result;
@@ -837,9 +839,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 	}
 	if (ps_active && ps_input_info->geometry_motion_dword != UINT32_MAX) {
-		rendering.color_count = 8;
-		rendering.color_formats[7] = vk::Format::eR16G16B16A16Sfloat;
-		static_params.color_mask[7] = 0xf;
+		rendering.color_count         = 8;
+		rendering.color_formats[7]    = vk::Format::eR16G16B16A16Sfloat;
+		static_params.color_mask[7]   = 0xf;
 		static_params.blend_enable[7] = false;
 	}
 	const bool with_depth =
@@ -966,7 +968,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+	                       m_driver_cache);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

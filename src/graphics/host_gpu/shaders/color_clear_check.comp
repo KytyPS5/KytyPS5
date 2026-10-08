@@ -1,0 +1,63 @@
+#version 450
+
+// One workgroup per metadata slice. Writes one predicate per candidate clear code:
+// 1 when every byte of the slice equals that code. Uniform slices that match a code
+// are rewritten as 0xff (expanded) when write_back is set, like the CPU path.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer Metadata {
+    uint metadata[];
+};
+
+layout(std430, binding = 1) writeonly buffer Predicates {
+    uint predicates[];
+};
+
+layout(push_constant) uniform Constants {
+    uint base_dword;
+    uint slice_dwords;
+    uvec2 codes;     // up to eight candidate codes, one per byte
+    uint code_count;
+    uint write_back;
+};
+
+shared uint mismatch;
+
+uint Code(uint k) {
+    return (codes[k >> 2] >> (8 * (k & 3))) & 0xffu;
+}
+
+void main() {
+    const uint slice = gl_WorkGroupID.x;
+    const uint base  = base_dword + slice * slice_dwords;
+    if (gl_LocalInvocationIndex == 0) {
+        mismatch = 0;
+    }
+    barrier();
+    const uint code   = metadata[base] & 0xffu;
+    const uint expect = code * 0x01010101u;
+    uint differ = 0;
+    for (uint i = gl_LocalInvocationIndex; i < slice_dwords; i += 256) {
+        differ |= metadata[base + i] ^ expect;
+    }
+    if (differ != 0) {
+        atomicOr(mismatch, 1u);
+    }
+    barrier();
+    bool hit = false;
+    if (gl_LocalInvocationIndex < code_count) {
+        hit = mismatch == 0 && Code(gl_LocalInvocationIndex) == code;
+        predicates[slice * 8 + gl_LocalInvocationIndex] = hit ? 1u : 0u;
+    }
+    bool matched = false;
+    for (uint k = 0; k < code_count; k++) {
+        matched = matched || Code(k) == code;
+    }
+    // Every invocation read its dwords before the barrier above.
+    if (write_back != 0 && mismatch == 0 && matched) {
+        for (uint i = gl_LocalInvocationIndex; i < slice_dwords; i += 256) {
+            metadata[base + i] = 0xffffffffu;
+        }
+    }
+}

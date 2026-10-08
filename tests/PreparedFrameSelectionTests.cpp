@@ -15,15 +15,15 @@ void Check(bool condition, const char* message) {
 	}
 }
 size_t Select(std::span<Frame* const> frames) {
-	return Libs::Graphics::SelectPreparedFrame(frames,
-	    [](const Frame& frame) { return frame.compatible; },
+	return Libs::Graphics::SelectPreparedFrame(
+	    frames, [](const Frame& frame) { return frame.compatible; },
 	    [](const Frame& frame) { return frame.ready; });
 }
-}
+} // namespace
 
 int main() {
-	Frame pending_match {true, false}, ready_match {true, true};
-	Frame pending_other {false, false}, ready_other {false, true};
+	Frame                       pending_match {true, false}, ready_match {true, true};
+	Frame                       pending_other {false, false}, ready_other {false, true};
 	const std::array<Frame*, 2> matches {&pending_match, &ready_match};
 	Check(Select(matches) == 1, "a pending compatible frame hid a ready compatible frame");
 	const std::array<Frame*, 2> mixed {&pending_match, &ready_other};

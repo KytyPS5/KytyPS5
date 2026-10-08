@@ -127,10 +127,11 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
-	constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+	constexpr auto writes =
+	    vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
 	    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite |
-	    vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-	    vk::AccessFlagBits2::eHostWrite;
+	    vk::AccessFlagBits2::eColorAttachmentWrite |
+	    vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eHostWrite;
 	if (destination_access & writes) ++m_write_version;
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;

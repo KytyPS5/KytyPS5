@@ -14005,14 +14005,14 @@ void TestNewShaderRecompilerStageInputInfo() {
   // The mesh prefix uses dwords 0..5; fragment coordinate compensation must
   // coexist with it and with resource constants on both native and scaled passes.
   ps_info.raster_scale_dword = 6;
-  const auto scaled_result = RecompileForTest(shader, ps_options);
+  const auto scaled_result   = RecompileForTest(shader, ps_options);
   CheckSpirvBinaryValidates(scaled_result.spirv);
   std::vector<uint32_t> native_key, scaled_key;
   BuildStageStaticKey(ps_info, scaled_key);
   ps_info.raster_scale_dword = UINT32_MAX;
   BuildStageStaticKey(ps_info, native_key);
   Check(native_key != scaled_key,
-        "fragment coordinate compensation must have a distinct shader cache key");
+	    "fragment coordinate compensation must have a distinct shader cache key");
 
   ShaderPixelInputInfo ps_pos_y_info{};
   ps_pos_y_info.input_num = 1;
@@ -14759,20 +14759,20 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 #include "ShaderRayTracingTests.inc"
 
 void TestScaledRasterScissor() {
-  const auto outside = ScaleRasterScissor({{3000, 2000}, {0, 0}}, .5f, .5f, {640, 360});
-  Check(outside.offset == vk::Offset2D(640, 360) && outside.extent == vk::Extent2D(0, 0),
-        "out-of-bounds empty scissor wraps its extent");
-  const auto edge = ScaleRasterScissor({{1279, 719}, {1, 1}}, .5f, .5f, {640, 360});
-  Check(edge.offset == vk::Offset2D(639, 359) && edge.extent == vk::Extent2D(1, 1),
-        "scaled scissor loses the last attachment pixel");
-  const auto clipped = ScaleRasterScissor({{1200, 600}, {200, 200}}, .5f, .5f, {640, 360});
-  Check(clipped.offset == vk::Offset2D(600, 300) && clipped.extent == vk::Extent2D(40, 60),
-        "scaled scissor exceeds the attachment");
-  const auto empty = ScaleRasterScissor({{3, 5}, {0, 0}}, .5f, .5f, {640, 360});
-  Check(empty.extent == vk::Extent2D(0, 0), "fractional scaling expands an empty scissor");
-  const auto negative = ScaleRasterScissor({{-10, -20}, {30, 60}}, .5f, .5f, {640, 360});
-  Check(negative.offset == vk::Offset2D(0, 0) && negative.extent == vk::Extent2D(10, 20),
-        "negative scissor origin wraps during scaling");
+	const auto outside = ScaleRasterScissor({{3000, 2000}, {0, 0}}, .5f, .5f, {640, 360});
+	Check(outside.offset == vk::Offset2D(640, 360) && outside.extent == vk::Extent2D(0, 0),
+	      "out-of-bounds empty scissor wraps its extent");
+	const auto edge = ScaleRasterScissor({{1279, 719}, {1, 1}}, .5f, .5f, {640, 360});
+	Check(edge.offset == vk::Offset2D(639, 359) && edge.extent == vk::Extent2D(1, 1),
+	      "scaled scissor loses the last attachment pixel");
+	const auto clipped = ScaleRasterScissor({{1200, 600}, {200, 200}}, .5f, .5f, {640, 360});
+	Check(clipped.offset == vk::Offset2D(600, 300) && clipped.extent == vk::Extent2D(40, 60),
+	      "scaled scissor exceeds the attachment");
+	const auto empty = ScaleRasterScissor({{3, 5}, {0, 0}}, .5f, .5f, {640, 360});
+	Check(empty.extent == vk::Extent2D(0, 0), "fractional scaling expands an empty scissor");
+	const auto negative = ScaleRasterScissor({{-10, -20}, {30, 60}}, .5f, .5f, {640, 360});
+	Check(negative.offset == vk::Offset2D(0, 0) && negative.extent == vk::Extent2D(10, 20),
+	      "negative scissor origin wraps during scaling");
 }
 
 } // namespace

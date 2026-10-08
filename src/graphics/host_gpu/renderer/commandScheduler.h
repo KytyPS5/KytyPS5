@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -31,6 +32,10 @@ public:
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// Work that runs after everything already submitted but ahead of the recording command
+	// buffer. BeginAhead returns a recording buffer; SubmitAheadAndWait runs it and blocks.
+	[[nodiscard]] vk::CommandBuffer BeginAhead();
+	void                            SubmitAheadAndWait();
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -50,6 +55,8 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Tick of the newest DeferPriorityOperation (publishes that land after GPU completion).
+	[[nodiscard]] uint64_t LastPriorityTick() const noexcept { return m_last_priority_tick; }
 
 private:
 	class CommandPool {
@@ -87,8 +94,8 @@ private:
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
-	vk::Queue                    m_queue;
-	Common::Mutex&               m_queue_mutex;
+	vk::Queue                        m_queue;
+	Common::Mutex&                   m_queue_mutex;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;
@@ -99,6 +106,10 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	uint64_t                         m_last_priority_tick   = 0;
+	vk::CommandPool                  m_ahead_pool           = nullptr;
+	vk::CommandBuffer                m_ahead_buffer         = nullptr;
+	std::unique_ptr<MasterSemaphore> m_ahead_semaphore;
 };
 
 } // namespace Libs::Graphics

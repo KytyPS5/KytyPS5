@@ -130,7 +130,7 @@ struct ShaderVertexInputInfo {
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
-	uint32_t                geometry_motion_dword = UINT32_MAX;
+	uint32_t                    geometry_motion_dword = UINT32_MAX;
 	ShaderType                  logical_stage        = ShaderType::Vertex;
 	int                     resources_num       = 0;
 	int                     fetch_attrib_reg    = 0;

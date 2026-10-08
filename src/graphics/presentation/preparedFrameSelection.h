@@ -6,7 +6,7 @@
 
 namespace Libs::Graphics {
 // Caller owns the free list and performs the selected frame's lifetime waits.
-template<typename Frame, typename Compatible, typename Ready>
+template <typename Frame, typename Compatible, typename Ready>
 size_t SelectPreparedFrame(std::span<Frame* const> frames, Compatible compatible, Ready ready) {
 	size_t matching = frames.size(), ready_other = frames.size();
 	for (size_t i = 0; i < frames.size(); ++i) {

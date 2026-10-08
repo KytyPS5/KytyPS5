@@ -3,11 +3,12 @@
 
 #include "common/common.h"
 
-#include <cstddef>
 #include <array>
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Config {
@@ -28,6 +29,12 @@ enum class LogDirection { Silent, Console, File };
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
 enum class DlssMode { Off, Quality, Balanced, Performance, UltraPerformance, DLAA };
+enum class UpscaleBackend { Native, OptiScaler };
+enum class UpscaleMotion { Hybrid, Geometry };
+// OptiScaler backend algorithms. Auto uses OptiScaler's NGX layer and its INI selection;
+// Fsr and XeSS call the package's FidelityFX and XeSS runtimes directly.
+enum class OptiScalerUpscaler { Auto, Fsr, XeSS };
+enum class OptiScalerFrameGeneration { Fsr, XeSS };
 
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
@@ -53,9 +60,15 @@ struct ConfigOptions {
 	uint32_t               controller_speaker_volume      = 50;
 	uint32_t               controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
-	DlssMode               dlss_mode                   = DlssMode::Off;
-	uint32_t               render_scale_percent        = 100;
-	bool                   dlss_frame_generation       = false;
+	DlssMode                       dlss_mode                      = DlssMode::Off;
+	UpscaleBackend                 upscale_backend                = UpscaleBackend::Native;
+	UpscaleMotion                  upscale_motion                 = UpscaleMotion::Hybrid;
+	std::string                    optiscaler_path;
+	OptiScalerUpscaler             optiscaler_upscaler             = OptiScalerUpscaler::Auto;
+	OptiScalerFrameGeneration      optiscaler_frame_generation     = OptiScalerFrameGeneration::Fsr;
+	uint32_t                       render_scale_percent            = 100;
+	bool                           dlss_frame_generation           = false;
+	uint32_t                       frame_generation_frames         = 1; // generated per real frame
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
@@ -98,9 +111,16 @@ const std::optional<ControllerColor>& GetControllerColor();
 uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();
 PresentMode GetPresentMode();
-DlssMode GetDlssMode();
-uint32_t GetRenderScalePercent();
-bool DlssFrameGenerationEnabled();
+DlssMode                              GetDlssMode();
+UpscaleBackend                        GetUpscaleBackend();
+UpscaleMotion                         GetUpscaleMotion();
+const std::string&                    GetOptiScalerPath();
+OptiScalerUpscaler                    GetOptiScalerUpscaler();
+OptiScalerFrameGeneration             GetOptiScalerFrameGeneration();
+uint32_t                              GetRenderScalePercent();
+bool                                  DlssFrameGenerationEnabled();
+// Frames generated per real frame, 1-4; each generator caps it at what it supports.
+uint32_t GetFrameGenerationFrames();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HideCursorEnabled();

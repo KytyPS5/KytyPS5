@@ -22,9 +22,9 @@ struct RenderAttachment {
 	bool                    has_stencil   = false;
 	bool                    stencil_clear = false;
 	// Cache-owned original. Raster scaling restores its contents/layout at pass end.
-	Image*                  image          = nullptr;
-	uint32_t                mip_level      = 0;
-	uint32_t                base_layer     = 0;
+	Image*   image      = nullptr;
+	uint32_t mip_level  = 0;
+	uint32_t base_layer = 0;
 
 	bool operator==(const RenderAttachment&) const = default;
 };
@@ -36,7 +36,8 @@ struct RenderState {
 	uint32_t                                                   height                = 0;
 	uint32_t                                                   num_layers            = 1;
 	uint32_t                                                   num_color_attachments = 0;
-	uint32_t                                                   raster_scale_percent  = 100;
+	float                                                      raster_scale_x             = 1.f;
+	float                                                      raster_scale_y             = 1.f;
 	bool                                                       geometry_motion_attachment = false;
 
 	bool operator==(const RenderState&) const = default;

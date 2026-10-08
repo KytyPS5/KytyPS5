@@ -93,15 +93,64 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics, bool presentation)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   bool presentation)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_queue(presentation && graphics.present_queue ? graphics.present_queue : graphics.queue),
-      m_queue_mutex(m_queue != graphics.queue ? graphics.present_queue_mutex : graphics.queue_mutex),
+      m_queue_mutex(m_queue != graphics.queue ? graphics.present_queue_mutex
+                                              : graphics.queue_mutex),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_ahead_pool) {
+		m_graphics.device.destroyCommandPool(m_ahead_pool, nullptr);
+	}
+}
+
+vk::CommandBuffer CommandScheduler::BeginAhead() {
+	if (!m_ahead_pool) {
+		vk::CommandPoolCreateInfo pool {};
+		pool.queueFamilyIndex = m_graphics.queue_family;
+		pool.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		             vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		RequireVulkanSuccess(m_graphics.device.createCommandPool(&pool, nullptr, &m_ahead_pool),
+		                     "create ahead command pool");
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_ahead_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		RequireVulkanSuccess(m_graphics.device.allocateCommandBuffers(&allocate, &m_ahead_buffer),
+		                     "allocate ahead command buffer");
+		m_ahead_semaphore = std::make_unique<MasterSemaphore>(m_graphics);
+	}
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(m_ahead_buffer.begin(&begin), "begin ahead command buffer");
+	return m_ahead_buffer;
+}
+
+void CommandScheduler::SubmitAheadAndWait() {
+	RequireVulkanSuccess(m_ahead_buffer.end(), "end ahead command buffer");
+	const auto                      tick   = m_ahead_semaphore->NextTick();
+	const auto                      signal = m_ahead_semaphore->Handle();
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.signalSemaphoreValueCount = 1;
+	timeline.pSignalSemaphoreValues    = &tick;
+	vk::SubmitInfo submit {};
+	submit.pNext                = &timeline;
+	submit.commandBufferCount   = 1;
+	submit.pCommandBuffers      = &m_ahead_buffer;
+	submit.signalSemaphoreCount = 1;
+	submit.pSignalSemaphores    = &signal;
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		result = m_queue.submit(1, &submit, nullptr);
+	}
+	RequireVulkanSuccess(result, "submit ahead command buffer");
+	m_ahead_semaphore->Wait(tick);
 }
 
 void CommandScheduler::Shutdown() {
@@ -247,6 +296,7 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	m_last_priority_tick = CurrentTick();
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);

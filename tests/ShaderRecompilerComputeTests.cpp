@@ -13325,9 +13325,7 @@ public:
               read_only_depth.stencil_back.writeMask == 0 &&
               read_only_depth.stencil_front.passOp ==
                   vk::StencilOp::eKeep &&
-              !read_only_depth.AttachmentWriteAspects() &&
-              depth_attachment_layout(read_only_depth) ==
-                  vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+              !read_only_depth.AttachmentWriteAspects(),
           "a PS5 read-only depth/stencil target required write addresses or "
           "retained host writes");
 
@@ -13340,9 +13338,7 @@ public:
       Require(name, "read-only stencil clear suppression",
               read_only_clear_depth.image_id == phased_depth.image_id &&
                   !read_only_clear_depth.stencil_clear_enable &&
-                  !read_only_clear_depth.AttachmentWriteAspects() &&
-                  depth_attachment_layout(read_only_clear_depth) ==
-                      vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                  !read_only_clear_depth.AttachmentWriteAspects(),
               "a PS5 target-level stencil write disable retained a host clear");
 
       registers.SetDepthRenderTarget(phased_depth_target);
@@ -39901,35 +39897,50 @@ void CheckDynamicRenderingState() {
           rgba != depth,
           "depth/stencil formats did not participate in pipeline identity");
 
-  RenderDepthInfo attachment{};
-  attachment.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
-  Require("DynamicRenderingState", "read-only depth/stencil layout",
-          depth_attachment_layout(attachment) ==
+  const vk::ImageAspectFlags depth_aspect = vk::ImageAspectFlagBits::eDepth;
+  const vk::ImageAspectFlags stencil_aspect = vk::ImageAspectFlagBits::eStencil;
+  const auto depth_stencil_aspects = depth_aspect | stencil_aspect;
+  Require("DynamicRenderingState", "unsampled depth/stencil layout",
+          depth_attachment_layout(depth_stencil_aspects, {}, {}) ==
+                  vk::ImageLayout::eDepthStencilAttachmentOptimal &&
+              depth_attachment_layout(depth_stencil_aspects, depth_aspect, {}) ==
+                  vk::ImageLayout::eDepthStencilAttachmentOptimal,
+          "an unsampled depth/stencil target used a read-only layout");
+  Require("DynamicRenderingState", "sampled read-only depth/stencil layout",
+          depth_attachment_layout(depth_stencil_aspects, {}, depth_aspect) ==
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,
-          "fully read-only depth/stencil used a writable layout");
-  attachment.depth_load_clear_enable = true;
-  Require("DynamicRenderingState", "deferred depth clear layout",
-          depth_attachment_layout(attachment) ==
-              vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
-          "a depth load clear used a read-only attachment layout");
-  attachment.depth_test_enable = true;
-  attachment.depth_write_enable = true;
-  Require("DynamicRenderingState", "depth-write stencil-read layout",
-          depth_attachment_layout(attachment) ==
-              vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
-          "depth-only writes did not retain read-only stencil");
-  attachment.depth_load_clear_enable = false;
-  attachment.depth_write_enable = false;
-  attachment.stencil_clear_enable = true;
-  Require("DynamicRenderingState", "depth-read stencil-write layout",
-          depth_attachment_layout(attachment) ==
+          "a sampled target without writes used a writable layout");
+  Require("DynamicRenderingState", "sampled depth, written stencil layout",
+          depth_attachment_layout(depth_stencil_aspects, stencil_aspect,
+                                  depth_aspect) ==
               vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
-          "stencil-only writes did not retain read-only depth");
-  attachment.depth_write_enable = true;
-  Require("DynamicRenderingState", "writable depth/stencil layout",
-          depth_attachment_layout(attachment) ==
-              vk::ImageLayout::eDepthStencilAttachmentOptimal,
-          "combined depth/stencil writes did not use the writable layout");
+          "sampled depth with stencil writes did not split the aspects");
+  Require("DynamicRenderingState", "sampled stencil, written depth layout",
+          depth_attachment_layout(depth_stencil_aspects, depth_aspect,
+                                  stencil_aspect) ==
+              vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
+          "sampled stencil with depth writes did not split the aspects");
+  Require("DynamicRenderingState", "single-aspect layouts",
+          depth_attachment_layout(depth_aspect, {}, {}) ==
+                  vk::ImageLayout::eDepthAttachmentOptimal &&
+              depth_attachment_layout(depth_aspect, {}, depth_aspect) ==
+                  vk::ImageLayout::eDepthReadOnlyOptimal &&
+              depth_attachment_layout(stencil_aspect, {}, {}) ==
+                  vk::ImageLayout::eStencilAttachmentOptimal &&
+              depth_attachment_layout(stencil_aspect, {}, stencil_aspect) ==
+                  vk::ImageLayout::eStencilReadOnlyOptimal,
+          "a single-aspect format used a combined depth/stencil layout");
+  Require("DynamicRenderingState", "kept depth/stencil layouts",
+          DepthAttachmentLayoutPermits(
+              vk::ImageLayout::eDepthStencilAttachmentOptimal, depth_aspect, {}) &&
+              DepthAttachmentLayoutPermits(
+                  vk::ImageLayout::eDepthStencilReadOnlyOptimal, {}, depth_aspect) &&
+              !DepthAttachmentLayoutPermits(
+                  vk::ImageLayout::eDepthStencilReadOnlyOptimal, depth_aspect, {}) &&
+              !DepthAttachmentLayoutPermits(
+                  vk::ImageLayout::eDepthStencilAttachmentOptimal, {}, depth_aspect) &&
+              !DepthAttachmentLayoutPermits(vk::ImageLayout::eGeneral, {}, {}),
+          "a kept attachment layout ignored a draw's writes or samples");
   std::printf("[host]    %-32s ok\n", "DynamicRenderingState");
 }
 

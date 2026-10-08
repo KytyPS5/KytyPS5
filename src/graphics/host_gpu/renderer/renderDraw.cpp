@@ -541,15 +541,27 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
-		auto layout = depth_attachment_layout(depth);
-		if (sampled_aspects & ~DepthReadableAspects(layout)) {
+		auto layout = image.backing.subresource_states.empty() ? image.backing.state.layout
+		                                                       : vk::ImageLayout::eUndefined;
+		if (!DepthAttachmentLayoutPermits(layout, draw_writes, sampled_aspects)) {
+			layout =
+			    depth_attachment_layout(ImageViewOps::DepthAspectMask(depth.desc.view_info.format),
+			                            draw_writes, sampled_aspects);
+		}
+		// A draw writing an aspect it also samples (possibly in another subresource) needs one
+		// layout for both.
+		if ((draw_writes & ~DepthWritableAspects(layout)) ||
+		    (sampled_aspects & ~DepthReadableAspects(layout))) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
-		// The attachment store writes even when guest depth/stencil tests do not.
-		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		// The attachment store writes even when guest depth/stencil tests do not. Sampled targets
+		// take their shader reads here too, so binding them needs no second barrier.
+		const auto access =
+		    vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		    vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+		    (sampled_aspects ? vk::AccessFlagBits2::eShaderRead : vk::AccessFlags2 {});
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;

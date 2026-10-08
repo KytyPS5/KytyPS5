@@ -3977,6 +3977,89 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBufferCacheOversizedImageSource() {
+    constexpr const char *name = "BufferCacheOversizedImageSource";
+    // A streaming pool larger than the staging ring is uploaded whole: its source buffer
+    // must carry every resident byte at the image's offset.
+    constexpr uintptr_t base = 0x0000001000000000ull;
+    constexpr uint64_t aperture_size = 0x21000000;  // 528 MiB, past the 512 MiB ring.
+    constexpr uint64_t resident_offset = 0x20ff0000;
+    constexpr uint64_t resident_size = 0x10000;
+    constexpr uint32_t resident_value = 0x1e2d3c4bu;
+
+    EnsureRuntimeContext();
+    void *reserved = reinterpret_cast<void *>(base);
+    Require(name, "aperture reservation",
+            Libs::LibKernel::Memory::KernelReserveVirtualRange(
+                &reserved, aperture_size, 0x10, 0x10000) == 0 &&
+                reserved == reinterpret_cast<void *>(base),
+            "fixed aperture reservation failed");
+    Require(name, "aperture",
+            Libs::LibKernel::Memory::KernelSetPrtAperture(0, reserved, aperture_size) == 0,
+            "PRT aperture registration failed");
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                resident_size, 0x10000, 0, &direct_offset) == 0,
+            "resident page allocation failed");
+    void *resident = reinterpret_cast<void *>(base + resident_offset);
+    Require(name, "resident mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &resident, resident_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                resident == reinterpret_cast<void *>(base + resident_offset),
+            "resident page mapping inside the aperture failed");
+    std::memcpy(resident, &resident_value, sizeof(resident_value));
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, aperture_size);
+      const auto [buffer, offset] = cache.ObtainBufferForImage(base, aperture_size);
+      Require(name, "source buffer",
+              buffer != nullptr && buffer->Size() >= offset + aperture_size,
+              "an image larger than the staging ring has no upload source");
+      auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                       vk::BufferUsageFlagBits::eTransferDst, {0xffffffffu});
+      const vk::BufferCopy copy{offset + resident_offset, 0, sizeof(uint32_t)};
+      scheduler.Current().Handle().copyBuffer(buffer->Handle(), readback.buffer, 1, &copy);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = readback.buffer;
+      barrier.size = readback.size;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+          nullptr, 1, &barrier, 0, nullptr);
+      scheduler.Finish();
+      Require(name, "resident bytes", ReadBuffer(name, readback, 1)[0] == resident_value,
+              "the oversized image source lost its resident contents");
+      DestroyBuffer(&readback);
+      context.UnmapMemory(base, aperture_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "aperture release",
+            Libs::LibKernel::Memory::KernelSetPrtAperture(0, nullptr, 0) == 0,
+            "PRT aperture release failed");
+    Require(name, "aperture unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, aperture_size) == 0,
+            "aperture range unmap failed");
+    Require(name, "direct release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, resident_size) == 0,
+            "resident page release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -43430,6 +43513,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
+    vulkan.CheckBufferCacheOversizedImageSource();
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
@@ -43648,6 +43732,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+    vulkan.CheckBufferCacheOversizedImageSource();
     vulkan.CheckBufferCacheDirtyGarbageCollection();
   } else {
     skipped_device_checks = true;

@@ -915,9 +915,23 @@ void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 	const auto flags = AddMemoryInfo(memory, inst.pc);
 	const bool ordered  = program.info.uses_ordered_append;
 	if (ordered) {
-		// M0[10:0] carries the wave's ordered-append term, as the game copied it from TG_SIZE.
-		const auto wave_id = ir.BitwiseAnd(m0, IR::U32(IR::Value(IR::OrderedAppendWaveIdMask)));
-		ir.Emit(IR::ValueOpcode::OrderedAppendWait, {wave_id, is_first}, flags);
+		// Wait on the full dispatch-order rank: M0 only keeps its low 11 bits, which repeat
+		// every 2048 waves while Vulkan may run such waves concurrently.
+		const auto builtin = [&](IR::StageInputKind kind, uint32_t component) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::GetBuiltin,
+			                       {IR::Value(static_cast<uint32_t>(kind)), IR::Value(component)}));
+		};
+		auto group      = builtin(IR::StageInputKind::WorkgroupId, 2);
+		group           = ir.IAdd(ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 1)),
+		                          builtin(IR::StageInputKind::WorkgroupId, 1));
+		group           = ir.IAdd(ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 0)),
+		                          builtin(IR::StageInputKind::WorkgroupId, 0));
+		const auto wave = IR::U32(
+		    ir.Emit(IR::ValueOpcode::UDiv32, {builtin(IR::StageInputKind::LocalInvocationIndex, 0),
+		                                      IR::Value(program.info.ordered_append_wave_size)}));
+		const auto rank =
+		    ir.IAdd(ir.IMul(group, IR::U32(IR::Value(program.info.ordered_append_waves))), wave);
+		ir.Emit(IR::ValueOpcode::OrderedAppendWait, {rank, is_first}, flags);
 	}
 	IR::U32 result;
 	if (((inst.secondary_offset >> 4u) & 3u) == 1u) {

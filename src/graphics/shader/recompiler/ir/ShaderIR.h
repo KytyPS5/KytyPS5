@@ -491,6 +491,9 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	// Waves per workgroup and wave size used to rebuild a wave's dispatch-order rank.
+	uint32_t ordered_append_waves     = 0;
+	uint32_t ordered_append_wave_size = 0;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

@@ -1227,12 +1227,11 @@ void EmitOrderedAppendRelease(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 void EmitOrderedAppendWait(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state   = ctx.state;
-	const auto wave_id = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 0),
-	                            ConstantU32(state, IR::OrderedAppendWaveIdMask));
+	auto&      state = ctx.state;
+	const auto rank  = ctx.Arg(inst, 0);
 	EmitIfCondition(state, ctx.Arg(inst, 1), [&]() {
-		// Spin until the release counter reaches this wave's term. The bound only breaks a
-		// deadlock when a wave never releases; the order is then lost, not the dispatch.
+		// Spin until the release counter reaches this wave's rank. Known limitation: the bound
+		// breaks a deadlock when an earlier wave never releases, at the cost of the order.
 		const auto preheader = state.current_label;
 		const auto header    = state.builder.AllocateId();
 		const auto body      = state.builder.AllocateId();
@@ -1250,9 +1249,7 @@ void EmitOrderedAppendWait(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto current = OrderedAppendCounterAdd(ctx, inst, IR::OrderedAppendReleaseCounter, 0u,
 		                                             spv::MemorySemanticsAcquireReleaseMask |
 		                                                 spv::MemorySemanticsUniformMemoryMask);
-		const auto served  = Binary(state, spv::OpBitwiseAnd, TypeU32(state), current,
-		                            ConstantU32(state, IR::OrderedAppendWaveIdMask));
-		const auto ready   = Binary(state, spv::OpIEqual, TypeBool(state), served, wave_id);
+		const auto ready   = Binary(state, spv::OpIEqual, TypeBool(state), current, rank);
 		const auto expired = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), iteration,
 		                            ConstantU32(state, 1u << 22u));
 		const auto done    = Binary(state, spv::OpLogicalOr, TypeBool(state), ready, expired);

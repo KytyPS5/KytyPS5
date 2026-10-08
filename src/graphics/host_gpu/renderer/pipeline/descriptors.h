@@ -26,6 +26,16 @@ struct TextureBinding {
 	std::vector<vk::ImageView> mip_views;
 };
 
+// The part of a texture binding decided by its resource and descriptor alone.
+struct TextureDescription {
+	TextureCache::ImageDesc desc;
+	ShaderTextureResource   descriptor;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	bool                    shader_conversion = false;
+	bool                    null              = false;
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;

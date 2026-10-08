@@ -2098,8 +2098,18 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			std::string dword_states;
+			for (uint32_t i = 0; i < descriptor.dword_count; i++) {
+				const auto resolved = descriptor.dwords[i].Resolve();
+				dword_states += fmt::format("{}:{} ", i,
+				    resolved.GetType() != Type::U32 ? "type"
+				    : !ValidateRuntimeValue(m_program, descriptor.dwords[i]) ? "proof"
+				                                                            : "ok");
+			}
+			Fail(pc, fmt::format("{} dword {} is not a valid runtime value "
+			                     "(handle dwords {}, states [{}])",
+			                     ValueOpcodeName(expected), bad_dword,
+			                     handle->NumArgs(), dword_states));
 		}
 		source = InternSource(descriptor);
 		return true;

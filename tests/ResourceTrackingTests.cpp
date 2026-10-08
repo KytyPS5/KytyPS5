@@ -207,7 +207,9 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t table_offset = 0,
-                         uint32_t table_shader_offset = 0, bool nested = false) {
+                         uint32_t table_shader_offset = 0, bool nested = false,
+                         uint32_t heap_mask = UINT32_MAX,
+                         uint32_t selector_bits = UINT32_MAX) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -241,10 +243,14 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
   MemoryInfo material_scalar;
   material_scalar.kind = ResourceKind::ScalarBuffer;
   material_scalar.offset = 4u;
-  const auto key =
+  auto key =
       fixture->Emit(ValueOpcode::ReadConstBuffer, {material, member},
                     fixture->AddMemory(material_scalar, 0x10d8));
+  if (selector_bits != UINT32_MAX)
+    key = fixture->Emit(ValueOpcode::BitwiseAnd32, {key, Value(selector_bits)});
   auto heap_offset = fixture->Emit(ValueOpcode::IMul32, {key, Value(table_stride)});
+  if (heap_mask != UINT32_MAX)
+    heap_offset = fixture->Emit(ValueOpcode::BitwiseAnd32, {heap_offset, Value(heap_mask)});
   if (table_shader_offset != 0u)
     heap_offset = fixture->Emit(ValueOpcode::IAdd32, {heap_offset, Value(table_shader_offset)});
   std::array<Value, 8> image_words;
@@ -1716,6 +1722,88 @@ void TestDenseBufferTracking() {
 
   CheckFatal([&] { fixture.PlanAndTrack(); }, "already tracked",
              "resource tracking allowed a second mutation pass");
+}
+
+// GTA V ray tracing: after a hit, S_BUFFER_LOAD reads instance data through a V# that
+// S_BUFFER_LOAD_DWORDX4 selected from a table at a GPU-computed offset.
+void TestIndirectScalarReads() {
+  Fixture fixture;
+  const auto table = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2),
+       fixture.UserData(3)},
+      4);
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                {fixture.Emit(ValueOpcode::LaneId), Value(true)});
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+  std::array<Value, 4> dwords;
+  for (uint32_t dword = 0; dword < dwords.size(); dword++) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    scalar.offset = dword * 4;
+    dwords[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                                 fixture.AddMemory(scalar, 8));
+  }
+  const auto instance = fixture.Buffer(dwords, 16);
+  MemoryInfo data;
+  data.kind = ResourceKind::ScalarBuffer;
+  data.offset = 8;
+  const auto data_flags = fixture.AddMemory(data, 16);
+  fixture.Emit(ValueOpcode::ReadConstBuffer,
+               {instance, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(3u)})},
+               data_flags);
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.memory_info[data_flags.index].kind == ResourceKind::IndirectBuffer &&
+            fixture.program.info.uses_dma,
+        "a scalar read through a GPU-selected V# did not use the indirect buffer path");
+  Check(fixture.program.info.buffers.size() == 1 && fixture.program.info.buffers[0].scalar,
+        "a GPU-selected scalar read bound more than its V# table");
+}
+
+// GTA V ray tracing: the BVH traversal reads instance nodes at base + (node >> 3) << 7 with the
+// node it popped off a lane stack. Reads behind such an address cannot be flattened into host SRT
+// reads; reads the host can evaluate still are.
+void TestGpuDependentAddressReads() {
+  Fixture fixture;
+  const auto node = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                 {fixture.Emit(ValueOpcode::LaneId), Value(true)});
+  const auto instance_base = fixture.Emit(
+      ValueOpcode::IAdd32,
+      {fixture.UserData(2),
+       fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                    {fixture.Emit(ValueOpcode::ShiftRightLogical32, {node, Value(3u)}),
+                     Value(7u)})});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  scalar.offset = 60;
+  const auto gpu_flags = fixture.AddMemory(scalar, 0x20);
+  const auto instance_word = fixture.Emit(
+      ValueOpcode::LoadAddressU32,
+      {fixture.Address(instance_base, fixture.UserData(3)), Value(0u), Value(0u), Value(true)},
+      gpu_flags);
+  scalar.offset = 4;
+  const auto host_flags = fixture.AddMemory(scalar, 0x10);
+  const auto host_word = fixture.Emit(
+      ValueOpcode::LoadAddressU32,
+      {fixture.Address(fixture.UserData(0), fixture.UserData(1)), Value(0u), Value(0u),
+       Value(true)},
+      host_flags);
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  global.address_is_full = false;
+  const auto load_flags = fixture.AddMemory(global, 0x30);
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {fixture.Address(fixture.Emit(ValueOpcode::IAdd32, {instance_word, host_word}),
+                                fixture.UserData(5)),
+                Value(0u), Value(0u), Value(true)},
+               load_flags);
+  fixture.PlanAndTrack();
+
+  Check(!fixture.program.memory_info[gpu_flags.index].planning_only,
+        "a read behind a GPU-dependent address was flattened into a host SRT read");
+  Check(fixture.program.memory_info[host_flags.index].planning_only,
+        "a host-evaluable read behind an address was not flattened");
+  Check(fixture.program.info.uses_dma, "GPU-dependent address reads did not use DMA");
 }
 
 void TestScalarAndVectorBufferAlias() {
@@ -3198,6 +3286,187 @@ void TestConservativeBufferReachability() {
   }
 }
 
+void TestBindlessImageTable() {
+  // A key the host cannot probe binds every distinct T# of the table, as GTA V (PPSA04263)
+  // CS 0xc6c91cf1882cdc3b samples material textures by a GPU-written index, masking the
+  // table offset with 0x1fffffe0.
+  auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, 0x1fffffe0u);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 9> user_data{0x1000u, 224u << 16u, 2u, 0u, 0x2000u,
+                                    0u,      128u,        0u, 7u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> first{};
+  first[0] = 0x20u;
+  first[1] = static_cast<uint32_t>(
+                 Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+             << 20u;
+  first[2] = 3u | (3u << 14u);
+  first[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+             (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+              << 28u);
+  auto second = first;
+  second[0] = 0x40u;
+  const auto entry = [&](uint32_t index) {
+    return memory.words.begin() + (0x2000u - memory.base) / 4u + index * 8u;
+  };
+  std::copy(first.begin(), first.end(), entry(0));
+  std::copy(first.begin(), first.end(), entry(1));
+  std::copy(second.begin(), second.end(), entry(3));
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto mapping_of = [&](const ResourceSpecialization &value) {
+    const auto offset = value.images[0].table_mapping_offset;
+    return std::vector<uint32_t>(snapshot.flattened_srt.begin() + offset,
+                                 snapshot.flattened_srt.begin() + offset + 5u);
+  };
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.image_tables.size() == 1 &&
+            snapshot.image_tables[0].slots.size() == 3 &&
+            std::equal(first.begin(), first.end(),
+                       snapshot.image_tables[0].slots[1].dwords.begin()) &&
+            std::equal(second.begin(), second.end(),
+                       snapshot.image_tables[0].slots[2].dwords.begin()) &&
+            mapping_of(specialization) == std::vector<uint32_t>{4u, 1u, 1u, 0u, 2u} &&
+            specialization.images[0].table == 0 &&
+            specialization.images[0].table_capacity == 256u &&
+            specialization.images[0].table_entry_mask == 0x00ffffffu &&
+            std::equal(first.begin(), first.end(), snapshot.images[0].dwords.begin()),
+        "bindless table did not deduplicate its T#s into slots");
+  const auto stable = specialization;
+  std::copy(first.begin(), first.end(), entry(3));
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.image_tables[0].slots.size() == 2 &&
+            mapping_of(specialization) == std::vector<uint32_t>{4u, 1u, 1u, 0u, 1u} &&
+            specialization == stable,
+        "bindless table refresh kept stale slots or changed the shader permutation");
+
+  ApplyResourceSpecialization(fixture->program, specialization);
+  EliminateDeadCode(fixture->program.blocks);
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture->program, {.compute = &compute});
+  AllocateBindings(fixture->program);
+  const auto kind = DescriptorBindingForImage(fixture->program.info.images[0]);
+  const auto *binding =
+      kind.has_value() ? FindBinding(fixture->program.bindings, *kind) : nullptr;
+  Check(binding != nullptr && binding->resources.size() == 1 &&
+            binding->tables.size() == 1 && binding->tables[0].capacity == 256u &&
+            binding->tables[0].root == 0 && binding->TableBase(0) == 1u &&
+            binding->ElementCount() == 257u &&
+            FindBinding(fixture->program.bindings, DescriptorBindingKind::FlattenedSrt) !=
+                nullptr,
+        "bindless table descriptors were not appended to the root's binding");
+}
+
+void TestBindlessImageTableQuery() {
+  // GTA V (PPSA04263) CS 0xedc5bdc9a5687671 (Performance RT) also queries the size of a
+  // material table texture: IMAGE_GET_RESINFO through the T# its alpha test samples.
+  auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, UINT32_MAX, 0x1fffffe0u);
+  Value image;
+  MemoryFlags sample_flags{};
+  for (auto &inst : *fixture->block) {
+    if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
+      image = inst.Arg(0);
+      sample_flags = inst.Flags<MemoryFlags>();
+    }
+  }
+  Check(!image.IsEmpty(), "fixture has no sampled table image");
+  MemoryInfo query;
+  query.kind = ResourceKind::Image;
+  query.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto query_flags = fixture->AddMemory(query, 0x10f8);
+  const auto size = fixture->Emit(ValueOpcode::ImageQueryDimensions,
+                                  {image, fixture->ImageAddress()}, query_flags);
+  fixture->Emit(ValueOpcode::ReferenceU32,
+                {fixture->Emit(ValueOpcode::CompositeExtractU32x4, {size, Value(0u)})});
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 9> user_data{0x1000u, 224u << 16u, 2u, 0u, 0x2000u,
+                                    0u,      128u,        0u, 7u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> texture{};
+  texture[0] = 0x20u;
+  texture[1] = static_cast<uint32_t>(
+                   Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+               << 20u;
+  texture[2] = 3u | (3u << 14u);
+  texture[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+               (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+                << 28u);
+  std::copy(texture.begin(), texture.end(),
+            memory.words.begin() + (0x2000u - memory.base) / 4u);
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            specialization.images.size() == 1 &&
+            specialization.images[0].table_capacity != 0u,
+        "queried bindless table did not materialize as a table");
+  Check(fixture->program.memory_info[query_flags.index].resource ==
+            fixture->program.memory_info[sample_flags.index].resource,
+        "the size query and the sample of one table T# use different images");
+  // Before table queries were supported this was fatal.
+  ApplyResourceSpecialization(fixture->program, specialization);
+}
+
+void TestBindlessImageTableSharedRegisters() {
+  // GTA V (PPSA04263) CS 0xca313cf56ef25496 reuses the SGPRs of a material T# for other data, so
+  // a T# word also reaches a Phi of the register's other lifetime. The table plan still applies
+  // to the image; the read stays an ordinary scalar load for the Phi.
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, UINT32_MAX, 0x1fffffe0u);
+  Value image;
+  for (auto &inst : *fixture->block) {
+    if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
+      image = inst.Arg(0);
+    }
+  }
+  Check(!image.IsEmpty(), "fixture has no sampled table image");
+  const auto *handle = image.ResolveInstruction();
+  const auto shared_word = handle->Arg(1);
+  const auto other_word = handle->Arg(0);
+  auto *entry = fixture->block;
+  auto *taken = fixture->AddBlock();
+  auto *skipped = fixture->AddBlock();
+  auto *merge = fixture->AddBlock();
+  entry->AddBranch(taken);
+  entry->AddBranch(skipped);
+  taken->AddBranch(merge);
+  skipped->AddBranch(merge);
+  fixture->program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+  fixture->program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                               .true_block = 3};
+  fixture->program.block_info[2].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                               .true_block = 3};
+  fixture->program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+  fixture->program.block_info[0].condition =
+      fixture->Emit(ValueOpcode::INotEqual32, {fixture->UserData(12), Value(0u)});
+  fixture->block = skipped;
+  const auto other = fixture->UserData(13);
+  auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  phi.AddPhiOperand(taken, shared_word);
+  phi.AddPhiOperand(skipped, other);
+  fixture->block = merge;
+  fixture->Emit(ValueOpcode::ReferenceU32, {Value(&phi)});
+  fixture->PlanAndTrack();
+
+  const auto source = fixture->program.info.images.at(0).source;
+  const auto &indirect = fixture->program.descriptor_sources.at(source).indirect_descriptor;
+  Check(indirect.has_value() && indirect->table_array,
+        "a T# word reaching a Phi of another register lifetime lost the table plan");
+  const auto *shared_read = shared_word.ResolveInstruction();
+  const auto *other_read = other_word.ResolveInstruction();
+  Check(!fixture->program.memory_info[shared_read->Flags<MemoryFlags>().index].planning_only &&
+            fixture->program.memory_info[other_read->Flags<MemoryFlags>().index].planning_only,
+        "only the T# word with a non-image use must stay an emitted scalar load");
+}
+
 void TestConditionalIndirectImageMaterialization() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = MakeIndirectImageFixture(false);
@@ -3565,6 +3834,11 @@ int main() {
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+    Run("indirect scalar reads", TestIndirectScalarReads);
+    Run("GPU-dependent address reads", TestGpuDependentAddressReads);
+    Run("bindless image table", TestBindlessImageTable);
+    Run("bindless image table query", TestBindlessImageTableQuery);
+    Run("bindless image table shared registers", TestBindlessImageTableSharedRegisters);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);

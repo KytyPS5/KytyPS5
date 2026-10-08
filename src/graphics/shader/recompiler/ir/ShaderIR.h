@@ -129,6 +129,7 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
+	static constexpr uint32_t NoImageTable    = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      first_use_pc      = 0;
@@ -150,6 +151,14 @@ struct ImageResource {
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
+	// A root sampling a GPU-indexed T# table (bindless): the key selects table entry
+	// key & table_entry_mask, flattened_srt[table_mapping_offset] holds the entry count and
+	// then one slot per entry, and the slot indexes table_capacity descriptors of this image's
+	// binding that the host fills from the table (slot 0 is a null image).
+	uint32_t                      table                = NoImageTable;
+	uint32_t                      table_capacity       = 0;
+	uint32_t                      table_mapping_offset = 0;
+	uint32_t                      table_entry_mask     = 0;
 
 	bool operator==(const ImageResource& other) const = default;
 };
@@ -425,8 +434,37 @@ DescriptorBindingForImage(const ImageResource& image) {
 }
 
 struct DescriptorBinding {
-	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
-	std::vector<uint32_t> resources;
+	// Descriptors of a bindless image table, following the binding's resources.
+	struct TableRange {
+		uint32_t table    = 0;
+		uint32_t capacity = 0;
+		uint32_t root     = 0; // An image resource that samples the table through this binding.
+
+		bool operator==(const TableRange& other) const = default;
+	};
+
+	DescriptorBindingKind   kind = DescriptorBindingKind::Buffers;
+	std::vector<uint32_t>   resources;
+	std::vector<TableRange> tables;
+
+	[[nodiscard]] uint32_t ElementCount() const {
+		auto count = static_cast<uint32_t>(resources.size());
+		for (const auto& range: tables) {
+			count += range.capacity;
+		}
+		return count;
+	}
+	// First array element of a table's descriptors.
+	[[nodiscard]] uint32_t TableBase(uint32_t table) const {
+		auto base = static_cast<uint32_t>(resources.size());
+		for (const auto& range: tables) {
+			if (range.table == table) {
+				return base;
+			}
+			base += range.capacity;
+		}
+		return UINT32_MAX;
+	}
 
 	bool operator==(const DescriptorBinding& other) const = default;
 };
@@ -501,6 +539,10 @@ struct DescriptorSource {
 		uint32_t table_record_bytes = 0;
 		bool     table_scalar = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
+		// The table entry is at ((key * table_stride) & table_mask) + table_offset.
+		uint32_t table_mask      = UINT32_MAX;
+		// A bindless T# table: every table entry is a candidate.
+		bool     table_array     = false;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;

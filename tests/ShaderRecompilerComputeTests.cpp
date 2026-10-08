@@ -28895,6 +28895,64 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
   return test;
 }
 
+// GTA V (PPSA04263) ray tracing shaders read instance data with S_BUFFER_LOAD through a V# they
+// loaded from a table at a GPU-computed offset: the DWORD at (offset & ~3) + immediate, zero past
+// NUM_RECORDS bytes (times the stride of a structured buffer).
+TestCase ScalarLoadsGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  struct ScalarCase {
+    u32 stride, records, immediate, soffset;
+    u32 expected_word; // UINT32_MAX: out of bounds, reads zero.
+  };
+  const ScalarCase cases[] = {
+      {0, 64, 8, 0, 2},
+      {0, 64, 60, 0, 15},
+      {0, 64, 64, 0, UINT32_MAX},
+      {0, 64, 4, 12, 4},
+      {0, 64, 0, 6, 1}, // The low two bits of the offset are ignored.
+      {16, 2, 28, 0, 7},
+      {16, 2, 32, 0, UINT32_MAX},
+  };
+  TestCase test;
+  test.name = "ScalarLoadsGpuSelectedDescriptors";
+  test.initial.resize(2048);
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &input = cases[i];
+    const u32 data_offset = 4096 + i * 128;
+    // 120-byte table entries with a descriptor at byte 8.
+    const std::array<u32, 4> descriptor{static_cast<u32>(GuestBase + data_offset),
+                                        (input.stride << 16u) | 1u, input.records,
+                                        (20u << 12u) | 0x204u};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
+    for (u32 word = 0; word < 32; ++word) {
+      test.initial[data_offset / 4 + word] = i * 100 + word + 1;
+    }
+    // The table entry is selected through a GPU load and readfirstlane, not host constants.
+    test.initial[64 + i] = i;
+    AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120
+    test.code.push_back(120);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0)); // s_buffer_load_dwordx4 s[8:11], s[0:3]
+    test.code.push_back(EncodeSmem1(520, 20));
+    AppendSMovLiteral(&test.code, 22, input.soffset);
+    test.code.push_back(EncodeSmem0(0x08, 16, 4)); // s_buffer_load_dword s16, s[8:11]
+    test.code.push_back(EncodeSmem1(input.immediate, 22));
+    AppendStoreSgpr(&test.code, 16, i);
+    test.expected.push_back(input.expected_word == UINT32_MAX ? 0u
+                                                               : i * 100 + input.expected_word + 1);
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
+                  O::S_BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
 TestCase BufferLoadsGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(4u);
 }
@@ -36600,6 +36658,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
+  AddCase(ScalarLoadsGpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -39337,7 +39396,6 @@ void CheckImageSamplerSpecialization() {
                                EncodeVop1(0x02, 20, Vgpr(15)), EncodeVopc(0xd2, 20, 15)});
     code.insert(code.end(), {EncodeSop2(0x1e, 20, 20, InlineU32(5)),
                              EncodeSmem0(0x0b, 12), EncodeSmem1(0, 20)});
-    const auto table_read_end = code.size();
     code.insert(code.end(), {EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 3, 2)});
     AppendBufferStoreDword(&code, 4, 0);
     if (!scalar) {
@@ -39389,62 +39447,19 @@ void CheckImageSamplerSpecialization() {
     ResourceSpecialization specialization;
     const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
                              .userdata = &memory, .read_specialization_memory = ReadTestMemory};
-    Require(name, "bounded native material plan",
-            plan.capture_specialization_reads && !translated.program.has_address_writes &&
+    // GPU-selected material T#s bind the whole T# table (bindless) instead of expanding the
+    // bounded material keys: GTA V's ray tracing shaders select among ~500 material T#s, and
+    // one image per key took the driver minutes to compile.
+    Require(name, "bindless table material plan",
+            !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
-            "GPU-selected material descriptors did not expand beyond native root capacity");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
-    const auto ordinal = [&](u32 byte_offset) {
-      const auto word = byte_offset >> 2u;
-      return word < snapshot.flattened_srt[offset]
-                 ? snapshot.flattened_srt[offset + 1u + word] : 0u;
-    };
-    Require(name, "dense table map and coherent snapshot",
-            specialization.images[0].indirect_search_iterations == 0u &&
-                snapshot.flattened_srt[offset] == (count - 1u) * 8u + 1u &&
-                ordinal(32u) != 0u &&
-                ordinal(count * 32u) == 0u && snapshot.images[0].dwords[0] == 0u &&
-                snapshot.specialization_reads ==
-                    std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
-            "image table lost its dense offsets, explicit null or single coherent read");
-    const auto previous = specialization;
-    memory[table_base / 4u + 8u] += 0x10000u;
-    Require(name, "runtime descriptor refresh",
-            MaterializeResources(plan, runtime, snapshot, specialization) &&
-                specialization == previous && snapshot.images[ordinal(32u)].dwords[0] == 0x11100u,
-            "descriptor addresses were frozen or entered the shader specialization");
+                !specialization.images.empty() &&
+                std::ranges::any_of(specialization.images,
+                                    [](const auto &image) { return image.table_capacity != 0u; }) &&
+                snapshot.image_tables.size() == 1u &&
+                snapshot.image_tables[0].mapping.size() == count + 1u,
+            "GPU-selected material descriptors did not bind the T# table");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
-    ValidateSpirv(name, compiled.spirv);
-    if (!scalar) {
-      user_data[4] += 1u;
-      Require(name, "GPU material reads remain on GPU",
-              MaterializeResources(plan, runtime, snapshot, specialization) &&
-                  specialization == previous && snapshot.specialization_reads ==
-                      std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
-              "GPU material addressing reentered host descriptor selection");
-      user_data[4] -= 1u;
-    }
-    auto dirty = runtime;
-    dirty.read_specialization_memory = +[](void*, uint64_t, std::span<u32>) { return false; };
-    Require(name, "unreadable image table rejection",
-            !MaterializeResources(plan, dirty, snapshot, specialization),
-            "GPU-selected texture materialization bypassed strict read provenance");
-    if (scalar) {
-      code.insert(code.begin() + table_read_end, EncodeVop1(0x01, 18, 12));
-      code.pop_back();
-      AppendBufferStoreDword(&code, 18, 0);
-      code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
-      AppendEnd(&code);
-    } else {
-      code[2] = EncodeSopp(0x00, 0); // GPU selectors do not need a host nonempty-EXEC witness.
-    }
-    auto retained = ShaderRecompiler::TranslateProgram(code, options);
-    auto retained_plan = ExtractResourcePlan(retained.program);
-    Require(name, "retained descriptor consumers",
-            MaterializeResources(retained_plan, runtime, snapshot, specialization),
-            "retained GPU descriptor reads could not use the shared image table");
-    compiled = ShaderRecompiler::CompileProgram(std::move(retained), options, specialization);
     ValidateSpirv(name, compiled.spirv);
   }
 
@@ -42236,6 +42251,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
+    RunCase(&vulkan, ScalarLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
     RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());

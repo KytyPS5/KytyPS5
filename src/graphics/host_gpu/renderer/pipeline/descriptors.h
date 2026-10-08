@@ -40,6 +40,11 @@ struct PreparedBindings {
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
+	// Bindless table descriptors in binding and table-range order, with the T# and the root
+	// image each element was resolved for.
+	std::vector<TextureBinding>                         table_images;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> table_sources;
+	std::vector<uint32_t>                               table_roots;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;

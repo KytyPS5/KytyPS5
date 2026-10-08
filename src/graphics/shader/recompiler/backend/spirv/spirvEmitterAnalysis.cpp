@@ -161,6 +161,28 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 	return image;
 }
 
+uint32_t LoadImageTableElement(EmitterState& state, uint32_t resource, uint32_t element) {
+	const auto& image_resource = state.program.info.images.at(resource);
+	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
+	const auto kind = IR::DescriptorBindingForImage(image_resource);
+	EXIT_IF(!kind.has_value());
+	const auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	if (variable == 0) {
+		ExitDescriptorBindingFailure(state, *kind, resource,
+		                             "sampled image descriptor array was not emitted");
+	}
+	const auto pointer_type = state.builder.Type(
+	    spv::OpTypePointer, spv::StorageClassUniformConstant, ImageType(state, image_resource));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable, element);
+	state.builder.AddAnnotation(spv::OpDecorate, element, spv::DecorationNonUniform);
+	state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+	const auto image = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, ImageType(state, image_resource), image, pointer);
+	state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
+	return image;
+}
+
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 	const auto array_index =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
@@ -176,10 +198,11 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 }
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id, uint32_t mip,
-                          uint32_t array_index) {
+                          uint32_t array_index, uint32_t element) {
 	const auto& image_resource = state.program.info.images.at(resource);
 	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
-	const auto  image          = LoadImageDescriptor(state, resource, mip, array_index);
+	const auto  image          = element != 0 ? LoadImageTableElement(state, resource, element)
+	                                          : LoadImageDescriptor(state, resource, mip, array_index);
 	const auto  sampled_image = state.builder.AllocateId();
 	const auto  sampled_type =
 	    state.builder.Type(spv::OpTypeSampledImage, ImageType(state, image_resource));
@@ -188,6 +211,8 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+	}
+	if (array_index != 0u || element != 0u) {
 		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
 	}
 	return sampled_image;

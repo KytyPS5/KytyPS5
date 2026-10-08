@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -190,8 +191,31 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	uint32_t descriptor_count = 0;
+	uint32_t sampled_images   = 0;
+	uint32_t stage_count      = 0;
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
+		if (binding.descriptorType != vk::DescriptorType::eSampledImage) continue;
+		sampled_images += binding.descriptorCount;
+		uint32_t stage = 0;
+		for (const auto& other: bindings) {
+			if (other.descriptorType == vk::DescriptorType::eSampledImage &&
+			    other.stageFlags == binding.stageFlags) {
+				stage += other.descriptorCount;
+			}
+		}
+		stage_count = std::max(stage_count, stage);
+	}
+	// Bindless image tables can need more sampled images than the device or a descriptor pool
+	// provides: fail clearly instead of creating an invalid layout.
+	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+	if (sampled_images > limits.maxDescriptorSetSampledImages ||
+	    stage_count > limits.maxPerStageDescriptorSampledImages ||
+	    sampled_images > DescriptorHeap::MaxSampledImages) {
+		EXIT("pipeline needs %u sampled images (%u in one stage); the device allows %u per set "
+		     "and %u per stage, a descriptor pool holds %u\n",
+		     sampled_images, stage_count, limits.maxDescriptorSetSampledImages,
+		     limits.maxPerStageDescriptorSampledImages, DescriptorHeap::MaxSampledImages);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 

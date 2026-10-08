@@ -49492,7 +49492,8 @@ if (argc == 1) {
     for(auto test : {CompactBoundedBufferMetadata(),CompactBoundedBufferMetadata(true),
                     FormattedBufferExecCountGuard(2u,15u,64u),
                     FormattedBufferExecCountGuard(2u,5u,64u),
-                    VectorMadF32CooperativeChainBudget()}) {
+                    VectorMadF32CooperativeChainBudget(),
+                    Wave64MultiWaveLdsAtomicReduction()}) {
       test.optimize_spirv=true;
       RunCase(&vulkan,test);
     }

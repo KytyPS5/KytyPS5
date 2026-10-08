@@ -24348,6 +24348,75 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+// Hardware (FI=0, bound_ctrl off): a DISABLED source lane is invalid like an out-of-range one, so
+// the destination keeps its old value instead of combining a zero. Needs
+// KYTY_DPP_PRESERVE_INACTIVE=1 (set by main for this test binary).
+TestCase VectorDppInactiveSourcePreservesDestination() {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendVMovU32(&code, 1, 100);
+  AppendSMovLiteral(&code, 126, 0xfffffffdu); // lane 1 disabled
+  AppendSMovLiteral(&code, 127, 0xffffffffu);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x111)); // row_shr:1, bound_ctrl off
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  AppendSMovLiteral(&code, 127, 0xffffffffu);
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppInactiveSourcePreservesDestination";
+  test.code = std::move(code);
+  test.expected.resize(64, sentinel);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    if (lane == 1u || lane % 16u == 0u || lane - 1u == 1u) {
+      continue;
+    }
+    test.expected[lane] = 100u + (lane - 1u);
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDppRowShare() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x153)); // row_share:3
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppRowShare";
+  test.code = std::move(code);
+  test.expected.resize(32);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected[lane] = 100u + (lane & ~15u) + 3u;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorMadF32RoundsProduct() {
   using O = ShaderOpcode;
 
@@ -35938,6 +36007,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  AddCase(VectorDppInactiveSourcePreservesDestination);
+  AddCase(VectorDppRowShare);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
@@ -41470,6 +41541,11 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+#ifdef _WIN32
+  _putenv_s("KYTY_DPP_PRESERVE_INACTIVE", "1");
+#else
+  setenv("KYTY_DPP_PRESERVE_INACTIVE", "1", 1);
+#endif
   EnsureConfigInitialized();
   if (argc == 3 && std::strcmp(argv[1], "--decode-bin") == 0) {
     // Debug: print the decoded guest ISA of a dumped shader binary.
@@ -41581,6 +41657,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorDppRowXmask());
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination());
+    RunCase(&vulkan, VectorDppRowShare());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {

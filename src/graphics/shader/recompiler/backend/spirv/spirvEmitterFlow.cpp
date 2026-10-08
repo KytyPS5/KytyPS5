@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -111,8 +112,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 }
 
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
-                               uint32_t exec) {
+                               IR::Value exec_value) {
 	auto&      state      = ctx.state;
+	const auto exec       = ctx.Def(exec_value);
 	const auto lane       = EmitSubgroupLocalInvocationId(state);
 	const auto bank_shift = state.builder.AllocateId();
 	const auto row_shift  = state.builder.AllocateId();
@@ -153,6 +155,21 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), bounded, writable,
 		                          target.valid);
 		writable = bounded;
+		// Hardware (FI=0): a DISABLED source lane is invalid exactly like an out-of-range one, so
+		// with bound_ctrl=0 the destination lane is not written either (keeps its old value).
+		// Without this the DppMove zero would be combined (min(0,x)=0) instead of skipped.
+		static const bool preserve_inactive = [] {
+			const char* v = std::getenv("KYTY_DPP_PRESERVE_INACTIVE");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (preserve_inactive && !flags.fetch_inactive && !flags.dpp8) {
+			const auto ballot        = ctx.Ballot(exec_value);
+			const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
+			const auto both          = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), both, writable,
+			                          source_active);
+			writable = both;
+		}
 	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, exec, writable);
@@ -739,7 +756,7 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
-	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	const auto write = EmitDppWriteCondition(ctx, flags, inst.Arg(2));
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
 }

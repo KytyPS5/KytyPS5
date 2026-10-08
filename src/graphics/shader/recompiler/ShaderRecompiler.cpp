@@ -123,6 +123,80 @@ bool ReportCfgBuildFailure(std::span<const uint32_t> binary, const CompileOption
 	return skip != nullptr && skip[0] == '1';
 }
 
+bool LaneAuditEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_DBG_LANE_AUDIT");
+		return v != nullptr && v[0] == '1';
+	}();
+	return enabled;
+}
+
+// KYTY_DBG_LANE_AUDIT=1: one "NHL27LANES:" line per translated shader with its cross-lane ops.
+void LogLaneAudit(const IR::Program& ir, const CompileOptions& options, uint32_t reductions) {
+	uint32_t dpp_quad = 0, dpp_shl = 0, dpp_shr = 0, dpp_ror = 0, dpp_mirror = 0, dpp_share = 0,
+	         dpp_xmask = 0, dpp_dpp8 = 0, dpp_other = 0, dpp_bc0 = 0, dpp_bc1 = 0, dpp_masked = 0,
+	         dpp_fi = 0;
+	uint32_t permlane = 0, permlanex = 0, readlane_const = 0, readlane_dyn = 0, readfirst = 0;
+	uint32_t writelane = 0, swizzle = 0, permute = 0, bpermute = 0, ballot = 0, cond_ref = 0;
+	uint32_t wave_reduce = 0;
+	for (const auto* block: ir.blocks) {
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::DppMoveU32: {
+					const auto f = inst.Flags<IR::DppMoveFlags>();
+					const auto c = static_cast<uint32_t>(f.control);
+					if (f.dpp8) dpp_dpp8++;
+					else if (c <= 0xffu) dpp_quad++;
+					else if (c >= 0x101u && c <= 0x10fu) dpp_shl++;
+					else if (c >= 0x111u && c <= 0x11fu) dpp_shr++;
+					else if (c >= 0x121u && c <= 0x12fu) dpp_ror++;
+					else if (c == 0x140u || c == 0x141u) dpp_mirror++;
+					else if (c >= 0x150u && c <= 0x15fu) dpp_share++;
+					else if (c >= 0x160u && c <= 0x16fu) dpp_xmask++;
+					else dpp_other++;
+					(f.bound_control ? dpp_bc1 : dpp_bc0)++;
+					if (f.row_mask != 0xfu || f.bank_mask != 0xfu) dpp_masked++;
+					if (f.fetch_inactive) dpp_fi++;
+					break;
+				}
+				case IR::ValueOpcode::Permlane16U32:
+					(inst.Flags<IR::PermlaneFlags>().x16 ? permlanex : permlane)++;
+					break;
+				case IR::ValueOpcode::ReadLane:
+					(inst.Arg(1).IsImmediate() ? readlane_const : readlane_dyn)++;
+					break;
+				case IR::ValueOpcode::ReadFirstLane: readfirst++; break;
+				case IR::ValueOpcode::WriteLane: writelane++; break;
+				case IR::ValueOpcode::SwizzleU32: swizzle++; break;
+				case IR::ValueOpcode::PermuteU32: permute++; break;
+				case IR::ValueOpcode::BpermuteU32: bpermute++; break;
+				case IR::ValueOpcode::Ballot: ballot++; break;
+				case IR::ValueOpcode::WaveReduceU32: wave_reduce++; break;
+				case IR::ValueOpcode::ConditionRef:
+					if (inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction) {
+						cond_ref++;
+					}
+					break;
+				default: break;
+			}
+		}
+	}
+	const auto* compute = options.stage == ShaderType::Compute ? options.input_info.compute : nullptr;
+	std::printf("NHL27LANES: hash=0x%016" PRIx64 " stage=%s wave=%u wg=%ux%ux%u "
+	            "dpp[quad=%u shl=%u shr=%u ror=%u mirror=%u share=%u xmask=%u dpp8=%u other=%u "
+	            "bc0=%u bc1=%u masked=%u fi=%u] permlane=%u permlanex16=%u readlane[const=%u dyn=%u] "
+	            "readfirst=%u writelane=%u swizzle=%u permute=%u bpermute=%u ballot=%u "
+	            "execbranch=%u wavereduce=%u partial_reduction=%u\n",
+	            options.shader_hash, StageName(options.stage), ir.wave_size,
+	            compute != nullptr ? compute->threads_num[0] : 0u,
+	            compute != nullptr ? compute->threads_num[1] : 0u,
+	            compute != nullptr ? compute->threads_num[2] : 0u, dpp_quad, dpp_shl, dpp_shr, dpp_ror,
+	            dpp_mirror, dpp_share, dpp_xmask, dpp_dpp8, dpp_other, dpp_bc0, dpp_bc1, dpp_masked,
+	            dpp_fi, permlane, permlanex, readlane_const, readlane_dyn, readfirst, writelane,
+	            swizzle, permute, bpermute, ballot, cond_ref, wave_reduce, reductions);
+	std::fflush(stdout);
+}
+
 enum class EmbeddedFetchValueType {
 	Unknown,
 	Constant,
@@ -667,8 +741,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	uint32_t lane_audit_reductions = 0;
 	if (IR::PartialWaveReductionEnabled()) {
 		const auto reduction_stats = IR::LowerPartialWaveReductions(ir);
+		lane_audit_reductions      = reduction_stats.rewritten_reads;
 		if (reduction_stats.rewritten_reads != 0) {
 			LOGF("%s partial-wave reductions: reads=%" PRIu32 "\n", GetDumpLabel(options),
 			     reduction_stats.rewritten_reads);
@@ -681,6 +757,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			IR::RemoveIdentities(ir.blocks);
 			IR::EliminateDeadCode(ir.blocks);
 		}
+	}
+	if (LaneAuditEnabled()) {
+		LogLaneAudit(ir, options, lane_audit_reductions);
 	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;

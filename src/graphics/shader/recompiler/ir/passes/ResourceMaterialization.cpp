@@ -625,7 +625,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool mixed_dimensions =
 		    base_root.resource_class == ImageResourceClass::Sampled && !base_root.written &&
 		    !base_root.atomic &&
-		    (sample_flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagOffset |
+		    (sample_flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagCd |
+		                     Decoder::ImageSampleFlagOffset | Decoder::ImageSampleFlagCompare |
 		                     Decoder::ImageSampleFlagGatherHorizontal)) == 0u;
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];

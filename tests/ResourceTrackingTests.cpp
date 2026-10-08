@@ -469,6 +469,17 @@ void TestBoundedImageViewEligibility() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected descriptor of another numeric class was sampled");
   plan.descriptor_sources[image_source].indirect_descriptor->sources[1] = volume;
+  // Depth comparison has no 3D form: the mixed table is refused.
+  for (auto &memory : plan.memory_info) {
+    if (memory.kind == ResourceKind::Image && memory.resource == 0u)
+      memory.image_sample_flags |= Decoder::ImageSampleFlagCompare;
+  }
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "a depth-compare sample accepted a mixed-dimension table");
+  for (auto &memory : plan.memory_info) {
+    if (memory.kind == ResourceKind::Image && memory.resource == 0u)
+      memory.image_sample_flags &= ~uint32_t{Decoder::ImageSampleFlagCompare};
+  }
   // Derivatives are laid out for one dimension: the mixed table is refused.
   for (auto &memory : plan.memory_info) {
     if (memory.kind == ResourceKind::Image && memory.resource == 0u)

@@ -4,9 +4,11 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -15,7 +17,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_gpu_timestamps(graphics, m_command_scheduler, *this) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -76,6 +79,19 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
+bool RenderContext::StoreAtCompletion(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		std::memcpy(reinterpret_cast<void*>(vaddr), data, size);
+		return true;
+	}
+	// Cached copies cannot be invalidated here; unwatched pages have none that a write can stale.
+	if (m_page_manager.IsWatched(vaddr, 1) || m_page_manager.IsWatched(vaddr + size - 1, 1)) {
+		return false;
+	}
+	LibKernel::Memory::WriteBacking(vaddr, data, size);
 	return true;
 }
 

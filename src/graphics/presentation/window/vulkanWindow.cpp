@@ -78,6 +78,35 @@ static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions,
 	                   [name](const auto& ext) { return strcmp(ext.extensionName, name) == 0; });
 }
 
+// GPU clock writes are calibrated against the host when the device clock can be sampled.
+static const char*
+CalibratedTimestampsExtension(vk::PhysicalDevice                          device,
+                              const std::vector<vk::ExtensionProperties>& extensions) {
+	const char* name = HasExtension(extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)
+	                       ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME
+	                   : HasExtension(extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)
+	                       ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME
+	                       : nullptr;
+	const auto  get_domains =
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR != nullptr
+	        ? VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+	        : VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
+	if (name == nullptr || get_domains == nullptr) {
+		return nullptr;
+	}
+	uint32_t count = 0;
+	if (get_domains(device, &count, nullptr) != VK_SUCCESS) {
+		return nullptr;
+	}
+	std::vector<VkTimeDomainKHR> domains(count);
+	if (get_domains(device, &count, domains.data()) != VK_SUCCESS) {
+		return nullptr;
+	}
+	return std::find(domains.begin(), domains.end(), VK_TIME_DOMAIN_DEVICE_KHR) != domains.end()
+	           ? name
+	           : nullptr;
+}
+
 static bool HasExtension(const std::vector<const char*>& extensions, const char* name) {
 	return std::any_of(extensions.begin(), extensions.end(),
 	                   [name](const char* ext) { return strcmp(ext, name) == 0; });
@@ -1010,6 +1039,11 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		if (const auto* calibrated =
+		        CalibratedTimestampsExtension(graphic_ctx.physical_device, available_extensions)) {
+			device_extensions.push_back(calibrated);
+			graphic_ctx.calibrated_timestamps_enabled = true;
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

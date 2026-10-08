@@ -591,6 +591,10 @@ constexpr uint64_t APR_COMMAND_BUFFER_SG_OFFSET  = 0x20;
 constexpr uint32_t COMMAND_BUFFER_SIZE_MAX       = 64 * 1024 * 1024;
 constexpr uint64_t READ_FILE_RECORD_SIZE         = 0x14;
 constexpr uint64_t READ_FILE_RECORD_SIZE_EXT     = 0x18;
+// A "write address on completion" record must fit together with the preceding
+// read-file record inside the command buffer the application sizes for one
+// read+write pair (PS5 SDK uses 0x30 bytes per pair).
+constexpr uint64_t WRITE_ADDRESS_RECORD_SIZE     = 0x1c;
 constexpr uint64_t READ_GATHER_RECORD_SIZE       = 0x08;
 constexpr uint64_t READ_GATHER_RECORD_SIZE_EXT   = 0x0c;
 constexpr uint64_t READ_SCATTER_RECORD_SIZE      = 0x0c;
@@ -1621,28 +1625,28 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteAddressOnCompletion(volatil
                                                                          uint64_t) {
 	PRINT_NAME();
 
-	return 0x20;
+	return WRITE_ADDRESS_RECORD_SIZE;
 }
 
 static uint64_t KYTY_SYSV_ABI
 MeasureCommandSizeWriteAddressFromTimeCounterOnCompletion(volatile uint64_t*) {
 	PRINT_NAME();
 
-	return 0x20;
+	return WRITE_ADDRESS_RECORD_SIZE;
 }
 
 static uint64_t KYTY_SYSV_ABI
 MeasureCommandSizeWriteAddressFromCounterOnCompletion(volatile uint64_t*, uint8_t) {
 	PRINT_NAME();
 
-	return 0x20;
+	return WRITE_ADDRESS_RECORD_SIZE;
 }
 
 static uint64_t KYTY_SYSV_ABI
 MeasureCommandSizeWriteAddressFromCounterPairOnCompletion(volatile uint64_t*, uint8_t) {
 	PRINT_NAME();
 
-	return 0x20;
+	return WRITE_ADDRESS_RECORD_SIZE;
 }
 
 static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t, uint8_t, uint64_t,
@@ -1958,7 +1962,7 @@ static int AppendWriteAddressCommand(void* command_buffer, volatile uint64_t* ad
 	return AppendCommandRecord(
 	           reinterpret_cast<uint64_t>(command_buffer),
 	           CommandBufferState::WriteAddressCommand {reinterpret_cast<uint64_t>(address), value},
-	           0x20)
+	           WRITE_ADDRESS_RECORD_SIZE)
 	           ? OK
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }

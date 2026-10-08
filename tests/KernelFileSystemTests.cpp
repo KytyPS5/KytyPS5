@@ -264,16 +264,79 @@ void TestNpCommerceDialog() {
   };
   using Call = int (KYTY_SYSV_ABI *)();
   using Open = int (KYTY_SYSV_ABI *)(const void *);
+  using GetResult = int (KYTY_SYSV_ABI *)(void *);
   const auto initialize = reinterpret_cast<Call>(find("0aR2aWmQal4"));
   const auto terminate = reinterpret_cast<Call>(find("m-I92Ab50W8"));
   const auto update = reinterpret_cast<Call>(find("LR5cwFMMCVE"));
   const auto open = reinterpret_cast<Open>(find("DfSCDRA3EjY"));
-  std::array<uint8_t, 64> param {};
-  Check(open(param.data()) == static_cast<int>(0x80B80003u),
-        "NpCommerce dialog open requires initialization");
-  Check(initialize() == OK && update() == 1 && open(param.data()) == OK && update() == 3 &&
-            terminate() == OK && update() == 0,
-        "NpCommerce dialog finishes at once without a store and terminates");
+  const auto get_result = reinterpret_cast<GetResult>(find("r42bWcQbtZY"));
+  struct BaseParam {
+    uint64_t size;
+    uint8_t reserved[36];
+    uint32_t magic;
+  };
+  struct Param {
+    BaseParam base;
+    int32_t size, user_id, mode;
+    uint32_t service_label;
+    const char *const *targets;
+    uint32_t num_targets, padding;
+    uint64_t features;
+    void *user_data;
+    uint8_t reserved[32];
+  } param {};
+  struct Result {
+    int32_t result;
+    bool authorized;
+    void *user_data;
+    uint8_t reserved[32];
+  } result {};
+  static_assert(sizeof(Param) == 128 && offsetof(Param, user_data) == 88);
+  static_assert(sizeof(Result) == 48 && offsetof(Result, user_data) == 8);
+  param.base.size = sizeof(BaseParam);
+  param.base.magic = static_cast<uint32_t>(0xC0D1A109u + reinterpret_cast<uintptr_t>(&param.base));
+  param.size = sizeof(param);
+  param.user_id = 1;
+  param.user_data = &symbols;
+  Check(open(&param) == static_cast<int>(0x80B80003u) &&
+            get_result(&result) == static_cast<int>(0x80B80003u),
+        "NpCommerce dialog calls require initialization");
+  Check(initialize() == OK && update() == 1 &&
+            get_result(&result) == static_cast<int>(0x80B80005u),
+        "NpCommerce dialog result requires completion");
+  Check(open(nullptr) == static_cast<int>(0x80B8000Du) && update() == 1 &&
+            get_result(nullptr) == static_cast<int>(0x80B8000Du),
+        "NpCommerce dialog rejects null arguments");
+  Check(open(&param) == OK && update() == 3, "NpCommerce dialog finishes without a store");
+  param.user_data = nullptr;
+  result.authorized = true;
+  Check(get_result(&result) == 1 && result.result == 1 && !result.authorized &&
+            result.user_data == &symbols,
+        "NpCommerce cancellation returns the original user data");
+  param.mode = 5;
+  Check(open(&param) == OK && get_result(&result) == 1 && !result.authorized &&
+            result.user_data == nullptr,
+        "NpCommerce dialog can reopen with fresh result data");
+  const auto invalid_param = [&] {
+    Check(open(&param) == static_cast<int>(0x80B8000Au) && update() == 3 &&
+              get_result(&result) == static_cast<int>(0x80B8000Au) &&
+              result.result == static_cast<int>(0x80B8000Au) && !result.authorized,
+          "NpCommerce dialog reports invalid parameters in the completion result");
+  };
+  param.mode = 99;
+  invalid_param();
+  param.mode = -1;
+  invalid_param();
+  param.mode = 0;
+  param.size = 64;
+  invalid_param();
+  param.size = sizeof(param);
+  param.reserved[0] = 1;
+  invalid_param();
+  param.reserved[0] = 0;
+  Check(open(&param) == OK && get_result(&result) == 1 && terminate() == OK && update() == 0 &&
+            get_result(&result) == static_cast<int>(0x80B80003u),
+        "NpCommerce dialog recovers from invalid parameters and terminates");
 }
 
 void TestNpWebApi2Memory() {

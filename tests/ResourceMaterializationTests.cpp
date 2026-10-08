@@ -324,12 +324,13 @@ void TestExactReciprocalDescriptorArithmetic() {
   }
 }
 
-void TestArrayDescriptorsStayArrays() {
+void TestDescriptorTypeSetsImageDimension() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
   using Type = Libs::Graphics::Prospero::ImageType;
   for (const auto &[type, dimension] : {std::pair{Type::kColor2DArray, Dimension::Dim2DArray},
-                                        std::pair{Type::kColor1DArray, Dimension::Dim1DArray}}) {
+                                        std::pair{Type::kColor1DArray, Dimension::Dim1DArray},
+                                        std::pair{Type::kColor2D, Dimension::Dim2D}}) {
     Program program;
     program.stage = Libs::Graphics::ShaderType::Compute;
     program.srt_plan_complete = true;
@@ -349,14 +350,14 @@ void TestArrayDescriptorsStayArrays() {
         .source = 0,
         .resource_class = ImageResourceClass::Sampled,
         .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
-        .dimension = dimension});
+        .dimension = Dimension::Dim2DArray});
     const auto plan = ExtractResourcePlan(program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     Check(MaterializeResources(plan, {}, snapshot, specialization) &&
               specialization.images.size() == 1u &&
               specialization.images[0].dimension == dimension,
-          "array descriptor used by an array instruction lost its layers");
+          "materialized image dimension does not follow the descriptor type");
   }
 }
 
@@ -605,7 +606,7 @@ int main() {
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
-  TestArrayDescriptorsStayArrays();
+  TestDescriptorTypeSetsImageDimension();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();

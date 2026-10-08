@@ -24119,6 +24119,36 @@ TestCase VectorFractF16Modifiers() {
   return test;
 }
 
+TestCase VectorFractF32Edges() {
+  using O = ShaderOpcode;
+
+  // RDNA2 section 12.8: the result stays below 1.0. In f32, 1 - 2^-25 (a tie)
+  // and 1 - 2^-26 round to 1.0; 1 - 2^-24 is exact.
+  const std::array<u32, 5> inputs{0x40500000u, 0xbfa00000u, 0xb3800000u,
+                                  0xb3000000u, 0xb2800000u};
+  const std::array<u32, 5> fractions{0x3e800000u, 0x3f400000u, 0x3f7fffffu,
+                                     0x3f7fffffu, 0x3f7fffffu};
+  TestCase test;
+  test.name = "VectorFractF32Edges";
+  test.initial.assign(inputs.begin(), inputs.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 7, 30);
+    code.push_back(EncodeVop1(0x20, 9, Vgpr(7)));
+    AppendStoreVgpr(&code, 9, static_cast<u32>(inputs.size()) + i);
+    test.expected.push_back(fractions[i]);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_FRACT_F32 v9, v7", inputs.size()}};
+  // AMD drivers may already clamp, so count the clamp in the IR too.
+  test.ir_counts = {{" = SelectF32 ", inputs.size()}};
+  return test;
+}
+
 TestCase VectorCosF16CapturedSdwaAndEdges() {
   using O = ShaderOpcode;
 
@@ -36334,6 +36364,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorFractF16CapturedAndEdges);
   AddCase(VectorFractF16Modifiers);
+  AddCase(VectorFractF32Edges);
   AddCase(VectorCosF16CapturedSdwaAndEdges);
   AddCase(VectorSinF16SdwaAndEdges);
   AddCase(VectorWritelaneIgnoresExecMask);
@@ -42020,6 +42051,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorFractF16CapturedAndEdges());
     RunCase(&vulkan, VectorFractF16Modifiers());
+    RunCase(&vulkan, VectorFractF32Edges());
     RunCase(&vulkan, NativeAndSdwa16BitDestinationWrites());
     RunCase(&vulkan, VectorSpecialF16Ops());
     RunCase(&vulkan, VectorCosF16CapturedSdwaAndEdges());

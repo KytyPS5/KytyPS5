@@ -16,7 +16,6 @@ static_assert(!std::is_copy_assignable_v<OwnershipCache>);
 static_assert(std::is_move_constructible_v<OwnershipCache>);
 static_assert(std::is_nothrow_move_assignable_v<OwnershipCache>);
 
-/// Report a failed test condition and terminate the test executable.
 void Check(bool value, const char *message) {
   if (!value) {
     std::fprintf(stderr, "LruCacheTests: failed: %s\n", message);
@@ -24,7 +23,7 @@ void Check(bool value, const char *message) {
   }
 }
 
-/// Collect the objects reachable through ForEachItemBelow(), in visit order.
+// Collect the objects reachable through ForEachItemBelow(), in visit order.
 std::vector<std::string> Collect(Common::LeastRecentlyUsedCache<std::string, uint64_t> &cache,
                                  uint64_t tick) {
   std::vector<std::string> visited;
@@ -32,7 +31,6 @@ std::vector<std::string> Collect(Common::LeastRecentlyUsedCache<std::string, uin
   return visited;
 }
 
-/// Verify insertion order and timestamp cutoffs.
 void TestInsertAndVisitOrder() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -53,7 +51,6 @@ void TestInsertAndVisitOrder() {
   Check(none.empty(), "ForEachItemBelow visited items below an empty tick");
 }
 
-/// Verify bool callbacks can stop or continue iteration.
 void TestEarlyExitCallback() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   (void)cache.Insert("a", 10);
@@ -75,7 +72,6 @@ void TestEarlyExitCallback() {
   Check(all_visited.size() == 3, "false-returning callback did not visit every item");
 }
 
-/// Verify timestamps and list order after touching entries.
 void TestTouchReordersAndSkips() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -115,7 +111,6 @@ void TestTouchReordersAndSkips() {
         "touching a middle item did not move it to the end");
 }
 
-/// Verify removal, ID reuse and rebuilding an emptied cache.
 void TestFreeAndIdReuse() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -246,7 +241,6 @@ void TestMoveEmptyCaches() {
 
 } // namespace
 
-/// Run ownership, ordering and ID reuse regressions.
 int main() {
   TestMoveConstruction();
   TestMoveAssignment();

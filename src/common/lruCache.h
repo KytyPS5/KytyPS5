@@ -18,11 +18,9 @@ class LeastRecentlyUsedCache {
 	};
 
 public:
-	/// Construct an empty cache with no linked entries.
 	LeastRecentlyUsedCache() = default;
 	/// Copying is disabled because links belong to this cache's item storage.
 	LeastRecentlyUsedCache(const LeastRecentlyUsedCache&) = delete;
-	/// Copy assignment cannot share the intrusive links of another cache.
 	LeastRecentlyUsedCache& operator=(const LeastRecentlyUsedCache&) = delete;
 
 	/// Transfer storage and links together, leaving the source empty and reusable.
@@ -42,7 +40,6 @@ public:
 		return *this;
 	}
 
-	/// Insert an object at the newest end, reusing a free ID when available.
 	[[nodiscard]] size_t Insert(Object object, Tick tick) {
 		const auto id   = Build();
 		auto&      item = m_items[id];
@@ -52,7 +49,6 @@ public:
 		return id;
 	}
 
-	/// Advance an entry timestamp and move it to the newest end when needed.
 	void Touch(size_t id, Tick tick) {
 		auto& item = m_items[id];
 		if (item.tick >= tick) {
@@ -65,7 +61,6 @@ public:
 		}
 	}
 
-	/// Unlink a live entry and make its ID available for reuse.
 	void Free(size_t id) {
 		auto& item = m_items[id];
 		Detach(item);
@@ -74,7 +69,6 @@ public:
 		m_free.push_back(id);
 	}
 
-	/// Visit entries up to the cutoff, stopping when a bool callback returns true.
 	template <typename Function>
 	void ForEachItemBelow(Tick tick, Function&& function) {
 		constexpr bool ReturnsBool = std::is_same_v<std::invoke_result_t<Function, Object>, bool>;
@@ -103,7 +97,6 @@ private:
 		std::swap(m_last, other.m_last);
 	}
 
-	/// Obtain an unused slot from the free list or append a new one.
 	[[nodiscard]] size_t Build() {
 		if (m_free.empty()) {
 			const auto id = m_items.size();
@@ -115,7 +108,6 @@ private:
 		return id;
 	}
 
-	/// Append an unlinked item to the newest end of the list.
 	void Attach(Item& item) {
 		if (m_first == nullptr) {
 			m_first = &item;
@@ -130,7 +122,6 @@ private:
 		m_last       = &item;
 	}
 
-	/// Remove an item from the live chain and update its neighbors and endpoints.
 	void Detach(Item& item) {
 		if (item.prev != nullptr) {
 			item.prev->next = item.next;

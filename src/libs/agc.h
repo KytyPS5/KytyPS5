@@ -95,6 +95,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
                                       uint32_t thread_group_y, uint32_t thread_group_z,
                                       uint32_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcCbDispatchGetSize();
+uint32_t KYTY_SYSV_ABI  AgcCbBranchGetSize();
 uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t compare_function,
                                     const volatile uint64_t* compare_addr, uint64_t mask,
                                     uint64_t reference, uint8_t cache_policy1,

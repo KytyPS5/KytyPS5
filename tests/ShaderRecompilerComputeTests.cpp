@@ -41477,6 +41477,27 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4DrawIndirectMulti");
 }
 
+void CheckAgcCbBranchSize() {
+  std::array<uint32_t, 16> packet{};
+  CommandBufferLayout cb{packet.data(),
+                         packet.data() + packet.size(),
+                         packet.data(),
+                         packet.data() + packet.size(),
+                         nullptr,
+                         nullptr,
+                         0};
+  alignas(8) static volatile uint64_t compare = 1;
+  static volatile uint32_t then_buffer[4]{};
+  static volatile uint32_t else_buffer[4]{};
+  auto *emitted = Gen5::AgcCbBranch(reinterpret_cast<Gen5::CommandBuffer *>(&cb), 0, 0,
+                                    &compare, UINT64_MAX, 1, 0, then_buffer, 4, 0,
+                                    else_buffer, 4);
+  Require("AgcCbBranch", "packet size",
+          emitted == packet.data() && Gen5::AgcCbBranchGetSize() == 56 &&
+              cb.cursor_up == packet.data() + Gen5::AgcCbBranchGetSize() / 4,
+          "sceAgcCbBranchGetSize differs from the branch packet AgcCbBranch writes");
+}
+
 void CheckPm4ContextStateOperations(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -42916,6 +42937,7 @@ int main(int argc, char **argv) {
   CheckShaderFusion();
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());
   CheckPm4DrawIndirectMultiPacket(vulkan.RuntimeRenderer());
+  CheckAgcCbBranchSize();
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());

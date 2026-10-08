@@ -43,6 +43,10 @@ namespace {
 	if (info.IsVolume()) {
 		flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
 	}
+	if (info.type == Prospero::ImageType::kColor2D && info.resources.layers >= 6 &&
+	    info.extent.width == info.extent.height) {
+		flags |= vk::ImageCreateFlagBits::eCubeCompatible;
+	}
 	return flags;
 }
 
@@ -51,7 +55,17 @@ namespace {
 	return static_cast<bool>(properties.optimalTilingFeatures & feature);
 }
 
-[[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
+void ValidateOptionalRange(GuestRange range, const char* name) {
+	if (!range.ValidOrEmpty()) {
+		EXIT("invalid %s image range: address=0x%016llx size=0x%016llx\n", name,
+		     static_cast<unsigned long long>(range.address),
+		     static_cast<unsigned long long>(range.size));
+	}
+}
+
+} // namespace
+
+vk::ImageUsageFlags ImageOps::UsageFlags(GraphicContext& graphics, const ImageInfo& info) {
 	auto usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (info.IsBlock()) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
@@ -93,16 +107,6 @@ namespace {
 	}
 	return usage;
 }
-
-void ValidateOptionalRange(GuestRange range, const char* name) {
-	if (!range.ValidOrEmpty()) {
-		EXIT("invalid %s image range: address=0x%016llx size=0x%016llx\n", name,
-		     static_cast<unsigned long long>(range.address),
-		     static_cast<unsigned long long>(range.size));
-	}
-}
-
-} // namespace
 
 vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	switch (format) {
@@ -706,7 +710,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = ImageUsageFlags(graphics, info);
+	create.usage         = ImageOps::UsageFlags(graphics, info);
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};

@@ -177,6 +177,10 @@ namespace ImageOps {
 
 void                                 Validate(const ImageInfo& info);
 [[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
+// Exact usage flags Image::Create will request for this descriptor. Callers that need to
+// preflight host support (tests skipping cases a driver cannot back) must use this rather
+// than guessing, because the set is derived from format features and device state.
+[[nodiscard]] vk::ImageUsageFlags UsageFlags(GraphicContext& graphics, const ImageInfo& info);
 
 } // namespace ImageOps
 

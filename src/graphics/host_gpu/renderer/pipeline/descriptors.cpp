@@ -367,19 +367,47 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 		default: EXIT("null image has unsupported numeric class\n");
 	}
 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
-	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
 	desc.info.bytes_per_block = Prospero::NumBytesPerElement(desc.info.guest_format);
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
 	desc.type                 = binding;
+	switch (resource.dimension) {
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
+			desc.info.type      = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
+			desc.info.type             = Prospero::ImageType::kColor2D;
+			desc.view_info.type        = vk::ImageViewType::e2DArray;
+			desc.info.resources.layers = resource.cube ? 6u : 1u;
+			desc.view_info.layer_count = resource.cube ? 6u : 1u;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
+		default:
+			desc.info.type             = Prospero::ImageType::kColor2D;
+			desc.view_info.type        = resource.cube ? vk::ImageViewType::e2DArray
+			                                           : vk::ImageViewType::e2D;
+			desc.info.resources.layers = resource.cube ? 6u : 1u;
+			desc.view_info.layer_count = resource.cube ? 6u : 1u;
+			break;
+	}
 	return desc;
 }
 

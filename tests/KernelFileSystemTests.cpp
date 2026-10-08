@@ -1476,6 +1476,12 @@ void CheckSocketWakeup() {
   const int enabled = 1;
   Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
         "enable TCP_NODELAY");
+  int reuse_address = 0;
+  uint32_t reuse_address_size = sizeof(reuse_address);
+  Check(Net::Setsockopt(writer, 0xffff, 0x0004, &enabled, sizeof(enabled)) == 0 &&
+            Net::Getsockopt(writer, 0xffff, 0x0004, &reuse_address, &reuse_address_size) == 0 &&
+            reuse_address != 0,
+        "Net SO_REUSEADDR reaches the host socket");
   int socket_error = -1;
   uint32_t error_size = sizeof(socket_error);
   *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;

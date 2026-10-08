@@ -224,6 +224,12 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+void RenderExecutor::ResetOrderedAppendCounters() {
+	// Every dispatch starts its ordered-append wave numbering from zero.
+	m_context.GetBufferCache().FillBuffer(
+	    ShaderRecompiler::IR::OrderedAppendReleaseCounter * sizeof(uint32_t), 8u, 0u, true);
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -429,6 +435,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	if (program.info.uses_ordered_append) {
+		ResetOrderedAppendCounters();
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
@@ -491,6 +500,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
+	if (program.info.uses_ordered_append) {
+		ResetOrderedAppendCounters();
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

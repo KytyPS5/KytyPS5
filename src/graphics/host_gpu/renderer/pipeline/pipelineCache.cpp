@@ -842,7 +842,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
 	const auto& vp           = ctx.GetScreenViewport();
-	const bool  y_inverted   = !ctx.GetClipControl().clip_disable && vp.viewports[0].yscale < 0.0f;
+	const bool  y_inverted   = vp.viewports[0].yscale < 0.0f;
 	static_params.face       = y_inverted ? !mc.face : mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =

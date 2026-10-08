@@ -1978,7 +1978,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
-void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
@@ -2032,7 +2032,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
-			source = {address, size, cache.FindBuffer(address, size)};
+			// Without device-address reads, ObtainBuffer() finds the buffer when it needs one
+			// (draws stream most small buffers from CPU-dirty pages without it).
+			source = {address, size, find_buffers ? cache.FindBuffer(address, size) : NULL_BUFFER_ID};
 		}
 	}
 }
@@ -2187,7 +2189,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	std::array<const ShaderStageRuntime*, 4> dma_stages {};
 	uint32_t                                 dma_stage_count = 0;
 	bool                                     uses_image_heap = false;
-	FindBuffers(stages);
+	// Operations with device-address reads need their buffers before the BDA synchronization.
+	FindBuffers(stages, std::ranges::any_of(stages, [](const auto* stage) {
+		            return stage->runtime->module->info.info.uses_dma;
+	            }));
 	for (auto* stage: stages) {
 		if (stage->runtime->module->info.info.uses_dma) {
 			m_context.CacheDmaBases(*stage->runtime);

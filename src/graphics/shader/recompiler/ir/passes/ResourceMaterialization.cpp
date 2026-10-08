@@ -1070,9 +1070,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
-	if (!program.resource_tracking_complete ||
-	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
-		return false;
+	if (!program.resource_tracking_complete) {
+		return SpecializationFail("cached plan has incomplete resource tracking");
+	}
+	if (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr) {
+		return SpecializationFail("cached plan requires specialization memory");
 	}
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;
@@ -1089,7 +1091,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
+		return SpecializationFail("cached plan failed to refresh the flattened SRT");
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};

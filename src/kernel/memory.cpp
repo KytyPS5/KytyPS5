@@ -930,12 +930,29 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
-	// Write faults in GPU-mapped guest memory are resolved by HandleGpuFault.
+	// Guest-writable pages do not fault; other pages need a watcher whose fault HandleGpuFault
+	// resolves, otherwise a recovered read would fault forever.
 	SysFileRecoverableDestination probe = nullptr;
 	if (resources != nullptr) {
 		probe = [](const void* data, uint64_t size) {
-			return g_gpu_resources != nullptr &&
-			       g_gpu_resources->IsMapped(reinterpret_cast<uint64_t>(data), size);
+			if (g_gpu_resources == nullptr || g_virtual_ranges == nullptr) {
+				return false;
+			}
+			auto       addr = reinterpret_cast<uint64_t>(data);
+			const auto end  = addr + size;
+			while (addr < end) {
+				VirtualRanges::Range range {};
+				if (!g_virtual_ranges->Query(addr, 0, &range)) {
+					return false;
+				}
+				const auto next = std::min(end, range.start + range.size);
+				if ((range.protection & PROT_CPU_WRITE) == 0 &&
+				    !g_gpu_resources->ResolvesWriteFaults(addr, next - addr)) {
+					return false;
+				}
+				addr = next;
+			}
+			return true;
 		};
 	}
 	SysFileSetRecoverableDestination(probe);

@@ -680,6 +680,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+	add_test(NAME buffer_cache_bda_remap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-remap-only)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests

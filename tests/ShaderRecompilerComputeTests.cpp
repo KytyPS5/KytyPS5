@@ -5182,6 +5182,92 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckBdaSweepAfterRemap() {
+    constexpr const char *name = "BdaSweepAfterRemap";
+    constexpr uintptr_t base = 0x000000020a000000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t remap_offset = 0x10000;
+    constexpr uint64_t remap_size = 0x10000;
+    constexpr uint64_t word_offset = remap_offset + TRACKER_PAGE_SIZE;
+    constexpr uint32_t initial_value = 0x1b2c3d4eu;
+    constexpr uint32_t remap_value = 0x5f607182u;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memcpy(memory + word_offset, &initial_value, sizeof(initial_value));
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto id = cache.FindBuffer(base, allocation_size);
+      const auto GpuWord = [&] {
+        const auto &buffer = cache.GetBuffer(id);
+        auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                         vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{buffer.Offset(base + word_offset), 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+            {}, 0, nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        const auto value = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+        return value;
+      };
+      context.PrepareBda();
+      Require(name, "initial sweep", GpuWord() == initial_value,
+              "the first sweep did not upload the registered buffer");
+
+      // Unmapping leaves the range CPU-dirty and writable without a fault, and the sweep after
+      // it skips the range. Only the mapping tells the next sweep to look again.
+      context.UnmapMemory(base + remap_offset, remap_size);
+      context.PrepareBda();
+      std::memcpy(memory + word_offset, &remap_value, sizeof(remap_value));
+      context.MapMemory(base + remap_offset, remap_size);
+      context.PrepareBda();
+      Require(name, "mapped again", GpuWord() == remap_value,
+              "memory mapped again kept the GPU contents from before its unmap");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -42491,6 +42577,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaPageTableUploads();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-remap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaSweepAfterRemap();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -42692,6 +42783,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  vulkan.CheckBdaSweepAfterRemap();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

@@ -1145,17 +1145,16 @@ void TextureCache::MaterializeViewClear(ImageId id, const ImageDesc& desc) {
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
-	ImageDesc  clear_desc = desc;
-	auto&      metadata   = clear_desc.info.metadata;
-	const bool desc_metadata =
-	    metadata.kind == ImageMetadataKind::Dcc || metadata.kind == ImageMetadataKind::Cmask;
-	bool use_target = false;
+	const bool        desc_metadata = desc.info.metadata.kind == ImageMetadataKind::Dcc ||
+	                                  desc.info.metadata.kind == ImageMetadataKind::Cmask;
+	ImageMetadataInfo target {};
+	bool              use_target = false;
 	if (desc.type == BindingType::Texture || desc.type == BindingType::Storage) {
 		// A texture or storage view of a fast-cleared color target sees the clear as well, through
 		// the metadata and clear registers of the target's last binding, even if the view has DCC.
 		std::scoped_lock lock {m_lock};
-		const auto&      image  = m_slot_images[id];
-		const auto&      target = image.info.metadata;
+		const auto&      image = m_slot_images[id];
+		target                 = image.info.metadata;
 		use_target =
 		    (target.kind == ImageMetadataKind::Dcc || target.kind == ImageMetadataKind::Cmask) &&
 		    target.clear_register_valid && image.info.data == desc.info.data &&
@@ -1163,14 +1162,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    image.info.resources.layers == desc.info.resources.layers &&
 		    desc.info.resources.levels == 1 && desc.view_info.level_count == 1 &&
 		    !image.info.IsVolume();
-		if (use_target) {
-			metadata                    = target;
-			clear_desc.type             = BindingType::RenderTarget;
-			clear_desc.view_info.format = target.clear_format;
-		}
 	}
+	// Most lookups are plain textures of images without color metadata: leave before copying.
 	if (!desc_metadata && !use_target) {
 		return;
+	}
+	ImageDesc clear_desc = desc;
+	auto&     metadata   = clear_desc.info.metadata;
+	if (use_target) {
+		metadata                    = target;
+		clear_desc.type             = BindingType::RenderTarget;
+		clear_desc.view_info.format = target.clear_format;
 	}
 	const auto range = metadata.range;
 	if (!use_target) {

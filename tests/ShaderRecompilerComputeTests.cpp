@@ -24068,7 +24068,7 @@ TestCase VectorFractF16CapturedAndEdges() {
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
   test.required_spirv = {" Fract ", " UnpackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  test.forbidden_spirv = {"OpCapability Float16", " PackHalf2x16 "};
   return test;
 }
 
@@ -24111,6 +24111,7 @@ TestCase VectorFractF16Modifiers() {
   test.decoded_counts = {{"V_FRACT_F16", 10}};
   test.ir_counts = {{" = FPFract32 ", 10}};
   test.required_spirv = {" Fract "};
+  test.forbidden_spirv = {" PackHalf2x16 "};
   return test;
 }
 
@@ -24149,7 +24150,7 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
   test.required_spirv = {" Fract ", " Cos "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  test.forbidden_spirv = {"OpCapability Float16", " PackHalf2x16 "};
   return test;
 }
 
@@ -24195,7 +24196,7 @@ TestCase VectorSinF16SdwaAndEdges() {
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
   test.required_spirv = {" Fract ", " Sin "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  test.forbidden_spirv = {"OpCapability Float16", " PackHalf2x16 "};
   return test;
 }
 
@@ -29458,6 +29459,7 @@ TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
       8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  test.forbidden_spirv = {"PackHalf2x16"};
   return test;
 }
 
@@ -34040,6 +34042,7 @@ TestCase ImageD16GatherPacksHalfPairs() {
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"d16=1", 1}};
   test.required_spirv = {"OpImageGather"};
+  test.forbidden_spirv = {"PackHalf2x16"};
   return test;
 }
 

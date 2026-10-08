@@ -607,6 +607,32 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_layout = layout;
 	}
 	if (depth.image_id) {
+		static const bool log_shadow = std::getenv("KYTY_DBG_LOG_SHADOW") != nullptr;
+		if (log_shadow && color_count == 0) {
+			// DIAGNOSTIC: depth-only (shadow-map style) passes, logged once per unique state.
+			static std::mutex                           mtx;
+			static std::vector<std::array<uint64_t, 4>> seen;
+			const auto& dex = depth.desc.info.extent;
+			const auto& dcx = buffer.GetRegisters().GetDepthControl();
+			const std::array<uint64_t, 4> key {
+			    depth.desc.info.data.address,
+			    (static_cast<uint64_t>(dex.width) << 32) | dex.height,
+			    (static_cast<uint64_t>(depth.depth_clear_enable) << 8) |
+			        (static_cast<uint64_t>(dcx.zfunc) << 1) |
+			        (static_cast<uint64_t>(dcx.z_write_enable) << 12) |
+			        (static_cast<uint64_t>(std::bit_cast<uint32_t>(depth.depth_clear_value)) << 32),
+			    static_cast<uint64_t>(depth.desc.view_info.format)};
+			std::lock_guard<std::mutex> lock(mtx);
+			if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+				seen.push_back(key);
+				printf("NHL27SHADOW: depth-only pass addr=0x%llx %ux%u fmt=%s clear=%d clearval=%g "
+				       "zfunc=%u zwrite=%d ztest=%d\n",
+				       static_cast<unsigned long long>(depth.desc.info.data.address), dex.width,
+				       dex.height, vk::to_string(depth.desc.view_info.format).c_str(),
+				       depth.depth_clear_enable ? 1 : 0, depth.depth_clear_value, dcx.zfunc,
+				       dcx.z_write_enable ? 1 : 0, dcx.z_enable ? 1 : 0);
+			}
+		}
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");

@@ -36,8 +36,11 @@
 #include <bit>
 #include <cstdio>
 #include <fmt/format.h>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #ifdef min
@@ -755,6 +758,33 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
+	} else {
+		// DIAGNOSTIC ONLY: KYTY_DBG_FORCE_SHADOW_COMPARE=always|0..7 (S# compare func; 7=always
+		// lit, 1=less, 3=lequal, 4=greater, 6=gequal) overrides every depth-compare sampler.
+		static const int force_func = [] {
+			const char* e = std::getenv("KYTY_DBG_FORCE_SHADOW_COMPARE");
+			if (e == nullptr || *e == 0) return -1;
+			if (std::string_view(e) == "always") return 7;
+			return std::atoi(e) & 7;
+		}();
+		static const bool log_shadow = std::getenv("KYTY_DBG_LOG_SHADOW") != nullptr;
+		if (log_shadow) {
+			static std::mutex            mtx;
+			static std::vector<uint32_t> seen;
+			const uint32_t               key = descriptor.fields[0] ^ (descriptor.fields[1] * 31u);
+			std::lock_guard<std::mutex>  lock(mtx);
+			if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+				seen.push_back(key);
+				printf("NHL27SHADOW: sampler s0=%08x s1=%08x func=%u clamp=%u,%u compareEnable=%d\n",
+				       descriptor.fields[0], descriptor.fields[1], descriptor.DepthCompareFunc(),
+				       descriptor.ClampX(), descriptor.ClampY(),
+				       descriptor.DepthCompareFunc() != 0 ? 1 : 0);
+			}
+		}
+		if (force_func >= 0) {
+			descriptor.fields[0] = (descriptor.fields[0] & ~(0x7u << 12u)) |
+			                       (static_cast<uint32_t>(force_func) << 12u);
+		}
 	}
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();

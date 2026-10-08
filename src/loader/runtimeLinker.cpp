@@ -1797,11 +1797,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		                                &function_starts) &&
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
-		if (!have_function_starts && (emulate_amd || protect_memory_faults)) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
-			                module_name));
+		if (!have_function_starts) {
+			const char* feature = emulate_amd             ? "AMD CPU compatibility"
+			                      : protect_memory_faults ? "Guest red-zone protection"
+			                                              : "Host CPU compatibility";
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "{}: {} not patched (function boundaries unavailable)\n", feature, module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {

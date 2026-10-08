@@ -1978,7 +1978,10 @@ int KYTY_SYSV_ABI PthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedP
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = pthread_attr_getschedparam(&(*attr)->p, param);
+	// The guest's sched_param is a single int, but the host struct can be larger (macOS has an
+	// extra __opaque field), so let the host fill a local copy instead of the guest's buffer.
+	sched_param host_param {};
+	int         result = pthread_attr_getschedparam(&(*attr)->p, &host_param);
 
 	// Host priority mapping is lossy; return the exact guest value.
 	param->sched_priority = (*attr)->guest_priority;

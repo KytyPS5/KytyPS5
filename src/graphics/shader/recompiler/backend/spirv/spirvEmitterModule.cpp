@@ -524,7 +524,24 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.requirements.subgroup_local_invocation_id) {
+#if defined(__APPLE__)
+	// Metal forbids subgroup builtins in vertex functions. Derive the lane from VertexIndex
+	// instead (consecutive vertices fill consecutive lanes of a wave).
+	const bool subgroup_builtin_allowed = state.program.stage != ShaderType::Vertex;
+	if (state.requirements.subgroup_local_invocation_id && !subgroup_builtin_allowed) {
+		auto variable = InputVariableForKind(state, IR::StageInputKind::VertexIndex);
+		if (variable == 0) {
+			variable = DefineInterfaceVariable(state, TypeI32(state), spv::StorageClassInput,
+			                                   "gl_VertexIndexLane");
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+			                            spv::BuiltInVertexIndex);
+		}
+		state.subgroup_local_invocation_id_variable = variable;
+	}
+#else
+	const bool subgroup_builtin_allowed = true;
+#endif
+	if (state.requirements.subgroup_local_invocation_id && subgroup_builtin_allowed) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;

@@ -125,6 +125,20 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+#if defined(__APPLE__)
+	if (state.program.stage == ShaderType::Vertex) {
+		// The "lane" is the vertex index modulo the subgroup size (see DefineInputs).
+		EXIT_IF(state.subgroup_local_invocation_id_variable == 0);
+		const auto raw  = state.builder.AllocateId();
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeI32(state), raw,
+		                          state.subgroup_local_invocation_id_variable);
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, raw);
+		const auto lane =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), bits, ConstantU32(state, 31));
+		return state.lane_half == 0 ? lane : EmitAddU32(state, lane, ConstantU32(state, 32));
+	}
+#endif
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}

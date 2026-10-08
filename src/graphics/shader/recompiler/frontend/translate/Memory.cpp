@@ -885,8 +885,9 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
-	// Approximate ordered counting with one GDS atomic per wave. Wave-launch ordering and
-	// release/done synchronization are not emulated.
+	// One GDS atomic per wave. With the ordered-append term in the TG_SIZE SGPR (see
+	// TranslateProgram) the wave first waits for every earlier wave to release, as the hardware
+	// does.
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto m0 = ir.GetM0();
 	auto address = ir.BitwiseAnd(ir.ShiftRightLogical(m0, IR::U32(IR::Value(16u))),
@@ -912,6 +913,12 @@ void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 	                                   {ReadU32(inst.src0), is_first}));
 	const auto value = ir.Select(active, source, IR::U32(IR::Value(0u)));
 	const auto flags = AddMemoryInfo(memory, inst.pc);
+	const bool ordered  = program.info.uses_ordered_append;
+	if (ordered) {
+		// M0[10:0] carries the wave's ordered-append term, as the game copied it from TG_SIZE.
+		const auto wave_id = ir.BitwiseAnd(m0, IR::U32(IR::Value(IR::OrderedAppendWaveIdMask)));
+		ir.Emit(IR::ValueOpcode::OrderedAppendWait, {wave_id, is_first}, flags);
+	}
 	IR::U32 result;
 	if (((inst.secondary_offset >> 4u) & 3u) == 1u) {
 		const auto swapped = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicSwap32,
@@ -922,6 +929,10 @@ void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 	} else {
 		result = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
 		                        {address, value, is_first}, flags));
+	}
+	if (ordered && (inst.secondary_offset & 1u) != 0u) {
+		// wave_release: hand the ordered-append slot to the next wave.
+		ir.Emit(IR::ValueOpcode::OrderedAppendRelease, {is_first}, flags);
 	}
 	// DS_ORDERED_COUNT writes every destination lane, regardless of EXEC.
 	ir.SetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg),

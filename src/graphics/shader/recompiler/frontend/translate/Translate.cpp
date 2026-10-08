@@ -1189,7 +1189,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				if (ordered_append) {
 					// Ordered append term [16:6]: the wave's position in dispatch order, which the
 					// hardware dispatcher assigns and DS_ORDERED_COUNT serves in sequence.
-					result.info.uses_ordered_append = true;
+					result.info.uses_ordered_append      = true;
+					result.info.ordered_append_waves     = waves;
+					result.info.ordered_append_wave_size = wave_size;
 					const auto u32   = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 					auto       group = builtin(IR::StageInputKind::WorkgroupId, 2);
 					group            = entry_ir.IAdd(

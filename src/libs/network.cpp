@@ -4117,8 +4117,12 @@ int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_
 		return np_error_invalid_argument;
 	}
 
-	// The emulated user is never signed in to PSN, so answer like a signed-out console does,
-	// the same as NpGetAccountAge and NpGetAccountCountryA.
+	std::lock_guard lock(g_np_request_mutex);
+
+	if (np_get_request_locked(req_id) == nullptr) {
+		return np_error_request_not_found;
+	}
+
 	return np_error_signed_out;
 }
 

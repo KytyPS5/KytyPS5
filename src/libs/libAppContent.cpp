@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
+#include "libs/gameTrace.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
@@ -122,6 +123,8 @@ int KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
 	}
 
 	LOGF("\t value    = %d [%s]\n", *value, found ? "found" : "not found");
+	GameTrace::Line("AppContentAppParamGetInt id=%u -> %d (%s)", param_id, *value,
+	                found ? "found" : "not found");
 
 	return OK;
 }
@@ -177,6 +180,7 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	}
 
 	std::memset(mount_point->data, 0, sizeof(mount_point->data));
+	GameTrace::Line("AppContentAddcontMount label=%.16s -> NO_ENTITLEMENT", entitlement_label->data);
 
 	return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
 }

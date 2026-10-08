@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
+#include "libs/gameTrace.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
@@ -125,6 +126,7 @@ int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 		return PLAYGO_ERROR_NOT_SUPPORT_PLAYGO;
 	}
 
+	GameTrace::Line("PlayGoOpen ok chunks=%u", g_chunks_num);
 	*out_handle = PLAYGO_HANDLE;
 
 	return OK;
@@ -161,6 +163,7 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
 		LOGF("\t chunk_ids[%u] = %" PRIu16 "\n", i, chunk_ids[i]);
 
 		if (is_valid_chunk(chunk_ids[i])) {
+			GameTrace::Line("PlayGoGetLocus chunk=%u -> LOCAL_FAST", static_cast<unsigned>(chunk_ids[i]));
 			out_loci[i] = PLAYGO_LOCUS_LOCAL_FAST;
 		} else {
 			return PLAYGO_ERROR_BAD_CHUNK_ID;
@@ -231,6 +234,7 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 		out_chunk_id_list[i] = static_cast<uint16_t>(i);
 	}
 	*out_entries = entries;
+	GameTrace::Line("PlayGoGetChunkId req=%u -> %u", number_of_entries, entries);
 
 	return OK;
 }
@@ -355,6 +359,7 @@ int KYTY_SYSV_ABI PlayGoGetLanguageMask(int handle, uint64_t* out_language_mask)
 	}
 
 	*out_language_mask = PLAYGO_LANGUAGE_MASK_ALL;
+	GameTrace::Line("PlayGoGetLanguageMask -> all");
 
 	return OK;
 }
@@ -398,6 +403,7 @@ int KYTY_SYSV_ABI PlayGoGetOptionalChunk(int handle, int32_t type, PlayGoOptiona
 	}
 
 	set_optional_chunk(type, option);
+	GameTrace::Line("PlayGoGetOptionalChunk type=%d -> %llx", type, static_cast<unsigned long long>(option->bitmask));
 
 	return OK;
 }

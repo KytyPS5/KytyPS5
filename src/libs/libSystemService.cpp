@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
+#include "libs/gameTrace.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -113,6 +114,7 @@ static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
 	}
 
 	LOGF(" %d = %d\n", param_id, v);
+	GameTrace::Line("SystemServiceParamGetInt id=%d -> %d", param_id, v);
 
 	*value = v;
 

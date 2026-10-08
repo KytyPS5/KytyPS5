@@ -12,6 +12,7 @@
 #include "common/threads.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
+#include "libs/gameTrace.h"
 #include "libs/libs.h"
 #include "libs/network.h"
 
@@ -402,7 +403,7 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
+static int KernelOpenImpl(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
@@ -550,6 +551,14 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	file->opened = true;
 	return descriptor;
+}
+
+int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
+	const int r = KernelOpenImpl(path, flags, mode);
+	if (GameTrace::Enabled() && path != nullptr) {
+		GameTrace::Line("open %s flags=%x -> %d", path, static_cast<unsigned>(flags), r);
+	}
+	return r;
 }
 
 int KYTY_SYSV_ABI KernelClose(int d) {
@@ -1104,7 +1113,7 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	return static_cast<int64_t>(position);
 }
 
-int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
+static int KernelStatImpl(const char* path, FileStat* sb) {
 	PRINT_NAME();
 
 	if (path == nullptr || sb == nullptr) {
@@ -1149,6 +1158,14 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	*sb              = stat;
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
+	const int r = KernelStatImpl(path, sb);
+	if (GameTrace::Enabled() && path != nullptr) {
+		GameTrace::Line("stat %s -> %d", path, r);
+	}
+	return r;
 }
 
 int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {

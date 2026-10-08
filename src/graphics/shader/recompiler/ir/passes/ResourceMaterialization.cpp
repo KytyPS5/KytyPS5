@@ -137,19 +137,7 @@ bool IsCompatibleDescriptorDimension(const DescriptorValue&   descriptor,
 	const auto is_2d = [](Decoder::ImageDimension d) {
 		return d == Decoder::ImageDimension::Dim2D || d == Decoder::ImageDimension::Dim2DArray;
 	};
-	if (is_2d(dim) && is_2d(requested_dimension)) {
-		return true;
-	}
-	const auto is_1d = [](Decoder::ImageDimension d) {
-		return d == Decoder::ImageDimension::Dim1D || d == Decoder::ImageDimension::Dim1DArray;
-	};
-	if (is_1d(dim) && is_1d(requested_dimension)) {
-		return true;
-	}
-	const auto is_msaa = [](Decoder::ImageDimension d) {
-		return d == Decoder::ImageDimension::Dim2DMsaa || d == Decoder::ImageDimension::Dim2DMsaaArray;
-	};
-	return is_msaa(dim) && is_msaa(requested_dimension);
+	return is_2d(dim) && is_2d(requested_dimension);
 }
 
 uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {

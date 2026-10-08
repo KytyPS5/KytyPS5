@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <bit>
 
@@ -239,9 +240,32 @@ void DefineDescriptors(EmitterState& state) {
 					state.storage_buffer_u64_variable =
 					    Define(ArrayType(StorageBufferType(state, 64)), "buffers_u64");
 				}
+				// KYTY_READONLY_BUFFERS=1: the array is one variable, so it is NonWritable only if
+				// no buffer in the group is written/atomic, none is an indirect root/child or an
+				// image alias (those writes could be routed through another resource index).
+				static const bool readonly_buffers = [] {
+					const char* v = std::getenv("KYTY_READONLY_BUFFERS");
+					return v != nullptr && v[0] == '1';
+				}();
+				bool group_read_only = readonly_buffers && !binding.resources.empty();
+				if (group_read_only) {
+					for (const auto index: binding.resources) {
+						const auto& buffer = state.program.info.buffers.at(index);
+						if (buffer.written || buffer.atomic ||
+						    buffer.image_alias != IR::BufferResource::NoImageAlias ||
+						    buffer.indirect_root != IR::BufferResource::NoIndirectBuffer ||
+						    !buffer.indirect_resources.empty()) {
+							group_read_only = false;
+							break;
+						}
+					}
+				}
 				for (const auto variable: {state.storage_buffer_variable, state.storage_buffer_u8_variable,
 				                           state.storage_buffer_u16_variable, state.storage_buffer_u64_variable}) {
 					if (variable == 0) continue;
+					if (group_read_only) {
+						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+					}
 					if (state.storage_buffer_u8_variable != 0 || state.storage_buffer_u16_variable != 0 ||
 					    state.storage_buffer_u64_variable != 0) {
 						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);

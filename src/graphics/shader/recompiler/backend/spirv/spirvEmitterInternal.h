@@ -77,13 +77,14 @@ struct SpirvRequirements {
 	bool float64                      = false;
 };
 
-SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program,
+                                             ShaderStageInputInfo input_info = {});
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
 	      program(program_), input_info(input_info_),
-	      requirements(AnalyzeProgramRequirements(program_)) {
+	      requirements(AnalyzeProgramRequirements(program_, input_info_)) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}

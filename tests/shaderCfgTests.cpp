@@ -13272,6 +13272,17 @@ void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
         "EarlyFragmentTests");
   CheckSpirvBinaryValidates(result.spirv);
 
+  const uint32_t kill_without_vm_shader[] = {
+      EncodeExp0(0x00, 0xf), // vm=false
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  ps_info.ps_pixel_kill_enable = true;
+  auto kill_without_vm_result = RecompileForTest(kill_without_vm_shader, options);
+  Check(SpirvInstructionOpcodeCount(kill_without_vm_result.spirv, 252) != 0,
+        "pixel shader with ps_pixel_kill_enable but without vm export flag must still lower to OpKill");
+  CheckSpirvBinaryValidates(kill_without_vm_result.spirv);
+
   const uint32_t ordinary_shader[] = {
       EncodeExp0(0x00, 0xf),
       EncodeExp1(0, 1, 2, 3),

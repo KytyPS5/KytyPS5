@@ -190,8 +190,13 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 } // namespace
 
-Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
+Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program,
+                                                               ShaderStageInputInfo input_info) {
 	SpirvRequirements requirements {};
+	if (program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
+	    input_info.pixel->ps_pixel_kill_enable) {
+		requirements.pixel_valid_mask = true;
+	}
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			requirements.float64 |= inst.GetType() == IR::Type::F64;

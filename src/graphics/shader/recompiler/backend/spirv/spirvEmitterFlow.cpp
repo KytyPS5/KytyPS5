@@ -472,12 +472,27 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
 	const auto  exec  = ctx.Arg(inst, 1);
-	if (state.program.stage == ShaderType::Pixel && exp.vm && state.requirements.pixel_valid_mask &&
+	if (state.program.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask &&
 	    state.pixel_valid_mask_variable != 0) {
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), value, exec, ConstantU32(state, 1),
-		                          ConstantU32(state, 0));
-		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable, value);
+		const bool pixel_kill = state.input_info.pixel != nullptr &&
+		    state.input_info.pixel->ps_pixel_kill_enable;
+		if (exp.vm) {
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), value, exec, ConstantU32(state, 1),
+			                          ConstantU32(state, 0));
+			state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable, value);
+		} else if (pixel_kill) {
+			const auto current_mask = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), current_mask,
+			                          state.pixel_valid_mask_variable);
+			const auto exec_u32 = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), exec_u32, exec,
+			                          ConstantU32(state, 1), ConstantU32(state, 0));
+			const auto new_mask = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), new_mask,
+			                          current_mask, exec_u32);
+			state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable, new_mask);
+		}
 	}
 	if (exp.kind == IR::ExportTargetKind::Null || exp.en == 0u) {
 		return;

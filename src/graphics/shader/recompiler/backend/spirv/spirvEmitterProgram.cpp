@@ -747,8 +747,10 @@ void EmitProgram(EmitterState& state) {
 		                          state.gds_variable, 0);
 	}
 	if (state.pixel_valid_mask_variable != 0) {
+		const bool pixel_kill = state.program.stage == ShaderType::Pixel &&
+		    state.input_info.pixel != nullptr && state.input_info.pixel->ps_pixel_kill_enable;
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
-		                          ConstantU32(state, 1));
+		                          ConstantU32(state, pixel_kill ? 0 : 1));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

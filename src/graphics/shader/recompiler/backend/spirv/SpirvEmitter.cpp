@@ -195,9 +195,16 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
 	SpirvRequirements requirements {};
+	bool              has_barrier      = false;
+	bool              has_buffer_write = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			requirements.float64 |= inst.GetType() == IR::Type::F64;
+			has_barrier |= inst.GetOpcode() == IR::ValueOpcode::Barrier;
+			{
+				const auto access = IR::BufferAccessOf(inst.GetOpcode());
+				has_buffer_write |= access == IR::BufferAccess::Write || access == IR::BufferAccess::Atomic;
+			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
@@ -343,6 +350,19 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				default: break;
 			}
 		}
+	}
+	// KYTY_WORKGROUP_BUFFER_SYNC=1: guest compute shaders (e.g. ea94f09b2981eb43, which builds
+	// per-cell linked lists with BUFFER_STORE and walks them in other lanes after s_barrier) rely
+	// on RDNA L0 ordering between waves of a workgroup (glc=0 everywhere). Vulkan needs coherent
+	// buffer accesses plus a barrier whose semantics include buffer memory.
+	static const bool workgroup_buffer_sync = [] {
+		const char* v = std::getenv("KYTY_WORKGROUP_BUFFER_SYNC");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (workgroup_buffer_sync && program.stage == ShaderType::Compute && has_barrier &&
+	    has_buffer_write) {
+		requirements.workgroup_buffer_sync = true;
+		requirements.coherent_buffers      = true;
 	}
 	return requirements;
 }

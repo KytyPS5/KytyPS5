@@ -630,9 +630,12 @@ void EmitBarrier(EmitterState& state) {
 		return;
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
-	                        ? spv::MemorySemanticsUniformMemoryMask
-	                        : spv::MemorySemanticsWorkgroupMemoryMask;
+	uint32_t memory = state.lds_storage_class == spv::StorageClassStorageBuffer
+	                      ? spv::MemorySemanticsUniformMemoryMask
+	                      : spv::MemorySemanticsWorkgroupMemoryMask;
+	if (state.requirements.workgroup_buffer_sync) {
+		memory |= spv::MemorySemanticsUniformMemoryMask | spv::MemorySemanticsImageMemoryMask;
+	}
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),

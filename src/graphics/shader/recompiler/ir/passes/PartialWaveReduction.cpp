@@ -168,13 +168,18 @@ std::optional<Reduction> MatchReduction(Value source) {
 		// launched read the neutral element on hardware.
 		const auto  input = StripAllTrueSelect(cursor);
 		const auto* fill  = input.TryInstruction();
-		if (fill == nullptr || fill->GetOpcode() != ValueOpcode::SelectU32) continue;
-		const auto                      neutral = fill->Arg(2).Resolve();
-		std::unordered_set<const Inst*> visiting;
-		if (!neutral.IsImmediate() || neutral.GetType() != Type::U32 ||
-		    neutral.U32() != NeutralOf(*op) || !IsExecBounded(fill->Arg(0), visiting)) {
-			continue;
+		if (fill != nullptr && fill->GetOpcode() == ValueOpcode::SelectU32) {
+			const auto                      neutral = fill->Arg(2).Resolve();
+			std::unordered_set<const Inst*> visiting;
+			if (!neutral.IsImmediate() || neutral.GetType() != Type::U32 ||
+			    neutral.U32() != NeutralOf(*op) || !IsExecBounded(fill->Arg(0), visiting)) {
+				continue;
+			}
 		}
+		// Otherwise there is no Select at all: constant propagation of the initial EXEC (a literal
+		// true) folded away `V_CNDMASK(neutral, V, exec & k)` with a provably true k (ps 33037c60,
+		// pc 0x21f8: s28 = exec & s80). The DPP chain still reads only existing lanes, so the
+		// subgroup reduction over existing invocations is the same value.
 		return Reduction {*op, input};
 	}
 	return std::nullopt;

@@ -75,7 +75,10 @@ struct SpirvRequirements {
 	bool buffer_u16                   = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
-	bool float64                      = false;
+	// KYTY_WORKGROUP_BUFFER_SYNC=1: compute shader that writes storage buffers and uses
+	// s_barrier; the barrier must also order/publish buffer (and image) memory.
+	bool workgroup_buffer_sync        = false;
+	bool float64                     = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);

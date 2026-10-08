@@ -615,7 +615,8 @@ struct ReductionIr {
 // Z = exec ? v : neutral; four DPP row_shr steps; permlanex16(-1,-1); min; readlane 31 / 63.
 ReductionIr BuildReduction(Fixture &fixture, ValueOpcode op, uint32_t neutral,
                            bool bounded_condition = true,
-                           uint32_t perm_select = 0xffffffffu) {
+                           uint32_t perm_select = 0xffffffffu,
+                           bool folded_fill = false) {
   const auto exec = fixture.Emit(ValueOpcode::LogicalAnd, {Value(true), Value(true)});
   const auto not_exec = fixture.Emit(ValueOpcode::LogicalNot, {exec});
   const auto whole = fixture.Emit(ValueOpcode::LogicalOr, {not_exec, exec});
@@ -625,7 +626,9 @@ ReductionIr BuildReduction(Fixture &fixture, ValueOpcode op, uint32_t neutral,
   if (!bounded_condition) {
     condition = fixture.Emit(ValueOpcode::IEqual32, {data, Value(7u)});
   }
-  Value current = fixture.Emit(ValueOpcode::SelectU32, {condition, data, Value(neutral)});
+  Value current = folded_fill
+                      ? data
+                      : fixture.Emit(ValueOpcode::SelectU32, {condition, data, Value(neutral)});
   for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
     DppMoveFlags flags;
     flags.control = 0x110u + shift;
@@ -689,6 +692,17 @@ void TestPartialWaveReductionStructure() {
       }
     }
     Check(reference_users == 2, "lane 31/63 users were not redirected");
+  }
+}
+
+void TestPartialWaveReductionFoldedFill() {
+  // ps 33037c605e42f4ce: the neutral V_CNDMASK was folded away; still a wave reduction.
+  for (const auto op : {ValueOpcode::UMax32, ValueOpcode::UMin32, ValueOpcode::BitwiseOr32}) {
+    Fixture fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    BuildReduction(fixture, op, 0u, true, 0xffffffffu, true);
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 2,
+          "reduction with folded neutral fill was not recognised");
   }
 }
 
@@ -922,6 +936,10 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
+    TestPartialWaveReductionStructure();
+    TestPartialWaveReductionFoldedFill();
+    TestPartialWaveReductionRejectsUnprovenPatterns();
+    TestPartialWaveReductionEquivalence();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();

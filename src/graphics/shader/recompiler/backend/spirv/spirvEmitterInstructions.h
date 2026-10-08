@@ -59,6 +59,7 @@ EMIT_NATIVE(BitFieldSExtract, OpBitFieldSExtract, U32, uint32_t, uint32_t, uint3
 EMIT_NATIVE(SelectU1, OpSelect, U1, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(SelectU32, OpSelect, U32, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(SelectF32, OpSelect, F32, uint32_t, uint32_t, uint32_t)
+EMIT_NATIVE(SelectF64, OpSelect, F64, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(IAdd32, OpIAdd, U32, uint32_t, uint32_t)
 EMIT_NATIVE(ISub32, OpISub, U32, uint32_t, uint32_t)
 EMIT_NATIVE(IMul32, OpIMul, U32, uint32_t, uint32_t)

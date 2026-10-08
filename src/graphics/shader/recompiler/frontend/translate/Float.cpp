@@ -118,6 +118,33 @@ void Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode op
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {ReadOperand(inst.src0, type)}));
 }
 
+void Translator::FloatFract(const Decoder::Instruction& inst) {
+	if (inst.opcode == Decoder::Opcode::V_FRACT_F64) {
+		const auto fraction =
+		    ir.Emit(IR::ValueOpcode::FPFract64, {ReadOperand(inst.src0, IR::Type::F64)});
+		const auto below_one =
+		    ir.Emit(IR::ValueOpcode::BitCastF64U64, {IR::Value(uint64_t {0x3fefffffffffffffull})});
+		const auto reaches_one =
+		    ir.Emit(IR::ValueOpcode::FPOrdGreaterThanEqual64, {fraction, below_one});
+		WriteOperand(DestinationOperand(inst),
+		             ir.Emit(IR::ValueOpcode::SelectF64, {reaches_one, below_one, fraction}));
+		return;
+	}
+	const bool half = inst.opcode == Decoder::Opcode::V_FRACT_F16;
+	const auto argument =
+	    half ? IR::Value(ReadF16AsF32(inst.src0)) : ReadOperand(inst.src0, IR::Type::F32);
+	const auto below_one = IR::F32(IR::Value::F32(half ? 0x1.ffcp-1f : 0x1.fffffep-1f));
+	const auto fraction  = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {argument}));
+	const auto reaches_one =
+	    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThanEqual32, {fraction, below_one}));
+	const auto result = SelectF32(reaches_one, below_one, fraction);
+	if (half) {
+		WriteF16(DestinationOperand(inst), result);
+		return;
+	}
+	WriteOperand(DestinationOperand(inst), result);
+}
+
 void Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                              bool reverse) {
 	std::array<IR::Value, 2> args;

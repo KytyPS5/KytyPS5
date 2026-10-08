@@ -98,6 +98,7 @@ VALUE_OPCODE(WqmU64, U64, U64)
 // Core value operations used to expand architectural side effects.
 VALUE_OPCODE(SelectU1, U1, U1, U1, U1)
 VALUE_OPCODE(SelectF32, F32, U1, F32, F32)
+VALUE_OPCODE(SelectF64, F64, U1, F64, F64)
 VALUE_OPCODE(IAdd32, U32, U32, U32)
 VALUE_OPCODE(IAdd64, U64, U64, U64)
 VALUE_OPCODE(IAddCarry32, U32x2, U32, U32)

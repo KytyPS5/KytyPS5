@@ -722,6 +722,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
 	add_test(NAME texture_cache_layout_alias
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layout-alias-only)
+	add_test(NAME texture_cache_raw_image_read
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --raw-image-read-only)
+	add_test(NAME texture_cache_raw_image_read_layered
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --raw-image-read-layered-only)
 	add_test(NAME texture_cache_image_views
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled

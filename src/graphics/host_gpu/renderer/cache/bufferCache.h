@@ -58,12 +58,11 @@ public:
 		EnsureDeviceStateCleared();
 		return m_slot_buffers[id];
 	}
-	[[nodiscard]] BufferId                     FindBuffer(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
-	                                                        bool     is_written,
-	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
-	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
+	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] std::pair<Buffer*, uint64_t>
+	ObtainBuffer(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer = false,
+	             BufferId id = {}, bool raw_image_read = false);
+	[[nodiscard]] StreamBuffer& GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
 			case MemoryUsage::Stream: return m_stream_buffer;
@@ -155,7 +154,8 @@ private:
 	void                     ChangeRegister(BufferId id);
 	void                     DeleteBuffer(BufferId id);
 	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                           bool is_written, bool is_texel_buffer);
+	                                           bool is_written, bool is_texel_buffer,
+	                                           bool raw_image_read = false);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);

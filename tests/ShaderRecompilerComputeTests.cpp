@@ -14237,6 +14237,342 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // RESIDENT EVIL 2 reads a GPU-written render target's tiled bytes as a raw buffer.
+  void CheckRawImageRead() {
+    constexpr const char *name = "RawImageRead";
+    constexpr uintptr_t base = 0x0000000204c00000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t destination_offset = 0x20000;
+    constexpr auto tile = Prospero::TileMode::kStandard64KB;
+    constexpr vk::Extent3D extent{64, 64, 1};
+    constexpr uint32_t guest_bytes = 0xdeadbeefu;
+    constexpr uint32_t pixel_bits = 0x12345678u;
+    constexpr uint32_t destination_fill = 0x0badf00du;
+    EnsureRuntimeContext();
+
+    TileSizeAlign total{};
+    TileGetTextureTotalSize(Prospero::BufferFormat::k32UInt, extent.width, extent.height, 1, 1,
+                            tile, false, total);
+    TileSizeOffset offsets[16]{};
+    TilePaddedSize padded[16]{};
+    TileGetTextureSize(Prospero::BufferFormat::k32UInt, extent.width, extent.height, 1, tile,
+                       nullptr, offsets, padded);
+    ImageDesc desc{};
+    desc.type = BindingType::Texture;
+    desc.info.data = {base, total.size};
+    desc.info.pixel_format = vk::Format::eR32Uint;
+    desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+    desc.info.type = Prospero::ImageType::kColor2D;
+    desc.info.extent = extent;
+    desc.info.resources = {1, 1};
+    desc.info.pitch = TileGetTexturePitch(Prospero::BufferFormat::k32UInt, extent.width, tile);
+    desc.info.bytes_per_block = sizeof(uint32_t);
+    desc.info.tile_mode = tile;
+    desc.info.mip_layout[0] = {
+        offsets[0].src_size != 0 ? offsets[0].src_offset : offsets[0].offset,
+        offsets[0].src_size != 0 ? offsets[0].src_size : offsets[0].size, padded[0].width,
+        padded[0].height};
+    desc.view_info.format = vk::Format::eR32Uint;
+    desc.view_info.type = vk::ImageViewType::e2D;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+    desc.view_info.level_count = 1;
+    desc.view_info.layer_count = 1;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    const auto surface_words = static_cast<uint32_t>(total.size / sizeof(uint32_t));
+    const auto texel_count = extent.width * extent.height;
+    Require(name, "fixture",
+            total.size > BufferCache::CACHING_PAGESIZE && total.size <= destination_offset &&
+                total.size % (64u * sizeof(uint32_t)) == 0 && surface_words > texel_count,
+            "the tiled surface must outgrow the stream shortcut and carry tile padding");
+
+    // v1 = WorkGroupID.x * 64 + lane; copy that DWORD record from s[4:7] to s[0:3].
+    static const auto copy_shader = [] {
+      std::vector<u32> code;
+      AppendVop3(&code, 0x346u, 1, 8, InlineU32(6), Vgpr(0));
+      code.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+      code.push_back(EncodeMubuf1(2, 1, 1));
+      code.push_back(EncodeSopp(0x0c, 0));
+      code.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+      code.push_back(EncodeMubuf1(2, 0, 1));
+      AppendEnd(&code);
+      return code;
+    }();
+    ShaderMapUserData(reinterpret_cast<uint64_t>(copy_shader.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(copy_shader.size() * sizeof(u32))});
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "raw image read allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "raw image read mapping failed");
+    std::iota(static_cast<uint32_t *>(mapped),
+              static_cast<uint32_t *>(mapped) + allocation_size / sizeof(uint32_t), guest_bytes);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+
+      const auto image = textures.FindImage(desc);
+      (void)textures.FindTexture(image, desc);
+      vk::ClearValue painted{};
+      painted.color.uint32 = std::array{pixel_bits, 0u, 0u, 0u};
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), image,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+      textures.MarkGpuWritten(image);
+
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 bytes) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[1] |= static_cast<u32>(sizeof(uint32_t)) << 16u;
+        descriptor.fields[2] = bytes / static_cast<u32>(sizeof(uint32_t));
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i], HW::UserSgprType::Unknown);
+        }
+      };
+      const auto run_copy = [&](u32 bytes) {
+        const auto destination = base + destination_offset;
+        cache.FillBuffer(destination, total.size, destination_fill, false);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(copy_shader.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 8, .tgid_x_en = true});
+        set_buffer(0, destination, bytes);
+        set_buffer(4, base, bytes);
+        processor.DispatchDirect(bytes / (64u * sizeof(uint32_t)), 1, 1, 0x41u);
+        cache.ReadMemory(destination, bytes);
+        std::vector<uint32_t> words(bytes / sizeof(uint32_t));
+        Require(name, "destination readback",
+                LibKernel::Memory::TryReadBacking(destination, words.data(), bytes),
+                "the copied surface could not be read back");
+        return words;
+      };
+      const auto count = [](const std::vector<uint32_t> &words, uint32_t value) {
+        return static_cast<uint32_t>(std::ranges::count(words, value));
+      };
+
+      // A partial read is not a surface copy, so it does not pull the pixels.
+      const auto prefix = run_copy(static_cast<u32>(total.size / 2));
+      Require(name, "partial read leaves the image alone",
+              count(prefix, pixel_bits) == 0 && count(prefix, destination_fill) == 0 &&
+                  textures.GetImage(image).SafeToDownload(),
+              "a raw read of part of a GPU-written surface pulled its pixels or took ownership");
+
+      const auto whole = run_copy(static_cast<u32>(total.size));
+      Require(name, "whole read takes the pixels",
+              count(whole, pixel_bits) == texel_count && count(whole, destination_fill) == 0,
+              "a raw read spanning a GPU-written surface copied " +
+                  std::to_string(count(whole, pixel_bits)) + " of " +
+                  std::to_string(texel_count) + " texels instead of the image contents");
+      Require(name, "image keeps ownership", textures.GetImage(image).IsGpuModified(),
+              "the raw read transferred the surface's GPU ownership");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "raw image read mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "raw image read allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // RESIDENT EVIL 2 raw-copies a GPU-written cube; layered guest surfaces are slice-major.
+  void CheckRawImageReadLayered() {
+    constexpr const char *name = "RawImageReadLayered";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t destination_offset = 0x240000;
+    constexpr uint64_t allocation_size = 0x480000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr auto tile = Prospero::TileMode::kRenderTarget;
+    constexpr auto format = Prospero::BufferFormat::k32UInt;
+    constexpr vk::Extent3D extent{256, 256, 1};
+    constexpr uint32_t levels = 5;
+    constexpr uint32_t layers = 6;
+    constexpr uint32_t guest_bytes = 0xdeadbeefu;
+    constexpr uint32_t destination_fill = 0x0badf00du;
+    const auto pixel_bits = [](uint32_t level, uint32_t layer) {
+      return 0x10000000u | (level << 8u) | layer;
+    };
+    EnsureRuntimeContext();
+
+    TileSizeAlign slice{};
+    TileSizeOffset offsets[16]{};
+    TilePaddedSize padded[16]{};
+    TileGetTextureSize(format, extent.width, extent.height, levels, tile, &slice, offsets,
+                       padded);
+    const uint64_t total = static_cast<uint64_t>(slice.size) * layers;
+    ImageDesc desc{};
+    desc.type = BindingType::Texture;
+    desc.info.data = {base, total};
+    desc.info.pixel_format = vk::Format::eR32Uint;
+    desc.info.guest_format = format;
+    desc.info.type = Prospero::ImageType::kColor2D;
+    desc.info.extent = extent;
+    desc.info.resources = {levels, layers};
+    desc.info.pitch = TileGetTexturePitch(format, extent.width, tile);
+    desc.info.bytes_per_block = sizeof(uint32_t);
+    desc.info.tile_mode = tile;
+    // As PopulateTextureMipLayout: per-slice offset, all-layers size.
+    for (uint32_t level = 0; level < levels; ++level) {
+      const auto &mip = offsets[level];
+      desc.info.mip_layout[level] = {
+          mip.src_size != 0 ? mip.src_offset : mip.offset,
+          static_cast<uint64_t>(mip.src_size != 0 ? mip.src_size : mip.size) * layers,
+          padded[level].width, padded[level].height};
+    }
+    desc.view_info.format = vk::Format::eR32Uint;
+    desc.view_info.type = vk::ImageViewType::e2DArray;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+    desc.view_info.level_count = levels;
+    desc.view_info.layer_count = layers;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    uint64_t chain_end = 0;
+    for (uint32_t level = 0; level < levels; ++level) {
+      chain_end = std::max(chain_end, desc.info.mip_layout[level].offset +
+                                          desc.info.mip_layout[level].size);
+    }
+    Require(name, "fixture",
+            total == 0x240000 && total <= destination_offset && chain_end < total &&
+                total % (64u * sizeof(uint32_t)) == 0,
+            "the cube must match RE2's 0x240000-byte surface, with a per-slice mip offset that "
+            "the all-layers mip size does not reach past");
+
+    static const auto copy_shader = [] {
+      std::vector<u32> code;
+      AppendVop3(&code, 0x346u, 1, 8, InlineU32(6), Vgpr(0));
+      code.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+      code.push_back(EncodeMubuf1(2, 1, 1));
+      code.push_back(EncodeSopp(0x0c, 0));
+      code.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+      code.push_back(EncodeMubuf1(2, 0, 1));
+      AppendEnd(&code);
+      return code;
+    }();
+    ShaderMapUserData(reinterpret_cast<uint64_t>(copy_shader.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(copy_shader.size() * sizeof(u32))});
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "layered raw image read allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "layered raw image read mapping failed");
+    std::iota(static_cast<uint32_t *>(mapped),
+              static_cast<uint32_t *>(mapped) + allocation_size / sizeof(uint32_t), guest_bytes);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+
+      const auto image = textures.FindImage(desc);
+      (void)textures.FindTexture(image, desc);
+      for (uint32_t level = 0; level < levels; ++level) {
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+          vk::ClearValue painted{};
+          painted.color.uint32 = std::array{pixel_bits(level, layer), 0u, 0u, 0u};
+          TextureCacheTestAccess::ClearImage(
+              textures, scheduler.Current(), image,
+              {vk::ImageAspectFlagBits::eColor, level, 1, layer, 1}, painted);
+        }
+      }
+      textures.MarkGpuWritten(image);
+
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 bytes) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[1] |= static_cast<u32>(sizeof(uint32_t)) << 16u;
+        descriptor.fields[2] = bytes / static_cast<u32>(sizeof(uint32_t));
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i], HW::UserSgprType::Unknown);
+        }
+      };
+      const auto bytes = static_cast<u32>(total);
+      const auto destination = base + destination_offset;
+      cache.FillBuffer(destination, total, destination_fill, false);
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(copy_shader.data()),
+                           .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 8, .tgid_x_en = true});
+      set_buffer(0, destination, bytes);
+      set_buffer(4, base, bytes);
+      processor.DispatchDirect(bytes / (64u * sizeof(uint32_t)), 1, 1, 0x41u);
+      cache.ReadMemory(destination, bytes);
+      std::vector<uint32_t> words(bytes / sizeof(uint32_t));
+      Require(name, "destination readback",
+              LibKernel::Memory::TryReadBacking(destination, words.data(), bytes),
+              "the copied cube could not be read back");
+
+      Require(name, "copy ran", std::ranges::count(words, destination_fill) == 0,
+              "the raw copy left destination words unwritten");
+      for (uint32_t level = 0; level < levels; ++level) {
+        const auto mip_width = std::max(extent.width >> level, 1u);
+        const auto mip_height = std::max(extent.height >> level, 1u);
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+          const auto copied = static_cast<uint64_t>(
+              std::ranges::count(words, pixel_bits(level, layer)));
+          Require(name, "every slice and mip takes the pixels",
+                  copied == static_cast<uint64_t>(mip_width) * mip_height,
+                  "level " + std::to_string(level) + " layer " + std::to_string(layer) +
+                      " copied " + std::to_string(copied) + " of " +
+                      std::to_string(mip_width * mip_height) + " texels");
+        }
+      }
+      Require(name, "image keeps ownership", textures.GetImage(image).IsGpuModified(),
+              "the raw read transferred the cube's GPU ownership");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "layered raw image read mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "layered raw image read allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorStandardTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
@@ -51552,6 +51888,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--layout-alias-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLayoutAliasSync();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--raw-image-read-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRawImageRead();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--raw-image-read-layered-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRawImageReadLayered();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-cache-only") == 0) {

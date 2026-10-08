@@ -2560,7 +2560,8 @@ void TextureCache::DownloadDepthRegions(Image& image, std::vector<vk::BufferImag
 	}
 }
 
-bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                             bool whole_image) {
 	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
 	if (!selected) {
 		return false;
@@ -2572,6 +2573,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (!image.SafeToDownload()) {
 		return false;
 	}
+	if (whole_image && size < image.info.data.size) {
+		return false;
+	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
 		return false;
 	}
@@ -2579,7 +2583,11 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	const auto available  = buffer.Size() - buf_offset;
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
-	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+	if (image.info.IsVolume() || image.info.resources.layers > 1) {
+		// Volume and layered mips are strided across slices, so no per-level span covers them.
+		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+			return false;
+		}
 		levels    = image.info.resources.levels;
 		copy_size = image.info.data.size;
 	} else if (image.info.IsVolume() || image.info.resources.layers > 1) {

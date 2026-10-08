@@ -773,8 +773,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
 		    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
-	if (is_texel_buffer && !is_written) {
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	if ((is_texel_buffer || raw_image_read) && !is_written) {
+		return SynchronizeBufferFromImage(buffer, vaddr, size, !is_texel_buffer);
 	}
 	return false;
 }
@@ -811,7 +811,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id) {
+                                                       BufferId id, bool raw_image_read) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -835,7 +835,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer, raw_image_read);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		MarkGpuWrite(vaddr, size);

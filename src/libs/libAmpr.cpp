@@ -45,21 +45,21 @@ struct ResultBuffer {
 };
 
 struct ResolvedPathInfo {
-	int                   result    = OK;
-	uint32_t              file_id   = 0xffffffffu;
-	uint64_t              file_size = 0;
-	bool                  is_dir    = false;
+	int         result    = OK;
+	uint32_t    file_id   = 0xffffffffu;
+	uint64_t    file_size = 0;
+	bool        is_dir    = false;
 	std::filesystem::path host_path;
 };
 
-static std::mutex                                          g_mutex;
-static uint32_t                                            g_next_submission_id = 1;
-static uint32_t                                            g_next_file_id       = 1;
-static std::unordered_map<uint32_t, bool>                  g_submissions;
-static std::condition_variable                             g_submission_cv;
-static std::unordered_map<uint32_t, std::filesystem::path> g_files;
-static std::unordered_map<uint32_t, uint64_t>              g_file_sizes;
-static std::unordered_map<std::string, ResolvedPathInfo>   g_resolved_paths;
+static std::mutex                                        g_mutex;
+static uint32_t                                          g_next_submission_id = 1;
+static uint32_t                                          g_next_file_id       = 1;
+static std::unordered_map<uint32_t, bool>                g_submissions;
+static std::condition_variable                           g_submission_cv;
+static std::unordered_map<uint32_t, std::filesystem::path>         g_files;
+static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
+static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
 	(void)write;
@@ -134,8 +134,7 @@ static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	return true;
 }
 
-static int GetHostPathStat(const std::filesystem::path&     host_path,
-                           LibKernel::FileSystem::FileStat* st) {
+static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::FileSystem::FileStat* st) {
 	if (st == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
@@ -229,8 +228,7 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			}
 		}
 		if (log_missing) {
-			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path,
-			     Common::PathToString(info.host_path).c_str());
+			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, Common::PathToString(info.host_path).c_str());
 		}
 	}
 
@@ -1183,8 +1181,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		                                      command.size, &bytes_read);
 		if (result != OK) {
 			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
-			     command.file_id, static_cast<uint32_t>(result),
-			     Common::PathToString(host_path).c_str());
+			     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());
 			return result;
 		}
 	} else if (const auto* payload =

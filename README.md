@@ -338,6 +338,12 @@ folders recursively for game directories containing `eboot.bin` and ZArchive (`.
 whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
 ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
 
+To keep launcher settings and its compatibility database beside the executable, create an empty
+`portable.txt` next to `launcher.exe` or `launcher`. This selects the adjacent `Kyty.ini` even when
+starting from another working directory. The directory must be writable. Existing user/system
+settings are not copied. Emulator data paths and explicitly configured output paths retain their
+existing behavior.
+
 The emulator can also be started directly with a legally obtained game directory, ELF file, or
 ZArchive dump:
 

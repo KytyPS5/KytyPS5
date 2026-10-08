@@ -302,20 +302,25 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 	set_icon(m_ui->trophy_overview_button, QStringLiteral(":/icons/trophy.svg"));
 }
 
-void ConfigurationListWidget::WriteSettings() {
-	QFile                      file = QFile(QDir(".").absoluteFilePath(CONF_FILE_NAME));
-	std::unique_ptr<QSettings> s;
-	if (file.exists()) {
-		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
-	} else {
-#ifdef __linux__
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#else
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#endif
+static std::unique_ptr<QSettings> CreateSettings() {
+	const QDir app_dir(QCoreApplication::applicationDirPath());
+	if (QFileInfo(app_dir.filePath("portable.txt")).isFile()) {
+		return std::make_unique<QSettings>(app_dir.filePath(CONF_FILE_NAME), QSettings::IniFormat);
 	}
+	if (QFile::exists(CONF_FILE_NAME)) {
+		return std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
+	}
+#ifdef __linux__
+	return std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
+	                                   CONF_APP_NAME);
+#else
+	return std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
+	                                   CONF_APP_NAME);
+#endif
+}
+
+void ConfigurationListWidget::WriteSettings() {
+	auto s = CreateSettings();
 
 	MainDialog::WriteSettings(*s);
 	ConfigurationEditDialog::WriteSettings(*s);
@@ -343,19 +348,7 @@ void ConfigurationListWidget::WriteSettings() {
 }
 
 void ConfigurationListWidget::ReadSettings() {
-	QFile                      file = QFile(QDir(".").absoluteFilePath(CONF_FILE_NAME));
-	std::unique_ptr<QSettings> s;
-	if (file.exists()) {
-		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
-	} else {
-#ifdef __linux__
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#else
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#endif
-	}
+	auto s = CreateSettings();
 
 	m_settings_file = s->fileName();
 

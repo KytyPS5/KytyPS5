@@ -202,3 +202,20 @@ list(APPEND inc_headers
 include_what_you_use_with_mappings(launcher "${inc_headers}" "${iwyu_maps}")
 
 clang_tidy_check(launcher "" "${tidy_dirs}" "${inc_headers}")
+
+if(BUILD_TESTING)
+    set(launcher_test_src ${launcher_src})
+    list(REMOVE_ITEM launcher_test_src "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+    add_executable(launcher_settings_tests EXCLUDE_FROM_ALL
+        "${KYTY_TESTS_DIR}/LauncherSettingsTests.cpp"
+        ${launcher_test_src} ${launcher_forms} resources.qrc)
+    get_target_property(launcher_test_libraries launcher LINK_LIBRARIES)
+    target_link_libraries(launcher_settings_tests PRIVATE ${launcher_test_libraries})
+    target_include_directories(launcher_settings_tests PRIVATE include src)
+    set_target_properties(launcher_settings_tests PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
+    if(CLANG AND NOT KYTY_CLANG_CL)
+        target_compile_options(launcher_settings_tests PRIVATE -frtti)
+    endif()
+    add_test(NAME launcher_settings COMMAND launcher_settings_tests)
+    set_tests_properties(launcher_settings PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 45)
+endif()

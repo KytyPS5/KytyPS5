@@ -44,6 +44,7 @@ using HttpUriParse = int(KYTY_SYSV_ABI *)(SceHttpUriElement *, const char *,
 using HttpUriBuild = int(KYTY_SYSV_ABI *)(char *, size_t *, size_t,
                                           const SceHttpUriElement *, uint32_t);
 
+/// Resolve an exported HTTP function by NID and record a failure if it is absent.
 template <typename T>
 T GetHttpFunction(const Loader::SymbolDatabase &symbols, const char *nid) {
   const auto *record = symbols.FindByNid(nid, Loader::SymbolType::Func);
@@ -51,6 +52,7 @@ T GetHttpFunction(const Loader::SymbolDatabase &symbols, const char *nid) {
   return record != nullptr ? reinterpret_cast<T>(record->vaddr) : nullptr;
 }
 
+/// Check whether a non-null pointer lies within the used portion of the pool.
 template <size_t N>
 bool PointsIntoPool(const char *ptr, const std::array<char, N> &pool,
                     size_t used) {
@@ -62,6 +64,7 @@ bool PointsIntoPool(const char *ptr, const std::array<char, N> &pool,
   return address >= begin && address < begin + used;
 }
 
+/// Verify an absent query is represented by an empty string inside the sized pool.
 void TestAbsentQuery(HttpUriParse parse) {
   constexpr char url[] = "http://example.com/path";
   size_t required = 0;
@@ -83,6 +86,7 @@ void TestAbsentQuery(HttpUriParse parse) {
   }
 }
 
+/// Verify an empty URI needs four pool bytes and provides an empty query string.
 void TestEmptyUri(HttpUriParse parse) {
   constexpr char url[] = "";
   size_t required = 0;
@@ -101,6 +105,7 @@ void TestEmptyUri(HttpUriParse parse) {
   }
 }
 
+/// Verify parsing preserves the query delimiter and query text in the pool.
 void TestPresentQuery(HttpUriParse parse) {
   constexpr char url[] = "http://example.com/path?foo=bar";
   size_t required = 0;
@@ -118,6 +123,7 @@ void TestPresentQuery(HttpUriParse parse) {
   }
 }
 
+/// Query the build size, build into that extent and return the resulting URI text.
 std::string BuildWith(HttpUriBuild build, const SceHttpUriElement &element,
                       uint32_t option) {
   size_t required = 0;

@@ -307,6 +307,7 @@ struct UriPart {
 	size_t      len   = 0;
 };
 
+/// Accept a leading letter and subsequent URI scheme letters, digits, plus, minus or dot.
 static bool IsUriSchemeChar(char c, bool first) {
 	const auto ch = static_cast<unsigned char>(c);
 	return first ? std::isalpha(ch) != 0
@@ -551,6 +552,7 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 	return 0;
 }
 
+/// Percent-encode reserved bytes, reporting the required size before checking capacity.
 static int KYTY_SYSV_ABI HttpUriEscape(char* out, size_t* require, size_t prepare, const char* in) {
 	PRINT_NAME();
 

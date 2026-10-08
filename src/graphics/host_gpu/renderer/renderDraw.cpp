@@ -1078,6 +1078,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	std::array<const ShaderStageRuntime*, 4> immutable_stages{};
+	uint32_t immutable_stage_count = 0;
+	for (const auto& vertex: vertex_stages) immutable_stages[immutable_stage_count++] = &vertex.stage;
+	if (state.ps_active) immutable_stages[immutable_stage_count++] = &state.ps_input_info.stage;
+	ValidateImmutableSrtBindings(std::span{immutable_stages.data(), immutable_stage_count});
+
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.

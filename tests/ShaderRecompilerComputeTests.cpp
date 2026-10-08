@@ -431,6 +431,8 @@ struct RenderExecutorTestAccess {
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
                                       bool pixel_active) {
+    const std::array<const ShaderStageRuntime*,2> runtimes{&vertex,&pixel};
+    RenderExecutor::ValidateImmutableSrtBindings(std::span{runtimes.data(),pixel_active?2u:1u});
     RenderExecutor::GraphicsBindings result;
     executor.PrepareBindings(vertex, result.vertex[0]);
     std::array<PreparedBindings *, 2> stages{&result.vertex[0], nullptr};
@@ -2221,9 +2223,18 @@ constexpr std::array ImmutableSrtScenarios {
     ImmutableSrtScenario{"range-overflow", "immutable SRT snapshot has an invalid range"},
     ImmutableSrtScenario{"range-48bit", "immutable SRT snapshot has an invalid range"},
     ImmutableSrtScenario{"range-zero", "immutable SRT snapshot has an invalid range"},
+    ImmutableSrtScenario{"pixel-snapshot", "", true},
+    ImmutableSrtScenario{"pixel-buffer-disjoint", "", true},
+    ImmutableSrtScenario{"pixel-buffer-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"pixel-buffer-atomic-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"pixel-buffer-overlap-ordered", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"pixel-dma-write", "immutable SRT snapshot requires compute or pixel owners without DMA writes"},
+    ImmutableSrtScenario{"vs-buffer-ps-snapshot-disjoint", "", true},
+    ImmutableSrtScenario{"vs-buffer-ps-snapshot-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"vs-buffer-ps-snapshot-overlap-ordered", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"dma-read", "", true},
-    ImmutableSrtScenario{"dma-write", "immutable SRT snapshot requires compute without DMA writes"},
-    ImmutableSrtScenario{"vertex-snapshot", "immutable SRT snapshot requires compute without DMA writes"},
+    ImmutableSrtScenario{"dma-write", "immutable SRT snapshot requires compute or pixel owners without DMA writes"},
+    ImmutableSrtScenario{"vertex-snapshot", "immutable SRT snapshot requires compute or pixel owners without DMA writes"},
     ImmutableSrtScenario{"buffer-disjoint", "", true},
     ImmutableSrtScenario{"buffer-stride-zero-disjoint", "", true},
     ImmutableSrtScenario{"buffer-stride-zero-overlap", "", true},
@@ -14038,15 +14049,18 @@ void CheckSampledHtileArrayClearDiscovery() {
     const auto scenario = *found;
     const std::string_view selected(mode);
     const bool image_writer = selected.starts_with("image-padding-");
-    const bool buffer_writer = selected.starts_with("buffer-");
+    const bool cross_stage = selected.starts_with("vs-buffer-ps-snapshot-");
+    const bool pixel_owner = selected.starts_with("pixel-");
+    const bool buffer_writer = selected.starts_with("buffer-") || selected.starts_with("pixel-buffer-") || cross_stage;
     const bool stride_zero_writer = selected == "buffer-stride-zero-disjoint" ||
                                     selected == "buffer-stride-zero-overlap";
     const bool stride_zero_overlap = selected == "buffer-stride-zero-overlap";
     const bool selector_snapshot = selected.find("selector") != std::string_view::npos;
     const bool ordered_overlap = selected == "buffer-overlap-ordered" ||
                                  selected == "image-padding-selector-ordered" ||
-                                 selected == "buffer-selector-ordered";
-    const bool graphics = selected == "vertex-snapshot";
+                                 selected == "buffer-selector-ordered" || selected == "pixel-buffer-overlap-ordered" ||
+                                 selected == "vs-buffer-ps-snapshot-overlap-ordered";
+    const bool graphics = selected == "vertex-snapshot" || cross_stage;
     constexpr uintptr_t base = 0x0000000205200000ull;
     constexpr uint64_t allocation_size = 0x20000u;
     constexpr uint64_t allocation_alignment = 0x10000u;
@@ -14086,12 +14100,12 @@ void CheckSampledHtileArrayClearDiscovery() {
       auto& executor = context.GetRenderExecutor();
 
       Program program{};
-      program.stage = graphics ? ShaderType::Vertex : ShaderType::Compute;
+      program.stage = graphics ? ShaderType::Vertex : pixel_owner ? ShaderType::Pixel : ShaderType::Compute;
       program.resource_tracking_complete = true;
       program.shader_info_complete = true;
-      program.info.uses_dma = selected == "dma-read" || selected == "dma-write";
-      program.info.writes_dma = selected == "dma-write";
-      program.info.bounded_srt_reads.push_back({1u,0u});
+      program.info.uses_dma = selected == "dma-read" || selected == "dma-write" || selected == "pixel-dma-write";
+      program.info.writes_dma = selected == "dma-write" || selected == "pixel-dma-write";
+      if (!cross_stage) program.info.bounded_srt_reads.push_back({1u,0u});
       ShaderRecompiler::IR::ResourceSnapshot runtime_snapshot;
       ShaderStageRuntime runtime{.resources = &runtime_snapshot};
       runtime_snapshot.flattened_srt = {0x13579bdfu};
@@ -14115,8 +14129,8 @@ void CheckSampledHtileArrayClearDiscovery() {
       }
       if (buffer_writer) {
         BufferResource info{};
-        info.written = selected != "buffer-atomic-overlap";
-        info.atomic = selected == "buffer-atomic-overlap";
+        info.atomic = selected == "buffer-atomic-overlap" || selected == "pixel-buffer-atomic-overlap";
+        info.written = !info.atomic;
         info.stride_zero_access_size = stride_zero_writer ? 16u : 0u;
         program.info.buffers.push_back(info);
         ShaderBufferResource buffer{};
@@ -14172,17 +14186,30 @@ void CheckSampledHtileArrayClearDiscovery() {
       pixel_program.stage=ShaderType::Pixel;
       pixel_program.resource_tracking_complete=true;
       pixel_program.shader_info_complete=true;
+      if (cross_stage) pixel_program.info.bounded_srt_reads.push_back({1u,0u});
       AllocateBindings(pixel_program);
       CompiledShaderInfo pixel_info{};
       pixel_info.stage=ShaderType::Pixel;
       pixel_info.info=std::move(pixel_program.info);
       pixel_info.bindings=std::move(pixel_program.bindings);
       ShaderRecompiler::IR::ResourceSnapshot pixel_snapshot;
+      if (cross_stage) {
+        pixel_snapshot.flattened_srt=std::move(runtime_snapshot.flattened_srt);
+        pixel_snapshot.immutable_srt_ranges=std::move(runtime_snapshot.immutable_srt_ranges);
+      }
       ShaderStageRuntime pixel_runtime{.program=&pixel_info, .resources=&pixel_snapshot};
       std::printf("KYTY_IMMUTABLE_SRT_READY %s\n",mode);
       std::fflush(stdout);
       if (graphics) {
-        (void)RenderExecutorTestAccess::PrepareGraphicsBindings(executor,runtime,pixel_runtime,true);
+        auto bindings=RenderExecutorTestAccess::PrepareGraphicsBindings(executor,runtime,pixel_runtime,true);
+        if (scenario.allowed && cross_stage) {
+          Require(name,mode,bindings.vertex[0].buffers.size()==1u &&
+                    bindings.vertex[0].buffers[0].buffer!=nullptr &&
+                    bindings.vertex[0].buffers[0].range==buffer_size &&
+                    bindings.pixel->flattened_srt.buffer!=nullptr &&
+                    bindings.pixel->flattened_srt.range==sizeof(uint32_t),
+                  "graphics companion writer or pixel immutable upload was omitted");
+        }
       } else {
         PreparedBindings prepared;
         executor.PrepareBindings(runtime, prepared);
@@ -14190,6 +14217,9 @@ void CheckSampledHtileArrayClearDiscovery() {
           executor.FindBuffers(prepared);
           executor.RebindBuffers(prepared);
           executor.RebindImages(prepared);
+          Require(name,mode,prepared.flattened_srt.buffer!=nullptr &&
+                    prepared.flattened_srt.range==runtime_snapshot.flattened_srt.size()*sizeof(uint32_t),
+                  "immutable SRT upload lost its exact payload footprint");
           Require(name,mode,prepared.buffers.size()==info.info.buffers.size() &&
                       prepared.images.size()==info.info.images.size(),
                   fmt::format("immutable snapshot binding count mismatch: buffers={} expected={} images={} expected={}",

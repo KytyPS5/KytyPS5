@@ -1165,6 +1165,15 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Most lookups are plain textures of images without color metadata: leave before copying.
 	if (!desc_metadata && !use_target) {
+		if (desc.type == BindingType::RenderTarget) {
+			// A target bound without color metadata drops the previous binding's clear state.
+			std::scoped_lock lock {m_lock};
+			auto&            image = m_slot_images[id];
+			if (image.info.metadata.kind == ImageMetadataKind::Dcc ||
+			    image.info.metadata.kind == ImageMetadataKind::Cmask) {
+				image.info.metadata = desc.info.metadata;
+			}
+		}
 		return;
 	}
 	ImageDesc clear_desc = desc;

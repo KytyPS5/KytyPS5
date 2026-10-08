@@ -10899,6 +10899,31 @@ public:
                   "registers");
         }
         bind();
+        // A later binding of the target without color metadata forgets the
+        // old clear state, so a texture view keeps the drawn texels.
+        {
+          // Fresh clear keys, with the target unprogrammed so no draw or
+          // dispatch consumes them before the metadata-less rebind.
+          registers.SetColorBase(0, {.addr = 0});
+          fill_metadata(metadata_words);
+          registers.SetColorBase(0, {.addr = base});
+          ImageDesc plain = color.desc;
+          plain.info.metadata = {};
+          (void)texture_cache.FindImage(plain);
+          paint();
+          ImageDesc sampled = color.desc;
+          sampled.type = BindingType::Texture;
+          sampled.info.metadata = {};
+          sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          RenderExecutorTestAccess::ResetBindings(executor);
+          const auto sampled_id = texture_cache.FindImage(sampled);
+          (void)texture_cache.FindTexture(sampled_id, sampled);
+          Require(name, "metadata-less rebind forgets the clear",
+                  sampled_id == color.image_id && retains_painted_texel(),
+                  "a texture view applied the clear state of an earlier "
+                  "binding");
+        }
+        bind();
         // The metadata fill of a programmed target clears it even without a
         // draw; the second dispatch stands for any later GPU work.
         paint();

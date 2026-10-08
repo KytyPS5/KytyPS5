@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -210,6 +211,7 @@ struct ProtectionCall {
 };
 
 std::vector<ProtectionCall> g_protection_log;
+std::mutex g_protection_log_mutex;
 
 void ResetProtectionLog() {
   g_protection_calls = 0;
@@ -225,8 +227,11 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     protection = PAGE_READWRITE;
   }
   DWORD old_protection = 0;
-  g_protection_calls++;
-  g_protection_log.push_back({vaddr, size, mode});
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_protection_calls++;
+    g_protection_log.push_back({vaddr, size, mode});
+  }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
 }
@@ -719,24 +724,91 @@ void TestGpuDownloadProtectionMirrors() {
 }
 
 void TestCrossRegionUpload() {
-  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = AllocateFixedGuestRange(region_size * 2, 0x10000);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto boundary = (address + region_size - 1) & ~(region_size - 1);
-  uint32_t ranges = 0;
-  tracker.ForEachUploadRange(
-      boundary - page_size, page_size * 2, false,
-      [&](uint64_t, uint64_t) noexcept { ranges++; }, []() noexcept {});
-  Check(ranges == 2 &&
-            !tracker.IsRegionCpuModified(boundary - page_size, page_size * 2) &&
-            !IsWritable(reinterpret_cast<void *>(boundary - page_size)) &&
-            !IsWritable(reinterpret_cast<void *>(boundary)),
-        "cross-region upload did not clear and protect both regions");
-  tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
+  for (const bool is_written : {false, true}) {
+    TrackerHarness harness;
+    auto &tracker = harness.tracker;
+    uint32_t ranges = 0;
+    tracker.ForEachUploadRange(
+        boundary - page_size, page_size * 2, is_written,
+        [&](uint64_t start, uint64_t size) noexcept {
+          Check(start == boundary - page_size + ranges * page_size &&
+                    size == page_size,
+                "cold upload did not visit both region boundaries exactly");
+          ranges++;
+        },
+        [&]() noexcept {
+          Check(ranges == 2 &&
+                    Protection(reinterpret_cast<void *>(boundary - page_size)) ==
+                        PAGE_READONLY &&
+                    Protection(reinterpret_cast<void *>(boundary)) == PAGE_READONLY,
+                "cold upload completed before clearing and protecting both regions");
+        });
+    for (const auto page : {boundary - page_size, boundary}) {
+      Check(!tracker.IsRegionCpuModified(page, page_size) &&
+                tracker.IsRegionGpuModified(page, page_size) == is_written &&
+                Protection(reinterpret_cast<void *>(page)) ==
+                    (is_written ? PAGE_NOACCESS : PAGE_READONLY),
+            "cross-region upload did not preserve final ownership and protection");
+    }
+    Check(IsWritable(reinterpret_cast<void *>(boundary - 2 * page_size)) &&
+              IsWritable(reinterpret_cast<void *>(boundary + page_size)),
+          "cross-region upload changed neighboring pages");
+    tracker.UnmarkRegionAsGpuModified(boundary - page_size, 2 * page_size);
+    tracker.UntrackMemory(address, region_size * 2);
+  }
+  Release(memory);
+}
+
+void TestConcurrentColdUploads() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = AllocateFixedGuestRange(region_size * 2, region_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::counting_semaphore<2> start{0};
+  std::counting_semaphore<2> upload_entered{0};
+  std::counting_semaphore<2> finish_upload{0};
+  std::vector<std::jthread> workers;
+  for (const auto page : {address, address + region_size}) {
+    workers.emplace_back([&, page] {
+      start.acquire();
+      uint32_t ranges = 0;
+      tracker.ForEachUploadRange(
+          page, page_size, true,
+          [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+            Check(upload_address == page && upload_size == page_size,
+                  "concurrent cold upload lost its dirty page");
+            ranges++;
+          },
+          [&]() noexcept {
+            Check(ranges == 1, "concurrent cold upload skipped its dirty page");
+            upload_entered.release();
+            finish_upload.acquire();
+          });
+    });
+  }
+  start.release(2);
+  const bool first_entered = upload_entered.try_acquire_for(std::chrono::seconds(5));
+  const bool second_entered = upload_entered.try_acquire_for(std::chrono::seconds(5));
+  finish_upload.release(2);
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  Check(first_entered && second_entered,
+        "cold writable uploads serialized disjoint regions");
+  for (const auto page : {address, address + region_size}) {
+    Check(!tracker.IsRegionCpuModified(page, page_size) &&
+              tracker.IsRegionGpuModified(page, page_size) &&
+              Protection(reinterpret_cast<void *>(page)) == PAGE_NOACCESS,
+          "concurrent cold upload did not retain GPU ownership");
+    tracker.UnmarkRegionAsGpuModified(page, page_size);
+  }
   tracker.UntrackMemory(address, region_size * 2);
   Release(memory);
 }
@@ -1137,6 +1209,7 @@ int main(int argc, char **argv) {
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
+  TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();

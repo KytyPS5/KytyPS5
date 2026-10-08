@@ -503,41 +503,11 @@ IR::U64 Translator::ReadU64(const Decoder::Operand& operand) {
 	return IR::U64(ReadOperand(operand, IR::Type::U64));
 }
 
-IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed) {
-	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		const bool use_zero = packed && (high_lane ? operand.op_sel_hi : operand.op_sel);
-		auto       value    = use_zero ? IR::F32(IR::Value::F32(0.0f))
-		                               : ir.BitCastF32(IR::U32(IR::Value(operand.value)));
-		const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
-		value               = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
-		if (operand.absolute) {
-			value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
-		}
-		if (high_lane ? operand.negate_hi : operand.negate) {
-			value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
-		}
-		return value;
-	}
-	auto raw_operand      = operand;
-	raw_operand.sdwa_sel  = 6;
-	raw_operand.sdwa_sext = false;
-	const auto bits       = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
-	uint32_t   offset     = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
-	if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
-		offset = operand.sdwa_sel == 5u ? 16u : 0u;
-	}
-	const auto half_u32 = IR::U32(
-	    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(offset), IR::Value(16u)}));
-	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {half_u32}));
+IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane) {
+	const auto bits     = Read16LaneBits(operand, high_lane);
+	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits}));
 	const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::BitCastF16U16, {half_u16}));
-	auto       value    = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
-	if (operand.absolute) {
-		value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
-	}
-	if (high_lane ? operand.negate_hi : operand.negate) {
-		value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
-	}
-	return value;
+	return IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
 }
 
 IR::F32 Translator::ReadF16AsF32(const Decoder::Operand& operand) {
@@ -555,29 +525,6 @@ IR::F32 Translator::ReadMixF32(const Decoder::Operand& operand) {
 	return IR::F32(ReadOperand(value_operand, IR::Type::F32));
 }
 
-IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_lane) {
-	auto raw_operand      = operand;
-	raw_operand.sdwa_sel  = 6;
-	raw_operand.sdwa_sext = false;
-	const auto bits       = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
-	uint32_t   offset     = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
-	uint32_t   width      = 16u;
-	if (operand.sdwa_sel <= 3u) {
-		offset = operand.sdwa_sel * 8u;
-		width  = 8u;
-	} else if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
-		offset = operand.sdwa_sel == 5u ? 16u : 0u;
-	}
-	if (width == 8u && operand.sdwa_sext) {
-		// Extend the selected byte into the 16-bit operand before halfword modifiers.
-		const auto value = IR::U32(
-		    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {bits, IR::Value(offset), IR::Value(width)}));
-		return ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)));
-	}
-	return IR::U32(
-	    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(offset), IR::Value(width)}));
-}
-
 IR::U32 Translator::ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane,
                                      bool sign_extend) {
 	auto value = Read16LaneBits(operand, high_lane);
@@ -593,12 +540,36 @@ IR::U32 Translator::ReadU16AsU32(const Decoder::Operand& operand, bool sign_exte
 }
 
 IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_lane) {
-	auto value = ReadU16LaneRaw(operand, high_lane);
+	auto raw_operand      = operand;
+	raw_operand.sdwa_sel  = 6;
+	raw_operand.sdwa_sext = false;
+	auto bits             = ReadRawU32(operand);
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		// Inline floats encode the operand's width before SDWA or OP_SEL selects bits.
+		const auto half      = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {ir.BitCastF32(bits)}));
+		const auto half_bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}));
+		bits                = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {half_bits}));
+	}
+	bits = ApplyBitSourceModifiers(raw_operand, bits);
+	uint32_t offset = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
+	uint32_t width  = 16u;
+	if (operand.sdwa_sel <= 3u) {
+		offset = operand.sdwa_sel * 8u;
+		width  = 8u;
+	} else if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
+		offset = operand.sdwa_sel == 5u ? 16u : 0u;
+	}
+	const auto extract = width == 8u && operand.sdwa_sext
+	                         ? IR::ValueOpcode::BitFieldSExtract
+	                         : IR::ValueOpcode::BitFieldUExtract;
+	auto value = IR::U32(ir.Emit(extract, {bits, IR::Value(offset), IR::Value(width)}));
+	if (width == 8u && operand.sdwa_sext) {
+		value = ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)));
+	}
 	if (operand.absolute) {
 		value = ir.BitwiseAnd(value, IR::U32(IR::Value(0x7fffu)));
 	}
 	if (high_lane ? operand.negate_hi : operand.negate) {
-		// RDNA2 source NEG flips the sign bit, including packed integer operands.
 		value = ir.BitwiseXor(value, IR::U32(IR::Value(0x8000u)));
 	}
 	return value;
@@ -918,9 +889,16 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CMP_GT_U64:
 		case Decoder::Opcode::V_CMP_NE_U64:
 		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMPX_LT_I64:
+		case Decoder::Opcode::V_CMPX_EQ_I64:
+		case Decoder::Opcode::V_CMPX_LE_I64:
 		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_LT_U64:
+		case Decoder::Opcode::V_CMPX_EQ_U64:
 		case Decoder::Opcode::V_CMPX_LE_U64:
+		case Decoder::Opcode::V_CMPX_GT_U64:
 		case Decoder::Opcode::V_CMPX_NE_U64:
+		case Decoder::Opcode::V_CMPX_GE_U64:
 			include_vector(inst.src0, 2u);
 			include_vector(inst.src1, 2u);
 			break;
@@ -1159,7 +1137,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 64u ||
+			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 0x1ffu ||
+			                     mesh.primitives_per_group > 0x1ffu ||
 			                     total_threads > 15u * options.wave_size);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
@@ -1195,6 +1174,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto wave_info = entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(wave, u32(24)),
 			                                          u32(((total_threads + options.wave_size - 1u) /
 			                                               options.wave_size) << 28u));
+			entry_ir.SetScalarReg(
+			    static_cast<IR::ScalarReg>(2),
+			    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(vertices, u32(12)),
+			                       entry_ir.ShiftLeftLogical(primitives, u32(22))));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
@@ -1303,6 +1286,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 			};
 			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
+			barycentric_pair(ps->ps_perspective_sample_vgpr,
+			                 IR::StageInputKind::BaryCoordSmoothSample);
 			barycentric_pair(ps->ps_perspective_centroid_vgpr,
 			                 IR::StageInputKind::BaryCoordSmoothCentroid);
 			uint32_t reg = ps->ps_system_input_base;

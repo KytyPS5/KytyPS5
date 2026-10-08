@@ -196,6 +196,7 @@ enum class StageInputKind {
 	Layer,
 	SampleId,
 	BaryCoordSmooth,
+	BaryCoordSmoothSample,
 	BaryCoordSmoothCentroid,
 	BaryCoordNoPerspective,
 	WorkgroupId,
@@ -485,14 +486,21 @@ struct BlockInfo {
 
 struct DescriptorSource {
 	struct IndirectDescriptor {
-		uint32_t material_source = UINT32_MAX;
+		struct SelectorRead {
+			uint32_t source = UINT32_MAX;
+			uint32_t stride = 0;
+			uint32_t offset = 0;
+
+			bool operator==(const SelectorRead& other) const = default;
+		};
+		std::optional<SelectorRead> selector;
 		uint32_t table_source    = 0;
-		uint32_t selector_stride = 0;
-		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		uint32_t table_immediate = 0;
 		uint32_t table_stride    = 0;
+		uint32_t table_record_bytes = 0;
+		bool     table_scalar = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
-		uint32_t selector_shift  = 0;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;

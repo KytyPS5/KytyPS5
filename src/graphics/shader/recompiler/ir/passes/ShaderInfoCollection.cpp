@@ -143,6 +143,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							}
 							break;
 						case StageInputKind::BaryCoordSmooth:
+						case StageInputKind::BaryCoordSmoothSample:
 						case StageInputKind::BaryCoordSmoothCentroid:
 						case StageInputKind::BaryCoordNoPerspective:
 							if (component >= 2u) {
@@ -226,15 +227,16 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 			}
 		}
 	}
-	// Aliases of a vertex output share one SPIR-V interface variable. If any
-	// alias reads raw vertices, interpolate the other aliases from those too.
+	// Mixed interpolation modes share raw vertices at their guest export slot.
+	// Rectangle expansion alone supplies separate flat and smooth outputs.
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
+			const bool same_mode = ShaderPixelParameterIsFlat(*pixel, input) ==
+			                       ShaderPixelParameterIsFlat(*pixel, alias);
 			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
 			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
-			    ShaderPixelParameterIsFlat(*pixel, input) ==
-			        ShaderPixelParameterIsFlat(*pixel, alias)) {
-				per_vertex[input] = per_vertex[input] || per_vertex[alias];
+			    (pixel->parameter_mode != ShaderPixelParameterMode::Rectangle || same_mode)) {
+				per_vertex[input] = per_vertex[input] || per_vertex[alias] || !same_mode;
 			}
 		}
 	}
@@ -243,7 +245,8 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 		         per_vertex[input]);
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		if (interpolated[input] && per_vertex[input]) {
+		if (interpolated[input] && per_vertex[input] &&
+		    !ShaderPixelParameterIsFlat(*pixel, input)) {
 			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
 			                                           : StageInputKind::BaryCoordSmooth;
 			AddInput(info, kind, 0, 3,
@@ -299,6 +302,9 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 					break;
 				case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
 				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
+				case StageInputKind::BaryCoordSmoothSample:
+					AddInput(info, StageInputKind::SampleId, 0, 1, "gl_SampleID");
+					[[fallthrough]];
 				case StageInputKind::BaryCoordSmooth:
 				case StageInputKind::BaryCoordSmoothCentroid:
 					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
@@ -386,16 +392,23 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 					AddOutput(info, StageOutputKind::Parameter, export_info.index,
 					          export_info.index, fmt::format("out_param_{}", export_info.index));
 					break;
-				case ExportTargetKind::Mrt:
+				case ExportTargetKind::Mrt: {
 					if (alpha_remap && export_info.index != 0) {
 						break;
 					}
-					AddOutput(info, StageOutputKind::Mrt, export_info.index, export_info.index,
+					const auto slot = input_info.pixel->dual_source_blending
+					                      ? 0u : ShaderPixelExportTarget(input_info.pixel->target_shader_mask,
+					                                                    export_info.index);
+					if (slot >= 8) {
+						break;
+					}
+					AddOutput(info, StageOutputKind::Mrt, export_info.index, slot,
 					          fmt::format("out_mrt_{}", export_info.index));
 					if (alpha_remap) {
-						AddOutput(info, StageOutputKind::Mrt, 1, 1, "out_mrt_1");
+						AddOutput(info, StageOutputKind::Mrt, 1, 0, "out_mrt_1");
 					}
 					break;
+				}
 				default: break;
 			}
 		}

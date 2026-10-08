@@ -347,6 +347,17 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			if (IsImmediate(low, Type::U32) && IsImmediate(high, Type::U32)) {
 				Replace(inst, Value(static_cast<uint64_t>(low.U32()) |
 				                    (static_cast<uint64_t>(high.U32()) << 32u)));
+			} else {
+				const auto* low_extract  = low.TryInstruction();
+				const auto* high_extract = high.TryInstruction();
+				if (low_extract != nullptr && high_extract != nullptr &&
+				    low_extract->GetOpcode() == ValueOpcode::CompositeExtractU64 &&
+				    high_extract->GetOpcode() == ValueOpcode::CompositeExtractU64 &&
+				    Arg(*low_extract, 1) == Value(0u) && Arg(*high_extract, 1) == Value(1u) &&
+				    Arg(*low_extract, 0) == Arg(*high_extract, 0)) {
+					// Guest register pairs need not unpack and repack between wide operations.
+					Replace(inst, Arg(*low_extract, 0));
+				}
 			}
 			return;
 		}

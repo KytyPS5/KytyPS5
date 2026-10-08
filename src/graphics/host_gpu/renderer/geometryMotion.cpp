@@ -16,6 +16,9 @@ struct GeometryMotion::Impl {
 	bool                      pending_clear = false;
 	static constexpr uint64_t Budget        = 64 * 1024 * 1024;
 	static constexpr uint64_t GuideBudget   = 128 * 1024 * 1024;
+	static constexpr uint64_t KeyBudget     = 4 * 1024 * 1024;
+	static constexpr size_t   MaxDraws      = 8192;
+	uint64_t                  key_bytes     = 0;
 	struct History {
 		std::unique_ptr<Buffer> current, previous;
 		uint64_t                frame       = 0;
@@ -100,10 +103,21 @@ std::array<uint32_t, 14> GeometryMotion::PrepareDraw(CommandBuffer&            c
                                                      uint32_t instances) {
 	std::array<uint32_t, 14> push {};
 	auto&                    s = *m_impl;
-	if (!capacity || !instances || uint64_t(capacity) > Impl::Budget / 2 / 20 / instances)
+	if (!capacity || !instances || key.size_bytes() > Impl::KeyBudget ||
+	    uint64_t(capacity) > Impl::Budget / 2 / 20 / instances)
 		return push;
 	const uint64_t size  = uint64_t(capacity) * instances * 20;
-	auto&          entry = s.draws[std::vector<uint64_t>(key.begin(), key.end())];
+	std::vector<uint64_t> draw_key(key.begin(), key.end());
+	auto found = s.draws.find(draw_key);
+	if (found == s.draws.end()) {
+		// Bound admission even when the guest keeps drawing without a VideoOut flip.
+		if (s.draws.size() >= Impl::MaxDraws || s.key_bytes + key.size_bytes() > Impl::KeyBudget ||
+		    s.bytes + size > Impl::Budget)
+			return push;
+		found = s.draws.try_emplace(std::move(draw_key)).first;
+		s.key_bytes += key.size_bytes();
+	}
+	auto& entry = found->second;
 	if ((entry.current && entry.current->Size() != size) ||
 	    (entry.previous && entry.previous->Size() != size)) {
 		for (auto* buffer: {&entry.current, &entry.previous}) {
@@ -268,6 +282,7 @@ void GeometryMotion::AdvanceFrame() {
 				if (*buffer) s.bytes -= (*buffer)->Size();
 				s.Recycle(*buffer);
 			}
+			s.key_bytes -= it->first.size() * sizeof(uint64_t);
 			it = s.draws.erase(it);
 		} else
 			++it;

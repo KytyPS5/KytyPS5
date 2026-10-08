@@ -28,6 +28,46 @@ void CheckConcurrentResult(int result, const char* text) {
 	Check(result == OK || result == KERNEL_ERROR_EBADF || result == KERNEL_ERROR_ENOENT, text);
 }
 
+void TestLevelUserEventDelivery() {
+	using Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "level-user-events") == OK, "create user event queue");
+	Check(EventQueue::KernelAddUserEvent(queue, 1) == OK &&
+	          EventQueue::KernelAddUserEvent(queue, 2) == OK &&
+	          EventQueue::KernelAddUserEventEdge(queue, 3) == OK, "add level and edge events");
+	for (int id = 1; id <= 3; ++id)
+		Check(EventQueue::KernelTriggerUserEvent(queue, id, reinterpret_cast<void*>(uintptr_t(id))) == OK,
+		      "trigger distinct user events");
+	EventQueue::KernelEvent events[16] {};
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	int out = 0;
+	const auto find_event = [&](uintptr_t id) {
+		return std::find_if(events, events + out, [=](const auto& event) { return event.ident == id; });
+	};
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == OK && out == 3,
+	      "level events are returned once per wait without starving following events");
+	for (uintptr_t id = 1; id <= 3; ++id) {
+		const auto* event = find_event(id);
+		Check(event != events + out && event->data == static_cast<intptr_t>(id) &&
+		          event->udata == reinterpret_cast<void*>(id), "distinct event payloads");
+	}
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == OK && out == 2 &&
+	          find_event(1) != events + out && find_event(2) != events + out,
+	      "level persists while edge clears");
+	Check(EventQueue::KernelDeleteUserEvent(queue, 1) == OK, "delete first level event");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == OK && out == 1 &&
+	          events[0].ident == 2, "remaining level event is delivered only once");
+	Check(EventQueue::KernelDeleteUserEvent(queue, 2) == OK, "delete remaining level event");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
+	      "deleted levels and consumed edge do not reappear");
+	Check(EventQueue::KernelTriggerUserEvent(queue, 3, nullptr) == OK, "retrigger edge event");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == OK && out == 1 &&
+	          events[0].ident == 3, "retriggered edge is delivered once");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 16, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
+	      "retriggered edge clears after delivery");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete user event queue");
+}
+
 void TestPeriodicTimerEvents() {
 	using namespace std::chrono_literals;
 	using Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
@@ -188,6 +228,12 @@ void TestDuplicateAddPreservesEventState() {
 	      "duplicate add updates deadline metadata");
 	Check(timer_event.data == 0 && timer_event.udata == reinterpret_cast<void*>(0x2222),
 	      "deadline trigger retains updated duplicate metadata");
+	for (uintptr_t value: {0x9abcu, 0xdef0u})
+		Check(EventQueue::KernelTriggerEvent(queue, 17, EventQueue::KERNEL_EVFILT_VIDEO_OUT,
+		                                     reinterpret_cast<void*>(value)) == OK, "queue bounded read payload");
+	for (intptr_t value: {0x9abcu, 0xdef0u})
+		Check(EventQueue::KernelWaitEqueue(queue, events, 1, &out, &timeout) == OK && out == 1 &&
+		          events[0].data == value, "capacity-one reads preserve pending event order");
 
 	auto retained_owner = weak_original.lock();
 	Check(retained_owner != nullptr, "original owner alive before delete");
@@ -495,6 +541,7 @@ void TestConcurrentDelete() {
 } // namespace
 
 int main() {
+	TestLevelUserEventDelivery();
 	TestPeriodicTimerEvents();
 	TestDuplicateAddPreservesEventState();
 	TestCallbackStateOutlivesPort();

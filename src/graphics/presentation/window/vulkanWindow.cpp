@@ -642,8 +642,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// interposer requests the extension dependencies but the core feature must
 	// also be explicitly enabled by the host before plugin initialization.
 	if (HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
-		EXIT_NOT_IMPLEMENTED(supported_features13.privateData != VK_TRUE);
-		features13.privateData = VK_TRUE;
+		features13.privateData = supported_features13.privateData;
 	}
 #if defined(__APPLE__)
 	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
@@ -1065,14 +1064,20 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
-		if (frame_generation->Hooked() &&
-		    !frame_generation->ConfigureDeviceExtensions(available_extensions, device_extensions)) {
-			// Streamline must stop injecting plugin requirements into vkCreateDevice.
-			// Its instance and physical-device handles are native Vulkan handles.
-			get_instance_proc_addr =
-			    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
-			VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
-			VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
+		if (frame_generation->Hooked()) {
+			vk::PhysicalDeviceVulkan13Features fg_features {};
+			vk::PhysicalDeviceFeatures2 features {};
+			features.pNext = &fg_features;
+			graphic_ctx.physical_device.getFeatures2(&features);
+			if (!frame_generation->ConfigureDeviceExtensions(available_extensions, device_extensions,
+			                                                fg_features.privateData == VK_TRUE)) {
+				// Streamline must stop injecting plugin requirements into vkCreateDevice.
+				// Its instance and physical-device handles are native Vulkan handles.
+				get_instance_proc_addr =
+				    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+				VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+				VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
+			}
 		}
 		if (dlss_instance_extensions) {
 			graphic_ctx.dlss_extensions_enabled =

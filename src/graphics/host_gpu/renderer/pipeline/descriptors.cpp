@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -126,8 +127,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                              resource.formatted, id);
+	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
+	    address, size, resource.written,
+	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -807,30 +809,52 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
-void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-	const auto& program  = *prepared.runtime->program;
-	const auto& snapshot = *prepared.runtime->resources;
-	auto&       cache    = m_context.GetBufferCache();
-
-	prepared.buffer_sources.clear();
-	const auto& layout = program.bindings;
-	if (layout.memory_offset_count == 0) {
-		return;
-	}
-	const auto& resources = layout.descriptors.front().resources;
-	prepared.buffer_sources.reserve(resources.size());
-	for (const auto resource: resources) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
-		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
-		if (address == 0 || requested_size == 0) {
-			prepared.buffer_sources.push_back({});
+	auto& cache = m_context.GetBufferCache();
+	for (auto* stage: stages) {
+		auto& prepared = *stage;
+		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+		const auto& program  = *prepared.runtime->program;
+		const auto& snapshot = *prepared.runtime->resources;
+		prepared.buffer_sources.clear();
+		const auto& layout = program.bindings;
+		if (layout.memory_offset_count == 0) {
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
-		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		const auto& resources = layout.descriptors.front().resources;
+		prepared.buffer_sources.reserve(resources.size());
+		for (const auto resource: resources) {
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
+			const auto address = descriptor.Base48();
+			auto size = descriptor.GetSize();
+			if (address == 0 || size == 0) {
+				prepared.buffer_sources.push_back({});
+				continue;
+			}
+			if (descriptor.NumRecords() == UINT32_MAX) {
+				if (program.info.buffers[resource].written) {
+					// Sentinel write ranges end before tables captured by any bound stage.
+					for (const auto* reader: stages) {
+						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
+							if (read_size == 0) continue;
+							if (read_address > address) {
+								size = std::min(size, read_address - address);
+							} else if (address - read_address < read_size) {
+								EXIT("scalar resource reads overlap a shader buffer write\n");
+							}
+						}
+					}
+				} else {
+					const auto& graphics = m_context.GetGraphics();
+					const auto limit = uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+					                   (graphics.StorageMinAlignment() - 1);
+					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
+				}
+			}
+			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		}
 	}
 }
 
@@ -919,8 +943,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
+	FindBuffers(stages);
 	for (auto* stage: stages) {
-		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
 	if (uses_dma) {

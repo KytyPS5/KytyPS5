@@ -121,6 +121,9 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 				event.event = event.pending_events.front();
 				event.pending_events.pop_front();
 				event.triggered = true;
+			} else {
+				// A persistent level is delivered again by the next wait, not this batch.
+				break;
 			}
 
 			if (ret >= num) {

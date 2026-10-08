@@ -248,6 +248,7 @@ void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 
 void Translator::ScalarSelect64(const Decoder::Instruction& inst,
                                  const Decoder::Operand& false_source) {
+	// Preserve per-word expressions for descriptor tracking and mask provenance.
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
 	const auto rhs           = ReadU32Pair(false_source);

@@ -29,15 +29,15 @@ uint32_t Address(EmitterState& s, uint32_t offset) {
 	const auto pair = s.builder.AllocateId();
 	s.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(s, 2), pair, Push(s, offset),
 	                      Push(s, offset + 1));
-	return Unary(s, spv::OpBitcast, TypeScalarU64(s), pair);
+	return Unary(s, spv::OpBitcast, TypeU64(s), pair);
 }
 uint32_t Pointer(EmitterState& s, uint32_t address, uint32_t record, uint32_t word) {
 	const auto offset = Binary(s, spv::OpIAdd, TypeU32(s),
 	                           Binary(s, spv::OpIMul, TypeU32(s), record, ConstantU32(s, 20)),
 	                           ConstantU32(s, word * 4));
 	return Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s),
-	             Binary(s, spv::OpIAdd, TypeScalarU64(s), address,
-	                    Unary(s, spv::OpUConvert, TypeScalarU64(s), offset)));
+	              Binary(s, spv::OpIAdd, TypeU64(s), address,
+	                     Unary(s, spv::OpUConvert, TypeU64(s), offset)));
 }
 uint32_t LoadWord(EmitterState& s, uint32_t pointer) {
 	const auto result = s.builder.AllocateId();

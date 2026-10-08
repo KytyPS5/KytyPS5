@@ -101,7 +101,7 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 
 bool UsesFlattenedSrt(const Program& program) {
 	const auto uses_mapping = [](const auto& resource) {
-		return resource.indirect_search_iterations != 0u;
+		return resource.indirect_root != UINT32_MAX;
 	};
 	return std::ranges::any_of(program.blocks, [](const Block* block) {
 		return std::ranges::any_of(*block, [](const Inst& inst) {

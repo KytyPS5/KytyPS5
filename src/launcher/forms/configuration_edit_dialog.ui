@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>840</width>
+    <width>900</width>
     <height>620</height>
    </rect>
   </property>
@@ -187,6 +187,18 @@
          <widget class="QCheckBox" name="checkBox_hide_cursor">
           <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>
           <property name="text"><string>Auto-hide cursor</string></property>
+         </widget>
+        </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_skip_notice_screen">
+          <property name="toolTip"><string>Skip startup logos and notices in supported games.</string></property>
+          <property name="text"><string>Skip boot logos</string></property>
+         </widget>
+        </item>
+        <item row="10" column="1">
+         <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
+          <property name="toolTip"><string>Can fix missing textures and incorrect transparency in some games. May reduce performance.</string></property>
+          <property name="text"><string>Accurate texture synchronization</string></property>
          </widget>
         </item>
        </layout>
@@ -472,6 +484,13 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
        <property name="text"><string>Reset</string></property>
        <property name="toolTip"><string>Restore default settings</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="settings_button">
+       <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
+       <property name="text"><string>Game Configs</string></property>
+       <property name="toolTip"><string>Import or export game configs</string></property>
       </widget>
      </item>
      <item>

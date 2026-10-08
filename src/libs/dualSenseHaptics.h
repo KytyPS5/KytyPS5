@@ -17,7 +17,8 @@ bool UsesBluetooth(const Stream* stream);
 // (the active pad has no usable controller audio device or its speaker cannot be routed).
 // Ambiguous USB or Bluetooth endpoints are not selected.
 uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames, uint32_t channels,
-               bool is_float, const int* volume, float gain = 1.0f);
+               bool is_float, const int* volume, float gain = 1.0f,
+               const float* gains = nullptr);
 // Returns false for other gamepad types, which retain the normal rumble path.
 bool SetVibration(int controller, uint8_t large_motor, uint8_t small_motor,
                   uint32_t duration_ms = 0xffff);

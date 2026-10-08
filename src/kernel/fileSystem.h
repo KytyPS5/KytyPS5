@@ -59,6 +59,7 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);
+int KYTY_SYSV_ABI     KernelFcntl(int d, int command, int arg);
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes);
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset);

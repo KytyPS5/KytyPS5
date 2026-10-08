@@ -139,8 +139,9 @@ fragment depth in a spare attachment. Depth tests and discard apply to this
 guide. Ambiguous draw identities, resource changes and unrelated color writes
 invalidate coverage; arbitrary post-processing does not propagate scene motion.
 Mesh/tessellation, blending, MSAA, fragment depth/sample-mask exports and occupied
-interfaces retain the estimated path. Position history is bounded at 64 MiB;
-guide images are bounded at 128 MiB.
+interfaces retain the estimated path. Position history is bounded at 64 MiB,
+with at most 8,192 draw identities and 4 MiB of copied keys even without guest
+flips; guide images are bounded at 128 MiB.
 
 Hybrid uses a four-level optical-flow pyramid outside valid geometry coverage.
 Geometry skips that pyramid; uncovered pixels use neutral depth, zero motion

@@ -832,10 +832,6 @@ namespace Net {
 
 LIB_NAME("Net", "Net");
 
-struct NetEtherAddr {
-	uint8_t data[6] = {0};
-};
-
 #if defined(_WIN32)
 using NativeSocket                                  = SOCKET;
 static constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
@@ -992,6 +988,7 @@ static int ConvertHostSocketError(int error) {
 		case WSAENETUNREACH: posix_error = Posix::POSIX_ENETUNREACH; break;
 		case WSAENOTCONN: posix_error = Posix::POSIX_ENOTCONN; break;
 		case WSAENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case WSAENOPROTOOPT: posix_error = Posix::POSIX_ENOPROTOOPT; break;
 		case WSAEOPNOTSUPP: posix_error = Posix::POSIX_EOPNOTSUPP; break;
 		case WSAEPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
 		case WSAESHUTDOWN: posix_error = Posix::POSIX_ESHUTDOWN; break;
@@ -1028,6 +1025,7 @@ static int ConvertHostSocketError(int error) {
 		case ENETUNREACH: posix_error = Posix::POSIX_ENETUNREACH; break;
 		case ENOTCONN: posix_error = Posix::POSIX_ENOTCONN; break;
 		case ENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case ENOPROTOOPT: posix_error = Posix::POSIX_ENOPROTOOPT; break;
 		case EOPNOTSUPP: posix_error = Posix::POSIX_EOPNOTSUPP; break;
 		case EPIPE: posix_error = Posix::POSIX_EPIPE; break;
 		case EPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
@@ -1064,6 +1062,26 @@ static int ConvertFamily(int family) {
 
 static int ConvertSocketOptionLevel(int level) {
 	return (level == 0xffff ? SOL_SOCKET : level);
+}
+
+static int ConvertSocketOptionName(int level, int option) {
+	if (level == 0xffff) {
+		switch (option) {
+			case 0x0020: return SO_BROADCAST;
+			case 0x1001: return SO_SNDBUF;
+			case 0x1002: return SO_RCVBUF;
+			case 0x1007: return SO_ERROR;
+			case 0x1105: return SO_SNDTIMEO;
+			default: break;
+		}
+	} else if (level == 6 && option == 1) {
+		return TCP_NODELAY;
+	}
+#if defined(_WIN32)
+	return option;
+#else
+	return -1;
+#endif
 }
 
 static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
@@ -1542,14 +1560,12 @@ const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32
 int KYTY_SYSV_ABI NetEtherNtostr(const NetEtherAddr* n, char* str, size_t len) {
 	PRINT_NAME();
 
-	NetEtherAddr zero {};
+	if (n == nullptr || str == nullptr || len < 18) {
+		return NET_ERROR_EINVAL;
+	}
 
-	EXIT_NOT_IMPLEMENTED(len != 18);
-	EXIT_NOT_IMPLEMENTED(n == nullptr);
-	EXIT_NOT_IMPLEMENTED(str == nullptr);
-	EXIT_NOT_IMPLEMENTED(memcmp(n->data, zero.data, sizeof(zero.data)) != 0);
-
-	strcpy(str, "00:00:00:00:00:00"); // NOLINT
+	std::snprintf(str, len, "%02x:%02x:%02x:%02x:%02x:%02x", n->data[0], n->data[1],
+	              n->data[2], n->data[3], n->data[4], n->data[5]);
 
 	return OK;
 }
@@ -2149,20 +2165,40 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 		return 0;
 	}
 
-	// Guest socket options: SOL_SOCKET=0xffff, SO_ERROR=0x1007.
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
-#if !defined(_WIN32)
-	if (!socket_error) {
+	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	optname                = ConvertSocketOptionName(level, optname);
+	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
+#if defined(_WIN32)
+	DWORD timeout {};
+#else
+	timeval timeout {};
 #endif
-	if (socket_error) {
-		optname = SO_ERROR;
-	}
 	SocketLength len = static_cast<SocketLength>(*optlen);
-	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(optval),
+	void*        value = optval;
+	if (send_timeout) {
+		if (*optlen < sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		value = &timeout;
+		len   = sizeof(timeout);
+	}
+	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(value),
 	                 &len) != 0) {
 		return SetHostSocketError();
+	}
+	if (send_timeout) {
+#if defined(_WIN32)
+		const int64_t usec = static_cast<int64_t>(timeout) * 1000;
+#else
+		const int64_t usec = static_cast<int64_t>(timeout.tv_sec) * 1'000'000 + timeout.tv_usec;
+#endif
+		const int guest_timeout =
+		    static_cast<int>(std::min<int64_t>(usec, std::numeric_limits<int>::max()));
+		std::memcpy(optval, &guest_timeout, sizeof(guest_timeout));
+		len = sizeof(guest_timeout);
 	}
 	if (socket_error && len >= static_cast<SocketLength>(sizeof(int))) {
 		auto* error = static_cast<int*>(optval);
@@ -2215,6 +2251,18 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 
+#if defined(__linux__)
+	if (level == 0xffff && optname == 0x10000) {
+		if (optlen != sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		int enabled = 0;
+		std::memcpy(&enabled, optval, sizeof(enabled));
+		// Native sends preserve 255.255.255.255 without changing broadcast permission.
+		return enabled != 0 ? 0 : SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
+	}
+#endif
+
 	constexpr int ORBIS_SO_NBIO = 0x1200;
 	if (ConvertSocketOptionLevel(level) == SOL_SOCKET && optname == ORBIS_SO_NBIO &&
 	    optlen >= sizeof(int)) {
@@ -2230,14 +2278,32 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 #endif
 		return failed ? SetHostSocketError() : 0;
 	}
-#if !defined(_WIN32)
-	// Guest TCP options: IPPROTO_TCP=6, TCP_NODELAY=1.
-	if (level != 6 || optname != 1) {
+	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	optname                = ConvertSocketOptionName(level, optname);
+	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
-	level   = IPPROTO_TCP;
-	optname = TCP_NODELAY;
+#if defined(_WIN32)
+	DWORD timeout {};
+#else
+	timeval timeout {};
 #endif
+	if (send_timeout) {
+		if (optlen != sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		int usec = 0;
+		std::memcpy(&usec, optval, sizeof(usec));
+		usec = std::max(usec, 0);
+#if defined(_WIN32)
+		timeout = static_cast<DWORD>((static_cast<int64_t>(usec) + 999) / 1000);
+#else
+		timeout.tv_sec  = usec / 1'000'000;
+		timeout.tv_usec = usec % 1'000'000;
+#endif
+		optval = &timeout;
+		optlen = sizeof(timeout);
+	}
 
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,
 	                 static_cast<const char*>(optval), static_cast<SocketLength>(optlen)) != 0) {
@@ -4037,6 +4103,26 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 	*age = 0;
 
 	// return OK;
+	return np_error_signed_out;
+}
+
+int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_code) {
+	PRINT_NAME();
+
+	LOGF("\t req_id        = %d\n", req_id);
+	LOGF("\t user_id       = %d\n", user_id);
+	LOGF("\t language_code = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(language_code));
+
+	if (req_id <= 0 || language_code == nullptr) {
+		return np_error_invalid_argument;
+	}
+
+	std::lock_guard lock(g_np_request_mutex);
+
+	if (np_get_request_locked(req_id) == nullptr) {
+		return np_error_request_not_found;
+	}
+
 	return np_error_signed_out;
 }
 

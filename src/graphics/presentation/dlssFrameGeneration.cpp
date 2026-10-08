@@ -56,6 +56,7 @@ void DlssFgInputs::Wait(GraphicContext& graphics) {
 		                     "wait for Frame Generation inputs");
 	} else {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
+		Common::LockGuard present_lock(graphics.present_queue_mutex);
 		RequireVulkanSuccess(graphics.device.waitIdle(), "drain Frame Generation inputs");
 	}
 	pending          = false;
@@ -360,9 +361,15 @@ vk::Result DlssFrameGeneration::CreateInstance(const vk::InstanceCreateInfo& inf
 }
 
 bool DlssFrameGeneration::ConfigureDeviceExtensions(
-    std::span<const vk::ExtensionProperties> available, std::vector<const char*>& enabled) {
+    std::span<const vk::ExtensionProperties> available, std::vector<const char*>& enabled,
+    bool private_data) {
 	auto& impl = *m_impl;
 	if (!impl.initialized) return false;
+	if (!private_data) {
+		LOGF("DLSS Frame Generation unavailable: privateData is unsupported; using native Vulkan\n");
+		Shutdown();
+		return false;
+	}
 	const auto present_id = [](const auto& extension) {
 		return std::strcmp(extension.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
 	};

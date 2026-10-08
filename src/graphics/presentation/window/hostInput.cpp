@@ -454,7 +454,7 @@ void HostInputToggleMouseToJoystick() {
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
-bool HostInputWaitEvent(SDL_Event* event) {
+bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	int timeout = -1;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
@@ -473,6 +473,7 @@ bool HostInputWaitEvent(SDL_Event* event) {
 		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
 		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
 	}
+	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);
 
 	if (Config::HideCursorEnabled()) {

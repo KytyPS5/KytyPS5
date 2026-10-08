@@ -722,6 +722,7 @@ void WindowContext::Run() {
 	loop.need_exit = false;
 	loop.paused.store(false, std::memory_order_release);
 
+
 	while (!loop.need_exit) {
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
@@ -731,7 +732,7 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (!HostInputWaitEvent(&loop.event)) {
+		if (!HostInputWaitEvent(&loop.event, 1000)) {
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());

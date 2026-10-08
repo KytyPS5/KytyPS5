@@ -80,5 +80,20 @@ int main(int argc, char** argv) {
 	Check(corrupt.upscale_backend == Configuration::UpscaleBackend::Native &&
 	          corrupt.upscale_motion == Configuration::UpscaleMotion::Hybrid,
 	      "corrupt backend/motion is not reset");
+	Configuration exported;
+	exported.dlss_mode = Configuration::DlssMode::Quality;
+	exported.upscale_backend = Configuration::UpscaleBackend::OptiScaler;
+	exported.upscale_motion = Configuration::UpscaleMotion::Geometry;
+	exported.optiscaler_path = "D:/OptiScaler/OptiScaler.dll";
+	exported.optiscaler_upscaler = Configuration::OptiScalerUpscaler::XeSS;
+	exported.optiscaler_frame_generation = Configuration::OptiScalerFrameGeneration::XeSS;
+	exported.render_scale_percent = 50;
+	exported.dlss_frame_generation = true;
+	exported.frame_generation_frames = 1;
+	Configuration imported;
+	QString error;
+	Check(imported.SetGameSettings(QJsonObject::fromVariantMap(exported.GameSettings()), error) &&
+	          imported.GameSettings() == exported.GameSettings(),
+	      "upscaling settings do not survive game settings export/import");
 	std::puts("DLSS settings tests passed");
 }

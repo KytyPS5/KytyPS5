@@ -866,6 +866,32 @@ void GeometryMotionCase(GraphicContext& graphics, RenderContext& renderer) {
 	      "unbounded guide allocation accepted");
 	Check(motion.PrepareDraw(scheduler.Current(), key, UINT32_MAX, 0, UINT32_MAX)[4] == 0,
 	      "overflowing vertex history allocation accepted");
+	{
+		GeometryMotion bounded(graphics, scheduler);
+		constexpr uint32_t capacity = 64 * 1024 * 1024 / 2 / 20;
+		const std::array<uint64_t, 1> first {1}, second {2}, rejected {3};
+		Check(bounded.PrepareDraw(scheduler.Current(), first, capacity, 0, 1)[4] == capacity &&
+		          bounded.PrepareDraw(scheduler.Current(), second, capacity, 0, 1)[4] == capacity,
+		      "history budget fixture did not allocate its resident draws");
+		Check(bounded.PrepareDraw(scheduler.Current(), rejected, 2, 0, 1)[4] == 0,
+		      "draw history exceeded its GPU budget");
+		Check(bounded.PrepareDraw(scheduler.Current(), first, 1, 0, 1)[4] == 1 &&
+		          bounded.PrepareDraw(scheduler.Current(), rejected, 2, 0, 1)[4] == 2,
+		      "refused draw retained metadata and became ambiguous without a guest flip");
+		std::vector<uint64_t> oversized_key(4 * 1024 * 1024 / sizeof(uint64_t) + 1);
+		Check(bounded.PrepareDraw(scheduler.Current(), oversized_key, 1, 0, 1)[4] == 0,
+		      "unbounded draw identity was retained");
+		std::vector<uint64_t> large_key(4 * 1024 * 1024 / 2 / sizeof(uint64_t) + 1);
+		Check(bounded.PrepareDraw(scheduler.Current(), large_key, 1, 0, 1)[4] == 1,
+		      "bounded draw identity was refused");
+		large_key.back() = 1;
+		Check(bounded.PrepareDraw(scheduler.Current(), large_key, 1, 0, 1)[4] == 0,
+		      "draw identities exceeded their aggregate budget without a guest flip");
+		for (int i = 0; i < 3; ++i) bounded.AdvanceFrame();
+		Check(bounded.PrepareDraw(scheduler.Current(), large_key, 1, 0, 1)[4] == 1,
+		      "retired identities did not release their metadata budget");
+		scheduler.Finish();
+	}
 	for (bool inverted_depth: {false, true})
 		for (bool negative_height: {false, true})
 			for (uint32_t scale: {100u, 50u})
@@ -1704,7 +1730,7 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 	std::puts("Emulator presentation: no adapter, actual GPU pixels, overlay, cached frame, modes "
 	          "and resize passed");
 }
-void FrameGenerationExtensionFallbackCase() {
+void FrameGenerationExtensionFallbackCase(bool missing_private_data = false) {
 	static vk::detail::DynamicLoader loader;
 	const auto native = loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(native);
@@ -1734,18 +1760,20 @@ void FrameGenerationExtensionFallbackCase() {
 	if (std::any_of(available.begin(), available.end(), [](const auto& extension) {
 		    return std::strcmp(extension.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
 	    })) {
-		Check(fg.ConfigureDeviceExtensions(available, enabled), "supported present_id rejected");
-		Check(fg.ConfigureDeviceExtensions(available, enabled) && enabled.size() == 1,
+		Check(fg.ConfigureDeviceExtensions(available, enabled, true), "supported present_id rejected");
+		Check(fg.ConfigureDeviceExtensions(available, enabled, true) && enabled.size() == 1,
 		      "optional present_id was appended more than once");
 	}
 	// Mask the optional capability on the selected physical device. Keep the
 	// real interposer-created instance to exercise native dispatcher restoration.
-	std::erase_if(available, [](const auto& extension) {
-		return std::strcmp(extension.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
-	});
+	if (!missing_private_data) {
+		std::erase_if(available, [](const auto& extension) {
+			return std::strcmp(extension.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
+		});
+	}
 	enabled.clear();
-	Check(!fg.ConfigureDeviceExtensions(available, enabled),
-	      "missing present_id did not fall back");
+	Check(!fg.ConfigureDeviceExtensions(available, enabled, !missing_private_data),
+	      "missing optional FG capability did not fall back");
 	Check(!fg.Hooked() && !fg.Available() && !fg.Enabled() && enabled.empty(),
 	      "unsupported FG left Streamline requirements enabled");
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(native);
@@ -1884,6 +1912,7 @@ int main(int argc, char** argv) {
 	subsystems.Initialize<Log::Lifecycle>();
 	if (fg_extension_fallback) {
 		FrameGenerationExtensionFallbackCase();
+		FrameGenerationExtensionFallbackCase(true);
 		return 0;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--window-title-timing") == 0) {

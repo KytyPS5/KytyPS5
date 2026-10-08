@@ -53,6 +53,8 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x14u, Opcode::S_FF1_I32_B64},
     {0x15u, Opcode::S_FLBIT_I32_B32},
     {0x16u, Opcode::S_FLBIT_I32_B64},
+    {0x19u, Opcode::S_SEXT_I32_I8},
+    {0x1au, Opcode::S_SEXT_I32_I16},
     {0x1bu, Opcode::S_BITSET0_B32},
     {0x1cu, Opcode::S_BITSET0_B64},
     {0x1du, Opcode::S_BITSET1_B32},

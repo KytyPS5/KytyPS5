@@ -11,12 +11,28 @@ constexpr uint32_t PsInputFlatShade  = 0x00000400u;
 
 } // namespace
 
+uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index) {
+	for (uint32_t target = 0; target < 8u; target++) {
+		if (((shader_mask >> (target * 4u)) & 0xfu) == 0u) {
+			continue;
+		}
+		if (export_index == 0u) {
+			return target;
+		}
+		export_index--;
+	}
+	return UINT32_MAX;
+}
+
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input) {
 	return input < info.input_num ? info.interpolator_settings[input] & PsInputOffsetMask : input;
 }
 
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input) {
+	if (info.parameter_mode != ShaderPixelParameterMode::Rectangle) {
+		return ShaderPixelParameterMappedLocation(info, input);
+	}
 	std::array<bool, 32> used_locations {};
 	for (const auto active_input: active_inputs) {
 		used_locations[ShaderPixelParameterMappedLocation(info, active_input)] = true;
@@ -29,8 +45,7 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
 		auto&      location = group_locations[group];
 		if (location == UINT32_MAX) {
 			location = mapped;
-			// Smooth and custom interpolation read the same vertex output. Only
-			// differing flat/smooth rectangle outputs need separate locations.
+			// Rectangle expansion broadcasts flat aliases through separate outputs.
 			if (group_locations[group ^ 1u] != UINT32_MAX) {
 				location = 0;
 				while (location < used_locations.size() && used_locations[location]) {

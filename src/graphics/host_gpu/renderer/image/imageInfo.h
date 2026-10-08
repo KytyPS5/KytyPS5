@@ -390,7 +390,28 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
+	const auto float16 = [](uint32_t value) {
+		const auto sign = (value & 0x8000u) << 16u;
+		const auto exponent = (value >> 10u) & 0x1fu;
+		const auto mantissa = value & 0x3ffu;
+		if (exponent == 0) {
+			return std::copysign(static_cast<float>(mantissa) * 0x1p-24f,
+			                     std::bit_cast<float>(sign));
+		}
+		return std::bit_cast<float>(sign | ((exponent == 31 ? 255u : exponent + 112u) << 23u) |
+		                            (mantissa << 13u));
+	};
 	switch (format) {
+		case vk::Format::eR16G16Sfloat:
+			next.float32[1] = float16(packed >> 16u);
+			[[fallthrough]];
+		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
+		case vk::Format::eR16G16Unorm:
+			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
+			[[fallthrough]];
+		case vk::Format::eR16Unorm:
+			next.float32[0] = static_cast<float>(packed & 0xffffu) / 65535.0f;
+			break;
 		// A single-plane float target carries its clear as raw float bits, the same encoding the
 		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
 		// contents.
@@ -446,6 +467,8 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 // bit pattern, so those fills stay buffer writes.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
+	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
+	    (packed & 0xffffu) != (packed >> 16u)) return false;
 	const auto half = [](uint32_t bits) {
 		const uint32_t exponent = (bits >> 10u) & 0x1fu;
 		const uint32_t mantissa = bits & 0x3ffu;

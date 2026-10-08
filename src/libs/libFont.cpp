@@ -78,6 +78,8 @@ constexpr int SCE_FONT_TEXT_PARSER_RESULT_TERMINATE = 0;
 constexpr int SCE_FONT_TEXT_PARSER_RESULT_ERROR     = -1;
 constexpr int SCE_FONT_WRITING_FORM_HORIZONTAL      = 0x10;
 constexpr int FONT_BITMAP_MAX_DIM                   = 128;
+// TrueType glyphs are rasterized at the requested size; the limit only rejects absurd scales.
+constexpr int FONT_GLYPH_MAX_DIM                    = 4096;
 constexpr int FONT_ERROR_INVALID_PARAMETER          = static_cast<int>(0x80460002u);
 constexpr int FONT_ERROR_INVALID_FONT_HANDLE        = static_cast<int>(0x80460005u);
 constexpr int FONT_ERROR_NO_SUPPORT_CODE            = static_cast<int>(0x80460041u);
@@ -206,7 +208,7 @@ struct FontState {
 	const uint8_t*                                                 ttf_data;
 	uint32_t                                                       ttf_size;
 	bool                                                           has_ttf;
-	std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX_DIM> fallback_image;
+	std::vector<uint8_t>                                           fallback_image;
 	FontTransImage                                                 trans_image;
 };
 
@@ -227,7 +229,7 @@ struct GlyphState {
 	uint32_t                                                       code;
 	int                                                            attribute;
 	FontGlyphMetrics                                               metrics;
-	std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX_DIM> image;
+	std::vector<uint8_t>                                           image;
 	FontTransImage                                                 trans_image;
 };
 
@@ -851,8 +853,8 @@ static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* me
 	return true;
 }
 
-static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX_DIM>* image,
-                           FontTransImage* trans_image, uint32_t code, FontState* font) {
+static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_image, uint32_t code,
+                           FontState* font) {
 	if (image == nullptr || trans_image == nullptr || !ensure_stb_font(font)) {
 		return false;
 	}
@@ -868,12 +870,12 @@ static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP
 	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale_x, scale_y, &x0, &y0,
 	                            &x1, &y1);
 
-	image->fill(0);
-
-	const auto width          = static_cast<uint32_t>(std::clamp(x1 - x0, 0, FONT_BITMAP_MAX_DIM));
-	const auto height         = static_cast<uint32_t>(std::clamp(y1 - y0, 0, FONT_BITMAP_MAX_DIM));
+	const auto width  = static_cast<uint32_t>(std::clamp(x1 - x0, 0, FONT_GLYPH_MAX_DIM));
+	const auto height = static_cast<uint32_t>(std::clamp(y1 - y0, 0, FONT_GLYPH_MAX_DIM));
+	// Keep at least one byte so that blank glyphs still get a valid address.
+	image->assign(std::max<size_t>(static_cast<size_t>(width) * height, 1), 0);
 	trans_image->address      = image->data();
-	trans_image->width_byte   = FONT_BITMAP_MAX_DIM;
+	trans_image->width_byte   = width;
 	trans_image->image_width  = width;
 	trans_image->image_height = height;
 
@@ -882,7 +884,7 @@ static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP
 	}
 
 	stbtt_MakeCodepointBitmap(&font->font_info, image->data(), static_cast<int>(width),
-	                          static_cast<int>(height), FONT_BITMAP_MAX_DIM, scale_x, scale_y,
+	                          static_cast<int>(height), static_cast<int>(width), scale_x, scale_y,
 	                          static_cast<int>(code));
 
 	return true;
@@ -939,8 +941,8 @@ static uint32_t normalize_bitmap_font_code(uint32_t code) {
 	return static_cast<uint32_t>('?');
 }
 
-static void init_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX_DIM>* image,
-                       FontTransImage* trans_image, uint32_t code, const FontState* font) {
+static void init_image(std::vector<uint8_t>* image, FontTransImage* trans_image, uint32_t code,
+                       const FontState* font) {
 	EXIT_NOT_IMPLEMENTED(image == nullptr);
 	EXIT_NOT_IMPLEMENTED(trans_image == nullptr);
 
@@ -948,11 +950,11 @@ static void init_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX
 		return;
 	}
 
-	image->fill(0);
 	code = normalize_bitmap_font_code(code);
 
 	const auto width  = static_cast<uint32_t>(scaled_font_width(font));
 	const auto height = static_cast<uint32_t>(scaled_font_height(font));
+	image->assign(static_cast<size_t>(width) * height, 0);
 #if LIBAVUTIL_VERSION_MAJOR < 61
 	const auto* vga_font = avpriv_vga16_font;
 #else
@@ -965,13 +967,13 @@ static void init_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX
 		for (uint32_t x = 0; x < width; x++) {
 			const uint32_t src_x = std::min<uint32_t>((x * 8u) / width, 7u);
 			if ((row & (0x80u >> src_x)) != 0) {
-				(*image)[y * FONT_BITMAP_MAX_DIM + x] = 0xff;
+				(*image)[y * width + x] = 0xff;
 			}
 		}
 	}
 
 	trans_image->address      = image->data();
-	trans_image->width_byte   = FONT_BITMAP_MAX_DIM;
+	trans_image->width_byte   = width;
 	trans_image->image_width  = width;
 	trans_image->image_height = height;
 }

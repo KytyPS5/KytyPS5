@@ -39,7 +39,7 @@ public:
 	// Negotiate optional FG requirements after selecting the physical device.
 	// False retires Streamline; restore the native dispatcher before device creation.
 	bool               ConfigureDeviceExtensions(std::span<const vk::ExtensionProperties> available,
-	                                             std::vector<const char*>&                enabled);
+	                                             std::vector<const char*>& enabled, bool private_data);
 	void               OnDevice(GraphicContext& graphics);
 	[[nodiscard]] bool Available() const;
 	[[nodiscard]] bool Hooked() const;

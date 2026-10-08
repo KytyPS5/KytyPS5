@@ -1,11 +1,14 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -193,6 +196,243 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 		}
 	}
 	return false;
+}
+
+// Exact sets of the few values an integer can take. M0-relative VGPR moves compare
+// M0 with every register index; a set proves most of those comparisons unreachable.
+constexpr size_t   MaxPossibleValues   = 64;
+constexpr size_t   MaxPossiblePairs    = 1024;
+constexpr uint32_t MaxPossibleBitWidth = 6;
+constexpr uint32_t PossibleValueDepth  = 8;
+constexpr uint32_t PossibleValueBudget = 48;
+
+using PossibleValues = std::optional<std::vector<uint32_t>>;
+
+PossibleValues MakePossibleValues(std::vector<uint32_t> values) {
+	std::ranges::sort(values);
+	values.erase(std::ranges::unique(values).begin(), values.end());
+	if (values.size() > MaxPossibleValues) {
+		return std::nullopt;
+	}
+	return values;
+}
+
+PossibleValues EnumerateSubmasks(uint32_t mask) {
+	if (std::popcount(mask) > static_cast<int>(MaxPossibleBitWidth)) {
+		return std::nullopt;
+	}
+	std::vector<uint32_t> values;
+	for (uint32_t bits = mask;; bits = (bits - 1u) & mask) {
+		values.push_back(bits);
+		if (bits == 0u) break;
+	}
+	return MakePossibleValues(std::move(values));
+}
+
+template <typename Function>
+PossibleValues CombinePossibleValues(const PossibleValues& lhs, const PossibleValues& rhs,
+                                     Function function) {
+	if (!lhs || !rhs || lhs->size() * rhs->size() > MaxPossiblePairs) {
+		return std::nullopt;
+	}
+	std::vector<uint32_t> values;
+	values.reserve(lhs->size() * rhs->size());
+	for (const auto a: *lhs) {
+		for (const auto b: *rhs) {
+			values.push_back(function(a, b));
+		}
+	}
+	return MakePossibleValues(std::move(values));
+}
+
+PossibleValues UnitePossibleValues(const PossibleValues& lhs, const PossibleValues& rhs) {
+	if (!lhs || !rhs) {
+		return std::nullopt;
+	}
+	auto values = *lhs;
+	values.insert(values.end(), rhs->begin(), rhs->end());
+	return MakePossibleValues(std::move(values));
+}
+
+// Follows the same operand semantics as the folds below. Loops terminate through the
+// depth limit, which leaves any cyclic value unknown.
+PossibleValues PossibleU32(Value value, uint32_t depth, uint32_t& budget) {
+	value = value.Resolve();
+	if (IsImmediate(value, Type::U32)) {
+		return std::vector<uint32_t> {value.U32()};
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth == 0u || budget == 0u) {
+		return std::nullopt;
+	}
+	budget--;
+	const auto operand = [&](size_t index) {
+		return PossibleU32(inst->Arg(index), depth - 1u, budget);
+	};
+	const auto binary = [&](auto function) {
+		const auto lhs = operand(0);
+		return lhs ? CombinePossibleValues(lhs, operand(1), function) : std::nullopt;
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::IAdd32: return binary([](uint32_t a, uint32_t b) { return a + b; });
+		case ValueOpcode::ISub32: return binary([](uint32_t a, uint32_t b) { return a - b; });
+		case ValueOpcode::IMul32: return binary([](uint32_t a, uint32_t b) { return a * b; });
+		case ValueOpcode::ShiftLeftLogical32:
+			return binary([](uint32_t a, uint32_t b) { return a << (b & 31u); });
+		case ValueOpcode::ShiftRightLogical32:
+			return binary([](uint32_t a, uint32_t b) { return a >> (b & 31u); });
+		case ValueOpcode::BitwiseOr32: return binary([](uint32_t a, uint32_t b) { return a | b; });
+		case ValueOpcode::BitwiseXor32: return binary([](uint32_t a, uint32_t b) { return a ^ b; });
+		case ValueOpcode::UMin32:
+			return binary([](uint32_t a, uint32_t b) { return std::min(a, b); });
+		case ValueOpcode::UMax32:
+			return binary([](uint32_t a, uint32_t b) { return std::max(a, b); });
+		case ValueOpcode::BitwiseAnd32: {
+			const auto lhs = operand(0);
+			const auto rhs = operand(1);
+			if (lhs && rhs) {
+				return CombinePossibleValues(lhs, rhs,
+				                             [](uint32_t a, uint32_t b) { return a & b; });
+			}
+			const auto& known = lhs ? lhs : rhs;
+			if (!known) {
+				return std::nullopt;
+			}
+			uint32_t mask = 0;
+			for (const auto bits: *known) {
+				mask |= bits;
+			}
+			return EnumerateSubmasks(mask);
+		}
+		case ValueOpcode::BitFieldUExtract: {
+			const auto offset = Arg(*inst, 1);
+			const auto count  = Arg(*inst, 2);
+			if (!IsImmediate(offset, Type::U32) || !IsImmediate(count, Type::U32) ||
+			    offset.U32() > 32u || count.U32() > 32u - offset.U32()) {
+				return std::nullopt;
+			}
+			if (count.U32() == 0u) {
+				return std::vector<uint32_t> {0u};
+			}
+			const auto mask = count.U32() == 32u ? UINT32_MAX : (uint32_t {1} << count.U32()) - 1u;
+			if (const auto source = operand(0)) {
+				std::vector<uint32_t> values;
+				values.reserve(source->size());
+				for (const auto bits: *source) {
+					values.push_back((bits >> offset.U32()) & mask);
+				}
+				return MakePossibleValues(std::move(values));
+			}
+			return EnumerateSubmasks(mask);
+		}
+		case ValueOpcode::SelectU32: {
+			const auto condition = Arg(*inst, 0);
+			if (IsImmediate(condition, Type::U1)) {
+				return operand(condition.U1() ? 1u : 2u);
+			}
+			const auto true_values = operand(1);
+			return true_values ? UnitePossibleValues(true_values, operand(2)) : std::nullopt;
+		}
+		case ValueOpcode::Phi: {
+			if (inst->GetType() != Type::U32 || inst->NumArgs() == 0u) {
+				return std::nullopt;
+			}
+			PossibleValues values = std::vector<uint32_t> {};
+			for (size_t index = 0; index < inst->NumArgs() && values; index++) {
+				values = UnitePossibleValues(values, operand(index));
+			}
+			return values;
+		}
+		default: return std::nullopt;
+	}
+}
+
+// Bits that are zero in every value an integer can take. When M0 is a scaled loop counter, its
+// possible values are unbounded but its low bits are known, which still rules out most
+// register indices.
+uint32_t KnownZeroU32(Value value, uint32_t depth, uint32_t& budget) {
+	value = value.Resolve();
+	if (IsImmediate(value, Type::U32)) {
+		return ~value.U32();
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth == 0u || budget == 0u) {
+		return 0u;
+	}
+	budget--;
+	const auto operand = [&](size_t index) {
+		return KnownZeroU32(inst->Arg(index), depth - 1u, budget);
+	};
+	const auto low_zeros = [](uint32_t known_zero) {
+		return static_cast<uint32_t>(std::countr_one(known_zero));
+	};
+	const auto low_mask = [](uint32_t bits) {
+		return bits >= 32u ? UINT32_MAX : (uint32_t {1} << bits) - 1u;
+	};
+	const auto shift = [&]() -> std::optional<uint32_t> {
+		const auto amount = Arg(*inst, 1);
+		if (!IsImmediate(amount, Type::U32)) {
+			return std::nullopt;
+		}
+		return amount.U32() & 31u;
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::BitwiseAnd32: return operand(0) | operand(1);
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32: return operand(0) & operand(1);
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::ISub32:
+			return low_mask(std::min(low_zeros(operand(0)), low_zeros(operand(1))));
+		case ValueOpcode::IMul32: return low_mask(low_zeros(operand(0)) + low_zeros(operand(1)));
+		case ValueOpcode::ShiftLeftLogical32: {
+			const auto amount = shift();
+			return amount ? (operand(0) << *amount) | low_mask(*amount) : 0u;
+		}
+		case ValueOpcode::ShiftRightLogical32: {
+			const auto amount = shift();
+			return amount ? (operand(0) >> *amount) | ~(UINT32_MAX >> *amount) : 0u;
+		}
+		case ValueOpcode::ReadFirstLane: return operand(0);
+		case ValueOpcode::SelectU32: return operand(1) & operand(2);
+		case ValueOpcode::Phi: {
+			if (inst->GetType() != Type::U32 || inst->NumArgs() == 0u) {
+				return 0u;
+			}
+			uint32_t known_zero = UINT32_MAX;
+			for (size_t index = 0; index < inst->NumArgs() && known_zero != 0u; index++) {
+				known_zero &= operand(index);
+			}
+			return known_zero;
+		}
+		default: return 0u;
+	}
+}
+
+bool FoldUnreachableEquality(Inst& inst, bool equal) {
+	auto value     = Arg(inst, 0);
+	auto immediate = Arg(inst, 1);
+	if (IsImmediate(value, Type::U32)) {
+		std::swap(value, immediate);
+	}
+	if (!IsImmediate(immediate, Type::U32) || value.IsImmediate()) {
+		return false;
+	}
+	uint32_t   budget = PossibleValueBudget;
+	const auto values = PossibleU32(value, PossibleValueDepth, budget);
+	if (!values) {
+		budget = PossibleValueBudget;
+		if ((KnownZeroU32(value, PossibleValueDepth, budget) & immediate.U32()) == 0u) {
+			return false;
+		}
+		Replace(inst, Value(!equal));
+		return true;
+	}
+	const bool reachable = std::ranges::binary_search(*values, immediate.U32());
+	if (reachable && values->size() != 1u) {
+		return false;
+	}
+	Replace(inst, Value(reachable == equal));
+	return true;
 }
 
 void FoldInstruction(Block& block, Block::iterator instruction,
@@ -559,10 +799,14 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });
 			return;
 		case ValueOpcode::IEqual32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a == b; });
+			if (!FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a == b; })) {
+				FoldUnreachableEquality(inst, true);
+			}
 			return;
 		case ValueOpcode::INotEqual32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a != b; });
+			if (!FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a != b; })) {
+				FoldUnreachableEquality(inst, false);
+			}
 			return;
 		case ValueOpcode::ULessThan32:
 			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a < b; });

@@ -36774,6 +36774,92 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// A bounded DWORD fill: index = group * 64 + lane, value = pattern[index % period].
+// The four stores have mutually exclusive EXEC masks; period one always selects s4.
+std::vector<u32> DwordPatternFillCode() {
+  return {
+    0xbfa00003u, 0xd7460002u, 0x04010c0au, 0x7da80408u, 0xbf88003fu, 0x7e000c09u,
+    0xbf070980u, 0x858a807eu, 0x7e005700u, 0x100000ffu, 0x4f800000u, 0x7e060f00u,
+    0xd5766a00u, 0x02020609u, 0x7d8a0280u, 0x4c020080u, 0x02000101u, 0xd56a0001u,
+    0x00020700u, 0x4c000303u, 0x4a020303u, 0x02000101u, 0xd56a0000u, 0x00020500u,
+    0xd5690001u, 0x00020009u, 0x4c060302u, 0x7d8c02f9u, 0x06068c02u, 0x7d860609u,
+    0x87ea6a0cu, 0x50000080u, 0xd5286a00u, 0x003200c1u, 0xd5010000u, 0x002a00c1u,
+    0xd5690000u, 0x00020009u, 0x4c000102u, 0x7d0a0080u, 0xbe88246au, 0xbf880015u,
+    0x7d0a0081u, 0xbe8a246au, 0xbf88000cu, 0x7d0a0082u, 0xbeea246au, 0xbf880003u,
+    0x7e000207u, 0xe0102000u, 0x80000002u, 0x8afe7e6au, 0xbf880003u, 0x7e000206u,
+    0xe0102000u, 0x80000002u, 0xbefe046au, 0x8afe7e0au, 0xbf880003u, 0x7e000205u,
+    0xe0102000u, 0x80000002u, 0xbefe040au, 0x8afe7e08u, 0xbf880003u, 0x7e000204u,
+    0xe0102000u, 0x80000002u, 0xbf810000u,
+  };
+}
+
+TestCase DwordPatternFill(uint32_t period) {
+  TestCase test;
+  test.name = period == 1 ? "DwordPatternFillUniform" : "DwordPatternFillVarying";
+  test.code = DwordPatternFillCode();
+  test.initial.resize(128, 0xdeadbeefu);
+  test.has_user_data = true;
+  test.user_data[0] = 0x10000u;
+  test.user_data[1] = 4u << 16u;
+  test.user_data[2] = 128;
+  test.user_data[3] = (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | DstSel(4, 5, 6, 7);
+  test.user_data[4] = 0xff000000u;
+  test.user_data[5] = 0x11223344u;
+  test.user_data[6] = 0x55667788u;
+  test.user_data[7] = 0x99aabbccu;
+  test.user_data[8] = 128;
+  test.user_data[9] = period;
+  for (uint32_t i = 0; i < 128; ++i) test.expected.push_back(test.user_data[4 + i % period]);
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 10;
+  test.compute_info.group_id[0] = true;
+  test.dispatch_x = 2;
+  return test;
+}
+
+void CheckDwordPatternFillRuntimeShape() {
+  auto test = DwordPatternFill(1);
+  auto compiled = CompileCase(test);
+  auto program = std::move(compiled.program).TakeCompiledInfo();
+  auto &input = test.compute_info;
+  input.stage = {.program = &program, .resources = &compiled.resources};
+  ShaderBufferResource descriptor;
+  uint32_t clear = 0;
+  uint64_t size = 0;
+  const auto resolves = [&](uint32_t groups = 2, uint32_t mode = 0x41u) {
+    return ResolveComputeBufferFill(input, groups, 1, 1, mode, descriptor, clear, size);
+  };
+  Require(test.name, "complete period-one fill", resolves() && clear == 0xff000000u && size == 512,
+          "a complete bounded DWORD fill was not recognized");
+  Require(test.name, "partial dispatch", !resolves(1), "a partial fill became a full clear");
+  Require(test.name, "extra dispatch", !resolves(3), "an oversized dispatch was accepted");
+  Require(test.name, "dispatch modifiers", !resolves(2, 0x61u), "thread dimensions bypassed coverage checks");
+  compiled.resources.user_data[9] = 4;
+  Require(test.name, "varying pattern", !resolves(), "a four-word pattern became one DWORD clear");
+  compiled.resources.user_data[9] = 0;
+  Require(test.name, "zero divisor", !resolves(), "a zero-period pattern became a clear");
+  compiled.resources.user_data[9] = 1;
+  compiled.resources.user_data[8] = 64;
+  Require(test.name, "guest bound", !resolves(), "the guest's narrower write bound was ignored");
+  compiled.resources.user_data[8] = 128;
+  input.workgroup_register = 8;
+  Require(test.name, "workgroup register", !resolves(), "a different group register was accepted");
+  input.workgroup_register = 10;
+  compiled.resources.user_data[4] = 0x44332211u;
+  Require(test.name, "refreshed clear", resolves() && clear == 0x44332211u,
+          "the clear retained a stale runtime value");
+  test.code[65] = EncodeVop1(0x01u, 0, 5); // The period-one arm now writes s5.
+  auto changed = CompileCase(test);
+  auto changed_program = std::move(changed.program).TakeCompiledInfo();
+  input.stage = {.program = &changed_program, .resources = &changed.resources};
+  Require(test.name, "changed shader", !resolves(), "modified store semantics retained the optimization");
+  std::printf("[host]    %-32s ok\n", "DwordPatternFillRuntimeShape");
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -42448,6 +42534,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorMetadataClear();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dword-pattern-clear-host-only") == 0) {
+    CheckDwordPatternFillRuntimeShape();
+    CheckPs5GameExampleImageClearRuntimeShape();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dword-pattern-clear-only") == 0) {
+    CheckDwordPatternFillRuntimeShape();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DwordPatternFill(1));
+    RunCase(&vulkan, DwordPatternFill(4));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {

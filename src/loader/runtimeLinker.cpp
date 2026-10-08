@@ -1678,10 +1678,14 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #endif
 	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
 
-	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
+	const uint64_t instruction_trampoline_size = is_shared
+	    ? std::clamp<uint64_t>(AlignUp(program->base_size_aligned / 4u, 4096u),
+	                           8u * 1024u * 1024u, 32u * 1024u * 1024u)
+	    : std::clamp<uint64_t>(AlignUp(program->base_size_aligned / 4u, 4096u),
+	                           32u * 1024u * 1024u, 128u * 1024u * 1024u);
 	if (patch_guest_instructions) {
-		EXIT_IF(INSTRUCTION_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
-		program->mapped_size += INSTRUCTION_TRAMPOLINE_SIZE;
+		EXIT_IF(instruction_trampoline_size > UINT64_MAX - program->mapped_size);
+		program->mapped_size += instruction_trampoline_size;
 	}
 
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
@@ -1691,7 +1695,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
-		program->instruction_trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE;
+		program->instruction_trampoline_size = instruction_trampoline_size;
 		RegisterGuestInstructionPatchModule(
 		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
 		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);

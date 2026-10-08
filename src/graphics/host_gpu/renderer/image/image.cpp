@@ -45,7 +45,13 @@ namespace {
 	}
 	if (info.type == Prospero::ImageType::kColor2D && info.resources.layers >= 6 &&
 	    info.extent.width == info.extent.height) {
-		flags |= vk::ImageCreateFlagBits::eCubeCompatible;
+		const auto probe_usage = vk::ImageUsageFlagBits::eSampled;
+		if (graphics.GetImageFormatProperties(info.pixel_format, vk::ImageType::e2D,
+		                                      vk::ImageTiling::eOptimal, probe_usage,
+		                                      flags | vk::ImageCreateFlagBits::eCubeCompatible,
+		                                      nullptr) == vk::Result::eSuccess) {
+			flags |= vk::ImageCreateFlagBits::eCubeCompatible;
+		}
 	}
 	return flags;
 }
@@ -718,6 +724,17 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	                                      create.usage, create.flags,
 	                                      &properties) != vk::Result::eSuccess ||
 	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
+		if (create.flags & vk::ImageCreateFlagBits::eCubeCompatible) {
+			const auto fallback_flags = create.flags & ~vk::ImageCreateFlagBits::eCubeCompatible;
+			if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+			                                      create.usage, fallback_flags,
+			                                      &properties) == vk::Result::eSuccess &&
+			    static_cast<bool>(properties.sampleCounts & create.samples)) {
+				create.flags = fallback_flags;
+			}
+		}
+	}
+	if (!static_cast<bool>(properties.sampleCounts & create.samples)) {
 		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),

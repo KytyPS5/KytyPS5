@@ -160,7 +160,8 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 			           z.depth_view.slice_max);
 	}
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
-	if (z.z_info.max_mip_level != 0 ||
+	if (z.z_info.partially_resident ||
+	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
 	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
 	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
 		DepthFatal("unsupported depth register state");
@@ -176,9 +177,6 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (has_htile) {
 		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
 			DepthFatal("invalid HTile metadata address");
-		}
-		if (z.depth_view.slice_max >= 32) {
-			DepthFatal("HTile clear tracking supports at most 32 slices");
 		}
 	}
 	if (!z.size.valid) {
@@ -198,6 +196,18 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (format == vk::Format::eUndefined) {
 		DepthFatal("no host depth/stencil format supports required usage for %s",
 		           vk::to_string(ideal_format).c_str());
+	}
+	const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+	vk::ImageFormatProperties format_properties {};
+	if (view.image_layers == 0 || view.layer_count == 0 ||
+	    view.image_layers > limits.maxImageArrayLayers ||
+	    view.layer_count > limits.maxFramebufferLayers ||
+	    buffer.GetGraphics().GetImageFormatProperties(
+	        format, vk::ImageType::e2D, vk::ImageTiling::eOptimal, DepthTargetImageUsage(),
+	        vk::ImageCreateFlags {}, &format_properties) != vk::Result::eSuccess ||
+	    view.image_layers > format_properties.maxArrayLayers) {
+		DepthFatal("depth view exceeds host array-layer limits: base=%u last=%u",
+		           z.depth_view.slice_start, z.depth_view.slice_max);
 	}
 	const auto     guest_format = policy->guest_format;
 	const uint32_t bytes        = policy->bytes_per_element;
@@ -315,6 +325,8 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
+	r.depth_min_bounds         = hw.GetDepthBoundsMin();
+	r.depth_max_bounds         = hw.GetDepthBoundsMax();
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;

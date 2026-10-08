@@ -114,6 +114,12 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Like TryReadGpuCleanBacking, but drains GPU-dirty buffer bytes on the GPU
+// thread before reading. Texture-modified ranges remain rejected.
+bool                   TryReadGpuCoherentBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

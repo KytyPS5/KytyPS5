@@ -1,17 +1,14 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
 bool IsExecOrVcc(const Decoder::Operand& operand) {
-	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-		case Decoder::OperandKind::ExecHi:
-		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi: return true;
-		default: return false;
-	}
+ using K = Decoder::OperandKind;
+ return operand.kind == K::ExecLo || operand.kind == K::ExecHi ||
+        operand.kind == K::VccLo || operand.kind == K::VccHi;
 }
 
 Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
@@ -181,12 +178,8 @@ void Translator::EmitControlNop() {
 	ir.Emit(IR::ValueOpcode::ControlNop);
 }
 
-void Translator::S_WAITCNT_VSCNT(const Decoder::Instruction& inst) {
-	const auto count = inst.src1.value & 63u;
-	if (inst.src0.kind != Decoder::OperandKind::Null || (count != 0u && count != 63u)) {
-		EXIT("unsupported partial or register-based S_WAITCNT_VSCNT at 0x%08x", inst.pc);
-	}
-	if (count == 0u) ir.Emit(IR::ValueOpcode::StoreCompletion);
+void Translator::EmitWaitcnt() {
+	ir.Emit(IR::ValueOpcode::Waitcnt);
 }
 
 void Translator::S_BARRIER() {
@@ -248,7 +241,6 @@ void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 
 void Translator::ScalarSelect64(const Decoder::Instruction& inst,
                                  const Decoder::Operand& false_source) {
-	// Preserve per-word expressions for descriptor tracking and mask provenance.
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
 	const auto rhs           = ReadU32Pair(false_source);
@@ -257,14 +249,13 @@ void Translator::ScalarSelect64(const Decoder::Instruction& inst,
 	const auto selected_mask_valid =
 	    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1,
 	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(false_source)}));
+	if (IsExecOrVcc(inst.dst)) {
+		WriteMask(inst.dst, selected_mask, true);
+		return;
+	}
 	WriteU32Pair(inst.dst,
 	             {ir.Select(condition, lhs[0], rhs[0]), ir.Select(condition, lhs[1], rhs[1])});
-	// Scalar selects preserve the raw pair even when EXEC/VCC holds an address.
-	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
-		ir.SetExec(selected_mask);
-	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
-		ir.SetVcc(selected_mask);
-	} else if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
 		ir.SetThreadBitScalarReg(dst, selected_mask);
 		ir.SetScalarMaskTag(dst, selected_mask_valid);

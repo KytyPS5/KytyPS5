@@ -10,12 +10,17 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
 
 class Presenter;
 class RenderContext;
+
+// Records a copy of a prepared presentation image into a host readback buffer.
+void RecordPreparedFrameReadback(vk::CommandBuffer command, VulkanImage& image,
+                                 vk::Buffer download, vk::Extent3D extent);
 
 struct SurfaceCapabilities {
 	vk::SurfaceCapabilitiesKHR        capabilities {};
@@ -44,7 +49,8 @@ struct WindowContext {
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
 	void UpdateTitle(uint64_t frame_num, double current_fps);
-	void                                                    Resize(int width, int height);
+	void ApplyPendingTitle();
+	void Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
 	void ProcessEvent(double time_seconds);
@@ -59,6 +65,9 @@ struct WindowContext {
 	WindowLoopState                loop;
 
 	Common::Mutex mutex;
+	Common::Mutex title_mutex;
+	std::string   pending_title;
+	bool          title_dirty = false;
 };
 
 } // namespace Libs::Graphics

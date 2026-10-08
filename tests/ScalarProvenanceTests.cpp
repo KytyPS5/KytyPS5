@@ -72,16 +72,18 @@ struct Fixture {
     return static_cast<uint32_t>(program.memory_info.size() - 1u);
   }
 
-  void Plan() { TrackResources(program, {}, {}); }
+  void Plan() { BuildSrtPlan(program); }
 };
 
 struct TestMemory {
   std::unordered_map<uint64_t, uint32_t> words;
   uint32_t reads = 0;
+  uint32_t attempts = 0;
 };
 
 bool ReadMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
   auto &memory = *static_cast<TestMemory *>(userdata);
+  memory.attempts++;
   for (auto &value : values) {
     const auto it = memory.words.find(address);
     if (it == memory.words.end()) return false;
@@ -101,6 +103,41 @@ Value RawRead(Fixture &fixture, Value address, Value offset, uint32_t memory,
   return fixture.EmitMemory(ValueOpcode::LoadAddressU32,
                             {address, offset, Value(0u), Value(true)}, memory,
                             0x80, block);
+}
+
+void TestDeferredFlatSlotSkipsEagerEvaluation() {
+  // Yōtei CS 8457901d: expression slots marked FlatSlotDeferred depend on
+  // ReadBoundedSrtU32 and must not be eagerly walked (GPU-selected addresses).
+  Fixture fixture;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x20);
+  fixture.program.memory_info[memory].planning_only = true;
+  const auto read = RawRead(
+      fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
+  fixture.Emit(ValueOpcode::GetBufferResource,
+               {read, Value(0u), Value(16u), Value(0u)});
+  fixture.Plan();
+  Check(!fixture.program.srt_reads.empty(),
+        "deferred flat slot fixture lost its planning SRT read");
+
+  fixture.program.clean_flat_slots.assign(fixture.program.srt_reads.size(), 0u);
+  fixture.program.clean_flat_slots[0] =
+      Libs::Graphics::ShaderRecompiler::IR::ResourcePlan::FlatSlotDeferred;
+
+  uint32_t rejected = 0;
+  const auto reject = [](void *userdata, uint64_t, std::span<uint32_t>) {
+    ++*static_cast<uint32_t *>(userdata);
+    return false;
+  };
+  SrtRuntime runtime{.read_memory = reject,
+                     .userdata = &rejected,
+                     .read_specialization_memory = reject};
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(fixture.program, runtime, fixture.program.clean_flat_slots)
+            .RefreshFlatBuffer(flat),
+        "deferred flat slot was eagerly evaluated during RefreshFlatBuffer");
+  Check(rejected == 0u, "deferred flat slot still attempted a guest memory read");
+  Check(flat.size() == fixture.program.srt_reads.size() && flat[0] == 0u,
+        "deferred flat slot was not left as a zero placeholder");
 }
 
 void LoadBuffer(Fixture &fixture, std::array<Value, 4> words) {
@@ -187,6 +224,29 @@ void TestDynamicReadRemainsTyped() {
             read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 &&
             !fixture.program.memory_info[memory].planning_only,
         "dynamic scalar read received a fake flattened slot");
+}
+
+void TestOrdinaryScalarPayloadRemainsGuestRead() {
+  for (const bool descriptor : {false, true}) {
+    Fixture fixture;
+    const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
+    const auto read = RawRead(fixture, Address(fixture, Value(0u), Value(0u)),
+                             Value(0u), memory);
+    if (descriptor) LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+    else fixture.Emit(ValueOpcode::ReferenceU32, {read});
+    Libs::Graphics::ShaderRecompiler::Decoder::Program decoded;
+    decoded.instructions.emplace_back();
+    decoded.instructions.back().opcode = Libs::Graphics::ShaderRecompiler::Decoder::Opcode::S_ENDPGM;
+    TrackResources(fixture.program, decoded, {});
+    if (descriptor) {
+      Check(fixture.program.srt_reads.size() == 1u && fixture.program.memory_info[memory].planning_only,
+            "descriptor scalar dependency lost its host resource slot");
+    } else {
+      Check(fixture.program.srt_reads.empty() && !fixture.program.memory_info[memory].planning_only &&
+                read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32,
+            "ordinary scalar payload was hoisted into an eager host resource read");
+    }
+  }
 }
 
 void TestNestedSrtWalk() {
@@ -548,11 +608,13 @@ void TestConstantBufferBounds() {
     uint32_t immediate;
     bool valid;
     uint32_t expected;
+    uint32_t expected_attempts;
   };
-  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u},
-                           Case{3u, 1u, true, 0x12345678u},
-                           Case{0xfffffffcu, 4u, false, 0u},
-                           Case{16u, 0u, false, 0u}}) {
+  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u, 1u},
+                           Case{3u, 1u, true, 0x12345678u, 1u},
+                           Case{0xfffffffcu, 4u, true, 0u, 0u},
+                           Case{16u, 0u, true, 0u, 0u},
+                           Case{4u, 0u, false, 0u, 1u}}) {
     Fixture fixture;
     const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, test.immediate);
     const auto buffer =
@@ -568,7 +630,10 @@ void TestConstantBufferBounds() {
     std::vector<uint32_t> flat;
     Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) == test.valid,
           "constant-buffer walk misaligned or wrapped its offset components");
-    Check(test.valid ? flat == std::vector<uint32_t>{test.expected} : memory_image.reads == 0,
+    // Match the already-proved scalar-buffer contract: descriptor OOB is a known
+    // zero without a memory probe; an unavailable in-bounds DWORD must still fail.
+    Check((!test.valid || flat == std::vector<uint32_t>{test.expected}) &&
+              memory_image.attempts == test.expected_attempts,
           "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
   }
 }
@@ -714,6 +779,8 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   try {
+    TestOrdinaryScalarPayloadRemainsGuestRead();
+    TestDeferredFlatSlotSkipsEagerEvaluation();
     TestImmediateFlatteningAndGvn();
     TestRawScalarComponentAlignment();
     TestScalarMemoryDomainMismatchFails();

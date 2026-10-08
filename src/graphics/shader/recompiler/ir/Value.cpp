@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
-#include <memory>
+#include <limits>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -23,6 +23,10 @@ Value Value::F16(uint16_t bits) {
 
 Value Value::F32(float value) {
 	return Value(Type::F32, std::bit_cast<uint32_t>(value));
+}
+
+Value Value::F64(uint64_t bits) {
+	return Value(Type::F64, bits);
 }
 
 bool Value::IsEmpty() const {
@@ -114,6 +118,11 @@ float Value::F32Value() const {
 	return std::bit_cast<float>(imm_u32);
 }
 
+uint64_t Value::F64Bits() const {
+	EXIT_IF(type != Type::F64);
+	return imm_u64;
+}
+
 bool Value::operator==(const Value& other) const {
 	if (type != other.type) {
 		return false;
@@ -129,22 +138,17 @@ bool Value::operator==(const Value& other) const {
 		case Type::F16: return imm_u16 == other.imm_u16;
 		case Type::U32:
 		case Type::F32: return imm_u32 == other.imm_u32;
-		case Type::U64: return imm_u64 == other.imm_u64;
+		case Type::U64:
+		case Type::F64: return imm_u64 == other.imm_u64;
 		default: return false;
 	}
 }
 
 Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
-    : opcode(value_opcode),
-      num_args(value_opcode == ValueOpcode::Phi ? PhiArity
-                                               : static_cast<uint8_t>(NumArgsOf(value_opcode))),
-      flags(value_flags) {
-	if (num_args == PhiArity) {
-		std::destroy_at(&fixed_args);
-		std::construct_at(&phi_args);
-	} else if (num_args > InlineArity) {
-		std::destroy_at(&fixed_args);
-		std::construct_at(&large_args, num_args);
+    : opcode(value_opcode), flags(value_flags) {
+	const auto count = NumArgsOf(opcode);
+	if (count != std::numeric_limits<size_t>::max()) {
+		args.resize(count);
 	}
 }
 
@@ -160,8 +164,8 @@ Type Inst::GetType() const {
 	if (opcode == ValueOpcode::Phi) {
 		return static_cast<Type>(flags);
 	}
-	if (opcode == ValueOpcode::Identity && num_args != 0) {
-		return Arg(0).GetType();
+	if (opcode == ValueOpcode::Identity && !args.empty()) {
+		return args.front().GetType();
 	}
 	return TypeOf(opcode);
 }
@@ -179,24 +183,21 @@ size_t Inst::UseCount() const {
 }
 
 size_t Inst::NumArgs() const {
-	return num_args == PhiArity ? phi_args.size() : num_args;
+	return args.size();
 }
 
 size_t Inst::NumPhiBlocks() const {
-	return num_args == PhiArity ? phi_args.size() : 0;
+	return phi_blocks.size();
 }
 
 Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= NumArgs());
-	if (num_args <= InlineArity) {
-		return fixed_args[index];
-	}
-	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+	EXIT_IF(index >= args.size());
+	return args[index];
 }
 
 Block* Inst::PhiBlock(size_t index) const {
-	EXIT_IF(opcode != ValueOpcode::Phi || index >= phi_args.size());
-	return phi_args[index].first;
+	EXIT_IF(opcode != ValueOpcode::Phi || index >= phi_blocks.size());
+	return phi_blocks[index];
 }
 
 Block* Inst::Parent() const {
@@ -212,17 +213,15 @@ void Inst::SetParent(Block* block) {
 }
 
 void Inst::SetArg(size_t index, Value value) {
-	const auto old = Arg(index);
+	if (index >= args.size()) {
+		EXIT_IF(NumArgsOf(opcode) != std::numeric_limits<size_t>::max());
+		args.resize(index + 1);
+	}
+	const auto old = args[index];
 	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
 		RemoveUse(old_inst, index);
 	}
-	if (num_args <= InlineArity) {
-		fixed_args[index] = value;
-	} else if (num_args == PhiArity) {
-		phi_args[index].second = value;
-	} else {
-		large_args[index] = value;
-	}
+	args[index] = value;
 	if (auto* new_inst = value.TryInstruction(); new_inst != nullptr) {
 		AddUse(new_inst, index);
 	}
@@ -230,8 +229,9 @@ void Inst::SetArg(size_t index, Value value) {
 
 void Inst::AddPhiOperand(Block* predecessor, Value value) {
 	EXIT_IF(opcode != ValueOpcode::Phi);
-	const auto index = phi_args.size();
-	phi_args.emplace_back(predecessor, value);
+	const auto index = args.size();
+	args.push_back(value);
+	phi_blocks.push_back(predecessor);
 	if (auto* value_inst = value.TryInstruction(); value_inst != nullptr) {
 		AddUse(value_inst, index);
 	}
@@ -244,9 +244,18 @@ void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
 	}
 	Invalidate();
 	if (preserve) {
-		opcode = ValueOpcode::Identity;
-		num_args = 1;
+		ReplaceOpcode(ValueOpcode::Identity);
+		args.resize(1);
 		SetArg(0, replacement);
+	}
+}
+
+void Inst::ReplaceOpcode(ValueOpcode value_opcode) {
+	opcode           = value_opcode;
+	const auto count = NumArgsOf(opcode);
+	if (count != std::numeric_limits<size_t>::max()) {
+		EXIT_IF(!args.empty() && args.size() != count);
+		args.resize(count);
 	}
 }
 
@@ -270,21 +279,13 @@ void Inst::RemoveUse(Inst* used, size_t operand) {
 }
 
 void Inst::ClearArgs() {
-	for (size_t index = 0; index < NumArgs(); index++) {
-		if (auto* value_inst = Arg(index).TryInstruction(); value_inst != nullptr) {
+	for (size_t index = 0; index < args.size(); index++) {
+		if (auto* value_inst = args[index].TryInstruction(); value_inst != nullptr) {
 			RemoveUse(value_inst, index);
 		}
 	}
-	if (num_args == PhiArity) {
-		std::destroy_at(&phi_args);
-		std::construct_at(&fixed_args);
-	} else if (num_args > InlineArity) {
-		std::destroy_at(&large_args);
-		std::construct_at(&fixed_args);
-	} else {
-		fixed_args.fill(Value {});
-	}
-	num_args = 0;
+	args.clear();
+	phi_blocks.clear();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

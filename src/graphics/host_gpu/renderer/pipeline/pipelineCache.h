@@ -4,14 +4,19 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 
@@ -38,6 +43,9 @@ struct PipelineStaticParameters {
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
+	bool                       depth_bounds_test_enable = false;
+	float                      depth_min_bounds         = 0.0f;
+	float                      depth_max_bounds         = 0.0f;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       cull_front                                         = false;
 	bool                       cull_back                                          = false;
@@ -61,7 +69,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 116);
+static_assert(sizeof(PipelineStaticParameters) == 125);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -99,7 +107,6 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
-// The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
@@ -130,7 +137,10 @@ public:
 	                    ShaderPixelInputInfo& pixel_info);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt,
+	                                bool compute_workgroups_trusted = true,
+	                                uint64_t indirect_args_addr = 0);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
@@ -163,10 +173,45 @@ private:
 			hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) +
 			        (hash >> 2u);
 		}
+
+		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
+			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
+			for (std::size_t i = 0; i < sizeof(params); i++) {
+				Mix(hash, bytes[i]);
+			}
+		}
+
+		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
+			Mix(hash, rendering.color_count);
+			for (uint32_t i = 0; i < rendering.color_count; i++) {
+				Mix(hash, static_cast<uint32_t>(rendering.color_formats[i]));
+			}
+			Mix(hash, static_cast<uint32_t>(rendering.depth_format));
+			Mix(hash, static_cast<uint32_t>(rendering.stencil_format));
+		}
 	};
 
 	struct GraphicsPipelineKeyHash {
-		std::size_t operator()(const GraphicsPipelineKey& key) const;
+		std::size_t operator()(const GraphicsPipelineKey& key) const {
+			std::size_t hash = 0;
+			PipelineKeyHash::MixRendering(hash, key.rendering);
+			for (const auto id: key.vertex_shader_ids) {
+				PipelineKeyHash::Mix(hash, id);
+			}
+			PipelineKeyHash::Mix(hash, key.ps_shader_id);
+			PipelineKeyHash::Mix(hash, key.vertex_input.binding_count);
+			for (uint32_t i = 0; i < key.vertex_input.binding_count; i++) {
+				PipelineKeyHash::Mix(hash, key.vertex_input.bindings[i].stride);
+				PipelineKeyHash::Mix(hash, key.vertex_input.bindings[i].instance);
+			}
+			PipelineKeyHash::Mix(hash, key.vertex_input.attribute_count);
+			for (uint32_t i = 0; i < key.vertex_input.attribute_count; i++) {
+				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].offset);
+				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].binding);
+			}
+			PipelineKeyHash::MixStaticParams(hash, key.static_params);
+			return hash;
+		}
 	};
 
 	GraphicContext&               m_graphics;
@@ -176,9 +221,20 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	Common::Mutex m_mutex;
+	uint32_t      m_new_driver_pipelines = 0;
+	uint64_t      m_previous_checkpoint_ms = 0;
+	std::chrono::steady_clock::time_point m_checkpoint_finished {};
+	uint64_t      m_saved_driver_cache_hash = 0;
+	bool          m_has_saved_driver_cache_hash = false;
 
 	void InitializeDriverCache();
+	bool SaveDriverCacheLocked(bool checkpoint);
+	void CheckpointDriverCacheLocked(uint64_t creation_ms = 0);
 };
+
+[[nodiscard]] std::string ConfigurePixelTargetConversions(const HW::Context& context,
+                                                           ShaderPixelInputInfo& pixel_info);
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
@@ -192,6 +248,38 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+
+[[nodiscard]] bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms);
+[[nodiscard]] bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms,
+                                          uint64_t previous_save_ms, uint64_t elapsed_ms);
+
+bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
+                                             std::string_view git_revision,
+                                             std::string_view worktree_fingerprint);
+bool IsDriverCacheSignatureCompatibleForTest(std::string_view cached_signature,
+                                             std::string_view expected_signature);
+// GPUAV instrumentation changes modules the driver caches. Core, GPUAV lite,
+// and GPUAV instrumented must have separate filename and signature identities.
+[[nodiscard]] std::string DriverCacheFileNameForTest(std::string_view title_id,
+                                                     bool gpu_assisted_validation);
+[[nodiscard]] std::string DriverCacheFileNameForTest(std::string_view title_id,
+                                                     bool gpu_assisted_validation,
+                                                     bool shader_instrumentation);
+[[nodiscard]] std::string FormatDriverCacheSignatureForTest(
+    std::string_view git_revision, std::string_view worktree_fingerprint, uint32_t vendor_id,
+    uint32_t device_id, uint32_t driver_version, std::string_view pipeline_cache_uuid_hex,
+    bool gpu_assisted_validation);
+[[nodiscard]] std::string FormatDriverCacheSignatureForTest(
+    std::string_view git_revision, std::string_view worktree_fingerprint, uint32_t vendor_id,
+    uint32_t device_id, uint32_t driver_version, std::string_view pipeline_cache_uuid_hex,
+    bool gpu_assisted_validation, bool shader_instrumentation);
+
+// Returns the existing ShaderProgram.id when a specialization miss emits SPIR-V
+// that is already resident. Empty when the binary is new and Create*Pipelines
+// must run. Used by ProgramCache permutation reuse and a focused RED/GREEN.
+[[nodiscard]] std::optional<uint64_t> FindReusableShaderProgramIdForTest(
+    std::span<const uint64_t> existing_spirv_hashes, std::span<const uint64_t> existing_program_ids,
+    uint64_t spirv_hash);
 
 } // namespace Libs::Graphics
 

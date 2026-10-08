@@ -68,10 +68,13 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 		return ShaderError::Fail(error, "vertex semantic count is outside the supported domain");
 	}
 
+	const auto semantic_size =
+	    static_cast<uint64_t>(data.num_input_semantics) * sizeof(ShaderSemantic);
 	if (data.input_semantics == nullptr) {
 		return ShaderError::Fail(error, "missing vertex input semantics");
 	}
-	next.input_semantics = {data.input_semantics, data.num_input_semantics};
+	std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);
+	next.input_semantics_count = data.num_input_semantics;
 	metadata                   = next;
 	return true;
 }

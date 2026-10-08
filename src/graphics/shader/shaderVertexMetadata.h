@@ -3,18 +3,19 @@
 
 #include "graphics/shader/shader.h"
 
-#include <span>
+#include <array>
 #include <string>
 
 namespace Libs::Graphics {
 
 struct ShaderVertexMetadata {
-	int                             vertex_buffer_reg = -1;
-	int                             vertex_attrib_reg = -1;
-	std::span<const ShaderSemantic> input_semantics;
+	int                                                        vertex_buffer_reg = -1;
+	int                                                        vertex_attrib_reg = -1;
+	std::array<ShaderSemantic, ShaderVertexInputInfo::RES_MAX> input_semantics {};
+	uint32_t                                                   input_semantics_count = 0;
 };
 
-// Validates the vertex metadata and returns a view into the shader header.
+// Copies the small AGC metadata subset used by the vertex path after validating every guest range.
 bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
                               ShaderVertexMetadata& metadata, std::string* error);
 

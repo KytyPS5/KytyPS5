@@ -876,6 +876,17 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
@@ -889,10 +900,32 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
-uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
-	EXIT_IF(g_virtual_ranges == nullptr);
+bool TryReadGpuCoherentBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			return false;
+		}
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+		if (buffers.HasGpuDirtyBytes(vaddr, size) || buffers.IsRegionGpuModified(vaddr, size)) {
+			buffers.ReadMemory(vaddr, size, false);
+		}
+		if (buffers.HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
 
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
+}
+
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+	const auto clamped_size = TryClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
@@ -962,6 +995,21 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 }
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
+}
+
+bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
+	std::vector<VirtualRanges::Range> ranges;
+	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr ||
+	    !IsInPrtAperture(vaddr, size) || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+		return false;
+	}
+	if (std::any_of(ranges.begin(), ranges.end(), [](const auto& range) {
+		    return !IsReservedRangeType(range.type) &&
+		           !g_guest_address_space->BackingContains(range.start, range.size);
+	    })) {
+		return false;
+	}
 	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
 }
 
@@ -2817,6 +2865,20 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 		return KERNEL_ERROR_EAGAIN;
 	}
 
+	// Hardware hands out zeroed pages for a new allocation. Unmap deliberately keeps the
+	// backing contents so that remapping the same range still sees them, so a range taken
+	// from the free list would otherwise expose the previous owner's bytes. Clear it here,
+	// at allocation, which leaves the unmap/remap contents contract untouched.
+	if (!g_guest_address_space->ZeroBacking(addr, len)) {
+		uint64_t     released_vaddr    = 0;
+		uint64_t     released_map_size = 0;
+		GpuAccessMode released_gpu_mode = GpuAccessMode::NoAccess;
+		(void)g_physical_memory->Release(addr, len, &released_vaddr, &released_map_size,
+		                                 &released_gpu_mode);
+		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
+		return KERNEL_ERROR_EAGAIN;
+	}
+
 	*phys_addr_out = static_cast<int64_t>(addr);
 
 	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
@@ -3879,8 +3941,43 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	if (g_guest_address_space == nullptr || size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+	if (g_virtual_ranges == nullptr || mode == VirtualMemory::Mode::NoAccess ||
+	    VirtualMemory::IsExecute(mode)) {
+		return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	}
+
+	// GPU tracking temporarily restricts reads/writes, not the guest's right to
+	// execute code. Use the current semantic ranges: host protections may already
+	// be NoAccess, and a permanent partial mprotect can revoke execution. A mixed
+	// span must not inherit an executable neighbor's permissions.
+	const auto end = vaddr + size;
+	for (auto current = vaddr; current < end;) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(current, 1, &range) || range.start >= end) {
+			return g_guest_address_space->ProtectTransient(current, end - current, mode);
+		}
+		if (range.start > current) {
+			// Keep the owner's existing sparse-placeholder no-op behavior.
+			if (!g_guest_address_space->ProtectTransient(current, range.start - current, mode)) {
+				return false;
+			}
+			current = range.start;
+		}
+		const auto part_end = std::min(end, range.start + range.size);
+		const auto part_mode = (range.protection & PROT_CPU_EXEC) != 0
+		                           ? static_cast<VirtualMemory::Mode>(
+		                                 static_cast<uint32_t>(mode) |
+		                                 static_cast<uint32_t>(VirtualMemory::Mode::Execute))
+		                           : mode;
+		if (!g_guest_address_space->ProtectTransient(current, part_end - current, part_mode)) {
+			return false;
+		}
+		current = part_end;
+	}
+	return true;
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
@@ -4087,6 +4184,14 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
 	if (!g_physical_memory->Alloc(static_cast<uint64_t>(search_start),
 	                              static_cast<uint64_t>(search_end), len, effective_alignment,
 	                              &phys_addr, 0, PhysicalMemory::AllocationKind::Pooled)) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+
+	// Same reasoning as KernelAllocateDirectMemory: an expansion can reuse a range whose
+	// backing still holds the previous owner's bytes, and the pool hands that memory out
+	// before anything writes it.
+	if (!g_guest_address_space->ZeroBacking(phys_addr, len)) {
+		(void)g_physical_memory->ReleasePoolExpansion(phys_addr, len);
 		return KERNEL_ERROR_ENOMEM;
 	}
 

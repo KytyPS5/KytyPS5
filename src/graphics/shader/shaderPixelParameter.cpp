@@ -11,19 +11,6 @@ constexpr uint32_t PsInputFlatShade  = 0x00000400u;
 
 } // namespace
 
-uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index) {
-	for (uint32_t target = 0; target < 8u; target++) {
-		if (((shader_mask >> (target * 4u)) & 0xfu) == 0u) {
-			continue;
-		}
-		if (export_index == 0u) {
-			return target;
-		}
-		export_index--;
-	}
-	return UINT32_MAX;
-}
-
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input) {
 	return input < info.input_num ? info.interpolator_settings[input] & PsInputOffsetMask : input;
 }

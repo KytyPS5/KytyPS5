@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <unordered_map>
 #include <utility>
 
@@ -19,6 +18,11 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	    .bound_control  = operand.dpp_bound_ctrl,
 	    .dpp8           = operand.dpp8,
 	};
+}
+
+IR::U1 Translator::MaskIsZero(IR::U32 low, IR::U32 high) {
+ const auto mask = program.wave_size == 64u ? ir.BitwiseOr(low, high) : low;
+ return ir.IEqual(mask, IR::U32(IR::Value(0u)));
 }
 
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
@@ -135,8 +139,6 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::IntegerInlineConstant:
 		case Decoder::OperandKind::FloatInlineConstant: return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::Null:
-		case Decoder::OperandKind::SharedBase:
-		case Decoder::OperandKind::PrivateBase:
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
@@ -172,11 +174,8 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 		case 106u: return ir.GetVccLo();
 		case 107u: return ir.GetVccHi();
 		case 124u: return ir.GetM0();
-		case 126u:
-		case 127u: {
-			const auto mask = BallotMask(ir.GetExec());
-			return mask[code - 126u];
-		}
+		case 126u: return ir.GetExecLo();
+		case 127u: return ir.GetExecHi();
 		default: return IR::U32(IR::Value(0u));
 	}
 }
@@ -185,6 +184,13 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 	if (operand.dpp) {
 		value =
 		    IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, DppFlags(operand)));
+	}
+	if (operand.dpp8) {
+		const IR::Dpp8MoveFlags flags {
+		    .lane_selectors = operand.dpp8_lane_selectors,
+		    .fetch_inactive = operand.dpp8_fetch_inactive,
+		};
+		value = IR::U32(ir.Emit(IR::ValueOpcode::Dpp8MoveU32, {value, ir.GetExec()}, flags));
 	}
 	if (operand.sdwa_sel != 6u) {
 		uint32_t offset = 0;
@@ -205,7 +211,34 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 	return value;
 }
 
+IR::F64 Translator::ReadF64(const Decoder::Operand& operand) {
+	if (operand.dpp || operand.dpp8 || operand.sdwa_sel != 6u || operand.sdwa_sext ||
+	    operand.op_sel || operand.op_sel_hi || operand.negate_hi) {
+		EXIT("FP64 source selectors are not implemented");
+	}
+	if (operand.kind != Decoder::OperandKind::Sgpr &&
+	    operand.kind != Decoder::OperandKind::Vgpr) {
+		// FP64 literals have different expansion rules from integer U64 operands.
+		// Keep untested literal/inline forms explicit instead of misreading bits.
+		EXIT("FP64 arithmetic currently requires a scalar or vector register pair");
+	}
+	const auto raw = PlainOperand(operand);
+	const auto low = ReadRawU32(raw);
+	const auto high = ReadRawU32(OffsetOperand(raw, 1));
+	auto value = IR::F64(ir.Emit(IR::ValueOpcode::CompositeConstructF64, {low, high}));
+	if (operand.absolute) {
+		value = IR::F64(ir.Emit(IR::ValueOpcode::FPAbs64, {value}));
+	}
+	if (operand.negate) {
+		value = IR::F64(ir.Emit(IR::ValueOpcode::FPNeg64, {value}));
+	}
+	return value;
+}
+
 IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type) {
+	if (type == IR::Type::F64) {
+		return ReadF64(operand);
+	}
 	if (type == IR::Type::U16) {
 		return ir.Emit(IR::ValueOpcode::ConvertU16U32,
 		               {ApplyBitSourceModifiers(operand, ReadRawU32(operand))});
@@ -222,34 +255,15 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 			case Decoder::OperandKind::ExecHi: return ir.GetExec();
 			case Decoder::OperandKind::VccLo:
 			case Decoder::OperandKind::VccHi: return ir.GetVcc();
-			case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-			case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+			case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+			case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 			default: break;
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
-	if (type == IR::Type::U64 || type == IR::Type::F64) {
-		auto pair = ReadU32Pair(operand);
-		if (type == IR::Type::F64) {
-			if (operand.kind == Decoder::OperandKind::LiteralConstant) {
-				pair = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
-			} else if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-				const auto bits = operand.value == 0x3e22f983u
-				                      ? 0x3fc45f306dc9c882ull
-				                      : std::bit_cast<uint64_t>(static_cast<double>(
-				                            std::bit_cast<float>(operand.value)));
-				pair            = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
-				                   IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
-			}
-			if (operand.absolute) {
-				pair[1] = ir.BitwiseAnd(pair[1], IR::U32(IR::Value(0x7fffffffu)));
-			}
-			if (operand.negate) {
-				pair[1] = ir.BitwiseXor(pair[1], IR::U32(IR::Value(0x80000000u)));
-			}
-		}
-		const auto bits = ir.ConstructU64(pair[0], pair[1]);
-		return type == IR::Type::F64 ? ir.Emit(IR::ValueOpcode::BitCastF64U64, {bits}) : IR::Value(bits);
+	if (type == IR::Type::U64) {
+		const auto pair = ReadU32Pair(operand);
+		return ir.ConstructU64(pair[0], pair[1]);
 	}
 	auto bits = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	if (TypesOverlap(type, IR::Type::F32) && !TypesOverlap(type, IR::Type::U32)) {
@@ -426,11 +440,12 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		Write16Bits(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
 		return;
 	}
-	if (type == IR::Type::F64) {
-		value = ir.Emit(IR::ValueOpcode::BitCastU64F64, {value});
-		type  = IR::Type::U64;
-	}
-	if (type == IR::Type::U64) {
+	if (type == IR::Type::U64 || type == IR::Type::F64) {
+		if (type == IR::Type::F64 &&
+		    (operand.clamp || operand.omod != 0u || operand.sdwa_sel != 6u ||
+		     operand.explicit_sdwa_dst || operand.dpp || operand.dpp8)) {
+			EXIT("FP64 destination modifiers are not implemented");
+		}
 		WriteU32Pair(operand, {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)});
 		return;
 	}
@@ -476,12 +491,6 @@ IR::U32 Translator::ReadU32(const Decoder::Operand& operand) {
 }
 
 std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) {
-	if (operand.kind == Decoder::OperandKind::PrivateBase ||
-	    operand.kind == Decoder::OperandKind::SharedBase) {
-		return {IR::U32(IR::Value(0u)), IR::U32(IR::Value(
-		    operand.kind == Decoder::OperandKind::PrivateBase ? Decoder::PrivateApertureHigh
-		                                                      : Decoder::SharedApertureHigh))};
-	}
 	if (operand.kind == Decoder::OperandKind::ExecLo) {
 		return {ir.GetExecLo(), ir.GetExecHi()};
 	}
@@ -503,11 +512,41 @@ IR::U64 Translator::ReadU64(const Decoder::Operand& operand) {
 	return IR::U64(ReadOperand(operand, IR::Type::U64));
 }
 
-IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane) {
-	const auto bits     = Read16LaneBits(operand, high_lane);
-	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits}));
+IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed) {
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		const bool use_zero = packed && (high_lane ? operand.op_sel_hi : operand.op_sel);
+		auto       value    = use_zero ? IR::F32(IR::Value::F32(0.0f))
+		                               : ir.BitCastF32(IR::U32(IR::Value(operand.value)));
+		const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
+		value               = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
+		if (operand.absolute) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
+		}
+		if (high_lane ? operand.negate_hi : operand.negate) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
+		}
+		return value;
+	}
+	auto raw_operand      = operand;
+	raw_operand.sdwa_sel  = 6;
+	raw_operand.sdwa_sext = false;
+	const auto bits       = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
+	uint32_t   offset     = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
+	if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
+		offset = operand.sdwa_sel == 5u ? 16u : 0u;
+	}
+	const auto half_u32 = IR::U32(
+	    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(offset), IR::Value(16u)}));
+	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {half_u32}));
 	const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::BitCastF16U16, {half_u16}));
-	return IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
+	auto       value    = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
+	if (operand.absolute) {
+		value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
+	}
+	if (high_lane ? operand.negate_hi : operand.negate) {
+		value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
+	}
+	return value;
 }
 
 IR::F32 Translator::ReadF16AsF32(const Decoder::Operand& operand) {
@@ -525,10 +564,27 @@ IR::F32 Translator::ReadMixF32(const Decoder::Operand& operand) {
 	return IR::F32(ReadOperand(value_operand, IR::Type::F32));
 }
 
+IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_lane) {
+	auto raw_operand      = operand;
+	raw_operand.sdwa_sel  = 6;
+	raw_operand.sdwa_sext = false;
+	const auto bits       = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
+	uint32_t   offset     = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
+	uint32_t   width      = 16u;
+	if (operand.sdwa_sel <= 3u) {
+		offset = operand.sdwa_sel * 8u;
+		width  = 8u;
+	} else if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
+		offset = operand.sdwa_sel == 5u ? 16u : 0u;
+	}
+	return IR::U32(
+	    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(offset), IR::Value(width)}));
+}
+
 IR::U32 Translator::ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane,
                                      bool sign_extend) {
 	auto value = Read16LaneBits(operand, high_lane);
-	if (sign_extend) {
+	if (sign_extend || operand.sdwa_sext) {
 		value = IR::U32(
 		    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {value, IR::Value(0u), IR::Value(16u)}));
 	}
@@ -540,36 +596,12 @@ IR::U32 Translator::ReadU16AsU32(const Decoder::Operand& operand, bool sign_exte
 }
 
 IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_lane) {
-	auto raw_operand      = operand;
-	raw_operand.sdwa_sel  = 6;
-	raw_operand.sdwa_sext = false;
-	auto bits             = ReadRawU32(operand);
-	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		// Inline floats encode the operand's width before SDWA or OP_SEL selects bits.
-		const auto half      = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {ir.BitCastF32(bits)}));
-		const auto half_bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}));
-		bits                = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {half_bits}));
-	}
-	bits = ApplyBitSourceModifiers(raw_operand, bits);
-	uint32_t offset = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
-	uint32_t width  = 16u;
-	if (operand.sdwa_sel <= 3u) {
-		offset = operand.sdwa_sel * 8u;
-		width  = 8u;
-	} else if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
-		offset = operand.sdwa_sel == 5u ? 16u : 0u;
-	}
-	const auto extract = width == 8u && operand.sdwa_sext
-	                         ? IR::ValueOpcode::BitFieldSExtract
-	                         : IR::ValueOpcode::BitFieldUExtract;
-	auto value = IR::U32(ir.Emit(extract, {bits, IR::Value(offset), IR::Value(width)}));
-	if (width == 8u && operand.sdwa_sext) {
-		value = ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)));
-	}
+	auto value = ReadU16LaneRaw(operand, high_lane);
 	if (operand.absolute) {
 		value = ir.BitwiseAnd(value, IR::U32(IR::Value(0x7fffu)));
 	}
 	if (high_lane ? operand.negate_hi : operand.negate) {
+		// RDNA2 source NEG flips the sign bit, including packed integer operands.
 		value = ir.BitwiseXor(value, IR::U32(IR::Value(0x8000u)));
 	}
 	return value;
@@ -640,8 +672,8 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 			           ? ThreadBit({ReadRawU32(operand), IR::U32(IR::Value(0u))})
 			           : ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
-		case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-		case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+		case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+		case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 		default: return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
 }
@@ -664,10 +696,9 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi:
 		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi:
-		case Decoder::OperandKind::VccZ:
-		case Decoder::OperandKind::ExecZ:
-		case Decoder::OperandKind::Scc: return IR::U1(IR::Value(true));
+		case Decoder::OperandKind::VccHi: return IR::U1(IR::Value(true));
+		// SCC/EXECZ/VCCZ are numeric scalar operands {flag, 0}, not replicated
+		// lane masks. Their Boolean form remains useful for carry/branch inputs.
 		default: return IR::U1(IR::Value(false));
 	}
 }
@@ -865,50 +896,16 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CVT_F64_F32:
 		case Decoder::Opcode::V_CVT_F64_U32: include_vector(inst.dst, 2u); break;
 		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
-		case Decoder::Opcode::V_ADD_F64:
-		case Decoder::Opcode::V_MIN_F64:
-		case Decoder::Opcode::V_MAX_F64:
 		case Decoder::Opcode::V_MUL_F64: include_vector(inst.src1, 2u); [[fallthrough]];
-		case Decoder::Opcode::V_RCP_F64:
-		case Decoder::Opcode::V_TRUNC_F64:
-		case Decoder::Opcode::V_CEIL_F64:
-		case Decoder::Opcode::V_FLOOR_F64:
-		case Decoder::Opcode::V_FRACT_F64: include_vector(inst.dst, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_RCP_F64: include_vector(inst.dst, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
-		case Decoder::Opcode::V_CMP_EQ_F64:
-		case Decoder::Opcode::V_CMP_LE_F64:
-		case Decoder::Opcode::V_CMPX_LE_F64:
-		case Decoder::Opcode::V_CMPX_GE_F64:
-		case Decoder::Opcode::V_CMP_EQ_I64:
-		case Decoder::Opcode::V_CMP_LT_I64:
-		case Decoder::Opcode::V_CMP_LE_I64:
-		case Decoder::Opcode::V_CMP_NE_I64:
-		case Decoder::Opcode::V_CMP_LT_U64:
-		case Decoder::Opcode::V_CMP_EQ_U64:
-		case Decoder::Opcode::V_CMP_LE_U64:
-		case Decoder::Opcode::V_CMP_GT_U64:
-		case Decoder::Opcode::V_CMP_NE_U64:
-		case Decoder::Opcode::V_CMP_GE_U64:
-		case Decoder::Opcode::V_CMPX_LT_I64:
-		case Decoder::Opcode::V_CMPX_EQ_I64:
-		case Decoder::Opcode::V_CMPX_LE_I64:
-		case Decoder::Opcode::V_CMPX_NE_I64:
-		case Decoder::Opcode::V_CMPX_LT_U64:
-		case Decoder::Opcode::V_CMPX_EQ_U64:
-		case Decoder::Opcode::V_CMPX_LE_U64:
-		case Decoder::Opcode::V_CMPX_GT_U64:
-		case Decoder::Opcode::V_CMPX_NE_U64:
-		case Decoder::Opcode::V_CMPX_GE_U64:
-			include_vector(inst.src0, 2u);
-			include_vector(inst.src1, 2u);
-			break;
 		default: break;
 	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
+			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_ADD_U64:
 			case Decoder::Opcode::DS_OR_B64:
-			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
 			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
 			case Decoder::Opcode::DS_WRITE2_B32:
@@ -1089,16 +1086,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  IR::U32(IR::Value(total_threads)));
 			}
 		}
-		if (options.stage == ShaderType::Compute &&
-		    options.input_info.compute->dispatch_thread_dimensions) {
-			for (uint32_t axis = 0; axis < 3u; axis++) {
-				const auto extent = IR::U32(entry_ir.Emit(
-				    IR::ValueOpcode::GetDispatchThreadExtent, {IR::Value(axis)}));
-				initial_exec = entry_ir.LogicalAnd(
-				    initial_exec,
-				    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis), extent));
-			}
-		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
 		entry_ir.SetExecLo(entry_ir.CompositeExtract(initial_mask, 0));
@@ -1137,8 +1124,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 0x1ffu ||
-			                     mesh.primitives_per_group > 0x1ffu ||
+			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 64u ||
 			                     total_threads > 15u * options.wave_size);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
@@ -1152,13 +1138,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto group = builtin(IR::StageInputKind::WorkgroupId, 0);
-			const auto primitive_chunk = mesh.fast_launch ? group :
-			    entry_ir.IMul(group, u32(mesh.primitives_per_group));
+			const auto primitive_chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
+			                                           u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
-			const auto chunk = mesh.fast_launch ? group : entry_ir.IMul(primitive_chunk, step);
-			const auto vertices = mesh.fast_launch ? u32(mesh.vertices_per_group) :
+			const auto chunk = entry_ir.IMul(primitive_chunk, step);
+			const auto vertices =
 			    minimum(subtract_saturate(draw(0), chunk), u32(mesh.vertices_per_group));
 			const auto primitives = entry_ir.Select(
 			    entry_ir.ULessThan(vertices, size), u32(0),
@@ -1175,72 +1160,60 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                                          u32(((total_threads + options.wave_size - 1u) /
 			                                               options.wave_size) << 28u));
 			entry_ir.SetScalarReg(
-			    static_cast<IR::ScalarReg>(2),
-			    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(vertices, u32(12)),
-			                       entry_ir.ShiftLeftLogical(primitives, u32(22))));
-			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
-			if (mesh.fast_launch) {
-				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
-				entry_ir.SetVectorReg(
-				    static_cast<IR::VectorReg>(6),
-				    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
-			} else {
-				// GS adjacency addresses local ES records in LDS. Fans retain the draw's
-				// center in every subgroup; strip winding follows the global primitive.
-				const auto vertex = entry_ir.IMul(local, step);
-				auto       first  = vertex;
-				auto       second = u32(0);
-				auto       third  = u32(0);
-				if (mesh.InputPrimitiveSize() >= 2u) {
-					second = entry_ir.IAdd(vertex, u32(1));
-				}
-				if (mesh.InputPrimitiveSize() == 3u) {
-					third = entry_ir.IAdd(vertex, u32(2));
-				}
-				auto input_vertex = entry_ir.IAdd(chunk, local);
-				if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
-					first = u32(0);
-					input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
-				} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
-					const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
-					first = entry_ir.IAdd(first, parity);
-					second = entry_ir.ISub(second, parity);
-				}
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
-				                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
-				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
-				                      entry_ir.ShiftLeftLogical(third, u32(2)));
-				const auto index_bytes  = draw(3);
-				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
-				const auto index_low    = draw(4);
-				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
-				                                           entry_ir.IMul(input_vertex, index_bytes));
-				const auto index_resource = entry_ir.Emit(
-				    IR::ValueOpcode::GetAddressResource,
-				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
-				const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
-				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
-				const auto packed_index = entry_ir.Emit(
-				    IR::ValueOpcode::LoadAddressU32,
-				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
-				    IR::MemoryFlags {.index = memory_index});
-				const auto index = IR::U32(entry_ir.Emit(
-				    IR::ValueOpcode::BitFieldUExtract,
-				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
-				     entry_ir.IMul(index_bytes, u32(8))}));
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
-				entry_ir.SetVectorReg(
-				    static_cast<IR::VectorReg>(8),
-				    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
+			// GS adjacency addresses local ES records in LDS. Fans retain the draw's
+			// center in every subgroup; strip winding follows the global primitive.
+			const auto vertex = entry_ir.IMul(local, step);
+			auto       first  = vertex;
+			auto       second = u32(0);
+			auto       third  = u32(0);
+			if (mesh.InputPrimitiveSize() >= 2u) {
+				second = entry_ir.IAdd(vertex, u32(1));
 			}
+			if (mesh.InputPrimitiveSize() == 3u) {
+				third = entry_ir.IAdd(vertex, u32(2));
+			}
+			auto input_vertex = entry_ir.IAdd(chunk, local);
+			if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
+				first = u32(0);
+				input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
+			} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
+				const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
+				first = entry_ir.IAdd(first, parity);
+				second = entry_ir.ISub(second, parity);
+			}
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
+			                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
+			                                         entry_ir.ShiftLeftLogical(second, u32(18))));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
+			                      entry_ir.ShiftLeftLogical(third, u32(2)));
+			const auto index_bytes  = draw(3);
+			const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
+			const auto index_low    = draw(4);
+			const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
+			                                           entry_ir.IMul(input_vertex, index_bytes));
+			const auto index_resource = entry_ir.Emit(
+			    IR::ValueOpcode::GetAddressResource,
+			    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
+			const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
+			result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+			const auto packed_index = entry_ir.Emit(
+			    IR::ValueOpcode::LoadAddressU32,
+			    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
+			     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
+			    IR::MemoryFlags {.index = memory_index});
+			const auto index = IR::U32(entry_ir.Emit(
+			    IR::ValueOpcode::BitFieldUExtract,
+			    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
+			     entry_ir.IMul(index_bytes, u32(8))}));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+			                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
+			entry_ir.SetVectorReg(
+			    static_cast<IR::VectorReg>(8),
+			    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
 		} else if (options.stage == ShaderType::Local) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
@@ -1286,8 +1259,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 			};
 			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
-			barycentric_pair(ps->ps_perspective_sample_vgpr,
-			                 IR::StageInputKind::BaryCoordSmoothSample);
 			barycentric_pair(ps->ps_perspective_centroid_vgpr,
 			                 IR::StageInputKind::BaryCoordSmoothCentroid);
 			uint32_t reg = ps->ps_system_input_base;
@@ -1318,12 +1289,25 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::PackedAncillary));
 			}
 		} else if (options.stage == ShaderType::Vertex) {
-			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts.
+			// ESVertCount is the number of launched vertices in this wave, including
+			// a partially populated final wave.  The entry ballot is mirrored for
+			// graphics wave64 on native32, so count that physical half only.
+			IR::U32 es_vertex_count = IR::U32(IR::Value(options.wave_size));
+			if (options.native_subgroup_size != 0u) {
+				const auto low = entry_ir.CompositeExtract(initial_mask, 0);
+				es_vertex_count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {low}));
+				if (options.wave_size == 64u && options.native_subgroup_size == 64u) {
+					const auto high = entry_ir.CompositeExtract(initial_mask, 1);
+					es_vertex_count = entry_ir.IAdd(
+				    es_vertex_count,
+				    IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {high})));
+				}
+			}
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
+			                      entry_ir.BitwiseOr(IR::U32(IR::Value(1u << 28u)),
+			                                         es_vertex_count));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),

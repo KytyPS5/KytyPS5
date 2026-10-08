@@ -4,7 +4,6 @@
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
-#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -31,6 +30,8 @@ public:
 
 	static Value F16(uint16_t bits);
 	static Value F32(float value);
+	// Store the exact IEEE binary64 encoding, including NaN payloads.
+	static Value F64(uint64_t bits);
 
 	[[nodiscard]] bool IsEmpty() const;
 	[[nodiscard]] bool IsImmediate() const;
@@ -51,6 +52,7 @@ public:
 	[[nodiscard]] uint64_t  U64() const;
 	[[nodiscard]] uint16_t  F16Bits() const;
 	[[nodiscard]] float     F32Value() const;
+	[[nodiscard]] uint64_t  F64Bits() const;
 
 	bool operator==(const Value& other) const;
 
@@ -92,6 +94,7 @@ using U32    = TypedValue<Type::U32>;
 using U64    = TypedValue<Type::U64>;
 using F16    = TypedValue<Type::F16>;
 using F32    = TypedValue<Type::F32>;
+using F64    = TypedValue<Type::F64>;
 using U32F32 = TypedValue<Type::U32 | Type::F32>;
 
 struct Use {
@@ -134,6 +137,7 @@ public:
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
+	void ReplaceOpcode(ValueOpcode opcode);
 	void Invalidate();
 
 	template <typename T>
@@ -158,23 +162,14 @@ private:
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
-	static constexpr uint8_t InlineArity = 4;
-	static constexpr uint8_t PhiArity = UINT8_MAX;
-
 	ValueOpcode         opcode;
-	uint8_t             num_args;
 	bool                live = false;
-	mutable uint32_t    evaluation_index = UINT32_MAX;
 	uint64_t            flags;
 	Block*              parent = nullptr;
-	union {
-		std::array<Value, InlineArity> fixed_args {};
-		std::vector<Value> large_args;
-		std::vector<std::pair<Block*, Value>> phi_args;
-	};
+	std::vector<Value>  args;
+	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
+	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
-
-static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

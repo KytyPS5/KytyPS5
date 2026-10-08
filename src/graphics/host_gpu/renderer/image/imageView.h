@@ -31,14 +31,20 @@ namespace ImageViewOps {
 	       ImageViewOps::IsFormatDepthCompatible(view_format);
 }
 
-[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle,
-                                             uint32_t component_count = 4) noexcept {
+[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle) noexcept {
 	if ((swizzle & ~0xfffu) != 0) {
 		return false;
 	}
 	for (uint32_t channel = 0; channel < 4; channel++) {
-		const auto selector = GetDstSel(swizzle, channel);
-		if (selector > 1 && (selector < 4 || selector >= 4 + component_count)) return false;
+		switch (GetDstSel(swizzle, channel)) {
+			case 0:
+			case 1:
+			case 4:
+			case 5:
+			case 6:
+			case 7: break;
+			default: return false;
+		}
 	}
 	return true;
 }
@@ -54,6 +60,19 @@ namespace ImageViewOps {
 		case vk::Format::eR8G8B8A8Srgb:
 		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
 		default: return vk::Format::eUndefined;
+	}
+}
+
+[[nodiscard]] inline vk::Format SrgbToUnorm(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eBc1RgbaSrgbBlock: return vk::Format::eBc1RgbaUnormBlock;
+		case vk::Format::eBc2SrgbBlock: return vk::Format::eBc2UnormBlock;
+		case vk::Format::eBc3SrgbBlock: return vk::Format::eBc3UnormBlock;
+		case vk::Format::eBc7SrgbBlock: return vk::Format::eBc7UnormBlock;
+		case vk::Format::eR8G8B8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
+		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eB8G8R8A8Unorm;
+		case vk::Format::eA8B8G8R8SrgbPack32: return vk::Format::eA8B8G8R8UnormPack32;
+		default: return format;
 	}
 }
 
@@ -75,8 +94,10 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 [[nodiscard]] inline bool IsSupportedSampledDepthView(vk::Format image_format,
                                                       vk::Format view_format,
                                                       uint32_t   swizzle) noexcept {
-	return IsSupportedSampledDepthFormat(image_format, view_format) &&
-	       IsValidImageSwizzle(swizzle, 1);
+	if (!IsSupportedSampledDepthFormat(image_format, view_format)) {
+		return false;
+	}
+	return IsValidImageSwizzle(swizzle);
 }
 
 [[nodiscard]] inline bool
@@ -90,11 +111,8 @@ IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resou
 	if (resource.numeric_class != Prospero::TextureNumericClass::Float && resource.depth_compare) {
 		return false;
 	}
-	return ((resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
-	         resource.mip_count == 1u) ||
-	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic &&
-	         resource.mip_count != 0u)) &&
-	       resource.read && !resource.written && !resource.atomic;
+	return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
+	       !resource.written && !resource.atomic;
 }
 
 inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_format,
@@ -109,7 +127,8 @@ inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_fo
 IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	return resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage &&
 	       (resource.numeric_class == Prospero::TextureNumericClass::Float ||
-	        resource.numeric_class == Prospero::TextureNumericClass::Uint) &&
+	        resource.numeric_class == Prospero::TextureNumericClass::Uint ||
+	        resource.numeric_class == Prospero::TextureNumericClass::Sint) &&
 	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
@@ -117,7 +136,7 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
 	       ((resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
 	         resource.mip_count == 1u) ||
-	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic &&
+	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage &&
 	         resource.mip_count != 0u)) &&
 	       resource.written &&
 	       (!resource.atomic ||

@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
+#include "graphics/shader/recompiler/ShaderHostProfile.h"
 
 #include <map>
 #include <mutex>
@@ -19,6 +20,8 @@ struct VulkanImage;
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
 struct GraphicContext {
+	bool depth_range_unrestricted_enabled = false;
+	ShaderRecompiler::ShaderHostProfile shader_host_profile;
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
 	vk::PhysicalDevice                 physical_device                       = nullptr;

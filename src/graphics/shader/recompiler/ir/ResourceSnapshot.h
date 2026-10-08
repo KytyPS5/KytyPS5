@@ -3,7 +3,6 @@
 
 #include <array>
 #include <cstdint>
-#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -15,6 +14,13 @@ struct DescriptorValue {
 	bool operator==(const DescriptorValue& other) const {
 		return dword_count == other.dword_count && dwords == other.dwords;
 	}
+};
+
+struct ResourceReadRange {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+
+	bool operator==(const ResourceReadRange&) const = default;
 };
 
 enum class UniformFillKind { None, Buffer, Image };
@@ -30,12 +36,14 @@ struct UniformFill {
 };
 
 struct ResourceSnapshot {
+	// Exact coherent source bytes frozen for indexed SRT reads; never native allocation ranges.
+	std::vector<ResourceReadRange> immutable_srt_ranges;
+	bool scalar_selectors_snapshotted = false;
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
-	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
 };
 

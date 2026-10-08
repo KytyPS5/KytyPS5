@@ -22,6 +22,13 @@ bool BlendFactorIsConstantColor(uint8_t factor) {
 
 BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                blend,
                                          const Prospero::ColorComponentMapping& mapping) {
+	const auto color_op = static_cast<Prospero::BlendOp>(blend.color_comb_fcn);
+	if ((color_op == Prospero::BlendOp::kMin || color_op == Prospero::BlendOp::kMax) &&
+	    (!blend.separate_alpha_blend || blend.alpha_comb_fcn == blend.color_comb_fcn)) {
+		// MIN/MAX compare unscaled components, so neither channel factors nor
+		// source/destination alpha relocation change this common equation.
+		return BlendMappingSupport::Direct;
+	}
 	// Color constants are not swizzled with the exports; scalar constant alpha is unaffected.
 	if (!mapping.IsIdentity() && (BlendFactorIsConstantColor(blend.color_srcblend) ||
 	                              BlendFactorIsConstantColor(blend.color_destblend))) {

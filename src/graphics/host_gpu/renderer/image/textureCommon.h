@@ -16,6 +16,7 @@ struct RenderTargetFormatInfo {
 	uint32_t                        bytes_per_element = 0;
 	Prospero::ColorComponentMapping export_mapping;
 	Prospero::BufferFormat          guest_format = Prospero::BufferFormat::kInvalid;
+	Prospero::BufferFormat          conversion_format = Prospero::BufferFormat::kInvalid;
 };
 
 struct SurfaceFormatInfo {
@@ -48,7 +49,8 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
 TextureUploadLayout    TextureCalcUploadLayout(Prospero::BufferFormat format, uint32_t width,
                                                uint32_t height, uint32_t levels, uint32_t depth,
                                                Prospero::TileMode tile_mode, uint64_t upload_size,
-                                               bool volume_texture, const char* owner);
+                                               bool allow_depth_tile, bool volume_texture,
+                                               const char* owner);
 std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayout& layout);
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,

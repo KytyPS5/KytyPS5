@@ -3,9 +3,11 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/DescriptorBudget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -24,6 +26,33 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+vk::PipelineCreateFlags ComputePipelineCreationFlags(bool cooperative_wave64) {
+	return cooperative_wave64 ? vk::PipelineCreateFlagBits::eDisableOptimization
+	                          : vk::PipelineCreateFlags {};
+}
+
+vk::ComputePipelineCreateInfo BuildComputePipelineCreateInfo(
+    const ShaderComputeInputInfo& input_info, vk::PipelineShaderStageCreateInfo stage,
+    vk::PipelineLayout layout) {
+	vk::ComputePipelineCreateInfo info {};
+	info.flags             = ComputePipelineCreationFlags(
+	    input_info.stage.program->compute_cooperative_wave64);
+	info.stage             = stage;
+	info.layout            = layout;
+	info.basePipelineIndex = -1;
+	return info;
+}
+
+bool ComputePipelineDisablesOptimizationForTest(bool cooperative_wave64) {
+	ShaderRecompiler::IR::CompiledShaderInfo program {};
+	program.compute_cooperative_wave64 = cooperative_wave64;
+	ShaderComputeInputInfo input_info {};
+	input_info.stage.program = &program;
+	const auto info = BuildComputePipelineCreateInfo(input_info, {}, nullptr);
+	return static_cast<VkPipelineCreateFlags>(info.flags) &
+	       VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+}
 
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
@@ -188,10 +217,31 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	uint32_t descriptor_count = 0;
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                   uint32_t fragment_color_attachments = 0) {
+	uint64_t descriptor_count = 0;
+	std::vector<DescriptorBudgetBinding> budget_bindings;
+	budget_bindings.reserve(bindings.size());
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
+		budget_bindings.push_back({static_cast<VkDescriptorType>(binding.descriptorType),
+		                           binding.descriptorCount,
+		                           static_cast<VkShaderStageFlags>(binding.stageFlags)});
+	}
+	// These are the final specialized native bindings: arrays include every storage mip,
+	// sampler clone, and auxiliary buffer, and graphics contains both VS and PS bindings.
+	const auto& limits = static_cast<const VkPhysicalDeviceLimits&>(
+	    graphics.GetPhysicalDeviceProperties().limits);
+	if (const auto failure = ValidateDescriptorBudget(budget_bindings, limits,
+	                                                  fragment_color_attachments)) {
+		const char* stage = failure->stage == VK_SHADER_STAGE_VERTEX_BIT ? "vertex"
+		                    : failure->stage == VK_SHADER_STAGE_FRAGMENT_BIT ? "fragment"
+		                    : failure->stage == VK_SHADER_STAGE_COMPUTE_BIT ? "compute"
+		                    : failure->stage == 0u ? "pipeline" : "other";
+		EXIT("Vulkan descriptor budget exceeded: limit=%s required=%" PRIu64
+		     " available=%" PRIu64 " stage=%s (0x%08x) type=%s\n",
+		     failure->limit_name, failure->required, failure->limit, stage,
+		     failure->stage, failure->resource_type);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
@@ -327,6 +377,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			}
 		}
 
+		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].AddTid());
+		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].SwizzleEnabled());
+
 		EXIT_IF(registers_num < 1 || registers_num > 4);
 	}
 
@@ -400,9 +453,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    GetBlendFactor(static_params.color_destblend[i]);
 		color_blend_attachment[i].colorBlendOp = GetBlendOp(static_params.color_comb_fcn[i]);
 		color_blend_attachment[i].srcAlphaBlendFactor =
-		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_srcblend[i])
-		         : color_blend_attachment[i].srcColorBlendFactor);
+		    (static_params.separate_alpha_blend[i] ? GetBlendFactor(static_params.alpha_srcblend[i])
+		                                           : color_blend_attachment[i].srcColorBlendFactor);
 		color_blend_attachment[i].dstAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
 		         ? GetBlendFactor(static_params.alpha_destblend[i])
@@ -471,6 +523,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
+	depth_stencil_info.depthBoundsTestEnable =
+#if defined(__APPLE__)
+	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
+#else
+	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
+#endif
+	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
+	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
@@ -489,8 +549,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
-	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
-	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
@@ -544,9 +602,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreateGraphicsPipelines failed: %s (device may be lost after TDR; cool down "
+		     "and retry)\n",
+		     vk::to_string(result).c_str());
+	}
+	EXIT_IF(pipeline.pipeline == nullptr);
 
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -600,22 +661,34 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
-	vk::ComputePipelineCreateInfo info {};
-	info.stage             = comp_shader_stage_info;
-	info.layout            = pipeline.pipeline_layout;
-	info.basePipelineIndex = -1;
+	const auto info = BuildComputePipelineCreateInfo(input_info, comp_shader_stage_info,
+	                                                 pipeline.pipeline_layout);
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
+	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p shader=0x%016" PRIx64
+	     " cooperative_wave64=%u flags=0x%x\n",
+	     static_cast<void*>(pipeline.pipeline_layout), input_info.stage.program->shader_hash,
+	     input_info.stage.program->compute_cooperative_wave64 ? 1u : 0u,
+	     static_cast<unsigned>(static_cast<VkPipelineCreateFlags>(info.flags)));
+	Log::Flush();
+	const auto pipeline_begin = Common::Timer::QueryPerformanceCounter();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	const auto pipeline_end = Common::Timer::QueryPerformanceCounter();
+	const auto frequency    = Common::Timer::QueryPerformanceFrequency();
+	const auto elapsed_ms =
+	    frequency == 0 ? 0 : (pipeline_end - pipeline_begin) * 1000u / frequency;
+	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p elapsed_ms=%" PRIu64
+	     "\n",
+	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline), elapsed_ms);
+	Log::Flush();
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreateComputePipelines failed: %s (device may be lost after TDR; cool down "
+		     "and retry)\n",
+		     vk::to_string(result).c_str());
+	}
+	EXIT_IF(pipeline.pipeline == nullptr);
 }
 
 } // namespace Libs::Graphics

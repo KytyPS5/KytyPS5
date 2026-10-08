@@ -3,13 +3,19 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
+#include <optional>
 #include <span>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+void BuildSrtPlan(Program& program);
 
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+using SrtMemoryRangeClamper = uint64_t (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -17,8 +23,51 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
-	std::span<const uint32_t> workgroup_counts;
+	// Actual guest dispatch counts before host wave partitioning. Absent for graphics
+	// and offline callers that cannot prove a dispatch-dependent snapshot's bound.
+	std::optional<std::array<uint32_t, 3>> compute_workgroups;
+	// False when indirect arguments can still be changed by queued GPU writes.
+	bool compute_workgroups_trusted = true;
+	// Explicit workgroup for bounded, dispatch-wide selector evaluation only.
+	std::optional<std::array<uint32_t, 3>> evaluation_workgroup_id;
+	// Optional renderer address-space query. A zero result means the requested
+	// base cannot be bound; a nonzero result is the contiguous mapped prefix.
+	SrtMemoryRangeClamper clamp_memory_range = nullptr;
+	// Dense finite-table candidates are native storage-buffer descriptors. The
+	// renderer supplies its actual stage/set ceiling; offline callers retain
+	// the conservative compiler policy. The final layout budget includes extras.
+	uint32_t max_dense_buffers = ShaderInfo::MaxBuffers;
+	// Expanded sampler candidates and numeric-class variants consume native
+	// descriptors independently of the original logical guest sampler count.
+	uint32_t max_native_samplers = ShaderInfo::MaxSamplers;
+	// Combined native image operands from independently bounded tables. Logical
+	// guest admission and each table's probe/candidate work budget stay separate.
+	uint32_t max_dense_images = ShaderInfo::MaxImages;
+	// Opt in only with coherent input reads and immutable-range writer checks.
+	// Offline callers otherwise keep the full wrapped-U32 selector domain.
+	bool capture_scalar_selector_values = false;
 };
+
+// A raw scalar read bounded by a loop guard or one actual dispatch axis.
+// offset_scale/index + offset_bias uses U32 arithmetic before separate signed
+// memory_offset addition/alignment, matching raw SMEM address evaluation.
+struct BoundedSrtReadProof {
+	Value index;
+	Value count;
+	Value address_low;
+	Value address_high;
+	Value descriptor_word2;
+	Value descriptor_word3;
+	uint32_t source_dwords = 2;
+	uint32_t offset_scale = 0;
+	uint32_t offset_bias = 0;
+	uint32_t memory_offset = 0;
+	uint32_t workgroup_axis = UINT32_MAX;
+	bool count_signed = false;
+};
+
+std::optional<BoundedSrtReadProof> ProveBoundedSrtRead(const Program& program,
+                                                       const Inst& read);
 
 enum class RuntimeValueType { Any, Integer };
 
@@ -26,21 +75,41 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
+                              const SrtRuntime& runtime, DescriptorValue& result);
+bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
+                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results);
+bool EvaluateBoundedDescriptorSource(const ResourcePlan& program, uint32_t source,
+                                     const SrtRuntime& runtime,
+                                     std::span<const BoundedSrtLayout> layouts,
+                                     std::span<const uint32_t> flattened_srt,
+                                     uint32_t candidate, DescriptorValue& result);
+bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
+                            const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
+                            std::vector<uint32_t>& flat,
+                            std::span<const uint8_t> clean_flat_slots);
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
-	          Value active_mask = {});
+	          Value active_mask = {}, std::span<const BoundedSrtLayout> bounded_layouts = {},
+	          std::span<const uint32_t> bounded_flat = {},
+	          std::optional<uint32_t> bounded_candidate = {});
 	~SrtWalker();
 	SrtWalker(const SrtWalker&)            = delete;
 	SrtWalker& operator=(const SrtWalker&) = delete;
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
-	// Refreshes reachable scalar reads and active descriptor sources in one walk.
-	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// An empty span means that all sources are active.
+	std::span<const uint8_t> FindActiveSources();
+	// Result of the latest FindActiveSources call on this plan. Empty means no
+	// control-flow proof and requires eager evaluation of every slot.
+	std::span<const uint8_t> ActiveFlatSlots() const { return m_program.active_flat_slots; }
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat,
+	                       std::span<const uint8_t> active_flat_slots = {});
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
@@ -57,7 +126,14 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	std::span<const BoundedSrtLayout> m_bounded_layouts;
+	std::span<const uint32_t>       m_bounded_flat;
+	std::optional<uint32_t>         m_bounded_candidate;
 	ResourcePlan::EvaluationContext& m_context;
+	std::string                     m_last_flat_error;
+
+public:
+	[[nodiscard]] const std::string& LastFlatError() const { return m_last_flat_error; }
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

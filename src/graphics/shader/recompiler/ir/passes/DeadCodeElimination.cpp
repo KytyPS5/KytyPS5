@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 
 #include <algorithm>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -25,7 +26,7 @@ void EliminateDeadCode(const BlockList& blocks) {
 		for (auto& inst: *block) {
 			// Retained resource-planning instructions live outside the block list.
 			inst.live = inst.MayHaveSideEffects() || std::ranges::any_of(inst.Uses(),
-			    [](const Use& use) { return use.user->Parent() == nullptr; });
+			    [](const Use& use) { return use.user != nullptr && use.user->Parent() == nullptr; });
 			if (inst.live) pending.push_back(&inst);
 		}
 	}

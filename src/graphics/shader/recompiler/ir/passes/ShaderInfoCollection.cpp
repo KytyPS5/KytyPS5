@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -143,7 +144,6 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							}
 							break;
 						case StageInputKind::BaryCoordSmooth:
-						case StageInputKind::BaryCoordSmoothSample:
 						case StageInputKind::BaryCoordSmoothCentroid:
 						case StageInputKind::BaryCoordNoPerspective:
 							if (component >= 2u) {
@@ -300,9 +300,6 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 					break;
 				case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
 				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
-				case StageInputKind::BaryCoordSmoothSample:
-					AddInput(info, StageInputKind::SampleId, 0, 1, "gl_SampleID");
-					[[fallthrough]];
 				case StageInputKind::BaryCoordSmooth:
 				case StageInputKind::BaryCoordSmoothCentroid:
 					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
@@ -390,24 +387,49 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 					AddOutput(info, StageOutputKind::Parameter, export_info.index,
 					          export_info.index, fmt::format("out_param_{}", export_info.index));
 					break;
-				case ExportTargetKind::Mrt: {
+				case ExportTargetKind::Mrt:
 					if (alpha_remap && export_info.index != 0) {
 						break;
 					}
-					const auto slot = input_info.pixel->dual_source_blending
-					                      ? 0u : ShaderPixelExportTarget(input_info.pixel->target_shader_mask,
-					                                                    export_info.index);
-					if (slot >= 8) {
-						break;
-					}
-					AddOutput(info, StageOutputKind::Mrt, export_info.index, slot,
+					AddOutput(info, StageOutputKind::Mrt, export_info.index, export_info.index,
 					          fmt::format("out_mrt_{}", export_info.index));
 					if (alpha_remap) {
-						AddOutput(info, StageOutputKind::Mrt, 1, 0, "out_mrt_1");
+						AddOutput(info, StageOutputKind::Mrt, 1, 1, "out_mrt_1");
 					}
 					break;
-				}
 				default: break;
+			}
+		}
+	}
+	if (program.stage == ShaderType::Vertex) {
+		const auto* vertex = input_info.vertex;
+		if (vertex->linked_param_count > ShaderVertexInputInfo::PARAM_LINK_MAX) {
+			return Fail("vertex parameter link count is out of range");
+		}
+		std::array<bool, ShaderVertexInputInfo::PARAM_LINK_MAX> exported_sources {};
+		for (const auto& output: info.outputs) {
+			if (output.kind == StageOutputKind::Parameter &&
+			    output.index < exported_sources.size()) {
+				exported_sources[output.index] = true;
+			}
+		}
+		for (uint32_t link = 0; link < vertex->linked_param_count; ++link) {
+			const auto source   = vertex->linked_param_sources[link];
+			const auto location = vertex->linked_param_locations[link];
+			if (source >= 32u || location >= 32u) {
+				return Fail("vertex parameter link is out of range");
+			}
+			const auto declared = std::ranges::any_of(info.outputs, [&](const auto& output) {
+				return output.kind == StageOutputKind::Parameter && output.index == source &&
+				       output.location == location;
+			});
+			if (!declared) {
+				std::erase_if(info.outputs, [&](const auto& output) {
+					return output.kind == StageOutputKind::Parameter && output.location == location;
+				});
+				const auto output_index = exported_sources[source] ? source : 32u + source;
+				info.outputs.push_back({StageOutputKind::Parameter, output_index, location,
+				                        fmt::format("out_param_{}_loc_{}", source, location)});
 			}
 		}
 	}
@@ -423,7 +445,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	ValidateOptions(program, input_info);
 	ValidateValueReferences(program, input_info);
 
-	auto& next = program.info;
+	auto next = program.info;
 	next.inputs.clear();
 	next.outputs.clear();
 	next.has_bitwise_xor =
@@ -444,6 +466,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	CollectBuiltinInputs(program, next);
 	CollectOutputs(program, input_info, next);
+	program.info                 = std::move(next);
 	program.shader_info_complete = true;
 }
 

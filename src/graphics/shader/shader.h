@@ -73,6 +73,20 @@ struct ShaderClipSpaceTransform {
 	bool  enabled        = false;
 };
 
+// Unknown is distinct from a known zero register value, particularly for old
+// offline manifests which did not capture the initial guest FP controls.
+struct ShaderFloatingPointState {
+	bool    known      = false;
+	uint8_t float_mode = 0;
+	bool    ieee_mode  = false;
+	bool    dx10_clamp = false;
+
+	[[nodiscard]] uint32_t StaticKey() const {
+		return known ? 0x10000u | float_mode | (uint32_t(ieee_mode) << 8u) |
+		                   (uint32_t(dx10_clamp) << 9u) : 0u;
+	}
+};
+
 struct ShaderWorkgroupInputInfo {
 	uint32_t threads_num[3]      = {0, 0, 0};
 	uint32_t lds_size_dwords     = 0;
@@ -88,7 +102,6 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_vertices         = 0;
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
-	bool     fast_launch          = false;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -125,12 +138,14 @@ struct ShaderTessellationInputInfo {
 
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
+	static constexpr uint32_t PARAM_LINK_MAX = 32;
 
 	ShaderBufferResource    resources[RES_MAX];
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
-	ShaderType                  logical_stage        = ShaderType::Vertex;
+	ShaderFloatingPointState initial_fp_state;
+	ShaderType              logical_stage        = ShaderType::Vertex;
 	int                     resources_num       = 0;
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
@@ -138,6 +153,9 @@ struct ShaderVertexInputInfo {
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	uint32_t                linked_param_sources[PARAM_LINK_MAX]   = {};
+	uint32_t                linked_param_locations[PARAM_LINK_MAX] = {};
+	uint32_t                linked_param_count                     = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
@@ -146,12 +164,12 @@ struct ShaderVertexInputInfo {
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
+	bool needs_lds_barriers = false;
+	ShaderFloatingPointState initial_fp_state;
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
-	uint32_t           workgroup_counts[3]        = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
-	bool               lds_storage                = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
@@ -161,17 +179,17 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
 
 struct ShaderPixelInputInfo {
+	ShaderFloatingPointState initial_fp_state;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       wave_size                    = 64;
 	uint32_t                                       ps_system_input_base         = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
-	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
-	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	std::array<Prospero::BufferFormat, 8> target_conversion_format = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
@@ -185,8 +203,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
-	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
-	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
+	ShaderAlphaBlendSource                         alpha_blend_source           = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
@@ -311,7 +328,6 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
-uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

@@ -41,6 +41,10 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16_16UInt, 4, 0, 4, true, true},
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
+	// Packed normalized loads use a same-width raw integer view and shader decoding.
+	// Color exports use explicit normalized packing into the same raw backing.
+	{BufferFormat::k11_11_10UNorm, 4, 0, 4, true, true},
+	{BufferFormat::k10_11_11UNorm, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},
@@ -218,6 +222,10 @@ uint32_t RenderTargetBytesPerElement(BufferFormat format) {
 	return info != nullptr ? info->render_target_bytes_per_element : 0;
 }
 
+bool IsKnownFormat(BufferFormat format) {
+	return FindFormatInfo(format) != nullptr;
+}
+
 bool IsFmaskTextureFormat(BufferFormat format) {
 	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }
@@ -238,6 +246,8 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
 		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
+		case BufferFormat::k11_11_10UNorm:
+		case BufferFormat::k10_11_11UNorm: return BufferFormat::k32UInt;
 		default: return format;
 	}
 }

@@ -307,6 +307,106 @@ void RunTest(void (*test_func)()) {
 	}
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct MisalignedSysvHostEntryState {
+	uintptr_t sysv_entry_rsp = 0;
+	bool      called         = false;
+	uintptr_t sysv_body_rsp  = 0;
+	uintptr_t ms_entry_rsp   = 0;
+};
+[[gnu::naked]] static KYTY_MS_ABI uintptr_t CaptureMsAbiEntryRsp() {
+	asm volatile("movq %rsp, %rax\n\t"
+	             "retq");
+}
+
+[[gnu::noinline]] static KYTY_SYSV_ABI void MisalignedSysvHostEntryTarget(
+    MisalignedSysvHostEntryState* state) {
+	asm volatile("movq %%rsp, %0" : "=r"(state->sysv_body_rsp) : : "memory");
+	state->ms_entry_rsp = CaptureMsAbiEntryRsp();
+	asm volatile("" : : : "memory");
+	state->called = true;
+}
+
+void TestWindowsMisalignedSysvHostEntry() {
+	const char* test = "WindowsMisalignedSysvHostEntry";
+	constexpr uint64_t code_size = 0x4000;
+
+	const auto mapping = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, code_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "misaligned_sysv_host_entry_test");
+	Check(test, mapping != 0, "failed to allocate executable trampoline");
+
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+
+	constexpr int xmm_save_size = 10 * 16;
+
+	// This trampoline itself is entered with the Windows x64 ABI. Preserve Windows
+	// nonvolatile state that a SysV callee may clobber while keeping the total stack
+	// reservation a multiple of 16. RSP remains 8 mod 16 before CALL, so CALL enters
+	// the SysV target at 0 mod 16 instead of the expected 8 mod 16.
+	code.push(code.rdi);
+	code.push(code.rsi);
+	code.sub(code.rsp, xmm_save_size);
+	code.movdqu(code.ptr[code.rsp + 0x00], code.xmm6);
+	code.movdqu(code.ptr[code.rsp + 0x10], code.xmm7);
+	code.movdqu(code.ptr[code.rsp + 0x20], code.xmm8);
+	code.movdqu(code.ptr[code.rsp + 0x30], code.xmm9);
+	code.movdqu(code.ptr[code.rsp + 0x40], code.xmm10);
+	code.movdqu(code.ptr[code.rsp + 0x50], code.xmm11);
+	code.movdqu(code.ptr[code.rsp + 0x60], code.xmm12);
+	code.movdqu(code.ptr[code.rsp + 0x70], code.xmm13);
+	code.movdqu(code.ptr[code.rsp + 0x80], code.xmm14);
+	code.movdqu(code.ptr[code.rsp + 0x90], code.xmm15);
+
+	code.mov(code.rdi, code.rcx);
+	code.mov(code.rax, code.rsp);
+	code.sub(code.rax, 8);
+	code.mov(code.qword[code.rdi], code.rax);
+	code.mov(code.rax, reinterpret_cast<uint64_t>(&MisalignedSysvHostEntryTarget));
+	code.call(code.rax);
+
+	code.movdqu(code.xmm6, code.ptr[code.rsp + 0x00]);
+	code.movdqu(code.xmm7, code.ptr[code.rsp + 0x10]);
+	code.movdqu(code.xmm8, code.ptr[code.rsp + 0x20]);
+	code.movdqu(code.xmm9, code.ptr[code.rsp + 0x30]);
+	code.movdqu(code.xmm10, code.ptr[code.rsp + 0x40]);
+	code.movdqu(code.xmm11, code.ptr[code.rsp + 0x50]);
+	code.movdqu(code.xmm12, code.ptr[code.rsp + 0x60]);
+	code.movdqu(code.xmm13, code.ptr[code.rsp + 0x70]);
+	code.movdqu(code.xmm14, code.ptr[code.rsp + 0x80]);
+	code.movdqu(code.xmm15, code.ptr[code.rsp + 0x90]);
+	code.add(code.rsp, xmm_save_size);
+	code.pop(code.rsi);
+	code.pop(code.rdi);
+	code.ret();
+
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+	      "failed to flush generated trampoline");
+
+	using Trampoline = void (*)(MisalignedSysvHostEntryState*);
+	MisalignedSysvHostEntryState state {};
+	reinterpret_cast<Trampoline>(mapping)(&state);
+
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, code_size);
+
+	Check(test, state.called, "misaligned SysV target was not called");
+	Check(test, (state.sysv_entry_rsp & 0x0f) == 0x00,
+	      "trampoline did not enter the SysV target with a misaligned stack");
+	Check(test, (state.ms_entry_rsp & 0x0f) == 0x08,
+	      "SysV host entry propagated a misaligned stack into an MS ABI call");
+	Check(test, freed, "failed to free generated trampoline");
+
+	std::printf(
+	    "[host]    %-48s entry_mod16=%zu body_mod16=%zu ms_mod16=%zu ok\n", test,
+	    static_cast<size_t>(state.sysv_entry_rsp & 0x0f),
+	    static_cast<size_t>(state.sysv_body_rsp & 0x0f),
+	    static_cast<size_t>(state.ms_entry_rsp & 0x0f));
+}
+#else
+void TestWindowsMisalignedSysvHostEntry() {
+	std::printf("[host]    %-48s skipped\n", "WindowsMisalignedSysvHostEntry");
+}
+#endif
 VirtualQueryInfo Query(const char* test, uint64_t addr, int flags = 0) {
 	VirtualQueryInfo info {};
 	const int ret = Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(addr),
@@ -941,6 +1041,65 @@ void TestFlexibleMemoryReuseIsZeroFilled() {
 	        "KernelMunmap(reuse)");
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "zero-fill test leaked flexible backing capacity");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectMemoryReuseIsZeroFilled() {
+	const char*       test    = "DirectMemoryReuseIsZeroFilled";
+	constexpr uint64_t MapSize = SceKernelPageSize * 2;
+	constexpr uint8_t Poison   = 0xa5;
+	const auto        direct   = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+
+	int64_t source_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, direct, MapSize, SceKernelPageSize, SceKernelMtypeC,
+	            &source_phys),
+	        "KernelAllocateDirectMemory(source)");
+
+	// Direct memory is physical: unmapping keeps the contents, so the bytes stay in the
+	// backing store while the range sits in the physical free list.
+	void* source = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &source, MapSize, SceKernelProtCpuRw, 0, source_phys, SceKernelPageSize,
+	            "direct_zero_source"),
+	        "KernelMapNamedDirectMemory(source)");
+	std::memset(source, Poison, MapSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(source), MapSize),
+	        "KernelMunmap(source)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(source_phys, MapSize),
+	        "KernelCheckedReleaseDirectMemory(source)");
+
+	// Searching from the released address makes the reuse deterministic: the freed range is
+	// the first one the allocator can hand back.
+	int64_t reused_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            source_phys, direct, MapSize, SceKernelPageSize, SceKernelMtypeC, &reused_phys),
+	        "KernelAllocateDirectMemory(reuse)");
+	Check(test, reused_phys == source_phys,
+	      "released direct range was not reused, so the zero-fill went untested");
+
+	void* reused = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &reused, MapSize, SceKernelProtCpuRw, 0, reused_phys, SceKernelPageSize,
+	            "direct_zero_reuse"),
+	        "KernelMapNamedDirectMemory(reuse)");
+	const auto* bytes = reinterpret_cast<const uint8_t*>(reused);
+	Check(test,
+	      std::all_of(bytes, bytes + MapSize, [](uint8_t value) { return value == 0; }),
+	      "reused direct backing exposed stale bytes");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(reused), MapSize),
+	        "KernelMunmap(reuse)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(reused_phys, MapSize),
+	        "KernelCheckedReleaseDirectMemory(reuse)");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -3202,6 +3361,89 @@ void TestProgramMemoryAllocationAndProtection() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestGpuTrackingPreservesExecutablePages() {
+  const char* test = "GpuTrackingPreservesExecutablePages";
+  using Common::VirtualMemory::Mode;
+  constexpr uint64_t size = SceKernelPageSize * 3;
+  const auto base = Libs::LibKernel::Memory::AllocateProgramMemory(
+      0, size, Mode::ExecuteReadWrite, "synthetic_exec_tracking");
+  Check(test, base != 0, "synthetic executable allocation failed");
+  const auto host_protection = [&](uint64_t address) {
+    MEMORY_BASIC_INFORMATION info {};
+    Check(test, VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0,
+          "host protection query failed");
+    return info.Protect;
+  };
+  const uint8_t function[] = {0xb8, 0x2a, 0, 0, 0, 0xc3}; // return 42
+  std::memcpy(reinterpret_cast<void*>(base), function, sizeof(function));
+  Check(test, FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(base),
+                                    sizeof(function)) != FALSE,
+        "synthetic instruction cache flush failed");
+  Check(test, host_protection(base) == PAGE_EXECUTE_READWRITE,
+        "synthetic executable baseline is not executable");
+  const auto read_only = [&](uint64_t address, uint64_t bytes) {
+    Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(address, bytes, Mode::Read),
+          "temporary read tracking failed");
+  };
+  read_only(base, size);
+  Check(test, host_protection(base) == PAGE_EXECUTE_READ,
+        "GPU write tracking removed executable permission from guest code");
+  Check(test, reinterpret_cast<uint32_t(*)()>(base)() == 42u,
+        "write-tracked synthetic code returned a wrong value");
+  Check(test, Query(test, base).protection ==
+                  (SceKernelProtCpuRead | SceKernelProtCpuRw | SceKernelProtCpuExec),
+        "temporary tracking changed semantic guest permissions");
+  Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size, Mode::NoAccess),
+        "temporary read tracking failed");
+  Check(test, host_protection(base) == PAGE_NOACCESS,
+        "read tracking failed to prohibit access");
+  read_only(base, size);
+  Check(test, host_protection(base) == PAGE_EXECUTE_READ,
+        "restoring read access lost the executable baseline after NoAccess");
+  Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size, Mode::ReadWrite),
+        "tracking release failed");
+  Check(test, host_protection(base) == PAGE_EXECUTE_READWRITE,
+        "tracking release failed to restore executable permission");
+
+  // Permanently revoke execution from the middle page, then track the mixed
+  // span. Permission restoration must follow current semantics for each part.
+  Check(test, Libs::LibKernel::Memory::ProtectGuestMemory(
+                  base + SceKernelPageSize, SceKernelPageSize, Mode::ReadWrite),
+        "permanent partial permission change failed");
+  read_only(base, size);
+  Check(test, host_protection(base) == PAGE_EXECUTE_READ &&
+                  host_protection(base + SceKernelPageSize) == PAGE_READONLY &&
+                  host_protection(base + SceKernelPageSize * 2) == PAGE_EXECUTE_READ,
+        "mixed tracking span lost execution or granted it to nonexecutable data");
+  Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size, Mode::NoAccess) &&
+                  Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size, Mode::ReadWrite),
+        "mixed tracking span release failed");
+  Check(test, host_protection(base) == PAGE_EXECUTE_READWRITE &&
+                  host_protection(base + SceKernelPageSize) == PAGE_READWRITE &&
+                  host_protection(base + SceKernelPageSize * 2) == PAGE_EXECUTE_READWRITE,
+        "tracking release restored execution that had been revoked");
+  Check(test, Libs::LibKernel::Memory::FreeGuestMemory(base, size),
+        "synthetic executable cleanup failed");
+
+  const auto data = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+      0, SceKernelPageSize, Mode::ReadWrite, "synthetic_data_tracking");
+  Check(test, data != 0, "synthetic nonexecutable allocation failed");
+  read_only(data, SceKernelPageSize);
+  Check(test, host_protection(data) == PAGE_READONLY,
+        "temporary tracking granted execution to data");
+  Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(data, SceKernelPageSize,
+                                                            Mode::ReadWrite),
+        "data tracking release failed");
+  Check(test, host_protection(data) == PAGE_READWRITE,
+        "data tracking release granted execution");
+  Check(test, Libs::LibKernel::Memory::FreeGuestMemory(data, SceKernelPageSize),
+        "synthetic data cleanup failed");
+  std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
@@ -4416,21 +4658,11 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
-	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
-		RunTest(TestConcurrentBackingReads);
-		RunTest(TestBackingReadExcludesWritesAndUnmap);
-		RunTest(TestSparseBackingReadPreservesResidency);
-		RunTest(TestSparseReadDuringDirectCommit);
-		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
-		RunTest(TestFlexibleMemoryUsesSharedBacking);
-		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
-		return g_failed_tests == 0 ? 0 : 1;
-	}
-#if defined(__linux__)
-	if (argc == 2 && std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
-		RunTest(TestFixedDirectReplacementPreservesAccess);
-		return g_failed_tests == 0 ? 0 : 1;
-	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-executable-protection-only") == 0) {
+    RunTest(TestGpuTrackingPreservesExecutablePages);
+    return g_failed_tests == 0 ? 0 : 1;
+  }
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
@@ -4454,6 +4686,12 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--sysv-align-only") == 0) {
+		RunTest(TestWindowsMisalignedSysvHostEntry);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -4469,6 +4707,7 @@ int main(int argc, char** argv) {
 	RunTest(TestPackedBitFieldInsert);
 	RunTest(TestCpuExtensionPatches);
 #endif
+	RunTest(TestWindowsMisalignedSysvHostEntry);
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
@@ -4483,6 +4722,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+	RunTest(TestDirectMemoryReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
@@ -4533,6 +4773,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolMultiRangeDecommit);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestGpuTrackingPreservesExecutablePages);
+#endif
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 
 	if (g_failed_tests != 0) {

@@ -20,12 +20,6 @@ struct MimgGatherInfo {
 	uint32_t flags    = 0;
 };
 
-struct MimgAtomicInfo {
-	uint32_t encoding    = 0;
-	Opcode   decoded     = Opcode::UNSUPPORTED;
-	bool     supports_64 = false;
-};
-
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
 	switch (dim) {
 		case 0u: return ImageDimension::Dim1D;
@@ -185,28 +179,29 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x44u, Opcode::IMAGE_GATHER4_L, ImageSampleFlagLod},
     {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
     {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
+    {0x4cu, Opcode::IMAGE_GATHER4_C_L,
+     ImageSampleFlagCompare | ImageSampleFlagLod},
     {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero},
     {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
      ImageSampleFlagLevelZero | ImageSampleFlagOffset},
     {0x58u, Opcode::IMAGE_GATHER4_C_O,
      ImageSampleFlagCompare | ImageSampleFlagOffset},
+    {0x5cu, Opcode::IMAGE_GATHER4_C_L_O,
+     ImageSampleFlagCompare | ImageSampleFlagLod | ImageSampleFlagOffset},
     {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
     {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
 };
 
-constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
-    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP, true},
-    {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
-    {0x11u, Opcode::IMAGE_ATOMIC_ADD, true},
-    {0x14u, Opcode::IMAGE_ATOMIC_SMIN},
-    {0x15u, Opcode::IMAGE_ATOMIC_UMIN, true},
-    {0x16u, Opcode::IMAGE_ATOMIC_SMAX},
-    {0x17u, Opcode::IMAGE_ATOMIC_UMAX, true},
-    {0x18u, Opcode::IMAGE_ATOMIC_AND, true},
-    {0x19u, Opcode::IMAGE_ATOMIC_OR, true},
-    {0x1au, Opcode::IMAGE_ATOMIC_XOR, true},
+constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
+    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
+    {0x11u, Opcode::IMAGE_ATOMIC_ADD},
+    {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
+    {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
+    {0x18u, Opcode::IMAGE_ATOMIC_AND},
+    {0x19u, Opcode::IMAGE_ATOMIC_OR},
+    {0x1au, Opcode::IMAGE_ATOMIC_XOR},
     {0x1eu, Opcode::IMAGE_ATOMIC_FMIN},
     {0x1fu, Opcode::IMAGE_ATOMIC_FMAX},
 };
@@ -216,7 +211,7 @@ constexpr auto MIMG_GATHER_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_GATHER_OPCO
 constexpr auto MIMG_ATOMIC_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_ATOMIC_OPCODE_LIST);
 
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                        const MimgAtomicInfo* atomic) {
+                        const Detail::OpcodeMap* atomic) {
 	if (sample != nullptr) {
 		return Opcode::IMAGE_SAMPLE;
 	}
@@ -234,8 +229,6 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
-		case 0xe6u:
-		case 0xe7u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -252,7 +245,7 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const MimgAtomicInfo* atomic) {
+                                     const Detail::OpcodeMap* atomic) {
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -264,8 +257,6 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 	}
 
 	switch (opcode) {
-		case 0xe6u: return 11u;
-		case 0xe7u: return 12u;
 		case 0x0eu: return 1u;
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
@@ -368,29 +359,10 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "MIMG image gather requires exactly one dmask bit");
 	}
-	if (atomic != nullptr) {
-		const bool compare_swap = inst.opcode == Opcode::IMAGE_ATOMIC_CMPSWAP;
-		const auto mask32       = compare_swap ? 0x3u : 0x1u;
-		const auto mask64       = compare_swap ? 0xfu : 0x3u;
-		if (inst.dmask != mask32 && inst.dmask != mask64) {
-			SetUnsupported(inst, Family::MIMG, opcode, "MIMG image atomic has invalid DMASK");
-		} else if (inst.dmask == mask64) {
-			inst.data_bits = 64u;
-			if (!atomic->supports_64) {
-				SetUnsupported(inst, Family::MIMG, opcode,
-				               "MIMG 64-bit image atomic opcode is not implemented");
-			}
-		}
-	}
 	const bool supports_d16 = sample != nullptr || gather != nullptr || opcode == 0x00u ||
 	                          opcode == 0x01u || opcode == 0x08u || opcode == 0x09u;
 	if (d16 && !supports_d16) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
-	}
-	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY &&
-	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
-		SetUnsupported(inst, Family::MIMG, opcode,
-		               "BVH intersection requires full-float ray DWORDs and R128/dmask:0xf");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

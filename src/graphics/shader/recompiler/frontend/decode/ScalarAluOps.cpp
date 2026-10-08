@@ -46,15 +46,12 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x09u, Opcode::S_WQM_B32},
     {0x0au, Opcode::S_WQM_B64},
     {0x0bu, Opcode::S_BREV_B32},
-    {0x0cu, Opcode::S_BREV_B64},
     {0x0fu, Opcode::S_BCNT1_I32_B32},
     {0x10u, Opcode::S_BCNT1_I32_B64},
     {0x13u, Opcode::S_FF1_I32_B32},
     {0x14u, Opcode::S_FF1_I32_B64},
     {0x15u, Opcode::S_FLBIT_I32_B32},
     {0x16u, Opcode::S_FLBIT_I32_B64},
-    {0x19u, Opcode::S_SEXT_I32_I8},
-    {0x1au, Opcode::S_SEXT_I32_I16},
     {0x1bu, Opcode::S_BITSET0_B32},
     {0x1cu, Opcode::S_BITSET0_B64},
     {0x1du, Opcode::S_BITSET1_B32},
@@ -88,7 +85,7 @@ constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
     {0x08u, Opcode::S_CMP_LE_I32}, {0x09u, Opcode::S_CMP_EQ_U32}, {0x0au, Opcode::S_CMP_LG_U32},
     {0x0bu, Opcode::S_CMP_GT_U32}, {0x0cu, Opcode::S_CMP_GE_U32}, {0x0du, Opcode::S_CMP_LT_U32},
     {0x0eu, Opcode::S_CMP_LE_U32}, {0x0fu, Opcode::S_ADD_I32},    {0x10u, Opcode::S_MULK_I32},
-    {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT_VSCNT}, {0x18u, Opcode::S_WAITCNT},
+    {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT},    {0x18u, Opcode::S_WAITCNT},
     {0x19u, Opcode::S_WAITCNT},    {0x1au, Opcode::S_WAITCNT},
     {0x1bu, Opcode::S_SUBVECTOR_LOOP_BEGIN}, {0x1cu, Opcode::S_SUBVECTOR_LOOP_END},
 };
@@ -111,7 +108,6 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x12u, Opcode::S_TRAP},
     {0x16u, Opcode::S_TTRACEDATA},
     {0x17u, Opcode::S_CBRANCH_CDBGSYS},
-    {0x19u, Opcode::S_CBRANCH_CDBGSYS_OR_USER},
     {0x20u, Opcode::S_INST_PREFETCH},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
 };
@@ -236,14 +232,6 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			inst.src_count         = 1;
 			return;
 		}
-		case Opcode::S_WAITCNT_VSCNT:
-			inst.dst.kind       = OperandKind::Null;
-			inst.src1           = inst.src0;
-			inst.src1.value     = word & 0xffffu;
-			inst.src1.signed_val = static_cast<int32_t>(inst.src1.value);
-			DecodeScalarSource(sdst, pc, inst.src0);
-			inst.src_count = 2;
-			return;
 		case Opcode::S_SETREG_B32:
 			inst.dst.kind        = OperandKind::Null;
 			inst.src1.kind       = OperandKind::LiteralConstant;

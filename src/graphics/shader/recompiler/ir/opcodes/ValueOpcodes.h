@@ -9,7 +9,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-enum class ValueOpcode : uint16_t {
+enum class ValueOpcode {
 #define VALUE_OPCODE(name, ...) name,
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
 #undef VALUE_OPCODE
@@ -43,6 +43,13 @@ struct DppMoveFlags {
 };
 static_assert(sizeof(DppMoveFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<DppMoveFlags>);
+
+struct Dpp8MoveFlags {
+	uint32_t lane_selectors = 0;
+	bool     fetch_inactive = false;
+};
+static_assert(sizeof(Dpp8MoveFlags) <= sizeof(uint64_t));
+static_assert(std::is_trivially_copyable_v<Dpp8MoveFlags>);
 
 struct PermlaneFlags {
 	bool x16            = false;

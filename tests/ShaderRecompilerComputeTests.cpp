@@ -27416,6 +27416,30 @@ TestCase VectorVop3CmpxWritesExecMask() {
           {O::V_MOV_B32, O::V_CMPX_LT_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorCmpxPreservesVcc() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 0, 2);
+  AppendVMovU32(&code, 1, 1);
+  code.push_back(EncodeVopc(0xc4, Vgpr(0), 1));
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  code.push_back(EncodeVopc(0xd1, Vgpr(0), 1));
+  code.push_back(EncodeSop1(0x04, 12, 126));
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+  AppendStoreVgpr(&code, 2, 0);
+  AppendStoreSgprPair(&code, 12, 1);
+  AppendEnd(&code);
+
+  return {"VectorCmpxPreservesVcc",
+          code,
+          {},
+          {1, 0, 0},
+          {O::V_MOV_B32, O::V_CMP_GT_U32, O::V_CMPX_LT_U32, O::S_MOV_B64,
+           O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase VectorVopcSdwaCmpxWritesExecMask() {
   using O = ShaderOpcode;
 
@@ -36542,6 +36566,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpxOrderedCapturedExecMask);
   AddCase(VectorVop3FloatCompareNegSourceModifier);
   AddCase(VectorVop3CmpxWritesExecMask);
+  AddCase(VectorCmpxPreservesVcc);
   AddCase(VectorVopcSdwaCmpxWritesExecMask);
   AddCase(VectorVopcCmpxGtU16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxLtU16CapturedSdwaExecMask);
@@ -42096,6 +42121,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVopcCmpxGtU16CapturedSdwaExecMask());
     RunCase(&vulkan, VectorVopcSdwaCmpxWritesExecMask());
     RunCase(&vulkan, VectorVop3CmpxWritesExecMask());
+    RunCase(&vulkan, VectorCmpxPreservesVcc());
     RunCase(&vulkan, VectorVopcSdwaCmpxClassF32CapturedExecMask());
     return 0;
   }

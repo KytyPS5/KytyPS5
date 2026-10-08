@@ -115,6 +115,10 @@
 
 namespace Libs::Graphics {
 
+std::vector<uint32_t> OptimizeShaderSpirvForTest(
+    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization,
+    bool cooperative_wave64);
+
 template <typename Cache>
 concept HasGetDownloadBuffer =
     requires(Cache &cache) { cache.GetDownloadBuffer(uint64_t{1}); };
@@ -1375,6 +1379,7 @@ struct TestCase {
   std::vector<std::string> forbidden_spirv;
   std::vector<std::pair<std::string, size_t>> spirv_counts;
   size_t max_spirv_words = 0;
+  bool optimize_spirv = false;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1866,6 +1871,15 @@ CompiledShader CompileCase(const TestCase &test,
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
+  if (test.optimize_spirv) {
+    const auto execution=ShaderRecompiler::PlanComputeExecution(result.program,options.input_info,workgroup_limits);
+    Require(test.name,"optimization execution plan",execution.error.empty(),execution.error);
+    const auto original_words=result.spirv.size();
+    result.spirv=OptimizeShaderSpirvForTest(result.spirv,Config::ShaderOptimizationType::Performance,
+                                         execution.IsCooperativeWave64());
+    std::printf("[optimization] %s cooperative=%u words=%zu->%zu\n",test.name,
+                execution.IsCooperativeWave64(),original_words,result.spirv.size());
+  }
   ValidateSpirv(test.name, result.spirv);
   if (test.max_spirv_words != 0) {
     std::printf("[code-size] %s words=%zu budget=%zu\n", test.name,
@@ -49472,6 +49486,17 @@ if (argc == 1) {
     test.fragment_code[test.fragment_code.size()-3u]=EncodeExp0(0u,1u);
     (void)CompileFragmentCase(test);
     return 1;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--performance-optimization-readback-only") == 0) {
+    VulkanHarness vulkan;
+    for(auto test : {CompactBoundedBufferMetadata(),CompactBoundedBufferMetadata(true),
+                    FormattedBufferExecCountGuard(2u,15u,64u),
+                    FormattedBufferExecCountGuard(2u,5u,64u),
+                    VectorMadF32CooperativeChainBudget()}) {
+      test.optimize_spirv=true;
+      RunCase(&vulkan,test);
+    }
+    return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--compact-bounded-metadata-only") == 0) {
     CheckCompactBoundedBufferMetadata();return 0;

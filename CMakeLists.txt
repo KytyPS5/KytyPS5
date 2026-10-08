@@ -704,6 +704,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME shader_performance_optimization_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --performance-optimization-readback-only)
+	set_tests_properties(shader_performance_optimization_readback PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	add_test(NAME compact_bounded_metadata
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compact-bounded-metadata-only)
 	add_test(NAME compact_bounded_metadata_gpu

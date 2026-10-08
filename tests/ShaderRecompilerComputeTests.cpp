@@ -18293,7 +18293,9 @@ private:
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     m_rasterization_supported = available_features.fillModeNonSolid &&
+#if !defined(__APPLE__)
                                 available_features.depthClamp &&
+#endif
                                 available_features.tessellationShader &&
                                 available_features.depthBounds &&
                                 available_depth_clip.depthClipEnable &&
@@ -18379,7 +18381,9 @@ private:
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+#if !defined(__APPLE__)
     device_features.depthClamp = m_rasterization_supported;
+#endif
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,

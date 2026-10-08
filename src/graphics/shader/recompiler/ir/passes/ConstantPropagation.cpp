@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -115,6 +116,24 @@ bool FoldSelect(Inst& inst) {
 	if (true_value == false_value) {
 		Replace(inst, true_value);
 		return true;
+	}
+	// select(c, select(c, a, b), d) == select(c, a, d); likewise for the false arm. Exec-predicated
+	// VGPR writes nest this way when a consumer re-applies the same exec mask.
+	const auto nested_arm = [&](const Value& arm, bool true_arm) -> std::optional<Value> {
+		const auto* nested = arm.TryInstruction();
+		if (nested == nullptr || nested->GetOpcode() != inst.GetOpcode() ||
+		    nested->NumArgs() != 3u || Arg(*nested, 0) != condition) {
+			return std::nullopt;
+		}
+		return Arg(*nested, true_arm ? 1u : 2u);
+	};
+	if (const auto arm = nested_arm(true_value, true); arm.has_value()) {
+		inst.SetArg(1, *arm);
+		return FoldSelect(inst);
+	}
+	if (const auto arm = nested_arm(false_value, false); arm.has_value()) {
+		inst.SetArg(2, *arm);
+		return FoldSelect(inst);
 	}
 	return false;
 }

@@ -34196,8 +34196,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+  AppendVMovU32(&code, 20, 1); // Constant +1 X texel offset (a SPIR-V ConstOffset).
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -34208,7 +34207,10 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   AppendEnd(&code);
 
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+  // The sampled texel is (2, 1); the +1 X offset must move the fetch to (3, 1).
+  SetRgbaPixel(&image, 4, 2, 1, 0x41100000u, 0x41100000u, 0x41100000u,
+               0x41100000u);
+  SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
@@ -34218,8 +34220,81 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
+  test.required_spirv = {"UnpackHalf2x16", "ConstOffset"};
   test.forbidden_spirv = {"OpBitFieldSExtract"};
+  return test;
+}
+
+// IMAGE_SAMPLE_LZ_O must apply its texel offsets: a constant in Vulkan's ConstOffset range,
+// a constant outside it and a runtime offset (v0 is the thread id). Runtime offsets of
+// IMAGE_SAMPLE_L_O with a LOD past the last level and of IMAGE_SAMPLE_D_O move by texels of
+// the level the sample reads.
+TestCase ImageSampleOffsetMovesTexel() {
+  using O = ShaderOpcode;
+
+  const auto coord = [](u32 texel) {
+    return std::bit_cast<u32>((static_cast<float>(texel) + 0.5f) / 16.0f);
+  };
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0x0000ff02u); // (+2, -1)
+  AppendVMovLiteral(&code, 21, coord(5));
+  AppendVMovLiteral(&code, 22, coord(6));
+  code.push_back(EncodeMimg0(0x37, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendVMovU32(&code, 24, 0x00000837u); // (-9, +8)
+  AppendVMovLiteral(&code, 25, coord(12));
+  AppendVMovLiteral(&code, 26, coord(3));
+  code.push_back(EncodeMimg0(0x37, 0x1));
+  code.push_back(EncodeMimg1(1, 24));
+  code.push_back(EncodeVop2(0x25, 28, 255u, 0));
+  code.push_back(0x00000103u); // (+3, +1) + thread id 0
+  AppendVMovLiteral(&code, 29, coord(4));
+  AppendVMovLiteral(&code, 30, coord(9));
+  code.push_back(EncodeMimg0(0x37, 0x1));
+  code.push_back(EncodeMimg1(2, 28));
+  code.push_back(EncodeVop2(0x25, 32, 255u, 0));
+  code.push_back(0x00000201u); // (+1, +2) + thread id 0
+  AppendVMovLiteral(&code, 33, coord(8));
+  AppendVMovLiteral(&code, 34, coord(2));
+  AppendVMovLiteral(&code, 35, std::bit_cast<u32>(3.0f)); // LOD past the only level
+  code.push_back(EncodeMimg0(0x34, 0x1));
+  code.push_back(EncodeMimg1(3, 32));
+  code.push_back(EncodeVop2(0x25, 36, 255u, 0));
+  code.push_back(0x0000013eu); // (-2, +1) + thread id 0
+  for (u32 i = 0; i < 4u; i++) {
+    AppendVMovLiteral(&code, 37 + i, std::bit_cast<u32>(1.0f / 16.0f)); // one texel
+  }
+  AppendVMovLiteral(&code, 41, coord(10));
+  AppendVMovLiteral(&code, 42, coord(12));
+  code.push_back(EncodeMimg0(0x32, 0x1));
+  code.push_back(EncodeMimg1(4, 36));
+  for (u32 i = 0; i < 5u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(16, 16, 0x41100000u);
+  SetRgbaPixel(&image, 16, 7, 5, 0x3f800000u, 0, 0, 0);
+  SetRgbaPixel(&image, 16, 3, 11, 0x40000000u, 0, 0, 0);
+  SetRgbaPixel(&image, 16, 7, 10, 0x40400000u, 0, 0, 0);
+  SetRgbaPixel(&image, 16, 9, 4, 0x40800000u, 0, 0, 0);
+  SetRgbaPixel(&image, 16, 8, 13, 0x40a00000u, 0, 0, 0);
+
+  TestCase test;
+  test.name = "ImageSampleOffsetMovesTexel";
+  test.code = code;
+  test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u, 0x40a00000u};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::IMAGE_SAMPLE,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.image_width = 16;
+  test.image_height = 16;
+  test.sampled_image_rgba = image;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"ConstOffset", "OpImageQuerySizeLod", "OpImageQueryLevels"};
   return test;
 }
 
@@ -36739,6 +36814,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsFloatMinMaxIgnoresData1);
   AddCase([] { return DsFloatMinMaxClasses(false); });
   AddCase([] { return DsFloatMinMaxClasses(true); });
+  AddCase(ImageSampleOffsetMovesTexel);
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsPermuteCapturedExecOffsetAndWrap);
   AddCase(DsPermuteWave64UsesIndependentHalves);
@@ -42258,6 +42334,13 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageStoreSingleMipBounds<0>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<1>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<2>());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-sample-offset-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageSampleOffsetMovesTexel());
+    RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu());
+    RunCase(&vulkan, ImageSampleAndGather());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {

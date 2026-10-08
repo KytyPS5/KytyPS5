@@ -337,6 +337,11 @@ IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
 			components[index] = ReadRawU32(OffsetOperand(PlainOperand(base), index));
 		}
 	}
+	if ((inst.image_sample_flags & Decoder::ImageSampleFlagOffset) != 0u) {
+		// Only lanes active here consume the result, so re-applying exec lets constant
+		// propagation fold an exec-predicated V_MOV of the texel offsets into a constant.
+		components[0] = ir.Select(ir.GetExec(), IR::U32(components[0]), IR::U32(IR::Value(0u)));
+	}
 	return ir.Emit(IR::ValueOpcode::MakeImageAddress,
 	               {components[0], components[1], components[2], components[3], components[4],
 	                components[5], components[6], components[7], components[8], components[9],

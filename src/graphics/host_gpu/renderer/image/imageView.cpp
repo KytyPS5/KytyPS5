@@ -360,6 +360,25 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
+	{
+		// A view may use a different (mutable) format than the image. Its usage must be limited to
+		// what the *view* format supports, otherwise e.g. an E5B9G9R9 view of an image created with
+		// COLOR_ATTACHMENT usage is invalid (RGB9E5 cannot be rendered to on most GPUs).
+		const auto features = m_graphics.GetFormatProperties(normalized.format).optimalTilingFeatures;
+		const auto original = usage.usage;
+		if (!(features & vk::FormatFeatureFlagBits::eColorAttachment)) {
+			usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
+		}
+		if (!(features & vk::FormatFeatureFlagBits::eSampledImage)) {
+			usage.usage &= ~vk::ImageUsageFlagBits::eSampled;
+		}
+		if (!(features & vk::FormatFeatureFlagBits::eDepthStencilAttachment)) {
+			usage.usage &= ~vk::ImageUsageFlagBits::eDepthStencilAttachment;
+		}
+		if (!usage.usage) {
+			usage.usage = original;
+		}
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +

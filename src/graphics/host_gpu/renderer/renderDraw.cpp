@@ -45,7 +45,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
+#include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -464,6 +467,102 @@ struct DrawCallInfo {
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
+
+// Debug: KYTY_DBG_LOG_SMALL_TEX=1 logs, once per unique (vs, ps) pair:
+//  NHL27TEX1x1:  the PS binds at least one <=1x1 image (any render target size)
+//  NHL27TEXFS:   no 1x1 image, rt0 >= 1920 wide, 3/4 vertices or 3/6 indices (max 300)
+//  NHL27TEXENV:  rt0 square with side 32..1024 (environment/cube capture candidates, max 300)
+static void DbgLogSmallTextureDraw(const PreparedBindings* ps, const DrawRenderState& state,
+                                   const DrawCallInfo& draw, uint64_t vs_hash, uint64_t ps_hash) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_LOG_SMALL_TEX");
+		return value != nullptr && *value != '\0' && *value != '0';
+	}();
+	if (!enabled || ps == nullptr) {
+		return;
+	}
+
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> seen_tex;
+	static std::set<std::pair<uint64_t, uint64_t>> seen_fs;
+	static std::set<std::pair<uint64_t, uint64_t>> seen_env;
+	static uint32_t                                fs_logged  = 0;
+	static uint32_t                                env_logged = 0;
+
+	bool has_small = false;
+	for (const auto& image: ps->images) {
+		if (image.desc.info.extent.width <= 1 && image.desc.info.extent.height <= 1) {
+			has_small = true;
+			break;
+		}
+	}
+
+	const bool     rt0_valid = state.color_count != 0;
+	const auto&    rt0_info  = state.color_info[0];
+	const auto     rt0       = rt0_info.Extent();
+	const uint32_t rt0_w     = rt0_valid ? rt0.width : 0;
+	const uint32_t rt0_h     = rt0_valid ? rt0.height : 0;
+	const bool     indexed   = draw.IsIndexed();
+	const bool     fs_count  = indexed ? (draw.index_count == 3 || draw.index_count == 6)
+	                                   : (draw.index_count == 3 || draw.index_count == 4);
+	const bool     fs_like   = rt0_valid && rt0_w >= 1920 && fs_count;
+	const bool     env_like  = rt0_valid && rt0_w == rt0_h && rt0_w >= 32 && rt0_w <= 1024;
+
+	const auto key = std::make_pair(vs_hash, ps_hash);
+	std::lock_guard lock(mutex);
+
+	const char* tag = nullptr;
+	if (has_small) {
+		if (!seen_tex.insert(key).second) {
+			return;
+		}
+		tag = "NHL27TEX1x1";
+	} else if (fs_like && fs_logged < 300) {
+		if (!seen_fs.insert(key).second) {
+			return;
+		}
+		++fs_logged;
+		tag = "NHL27TEXFS";
+	}
+
+	std::string images;
+	for (uint32_t i = 0; i < ps->images.size(); i++) {
+		const auto& image = ps->images[i];
+		const auto& info  = image.desc.info;
+		const bool  is_tiny = info.extent.width <= 1 && info.extent.height <= 1;
+		char        buf[192];
+		std::snprintf(buf, sizeof(buf), "%s%u:%ux%ux%u fmt=%u addr=0x%llx%s", i == 0 ? "" : ", ",
+		              i, info.extent.width, info.extent.height, info.extent.depth,
+		              static_cast<unsigned>(info.guest_format),
+		              static_cast<unsigned long long>(info.data.address), is_tiny ? " SMALL" : "");
+		images += buf;
+	}
+
+	if (tag == nullptr) {
+		// Environment-capture candidate: only when no 1x1 image matched above.
+		if (!env_like || env_logged >= 300 || !seen_env.insert(key).second) {
+			return;
+		}
+		++env_logged;
+		tag = "NHL27TEXENV";
+	}
+
+	const char* rt0_type = "none";
+	switch (rt0_info.desc.info.type) {
+		case Prospero::ImageType::kColor2D: rt0_type = "2D"; break;
+		case Prospero::ImageType::kColor2DArray: rt0_type = "2DArray"; break;
+		case Prospero::ImageType::kCube: rt0_type = "Cube"; break;
+		default: rt0_type = "other"; break;
+	}
+	std::printf("%s: vs=0x%016llx ps=0x%016llx verts=%u inst=%u rt0=%ux%u fmt=%u "
+	            "rt0_type=%s rt0_layer=%u rt0_mip=%u rt0_layers=%u images=[%s]\n",
+	            tag, static_cast<unsigned long long>(vs_hash),
+	            static_cast<unsigned long long>(ps_hash), draw.index_count, draw.instance_count,
+	            rt0_w, rt0_h, static_cast<unsigned>(rt0_info.desc.info.guest_format), rt0_type,
+	            rt0_info.guest_array_layer, rt0_info.guest_mip_level,
+	            rt0_info.desc.info.resources.layers, images.c_str());
+	std::fflush(stdout);
+}
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
@@ -1230,6 +1329,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                                 : 0;
 	const uint64_t crumb_info = (static_cast<uint64_t>(draw.index_count) << 32u) |
 	                            draw.instance_count;
+	DbgLogSmallTextureDraw(state.ps_active ? &*bindings.pixel : nullptr, state, draw, crumb_vs,
+	                       crumb_ps);
 	// Debugging: KYTY_DBG_SKIP_PS=<hex hash>[,<hex hash>...] skips matching pixel shaders.
 	static const std::vector<uint64_t> skip_ps = [] {
 		std::vector<uint64_t> list;

@@ -8,6 +8,7 @@
 
 namespace {
 
+/// Abort with a diagnostic when a cache regression expectation fails.
 void Check(bool value, const char *message) {
   if (!value) {
     std::fprintf(stderr, "LruCacheTests: failed: %s\n", message);
@@ -15,7 +16,7 @@ void Check(bool value, const char *message) {
   }
 }
 
-// Collect the objects reachable through ForEachItemBelow(), in visit order.
+/// Collect the objects reachable through ForEachItemBelow(), in visit order.
 std::vector<std::string> Collect(Common::LeastRecentlyUsedCache<std::string, uint64_t> &cache,
                                  uint64_t tick) {
   std::vector<std::string> visited;
@@ -23,6 +24,7 @@ std::vector<std::string> Collect(Common::LeastRecentlyUsedCache<std::string, uin
   return visited;
 }
 
+/// Verify unique IDs, insertion order, and inclusive tick filtering.
 void TestInsertAndVisitOrder() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -43,6 +45,7 @@ void TestInsertAndVisitOrder() {
   Check(none.empty(), "ForEachItemBelow visited items below an empty tick");
 }
 
+/// Verify that bool callbacks control early termination of traversal.
 void TestEarlyExitCallback() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   (void)cache.Insert("a", 10);
@@ -64,6 +67,7 @@ void TestEarlyExitCallback() {
   Check(all_visited.size() == 3, "false-returning callback did not visit every item");
 }
 
+/// Verify that newer touches reorder items while older ticks are ignored.
 void TestTouchReordersAndSkips() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -103,6 +107,7 @@ void TestTouchReordersAndSkips() {
         "touching a middle item did not move it to the end");
 }
 
+/// Verify removal, ID reuse, and rebuilding after all items have been freed.
 void TestFreeAndIdReuse() {
   Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
   const auto a = cache.Insert("a", 10);
@@ -144,13 +149,59 @@ void TestFreeAndIdReuse() {
   Check(Collect(cache, 70).size() == 1, "touching a rebuilt item failed");
 }
 
+/// Check that early exit follows the overload actually invoked with a stored object.
+void TestCallbackOverloadEarlyExit() {
+  Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
+  (void)cache.Insert("a", 10);
+  (void)cache.Insert("b", 20);
+
+  struct Visitor {
+    int calls = 0;
+    /// Request early exit when invoked as an lvalue on a stored object.
+    bool operator()(const std::string &) & {
+      ++calls;
+      return true;
+    }
+    /// Provide a different result type for the unused rvalue invocation.
+    void operator()(std::string &&) && { ++calls; }
+  } visitor;
+
+  cache.ForEachItemBelow(20, visitor);
+  Check(visitor.calls == 1, "lvalue callback's early-exit result was ignored");
+  visitor.calls = 0;
+  cache.ForEachItemBelow(20, std::move(visitor));
+  Check(visitor.calls == 1, "rvalue-supplied callback's early-exit result was ignored");
+}
+
+/// Verify that callbacks may update stored objects through mutable references.
+void TestMutableReferenceCallback() {
+  Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
+  (void)cache.Insert("a", 10);
+  (void)cache.Insert("b", 20);
+  cache.ForEachItemBelow(20, [](std::string &value) { value += "!"; });
+  Check(Collect(cache, 20) == std::vector<std::string>{"a!", "b!"},
+        "mutable reference callback did not update every stored object");
+
+  int calls = 0;
+  cache.ForEachItemBelow(20, [&](std::string &value) {
+    value += "?";
+    ++calls;
+    return true;
+  });
+  Check(calls == 1 && Collect(cache, 20) == std::vector<std::string>{"a!?", "b!"},
+        "mutable reference callback did not stop after the first object");
+}
+
 } // namespace
 
+/// Run the LRU cache regression suite.
 int main() {
   TestInsertAndVisitOrder();
   TestEarlyExitCallback();
   TestTouchReordersAndSkips();
   TestFreeAndIdReuse();
+  TestCallbackOverloadEarlyExit();
+  TestMutableReferenceCallback();
   std::puts("LruCacheTests: all cases passed");
   return 0;
 }

@@ -461,14 +461,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
 	supported_features2.pNext = mesh_extension ? static_cast<void*>(&supported_mesh)
 	                                           : static_cast<void*>(&supported_features13);
-	const bool feedback_extensions =
-	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
-	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+	const bool feedback_layout_extension =
+	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+	const bool feedback_dynamic_extension = HasExtension(
+	    device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 	vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout {};
 	vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic {};
-	if (feedback_extensions) {
+	if (feedback_dynamic_extension) {
 		feedback_dynamic.pNext = supported_features2.pNext;
-		feedback_layout.pNext  = &feedback_dynamic;
+		supported_features2.pNext = &feedback_dynamic;
+	}
+	if (feedback_layout_extension) {
+		feedback_layout.pNext = supported_features2.pNext;
 		supported_features2.pNext = &feedback_layout;
 	}
 	const bool provoking_extension =
@@ -540,10 +544,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
-	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
+	    feedback_layout_extension && feedback_layout.attachmentFeedbackLoopLayout;
+	graphics.feedback_loop_dynamic_state_enabled =
+	    graphics.attachment_feedback_loop_enabled && feedback_dynamic_extension &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
-	LOGF("Vulkan depth feedback support: %s\n",
-	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	LOGF("Vulkan depth feedback support: %s (dynamic state: %s)\n",
+	     graphics.attachment_feedback_loop_enabled ? "true" : "false",
+	     graphics.feedback_loop_dynamic_state_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,
@@ -623,11 +630,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
 	mesh_features.pNext                 = &features13;
 	mesh_features.meshShader            = graphics.mesh_shader_enabled;
-	feedback_dynamic.pNext =
+	void* next_features =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
-	create_info.pNext = graphics.attachment_feedback_loop_enabled
-	                        ? static_cast<void*>(&feedback_layout)
-	                        : feedback_dynamic.pNext;
+	if (graphics.feedback_loop_dynamic_state_enabled) {
+		feedback_dynamic.pNext = next_features;
+		next_features = &feedback_dynamic;
+	}
+	if (graphics.attachment_feedback_loop_enabled) {
+		feedback_layout.pNext = next_features;
+		next_features = &feedback_layout;
+	}
+	create_info.pNext = next_features;
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
@@ -1011,9 +1024,10 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
-		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
-		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
+		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 	}

@@ -538,11 +538,21 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                                         native->info);
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
+		if (feedback_aspects != vk::ImageAspectFlags {} &&
+		    !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+			static bool feedback_fallback_warned {false};
+			if (!feedback_fallback_warned) {
+				feedback_fallback_warned = true;
+				LOGF("Vulkan: depth attachment feedback loop unsupported by the host; "
+				     "falling back to eGeneral layout (rendering artifacts possible)\n");
+			}
 		}
 		auto layout = depth_attachment_layout(depth);
-		if (sampled_aspects & ~DepthReadableAspects(layout)) {
+		if (feedback_aspects != vk::ImageAspectFlags {}) {
+			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
+			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+			             : vk::ImageLayout::eGeneral;
+		} else if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
@@ -1140,7 +1150,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
-	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+	if (m_context.GetGraphics().feedback_loop_dynamic_state_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
 

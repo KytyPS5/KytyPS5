@@ -590,11 +590,16 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	EXIT_IF(!file->opened);
 
-	if (!file->directory && file->special == SpecialFile::None) {
-		file->f.Close();
-	}
+	{
+		// Wait for an operation that holds the file lock, such as KernelFsync, before closing.
+		Common::LockGuard lock(file->mutex);
 
-	file->opened = false;
+		if (!file->directory && file->special == SpecialFile::None) {
+			file->f.Close();
+		}
+
+		file->opened = false;
+	}
 
 	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
 
@@ -1269,8 +1274,11 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 		return KERNEL_ERROR_EIO;
 	}
 
-	Common::File file(real_file_name, Common::File::Mode::ReadWrite);
-	if (file.IsInvalid() || !file.Truncate(static_cast<uint64_t>(length))) {
+	// Resize by path so that only write access is needed. Common::File has no write-only mode
+	// that keeps the contents on every host (the POSIX backend opens Mode::Write with "r+").
+	std::error_code error;
+	std::filesystem::resize_file(real_file_name, static_cast<uintmax_t>(length), error);
+	if (error) {
 		return KERNEL_ERROR_EIO;
 	}
 

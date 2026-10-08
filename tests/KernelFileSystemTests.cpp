@@ -148,7 +148,7 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
 }
 
-void TestTruncate() {
+void TestTruncate(const std::filesystem::path &root) {
   namespace Kernel = Libs::LibKernel;
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
@@ -210,6 +210,51 @@ void TestTruncate() {
   Check(FileSystem::KernelClose(moved) == OK && FileSystem::KernelStat(MovedPath, &stat) == OK &&
             stat.st_size == 10,
         "sceKernelTruncate leaves a renamed open file alone");
+
+  // sceKernelTruncate flushes the writable descriptors for the path. Another
+  // thread keeps closing and reopening one of them, and every truncation must
+  // still succeed without touching a closed host file.
+  constexpr char RacePath[] = "/savedata0/truncate-race.dat";
+  std::atomic_bool closer_done {false};
+  std::atomic_int unexpected {0};
+  std::thread closer([&] {
+    for (int i = 0; i < 2000; ++i) {
+      const int d = FileSystem::KernelOpen(RacePath, 0x602, 0777);
+      if (d < 3 || FileSystem::KernelWrite(d, Payload, 7) != 7 ||
+          FileSystem::KernelClose(d) != OK) {
+        ++unexpected;
+      }
+    }
+    closer_done = true;
+  });
+  while (!closer_done) {
+    const int result = truncate_path(RacePath, 3);
+    if (result != OK && result != Kernel::KERNEL_ERROR_ENOENT) {
+      ++unexpected;
+    }
+  }
+  closer.join();
+  Check(unexpected == 0, "sceKernelTruncate races a concurrent close safely");
+
+  // Truncation needs write access only. Skip the check where the host still
+  // lets the file be read (Windows, or running as root).
+  constexpr char WriteOnlyPath[] = "/savedata0/truncate-write-only.dat";
+  const auto write_only = root / "truncate-write-only.dat";
+  const int wo = FileSystem::KernelOpen(WriteOnlyPath, 0x602, 0777);
+  Check(wo >= 3 && FileSystem::KernelWrite(wo, "0123456789", 10) == 10 &&
+            FileSystem::KernelClose(wo) == OK,
+        "create the write-only truncate fixture");
+  std::filesystem::permissions(write_only, std::filesystem::perms::owner_write,
+                               std::filesystem::perm_options::replace);
+  const bool readable =
+      !Common::File(write_only, Common::File::Mode::Read).IsInvalid();
+  if (!readable) {
+    Check(truncate_path(WriteOnlyPath, 4) == OK &&
+              std::filesystem::file_size(write_only) == 4,
+          "sceKernelTruncate resizes a write-only file");
+  }
+  std::filesystem::permissions(write_only, std::filesystem::perms::owner_all,
+                               std::filesystem::perm_options::replace);
 }
 
 void TestAioBatches() {
@@ -1473,7 +1518,7 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
-  TestTruncate();
+  TestTruncate(temporary.Path());
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

@@ -1,360 +1,233 @@
-# NVIDIA DLSS (experimental)
+# Experimental upscaling and Frame Generation
 
-The launcher exposes **NVIDIA DLSS** in the graphics settings, globally and per
-game: Off (default), Quality, Balanced, Performance, UltraPerformance and DLAA.
-The command line accepts the same names: `--dlss Quality`. **Output resolution**
-selects the reconstruction target. **Render scale** (25–100%, default 100%)
-reduces the dimensions of supported guest raster passes. **DLSS Frame Generation**
-is a separate toggle, off by default, and can also run with Super Resolution off.
+These settings are in the launcher's **Experimental** group. Super Resolution
+(SR), render scale and Frame Generation (FG) are independent. All backends use
+the same renderer inputs; there are no title checks or shader-hash overrides.
+Unchecking the group disables its controls; saving turns SR/FG off and restores
+render scale to 100%. Existing active configurations open with the group checked.
+Backend-specific rows appear only for the selected backend. The launcher uses
+one generated frame with OptiScaler; the frame-count control is shown for native
+DLSS FG and enabled when FG is selected.
 
-Global settings are inherited by games unless a per-game setting overrides them.
-Off is the default. In a build with DLSS enabled, select a mode and start the
-game; no game-name detection, patch or temporal-input setup is required.
+## Settings
 
-Selecting a mode runs the NGX Vulkan Super Resolution backend on the main
-VideoOut frame, independently of the game title. The emulator generates its
-temporal inputs on the GPU; no game-specific adapter is required. A compatible
-NVIDIA RTX device and the installed NGX runtime are required. Frame Generation
-uses the optional Streamline Vulkan backend described below. Ray Reconstruction
-is outside this integration.
+| Setting | Effect | Default |
+| --- | --- | --- |
+| Upscaler backend | Native NVIDIA NGX, or OptiScaler package | Native |
+| Upscaler quality | Off, Quality, Balanced, Performance, UltraPerformance, DLAA | Off |
+| Render scale | Raster resolution as a percentage of the configured output | 100% |
+| Motion estimation | Hybrid geometry/optical flow, or Geometry without optical flow | Hybrid |
+| OptiScaler upscaler | Auto (INI), direct Fsr, or direct XeSS | Auto |
+| OptiScaler Frame Generation | Fsr or XeSS | Fsr |
+| Frame Generation | Generate intermediate display frames, including with SR Off | Off |
+| Generated frames | Native DLSS FG request, capped by the runtime; OptiScaler uses one | 1 |
 
-This is **experimental final-frame reconstruction**. Supported opaque draws
-capture the actual clip-space positions produced by the guest vertex shader,
-retain them across consecutive MAIN frames, and export current-to-previous motion
-and fragment depth through a spare attachment in the same draw. Hardware depth
-tests and fragment discard apply to that attachment too. This generates motion
-from guest geometry; it does not identify or directly consume a game's velocity
-texture. A four-level color pyramid estimates image-space motion for pixels
-without validated geometry history. Both paths convert motion to render pixels.
-The final color is resampled with Halton jitter. At 100% render scale, its
-existing resolution is retained within the SDK's supported dynamic-resolution
-range. Super Resolution is skipped when the output is no larger than that
-native final frame; explicit DLAA still evaluates the model. A completed,
-unchanged full-surface raster pass supplies its actual reduced color directly,
-avoiding resampling the native-sized nearest copy. Its resolution is retained
-within the SDK's input range too. Other materialized surfaces retain the SDK's
-recommended input size because their dimensions do not prove their raster size.
-Covered geometry supplies actual fragment depth, including reversed-depth
-normalization. Uncovered pixels use an explicit neutral image plane. A per-pixel
-current-color bias rejects poorly matched estimated history.
-Consequently this does not provide the same inputs or guarantee the same image
-quality as a native game integration: fast motion, occlusion, thin details and
-transparency can produce artifacts. HUD already drawn into the guest frame is
-processed too; the separate VideoOut overlay bus remains outside reconstruction.
-
-**At 100% render scale, guest color resolution is unchanged.** Geometry capture and
-presentation add GPU work and do not guarantee an FPS improvement.
-Performance/UltraPerformance select the NGX preset and supported input range;
-they do not make the game render fewer pixels.
-Use Off with Frame Generation disabled to compare the original frame without
-geometry instrumentation. There are no game-name checks in this path.
-
-Below 100%, the rasterizer uses smaller color/depth attachments and adjusts
-viewports, scissors and fragment position inputs to preserve guest coordinates.
-Completed passes materialize their results into the native-sized cache image
-before later texture, storage or CPU consumers can observe it. Guest allocation
-sizes and compute shader grids remain unchanged. Unsupported formats, MSAA,
-attachment feedback, reinterpreted views and very small targets stay native.
-Copies into reduced attachments are skipped when the pass clears all their
-aspects; LOAD and mixed depth/stencil operations preserve existing content.
-This reduces raster pixel count but adds attachment copies; it does not guarantee
-lower total GPU time. Lower scales lose detail. For a 1920x1080 supported pass,
-50% rasterizes at 960x540; its resulting final frame is reconstructed to the
-selected output resolution using the chosen DLSS mode.
+For example, reconstruct supported raster passes at half the output dimensions:
 
 ```text
 --dlss Quality --render-scale 50 --screen-width 2560 --screen-height 1440
---dlss-frame-generation true
 ```
 
-### What changes when DLSS is enabled
+SR preserves the actual final image within the SDK's input range. With 100%
+render scale, a source already covering the output is presented directly; DLAA
+still evaluates at the output resolution. Materialized surfaces without a
+proven reduced raster use the SDK's recommended input size. Lower quality
+presets alone do not reduce the guest's rendering resolution.
 
-| Stage | Off | Quality / Balanced / Performance / UltraPerformance | DLAA |
-| --- | --- | --- | --- |
-| Guest raster passes | Controlled separately by Render scale | Controlled separately by Render scale | Controlled separately by Render scale |
-| Main final color | Copied for ordinary presentation | Actual source retained within the SDK's input range; recommended size for unproven materialized surfaces | Resampled to the output size, then reconstructed at that size |
-| Temporal inputs | Generated when Frame Generation is requested | Captured geometry motion/depth where valid; GPU optical flow/neutral depth elsewhere; resampling jitter, history rejection | Same emulator-generated inputs |
-| Prepared output | Original presentation format and size | RGBA16F at the configured screen resolution | RGBA16F at the configured screen resolution |
-| HUD inside the main frame | Original presentation | Processed with the scene | Processed with the scene |
-| Separate overlay bus and host overlay | Composited by the presenter | Composited after reconstruction | Composited after reconstruction |
-| Extra work | Ordinary presentation | Input generation and NGX evaluation | Input generation and NGX evaluation |
+Render scale reduces supported raster attachments, viewports and scissors while
+preserving guest coordinates and allocation sizes. Completed passes remain
+available to native-size texture, storage and CPU consumers. MSAA, unsupported
+formats, attachment feedback and incompatible views stay native. Smaller raster
+passes save pixel work but add copies and lose detail; total cost depends on the
+workload. Guest compute dispatch sizes and simulation speed are unchanged.
 
-For example, with a native 1920x1080 guest frame at 100% render scale and a
-1280x720 configured output, Quality retains the original frame for ordinary
-presentation instead of shrinking it to 853x480 and reconstructing it again.
-For an output larger than the source, reconstruction retains as many existing
-source samples as the SDK's supported input range permits.
-These input sizes are SDK-dependent; query them instead of
-hardcoding a ratio. The configured screen resolution selects the DLSS target;
-the swapchain can still scale that image to the window's drawable size.
+## Backends and runtimes
 
-This change evaluates the NVIDIA model and presents its computed pixels; it
-does not merely load NGX or change a settings label. It may change edge/detail
-appearance and temporal stability, but visual improvement is not guaranteed.
-The generated jitter shifts samples of the existing final image; it does not
-jitter the guest camera or expose additional guest-rendered scene information.
-The extra GPU work can reduce throughput when the workload is already limited
-by GPU execution. A vblank-capped run can hide that cost in its average FPS.
+| Backend | Runtime | Build requirement |
+| --- | --- | --- |
+| Native SR | NVIDIA NGX / `nvngx_dlss.dll` | `KYTY_ENABLE_DLSS=ON`; supported NVIDIA GPU |
+| OptiScaler Auto SR | `OptiScaler.dll`; algorithm selected in its INI | Windows; `KYTY_ENABLE_DLSS=ON` |
+| Direct Fsr SR | `amd_fidelityfx_vk.dll` | Windows; NVIDIA SDKs not required |
+| Direct XeSS SR | `libxess.dll` | Windows; NVIDIA SDKs not required |
+| Native FG | Streamline production runtimes | Windows clang-cl; `KYTY_ENABLE_DLSS_FG=ON` |
+| OptiScaler Fsr FG | `dlssg_to_fsr3_amd_is_better.dll` | Windows; `KYTY_ENABLE_DLSS=ON` for the NGX ABI |
+| OptiScaler XeSS FG | `libxess_fg.dll`, optional `libxell.dll` | Windows; NVIDIA SDKs not required |
 
-When a mode is requested, the title displays `DLSS: active` only for frames with
-a successfully evaluated DLSS output; fallback frames display `DLSS: inactive`.
-When the current source (after render scale) already covers the output
-resolution, Super Resolution has nothing to upscale and the title shows
-`DLSS: bypassed, source >= output`; raise the output resolution or lower the
-render scale below the output size to reconstruct.
-Opt-in CSV traces record actual evaluations and presentation intervals; see
-[frame-pacing.md](frame-pacing.md). SDK availability alone does not mean DLSS
-is affecting gameplay.
+Missing runtimes, unsupported device features or failed initialization retain
+ordinary presentation. Direct Fsr/XeSS SR use their Vulkan APIs and avoid the
+OptiScaler NGX translation layer. The emulator still requires its normal Vulkan
+1.3 renderer features; a runtime supporting a GPU does not establish emulator
+support for that GPU.
 
-## Build
+### OptiScaler package
 
-The official [NVIDIA/DLSS SDK](https://github.com/NVIDIA/DLSS) is included as the
-`3rdparty/DLSS` Git submodule, pinned to the tested revision
-`374959484e79a640feaba44c93ac8cfb0a03f5b5`. A recursive clone of this repository
-initializes it with the other dependencies. For an existing checkout:
+Use the [official package](https://github.com/optiscaler/OptiScaler/releases),
+including backend DLLs, INI and license files. Set **OptiScaler DLL** to its full
+path; an empty path resolves `OptiScaler.dll` beside the engine. Direct backends
+load sibling DLLs from this directory. No proxy renaming or replacement of the
+engine's NVIDIA DLLs is needed. Kyty does not distribute this package or edit its
+INI.
+
+For Auto SR, `VulkanUpscaler` in `OptiScaler.ini` chooses the output algorithm.
+When keeping the package in a separate directory, set `[Libraries] OptiDllPath`
+to that directory. Direct Fsr/XeSS SR bypass this INI algorithm selection.
+
+```text
+--upscale-backend OptiScaler --optiscaler-path "D:/Upscalers/OptiScaler.dll" --optiscaler-upscaler Fsr --dlss Quality --render-scale 50
+```
+
+Kyty controls FG itself. Disable competing OptiScaler presentation hooks:
+
+```ini
+[FrameGen]
+Enabled=false
+FGInput=nofg
+FGOutput=nofg
+```
+
+For Auto FSR SR, the following is a minimal configuration without extra overlays
+or vendor/extension spoofing. Re-enable DLSS when selecting a DLSS output.
+
+```ini
+[Upscalers]
+VulkanUpscaler=fsr31
+[DLSS]
+Enabled=false
+[Menu]
+OverlayMenu=false
+[Spoofing]
+Vulkan=false
+VulkanExtensionSpoofing=false
+Dxgi=false
+StreamlineSpoofing=false
+```
+
+### Frame Generation
+
+FG adds display frames; it does not increase guest simulation FPS. Fsr FG
+generates one intermediate Vulkan image per real frame. Its spacing wait runs
+on the presentation thread after the guest flip completes, leaving the producer
+free to render. XeSS FG presents through a D3D12/DXGI swapchain on the same GPU,
+using shared Vulkan images and a shared fence. XeSS and DLSS-G cap the requested
+generation level at the runtime's reported maximum.
+
+```text
+--upscale-backend OptiScaler --dlss Off --dlss-frame-generation true --optiscaler-frame-generation XeSS
+```
+
+Native DLSS-G requires a supported device, driver and Windows configuration.
+The backend checks Streamline support, uses Reflex and a separate presentation
+queue when available, and retains frame-owned inputs through the SDK completion
+timeline. Missing optional extensions fall back before creating the device.
+Native FG requires foreground focus and disables generation in the background.
+Vulkan VSync is unsupported by this backend; Streamline paces its presents.
+
+Native DLSS-G currently falls back when Vulkan validation is requested because
+of SDK image-layout errors. SR and render scale remain available. On Windows,
+the existing emergency process-exit route flushes persistence before terminating
+without DLL detach callbacks while guest threads are still running. Orderly
+presenter destruction drains GPU work and releases resources normally.
+
+Cached refreshes, blank frames, failed evaluations and missing inputs do not
+advance generation history or count as new guest frames. Resizing and mode
+changes retire resources only after their GPU and FG work completes.
+
+## Inputs and image quality
+
+Supported opaque vertex/fragment draws capture previous/current positions and
+fragment depth in a spare attachment. Depth tests and discard apply to this
+guide. Ambiguous draw identities, resource changes and unrelated color writes
+invalidate coverage; arbitrary post-processing does not propagate scene motion.
+Mesh/tessellation, blending, MSAA, fragment depth/sample-mask exports and occupied
+interfaces retain the estimated path. Position history is bounded at 64 MiB;
+guide images are bounded at 128 MiB.
+
+Hybrid uses a four-level optical-flow pyramid outside valid geometry coverage.
+Geometry skips that pyramid; uncovered pixels use neutral depth, zero motion
+and full history rejection. SR uses jittered resampling and a rejection mask.
+FG-only input generation allocates no SR color/mask images and leaves color
+unjittered. Pipelines are created on first use and pyramid passes bind only
+their required descriptors. Switching between SR and FG-only retains compatible
+motion history; extent, format, motion-mode changes and long gaps reset it.
+
+These are final-frame inputs, including guest HUD, rather than a native game's
+pre-HUD color, camera jitter and complete motion/depth. Resampling jitter adds
+no new guest-rendered detail. Fast motion, transparency, occlusion and thin
+details may show artifacts. The separate VideoOut overlay bus is composited
+after reconstruction. No image-quality or gameplay-FPS improvement is guaranteed.
+
+The default `Presenter::PrepareFrame(command, info)` generates inputs on the
+GPU. A generic caller may supply `DlssFrameInputs`: matching sampled color,
+depth and motion images produced on the renderer queue, render-pixel jitter,
+motion scales and history-reset flags. The resources must remain alive through
+the recording GPU tick. Evaluation runs under the renderer mutex outside
+dynamic rendering, once per new MAIN frame, into single-layer RGBA16F storage.
+Rejected inputs preserve ordinary unjittered presentation.
+
+The title reports successful SR evaluation as `active`, bypass as `native`,
+and fallback as `inactive`. FG display counts and guest submission counts are
+separate; SDK counts are not independent scanout measurements. See
+[frame-pacing.md](frame-pacing.md) for captures and comparisons.
+
+## Build and licensing
+
+NVIDIA options default to OFF. For native SR or OptiScaler Auto:
 
 ```powershell
 git submodule update --init --recursive 3rdparty/DLSS
 cmake -S . -B _Build/windows -DKYTY_ENABLE_DLSS=ON
-cmake --build _Build/windows --target launcher
-cmake --install _Build/windows --prefix _Build/windows/install
+cmake --build _Build/windows --target kyty_emulator launcher
 ```
 
-Use the existing clang-cl / Visual Studio developer environment and Qt build
-configuration described in the README. Linux x86_64 also supports the SDK;
-substitute your Linux build directory. CMake defaults to `3rdparty/DLSS`; an
-optional `KYTY_DLSS_SDK_ROOT` override can point to a custom SDK checkout. If an
-existing build caches the old `_Build/dlss-sdk` path, clear it once with
-`cmake -S . -B _Build/windows -U KYTY_DLSS_SDK_ROOT -DKYTY_ENABLE_DLSS=ON`.
-Unsupported platforms can build with
-`KYTY_ENABLE_DLSS=OFF` (default). Without the SDK, the launcher disables the DLSS
-selector and the engine logs a fallback if DLSS is requested on the CLI.
+Use the compiler/Qt environment described in the README. The NVIDIA SDK is
+pinned by the `3rdparty/DLSS` submodule; `KYTY_DLSS_SDK_ROOT` permits an override.
+Native SR also supports Linux x86_64. Other platforms retain the default build.
+Windows NGX builds enable ASLR for the engine and regression executable because
+NGX device creation fails without it on tested drivers.
 
-Windows clang-cl builds with DLSS enable ASLR (`/DYNAMICBASE /HIGHENTROPYVA`).
-With ASLR disabled, enabling NGX's Vulkan extensions reproducibly caused
-`vkCreateDevice` to return `VK_ERROR_INITIALIZATION_FAILED` on the tested NVIDIA
-driver, even though the same device initialized successfully without DLSS.
-The engine and GPU test share this linker configuration so that the test covers
-the actual executable layout.
-
-The build copies the **release** Super Resolution runtime next to the engine,
-launcher and GPU test, together with NVIDIA's license. Installation includes
-both the runtime and license. The SDK is initialized by Git's submodule commands;
-CMake does not download it. It is not covered by Kyty's license. Its distribution
-terms are in `3rdparty/DLSS/LICENSE.txt`. This software contains source code
-provided by NVIDIA Corporation.
-
-## Frame Generation
-
-Enable the independent Windows clang-cl backend with an extracted official
-[Streamline SDK release](https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.1).
-The current build uses matching v2.14.1 headers and production DLLs, on an NVIDIA
-RTX 4090 Laptop GPU. The Streamline release remains a separate dependency;
-its SDK files are not fetched automatically or committed.
+Native FG uses an extracted official
+[Streamline SDK](https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.1):
 
 ```powershell
 cmake -S . -B _Build/windows -DKYTY_ENABLE_DLSS_FG=ON -DKYTY_STREAMLINE_SDK_ROOT="$PWD/_Build/streamline-release"
-cmake --build _Build/windows --target launcher dlss_gpu_tests
-ctest --test-dir _Build/windows -R '^dlss_frame_generation' --output-on-failure
-cmake --install _Build/windows --prefix "$PWD/_Build/windows/install"
+cmake --build _Build/windows --target kyty_emulator launcher
+cmake --install _Build/windows --prefix _Build/windows/install
 ```
 
-The build deploys the signed production interposer, common/DLSS-G/Reflex/PCL
-plugins, `nvngx_dlssg.dll`, `NvLowLatencyVk.dll` and license notices. A supported
-device, driver, Windows configuration and runtime are required. The backend
-checks Streamline support instead of assuming availability from the GPU name.
-After rebuilding, reinstall before using `install/launcher.exe`; its companion
-engine and runtime DLLs must come from the same build. Installation preserves
-existing game settings and saves.
-It intercepts Vulkan instance/device/surface/swapchain/present operations,
-enables Reflex, tags frame-owned depth/motion snapshots and supplies per-frame
-constants. If the selected device lacks `VK_KHR_present_id`, Streamline is shut
-down before device creation and the engine uses native Vulkan presentation.
-Only new MAIN guest frames advance generation history. Cached guest
-frames retain an already active generation mode for overlay refreshes without
-retagging inputs or counting another guest frame. Blank and paused presentations,
-missing inputs and the Off setting disable generation. Mode changes recreate
-the swapchain; when generation is active, Vulkan uses Immediate presentation
-because the SDK does not support VSync for Vulkan Frame Generation.
-
-Reflex sleep and prepared-frame retirement run before acquiring the renderer
-mutex, allowing guest work to continue during pacing. On devices with at least
-two universal queues, FG uses a separate queue for presentation in the same
-family. Each presentation waits on the producer timeline tick of its MAIN and
-overlay frames; later guest rendering can run independently. Devices with only
-one queue retain the shared queue. Vulkan uses `eBlockNoClientQueues`; frame-owned input
-snapshots wait on the SDK completion timeline before reuse or destruction.
-The prepared-frame pool first chooses compatible images whose presentation
-and FG work have completed. If only another descriptor is ready, it uses that
-frame before waiting on a compatible one. Readiness queries are nonblocking;
-the lifetime waits remain in place before reuse.
-When the game loses foreground focus, FG is disabled and the swapchain is
-recreated for ordinary presentation. Unused FG snapshots are not prepared in
-the background. This avoids paying interpolation overhead while the SDK is
-bypassing generation. Foreground focus enables generation on the next eligible
-guest frame.
-With Super Resolution inactive, input generation skips unused color/mask
-writes and uses the actual source resolution for depth/motion instead of
-resampling them to the output resolution.
-
-The inputs share Super Resolution's partial geometry coverage and estimated
-fallback limitations. Guest HUD
-and overlays present in the backbuffer can exhibit interpolation artifacts.
-Generation adds display frames without increasing game simulation FPS. The
-existing CSV continues to count guest submissions. With FG enabled, the
-window title's `fps` (tagged `[FG]`) reports the Streamline display-frame count
-per second, including generated frames; it is not measured scanout.
-Activation
-is logged only after Streamline reports additional frames actually presented.
-
-On Windows, closing a game with FG requested preserves the emulator's emergency
-persistence and flushes buffered files, then terminates its own process without
-DLL detach callbacks. The existing fast-exit route leaves guest threads running;
-normal DLL teardown in that state reproduced an access violation inside
-`nvngx_dlssg.dll`. Normal presenter destruction, used when producers have stopped,
-drains presentation and FG inputs and disables generation before releasing images.
-
-**Vulkan validation and Frame Generation cannot currently run together.**
-Both tested SDK versions (2.10.3 and 2.14.1) produced internal image-layout errors,
-also reported in [Streamline issue #84](https://github.com/NVIDIA-RTX/Streamline/issues/84).
-The emulator preserves validation and falls back to ordinary presentation when
-validation is requested. Super Resolution and render scale remain available.
-The interpolation runtime test runs without Vulkan validation; its assertion
-requires the SDK's actual display-frame count to exceed real submitted frames
-and verifies switching off. A separate test checks validation-enabled fallback.
-This is distinct from the other GPU tests, which run with validation.
-
-**The window must remain focused.** The SDK deliberately bypasses interpolation
-in the background. The integration tests focus their own window while measuring;
-three consecutive production-runtime runs passed with Quality and with Super
-Resolution Off. Each reported 357–358 display frames for 180 actual submissions.
-The test compares against all SDK submissions, including presentation retries,
-so retries cannot pass as interpolation. It also verifies Off, re-enable, output
-resize and invalid-input fallback. These are runtime and lifetime checks, not a
-claim of native-game image quality or an increase in game simulation FPS.
-
-For runtime diagnosis, `KYTY_DLSS_FG_DEBUG=1` enables verbose SDK logging. Official
-development DLLs may be used in a separate diagnostic directory; deployment uses
-the signed production DLLs only.
-
-## Presentation and optional native scene inputs
-
-The normal call `Presenter::PrepareFrame(command, video_out_info)` generates
-inputs automatically. It accepts single-layer, single-sample 2D final color in
-RGBA8/BGRA8 UNORM or SRGB, packed RGB10A2 UNORM, RGBA16F or RGBA32F, with linear
-sampling support. SRGB sources retain the guest's already encoded color through
-a UNORM view. Unsupported sources, unavailable NGX or rejected input settings
-retain ordinary presentation. Size/format/mode changes, rejected main frames and
-gaps longer than 250 ms reset history. Motion estimation stays entirely on the
-GPU; no frame readback or CPU guest-memory scan occurs in this path.
-
-Geometry capture currently supports ordinary vertex/fragment stages, one opaque
-MRT0 output, single-sample/layer views and spare varying slots 26/27 plus MRT7.
-Mesh/tessellation, blending, fragment depth/sample-mask exports and occupied
-interfaces retain the estimated path. A draw sampling a previously rendered or
-storage image cannot advertise its quad as the sampled scene's motion/depth.
-Unrelated color writes invalidate its guide; arbitrary post-processing and copies
-do not propagate scene motion. Draw identities include shaders, vertex/index
-resources, draw offsets, topology and viewport; ambiguous duplicates and missing
-previous vertices invalidate history. Position buffers retain at most 64 MiB;
-guide images retain at most 128 MiB, with GPU-completion retirement. This is a
-general renderer path, but it does not guarantee native coverage of every game's
-final frame, object identity across reused buffers, camera-cut detection, true
-scene jitter, pre-HUD inputs or native-integration image quality.
-
-Call `Presenter::PrepareFrame(command, video_out_info, &inputs)` once per new
-guest frame to override generated inputs with a native scene adapter.
-`DlssFrameInputs` must then describe actual scene color, depth and
-two-channel motion vectors from the same frame, before HUD composition. Depth
-and motion dimensions must match the color dimensions. Supply camera jitter in
-render pixels and motion scales converting vectors to render pixels. Motion
-vectors must exclude camera jitter. Set the inverted-depth/HDR flags according
-to the game and reset history after scene cuts, pause/resume or discontinuities.
-
-Inputs must be single-sample, single-layer 2D sampled images, already updated in
-the texture cache, produced on the renderer's command queue. Supported depth
-formats are D16, D32F, R16 UNORM and R32F; motion formats are RG16F and RG32F.
-Color formats are RGBA8 UNORM, BGRA8 UNORM, RGBA16F and RGBA32F. The adapter must
-also arrange game HUD composition after the reconstructed scene (for example,
-using a separate VideoOut overlay layer).
-The integration owns image lifetimes until the recording GPU tick completes.
-The selected launcher resolution is the output resolution. Query
-`DlssProcessor::OptimalInputExtent` for the SDK's recommended scene resolution;
-the game adapter must actually arrange rendering at a supported input size.
-Changing the launcher option does not rewrite a game's render targets.
-
-The separate Render scale option changes host rasterization of supported passes;
-it does not change the game's declared texture dimensions or render graph.
-
-The backend creates an RGBA16F storage output, tracks Vulkan image transitions,
-checks NGX capabilities and the SDK's resolution range, recreates features on
-size/mode/flag changes, and defers release until queued GPU work completes.
-Missing or invalid inputs reset history and retain ordinary presentation.
-Failure while recording DLSS fills the prepared output from the original image.
-Evaluation happens during frame preparation; repeated presentation of a cached
-frame and host overlays do not advance the DLSS history.
+Headers and production DLLs must be from the same SDK release. CMake validates
+the supplied SDKs and copies/installs enabled production runtimes and license
+notices; it does not download them. NVIDIA code has separate terms in the SDK
+licenses and is not covered by Kyty's license. This software contains source
+code provided by NVIDIA Corporation. Vendored XeSS/FidelityFX interfaces retain
+their license/provenance files; their runtime DLLs are not bundled.
 
 ## Verification
 
 ```powershell
-cmake --build _Build/windows --target dlss_gpu_tests prepared_frame_selection_tests
-ctest --test-dir _Build/windows -L headless --output-on-failure
+cmake --build _Build/windows --target dlss_gpu_tests dlss_settings_tests upscale_menu_tests frame_pacer_tests prepared_frame_selection_tests shader_cfg_tests
+ctest --test-dir _Build/windows -R '^(dlss_|presentation_|prepared_frame_selection|upscale_menu|frame_timing_analysis|shader_cfg)' --output-on-failure
+_Build/windows/dlss_gpu_tests.exe --quality-cost
+_Build/windows/dlss_gpu_tests.exe --input-cost
 ```
 
-The `headless` selection runs DLSS GPU checks without creating or focusing a
-window. The broader `ctest --test-dir _Build/windows -R '^dlss_'` selection
-also includes presentation and Frame Generation tests that open and focus
-their windows; reserve those for a planned visual validation session.
+GPU fixtures verify motion/depth, color, detail, raster scaling, history, queues,
+fallbacks and resource lifetime. FG presentation checks require actual generated
+display frames and cover cached frames, Off/On and resize. They open and focus
+windows. `-L headless` selects checks without a window; native FG checks run
+without Vulkan validation, with a separate validated fallback test.
 
-`prepared_frame_selection` checks the free-frame selection when compatible
-allocations are pending but other frames are ready. The GPU checks also verify
-FG completion timeline queries, zero values, missing fences and retirement.
-The GPU suite also blocks a producer submission on a host gate, submits work on
-the separate presentation queue waiting for that producer tick, verifies that
-the consumer cannot finish early, then checks its actual pixels after releasing
-the gate. This runs without a window and with Vulkan validation.
+External-runtime tests skip when no package is configured:
 
-`dlss_settings_tests` checks every mode, saved settings, global-to-game inheritance,
-render scale, Frame Generation, old settings and corrupt values.
-`upscale_menu_tests` opens the actual settings dialog and checks the live summary
-and saved choices. Its Qt deployment includes the offscreen platform plugin.
-`dlss_gpu_tests` uses the production backend on
-an NVIDIA GPU with controlled synthetic scene buffers: every mode, repeated
-frames, history reset, output resize, missing depth, invalid jitter and readback
-of the computed output. It also evaluates every mode with emulator-generated
-inputs, checks GPU motion direction/scaling on a translated textured scene,
-zero motion for stationary frames, scene-cut rejection and resource retirement
-on resize. Raster tests verify reduced color/depth attachments at 25%, 50%, 67%
-and 100%, preservation of untouched pixels and materialization into native images.
-Translated guest shaders also test geometric movement on a uniform-color scene,
-first-frame depth, motion sign/scale, indexed duplicate vertices, instancing,
-negative viewports, reduced rasterization, reversed depth, depth-rejected
-fragments, duplicate draw rejection, bounded allocation and unchanged guest color.
-It enables Vulkan validation when the layer is available
-and fails on validation errors. These checks verify the backend, not the quality
-or performance of emulated games.
+```powershell
+$env:KYTY_OPTISCALER_TEST_DLL = "D:/Upscalers/OptiScaler.dll"
+$env:KYTY_OPTISCALER_TEST_GPU = "0"
+ctest --test-dir _Build/windows -R '^(dlss_optiscaler|dlss_(Fsr|XeSS)_presentation|optiscaler_.*frame_generation)' --output-on-failure
+```
 
-`dlss_presentation_srgb`, `dlss_presentation_fallback` and
-`dlss_presentation_pool` cover the review regressions: byte-preserving RGBA/BGRA
-sRGB copies with DLSS Off, encoded-color compute resampling into RGBA16F when
-DLSS rejects a frame, and stable image reuse while MAIN, overlay and blank frames
-share the pool. The pool matches the actual output size, format and storage usage
-before configuring a frame. Fallback resampling has no jitter or history update;
-if it cannot run, ordinary source-sized presentation is restored.
-
-`dlss_window_device` and `dlss_window_device_off` also exercise the production
-window, Vulkan device and presenter initialization, following the engine's
-subsystem initialization order. They cover startup with DLSS enabled and disabled.
-
-`dlss_emulator_presentation` exercises the production presenter without a scene
-adapter, reads back the actual prepared DLSS image, presents it through the
-swapchain, checks repeated presentation, excludes separate overlays, and checks
-mode/output changes plus changing source pixels. It fails if selecting DLSS
-only creates the SDK backend without reconstructing the presented frame.
-
-Run the presentation/DLSS/settings checks together using the command in
-[frame-pacing.md](frame-pacing.md). They establish integration and resource
-behavior, not compatibility, visual quality or FPS across the game catalog.
-Validate runtime activation and measure performance separately with the same
-scene and binary. Keep machine-specific results and graphics in the local PR
-report rather than treating them as cross-game guarantees.
+Known external failures remain visible: OptiScaler's Auto Vulkan path can report
+descriptor/storage-format errors and unreleased query/overlay objects; the
+tested Nukem 0.130 Fsr FG path reports three first-dispatch layout errors even
+when interpolated pixels match the expected midpoint. Passing direct Fsr/XeSS
+tests does not certify the Auto path or every driver/package combination.
+Quality fixtures and input-cost timestamps are not gameplay benchmarks. Keep
+machine-specific logs, captures and comparison reports under ignored `_Build/`.

@@ -1,21 +1,15 @@
-# Frame pacing diagnostics
-
-The window title updates once per second without waiting for the UI thread.
-Previously every presented frame synchronously called the UI thread, so a busy
-window event loop could stop presentation. Title callbacks own their text and
-resolve the SDL window ID when they run, including after a window closes.
-The FPS counter counts new guest frames; host blank frames and repeated paused
-frames do not inflate gameplay FPS.
+# Frame pacing and measurement
 
 VideoOut uses absolute vblank deadlines with fractional-clock compensation.
-Small wake-up errors retain the cadence. Delays of at least another full period
-discard accumulated timing debt, preventing a long stall from producing a burst
-of accelerated vblanks. The configured vblank frequency and guest flip interval
-remain the timing inputs. Increasing that frequency is not a performance fix.
+Small wake-up errors preserve cadence; a stall of a full additional period drops
+old timing debt. The configured frequency and guest flip interval remain the
+timing inputs. FG pacing adds display frames without changing simulation FPS.
 
-## Capture and compare
+The window title updates asynchronously once per second. New guest frames,
+cached/blank presentations and SDK display frames have separate counts. The
+title's FG FPS is the SDK's reported throughput, not measured scanout.
 
-Enable a buffered CSV only for a diagnostic run:
+## Capture
 
 ```powershell
 $env:KYTY_FRAME_TIMING_CSV = "$PWD/_Build/frame-timings.csv"
@@ -24,110 +18,55 @@ Remove-Item Env:KYTY_FRAME_TIMING_CSV
 python tools/analyze-frame-timings.py _Build/frame-timings.csv --start 35 --end 60
 ```
 
-Repeat with `--dlss Quality`, a different trace filename, the same scene, input
-sequence and frequency. Separate startup/shader compilation and area transitions
-from steady-scene samples. Do not compare menu samples to gameplay samples.
+Recording is disabled unless the variable is set. Files are buffered; close the
+emulator normally before analysis. The analyzer ignores incomplete trailing rows.
 
-`frame_ms` measures the CPU interval between successful presentation submissions.
-`present_ms` measures the call including image acquisition, recording, submission,
-presentation and title scheduling. These are **not GPU execution or displayed
-frame timings**. `new_frame=0` identifies repeated cached presentations and host
-blank frames.
+| CSV field | Meaning |
+| --- | --- |
+| `frame_ms` | CPU interval between successful presentation submissions |
+| `present_ms` | Acquisition, recording, submit/present and title scheduling |
+| `new_frame` | New guest frame, excluding cached refreshes and blank frames |
+| `dlss_evaluated` | Successful SR evaluation, including OptiScaler |
+| `display_frames` | Backend-reported frames for a new MAIN presentation |
+| `prepare_wait_ms`, `prepare_lock_ms` | Producer retirement and renderer lock |
+| `resolve_ms`, `inputs_ms` | Source resolution and input preparation |
+| `fg_capture_ms`, `dlss_record_ms` | FG snapshots and SR recording |
 
-The counter records guest frame submissions, not whether successive guest
-images contain distinct visual content. It cannot establish that game logic
-or animation advances at the same rate as the configured vblank frequency.
-`dlss_evaluated=1` means the frame contains an output successfully evaluated by
-the backend; repeated presentation of that output is not a new evaluation.
-The analyzer counts evaluations only on new frames.
+All these times are CPU measurements. They do not isolate GPU execution.
+`present_ms` excludes the producer's earlier SR work and Fsr FG's deferred
+spacing wait. Cached/blank frames have zero preparation timings. Repeated
+presentation of an evaluated frame is not another SR evaluation or guest frame.
+Older CSVs without optional fields remain supported.
 
-Optional producer timings are recorded as `prepare_wait_ms`, `prepare_lock_ms`,
-`resolve_ms`, `inputs_ms`, `fg_capture_ms` and `dlss_record_ms`. They separate CPU
-frame retirement, renderer-lock acquisition, source resolution, input preparation,
-FG snapshot recording and output/NGX recording. Cached/blank frames carry zero
-preparation timings. The analyzer summarizes the preparation of new MAIN frames;
-these values remain CPU measurements, not GPU timestamps.
+## Compare
 
-`display_frames` records Streamline's count for each new MAIN presentation when
-FG is enabled, or one for ordinary presentation. Cached refreshes contribute zero.
-The analyzer reports `sdk_display_fps` separately from `guest_fps` and continues
-to accept older traces without these columns.
+Use the same executable, GPU/driver, scene, input sequence, guest version,
+resolution, render scale, vblank rate and power profile. Record the binary hash
+and dirty-tree status. Exclude startup, shader compilation and transitions.
+Alternate baseline/candidate runs; avoid captures and overlays during samples.
 
-Files are buffered. Close the emulator normally before analyzing; a forcefully
-terminated process can lose the last buffered samples. The analyzer skips an
-incomplete trailing row. CSV recording is disabled unless the variable is set.
+Analyze the same stable interval and report individual runs as well as aggregate
+guest FPS, median/P95/P99 intervals and long stalls. Mean guest FPS counts frame
+intervals divided by elapsed time. The first selected row establishes the time
+boundary; its interval is excluded because it began before the sample window.
+Its presentation-call duration remains part of the presentation statistics.
 
-With a requested DLSS mode the title also displays `DLSS: active` or
-`DLSS: inactive`, according to the presented frame. The emulator-wide path now
-generates temporal inputs from the main VideoOut color, so a supported surface
-can activate reconstruction without a game-specific adapter. This stage adds
-GPU work. The separate render-scale option reduces supported raster passes and
-adds attachment copies; measure total cost separately. Frame Generation inserts
-display frames, which the guest-submission CSV does not count. When FG is
-enabled, the title's `fps` (tagged `[FG]`) shows the SDK's reported
-display-frame throughput, including generated frames. This is an SDK
-counter, not an independent scanout measurement.
-See [dlss.md](dlss.md).
+Verify that Off has no successful SR evaluations and that each eligible new
+frame in an active run has one. Report guest submissions, SDK display counts and
+GPU cost separately. Equal FPS at a vblank cap does not establish equal cost;
+a higher-cap stress run changes guest timing and must be identified separately.
+These counters do not prove that game logic or animation advances at that rate.
 
-## Reproducible DLSS comparisons
+Keep local CSVs, images and reports in ignored `_Build/`. See
+[dlss.md](dlss.md) for runtime requirements, quality limitations and GPU checks.
 
-Use the same executable, GPU, driver, guest dump/version, window size, screen
-resolution, shader optimization, vblank rate, scene and input sequence in both
-runs. Record the executable hash and whether the source tree is dirty. Capture
-CPU/GPU model, RAM, OS build, GPU driver, AC/battery state and power profile.
-Do not change a power profile between runs; note unmeasured thermal or
-background-load effects instead of attributing all variation to DLSS.
-
-Run both Off and an active DLSS mode at the normal vblank rate. If both reach
-the cap, their equal mean FPS does not show equal rendering cost. An additional
-pair at a higher, identical vblank setting can expose throughput differences,
-but this is a stress run that can change guest timing, not proof of equivalent
-gameplay at that FPS. Repeat in alternating order (for example Off, Quality,
-Quality, Off) to expose variation between runs.
-
-Analyze the same elapsed CSV interval after initialization and shader warm-up.
-Verify the scene outside that interval; PrintWindow, desktop screenshots,
-overlays and GPU validation can perturb measured runs. Avoid captures during
-the sampled interval. Reject comparisons if scenes, options or binaries differ.
-Earlier traces from another executable or with captures during sampling are
-historical evidence, not the baseline for the current change.
-
-Mean guest-submission FPS is `(new_frames - first_row.new_frame) / elapsed`,
-where `elapsed` is the time between the first and last selected submissions.
-For multiple runs, divide the total counted frame intervals by their total
-elapsed time and also report individual means/range. Do not average reciprocal
-per-frame intervals or mix Off and active frames into one mean.
-
-Interval statistics exclude the first selected row: its `frame_ms` begins before
-the selected window. The row still establishes the elapsed-time boundary and
-contributes its own `present_ms`, which measures the presentation call itself.
-This prevents a preceding area transition from becoming a steady-scene stall.
-`frame_timing_analysis` checks both an excluded preceding transition and a
-retained stall inside the window when a Python interpreter is available.
-
-Report interval median/P95/P99 and long intervals alongside mean FPS.
-`present_ms` excludes the earlier producer-side input generation and NGX
-evaluation; it cannot isolate DLSS GPU cost. Verify that Off has zero successful
-evaluations and that every measured new frame in an active run has one. Show
-FPS over time using fixed-width bins and state the bin width. Label graphs as
-CPU guest-submission throughput, rather than GPU execution or scanout FPS.
-
-Keep machine-specific reports, CSVs, screenshots and plot outputs under
-`_Build/reports/`, which is ignored by Git. Prepare the Markdown report for the
-PR description/comment and upload its PNG there; relative local image paths
-must be replaced by uploaded attachment URLs before publishing. Keep generic
-implementation and measurement instructions in `docs/`. A menu/calibration
-sample must be identified as such and cannot establish full-game performance
-or an image-quality improvement.
-
-## Focused checks
+## Checks
 
 ```powershell
-cmake --build _Build/windows --target dlss_gpu_tests dlss_settings_tests upscale_menu_tests shader_cfg_tests frame_pacer_tests
-ctest --test-dir _Build/windows -R '^(dlss_|presentation_|frame_timing_analysis$|shader_cfg$|upscale_menu$)' --output-on-failure
+cmake --build _Build/windows --target dlss_gpu_tests frame_pacer_tests prepared_frame_selection_tests
+ctest --test-dir _Build/windows -R '^(presentation_|prepared_frame_selection|frame_timing_analysis)' --output-on-failure
 ```
 
-The pacer test covers fractional cadence at 360 Hz, a 100 ms stall, ordinary
-oversleep and refresh changes. The SDL title regression test stops pumping the
-UI thread while issuing 120 frame updates, checks periodic refresh, and verifies
-that both paths let the producer finish without UI work.
+The pacer covers fractional refresh, oversleep, stalls and refresh changes.
+The title test pauses UI event handling and verifies that frame updates do not
+block the producer. GPU presentation checks cover reuse and queue dependencies.

@@ -529,8 +529,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		m_staging_buffer.Commit();
 		return {&m_staging_buffer, stage_offset};
 	}
-	// Larger than the staging ring (streaming pools of hundreds of MiB): a one-off upload
-	// buffer carries the whole image and is released once the submission completes.
+	// The ring cannot map the range, for now or because the image is larger than the ring
+	// (streaming pools of hundreds of MiB): a one-off upload buffer carries the whole image
+	// and is released once the submission completes.
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                          vk::BufferUsageFlagBits::eTransferSrc, size);
 	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, temporary->Mapped().data(), size)) {

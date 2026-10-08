@@ -1559,6 +1559,7 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("rbknaUjpqWo", NpManager::NpGetAccountIdA);
 	LIB_FUNC("JT+t00a3TxA", NpManager::NpGetAccountCountryA);
 	LIB_FUNC("+4DegjBqV1g", NpManager::NpGetAccountAge);
+	LIB_FUNC("3Tcz5bNCfZQ", NpManager::NpGetAccountLanguage2);
 	LIB_FUNC("GpLQDNKICac", NpManager::NpCreateRequest);
 	LIB_FUNC("eiqMCt9UshI", NpManager::NpCreateAsyncRequest);
 	LIB_FUNC("S7QTn72PrDw", NpManager::NpDeleteRequest);

@@ -4106,6 +4106,26 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 	return np_error_signed_out;
 }
 
+int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_code) {
+	PRINT_NAME();
+
+	LOGF("\t req_id        = %d\n", req_id);
+	LOGF("\t user_id       = %d\n", user_id);
+	LOGF("\t language_code = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(language_code));
+
+	if (req_id <= 0 || language_code == nullptr) {
+		return np_error_invalid_argument;
+	}
+
+	std::lock_guard lock(g_np_request_mutex);
+
+	if (np_get_request_locked(req_id) == nullptr) {
+		return np_error_request_not_found;
+	}
+
+	return np_error_signed_out;
+}
+
 int KYTY_SYSV_ABI NpCreateRequest() {
 	PRINT_NAME();
 

@@ -3217,6 +3217,14 @@ uint32_t KYTY_SYSV_ABI AgcAcbJumpGetSize() {
 	return 0x10u;
 }
 
+uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload) {
+	auto* cmd = AgcDcbRewind(buf, initial_state);
+	if (cmd != nullptr) {
+		cmd[1] |= (static_cast<uint32_t>(offload & 0x1u) << 24u);
+	}
+	return cmd;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {

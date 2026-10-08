@@ -67,8 +67,13 @@ struct PadTriggerEffectParam {
 	PadTriggerEffectCommand command[2];
 };
 
+struct PadTriggerEffectStateInformation {
+	int32_t state[2];
+};
+
 static_assert(sizeof(PadTriggerEffectCommand) == 56);
 static_assert(sizeof(PadTriggerEffectParam) == 120);
+static_assert(sizeof(PadTriggerEffectStateInformation) == 8);
 
 struct DualSenseEffects {
 	uint8_t enable_bits;
@@ -118,6 +123,7 @@ public:
 	int  GetActiveControllerId();
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
+	void  GetTriggerEffectState(PadTriggerEffectStateInformation* info);
 	void  CycleSetting(Setting setting);
 	float GetSettingScale(Setting setting) const;
 	void ReadState(ControllerState* state, bool* flag, int* count);
@@ -131,6 +137,7 @@ private:
 	// Apply cached output without changing its game-requested lifetime; caller holds m_mutex.
 	void ApplyVibration();
 	bool SendTriggerEffect(const PadTriggerEffectParam& param);
+	void UpdateTriggerEffectState();
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
@@ -152,6 +159,7 @@ private:
 	std::array<uint8_t, 2> m_vibration {};
 	uint64_t               m_vibration_until = 0;
 	PadTriggerEffectParam  m_trigger_effect {};
+	PadTriggerEffectStateInformation m_trigger_state {};
 	// Setting changes share the output lock; audio only needs an atomic scale snapshot.
 	std::array<std::atomic<uint32_t>, 3> m_setting_steps {};
 };
@@ -330,6 +338,51 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, 
 	}
 }
 
+enum TriggerState : int32_t {
+	TRIGGER_STATE_OFF               = 0,
+	TRIGGER_STATE_FEEDBACK_STANDBY  = 1,
+	TRIGGER_STATE_FEEDBACK_ACTIVE   = 2,
+	TRIGGER_STATE_WEAPON_STANDBY    = 3,
+	TRIGGER_STATE_WEAPON_PULLING    = 4,
+	TRIGGER_STATE_WEAPON_FIRED      = 5,
+	TRIGGER_STATE_VIBRATION_STANDBY = 6,
+	TRIGGER_STATE_VIBRATION_ACTIVE  = 7,
+};
+
+static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value,
+                                  int32_t previous) {
+	// Trigger positions use nonuniform travel ranges, with endpoints at 0 and 255.
+	const int pos = value == 0 ? 0 : value == 255 ? 9 : 1 + value / 32;
+	switch (command.mode) {
+		case 1: // feedback: resistance from position data[0], strength data[1]
+			return command.data[1] != 0 && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_ACTIVE
+			                                                      : TRIGGER_STATE_FEEDBACK_STANDBY;
+		case 2: // weapon: resistance from data[0], released at data[1]
+			if (value < command.data[0] * 32) {
+				return TRIGGER_STATE_WEAPON_STANDBY;
+			}
+			return previous == TRIGGER_STATE_WEAPON_FIRED ||
+			               value >= std::min(command.data[1] * 32, 254)
+			           ? TRIGGER_STATE_WEAPON_FIRED
+			           : TRIGGER_STATE_WEAPON_PULLING;
+		case 3: // vibration from position data[0], amplitude data[1], frequency data[2]
+			return command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
+			           ? TRIGGER_STATE_VIBRATION_ACTIVE
+			           : TRIGGER_STATE_VIBRATION_STANDBY;
+		case 4: // multiple-position feedback: strength per position
+			return command.data[pos] != 0 ? TRIGGER_STATE_FEEDBACK_ACTIVE
+			                              : TRIGGER_STATE_FEEDBACK_STANDBY;
+		case 5: // slope feedback between data[0] and data[1]
+			return pos >= command.data[0] && pos < command.data[1] ? TRIGGER_STATE_FEEDBACK_ACTIVE
+			                                                       : TRIGGER_STATE_FEEDBACK_STANDBY;
+		case 6: // multiple-position vibration: frequency data[0], amplitude per position
+			return command.data[0] != 0 && command.data[1 + pos] != 0
+			           ? TRIGGER_STATE_VIBRATION_ACTIVE
+			           : TRIGGER_STATE_VIBRATION_STANDBY;
+		default: return TRIGGER_STATE_OFF;
+	}
+}
+
 void Initialize() {
 	EXIT_IF(g_controller != nullptr);
 
@@ -419,6 +472,7 @@ void GameController::CheckActive() {
 	m_vibration          = {};
 	m_vibration_until    = 0;
 	m_trigger_effect     = {};
+	m_trigger_state      = {};
 }
 
 void GameController::AddState() {
@@ -466,6 +520,7 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 		}
 		if (trigger != 0) {
 			m_state.buttons = value > 0 ? m_state.buttons | trigger : m_state.buttons & ~trigger;
+			UpdateTriggerEffectState();
 		}
 
 		AddState();
@@ -622,6 +677,7 @@ void GameController::ResetInputState() {
 	m_state.buttons = 0;
 	std::fill_n(m_state.axes, 4, 128);
 	std::fill_n(m_state.axes + 4, 2, 0);
+	UpdateTriggerEffectState();
 	for (auto& touch: m_state.touch) {
 		touch = {};
 	}
@@ -730,7 +786,23 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 			m_trigger_effect.command[i] = param.command[i];
 		}
 	}
+	UpdateTriggerEffectState();
 	return true;
+}
+
+void GameController::GetTriggerEffectState(PadTriggerEffectStateInformation* info) {
+	Common::LockGuard lock(m_mutex);
+	*info = m_trigger_state;
+}
+
+void GameController::UpdateTriggerEffectState() {
+	// Track every input event so a weapon remains fired even when the game polls after release
+	// starts.
+	for (int i = 0; i < 2; i++) {
+		m_trigger_state.state[i] = TriggerEffectState(
+		    m_trigger_effect.command[i], m_state.axes[static_cast<int>(Axis::TriggerLeft) + i],
+		    m_trigger_state.state[i]);
+	}
 }
 
 bool GameController::SendTriggerEffect(const PadTriggerEffectParam& param) {
@@ -1096,6 +1168,23 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 	}
 
 	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
+}
+
+int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
+	PRINT_NAME();
+
+	LOGF("\t handle = %d\n", handle);
+
+	if (handle != 1) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+	if (info == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+
+	g_controller->GetTriggerEffectState(info);
+
+	return OK;
 }
 
 } // namespace Libs::Controller

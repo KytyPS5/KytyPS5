@@ -45,6 +45,9 @@ void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 
 namespace Libs {
 void InitLibKernel_1(Loader::SymbolDatabase *symbols);
+void InitSysmodule_1(Loader::SymbolDatabase *symbols);
+void InitSystemService_1(Loader::SymbolDatabase *symbols);
+void InitAppContent_1(Loader::SymbolDatabase *symbols);
 }
 
 namespace Libs::LibAmpr {
@@ -162,6 +165,95 @@ void TestFileDescriptorFlags() {
           "O_CLOEXEC sets the descriptor flag on open");
     Check(FileSystem::KernelClose(cloexec_fd) == OK, "close flagged entropy source");
   }
+}
+
+void TestSysmoduleReferences() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitSysmodule_1(&symbols);
+  using ModuleCall = int (KYTY_SYSV_ABI *)(uint16_t);
+  const auto resolve = [&](const char* nid) {
+    const auto* symbol = symbols.Find(
+        {nid, "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
+    Check(symbol != nullptr, "Sysmodule export resolves");
+    return reinterpret_cast<ModuleCall>(symbol->vaddr);
+  };
+  const auto load = resolve("g8cM39EUZ6o");
+  const auto unload = resolve("eR2bZFAAU0Q");
+  const auto is_loaded = resolve("fMP5NHUOaMk");
+  constexpr int unloaded = static_cast<int>(0x805a1001u);
+  Check(load(0x113) == OK && is_loaded(0xb4) == unloaded,
+        "loading entitlement access does not mark AppContent loaded");
+  Check(unload(0x113) == OK, "release independent module reference");
+  for (const uint16_t id : {0x113, 0xb4}) {
+    Check(is_loaded(id) == unloaded, "unloaded module allows guest initialization");
+    Check(unload(id) == unloaded, "unloading an absent module reports UNLOADED");
+    Check(load(id) == OK && load(id) == OK && is_loaded(id) == OK,
+          "repeated loads retain references");
+    Check(unload(id) == OK && is_loaded(id) == OK,
+          "one unload preserves the remaining reference");
+    Check(unload(id) == OK && is_loaded(id) == unloaded,
+          "last unload restores unloaded status");
+  }
+  const auto* internal_symbol = symbols.Find(
+      {"hHrGoGoNf+s", "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
+  Check(internal_symbol != nullptr, "internal Sysmodule load export resolves");
+  const auto internal_load =
+      reinterpret_cast<int (KYTY_SYSV_ABI *)(uint16_t, int, int, int, int*)>(
+          internal_symbol->vaddr);
+  int result = -1;
+  Check(internal_load(0xb4, 0, 0, 0, &result) == OK && result == OK &&
+            is_loaded(0xb4) == OK && unload(0xb4) == OK && is_loaded(0xb4) == unloaded,
+        "internal and public module operations share load state");
+}
+
+void TestSystemServiceEntitlementEvents() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitSystemService_1(&symbols);
+  Libs::InitAppContent_1(&symbols);
+  const auto resolve = [&](const char* nid, const char* library, const char* module) {
+    const auto* symbol = symbols.Find(
+        {nid, library, 1, module, 1, 1, Loader::SymbolType::Func});
+    Check(symbol != nullptr, "entitlement event export resolves");
+    return symbol->vaddr;
+  };
+  const auto initialize = reinterpret_cast<int (KYTY_SYSV_ABI *)(const void*, void*)>(
+      resolve("R9lA82OraNs", "AppContent", "AppContentUtil"));
+  struct Status {
+    int32_t event_num;
+    bool overlay, background, vr;
+    uint8_t reserved[127];
+  };
+  struct Event {
+    int32_t type;
+    uint8_t data[8192];
+  };
+  static_assert(sizeof(Status) == 136 && sizeof(Event) == 8196);
+  const auto get_status = reinterpret_cast<int (KYTY_SYSV_ABI *)(Status*)>(
+      resolve("rPo6tV8D9bM", "SystemService", "SystemService"));
+  const auto receive = reinterpret_cast<int (KYTY_SYSV_ABI *)(Event*)>(
+      resolve("656LMQSrg6U", "SystemService", "SystemService"));
+  Status status {};
+  Event event {};
+  Check(get_status(&status) == OK && status.event_num == 0,
+        "SystemService starts without pending events");
+  std::array<uint8_t, 32> init {};
+  std::array<uint8_t, 40> boot {};
+  Check(initialize(init.data(), boot.data()) == OK,
+        "AppContent initialization generates an entitlement notification");
+  Check(get_status(&status) == OK && status.event_num == 1 &&
+            get_status(&status) == OK && status.event_num == 1,
+        "status queries preserve pending notifications");
+  Check(receive(nullptr) == Libs::SystemService::SYSTEM_SERVICE_ERROR_PARAMETER &&
+            get_status(&status) == OK && status.event_num == 1,
+        "invalid event output does not consume a notification");
+  std::memset(&event, 0xff, sizeof(event));
+  Check(receive(&event) == OK && event.type == 0x10000003 &&
+            std::all_of(std::begin(event.data), std::end(event.data),
+                        [](uint8_t byte) { return byte == 0; }) &&
+            get_status(&status) == OK && status.event_num == 0,
+        "receive delivers the entitlement event with cleared payload exactly once");
+  Check(receive(&event) == Libs::SystemService::SYSTEM_SERVICE_ERROR_NO_EVENT,
+        "empty event queue reports NO_EVENT");
 }
 
 void TestSaveOpenVisibility() {
@@ -1532,6 +1624,8 @@ int main(int, char**) {
 
   TempDirectory temporary;
   FileSystem::Initialize();
+  TestSysmoduleReferences();
+  TestSystemServiceEntitlementEvents();
   TestRandomDevices();
   TestFileDescriptorFlags();
   CheckMountRoot(temporary.Path());

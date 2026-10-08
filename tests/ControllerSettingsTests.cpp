@@ -343,6 +343,162 @@ void TestIndependentOutputsAndPadSwitch() {
 		      "released controller retained a cached vibration");
 	}
 }
+
+void TestTriggerEffectState() {
+	Controller                       controller;
+	PadTriggerEffectStateInformation info {{-1, -1}};
+	const auto check_state = [&](int32_t left, int32_t right, const char* message) {
+		Check(PadGetTriggerEffectState(1, &info) == OK && info.state[0] == left &&
+		          info.state[1] == right,
+		      message);
+	};
+	const auto axis = [&](int left, int right) {
+		SetAxis(1, Axis::TriggerLeft, left);
+		SetAxis(1, Axis::TriggerRight, right);
+	};
+	PadTriggerEffectParam param {};
+	const auto            set_effect = [&] {
+		Check(PadSetTriggerEffect(1, &param) == OK, "trigger request failed");
+	};
+	Check(PadGetTriggerEffectState(2, &info) == PAD_ERROR_INVALID_HANDLE && info.state[0] == -1 &&
+	          info.state[1] == -1,
+	      "invalid trigger handle changed the output");
+	Check(PadGetTriggerEffectState(2, nullptr) == PAD_ERROR_INVALID_HANDLE,
+	      "trigger state checked the output before the handle");
+	Check(PadGetTriggerEffectState(1, nullptr) == PAD_ERROR_INVALID_ARG,
+	      "trigger state accepted a null output");
+	check_state(0, 0, "unset trigger effects did not report off");
+
+	param.trigger_mask       = 3;
+	param.command[0].mode    = 1;
+	param.command[0].data[0] = 7;
+	param.command[0].data[1] = 8;
+	param.command[1].mode    = 2;
+	param.command[1].data[0] = 2;
+	param.command[1].data[1] = 7;
+	param.command[1].data[2] = 6;
+	set_effect();
+	axis(191, 63);
+	check_state(1, 3, "triggers activated before the documented start positions");
+	axis(192, 64);
+	check_state(2, 4, "triggers did not activate at the documented start positions");
+	axis(255, 223);
+	check_state(2, 4, "weapon fired before its end position");
+	SetAxis(1, Axis::TriggerRight, 224);
+	SetAxis(1, Axis::TriggerRight, 100);
+	check_state(2, 5, "unpolled weapon firing was lost on partial release");
+	check_state(2, 5, "reading trigger state changed the weapon latch");
+	set_effect();
+	check_state(2, 5, "repeating a weapon request rearmed a held trigger");
+	CycleSetting(Setting::TriggerEffectIntensity);
+	check_state(2, 5, "muting trigger effects changed their reported states");
+
+	// A rejected two-trigger request must leave both cached commands and states intact.
+	auto invalid               = param;
+	invalid.command[0].mode    = 0;
+	invalid.command[1].data[1] = 2;
+	Check(PadSetTriggerEffect(1, &invalid) == PAD_ERROR_INVALID_ARG,
+	      "invalid weapon end position was accepted");
+	SetAxis(1, Axis::TriggerLeft, 255);
+	check_state(2, 5, "an invalid request changed cached trigger commands or states");
+	SetAxis(1, Axis::TriggerRight, 63);
+	SetAxis(1, Axis::TriggerRight, 100);
+	check_state(2, 4, "unpolled release did not rearm the weapon");
+	param.trigger_mask       = 2;
+	param.command[1].data[1] = 8;
+	set_effect();
+	axis(255, 253);
+	check_state(2, 4, "weapon end position 8 fired before output 254");
+	SetAxis(1, Axis::TriggerRight, 254);
+	check_state(2, 5, "weapon end position 8 did not fire at output 254");
+
+	// Masked updates preserve the other trigger, including its fired state.
+	param.trigger_mask       = 1;
+	param.command[0].data[0] = 9;
+	set_effect();
+	SetAxis(1, Axis::TriggerLeft, 254);
+	check_state(1, 5, "feedback position 9 activated before full travel");
+	SetAxis(HOST_INPUT_CONTROLLER_ID, Axis::TriggerLeft, 255);
+	check_state(2, 5, "keyboard trigger travel did not activate feedback");
+	param.command[0].data[0] = 0;
+	set_effect();
+	SetAxis(1, Axis::TriggerLeft, 0);
+	check_state(2, 5, "feedback at position 0 was suppressed by a dead zone");
+	param.command[0].data[1] = 0;
+	set_effect();
+	check_state(1, 5, "zero-strength feedback reported active");
+
+	param.command[0]         = {};
+	param.command[0].mode    = 4;
+	param.command[0].data[0] = 4;
+	param.command[0].data[2] = 4;
+	param.command[0].data[8] = 4;
+	set_effect();
+	const int feedback_cases[][2] = {{0, 2},  {1, 1},   {31, 1},  {32, 2},  {63, 2},
+	                                 {64, 1}, {223, 1}, {224, 2}, {254, 2}, {255, 1}};
+	for (const auto& test: feedback_cases) {
+		SetAxis(1, Axis::TriggerLeft, test[0]);
+		check_state(test[1], 5, "multi-position feedback used the wrong position");
+	}
+
+	param.command[0]         = {};
+	param.command[0].mode    = 5;
+	param.command[0].data[0] = 3;
+	param.command[0].data[1] = 7;
+	param.command[0].data[2] = 2;
+	param.command[0].data[3] = 6;
+	set_effect();
+	const int slope_cases[][2] = {{63, 1}, {64, 2}, {191, 2}, {192, 1}, {255, 1}};
+	for (const auto& test: slope_cases) {
+		SetAxis(1, Axis::TriggerLeft, test[0]);
+		check_state(test[1], 5, "slope feedback did not respect its start and end");
+	}
+	param.command[0].data[0] = 0;
+	set_effect();
+	SetAxis(1, Axis::TriggerLeft, 0);
+	check_state(2, 5, "slope feedback at position 0 was suppressed");
+
+	param.command[0]         = {};
+	param.command[0].mode    = 3;
+	param.command[0].data[0] = 6;
+	param.command[0].data[1] = 4;
+	param.command[0].data[2] = 20;
+	set_effect();
+	SetAxis(1, Axis::TriggerLeft, 159);
+	check_state(6, 5, "vibration activated before position 6");
+	SetAxis(1, Axis::TriggerLeft, 160);
+	check_state(7, 5, "vibration did not activate at position 6");
+	param.command[0].data[0] = 0;
+	set_effect();
+	SetAxis(1, Axis::TriggerLeft, 0);
+	check_state(7, 5, "vibration at position 0 was suppressed");
+	param.command[0].data[2] = 0;
+	set_effect();
+	check_state(6, 5, "zero-frequency vibration reported active");
+
+	param.command[0]          = {};
+	param.command[0].mode     = 6;
+	param.command[0].data[0]  = 20;
+	param.command[0].data[10] = 4;
+	set_effect();
+	SetAxis(1, Axis::TriggerLeft, 254);
+	check_state(6, 5, "multi-position vibration activated before position 9");
+	SetAxis(1, Axis::TriggerLeft, 255);
+	check_state(7, 5, "multi-position vibration did not activate at position 9");
+	param.command[0].data[0] = 0;
+	set_effect();
+	check_state(6, 5, "zero-frequency multi-position vibration reported active");
+
+	ResetInputState();
+	check_state(6, 3, "input reset retained a fired weapon");
+	param.command[0].mode = 0;
+	set_effect();
+	check_state(0, 3, "off mode retained an effect state");
+	Connect(2);
+	Disconnect(1);
+	check_state(0, 0, "switching controllers retained effect states");
+}
+
 } // namespace
 
 int main() {
@@ -353,6 +509,7 @@ int main() {
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
+	TestTriggerEffectState();
 	Config::Shutdown();
 	return 0;
 }

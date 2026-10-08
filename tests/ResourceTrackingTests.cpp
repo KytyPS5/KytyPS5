@@ -186,8 +186,8 @@ void TestPackedUnormImageAdmission() {
                             P::BufferFormat::k10_11_11UNorm}) {
     Check(P::NumBytesPerElement(format) == 4u &&
               P::RemapTextureFormat(format) == P::BufferFormat::k32UInt &&
-              P::RenderTargetBytesPerElement(format) == 0u,
-          "packed normalized load widened storage or admitted an unproved CB format");
+              P::RenderTargetBytesPerElement(format) == 4u,
+          "packed normalized image/color backing lost its exact four-byte footprint");
     for (uint32_t mode = 0; mode < 7u; ++mode) {
       const auto operation = mode < 2u || mode == 4u ? ValueOpcode::ImageRead
           : mode == 2u || mode == 6u ? ValueOpcode::ImageSampleRaw

@@ -452,8 +452,45 @@ static uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t raw, uint32_t 
 	                     ConstantU32(state, infinity | (1u << (mantissa_bits - 1u))), numeric);
 }
 
+// CB round-by-half quantizes the exact FP32 value. Multiplying in FP32 first
+// can move a value across a half-LSB boundary, so keep the significand product
+// as two U32 words; this needs no native Int64/Float64 device feature.
+static uint32_t EmitUnormRoundByHalf(EmitterState& state, uint32_t raw, uint32_t bits) {
+	const auto value = EmitFormatClampF32(state, raw, 0.0f, 1.0f);
+	const auto clamped = EmitBitcastF32ToU32(state, value);
+	const auto exponent = EmitAndConstant(state,
+	    Binary(state, OpShiftRightLogical, TypeU32(state), clamped, ConstantU32(state, 23u)), 0xffu);
+	const auto significand = Binary(state, OpBitwiseOr, TypeU32(state),
+	    EmitAndConstant(state, clamped, 0x7fffffu), ConstantU32(state, 0x800000u));
+	const auto product = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUMulExtended, TypeU32Pair(state), product, significand,
+	                          ConstantU32(state, (1u << bits) - 1u));
+	const auto low = state.builder.AllocateId(), high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, product, 0u);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, product, 1u);
+	const auto shift = Binary(state, OpISub, TypeU32(state), ConstantU32(state, 150u), exponent);
+	const auto tiny = EmitCompareU32Constant(state, spv::OpUGreaterThan, shift, 24u + bits);
+	const auto bounded_shift = Select(state, TypeU32(state), tiny,
+	                                 ConstantU32(state, 24u + bits), shift);
+	const auto right = [&](uint32_t amount) {
+		const auto count = EmitAndConstant(state, amount, 31u);
+		const auto low_part = Binary(state, OpShiftRightLogical, TypeU32(state), low, count);
+		const auto high_part = Binary(state, OpShiftLeftLogical, TypeU32(state), high,
+		    EmitAndConstant(state, Binary(state, OpISub, TypeU32(state), ConstantU32(state, 32u), amount), 31u));
+		const auto combined = Binary(state, OpBitwiseOr, TypeU32(state), low_part, high_part);
+		const auto high_only = Binary(state, OpShiftRightLogical, TypeU32(state), high, count);
+		return Select(state, TypeU32(state), EmitCompareU32Constant(state, spv::OpULessThan, amount, 32u),
+		              combined, high_only);
+	};
+	const auto integer = right(bounded_shift);
+	const auto half = EmitAndConstant(state, right(Binary(state, OpISub, TypeU32(state),
+	    bounded_shift, ConstantU32(state, 1u))), 1u);
+	return Select(state, TypeU32(state), tiny, ConstantU32(state, 0u),
+	              Binary(state, OpIAdd, TypeU32(state), integer, half));
+}
+
 uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
-                             uint32_t component, uint32_t raw) {
+                             uint32_t component, uint32_t raw, NormalizedFormatRounding rounding) {
 	const auto bits = info.component_bits[component];
 	if (bits == 32u) {
 		return raw;
@@ -479,6 +516,8 @@ uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo
 			                     ConstantU32(state, max_unsigned));
 		}
 		case Format::ComponentType::Unorm:
+			if (rounding == NormalizedFormatRounding::HalfUp)
+				return EmitUnormRoundByHalf(state, raw, bits);
 			return EmitF32ToU32(
 			    state, EmitScaledRoundEven(state, EmitFormatClampF32(state, raw, 0.0f, 1.0f),
 			                               static_cast<float>(max_unsigned)));

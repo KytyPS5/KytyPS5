@@ -759,6 +759,9 @@ if(BUILD_TESTING)
 	add_test(NAME graphics_packed_float_roundtrip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --packed-float-rt-only)
 	set_tests_properties(graphics_packed_float_roundtrip PROPERTIES TIMEOUT 90)
+	add_test(NAME graphics_packed_unorm_targets
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --packed-unorm-render-target-only)
+	set_tests_properties(graphics_packed_unorm_targets PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	add_test(NAME shader_packed_unorm_stores
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --packed-unorm-store-only)
 	set_tests_properties(shader_packed_unorm_stores PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1338,6 +1339,36 @@ void PipelineCache::CheckpointDriverCacheLocked(uint64_t creation_ms) {
 	m_previous_checkpoint_ms = static_cast<uint64_t>(std::max<int64_t>(cost_ms, 1));
 }
 
+std::string ConfigurePixelTargetConversions(const HW::Context& context,
+                                            ShaderPixelInputInfo& pixel_info) {
+	std::array<Prospero::BufferFormat, 8> formats {};
+	for (uint32_t slot = 0; slot < formats.size(); ++slot) {
+		const auto& target = context.GetRenderTarget(slot);
+		if (target.base.addr == 0 || pixel_info.target_output_mode[slot] == 0) continue;
+		const auto logical_mask = ((context.GetRenderTargetMask() & context.GetShaderRegisters().m_cbShaderMask)
+		                           >> (slot * 4u)) & 0xfu;
+		if (logical_mask == 0) continue;
+		const auto encoding = Prospero::ResolveRenderTargetFormat(target.info.format, target.info.channel_type);
+		if (encoding.buffer_format != Prospero::BufferFormat::k11_11_10UNorm &&
+		    encoding.buffer_format != Prospero::BufferFormat::k10_11_11UNorm) continue;
+		if (context.GetBlendControl(slot).enable && !target.info.blend_bypass)
+			return "packed normalized color blending is unsupported";
+		if (target.info.round_mode)
+			return "packed normalized color truncation is unsupported";
+		if (target.attrib.num_samples != 0 || target.attrib.num_fragments != 0 || pixel_info.dual_source_blending)
+			return "packed normalized multisample or dual-source color exports are unsupported";
+		if (pixel_info.target_output_mode[slot] != 9u)
+			return "packed normalized color export requires FP32 source components";
+		const auto target_format = TextureGetRenderTargetFormat(target.info.format,
+		    target.info.channel_type, target.info.channel_order);
+		if ((target_format.export_mapping.ApplyMask(logical_mask) & 7u) != 7u)
+			return "partial packed normalized color write masks are unsupported";
+		formats[slot] = target_format.conversion_format;
+	}
+	pixel_info.target_conversion_format = formats;
+	return {};
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -1407,6 +1438,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				pixel_info.target_export_mapping[1] = {};
 			}
 		}
+	}
+	if (pixel_active) {
+		const auto conversion_error = ConfigurePixelTargetConversions(context, pixel_info);
+		if (!conversion_error.empty()) EXIT("%s\n", conversion_error.c_str());
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];

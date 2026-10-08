@@ -567,11 +567,15 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool uint_output =
-				    binding.kind == IR::StageOutputKind::Mrt &&
+				const bool pixel_mrt = binding.kind == IR::StageOutputKind::Mrt &&
 				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
+				    binding.index < std::size(state.input_info.pixel->target_output_mode);
+				const auto conversion = pixel_mrt ? state.input_info.pixel->target_conversion_format[binding.index]
+				                                  : Prospero::BufferFormat::kInvalid;
+				const bool packed = conversion == Prospero::BufferFormat::k11_11_10UNorm ||
+				                    conversion == Prospero::BufferFormat::k10_11_11UNorm;
+				const bool uint_output = pixel_mrt &&
+				    (state.input_info.pixel->target_output_mode[binding.index] == 7u || packed);
 				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());

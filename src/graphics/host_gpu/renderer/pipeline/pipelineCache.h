@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -231,6 +232,9 @@ private:
 	bool SaveDriverCacheLocked(bool checkpoint);
 	void CheckpointDriverCacheLocked(uint64_t creation_ms = 0);
 };
+
+[[nodiscard]] std::string ConfigurePixelTargetConversions(const HW::Context& context,
+                                                           ShaderPixelInputInfo& pixel_info);
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

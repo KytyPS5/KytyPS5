@@ -543,6 +543,37 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				value = mapped;
 			}
 		}
+		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    exp.index < state.input_info.pixel->target_conversion_format.size()) {
+			const auto format = state.input_info.pixel->target_conversion_format[exp.index];
+			if (format != Prospero::BufferFormat::kInvalid) {
+				if ((format != Prospero::BufferFormat::k11_11_10UNorm &&
+				     format != Prospero::BufferFormat::k10_11_11UNorm) || uint_output || exp.compr)
+					ctx.Fail(inst, "unsupported packed normalized color export");
+				const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
+				uint32_t required = 0;
+				for (uint32_t component = 0; component < 3; ++component)
+					required |= 1u << mapping.Map(component);
+				if ((exp.en & required) != required)
+					ctx.Fail(inst, "partial packed normalized color export requires component accumulation");
+				const auto& info = Format::GetFormatInfo(format);
+				const auto raw = Unary(state, OpBitcast, TypeU32Vector(state, 4), value);
+				auto packed = ConstantU32(state, 0u);
+				for (uint32_t component = 0; component < 3; ++component) {
+					const auto source = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), source, raw, component);
+					auto field = PackFormatComponent(state, info, component, source, NormalizedFormatRounding::HalfUp);
+					if (info.component_bit_offset[component] != 0u)
+						field = Binary(state, OpShiftLeftLogical, TypeU32(state), field,
+						               ConstantU32(state, info.component_bit_offset[component]));
+					packed = Binary(state, OpBitwiseOr, TypeU32(state), packed, field);
+				}
+				value = state.builder.AllocateId();
+				const auto zero = ConstantU32(state, 0u);
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), value,
+				                          packed, zero, zero, zero);
+			}
+		}
 		if (exp.kind == IR::ExportTargetKind::Position &&
 		    state.input_info.vertex->clip_space.enabled) {
 			value = ConvertPositionToClipSpace(state, value);

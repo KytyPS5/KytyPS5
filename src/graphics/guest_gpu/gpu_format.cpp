@@ -42,9 +42,9 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
 	// Packed normalized loads use a same-width raw integer view and shader decoding.
-	// Render-target admission remains separate from the storage footprint.
-	{BufferFormat::k11_11_10UNorm, 4, 0, 0, true, true},
-	{BufferFormat::k10_11_11UNorm, 4, 0, 0, true, true},
+	// Color exports use explicit normalized packing into the same raw backing.
+	{BufferFormat::k11_11_10UNorm, 4, 0, 4, true, true},
+	{BufferFormat::k10_11_11UNorm, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},

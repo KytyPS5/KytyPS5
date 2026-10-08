@@ -1440,6 +1440,12 @@ struct GraphicsCase {
   u32 pixel_custom_interpolation_mask = 0;
   u32 index_count = 0;
   u32 unique_vertex_count = 0;
+  vk::Format target_format = vk::Format::eR32G32B32A32Sfloat;
+  u32 target_dwords = 4;
+  u32 target_slot = 0;
+  Prospero::BufferFormat target_conversion = Prospero::BufferFormat::kInvalid;
+  Prospero::ColorComponentMapping target_mapping;
+  std::vector<u32> expected_mrt0;
 };
 
 struct CompiledShader {
@@ -2012,6 +2018,10 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
        i++) {
     pixel_info.interpolator_settings[i] = test.pixel_interpolator_settings[i];
   }
+
+  pixel_info.target_output_mode[test.target_slot] = 9u;
+  pixel_info.target_conversion_format[test.target_slot] = test.target_conversion;
+  pixel_info.target_export_mapping[test.target_slot] = test.target_mapping;
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
@@ -10541,8 +10551,8 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckPackedUnormTextureBacking(bool storage = false) {
-    const char *name = storage ? "PackedUnormStorageBacking" : "PackedUnormTextureBacking";
+  void CheckPackedUnormTextureBacking(bool storage = false, bool render_target = false) {
+    const char *name = render_target ? "PackedUnormRenderTargetBacking" : storage ? "PackedUnormStorageBacking" : "PackedUnormTextureBacking";
     constexpr uintptr_t base = 0x0000000204f00000ull;
     constexpr uint64_t allocation_size = 0x10000;
     constexpr std::array<u32, 4> words{0u, 0xffffffffu, 0x00400801u, 0xaae2b321u};
@@ -10587,6 +10597,22 @@ public:
       resource.read = !storage;
       resource.written = storage;
       const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      if (render_target) {
+        registers.SetColorBase(0, {.addr = base});
+        registers.SetColorInfo(0, {.format = format == Prospero::BufferFormat::k11_11_10UNorm
+            ? Prospero::ChannelLayout::k11_11_10 : Prospero::ChannelLayout::k10_11_11,
+            .channel_type = Prospero::ChannelType::kUNorm});
+        registers.SetColorAttrib2(0, {.height = 0, .width = 3});
+        registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        registers.SetRenderTargetMask(0xf);
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+        (void)cache.FindRenderTarget(color.image_id, color.desc);
+        Require(name, "shared CB/texture backing", color.image_id == binding.image_id &&
+                color.desc.info.pixel_format == vk::Format::eR32Uint &&
+                color.desc.info.bytes_per_block == 4u,
+                "render target widened packed bytes or split the alias backing");
+      }
       (void)cache.FindTexture(binding.image_id, binding.desc);
       Require(name, "same-width native backing",
               binding.desc.info.pixel_format == vk::Format::eR32Uint &&
@@ -19678,16 +19704,24 @@ void CheckSampledHtileArrayClearDiscovery() {
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
-                      vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+        CreateImageMips(test.name, 1, 1, test.target_format,
+                      vk::ImageUsageFlagBits::eColorAttachment, {}, test.target_dwords,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
                       test.layers, 0, 0, test.samples);
+    Require(test.name, "bounded MRT slots", test.target_slot < 8u,
+            "graphics fixture has too many MRT slots");
+    std::vector<Image> extra_targets(test.target_slot);
+    for (auto &image : extra_targets)
+      image = CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
+          vk::ImageUsageFlagBits::eColorAttachment, {}, 4, vk::ImageLayout::eGeneral,
+          vk::ImageType::e2D, test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
+          test.layers);
     Image resolved;
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
           test.name, 1, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
-          {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+          {}, test.target_dwords, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
     }
@@ -20003,15 +20037,19 @@ void CheckSampledHtileArrayClearDiscovery() {
         vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
     vk::PipelineColorBlendStateCreateInfo color_blend{};
     color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &color_attachment;
+    std::vector<vk::PipelineColorBlendAttachmentState> blend_attachments(
+        test.target_slot + 1u, color_attachment);
+    color_blend.attachmentCount = static_cast<u32>(blend_attachments.size());
+    color_blend.pAttachments = blend_attachments.data();
 
     vk::GraphicsPipelineCreateInfo pipeline_info{};
-    const vk::Format color_format = vk::Format::eR32G32B32A32Sfloat;
+    std::vector<vk::Format> color_formats(test.target_slot + 1u,
+                                          vk::Format::eR32G32B32A32Sfloat);
+    color_formats.back() = test.target_format;
     vk::PipelineRenderingCreateInfo rendering_pipeline{};
     rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
-    rendering_pipeline.colorAttachmentCount = 1;
-    rendering_pipeline.pColorAttachmentFormats = &color_format;
+    rendering_pipeline.colorAttachmentCount = static_cast<u32>(color_formats.size());
+    rendering_pipeline.pColorAttachmentFormats = color_formats.data();
     pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
     pipeline_info.pNext = &rendering_pipeline;
     pipeline_info.stageCount = 2;
@@ -20045,8 +20083,14 @@ void CheckSampledHtileArrayClearDiscovery() {
     rendering.sType = vk::StructureType::eRenderingInfo;
     rendering.renderArea.extent = {1, 1};
     rendering.layerCount = test.layers;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color;
+    std::vector<vk::RenderingAttachmentInfo> attachments(test.target_slot + 1u, color);
+    for (u32 slot = 0; slot < test.target_slot; ++slot) {
+      attachments[slot].imageView = extra_targets[slot].view;
+      attachments[slot].resolveMode = vk::ResolveModeFlagBits::eNone;
+      attachments[slot].resolveImageView = nullptr;
+    }
+    rendering.colorAttachmentCount = static_cast<u32>(attachments.size());
+    rendering.pColorAttachments = attachments.data();
     cmd.beginRendering(rendering);
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
     if (vertex_fixture != nullptr)
@@ -20080,7 +20124,12 @@ void CheckSampledHtileArrayClearDiscovery() {
     target.layout = vk::ImageLayout::eGeneral;
 
     auto pixel = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
-    pixel.resize(4 * test.layers);
+    pixel.resize(test.target_dwords * test.layers);
+    if (!test.expected_mrt0.empty()) {
+      const auto neighbor = ReadImage(test.name, &extra_targets.at(0));
+      Require(test.name, "mixed float MRT neighbor", neighbor == test.expected_mrt0,
+              "packed output changed the neighboring float MRT");
+    }
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
@@ -20100,6 +20149,7 @@ void CheckSampledHtileArrayClearDiscovery() {
     DestroyBuffer(&index_buffer);
     DestroyImage(&resolved);
     DestroyImage(&target);
+    for (auto &image : extra_targets) DestroyImage(&image);
     return pixel;
   }
 
@@ -22159,6 +22209,108 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   CompareComputeReadback(test, actual);
   vulkan->CheckValidation(test.name);
   std::printf("[compute] %-32s ok\n", test.name);
+}
+
+void CheckPackedUnormTargetAdmission() {
+  HW::Context context{};
+  context.SetColorBase(2, {.addr=0x20010000u});
+  const HW::ColorInfo color{.format=Prospero::ChannelLayout::k11_11_10,
+                           .channel_type=Prospero::ChannelType::kUNorm};
+  context.SetColorInfo(2,color);
+  context.SetRenderTargetMask(0xf00u);
+  context.SetShaderMask(0xf00u);
+  ShaderPixelInputInfo pixel{};
+  pixel.target_output_mode[2]=9u;
+  Require("PackedUnormAdmission","FP32 full target",
+          ConfigurePixelTargetConversions(context,pixel).empty() &&
+              pixel.target_conversion_format[2]==Prospero::BufferFormat::k11_11_10UNorm,
+          "real render-state producer did not select normalized color packing");
+  const auto reject=[&](const HW::Context& changed,const ShaderPixelInputInfo& input){
+    auto result=input;
+    const auto previous=result.target_conversion_format;
+    Require("PackedUnormAdmission","transactional rejection",
+            !ConfigurePixelTargetConversions(changed,result).empty() &&
+                result.target_conversion_format==previous,
+            "unsupported target state was admitted or changed a prior conversion");
+  };
+  auto changed=context;
+  changed.SetBlendControl(2,{.enable=true}); reject(changed,pixel);
+  auto rounded=color; rounded.round_mode=true;
+  changed=context; changed.SetColorInfo(2,rounded); reject(changed,pixel);
+  changed=context; changed.SetRenderTargetMask(0x300u); reject(changed,pixel);
+  changed=context; changed.SetShaderMask(0x300u); reject(changed,pixel);
+  changed=context; changed.SetColorAttrib(2,{.num_samples=1u}); reject(changed,pixel);
+  changed=context; changed.SetColorAttrib(2,{.num_fragments=1u}); reject(changed,pixel);
+  auto source=pixel; source.target_output_mode[2]=7u; reject(context,source);
+  source=pixel; source.dual_source_blending=true; reject(context,source);
+  changed=context;
+  changed.SetBlendControl(2,{.enable=true});
+  auto bypass=color; bypass.blend_bypass=true; changed.SetColorInfo(2,bypass);
+  Require("PackedUnormAdmission","effective blend bypass",
+          ConfigurePixelTargetConversions(changed,pixel).empty(),
+          "disabled effective blending lost normalized packing");
+  source=pixel; source.target_output_mode[2]=0u;
+  Require("PackedUnormAdmission","unused target",
+          ConfigurePixelTargetConversions(context,source).empty() &&
+              source.target_conversion_format[2]==Prospero::BufferFormat::kInvalid,
+          "inactive target retained a stale conversion");
+  changed=context; changed.SetRenderTargetMask(0u); source=pixel;
+  Require("PackedUnormAdmission","fully masked target",
+          ConfigurePixelTargetConversions(changed,source).empty() &&
+              source.target_conversion_format[2]==Prospero::BufferFormat::kInvalid,
+          "fully masked target required an unused conversion");
+  std::printf("[host]    PackedUnormTargetAdmission       ok\n");
+}
+
+GraphicsCase PackedUnormRenderTargetCase(bool reverse_widths, u32 order,
+                                         const std::array<float,4>& values,
+                                         bool mixed = false) {
+  const auto layout = reverse_widths ? Prospero::ChannelLayout::k10_11_11
+                                    : Prospero::ChannelLayout::k11_11_10;
+  const auto format = reverse_widths ? Prospero::BufferFormat::k10_11_11UNorm
+                                    : Prospero::BufferFormat::k11_11_10UNorm;
+  const auto target = TextureGetRenderTargetFormat(layout, Prospero::ChannelType::kUNorm,
+                                                   static_cast<Prospero::ChannelOrder>(order));
+  Require("PackedUnormRenderTarget", "four-byte raw color backing",
+          target.format == vk::Format::eR32Uint && target.bytes_per_element == 4u &&
+              target.guest_format == format && target.conversion_format == format,
+          "normalized color target lacks exact integer backing and conversion metadata");
+  GraphicsCase test;
+  test.name = mixed ? "PackedUnormMixedMrt2" : reverse_widths
+      ? "PackedUnormRenderTarget10_11_11" : "PackedUnormRenderTarget11_11_10";
+  test.target_format = target.format;
+  test.target_dwords = 1;
+  test.target_slot = mixed ? 2u : 0u;
+  test.target_conversion = format;
+  test.target_mapping = target.export_mapping;
+  // Independent API channel-order matrix; do not use the production mapping
+  // to calculate the expected physical word. CB round-by-half adds half an
+  // LSB then truncates, separately from buffer/image round-to-even conversion.
+  constexpr u32 sources[4][3] = {{0,1,2},{0,1,3},{2,1,0},{3,1,0}};
+  const u32 widths[3] = {reverse_widths ? 10u : 11u, 11u, reverse_widths ? 11u : 10u};
+  u32 expected = 0, shift = 0;
+  for (u32 field = 0; field < 3; ++field) {
+    const float source = values[sources[order][field]];
+    const double normalized = std::isnan(source) ? 0.0 : std::clamp(double(source), 0.0, 1.0);
+    const u32 component = static_cast<u32>(std::floor(normalized * ((1u << widths[field])-1u) + 0.5));
+    expected |= component << shift;
+    shift += widths[field];
+  }
+  test.expected_pixel = {expected};
+  if (mixed) {
+    test.expected_mrt0 = {std::bit_cast<u32>(0.25f),std::bit_cast<u32>(0.5f),
+                         std::bit_cast<u32>(0.75f),std::bit_cast<u32>(1.0f)};
+    for (u32 component=0;component<4;++component)
+      AppendVMovLiteral(&test.fragment_code,component,test.expected_mrt0[component]);
+    test.fragment_code.push_back(EncodeExp0(0,0xf,false));
+    test.fragment_code.push_back(EncodeExp1(0,1,2,3));
+  }
+  for (u32 component=0;component<4;++component)
+    AppendVMovLiteral(&test.fragment_code,component,std::bit_cast<u32>(values[component]));
+  test.fragment_code.push_back(EncodeExp0(test.target_slot,0xf));
+  test.fragment_code.push_back(EncodeExp1(0,1,2,3));
+  AppendEnd(&test.fragment_code);
+  return test;
 }
 
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test,
@@ -49070,6 +49222,37 @@ if (argc == 1) {
     for (const auto &test : MakeCases()) {
       std::printf("KYTY_COMPUTE_CASE %s\n", test.name);
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--packed-unorm-partial-export-death") == 0) {
+    auto test=PackedUnormRenderTargetCase(false,0u,{0.25f,0.5f,0.75f,1.f});
+    test.fragment_code[test.fragment_code.size()-3u]=EncodeExp0(0u,1u);
+    (void)CompileFragmentCase(test);
+    return 1;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--packed-unorm-render-target-only") == 0) {
+    // Admission failure must precede any unsupported pipeline execution.
+    auto first = PackedUnormRenderTargetCase(false,0u,{0.25f,0.5f,0.75f,0.125f});
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, first);
+    const std::array<std::array<float,4>,5> samples{{
+      {0.f,0.f,0.f,0.f},{1.f,1.f,1.f,1.f},{0.25f,0.5f,0.75f,0.125f},
+      {-1.f,std::numeric_limits<float>::infinity(),std::numeric_limits<float>::quiet_NaN(),1.f},
+      {0.49f/2047.f,0.5f/2047.f,1.f/1023.f,0.5f/1023.f}}};
+    for (bool reverse_widths : {false,true})
+      for (u32 order=0;order<4;++order)
+        for (const auto& values : samples)
+          RunGraphicsCase(&vulkan,PackedUnormRenderTargetCase(reverse_widths,order,values));
+    RunGraphicsCase(&vulkan,PackedUnormRenderTargetCase(false,0u,{0.25f,0.5f,0.75f,1.f},true));
+    ShaderPixelInputInfo pixel{};
+    std::vector<u32> plain,packed;
+    BuildStageStaticKey(pixel,plain);
+    pixel.target_conversion_format[2]=Prospero::BufferFormat::k11_11_10UNorm;
+    BuildStageStaticKey(pixel,packed);
+    Require("PackedUnormRenderTarget", "module cache identity",plain!=packed,
+            "packed color conversion aliases the float shader permutation");
+    vulkan.CheckPackedUnormTextureBacking(false,true);
+    CheckPackedUnormTargetAdmission();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-unorm-store-only") == 0) {

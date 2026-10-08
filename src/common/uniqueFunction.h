@@ -20,7 +20,14 @@ class UniqueFunction {
 	public:
 		explicit Callable(Function function): m_function(std::move(function)) {}
 
-		Result Invoke(Args&&... args) override { return m_function(std::forward<Args>(args)...); }
+		/// Invoke the stored callable, discarding its result only for a void wrapper.
+		Result Invoke(Args&&... args) override {
+			if constexpr (std::is_void_v<Result>) {
+				m_function(std::forward<Args>(args)...);
+			} else {
+				return m_function(std::forward<Args>(args)...);
+			}
+		}
 
 	private:
 		Function m_function;

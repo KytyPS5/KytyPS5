@@ -12173,6 +12173,10 @@ public:
                           vk::Format::eR16G16B16A16Unorm,
                   "the aliased clear did not reuse its existing UNORM allocation");
         }
+        Require(name, "metadata decided without readback",
+                !m_conditional_rendering_supported ||
+                    context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
+                "binding a target read its GPU-written metadata back to the CPU");
         Require(name, "color clear metadata discovery",
                 color.image_id &&
                     color.desc.info.metadata.kind ==
@@ -20380,6 +20384,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_conditional_rendering_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -20417,6 +20422,7 @@ private:
     m_runtime_context.maintenance8_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
+    m_runtime_context.conditional_rendering_enabled = m_conditional_rendering_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -20561,8 +20567,10 @@ private:
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
     available_provoking_vertex.pNext = &available_feedback_dynamic;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional{};
+    available_conditional.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
-    available_min_lod.pNext = &available_provoking_vertex;
+    available_min_lod.pNext = &available_conditional;
     vk::PhysicalDeviceMaintenance8FeaturesKHR available_maintenance8{};
     available_maintenance8.pNext = &available_min_lod;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
@@ -20616,6 +20624,7 @@ private:
             "maintenance8 dynamic image offsets are not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
+    m_conditional_rendering_supported = available_conditional.conditionalRendering;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.depthBounds &&
@@ -20692,9 +20701,14 @@ private:
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional{};
+    conditional.conditionalRendering = true;
+    conditional.pNext = &min_lod;
     vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8{};
     maintenance8.maintenance8 = true;
-    maintenance8.pNext = &min_lod;
+    maintenance8.pNext = m_conditional_rendering_supported
+                             ? static_cast<void *>(&conditional)
+                             : static_cast<void *>(&min_lod);
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
     robustness2.pNext = &maintenance8;
@@ -20726,6 +20740,9 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (m_conditional_rendering_supported) {
+      device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());

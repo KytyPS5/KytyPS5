@@ -324,6 +324,42 @@ void TestExactReciprocalDescriptorArithmetic() {
   }
 }
 
+void TestArrayDescriptorsStayArrays() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  using Type = Libs::Graphics::Prospero::ImageType;
+  for (const auto &[type, dimension] : {std::pair{Type::kColor2DArray, Dimension::Dim2DArray},
+                                        std::pair{Type::kColor1DArray, Dimension::Dim1DArray}}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 8;
+    source.dwords.fill(Value(0u));
+    source.dwords[0] = Value(0x100u);
+    source.dwords[1] = Value(static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u);
+    source.dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+                             (static_cast<uint32_t>(type) << 28u));
+    source.dwords[4] = Value(1u);
+    program.descriptor_sources.push_back(source);
+    program.info.images.push_back({
+        .source = 0,
+        .resource_class = ImageResourceClass::Sampled,
+        .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+        .dimension = dimension});
+    const auto plan = ExtractResourcePlan(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+              specialization.images.size() == 1u &&
+              specialization.images[0].dimension == dimension,
+          "array descriptor used by an array instruction lost its layers");
+  }
+}
+
 void TestUnbasedFlatCacheHitMaterializes() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UnbasedFlatPlan();
@@ -569,6 +605,7 @@ int main() {
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
+  TestArrayDescriptorsStayArrays();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();

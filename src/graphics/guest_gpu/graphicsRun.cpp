@@ -357,13 +357,11 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
-	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.GetGpuTimestamps().Write(dst_address, num_bytes, false);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
-		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
-		     " size=%u\n",
-		     dst_address, value, num_bytes);
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " size=%u\n", dst_address,
+		     num_bytes);
 	}
 }
 
@@ -1113,14 +1111,17 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 				}
 			} else {
-				if (event_write_source == 0x04) {
-					value = Sync::ReadReferenceClock();
-				}
-				auto write64 = [&] {
+				const bool gpu_clock = event_write_source == 0x04;
+				auto       write64   = [&] {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					std::memcpy(dst, &value, sizeof(value));
+					if (gpu_clock) {
+						m_renderer.GetGpuTimestamps().Write(reinterpret_cast<uint64_t>(dst),
+						                                    sizeof(uint64_t), true);
+					} else {
+						std::memcpy(dst, &value, sizeof(value));
+					}
 
 					if (with_interrupt) {
 						TriggerEopEventAtEndOfPipe(interrupt_context_id);

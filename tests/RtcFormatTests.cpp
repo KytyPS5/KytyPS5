@@ -135,11 +135,13 @@ void TestRFC3339(FormatFunc format, LocalFormatFunc local) {
 	CHECK(Untouched(buf, 32));
 	CHECK(local(nullptr, &utc) == Rtc::RTC_ERROR_INVALID_POINTER);
 
-	// An offset whose zone suffix does not fit is rejected instead of truncated.
-	CheckFormat(format, TEST_TICK, 59999, "2026-11-18T13:42:05.12+999:59");
+	// RFC 3339 offset hours stop at 23, so 24 hours or more is rejected.
+	CheckFormat(format, TEST_TICK, 1439, "2026-10-08T21:42:05.12+23:59");
+	CheckFormat(format, TEST_TICK, -1439, "2026-10-06T21:44:05.12-23:59");
 	buf = MakeBuffer();
+	CHECK(format(buf.data(), &utc, 1440) == Rtc::RTC_ERROR_INVALID_VALUE);
+	CHECK(format(buf.data(), &utc, -1440) == Rtc::RTC_ERROR_INVALID_VALUE);
 	CHECK(format(buf.data(), &utc, 60000) == Rtc::RTC_ERROR_INVALID_VALUE);
-	CHECK(format(buf.data(), &utc, -60000) == Rtc::RTC_ERROR_INVALID_VALUE);
 	CHECK(Untouched(buf, 0));
 }
 

@@ -367,6 +367,11 @@ static int KYTY_SYSV_ABI RtcFormatRFC3339(char* date_time, const RtcTick* utc,
 		return ret;
 	}
 
+	// RFC 3339 allows offset hours 00-23 only.
+	if (time_zone_minutes <= -24 * 60 || time_zone_minutes >= 24 * 60) {
+		return RTC_ERROR_INVALID_VALUE;
+	}
+
 	char zone[8] {};
 	if (time_zone_minutes == 0) {
 		std::snprintf(zone, sizeof(zone), "Z");

@@ -43153,6 +43153,8 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, false));
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, true));
     }
+    RunCase(&vulkan, DsOrderedCountFollowsWaveLaunchOrder());
+    RunCase(&vulkan, DsOrderedCountRanksPastElevenBits());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {

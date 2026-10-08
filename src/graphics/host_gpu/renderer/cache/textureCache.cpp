@@ -1339,8 +1339,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		const bool native_current =
 		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
 		if (!native_current) {
-			EXIT("TextureCache: compressed video-out read requires clean native GPU "
-			     "contents\n");
+		EXIT("TextureCache: compressed video-out read requires clean native GPU "
+		     "contents (addr=0x%016" PRIx64 " size=0x%016" PRIx64 " compression=%u "
+		     "guest_dirty=%u gpu_modified=%u render_target=%u)\n",
+		     image.info.data.address, image.info.data.size,
+		     static_cast<unsigned>(desc.info.metadata.compression),
+		     static_cast<unsigned>(guest_dirty),
+		     static_cast<unsigned>(image.IsGpuModified()),
+		     static_cast<unsigned>(image.usage.render_target));
 		}
 	}
 	return result;

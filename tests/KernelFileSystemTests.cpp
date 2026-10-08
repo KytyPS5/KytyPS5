@@ -916,6 +916,49 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   }
 }
 
+// Reads an APR file ID through a submitted APR read command, the path that opens the
+// host file in ExecuteCommand/ReadHostFileToGuest rather than the stat/size exports.
+bool AprReadMatches(uint32_t file_id, std::string_view expected) {
+  Loader::SymbolDatabase symbols;
+  Libs::LibAmpr::InitAmpr_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "AMPR read exports resolve");
+    return symbol->vaddr;
+  };
+  using Unary = void (KYTY_SYSV_ABI *)(void *);
+  using AprConstructor = void (KYTY_SYSV_ABI *)(void *, void *, void *);
+  using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
+  using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
+                                       void *, uint64_t, uint64_t);
+  struct Result { int32_t result; uint32_t error_offset; };
+  using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
+  using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
+  const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
+  const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
+  const auto destroy = reinterpret_cast<Unary>(find("GuchCTefuZw"));
+  const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
+  const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
+  const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
+  const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
+  std::array<uint64_t, 5> header {};
+  std::array<uint32_t, 256> data {};
+  std::vector<char> output(expected.size());
+  Result result {1234, 5678};
+  uint32_t id = 0;
+  construct(header.data());
+  construct_apr(header.data(), &header[3], &header[4]);
+  const bool read =
+      set_buffer(header.data(), data.data(), sizeof(data)) == OK &&
+      read_file(header.data(), reinterpret_cast<uint64_t>(&header[3]),
+                reinterpret_cast<uint64_t>(&header[4]), file_id, output.data(),
+                output.size(), 0) == OK &&
+      submit_apr(header.data(), 3, &result, &id) == OK && wait_apr(id) == OK &&
+      result.result == OK;
+  destroy(header.data());
+  return read && std::memcmp(output.data(), expected.data(), expected.size()) == 0;
+}
+
 void CheckAprPaths(const std::filesystem::path &root) {
   Loader::SymbolDatabase symbols;
   Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
@@ -1033,6 +1076,7 @@ void CheckAprPaths(const std::filesystem::path &root) {
               reinterpret_cast<Size>(size_symbol->vaddr)(id, &size) == OK &&
               stat.st_size == 4 && size == 4,
           "APR stat and size work under a non-ASCII host folder");
+    Check(AprReadMatches(id, "UTOC"), "APR reads a file under a non-ASCII host folder");
   }
   CheckAmprOrdering(symbols, collision_ids[0]);
   FileSystem::Umount("/app0");

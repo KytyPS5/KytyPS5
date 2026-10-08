@@ -15,7 +15,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
-#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -84,10 +83,6 @@ private:
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
 	std::pair<uint64_t, uint64_t> m_bda_sync_key {};
-	uint64_t                      m_bda_sync_mapping = 0;
-	// Advances on each mapping: pages a BDA sweep skipped while unmapped may be CPU-dirty, and
-	// writes to them do not fault.
-	std::atomic<uint64_t> m_mapping_epoch {0};
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

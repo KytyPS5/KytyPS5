@@ -20,7 +20,7 @@ class LeastRecentlyUsedCache {
 public:
 	LeastRecentlyUsedCache() = default;
 	/// Copying is disabled because links belong to this cache's item storage.
-	LeastRecentlyUsedCache(const LeastRecentlyUsedCache&) = delete;
+	LeastRecentlyUsedCache(const LeastRecentlyUsedCache&)            = delete;
 	LeastRecentlyUsedCache& operator=(const LeastRecentlyUsedCache&) = delete;
 
 	/// Transfer storage and links together, leaving the source empty and reusable.

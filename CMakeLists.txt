@@ -727,6 +727,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --bounded-buffer-shared-access-only)
 	set_tests_properties(shader_bounded_buffer_shared_access PROPERTIES TIMEOUT 60)
 
+	add_test(NAME shader_indirect_dword_load
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-dword-only)
+	set_tests_properties(shader_indirect_dword_load PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 	add_test(NAME shader_indirect_ushort_load
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-ushort-only)
 	set_tests_properties(shader_indirect_ushort_load PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)

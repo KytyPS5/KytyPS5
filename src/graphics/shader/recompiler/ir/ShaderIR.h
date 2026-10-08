@@ -78,8 +78,8 @@ struct MemoryInfo {
 			return data_bits == 16u && data_dwords == 1u && !data_signed;
 		}
 		return data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
-		        opcode == ValueOpcode::LoadBufferU32x4);
+		       (opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;

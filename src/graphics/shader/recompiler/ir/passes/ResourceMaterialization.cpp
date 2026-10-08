@@ -826,8 +826,9 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 	if (program.bounded_srt_reads.empty()) {
 		return true;
 	}
-	if (program.stage != ShaderType::Compute || program.info.writes_dma) {
-		return SpecializationFail("bounded SRT snapshots require compute without DMA writes");
+	if ((program.stage != ShaderType::Compute && program.stage != ShaderType::Pixel) ||
+	    program.info.writes_dma) {
+		return SpecializationFail("bounded SRT snapshots require compute or pixel without DMA writes");
 	}
 	SrtRuntime clean_runtime = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;

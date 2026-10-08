@@ -3714,6 +3714,9 @@ void TestPhiValidation() {
                                    MemoryFlags{0, 20}, merge);
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;
+  // Typed descriptor resolution must reject this control-dependent phi. Raw
+  // DWORD reads now legitimately retain the per-lane descriptor in the GPU path.
+  memory.formatted = true;
   fixture.Emit(ValueOpcode::LoadBufferU32,
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
@@ -7068,6 +7071,70 @@ void CheckBoundedSrtSplitHeader(bool memory_bound) {
   }
 }
 
+void TestPixelBoundedFormattedDescriptorLoop() {
+  Fixture fixture(ShaderType::Pixel);
+  auto* entry=fixture.block;auto* header=fixture.AddBlock();
+  auto* body=fixture.AddBlock();auto* exit=fixture.AddBlock();
+  entry->AddBranch(header);body->AddBranch(header);
+  header->AddBranch(body);header->AddBranch(exit);
+  fixture.program.block_info[0].terminator={.kind=Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,.true_block=1u};
+  fixture.program.block_info[1].terminator={.kind=Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch,.true_block=2u,.false_block=3u};
+  fixture.program.block_info[2].terminator={.kind=Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,.true_block=1u};
+  const auto table=fixture.Buffer({fixture.UserData(0),fixture.UserData(1),fixture.UserData(2),fixture.UserData(3)});
+  const auto count=fixture.UserData(4);
+  auto& phi=header->AppendNewInst(ValueOpcode::Phi,{},uint64_t(Type::U32));
+  const auto index=Value(&phi);
+  const auto next=fixture.Emit(ValueOpcode::IAdd32,{index,Value(1u)},0,body);
+  phi.AddPhiOperand(entry,Value(0u));phi.AddPhiOperand(body,next);
+  fixture.program.block_info[1].condition=fixture.Emit(ValueOpcode::ULessThan32,{index,count},0,header);
+  const auto offset=fixture.Emit(ValueOpcode::IMul32,{index,Value(196u)},0,body);
+  std::array<Value,4> words;
+  for(uint32_t word=0;word<4;++word){
+    MemoryInfo read{.kind=ResourceKind::ScalarBuffer,.offset=16u+word*4u,.component_index=word,.component_count=4u};
+    words[word]=fixture.Emit(ValueOpcode::ReadConstBuffer,{table,offset},fixture.AddMemory(read,0x50u),body);
+  }
+  const auto handle=fixture.Emit(ValueOpcode::GetBufferResource,{words[0],words[1],words[2],words[3]},MemoryFlags{0,0x60u},body);
+  const auto value=fixture.Emit(ValueOpcode::LoadBufferU32,{handle,Value(0u),Value(0u),Value(0u),Value(true)},
+      fixture.AddMemory({.kind=ResourceKind::Buffer,.formatted=true},0x60u),body);
+  fixture.Emit(ValueOpcode::ReferenceU32,{value},0,body);
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.buffers.size()==1u && fixture.program.info.buffer_tables.empty(),
+        "pixel loop did not retain its logical descriptor source before materialization");
+  auto plan=ExtractResourcePlan(fixture.program);
+  const auto table_format=uint32_t(Libs::Graphics::Prospero::BufferFormat::k32UInt)<<12u;
+  const auto payload_format=uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float)<<12u;
+  const std::array<uint32_t,5> data{0x1000u,0u,1024u,table_format,3u};
+  BoundedSnapshotReader reader;
+  for(uint32_t row=0;row<3u;++row){
+    const std::array descriptor{0x20000u+row*256u,0u,16u,payload_format|Libs::Graphics::DstSel(4,5,6,7)};
+    for(uint32_t word=0;word<4u;++word)
+      reader.words.emplace_back(0x1010u+row*196u+word*4u,descriptor[word]);
+  }
+  ResourceSnapshot snapshot;ResourceSpecialization specialization;
+  Check(MaterializeResources(plan,BoundedSnapshotRuntime(reader,data),snapshot,specialization),
+        "pixel bounded descriptor snapshot failed materialization");
+  Check(reader.ordinary_reads==0u && reader.reads.size()==12u &&
+            specialization.buffer_tables.size()==1u && specialization.buffer_tables[0].count==3u,
+        "pixel table lost its count, coherent snapshot or exact descriptor footprint");
+  for(const auto& descriptor:snapshot.buffers)
+    Check(((descriptor.dwords[3]>>12u)&0x7fu)==uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float),
+          "pixel table lost the formatted payload class");
+  const auto saved_snapshot=snapshot;
+  const auto saved_specialization=specialization;
+  plan.info.writes_dma=true;
+  Check(!MaterializeResources(plan,BoundedSnapshotRuntime(reader,data),snapshot,specialization),
+        "pixel DMA writer admitted an immutable descriptor snapshot");
+  CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+  plan.info.writes_dma=false;
+  auto zero_data=data;zero_data[4]=0u;
+  BoundedSnapshotReader empty_reader;
+  Check(MaterializeResources(plan,BoundedSnapshotRuntime(empty_reader,zero_data),snapshot,specialization),
+        "zero-trip pixel descriptor loop failed materialization");
+  Check(empty_reader.reads.empty() && empty_reader.ordinary_reads==0u &&
+            specialization.buffer_tables.size()==1u && specialization.buffer_tables[0].count==0u,
+        "zero-trip pixel descriptor loop read payloads or retained stale rows");
+}
+
 void TestBoundedSrtSplitHeaderUniformCount() { CheckBoundedSrtSplitHeader(false); }
 void TestBoundedSrtSplitHeaderSharedMemoryCount() { CheckBoundedSrtSplitHeader(true); }
 
@@ -8926,7 +8993,7 @@ void TestGpuSelectedRawBufferAdmission() {
                           Case{ValueOpcode::LoadBufferU32x2, 2u, false, false, true},
                           Case{ValueOpcode::LoadBufferU32x3, 3u, false, false, true},
                           Case{ValueOpcode::LoadBufferU32x4, 4u, false, false, true},
-                          Case{ValueOpcode::LoadBufferU32, 1u, false, false, false},
+                          Case{ValueOpcode::LoadBufferU32, 1u, false, false, true},
                           Case{ValueOpcode::LoadBufferU32x4, 4u, true, false, false},
                           Case{ValueOpcode::LoadBufferU32x4, 4u, false, true, false},
                           Case{ValueOpcode::StoreBufferU32, 1u, false, false, false}}) {
@@ -9079,6 +9146,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_FORMATTED_SCALAR_NESTED_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--pixel-bounded-formatted-loop-only") == 0) {
+      TestPixelBoundedFormattedDescriptorLoop();
+      std::cout << "KYTY_PIXEL_BOUNDED_FORMATTED_LOOP_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--inline-buffer-table-only") == 0) {
       TestInlineBufferDescriptorTable();
       std::cout << "KYTY_INLINE_BUFFER_TABLE_PASS\n";
@@ -9227,6 +9299,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("pixel bounded formatted loop", TestPixelBoundedFormattedDescriptorLoop);
     Run("GPU-selected raw buffers", TestGpuSelectedRawBufferAdmission);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);

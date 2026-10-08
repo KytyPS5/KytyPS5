@@ -594,8 +594,8 @@ public:
 	explicit BoundedReadProof(const Program& program): m_program(program) {}
 
 	std::optional<BoundedSrtReadProof> Run(const Inst& read) {
-		if (m_program.stage != ShaderType::Compute || m_program.blocks.empty() ||
-		    m_program.blocks.size() != m_program.block_info.size())
+		if ((m_program.stage != ShaderType::Compute && m_program.stage != ShaderType::Pixel) ||
+		    m_program.blocks.empty() || m_program.blocks.size() != m_program.block_info.size())
 			return {};
 		const auto opcode = read.GetOpcode();
 		const bool address_read = opcode == ValueOpcode::LoadAddressU32 && read.NumArgs() == 4u;
@@ -657,6 +657,7 @@ public:
 		// assuming that the whole program was structurizable.
 		if (!BuildGraph()) return {};
 		const bool workgroup = offset.index->GetOpcode() == ValueOpcode::GetBuiltin;
+		if (workgroup && m_program.stage != ShaderType::Compute) return {};
 		if (m_program.dispatcher_fallback && workgroup) return {};
 		const auto maximum = workgroup ? std::optional<uint32_t>{} :
 		                                FiniteMaximum(Value(const_cast<Inst*>(offset.index)));

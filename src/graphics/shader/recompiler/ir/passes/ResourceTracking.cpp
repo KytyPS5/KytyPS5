@@ -915,7 +915,7 @@ private:
 	};
 
 	void PlanBoundedReads() {
-		if (m_program.stage != ShaderType::Compute) return;
+		if (m_program.stage != ShaderType::Compute && m_program.stage != ShaderType::Pixel) return;
 		for (auto* block : m_program.blocks) {
 			for (auto& inst : *block) {
 				if (!inst.HasUses()) continue;

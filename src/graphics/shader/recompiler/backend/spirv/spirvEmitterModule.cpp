@@ -212,6 +212,20 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
 					                            spv::DecorationAliased);
 				}
+				{
+					const bool readonly = std::ranges::all_of(binding.resources, [&](uint32_t resource) {
+						return resource < state.program.info.buffers.size() &&
+						       !state.program.info.buffers[resource].written &&
+						       !state.program.info.buffers[resource].atomic;
+					});
+					if (readonly) {
+						state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+						                            spv::DecorationNonWritable);
+						if (state.storage_buffer_u64_variable != 0)
+							state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
+							                            spv::DecorationNonWritable);
+					}
+				}
 				if (state.requirements.coherent_buffers) {
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
@@ -232,9 +246,13 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state), "shader_data");
+				state.builder.AddAnnotation(spv::OpDecorate, state.shader_data_storage_variable,
+				                            spv::DecorationNonWritable);
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				state.builder.AddAnnotation(spv::OpDecorate, state.flattened_srt_variable,
+				                            spv::DecorationNonWritable);
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),

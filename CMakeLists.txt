@@ -704,6 +704,22 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME pixel_bounded_formatted_loop
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --pixel-bounded-formatted-loop-only)
+	add_test(NAME pixel_bounded_readonly_spirv
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pixel-bounded-readonly-spirv-only)
+	add_test(NAME pixel_bounded_formatted_loop_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pixel-bounded-formatted-loop-gpu-only)
+	set_tests_properties(pixel_bounded_formatted_loop pixel_bounded_readonly_spirv PROPERTIES TIMEOUT 60)
+	set_tests_properties(pixel_bounded_formatted_loop_gpu PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+	add_test(NAME shader_formatted_exec_count_guard
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --formatted-exec-count-guard-only)
+	add_test(NAME shader_bounded_zero_stride
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bounded-zero-stride-only)
+	add_test(NAME shader_buffer_format_store
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-format-store-only)
+	set_tests_properties(shader_formatted_exec_count_guard shader_bounded_zero_stride
+		shader_buffer_format_store PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	add_test(NAME packed_unorm_image_admission
 		COMMAND $<TARGET_FILE:resource_tracking_tests> --packed-unorm-image-only)
 	set_tests_properties(packed_unorm_image_admission PROPERTIES TIMEOUT 30)

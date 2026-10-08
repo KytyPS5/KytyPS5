@@ -1446,6 +1446,7 @@ struct GraphicsCase {
   Prospero::BufferFormat target_conversion = Prospero::BufferFormat::kInvalid;
   Prospero::ColorComponentMapping target_mapping;
   std::vector<u32> expected_mrt0;
+  std::vector<u32> fragment_buffer_data;
 };
 
 struct CompiledShader {
@@ -2038,6 +2039,9 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(test.fragment_code.data()),
+      .read_memory = test.fragment_buffer_data.empty() ? nullptr : ReadTestMemory,
+      .userdata = const_cast<std::vector<u32>*>(&test.fragment_buffer_data),
+      .read_specialization_memory = test.fragment_buffer_data.empty() ? nullptr : ReadTestMemory,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -19766,6 +19770,66 @@ void CheckSampledHtileArrayClearDiscovery() {
     vk::ShaderModule fragment_module = CreateShaderModule(test.name, fragment.spirv);
 
     const auto &fragment_bind = fragment.program.bindings;
+    vk::DescriptorSetLayout fragment_descriptor_layout=nullptr;
+    vk::DescriptorPool fragment_descriptor_pool=nullptr;
+    vk::DescriptorSet fragment_descriptor_set=nullptr;
+    std::vector<Buffer> fragment_buffers;
+    auto fragment_push_data=fragment.packed_user_data;
+    if(!test.fragment_buffer_data.empty()) {
+      Require(test.name,"fragment-only descriptor fixture",vertex_fixture==nullptr,
+              "mixed vertex/fragment descriptor fixture is not implemented");
+      using Kind=ShaderRecompiler::IR::DescriptorBindingKind;
+      std::vector<vk::DescriptorSetLayoutBinding> layout;
+      std::vector<vk::DescriptorPoolSize> pool;
+      std::vector<std::vector<vk::DescriptorBufferInfo>> infos(fragment_bind.descriptors.size());
+      for(size_t group=0;group<fragment_bind.descriptors.size();++group){
+        const auto& binding=fragment_bind.descriptors[group];
+        Require(test.name,"fragment descriptor kind",binding.kind==Kind::Buffers ||
+                binding.kind==Kind::FlattenedSrt || binding.kind==Kind::ShaderData,
+                "pixel table fixture requested a non-buffer descriptor");
+        const auto count=NativeDescriptorCount(binding);
+        layout.push_back({ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel,binding.kind),
+                          vk::DescriptorType::eStorageBuffer,count,vk::ShaderStageFlagBits::eFragment});
+        pool.push_back({vk::DescriptorType::eStorageBuffer,count});
+        if(binding.kind==Kind::Buffers){
+          auto storage=CreateHostBuffer(test.name,test.fragment_buffer_data.size()*4u,
+              vk::BufferUsageFlagBits::eStorageBuffer,test.fragment_buffer_data);
+          for(u32 native=0;native<binding.resources.size();++native){
+            const auto& descriptor=fragment.resources.buffers.at(binding.resources[native]);
+            const uint64_t base=uint64_t(descriptor.dwords[0])|((uint64_t(descriptor.dwords[1])&0xffffu)<<32u);
+            const u32 stride=(descriptor.dwords[1]>>16u)&0x3fffu;
+            const uint64_t bytes=uint64_t(descriptor.dwords[2])*(stride?stride:1u);
+            Require(test.name,"fragment backing range",bytes && base+bytes<=storage.size,
+                    "pixel payload descriptor escaped fixture backing");
+            infos[group].push_back({storage.buffer,base,bytes});
+            fragment_push_data.at(fragment_bind.memory_limit_dword+native)=static_cast<u32>(bytes);
+          }
+          fragment_buffers.push_back(storage);
+        } else if(binding.kind==Kind::FlattenedSrt){
+          auto storage=CreateStorageBuffer(test.name,fragment.resources.flattened_srt,
+                                          fragment.resources.flattened_srt.size());
+          infos[group].push_back({storage.buffer,0,storage.size});fragment_buffers.push_back(storage);
+        } else {
+          auto storage=CreateStorageBuffer(test.name,fragment_push_data,fragment_push_data.size());
+          infos[group].push_back({storage.buffer,0,storage.size});fragment_buffers.push_back(storage);
+        }
+      }
+      if(!layout.empty()) {
+        vk::DescriptorSetLayoutCreateInfo create{};create.bindingCount=static_cast<u32>(layout.size());create.pBindings=layout.data();
+        RequireVk(test.name,"fragment layout",m_device.createDescriptorSetLayout(&create,nullptr,&fragment_descriptor_layout),"vkCreateDescriptorSetLayout");
+        vk::DescriptorPoolCreateInfo pool_info{};pool_info.maxSets=1;pool_info.poolSizeCount=static_cast<u32>(pool.size());pool_info.pPoolSizes=pool.data();
+        RequireVk(test.name,"fragment pool",m_device.createDescriptorPool(&pool_info,nullptr,&fragment_descriptor_pool),"vkCreateDescriptorPool");
+        vk::DescriptorSetAllocateInfo allocate{};allocate.descriptorPool=fragment_descriptor_pool;allocate.descriptorSetCount=1;allocate.pSetLayouts=&fragment_descriptor_layout;
+        RequireVk(test.name,"fragment set",m_device.allocateDescriptorSets(&allocate,&fragment_descriptor_set),"vkAllocateDescriptorSets");
+        std::vector<vk::WriteDescriptorSet> writes;
+        for(size_t group=0;group<fragment_bind.descriptors.size();++group){
+          vk::WriteDescriptorSet write{};write.dstSet=fragment_descriptor_set;
+          write.dstBinding=ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel,fragment_bind.descriptors[group].kind);
+          write.descriptorType=vk::DescriptorType::eStorageBuffer;write.descriptorCount=static_cast<u32>(infos[group].size());write.pBufferInfo=infos[group].data();writes.push_back(write);
+        }
+        m_device.updateDescriptorSets(static_cast<u32>(writes.size()),writes.data(),0,nullptr);
+      }
+    }
     std::vector<Image> vertex_sampled_images;
     Buffer vertex_data_buffer;
     Buffer vertex_mapping_buffer;
@@ -19944,7 +20008,7 @@ void CheckSampledHtileArrayClearDiscovery() {
     }
     if (fragment_bind.UsesPushData()) {
       Require(test.name, "graphics",
-              test.push_constants.size() * sizeof(u32) ==
+              (test.fragment_buffer_data.empty() ? test.push_constants.size() : fragment_push_data.size()) * sizeof(u32) ==
                   fragment_bind.ShaderDataDwords() * sizeof(u32),
               "fragment push constant data size does not match reflection");
       push_constant_range.stageFlags |= vk::ShaderStageFlagBits::eFragment;
@@ -19961,6 +20025,9 @@ void CheckSampledHtileArrayClearDiscovery() {
     if (vertex_fixture != nullptr) {
       pipeline_layout_info.setLayoutCount = 1;
       pipeline_layout_info.pSetLayouts = &vertex_descriptor_layout;
+    }
+    if(fragment_descriptor_layout!=nullptr){
+      pipeline_layout_info.setLayoutCount=1;pipeline_layout_info.pSetLayouts=&fragment_descriptor_layout;
     }
     vk::PipelineLayout pipeline_layout = nullptr;
     RequireVk(test.name, "graphics",
@@ -20093,6 +20160,8 @@ void CheckSampledHtileArrayClearDiscovery() {
     rendering.pColorAttachments = attachments.data();
     cmd.beginRendering(rendering);
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+    if(fragment_descriptor_set!=nullptr)
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,pipeline_layout,0,1,&fragment_descriptor_set,0,nullptr);
     if (vertex_fixture != nullptr)
       cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout,
                              0, 1, &vertex_descriptor_set, 0, nullptr);
@@ -20106,8 +20175,9 @@ void CheckSampledHtileArrayClearDiscovery() {
     }
     if (fragment_bind.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
-      std::copy(test.push_constants.begin(), test.push_constants.end(),
-                push_data.dwords.begin() + fragment_bind.push_data_start_dword);
+      const auto& words=test.fragment_buffer_data.empty()?test.push_constants:fragment_push_data;
+      std::copy(words.begin(),words.end(),
+                push_data.dwords.begin()+fragment_bind.push_data_start_dword);
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
@@ -20148,6 +20218,9 @@ void CheckSampledHtileArrayClearDiscovery() {
     DestroyBuffer(&vertex_buffer);
     DestroyBuffer(&index_buffer);
     DestroyImage(&resolved);
+    if(fragment_descriptor_pool!=nullptr)m_device.destroyDescriptorPool(fragment_descriptor_pool,nullptr);
+    if(fragment_descriptor_layout!=nullptr)m_device.destroyDescriptorSetLayout(fragment_descriptor_layout,nullptr);
+    for(auto& buffer:fragment_buffers)DestroyBuffer(&buffer);
     DestroyImage(&target);
     for (auto &image : extra_targets) DestroyImage(&image);
     return pixel;
@@ -22310,6 +22383,39 @@ GraphicsCase PackedUnormRenderTargetCase(bool reverse_widths, u32 order,
   test.fragment_code.push_back(EncodeExp0(test.target_slot,0xf));
   test.fragment_code.push_back(EncodeExp1(0,1,2,3));
   AppendEnd(&test.fragment_code);
+  return test;
+}
+
+GraphicsCase PixelBoundedFormattedLoop(u32 count) {
+  GraphicsCase test;
+  test.name=count==0u?"PixelBoundedFormattedLoopZero":count==1u?"PixelBoundedFormattedLoopOne":count==2u?"PixelBoundedFormattedLoopTwo":"PixelBoundedFormattedLoopThree";
+  test.has_user_data=true;
+  constexpr u32 table_base=512u,payload_base=2048u;
+  test.user_data[0]=table_base;test.user_data[2]=1024u;
+  test.user_data[3]=BufferFormat(Prospero::BufferFormat::k32UInt)<<12u;
+  test.user_data[4]=count;
+  test.fragment_buffer_data.assign(800u,0xdeadbeefu);
+  for(u32 row=0;row<3u;++row){
+    const std::array<u32,4> descriptor{payload_base+row*256u,4u<<16u,1u,
+        (BufferFormat(Prospero::BufferFormat::k32Float)<<12u)|DstSel(4,5,6,7)};
+    std::copy(descriptor.begin(),descriptor.end(),test.fragment_buffer_data.begin()+(table_base+16u+row*196u)/4u);
+    test.fragment_buffer_data[(payload_base+row*256u)/4u]=std::bit_cast<u32>(float(row+1u));
+  }
+  auto& code=test.fragment_code;
+  AppendSMovLiteral(&code,20,0u);AppendVMovLiteral(&code,8,0u);
+  const size_t header=code.size();code.push_back(EncodeSopc(0x0a,20,4));
+  const size_t exit=code.size();code.push_back(0u);
+  code.push_back(EncodeSop2(0x26,22,20,255));code.push_back(196u);
+  code.push_back(EncodeSmem0(0x0a,24,0));code.push_back(EncodeSmem1(16u,22));
+  code.push_back(EncodeSopp(0x0c,0));
+  code.push_back(EncodeMubuf0(0x00,0,false,false));code.push_back(EncodeMubuf1(0,6,0));
+  code.push_back(EncodeVop2(0x03,8,Vgpr(0),8));
+  code.push_back(EncodeSop2(0x00,20,20,InlineU32(1)));
+  code.push_back(EncodeSopp(0x02,static_cast<u32>(static_cast<int32_t>(header)-static_cast<int32_t>(code.size()+1u))));
+  code[exit]=EncodeSopp(0x04,code.size()-exit-1u);
+  code.push_back(EncodeExp0(0,0xf));code.push_back(EncodeExp1(8,8,8,8));AppendEnd(&code);
+  const auto expected=std::bit_cast<u32>(float(count*(count+1u)/2u));
+  test.expected_pixel={expected,expected,expected,expected};
   return test;
 }
 
@@ -49311,6 +49417,27 @@ if (argc == 1) {
     test.fragment_code[test.fragment_code.size()-3u]=EncodeExp0(0u,1u);
     (void)CompileFragmentCase(test);
     return 1;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pixel-bounded-readonly-spirv-only") == 0) {
+    const auto shader=CompileFragmentCase(PixelBoundedFormattedLoop(3u));
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);std::string text;
+    Require("PixelBoundedReadonly","disassembly",tools.Disassemble(shader.spirv,&text),
+            "could not inspect fragment descriptor decorations");
+    Require("PixelBoundedReadonly","immutable SRT decoration",
+            text.find("OpDecorate %flattened_srt NonWritable")!=std::string::npos,
+            "fragment immutable SRT is exposed as writable storage");
+    Require("PixelBoundedReadonly","readonly payload decoration",
+            text.find("OpDecorate %buffers NonWritable")!=std::string::npos,
+            "fragment readonly payloads are exposed as writable storage");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pixel-bounded-formatted-loop-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan,PixelBoundedFormattedLoop(1u));
+    RunGraphicsCase(&vulkan,PixelBoundedFormattedLoop(2u));
+    RunGraphicsCase(&vulkan,PixelBoundedFormattedLoop(3u));
+    RunGraphicsCase(&vulkan,PixelBoundedFormattedLoop(0u));
+    return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-unorm-render-target-only") == 0) {
     // Admission failure must precede any unsupported pipeline execution.

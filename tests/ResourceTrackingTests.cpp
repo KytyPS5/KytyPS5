@@ -434,6 +434,18 @@ void TestBoundedImageViewEligibility() {
     plan.descriptor_sources.push_back(source);
   }
   plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
+  // A plain sample reads it with its own type, as the T# drives the hardware.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u &&
+            snapshot.images[1].dwords == descriptor(0x30u, Type::kColor3D) &&
+            specialization.images[1].dimension == Decoder::ImageDimension::Dim3D &&
+            specialization.images[0].dimension == Decoder::ImageDimension::Dim2D,
+        "explicitly selected 3D descriptor was normalized to null or retyped as 2D");
+  // Derivatives are laid out for one dimension: the mixed table is refused.
+  for (auto &memory : plan.memory_info) {
+    if (memory.kind == ResourceKind::Image && memory.resource == 0u)
+      memory.image_sample_flags |= Decoder::ImageSampleFlagDerivative;
+  }
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected incompatible descriptor was silently normalized to null");
 }

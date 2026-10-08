@@ -607,6 +607,22 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
 		};
+		// A plain sample reads the selected record with the record's own type, as the T#
+		// drives the hardware: records of another dimension or numeric class stay candidates.
+		// Derivatives, offsets and gathers are laid out for one dimension only.
+		const auto& base_root    = program.info.images[root_index];
+		uint32_t    sample_flags = 0;
+		for (const auto& memory: program.memory_info) {
+			if (memory.kind == ResourceKind::Image && memory.resource == root_index) {
+				sample_flags |= memory.image_sample_flags;
+			}
+		}
+		const bool mixed_dimensions =
+		    base_root.resource_class == ImageResourceClass::Sampled && !base_root.written &&
+		    !base_root.atomic &&
+		    (sample_flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagOffset |
+		                     Decoder::ImageSampleFlagGatherHorizontal)) == 0u;
+		const bool mixed_classes = mixed_dimensions && !base_root.depth_compare;
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -622,8 +638,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
-			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
+			if ((image.numeric_class != image_class.numeric_class && !mixed_classes) ||
+			    (!same_coordinates && !mixed_dimensions &&
+			     !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {

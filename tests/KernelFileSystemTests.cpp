@@ -372,6 +372,35 @@ void TestFsyncChmod(const std::filesystem::path &root) {
         "rmdir removes an empty directory");
   Check(posix_rmdir(Directory) == -1 && *error == Libs::Posix::POSIX_ENOENT,
         "rmdir reports a missing directory");
+
+  // fsync and fchmod on a descriptor that another thread keeps closing and
+  // reopening must see either the open file or EBADF, never a freed one.
+  const int raced = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(raced >= 3 && FileSystem::KernelClose(raced) == OK,
+        "find the descriptor slot for the close race");
+  std::atomic_bool closer_done {false};
+  std::atomic_int unexpected {0};
+  std::thread closer([&] {
+    for (int i = 0; i < 2000; ++i) {
+      const int d = FileSystem::KernelOpen(Path, 0x602, 0777);
+      if (d != raced || FileSystem::KernelWrite(d, Payload, 7) != 7 ||
+          FileSystem::KernelClose(d) != OK) {
+        ++unexpected;
+      }
+    }
+    closer_done = true;
+  });
+  while (!closer_done) {
+    const int synced = kernel_fsync(raced);
+    const int changed = kernel_fchmod(raced, 0644);
+    if ((synced != OK && synced != Kernel::KERNEL_ERROR_EBADF) ||
+        (changed != OK && changed != Kernel::KERNEL_ERROR_EBADF)) {
+      ++unexpected;
+    }
+  }
+  closer.join();
+  Check(unexpected == 0 && std::filesystem::file_size(root / "fsync.dat") == 7,
+        "fsync and fchmod race a concurrent close safely");
   Check(FileSystem::KernelUnlink(Path) == OK, "remove fsync fixture");
 }
 

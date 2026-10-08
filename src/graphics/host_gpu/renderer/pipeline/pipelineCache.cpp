@@ -396,6 +396,14 @@ struct PipelineCache::ProgramCache {
 		                 hash, StageShortName(stage));
 	}
 
+	void ReportCallStubbed(ShaderType stage, uint64_t hash) {
+		if (!call_stubbed_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("any-hit calls stubbed to accept every hit: hash=0x{:016x} stage={}", hash,
+		                 StageShortName(stage));
+	}
+
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
 			std::size_t hash = static_cast<std::size_t>(key.stage);
@@ -627,6 +635,9 @@ struct PipelineCache::ProgramCache {
 		if (translated.program.uses_bvh_intersect_stub) {
 			ReportStubbed(stage, params.hash);
 		}
+		if (translated.program.uses_call_stub) {
+			ReportCallStubbed(stage, params.hash);
+		}
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
@@ -700,6 +711,7 @@ struct PipelineCache::ProgramCache {
 	UnfoldableSets                                              unfoldable;
 	std::unordered_set<uint64_t>                                reported_shaders;
 	std::unordered_set<uint64_t>                                stubbed_shaders;
+	std::unordered_set<uint64_t>                                call_stubbed_shaders;
 	ProgramKey                                                  lookup_key;
 	uint32_t                                                    host_subgroup_size    = 64;
 	GraphicContext&                                             graphics;

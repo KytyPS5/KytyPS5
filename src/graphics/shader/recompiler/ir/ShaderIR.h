@@ -801,6 +801,8 @@ struct Program: ResourcePlan {
 	bool                          dispatcher_fallback = false;
 	// A hardware ray-tracing intersect was lowered to a constant miss.
 	bool uses_bvh_intersect_stub = false;
+	// Set when an S_SWAPPC_B64 call was replaced by an any-hit that accepts every hit.
+	bool                          uses_call_stub      = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };

@@ -11919,6 +11919,77 @@ void TestPlainSetpcThroughS6DecodesFollowingCode() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestSwappcAcceptsEveryHit() {
+  using namespace ShaderRecompiler::Decoder;
+  // The any-hit function is a record the GPU selects per lane from a hit-group table.
+  const uint32_t shader[] = {
+      EncodeVop1(0x02, 4, 256),             // v_readfirstlane_b32 s4, v0
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, // s_buffer_load_dwordx2 s[14:15], s[0:3], s4
+      EncodeSop1(0x21, 14, 14),             // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSMovB32(0, 16),                 // s_mov_b32 s0, s16
+      0xbf810000u,
+  };
+  Program program;
+  DecodeProgram(shader, program);
+  Check(program.instructions[2].opcode == Opcode::S_SWAPPC_B64 &&
+            program.instructions[2].dst.kind == OperandKind::Sgpr &&
+            program.instructions[2].dst.reg == 14u,
+        "s_swappc_b64 did not decode as a call through s[14:15]");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(!result.spirv.empty() && result.program.uses_call_stub,
+        "a shader calling an any-hit function was not compiled with the call stubbed");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  // A target combined from a loaded record is still one the host cannot resolve.
+  const uint32_t combined[] = {
+      EncodeVop1(0x02, 4, 256),             // v_readfirstlane_b32 s4, v0
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, // s_buffer_load_dwordx2 s[14:15], s[0:3], s4
+      EncodeSop2(0x00, 14, 14, 255), 64u,   // s_add_u32 s14, s14, 64
+      EncodeSop2(0x0e, 15, 15, 255), 0xffffu, // s_and_b32 s15, s15, 0xffff
+      EncodeSop1(0x21, 14, 14),             // s_swappc_b64 s[14:15], s[14:15]
+      0xbf810000u,
+  };
+  const auto combined_result = RecompileForTest(combined, options);
+  Check(!combined_result.spirv.empty() && combined_result.program.uses_call_stub,
+        "a call through a combined GPU-selected target was not stubbed");
+  // The branch's spelling: a call whose return pair is not its target pair is not linked either.
+  const uint32_t separate_pair[] = {
+      EncodeSMovB32(4, 255), 0xb7cb0000u, // s_mov_b32 s4, lo(target)
+      EncodeSMovB32(5, 255), 0x20u,       // s_mov_b32 s5, hi(target)
+      EncodeSop1(0x21, 14, 4),            // s_swappc_b64 s[14:15], s[4:5]
+      0xbf810000u,
+  };
+  const auto separate_result = RecompileForTest(separate_pair, options);
+  Check(!separate_result.spirv.empty() && separate_result.program.uses_call_stub,
+        "a call through a separate register pair was not stubbed");
+
+  // Only compute call targets are re-executed on the host; a graphics-stage call takes the stub.
+  const uint32_t pixel_call[] = {
+      EncodeSMovB32(14, 255), 0xb7cb0000u, // s_mov_b32 s14, lo(target)
+      EncodeSMovB32(15, 255), 0x20u,       // s_mov_b32 s15, hi(target)
+      EncodeSop1(0x21, 14, 14),            // s_swappc_b64 s[14:15], s[14:15]
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      0xbf810000u,
+  };
+  const auto pixel_result = RecompileForTest(pixel_call, MakeCompileOptions(ShaderType::Pixel));
+  Check(!pixel_result.spirv.empty() && pixel_result.program.uses_call_stub,
+        "a graphics-stage call was not compiled with the any-hit stub");
+  CheckSpirvBinaryValidates(pixel_result.spirv);
+
+  // A target the host can evaluate is a call to link, not an any-hit stub.
+  const uint32_t constant_target[] = {
+      EncodeSMovB32(14, 255), 0xb7cb0000u, // s_mov_b32 s14, lo(target)
+      EncodeSMovB32(15, 255), 0x20u,       // s_mov_b32 s15, hi(target)
+      EncodeSop1(0x21, 14, 14),            // s_swappc_b64 s[14:15], s[14:15]
+      0xbf810000u,
+  };
+  const auto source = ShaderRecompiler::PrepareShaderSource(constant_target, options);
+  Check(source.calls.size() == 1u && !source.decoded.instructions[2].call_stub,
+        "a host-evaluable call target was stubbed instead of linked");
+}
+
 void TestFrontHalfDecodeStopsAtHandoff() {
   using namespace ShaderRecompiler::Decoder;
   // s_setpc_b64 s6 at word 103, then padding and the "sl00" metadata tag at word 112.
@@ -18282,6 +18353,7 @@ int main() {
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestPlainSetpcThroughS6DecodesFollowingCode();
+  TestSwappcAcceptsEveryHit();
   TestFrontHalfDecodeStopsAtHandoff();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();

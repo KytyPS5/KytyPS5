@@ -3,14 +3,14 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
-
-#include <queue>
-
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -40,8 +40,11 @@ public:
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// An empty range is host-only; an omitted range conservatively aliases all guest memory.
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+	                                                 std::optional<GuestRange>      range = std::nullopt);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	[[nodiscard]] bool        HasPendingPriorityOperations(GuestRange range);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -80,11 +83,13 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		std::optional<GuestRange>    range;
 	};
 
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+	                    std::optional<GuestRange> range = std::nullopt);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
@@ -92,13 +97,14 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
-	std::queue<PendingOperation> m_pending_operations;
-	std::queue<PendingOperation> m_priority_operations;
+	std::deque<PendingOperation> m_pending_operations;
+	std::deque<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	std::optional<GuestRange>    m_priority_active_range;
 	OperationState               m_operation_state      = OperationState::Open;
 };
 

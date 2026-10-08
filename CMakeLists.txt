@@ -562,6 +562,8 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_kyty_full_emulator_test(scheduler_unmap_tests "${KYTY_TESTS_DIR}/SchedulerUnmapTests.cpp")
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -598,6 +600,8 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	add_test(NAME scheduler_unmap COMMAND $<TARGET_FILE:scheduler_unmap_tests>)
+	set_tests_properties(scheduler_unmap PROPERTIES TIMEOUT 60)
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -699,6 +703,7 @@ if(BUILD_TESTING)
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
+		scheduler_unmap_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests

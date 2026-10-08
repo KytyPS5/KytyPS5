@@ -207,7 +207,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(std::move(publish),
+		                                   GuestRange {buffer_address, buffer.Size()});
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);

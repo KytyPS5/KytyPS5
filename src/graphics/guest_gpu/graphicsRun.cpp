@@ -618,7 +618,7 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			    [ready = m_suspend_point_ready] { ready->release(); }, GuestRange {});
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -1421,7 +1421,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
-	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, GuestRange {});
 	GetScheduler().Flush();
 }
 

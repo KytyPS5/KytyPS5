@@ -945,7 +945,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_dma = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
-		uses_dma |= stage->runtime->program->info.uses_dma;
+		if (stage->runtime->program->info.uses_dma) {
+			m_context.CacheDmaBases(*stage->runtime);
+			uses_dma = true;
+		}
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();

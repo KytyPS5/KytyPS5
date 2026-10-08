@@ -2918,6 +2918,93 @@ void TestDynamicFlatAddressesUseDma() {
         "dynamic FLAT address did not enable DMA");
 }
 
+void TestDmaBaseRegisters() {
+  // PPSA04263 glyph upload (cs e9e4f0b919d80844): v_add_co_u32 v1, s12, v6;
+  // v_add_co_ci_u32 v2, 0, s13 addresses a FLAT_LOAD_UBYTE.
+  Fixture fixture;
+  const auto lane = fixture.Emit(ValueOpcode::UndefU32);
+  const auto offset = fixture.Emit(
+      ValueOpcode::IMul32, {fixture.UserData(10), fixture.UserData(11)});
+  const auto index = fixture.Emit(ValueOpcode::IAdd32, {lane, offset});
+  const auto sum =
+      fixture.Emit(ValueOpcode::IAddCarry32, {fixture.UserData(12), index});
+  const auto low =
+      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(0u)});
+  const auto carry =
+      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(1u)});
+  const auto high =
+      fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(13), carry});
+  const auto address = fixture.Address(low, high, 0xa0);
+  MemoryInfo flat;
+  flat.kind = ResourceKind::Flat;
+  flat.address_is_full = true;
+  fixture.Emit(ValueOpcode::LoadAddressU8, {address, low, high, Value(true)},
+               fixture.AddMemory(flat, 0xa0));
+
+  // A global access with a scalar base pair and a vector offset.
+  const auto based =
+      fixture.Address(fixture.UserData(4), fixture.UserData(5), 0xb0);
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {based, lane, Value(0u), Value(true)},
+               fixture.AddMemory(global, 0xb0));
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.uses_dma, "address operations did not use DMA");
+  auto registers = fixture.program.info.dma_base_registers;
+  std::sort(registers.begin(), registers.end());
+  // Registers 10 and 11 feed the offset, and through the carry the high
+  // dword, but a base high dword never feeds the low dword.
+  Check(registers == std::vector<uint32_t>{4u, 12u},
+        "DMA base registers were not recorded");
+
+  // A base pair built as one composite: each dword extracts its own component.
+  {
+    Fixture composite;
+    const auto pair = composite.Emit(ValueOpcode::CompositeConstructU32x4,
+                                     {composite.UserData(12), composite.UserData(13),
+                                      Value(0u), Value(0u)});
+    const auto pair_low =
+        composite.Emit(ValueOpcode::CompositeExtractU32x4, {pair, Value(0u)});
+    const auto pair_high =
+        composite.Emit(ValueOpcode::CompositeExtractU32x4, {pair, Value(1u)});
+    const auto pair_address = composite.Address(pair_low, pair_high, 0xc0);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Flat;
+    memory.address_is_full = true;
+    composite.Emit(ValueOpcode::LoadAddressU32,
+                   {pair_address, pair_low, pair_high, Value(true)},
+                   composite.AddMemory(memory, 0xc0));
+    composite.PlanAndTrack();
+    Check(composite.program.info.dma_base_registers == std::vector<uint32_t>{12u},
+          "a composite base pair lost the provenance of its dwords");
+  }
+
+  // The base register at the end of a chain of exactly 256 instructions is still found.
+  {
+    // 254 adds of a lane value (not foldable), the lane value and GetUserData: 256 instructions,
+    // GetUserData last.
+    Fixture chain;
+    const auto chain_lane = chain.Emit(ValueOpcode::UndefU32);
+    auto low_value = chain.UserData(20);
+    for (uint32_t i = 0; i < 254; i++) {
+      low_value = chain.Emit(ValueOpcode::IAdd32, {low_value, chain_lane});
+    }
+    const auto chain_high = chain.Emit(ValueOpcode::IAdd32, {chain.UserData(21), Value(0u)});
+    const auto chain_address = chain.Address(low_value, chain_high, 0xd0);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Flat;
+    memory.address_is_full = true;
+    chain.Emit(ValueOpcode::LoadAddressU32,
+               {chain_address, low_value, chain_high, Value(true)},
+               chain.AddMemory(memory, 0xd0));
+    chain.PlanAndTrack();
+    Check(chain.program.info.dma_base_registers == std::vector<uint32_t>{20u},
+          "a base at the visit limit was missed");
+  }
+}
+
 void TestBufferSwizzleSpecialization() {
   Fixture fixture;
   const auto handle = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
@@ -3591,6 +3678,7 @@ int main() {
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
+    Run("DMA base registers", TestDmaBaseRegisters);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);

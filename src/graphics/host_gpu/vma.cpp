@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -141,6 +142,12 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
+		std::printf("vmaCreateImage failed: %s (%d), extent=%ux%ux%u format=%d levels=%u layers=%u\n",
+		            vk::to_string(result).c_str(), static_cast<int>(result), image_info.extent.width,
+		            image_info.extent.height, image_info.extent.depth,
+		            static_cast<int>(image_info.format), image_info.mipLevels,
+		            image_info.arrayLayers);
+		std::fflush(stdout);
 		LogMemoryBudget();
 		return false;
 	}

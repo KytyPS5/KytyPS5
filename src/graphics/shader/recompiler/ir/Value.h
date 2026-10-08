@@ -209,7 +209,10 @@ inline Value Value::Resolve() const {
 
 inline Inst* Value::ResolveInstruction() const {
 	EXIT_IF(type != Type::Opaque);
-	return Resolve().inst;
+	// An identity may forward an immediate: fail fast as the recursive form did.
+	const auto value = Resolve();
+	EXIT_IF(value.type != Type::Opaque);
+	return value.inst;
 }
 
 inline bool Value::U1() const {

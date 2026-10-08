@@ -81,6 +81,10 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Changes whenever a sweep over all buffers could find something new to upload.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> SynchronizationKey() const noexcept {
+		return {m_memory_tracker.CpuDirtyGeneration(), m_registration_epoch};
+	}
 	void               RunGarbageCollector();
 
 private:
@@ -132,6 +136,7 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;
+	uint64_t                                           m_registration_epoch = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

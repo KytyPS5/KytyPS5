@@ -407,6 +407,44 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestCpuDirtyGeneration() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto created = tracker.CpuDirtyGeneration();
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.CpuDirtyGeneration() > created,
+        "region creation did not advance the CPU dirty generation");
+
+  const auto before_upload = tracker.CpuDirtyGeneration();
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.CpuDirtyGeneration() == before_upload,
+        "clean upload advanced the CPU dirty generation");
+
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  const auto marked = tracker.CpuDirtyGeneration();
+  Check(marked > before_upload,
+        "explicit CPU dirtiness did not advance the generation");
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  bool flushed = false;
+  tracker.InvalidateRegion(address, page_size, [&] { flushed = true; });
+  Check(!flushed && tracker.CpuDirtyGeneration() > marked,
+        "invalidation did not advance the generation");
+
+  const auto before_untrack = tracker.CpuDirtyGeneration();
+  tracker.UntrackMemory(address, page_size * 2);
+  Check(tracker.CpuDirtyGeneration() > before_untrack,
+        "untracking did not advance the generation");
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1202,6 +1240,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuDirtyGeneration();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

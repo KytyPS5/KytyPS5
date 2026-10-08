@@ -128,11 +128,17 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	m_fault_process_pending = true;
+	// Read before the sweep: a CPU write landing during it changes the key for the next draw.
+	const auto key = m_buffer_cache.SynchronizationKey();
+	if (key == m_bda_sync_key) {
+		return;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 	});
-	m_fault_process_pending = true;
+	m_bda_sync_key = key;
 }
 
 void RenderContext::RunGarbageCollector() {

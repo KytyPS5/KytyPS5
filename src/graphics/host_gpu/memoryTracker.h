@@ -29,6 +29,10 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Advances after any page becomes CPU-dirty. Equal values mean no new CPU writes since.
+	[[nodiscard]] uint64_t CpuDirtyGeneration() const noexcept {
+		return m_cpu_dirty_generation.load(std::memory_order_acquire);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -51,6 +55,7 @@ public:
 				on_flush();
 			}
 		});
+		AdvanceCpuDirtyGeneration();
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -145,11 +150,16 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
+	// Called after the CPU-dirty bits are set, so a reader that saw the old value rescans.
+	void AdvanceCpuDirtyGeneration() noexcept {
+		m_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
+	}
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::atomic<uint64_t>                          m_cpu_dirty_generation {1};
 };
 
 } // namespace Libs::Graphics

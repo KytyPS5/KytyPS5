@@ -1671,12 +1671,18 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
 	const bool emulate_amd = Config::AmdCpuEnabled();
+	// Without the AMD CPU option, the AMD instructions the host CPU lacks are still patched:
+	// unpatched, each execution is a host exception, and games run them in hot loops.
+	const auto host_features = GetGuestInstructionHostFeatures();
+	const bool patch_host_missing =
+	    !emulate_amd && (!host_features.sse4a || !host_features.rdpid || !host_features.clwb);
+	const bool patch_amd = emulate_amd || patch_host_missing;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const bool patch_guest_instructions = protect_memory_faults || patch_amd;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1791,7 +1797,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		                                &function_starts) &&
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
-		if (!have_function_starts) {
+		if (!have_function_starts && (emulate_amd || protect_memory_faults)) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
 			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
@@ -1800,7 +1806,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			                                           protect_memory_faults, patch_amd,
+			                                           host_features, patch_host_missing);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
@@ -1819,7 +1826,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.unrelocatable_memory_instruction_count);
 			}
 		}
-		if (emulate_amd && have_function_starts) {
+		if (patch_amd && have_function_starts) {
 			InstructionPatchCounts combined {};
 			std::string            details;
 			for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
@@ -1838,8 +1845,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                      : skipped == found ? "not patched"
 			                      : skipped != 0     ? "partially patched"
 			                                         : "patched";
-			Log::WriteToConsoleAndLog(
-			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
+			if (emulate_amd || found != 0) {
+				Log::WriteToConsoleAndLog(
+				    fmt::format("{}: {} {} ({})\n",
+				                emulate_amd ? "AMD CPU compatibility" : "Host CPU compatibility",
+				                module_name, status, details));
+			}
 		}
 	}
 

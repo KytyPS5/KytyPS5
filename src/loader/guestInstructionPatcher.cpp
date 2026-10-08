@@ -925,11 +925,11 @@ void GenerateExtractQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerato
 void CollectAmdInstructions(const DecodedFunction&                   function,
                             std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                             GuestInstructionPatchResult&             result,
-                            GuestInstructionHostFeatures             host_features) {
+                            GuestInstructionHostFeatures host_features, bool host_missing_only) {
 	for (const auto& [address, decoded]: function.instructions) {
 		const auto&            instruction = decoded.instruction;
 		InstructionReplacement replacement {};
-		if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
+		if (!host_missing_only && instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
 		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
 		    instruction.raw.vex.offset == 0 && decoded.operands[0].size == 128 &&
 		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -983,7 +983,7 @@ bool NeedsTrapRedZoneProtection(const DecodedCodeInstruction& decoded) {
 
 void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunction& function,
                                  const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                                 GuestInstructionPatchResult&                   result) {
+                                 GuestInstructionPatchResult& result, bool host_missing_only) {
 	for (const auto& [address, rewrite]: rewrite_sites) {
 		if (rewrite.replacement == InstructionReplacement::None ||
 		    module.patched.contains(reinterpret_cast<u8*>(address))) {
@@ -991,8 +991,10 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 		}
 		const auto& decoded = function.instructions.at(address);
 		if (NeedsTrapRedZoneProtection(decoded)) {
-			if (rewrite.replacement != InstructionReplacement::ReciprocalSquareRoot) {
+			if (rewrite.replacement != InstructionReplacement::ReciprocalSquareRoot &&
+			    !host_missing_only) {
 				// Leaving an unsupported instruction unchanged still traps with a live red zone.
+				// Host-missing-only patching keeps that unpatched behaviour instead of refusing.
 				EXIT("AMD CPU compatibility: cannot safely trap %s at %p (guest red zone is "
 				     "live)\n",
 				     ZydisMnemonicGetString(decoded.instruction.mnemonic),
@@ -1497,7 +1499,8 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
-                                                   GuestInstructionHostFeatures host_features) {
+                                                   GuestInstructionHostFeatures host_features,
+                                                   bool                         host_missing_only) {
 	GuestInstructionPatchResult result {};
 	if (!protect_memory && !emulate_amd) {
 		return result;
@@ -1550,11 +1553,13 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
 		if (emulate_amd) {
-			CollectAmdInstructions(function, rewrite_sites, result, host_features);
+			CollectAmdInstructions(function, rewrite_sites, result, host_features,
+			                       host_missing_only);
 		}
 		if (!rewrite_sites.empty()) {
 			RelocateGuestInstructions(module, function, rewrite_sites, result);
-			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
+			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result,
+			                            host_missing_only);
 		}
 	}
 	const auto trampoline_addr =

@@ -102,8 +102,18 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 			clearerr(f.f);
 			thread_local std::vector<uint8_t> chunk(1u << 20u);
 			if (fseeko(f.f, start + static_cast<off_t>(w), SEEK_SET) == 0) {
-				while (w < size) {
-					const size_t step = std::min<size_t>(size - w, chunk.size());
+				// Probe only bytes the file can still supply: the tail past EOF is never written.
+				size_t      remaining = size - w;
+				struct stat file_stat {};
+				if (fstat(fileno(f.f), &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+					const off_t at = start + static_cast<off_t>(w);
+					remaining =
+					    file_stat.st_size > at
+					        ? std::min(remaining, static_cast<size_t>(file_stat.st_size - at))
+					        : 0;
+				}
+				while (remaining != 0) {
+					const size_t step = std::min(remaining, chunk.size());
 					const auto   recoverable =
 					    g_recoverable_destination.load(std::memory_order_acquire);
 					if (recoverable == nullptr ||
@@ -116,6 +126,10 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 					}
 					std::memcpy(static_cast<uint8_t*>(data) + w, chunk.data(), got);
 					w += got;
+					remaining -= got;
+					if (got < step) {
+						break;
+					}
 				}
 				fseeko(f.f, start + static_cast<off_t>(w), SEEK_SET);
 			}

@@ -213,6 +213,14 @@ void TestReadsIntoProtectedPages() {
   Check(guard() && FileSystem::KernelPreadv(fd, iov, 2, 0) ==
                        static_cast<int64_t>(payload.size()) && filled(),
         "preadv fills vectors that cross into a write-protected page");
+  // Only the bytes before EOF are probed: the request tail past the recoverable
+  // range is unused.
+  Check(guard() &&
+            FileSystem::KernelPread(fd, target + Half, Half + 0x1000, Half) ==
+                static_cast<int64_t>(Half) &&
+            g_guard_faults.load() > 0 &&
+            std::memcmp(target + Half, payload.data() + Half, Half) == 0,
+        "pread past EOF recovers the protected bytes the file still supplies");
 #if defined(__linux__)
   // A destination the emulator cannot fault in is not recovered: the read stays short.
   const long page = sysconf(_SC_PAGESIZE);

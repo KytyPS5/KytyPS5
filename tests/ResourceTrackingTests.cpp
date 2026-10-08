@@ -441,6 +441,20 @@ void TestBoundedImageViewEligibility() {
             specialization.images[1].dimension == Decoder::ImageDimension::Dim3D &&
             specialization.images[0].dimension == Decoder::ImageDimension::Dim2D,
         "explicitly selected 3D descriptor was normalized to null or retyped as 2D");
+  // No sample reads a multisampled record, whatever its coordinates.
+  auto msaa = descriptor(0x31u, Type::kColor2DMsaa);
+  msaa[3] |= 1u << 16u; // two fragments
+  msaa[5] |= 1u << 4u;
+  DescriptorSource multisampled;
+  multisampled.dword_count = 8u;
+  for (uint32_t word = 0; word < msaa.size(); ++word) multisampled.dwords[word] = Value(msaa[word]);
+  plan.descriptor_sources.push_back(multisampled);
+  auto &sources = plan.descriptor_sources[image_source].indirect_descriptor->sources;
+  const auto volume = sources[1];
+  sources[1] = static_cast<uint32_t>(plan.descriptor_sources.size() - 1u);
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "explicitly selected multisampled descriptor was sampled");
+  sources[1] = volume;
   // Derivatives are laid out for one dimension: the mixed table is refused.
   for (auto &memory : plan.memory_info) {
     if (memory.kind == ResourceKind::Image && memory.resource == 0u)
@@ -909,6 +923,14 @@ void TestBitScanKeyRange() {
                   specialization.images[0].indirect_root == ImageResource::NoIndirectImage,
               "bit scan table kept a set bit at or past the loop's count");
       }
+      // A scanned multisampled record (two fragments) cannot be sampled: the table is refused.
+      const auto record = (table_base - memory_image.base) / 4u + 9u * 8u;
+      memory_image.words[record + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) | (1u << 16u) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2DMsaa) << 28u);
+      memory_image.words[record + 5u] = 1u << 4u;
+      user_data[3] = 10u;
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "bit scan table sampled a multisampled record");
       user_data[2] = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.images.size() == 1u &&

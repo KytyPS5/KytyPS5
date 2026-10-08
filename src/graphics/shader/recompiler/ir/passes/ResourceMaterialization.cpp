@@ -607,6 +607,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
 		};
+		// Indirect tables are only sampled, and no sample reads a multisampled record.
+		const auto is_msaa = [](Decoder::ImageDimension dimension) {
+			return dimension == Decoder::ImageDimension::Dim2DMsaa ||
+			       dimension == Decoder::ImageDimension::Dim2DMsaaArray;
+		};
 		// A plain sample reads the selected record with the record's own type, as the T#
 		// drives the hardware: records of another dimension or numeric class stay candidates.
 		// Derivatives, offsets and gathers are laid out for one dimension only.
@@ -638,7 +643,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
-			if ((image.numeric_class != image_class.numeric_class && !mixed_classes) ||
+			if (is_msaa(image.dimension) ||
+			    (image.numeric_class != image_class.numeric_class && !mixed_classes) ||
 			    (!same_coordinates && !mixed_dimensions &&
 			     !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||

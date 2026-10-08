@@ -13279,8 +13279,14 @@ void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
   };
   ps_info.ps_pixel_kill_enable = true;
   auto kill_without_vm_result = RecompileForTest(kill_without_vm_shader, options);
+  const auto kill_without_vm_source =
+      DisassembleSpirvBinary(kill_without_vm_result.spirv);
   Check(SpirvInstructionOpcodeCount(kill_without_vm_result.spirv, 252) != 0,
         "pixel shader with ps_pixel_kill_enable but without vm export flag must still lower to OpKill");
+  Check(kill_without_vm_source.find("OpBitwiseOr") != std::string::npos &&
+            CountSourceOccurrences(kill_without_vm_source,
+                                   "OpStore %pixel_valid_mask_active") >= 2,
+        "non-VM export must accumulate into pixel_valid_mask");
   CheckSpirvBinaryValidates(kill_without_vm_result.spirv);
 
   const uint32_t ordinary_shader[] = {

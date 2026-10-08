@@ -106,7 +106,7 @@ public:
 	GraphicContext graphics;
 };
 
-constexpr uint64_t Base = 0x200000000ull;
+constexpr uint64_t Base = 0x60000000ull;
 constexpr uint64_t Page = 0x4000;
 
 void CheckHostEvent(RenderContext& context) {
@@ -171,7 +171,7 @@ void CheckGuestWriteback(RenderContext& context) {
 	        "map guest backing");
 	context.MapMemory(Base, Page);
 	static constexpr uint32_t expected  = 0x1234abcd;
-	auto&              scheduler = context.GetCommandScheduler();
+	auto&                     scheduler = context.GetCommandScheduler();
 	scheduler.DeferPriorityOperation([] { WriteBacking(Base, &expected, sizeof(expected)); },
 	                                 GuestRange {Base, sizeof(expected)});
 	context.UnmapMemory(Base, Page);

@@ -525,8 +525,12 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			return false;
 		}
 	} else {
-		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		// Without an ordinary reader a checked specialization reader still beats a raw
+		// dereference: a table the guest never set (null base) must fail, not fault the host.
+		if (vector || m_runtime.read_specialization_memory == nullptr ||
+		    !m_runtime.read_specialization_memory(m_runtime.userdata, address, {&word, 1})) {
+			return false;
+		}
 	}
 	result = word;
 	return true;
@@ -955,28 +959,38 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	for (const auto& block: m_program.control_flow) {
 		for (const auto source: block.sources) active.at(source) = 0u;
 	}
+	// Blocks entered only because their branch condition could not be evaluated may not run on
+	// the guest at all (the path is chosen per wave), so their reads may legitimately fail.
+	constexpr uint32_t Speculative = 0x80000000u;
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
 	visited.assign(m_program.control_flow.size(), 0u);
 	pending.clear();
 	pending.push_back(0u);
 	while (!pending.empty()) {
-		const auto index = pending.back();
+		const auto entry       = pending.back();
+		const auto index       = entry & ~Speculative;
+		const bool speculative = (entry & Speculative) != 0u;
 		pending.pop_back();
-		if (visited.at(index)) continue;
-		visited[index] = 1u;
+		const uint8_t level = speculative ? 1u : 2u;
+		if (visited.at(index) >= level) continue;
+		visited[index] = level;
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) active[source] = 1u;
 		for (const auto slot: block.srt_reads) {
-			if (!refresh(slot)) return false;
+			if (!refresh(slot) && !speculative) return false;
 		}
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
 		    predicate.Evaluate(block.condition, condition)) {
-			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+			pending.push_back(block.successors[condition != 0u ? 0u : 1u] |
+			                  (speculative ? Speculative : 0u));
 		} else {
-			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+			// A single successor is no choice: it is as definite as the block that leads to it.
+			const bool undecided = block.successors.size() > 1u;
+			for (const auto successor: block.successors)
+				pending.push_back(successor | (speculative || undecided ? Speculative : 0u));
 		}
 	}
 	return true;

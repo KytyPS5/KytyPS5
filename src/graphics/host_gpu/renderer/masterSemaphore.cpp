@@ -50,7 +50,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkWaitSemaphores failed: %s (%d), tick=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result), tick);
+	}
 	Refresh();
 }
 

@@ -157,11 +157,10 @@ bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> val
 
 bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
-	if (capture.source.read_memory != nullptr) {
-		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
-	} else {
-		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
-	}
+	// Never dereference a guest address directly: a table the guest never set must fail the read.
+	const auto reader = capture.source.read_memory != nullptr ? capture.source.read_memory
+	                                                          : capture.source.read_specialization_memory;
+	if (reader == nullptr || !reader(capture.source.userdata, address, values)) return false;
 	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;
 }

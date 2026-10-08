@@ -22500,9 +22500,9 @@ GraphicsCase PixelBoundedFormattedLoop(u32 count) {
   return test;
 }
 
-CompiledShader CompileVertexBoundedByteLoop(u32 count,u32 byte_offset,std::vector<u32>& backing) {
+CompiledShader CompileVertexBoundedByteLoop(u32 count,u32 byte_offset,std::vector<u32>& backing,u32 wave_size=32u) {
   using namespace ShaderRecompiler::IR;
-  Program program{};program.stage=ShaderType::Vertex;program.wave_size=32u;
+  Program program{};program.stage=ShaderType::Vertex;program.wave_size=wave_size;
   for(u32 n=0;n<4u;++n){program.block_storage.push_back(std::make_unique<Block>());program.blocks.push_back(program.block_storage.back().get());program.block_info.push_back({.id=n});}
   auto* entry=program.blocks[0];auto* header=program.blocks[1];auto* body=program.blocks[2];auto* exit=program.blocks[3];
   entry->AddBranch(header);header->AddBranch(body);header->AddBranch(exit);body->AddBranch(header);
@@ -22548,8 +22548,8 @@ CompiledShader CompileVertexBoundedByteLoop(u32 count,u32 byte_offset,std::vecto
   ResourceSnapshot snapshot;ResourceSpecialization specialization;
   const SrtRuntime runtime{.user_data=data,.read_memory=ReadTestMemory,.userdata=&backing,.read_specialization_memory=ReadTestMemory};
   Require("VertexBoundedByte","materialization",MaterializeResources(plan,runtime,snapshot,specialization),"vertex table materialization failed");
-  ShaderVertexInputInfo vertex_info{};vertex_info.resources_num=1u;vertex_info.wave_size=32u;
-  ShaderRecompiler::CompileOptions options;options.stage=ShaderType::Vertex;options.wave_size=32u;options.user_data=data;options.input_info.vertex=&vertex_info;
+  ShaderVertexInputInfo vertex_info{};vertex_info.resources_num=1u;vertex_info.wave_size=wave_size;
+  ShaderRecompiler::CompileOptions options;options.stage=ShaderType::Vertex;options.wave_size=wave_size;options.user_data=data;options.input_info.vertex=&vertex_info;
   ShaderRecompiler::TranslateResult translated;translated.program=std::move(program);
   auto result=ShaderRecompiler::CompileProgram(std::move(translated),options,specialization);
   ValidateSpirv("VertexBoundedByte",result.spirv);
@@ -49626,6 +49626,10 @@ if (argc == 1) {
       const std::array<u32,4> sums{0u,17u,60u,259u};const auto expected=std::bit_cast<u32>(float(offset==4u?0u:sums[count]));
       test.expected_pixel={expected,expected,std::bit_cast<u32>(0.75f),std::bit_cast<u32>(1.f)};RunGraphicsCase(&vulkan,test,&vertex);
     }
+    auto wide=GraphicsInterpolationExport();wide.name="VertexBoundedByteWave64Readback";
+    auto vertex=CompileVertexBoundedByteLoop(3u,1u,wide.vertex_buffer_data,64u);
+    wide.expected_pixel={std::bit_cast<u32>(259.f),std::bit_cast<u32>(259.f),std::bit_cast<u32>(0.75f),std::bit_cast<u32>(1.f)};
+    RunGraphicsCase(&vulkan,wide,&vertex);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--performance-optimization-readback-only") == 0) {

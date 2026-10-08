@@ -182,6 +182,14 @@ struct BufferCacheTestAccess {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
 
+  // ReadMemory without the GPU-thread hop, for tests that record on their own thread.
+  static void Download(BufferCache &cache, uint64_t address, uint64_t size) {
+    auto &buffer = cache.m_slot_buffers[cache.FindBuffer(address, size)];
+    if (cache.DownloadBufferMemory<false>(buffer, address, size)) {
+      cache.m_memory_tracker.UnmarkRegionAsGpuModified(address, size);
+    }
+  }
+
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
     const auto *owner = cache.m_page_table.Find(
         address >> BufferCache::PageTable::kPageBits);
@@ -400,6 +408,16 @@ struct RenderExecutorTestAccess {
   static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     executor.DrawAuto(0, command, args);
+  }
+
+  static bool DrawIndirect(RenderExecutor &executor, CommandBuffer &command,
+                           const DrawIndirectPacket &packet, uint32_t &latched) {
+    return executor.DrawIndirect(0, command, packet, latched);
+  }
+
+  static IndirectDrawPrepare::Latched ReadIndirectState(RenderExecutor &executor,
+                                                        uint32_t state) {
+    return executor.ReadIndirectState(state);
   }
 
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
@@ -16668,6 +16686,68 @@ public:
         }
       }
 
+      // GPU-written indirect arguments are drawn without a readback, with the parameters of
+      // the CPU path: without SGPR destinations a native fetch ignores the base vertex and
+      // first instance, and only the counted draws latch NUM_INSTANCES.
+      if (m_draw_indirect_count_supported) {
+        shaders.SetEsShaderBase(vertex_address);
+        constexpr uint64_t arguments_address = depth_address + 0x3e000;
+        constexpr uint64_t count_address = arguments_address + 0x100;
+        auto &buffers = context.GetBufferCache();
+        const auto write_gpu = [&](uint64_t address, std::span<const uint32_t> words) {
+          for (uint32_t i = 0; i < words.size(); i++) {
+            auto [buffer, offset] = buffers.ObtainBuffer(address + i * 4u, 4, true);
+            buffer->Fill(offset, 4, words[i]);
+          }
+        };
+        struct IndirectCase {
+          bool indexed;
+          uint32_t count;
+          std::array<uint32_t, 10> arguments;
+          uint32_t latched;
+        };
+        for (const auto &test : {IndirectCase{true, 0, {6, 1, 0, 7, 5}, 1},
+                                 IndirectCase{false, 0, {3, 2, 7, 5}, 2},
+                                 IndirectCase{true, 1, {3, 1, 0, 0, 0, 3, 4, 0, 0, 0}, 1},
+                                 IndirectCase{true, 2, {3, 1, 0, 0, 0, 3, 4, 0, 0, 0}, 4}}) {
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          write_gpu(arguments_address, test.arguments);
+          if (test.count != 0) {
+            write_gpu(count_address, std::array{test.count});
+          }
+          uint32_t latched = 0;
+          Require("GpuIndirectDraw", "GPU path",
+                  RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                      {.arguments = arguments_address,
+                       .count_address = test.count != 0 ? count_address : 0,
+                       .max_count = test.count != 0 ? 2u : 1u,
+                       .stride = test.indexed ? 20u : 16u,
+                       .indexed = test.indexed,
+                       .index_base = index_address,
+                       .index_type_and_size = 1,
+                       .index_buffer_size = 3},
+                      latched),
+                  "an eligible indirect draw fell back to reading its arguments");
+          Require("GpuIndirectDraw", "no argument readback",
+                  buffers.IsRegionGpuModified(arguments_address, sizeof(test.arguments)),
+                  "drawing read the GPU-written arguments back to the CPU");
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            Require("GpuIndirectDraw", test.indexed ? "indexed" : "auto",
+                    pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "the host draw applied offsets the CPU path drops, or lost coverage");
+          }
+          const auto state = RenderExecutorTestAccess::ReadIndirectState(executor, latched);
+          Require("GpuIndirectDraw", "latched instance count",
+                  state.executed && state.instances == test.latched,
+                  "NUM_INSTANCES did not come from the last counted draw");
+        }
+        BufferCacheTestAccess::Download(buffers, arguments_address, 0x200);
+        shaders.SetEsShaderBase(indirect_vs);
+      }
+
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
           static_cast<u32>(rect_address),
@@ -18095,6 +18175,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_draw_indirect_count_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -18131,6 +18212,7 @@ private:
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
+    m_runtime_context.draw_indirect_count_enabled = m_draw_indirect_count_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -18314,6 +18396,9 @@ private:
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
+    m_draw_indirect_count_supported = available_features12.drawIndirectCount &&
+                                      available_features.multiDrawIndirect &&
+                                      available_features.drawIndirectFirstInstance;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.depthBounds &&
@@ -18342,6 +18427,7 @@ private:
     device_info.pQueueCreateInfos = &queue_info;
     auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
+    device_features12.drawIndirectCount = m_draw_indirect_count_supported;
     device_features12.shaderSharedInt64Atomics = true;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
@@ -18400,6 +18486,8 @@ private:
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+    device_features.multiDrawIndirect = m_draw_indirect_count_supported;
+    device_features.drawIndirectFirstInstance = m_draw_indirect_count_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,

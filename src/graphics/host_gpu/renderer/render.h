@@ -4,12 +4,14 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/indirectDraw.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -72,6 +74,18 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+};
+
+// Guest indirect draw packet whose arguments stay in GPU memory.
+struct DrawIndirectPacket {
+	uint64_t arguments           = 0;
+	uint64_t count_address       = 0;
+	uint32_t max_count           = 0;
+	uint32_t stride              = 0;
+	bool     indexed             = false;
+	uint64_t index_base          = 0;
+	uint32_t index_type_and_size = 0;
+	uint32_t index_buffer_size   = 0;
 };
 
 struct SubmitInfo {
@@ -169,8 +183,14 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	struct IndirectEmit;
+
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// Records the draws with their arguments read by the GPU; false leaves them to the CPU.
+	[[nodiscard]] bool DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
+	                                const DrawIndirectPacket& args, uint32_t& latched_state);
+	[[nodiscard]] IndirectDrawPrepare::Latched ReadIndirectState(uint32_t state);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -193,7 +213,7 @@ private:
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable);
+	                         bool primitive_restart_enable, const IndirectEmit* indirect = nullptr);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -215,10 +235,14 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::unique_ptr<IndirectDrawPrepare>  m_indirect_prepare;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
+
+// The draw is a depth or stencil copy that DepthStencilCopy performs instead of drawing.
+[[nodiscard]] bool IsDepthStencilCopyDraw(const HW::Context& hw);
 
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,

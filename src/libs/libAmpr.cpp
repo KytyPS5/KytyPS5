@@ -194,8 +194,6 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 	}
 
 	if (!found) {
-		// Keep the native path: on Windows a UTF-8 std::string converts back through the ANSI
-		// code page, so install folders with non-ASCII names would no longer resolve.
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
 		info.host_path       = real_path;
 

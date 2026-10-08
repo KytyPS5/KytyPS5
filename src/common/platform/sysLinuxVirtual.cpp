@@ -255,6 +255,9 @@ static bool is_mapped(void* ptr, size_t length) {
 #else
 static bool is_mapped(void* ptr, size_t length) {
 	FILE* file = fopen("/proc/self/maps", "r");
+	if (file == nullptr) {
+		return true;
+	}
 	char  line[1024];
 	bool  ret  = false;
 	auto  addr = reinterpret_cast<uintptr_t>(ptr);

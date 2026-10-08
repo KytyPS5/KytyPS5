@@ -124,6 +124,34 @@ bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	       Prospero::ImageType::kCube;
 }
 
+bool IsCompatibleDescriptorDimension(const DescriptorValue&   descriptor,
+                                     Decoder::ImageDimension requested_dimension,
+                                     bool                    requested_cube) {
+	if (DescriptorIsCube(descriptor) != requested_cube) {
+		return false;
+	}
+	const auto dim = DescriptorDimension(descriptor, requested_dimension);
+	if (dim == requested_dimension) {
+		return true;
+	}
+	const auto is_2d = [](Decoder::ImageDimension d) {
+		return d == Decoder::ImageDimension::Dim2D || d == Decoder::ImageDimension::Dim2DArray;
+	};
+	if (is_2d(dim) && is_2d(requested_dimension)) {
+		return true;
+	}
+	const auto is_1d = [](Decoder::ImageDimension d) {
+		return d == Decoder::ImageDimension::Dim1D || d == Decoder::ImageDimension::Dim1DArray;
+	};
+	if (is_1d(dim) && is_1d(requested_dimension)) {
+		return true;
+	}
+	const auto is_msaa = [](Decoder::ImageDimension d) {
+		return d == Decoder::ImageDimension::Dim2DMsaa || d == Decoder::ImageDimension::Dim2DMsaaArray;
+	};
+	return is_msaa(dim) && is_msaa(requested_dimension);
+}
+
 uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {
 	if (image.mip_mode != ImageMipMode::Dynamic || NullImageDescriptor(descriptor)) {
 		return 1;
@@ -1193,7 +1221,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
-				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+				            (bounded_table &&
+				             !IsCompatibleDescriptorDimension(value, image.dimension, image.cube)))
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {

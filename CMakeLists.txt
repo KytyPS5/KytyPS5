@@ -665,6 +665,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-optimization-only)
 	add_test(NAME pipeline_cache_identity
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
+	add_test(NAME pipeline_cache_checkpoint
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-checkpoint-only)
+	set_tests_properties(pipeline_cache_checkpoint PROPERTIES TIMEOUT 30)
 	add_test(NAME spirv_permutation_reuse
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-permutation-reuse-only)
 	add_test(NAME pipeline_cache_validation_mode

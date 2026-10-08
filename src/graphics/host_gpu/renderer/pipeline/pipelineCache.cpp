@@ -1305,15 +1305,37 @@ bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms) 
 	       (pending_pipelines != 0 && creation_ms >= DriverCacheExpensiveCreationMs);
 }
 
+bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms,
+                              uint64_t previous_save_ms, uint64_t elapsed_ms) {
+	if (!DriverCacheCheckpointDue(pending_pipelines, creation_ms)) return false;
+	// Intermediate persistence should consume at most one tenth of the command
+	// lane. A new cache has no cost sample; genuinely expensive compilation can
+	// still be protected when its value pays for the measured checkpoint cost.
+	// Divide instead of multiplying durations so large clock values cannot wrap.
+	return previous_save_ms == 0 || elapsed_ms / previous_save_ms >= 9u ||
+	       creation_ms / previous_save_ms >= 10u;
+}
+
 void PipelineCache::CheckpointDriverCacheLocked(uint64_t creation_ms) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
-	if (!DriverCacheCheckpointDue(++m_new_driver_pipelines, creation_ms)) {
+	if (m_new_driver_pipelines != UINT32_MAX) ++m_new_driver_pipelines;
+	const auto begin = std::chrono::steady_clock::now();
+	const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	    begin - m_checkpoint_finished).count();
+	if (!DriverCacheCheckpointDue(m_new_driver_pipelines, creation_ms,
+	                               m_previous_checkpoint_ms,
+	                               static_cast<uint64_t>(elapsed_ms))) {
 		return;
 	}
-	m_new_driver_pipelines = 0;
-	SaveDriverCacheLocked(true);
+	// Keep dirty work eligible after a failed write; a slow failure also needs
+	// the same budget, rather than retrying expensive I/O on every creation.
+	if (SaveDriverCacheLocked(true)) m_new_driver_pipelines = 0;
+	m_checkpoint_finished = std::chrono::steady_clock::now();
+	const auto cost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	    m_checkpoint_finished - begin).count();
+	m_previous_checkpoint_ms = static_cast<uint64_t>(std::max<int64_t>(cost_ms, 1));
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(

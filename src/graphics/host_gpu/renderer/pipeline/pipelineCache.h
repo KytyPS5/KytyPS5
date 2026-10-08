@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
@@ -221,6 +222,8 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 	uint32_t      m_new_driver_pipelines = 0;
+	uint64_t      m_previous_checkpoint_ms = 0;
+	std::chrono::steady_clock::time_point m_checkpoint_finished {};
 	uint64_t      m_saved_driver_cache_hash = 0;
 	bool          m_has_saved_driver_cache_hash = false;
 
@@ -243,6 +246,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
 
 [[nodiscard]] bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms);
+[[nodiscard]] bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms,
+                                          uint64_t previous_save_ms, uint64_t elapsed_ms);
 
 bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
                                              std::string_view git_revision,

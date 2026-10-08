@@ -72,6 +72,8 @@ bool ShouldOptimizeShaderSpirvForTest(
     bool dispatcher_fallback, bool cooperative_wave64,
     Config::ShaderOptimizationType optimization);
 bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms);
+bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms,
+                              uint64_t previous_save_ms, uint64_t elapsed_ms);
 bool IsDriverCacheBuildIdentityUsableForTest(
     std::string_view git_hash, std::string_view git_revision,
     std::string_view worktree_fingerprint);
@@ -247,6 +249,37 @@ void TestShaderModuleDebugName() {
 }
 
 void TestDriverPipelineCacheCheckpointPolicy() {
+  // Model an observed slow persistence device, independently of shader/resource
+  // semantics. The cache must not monopolize the GPU lane during a cheap burst.
+  constexpr uint64_t save_ms = 26000u;
+  uint32_t pending = 0;
+  uint32_t saves = 0;
+  uint64_t saved_at = 0;
+  for (uint64_t now = 10; now <= 10000; now += 10) {
+    ++pending;
+    if (DriverCacheCheckpointDue(pending, 10u, saves == 0 ? 0u : save_ms,
+                                 now - saved_at)) {
+      ++saves;
+      pending = 0;
+      saved_at = now;
+    }
+  }
+  Check(saves == 1u && pending != 0u,
+        "slow driver-cache persistence repeatedly monopolizes a cheap pipeline burst");
+  Check(!DriverCacheCheckpointDue(pending, 0u, save_ms, 233999u) &&
+            DriverCacheCheckpointDue(pending, 0u, save_ms, 234000u),
+        "deferred cache work did not recover its ten-percent persistence budget");
+  Check(!DriverCacheCheckpointDue(1u, 5000u, save_ms, 0u) &&
+            DriverCacheCheckpointDue(1u, 260000u, save_ms, 0u),
+        "expensive pipeline preservation ignored its measured persistence cost");
+  Check(DriverCacheCheckpointDue(16u, 0u, 0u, 0u) &&
+            DriverCacheCheckpointDue(16u, 0u, 1u, 9u) &&
+            !DriverCacheCheckpointDue(16u, 0u, 1u, 8u),
+        "initial or cheap cache checkpoints lost their cadence");
+  Check(!DriverCacheCheckpointDue(0u, UINT64_MAX, 1u, UINT64_MAX) &&
+            !DriverCacheCheckpointDue(16u, 0u, UINT64_MAX, UINT64_MAX) &&
+            DriverCacheCheckpointDue(16u, 0u, UINT64_MAX / 9u, UINT64_MAX),
+        "cache checkpoint time arithmetic wrapped or invented pending work");
   Check(!DriverCacheCheckpointDue(1u, 0u) &&
             !DriverCacheCheckpointDue(15u, 4999u),
         "fast pipeline compilation stopped batching cache checkpoints");

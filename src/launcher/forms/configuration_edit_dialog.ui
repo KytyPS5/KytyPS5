@@ -16,7 +16,17 @@
   <property name="locale">
    <locale language="English" country="UnitedStates"/>
   </property>
+  <layout class="QVBoxLayout" name="dialogLayout">
+   <item>
+    <widget class="QScrollArea" name="scrollArea">
+     <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+     <property name="widgetResizable"><bool>true</bool></property>
+     <widget class="QWidget" name="scrollContents">
   <layout class="QGridLayout" name="gridLayout">
+   <property name="leftMargin"><number>0</number></property>
+   <property name="topMargin"><number>0</number></property>
+   <property name="rightMargin"><number>0</number></property>
+   <property name="bottomMargin"><number>0</number></property>
    <property name="horizontalSpacing">
     <number>8</number>
    </property>
@@ -173,43 +183,6 @@
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
          </widget>
         </item>
-        <item row="9" column="0">
-         <widget class="QLabel" name="label_dlss">
-          <property name="text"><string>NVIDIA DLSS (experimental):</string></property>
-         </widget>
-        </item>
-        <item row="9" column="1">
-         <widget class="QComboBox" name="comboBox_dlss">
-          <property name="toolTip"><string>Reconstruct the rendered image to the output resolution. Requires a supported NVIDIA RTX GPU. Includes the game's HUD; artifacts are possible.</string></property>
-         </widget>
-        </item>
-        <item row="10" column="0">
-         <widget class="QLabel" name="label_render_scale">
-          <property name="text"><string>Render scale:</string></property>
-         </widget>
-        </item>
-        <item row="10" column="1">
-         <widget class="QSpinBox" name="spinBox_render_scale">
-          <property name="toolTip"><string>Rasterize supported game passes at this percentage of their native dimensions, then reconstruct to the output resolution. Lower values reduce detail and can reduce GPU rendering cost.</string></property>
-          <property name="suffix"><string>%</string></property>
-          <property name="minimum"><number>25</number></property>
-          <property name="maximum"><number>100</number></property>
-          <property name="singleStep"><number>5</number></property>
-          <property name="value"><number>100</number></property>
-         </widget>
-        </item>
-        <item row="11" column="0" colspan="2">
-         <widget class="QLabel" name="label_upscale_summary">
-          <property name="wordWrap"><bool>true</bool></property>
-          <property name="text"><string>Native rendering</string></property>
-         </widget>
-        </item>
-        <item row="12" column="1">
-         <widget class="QCheckBox" name="checkBox_dlss_frame_generation">
-          <property name="text"><string>DLSS Frame Generation</string></property>
-          <property name="toolTip"><string>Generate intermediate display frames. Requires supported NVIDIA RTX hardware and the Frame Generation runtime, with Vulkan validation off. Does not increase game simulation FPS.</string></property>
-         </widget>
-        </item>
         <item row="8" column="1">
          <widget class="QCheckBox" name="checkBox_hide_cursor">
           <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>
@@ -219,7 +192,7 @@
        </layout>
       </widget>
      </item>
-     <item row="3" column="0">
+     <item row="3" column="0" alignment="Qt::AlignTop">
       <widget class="QGroupBox" name="notifications_group">
        <property name="title"><string>Notifications</string></property>
        <layout class="QVBoxLayout" name="notificationsLayout">
@@ -231,6 +204,66 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
           <property name="checked"><bool>true</bool></property>
          </widget>
         </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="3" column="1">
+      <widget class="QGroupBox" name="experimental_group">
+       <property name="title"><string>Experimental</string></property>
+       <property name="checkable"><bool>true</bool></property>
+       <property name="checked"><bool>false</bool></property>
+       <property name="toolTip"><string>Enable experimental rendering options. When disabled, saving turns off Super Resolution and Frame Generation and restores render scale to 100%.</string></property>
+       <layout class="QFormLayout" name="experimentalLayout">
+        <property name="fieldGrowthPolicy"><enum>QFormLayout::AllNonFixedFieldsGrow</enum></property>
+        <item row="0" column="0"><widget class="QLabel" name="label_upscale_backend"><property name="text"><string>Upscaler backend:</string></property></widget></item>
+        <item row="0" column="1"><widget class="QComboBox" name="comboBox_upscale_backend"><property name="toolTip"><string>Native uses NVIDIA NGX. OptiScaler routes reconstruction through an installed OptiScaler runtime, including FSR on compatible older GPUs.</string></property></widget></item>
+        <item row="1" column="0"><widget class="QLabel" name="label_optiscaler_path"><property name="text"><string>OptiScaler DLL:</string></property></widget></item>
+        <item row="1" column="1"><widget class="QLineEdit" name="lineEdit_optiscaler_path"><property name="placeholderText"><string>OptiScaler.dll beside the engine (default)</string></property><property name="toolTip"><string>Full path to the OptiScaler DLL. For a separate folder, set OptiDllPath in its INI to locate its backend files. Select the reconstruction algorithm in the OptiScaler overlay (Insert).</string></property></widget></item>
+        <item row="5" column="0"><widget class="QLabel" name="label_upscale_motion"><property name="text"><string>Motion estimation:</string></property></widget></item>
+        <item row="5" column="1"><widget class="QComboBox" name="comboBox_upscale_motion"><property name="toolTip"><string>Hybrid combines geometry with optical flow. Geometry skips optical flow to reduce GPU cost; uncovered pixels reject temporal history and may look less stable.</string></property></widget></item>
+        <item row="3" column="0">
+         <widget class="QLabel" name="label_dlss">
+          <property name="text"><string>DLSS quality:</string></property>
+         </widget>
+        </item>
+        <item row="3" column="1">
+         <widget class="QComboBox" name="comboBox_dlss">
+          <property name="toolTip"><string>Reconstruct the rendered image to the output resolution. Native requires NVIDIA RTX. OptiScaler requirements depend on the selected algorithm. Includes the game's HUD; artifacts are possible.</string></property>
+         </widget>
+        </item>
+        <item row="4" column="0">
+         <widget class="QLabel" name="label_render_scale">
+          <property name="text"><string>Render scale:</string></property>
+         </widget>
+        </item>
+        <item row="4" column="1">
+         <widget class="QSpinBox" name="spinBox_render_scale">
+          <property name="toolTip"><string>Rasterize supported game passes at this percentage of their native dimensions, then reconstruct to the output resolution. Lower values reduce detail and can reduce GPU rendering cost.</string></property>
+          <property name="suffix"><string>%</string></property>
+          <property name="minimum"><number>25</number></property>
+          <property name="maximum"><number>100</number></property>
+          <property name="singleStep"><number>5</number></property>
+          <property name="value"><number>100</number></property>
+         </widget>
+        </item>
+        <item row="6" column="0" colspan="2">
+         <widget class="QLabel" name="label_upscale_summary">
+          <property name="wordWrap"><bool>true</bool></property>
+          <property name="text"><string>Native rendering</string></property>
+         </widget>
+        </item>
+        <item row="2" column="0"><widget class="QLabel" name="label_optiscaler_upscaler"><property name="text"><string>OptiScaler upscaler:</string></property></widget></item>
+        <item row="2" column="1"><widget class="QComboBox" name="comboBox_optiscaler_upscaler"><property name="toolTip"><string>Auto uses OptiScaler and the algorithm selected in its INI. Fsr (FidelityFX 3.1) and XeSS call the runtimes in the OptiScaler folder directly, with less CPU overhead.</string></property></widget></item>
+        <item row="8" column="0"><widget class="QLabel" name="label_optiscaler_frame_generation"><property name="text"><string>OptiScaler Frame Generation:</string></property></widget></item>
+        <item row="8" column="1"><widget class="QComboBox" name="comboBox_optiscaler_frame_generation"><property name="toolTip"><string>Fsr uses the Vulkan FSR 3 generator in the OptiScaler folder. XeSS uses XeSS Frame Generation (libxess_fg.dll, libxell.dll), presenting through a D3D12 swap chain that paces the generated frames.</string></property></widget></item>
+        <item row="7" column="1">
+         <widget class="QCheckBox" name="checkBox_dlss_frame_generation">
+          <property name="text"><string>DLSS Frame Generation</string></property>
+          <property name="toolTip"><string>Generate intermediate display frames. Requires supported NVIDIA RTX hardware and the Frame Generation runtime, with Vulkan validation off. Does not increase game simulation FPS.</string></property>
+         </widget>
+        </item>
+        <item row="9" column="0"><widget class="QLabel" name="label_frame_generation_level"><property name="text"><string>Generated frames:</string></property></widget></item>
+        <item row="9" column="1"><widget class="QSpinBox" name="spinBox_frame_generation_level"><property name="toolTip"><string>Frames generated per real frame with DLSS Frame Generation on (1-4), limited by the GPU and runtime. OptiScaler uses one generated frame.</string></property><property name="minimum"><number>1</number></property><property name="maximum"><number>4</number></property><property name="value"><number>1</number></property></widget></item>
        </layout>
       </widget>
      </item>
@@ -428,7 +461,11 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
      </layout>
     </widget>
    </item>
-   <item row="2" column="0" colspan="2">
+  </layout>
+     </widget>
+    </widget>
+   </item>
+   <item>
     <layout class="QHBoxLayout" name="buttonLayout">
      <item>
      <widget class="QPushButton" name="clear_button">

@@ -3,7 +3,6 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
-#include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -13,6 +12,7 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLayout>
@@ -22,7 +22,9 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScreen>
 #include <QSettings>
+#include <QShowEvent>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStyle>
@@ -30,6 +32,9 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+
+#include <SDL3/SDL.h>
+#include <algorithm>
 
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
@@ -133,7 +138,17 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	        &ConfigurationEditDialog::UpdateUpscaleSummary);
 	connect(m_ui->comboBox_dlss, &QComboBox::currentTextChanged, this,
 	        &ConfigurationEditDialog::UpdateUpscaleSummary);
+	connect(m_ui->comboBox_upscale_backend, &QComboBox::currentTextChanged, this,
+	        &ConfigurationEditDialog::UpdateUpscaleSummary);
+	connect(m_ui->comboBox_optiscaler_upscaler, &QComboBox::currentTextChanged, this,
+	        &ConfigurationEditDialog::UpdateUpscaleSummary);
+	connect(m_ui->comboBox_optiscaler_frame_generation, &QComboBox::currentTextChanged, this,
+	        &ConfigurationEditDialog::UpdateUpscaleSummary);
 	connect(m_ui->spinBox_render_scale, &QSpinBox::valueChanged, this,
+	        &ConfigurationEditDialog::UpdateUpscaleSummary);
+	connect(m_ui->experimental_group, &QGroupBox::toggled, this,
+	        &ConfigurationEditDialog::UpdateUpscaleSummary);
+	connect(m_ui->checkBox_dlss_frame_generation, &QCheckBox::toggled, this,
 	        &ConfigurationEditDialog::UpdateUpscaleSummary);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
 	connect(m_ui->button_controller_color, &QPushButton::clicked, this, [this]() {
@@ -245,17 +260,18 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	ListInit(m_ui->comboBox_dlss, info.dlss_mode);
+	ListInit(m_ui->comboBox_upscale_backend, info.upscale_backend);
+	ListInit(m_ui->comboBox_upscale_motion, info.upscale_motion);
+	ListInit(m_ui->comboBox_optiscaler_upscaler, info.optiscaler_upscaler);
+	ListInit(m_ui->comboBox_optiscaler_frame_generation, info.optiscaler_frame_generation);
+	m_ui->lineEdit_optiscaler_path->setText(info.optiscaler_path);
 	m_ui->spinBox_render_scale->setValue(info.render_scale_percent);
 	m_ui->checkBox_dlss_frame_generation->setChecked(info.dlss_frame_generation);
-#if !defined(KYTY_HAS_DLSS_FG)
-	m_ui->checkBox_dlss_frame_generation->setEnabled(false);
-	m_ui->checkBox_dlss_frame_generation->setToolTip(tr("Frame Generation is unavailable in this build."));
-#endif
+	m_ui->spinBox_frame_generation_level->setValue(info.frame_generation_frames);
+	m_ui->experimental_group->setChecked(info.dlss_mode != Configuration::DlssMode::Off ||
+	                                     info.render_scale_percent != 100 ||
+	                                     info.dlss_frame_generation);
 	UpdateUpscaleSummary();
-#if !defined(KYTY_HAS_DLSS)
-	m_ui->comboBox_dlss->setEnabled(false);
-	m_ui->comboBox_dlss->setToolTip(tr("DLSS is unavailable in this build. Build with KYTY_ENABLE_DLSS=ON."));
-#endif
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
 	// Keep Auto when Qt is built without Vulkan support.
@@ -328,14 +344,78 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 }
 
 void ConfigurationEditDialog::UpdateUpscaleSummary() {
-	const auto resolution = m_ui->comboBox_screen_resolution->currentText();
-	const auto mode = TextToEnum<Configuration::DlssMode>(m_ui->comboBox_dlss->currentText());
-	const int scale = m_ui->spinBox_render_scale->value();
+	const auto resolution   = m_ui->comboBox_screen_resolution->currentText();
+	const bool experimental = m_ui->experimental_group->isChecked();
+	const auto mode         = experimental
+	                              ? TextToEnum<Configuration::DlssMode>(m_ui->comboBox_dlss->currentText())
+	                              : Configuration::DlssMode::Off;
+	const int  scale        = experimental ? m_ui->spinBox_render_scale->value() : 100;
+	const bool optiscaler   = m_ui->comboBox_upscale_backend->currentText() == "OptiScaler";
+	const bool xefg         = m_ui->comboBox_optiscaler_frame_generation->currentText() == "XeSS";
+	const auto upscaler     = m_ui->comboBox_optiscaler_upscaler->currentText();
+#if defined(KYTY_HAS_DLSS)
+	constexpr bool ngx_available = true;
+#else
+	constexpr bool ngx_available = false;
+#endif
+#if defined(KYTY_HAS_DLSS_FG)
+	constexpr bool native_fg_available = true;
+#else
+	constexpr bool native_fg_available = false;
+#endif
+#if defined(_WIN32)
+	const bool sr_available = ngx_available || (optiscaler && upscaler != "Auto");
+	const bool fg_available = optiscaler ? (xefg || ngx_available) : native_fg_available;
+	m_ui->comboBox_upscale_backend->setEnabled(experimental);
+#else
+	const bool sr_available = ngx_available && !optiscaler;
+	const bool fg_available = native_fg_available && !optiscaler;
+	m_ui->comboBox_upscale_backend->setEnabled(experimental && ngx_available);
+#endif
+	m_ui->comboBox_dlss->setEnabled(experimental && sr_available);
+	m_ui->label_dlss->setEnabled(experimental && sr_available);
+	m_ui->label_dlss->setText(optiscaler ? tr("Upscaler quality:") : tr("DLSS quality:"));
+	m_ui->comboBox_dlss->setToolTip(
+	    sr_available ? QString {} : tr("This upscaler is unavailable in this build."));
+	m_ui->checkBox_dlss_frame_generation->setText(
+	    optiscaler ? (xefg ? tr("OptiScaler Frame Generation (XeSS)")
+	                       : tr("OptiScaler Frame Generation (FSR)"))
+	               : tr("DLSS Frame Generation"));
+	m_ui->checkBox_dlss_frame_generation->setToolTip(
+	    optiscaler
+	        ? (xefg ? tr("Generate intermediate frames with XeSS Frame Generation from the "
+	                     "OptiScaler folder. The window presents through D3D12 while it is on. "
+	                     "Works with Super Resolution Off. Does not increase game simulation FPS.")
+	                : tr("Generate and pace intermediate frames using the Vulkan FSR generator "
+	                     "included with OptiScaler. Works with Super Resolution Off. Does not "
+	                     "increase game simulation FPS."))
+	        : tr("Generate intermediate display frames using NVIDIA Streamline. Requires supported "
+	             "RTX hardware and Vulkan validation off. Does not increase game simulation FPS."));
+	for (QWidget* field: {static_cast<QWidget*>(m_ui->lineEdit_optiscaler_path),
+	                      static_cast<QWidget*>(m_ui->comboBox_optiscaler_upscaler),
+	                      static_cast<QWidget*>(m_ui->comboBox_optiscaler_frame_generation)}) {
+		m_ui->experimentalLayout->setRowVisible(field, optiscaler);
+		field->setEnabled(experimental);
+	}
+	m_ui->experimentalLayout->setRowVisible(m_ui->spinBox_frame_generation_level, !optiscaler);
+	const bool fg_enabled =
+	    experimental && fg_available && m_ui->checkBox_dlss_frame_generation->isChecked();
+	m_ui->spinBox_frame_generation_level->setEnabled(fg_enabled && !optiscaler);
+	m_ui->label_frame_generation_level->setEnabled(fg_enabled && !optiscaler);
+	m_ui->checkBox_dlss_frame_generation->setEnabled(experimental && fg_available);
+	const bool temporal = (sr_available && mode != Configuration::DlssMode::Off) || fg_enabled;
+	m_ui->comboBox_upscale_motion->setEnabled(temporal);
+	m_ui->label_upscale_motion->setEnabled(temporal);
 	m_ui->label_upscale_summary->setText(
 	    mode == Configuration::DlssMode::Off
 	        ? tr("%1% render scale → %2 output (spatial scaling)").arg(scale).arg(resolution)
-	        : tr("%1% render scale → %2 output (DLSS %3)")
-	              .arg(scale).arg(resolution).arg(m_ui->comboBox_dlss->currentText()));
+	        : tr("%1% render scale → %2 output (%3 %4)")
+	              .arg(scale)
+	              .arg(resolution)
+	              .arg(!optiscaler          ? QStringLiteral("DLSS")
+	                   : upscaler == "Auto" ? QStringLiteral("OptiScaler")
+	                                        : QStringLiteral("OptiScaler %1").arg(upscaler))
+	              .arg(m_ui->comboBox_dlss->currentText()));
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -439,6 +519,50 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 	g_last_geometry = saveGeometry();
 }
 
+void ConfigurationEditDialog::showEvent(QShowEvent* event) {
+	QDialog::showEvent(event);
+	FitToScreen();
+}
+
+void ConfigurationEditDialog::FitToScreen() {
+	const auto* screen = this->screen();
+	if (screen == nullptr) {
+		return;
+	}
+	const QRect available = screen->availableGeometry();
+	// The frame (title bar and borders) is unknown until the window is mapped.
+	const int frame_width  = std::max(frameGeometry().width() - width(), 0);
+	const int frame_height = std::max(frameGeometry().height() - height(),
+	                                  style()->pixelMetric(QStyle::PM_TitleBarHeight));
+	// Everything visible without scrolling, plus room for a vertical scroll bar.
+	const QSize contents      = m_ui->scrollContents->sizeHint();
+	const int   scroll_bar    = style()->pixelMetric(QStyle::PM_ScrollBarExtent);
+	const auto  margins       = layout()->contentsMargins();
+	const int   wanted_width  = contents.width() + scroll_bar + margins.left() + margins.right();
+	const int   wanted_height = contents.height() + m_ui->ok_button->sizeHint().height() +
+	                          layout()->spacing() + margins.top() + margins.bottom();
+	const int max_width  = available.width() - frame_width;
+	const int max_height = available.height() - frame_height;
+	// The designed width is only a minimum while it fits; narrower screens scroll.
+	if (minimumWidth() > max_width) {
+		setMinimumWidth(max_width);
+	}
+	const QSize target(std::min(std::max(width(), wanted_width), max_width),
+	                   std::min(std::max(height(), wanted_height), max_height));
+	if (target != size()) {
+		resize(target);
+	}
+	// Keep the whole window, including the Save button, on the screen.
+	const QRect frame = frameGeometry();
+	const int   x     = std::clamp(frame.x(), available.left(),
+	                               std::max(available.left(), available.right() - frame.width() + 1));
+	const int   y     = std::clamp(frame.y(), available.top(),
+	                               std::max(available.top(), available.bottom() - frame.height() + 1));
+	if (x != frame.x() || y != frame.y()) {
+		move(x, y);
+	}
+}
+
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
@@ -452,10 +576,25 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
-	info.dlss_mode = TextToEnum<Configuration::DlssMode>(ui.comboBox_dlss->currentText());
-	info.render_scale_percent = ui.spinBox_render_scale->value();
-	info.dlss_frame_generation = ui.checkBox_dlss_frame_generation->isChecked();
-	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
+	const bool experimental = ui.experimental_group->isChecked();
+	info.dlss_mode          = experimental
+	                              ? TextToEnum<Configuration::DlssMode>(ui.comboBox_dlss->currentText())
+	                              : Configuration::DlssMode::Off;
+	info.upscale_backend =
+	    TextToEnum<Configuration::UpscaleBackend>(ui.comboBox_upscale_backend->currentText());
+	info.upscale_motion =
+	    TextToEnum<Configuration::UpscaleMotion>(ui.comboBox_upscale_motion->currentText());
+	info.optiscaler_path     = ui.lineEdit_optiscaler_path->text().trimmed();
+	info.optiscaler_upscaler = TextToEnum<Configuration::OptiScalerUpscaler>(
+	    ui.comboBox_optiscaler_upscaler->currentText());
+	info.optiscaler_frame_generation = TextToEnum<Configuration::OptiScalerFrameGeneration>(
+	    ui.comboBox_optiscaler_frame_generation->currentText());
+	info.render_scale_percent    = experimental ? ui.spinBox_render_scale->value() : 100;
+	info.dlss_frame_generation   = experimental && ui.checkBox_dlss_frame_generation->isChecked();
+	info.frame_generation_frames = info.upscale_backend == Configuration::UpscaleBackend::OptiScaler
+	                                   ? 1
+	                                   : ui.spinBox_frame_generation_level->value();
+	info.gpu_index               = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();

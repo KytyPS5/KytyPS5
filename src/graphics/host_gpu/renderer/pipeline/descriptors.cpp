@@ -972,6 +972,9 @@ void MergeGuestRanges(std::vector<GuestRange>& ranges) {
 	          [](const GuestRange& a, const GuestRange& b) { return a.address < b.address; });
 	size_t merged = 0;
 	for (const auto range: ranges) {
+		if (range.size == 0 || range.address > UINT64_MAX - range.size) {
+			EXIT("invalid image overlap range\n");
+		}
 		if (merged != 0 && range.address <= ranges[merged - 1].End()) {
 			auto& last = ranges[merged - 1];
 			last.size  = std::max(last.End(), range.End()) - last.address;

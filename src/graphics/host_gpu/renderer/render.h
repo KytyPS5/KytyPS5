@@ -223,7 +223,8 @@ private:
 	friend struct RenderExecutorTestAccess;
 };
 
-// Sorts nonempty ranges and merges those that overlap or touch.
+// Sorts nonempty ranges and merges those that overlap or touch; exits on an empty or wrapping
+// range.
 void MergeGuestRanges(std::vector<GuestRange>& ranges);
 // True when a scalar read is invalid or overlaps one of the sorted, disjoint written ranges.
 [[nodiscard]] bool ScalarReadsMayOverlap(std::span<const std::pair<uint64_t, uint64_t>> reads,

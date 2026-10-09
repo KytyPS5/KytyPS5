@@ -1302,6 +1302,12 @@ void CheckScalarReadOverlap() {
               ScalarReadsMayOverlap(Reads{{0x2000, 0}}, writes) &&
               !ScalarReadsMayOverlap(Reads{{0x2000, 0}}, {}),
           "merged write ranges gave a wrong overlap decision at range edges");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal("ScalarReadOverlapWrappingWrite", [] {
+    std::vector<GuestRange> wrapping{{0x1000, 0x100}, {UINT64_MAX - 0xf, 0x20}};
+    MergeGuestRanges(wrapping);
+  });
+#endif
   // Random draws: the decision matches the pairwise check of every read and write.
   uint64_t state = 0x9e3779b97f4a7c15ull;
   const auto next = [&state](uint64_t bound) {

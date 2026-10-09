@@ -454,8 +454,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	// A shader rewriting color metadata performs a fast clear; the target may only be
-	// programmed later, so remember the range until a color slot names it.
+	TrackMetaFills(input_info, buffer);
+	ResetBindings();
+}
+
+// A shader rewriting color metadata performs a fast clear; the target may only be
+// programmed later, so remember the range until a color slot names it.
+void RenderExecutor::TrackMetaFills(const ShaderComputeInputInfo& input, CommandBuffer& buffer) {
+	const auto&      program             = *input.stage.program;
+	const auto&      resources           = *input.stage.resources;
 	constexpr size_t MaxPendingMetaFills = 1024;
 	if (m_pending_meta_fills.size() > MaxPendingMetaFills) {
 		m_pending_meta_fills.clear();
@@ -466,7 +473,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (d.Base48() != 0 && d.GetSize() <= 0x40000) m_pending_meta_fills.insert(d.Base48());
 	}
 	ResolvePendingMetaClears(buffer);
-	ResetBindings();
 }
 
 // Clear the color targets whose fast-clear metadata was rewritten by a shader, with or
@@ -476,6 +482,9 @@ void RenderExecutor::ResolvePendingMetaClears(CommandBuffer& buffer) {
 		return;
 	}
 	const auto& hw = buffer.GetRegisters();
+	// Slots viewing other layers of one surface share its metadata: resolve all of them.
+	std::array<uint64_t, 8> resolved {};
+	uint32_t                resolved_count = 0;
 	for (uint32_t slot = 0; slot < 8; slot++) {
 		const auto& rt = hw.GetRenderTarget(slot);
 		// Same eligibility as ResolveRenderColorTarget, so a fill is only consumed when the
@@ -488,11 +497,16 @@ void RenderExecutor::ResolvePendingMetaClears(CommandBuffer& buffer) {
 		if (rt.base.addr == 0 || (!dcc && !cmask)) {
 			continue;
 		}
-		if (m_pending_meta_fills.erase(dcc ? rt.dcc_addr.addr : rt.cmask.addr) == 0) {
+		const uint64_t address = dcc ? rt.dcc_addr.addr : rt.cmask.addr;
+		if (!m_pending_meta_fills.contains(address)) {
 			continue;
 		}
+		resolved[resolved_count++] = address;
 		RenderColorInfo color {};
 		ResolveRenderColorTarget(buffer, color, 0, slot, true, false);
+	}
+	for (uint32_t i = 0; i < resolved_count; i++) {
+		m_pending_meta_fills.erase(resolved[i]);
 	}
 }
 
@@ -505,6 +519,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
+	ResolvePendingMetaClears(buffer);
 	vk::DispatchIndirectCommand args {};
 	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
@@ -562,6 +577,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	TrackMetaFills(input_info, buffer);
 	ResetBindings();
 }
 

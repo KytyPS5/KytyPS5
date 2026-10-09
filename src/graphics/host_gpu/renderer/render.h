@@ -205,6 +205,7 @@ private:
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	void                         ResolvePendingMetaClears(CommandBuffer& buffer);
+	void TrackMetaFills(const ShaderComputeInputInfo& input, CommandBuffer& buffer);
 	std::unordered_set<uint64_t> m_pending_meta_fills;
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,

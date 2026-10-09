@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -649,6 +650,29 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
 		if (meta_clear &&
+		if (DepthAliasLog::Enabled()) {
+			// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): depth draws that clear, or that write blindly.
+			const auto& dcl = buffer.GetRegisters().GetDepthControl();
+			const bool  blind_always =
+			    dcl.zfunc == static_cast<uint8_t>(vk::CompareOp::eAlways) && !dcl.z_write_enable;
+			const auto seq = DepthAliasLog::NextSeq();
+			if ((depth.depth_clear_enable || depth.stencil_clear_enable || blind_always) &&
+			    DepthAliasLog::TakeLine()) {
+				const auto& dex = depth.desc.info.extent;
+				std::printf("NHL27DEPTH: depth_draw #%llu addr=0x%llx %ux%u fmt=%s zwrite=%d "
+				            "zfunc=%u depth_clear=%d depth_clear_value=%g (bits=0x%08x) "
+				            "stencil_clear=%d stencil_clear_value=%u meta_clear=%d\n",
+				            static_cast<unsigned long long>(seq),
+				            static_cast<unsigned long long>(depth.desc.info.data.address),
+				            dex.width, dex.height,
+				            vk::to_string(depth.desc.view_info.format).c_str(),
+				            dcl.z_write_enable ? 1 : 0, dcl.zfunc,
+				            depth.depth_clear_enable ? 1 : 0, depth.depth_clear_value,
+				            std::bit_cast<uint32_t>(depth.depth_clear_value),
+				            depth.stencil_clear_enable ? 1 : 0, depth.stencil_clear_value,
+				            meta_clear ? 1 : 0);
+			}
+		}
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}

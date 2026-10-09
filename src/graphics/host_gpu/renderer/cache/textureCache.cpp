@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -317,6 +318,15 @@ void TextureCache::DeleteImage(ImageId id) {
 void TextureCache::FreeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
+		if (DepthAliasLog::Enabled() && DepthAliasLog::TakeLine()) {
+			// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): GPU-written content dropped without a download.
+			std::printf("NHL27DEPTH: free_gpu_modified_no_download addr=0x%llx size=0x%llx "
+			            "fmt=%s extent=%ux%u depth=%d\n",
+			            static_cast<unsigned long long>(image.info.data.address),
+			            static_cast<unsigned long long>(image.info.data.size),
+			            vk::to_string(image.backing.format).c_str(), image.info.extent.width,
+			            image.info.extent.height, image.info.IsDepth() ? 1 : 0);
+		}
 		image.ClearGpuModified();
 	}
 	DeleteImage(id);
@@ -780,12 +790,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
+	const char* copy_path = "none";
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
 		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
 		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
 		if (copy_supported) {
+			copy_path = "CopyImage";
 			CopyImage(replacement_id, cached_id);
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
@@ -797,6 +809,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		if (cached.IsBufferModified() || cached.IsDefinitelyCpuDirty()) {
 			EXIT("TextureCache: multisample depth conversion source is not native-current\n");
 		}
+		copy_path = "ReinterpretMsDepth";
 		PrepareImageCopy(replacement);
 		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
 		CommitGpuWrite(replacement);
@@ -804,6 +817,22 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
+	}
+	if (DepthAliasLog::Enabled() && DepthAliasLog::TakeLine()) {
+		// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): depth image recreated from an incompatible image.
+		// "ever uploaded" is not tracked per image; buffer_modified/cpu_dirty are the closest state.
+		std::printf("NHL27DEPTH: depth_recreate old addr=0x%llx size=0x%llx fmt=%s backing=%s "
+		            "extent=%ux%u samples=%u gpu_modified=%d buffer_modified=%d cpu_dirty=%d "
+		            "-> new fmt=%s backing=%s depth=%d copy=%s\n",
+		            static_cast<unsigned long long>(cached.info.data.address),
+		            static_cast<unsigned long long>(cached.info.data.size),
+		            vk::to_string(cached.info.pixel_format).c_str(),
+		            vk::to_string(cached.backing.format).c_str(), cached.info.extent.width,
+		            cached.info.extent.height, cached.backing.samples,
+		            cached.IsGpuModified() ? 1 : 0, cached.IsBufferModified() ? 1 : 0,
+		            cached.IsCpuDirty() ? 1 : 0, vk::to_string(requested.pixel_format).c_str(),
+		            vk::to_string(replacement.backing.format).c_str(),
+		            replacement.info.IsDepth() ? 1 : 0, copy_path);
 	}
 	FreeImage(cached_id);
 	return replacement_id;
@@ -917,6 +946,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		             static_cast<uint32_t>(layer));
 		FreeImage(cached_id);
 		return {merged_id};
+	}
+	if (DepthAliasLog::Enabled() && DepthAliasLog::TakeLine()) {
+		// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): partial overlap that falls through without a copy.
+		std::printf("NHL27DEPTH: partial_overlap_skipped requested addr=0x%llx size=0x%llx "
+		            "fmt=%s | cached addr=0x%llx size=0x%llx fmt=%s freed=%d\n",
+		            static_cast<unsigned long long>(requested.data.address),
+		            static_cast<unsigned long long>(requested.data.size),
+		            vk::to_string(requested.pixel_format).c_str(),
+		            static_cast<unsigned long long>(cached.info.data.address),
+		            static_cast<unsigned long long>(cached.info.data.size),
+		            vk::to_string(cached.info.pixel_format).c_str(),
+		            (requested.data.address >= cached.info.data.address && safe_to_delete) ? 1 : 0);
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
 		FreeImage(cached_id);
@@ -1389,6 +1430,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
+			} else if (desc.type == BindingType::Texture && DepthAliasLog::Enabled() &&
+			           DepthAliasLog::TakeLine()) {
+				// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): sampled image created fresh, nothing to upload.
+				std::printf("NHL27DEPTH: fresh_no_upload addr=0x%llx size=0x%llx fmt=%s extent=%ux%u "
+				            "depth=%d\n",
+				            static_cast<unsigned long long>(inserted.info.data.address),
+				            static_cast<unsigned long long>(inserted.info.data.size),
+				            vk::to_string(desc.info.pixel_format).c_str(),
+				            desc.info.extent.width, desc.info.extent.height,
+				            desc.info.IsDepth() ? 1 : 0);
 			}
 		}
 		auto& image = m_slot_images[result];

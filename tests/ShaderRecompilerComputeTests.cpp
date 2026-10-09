@@ -88,6 +88,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -9881,6 +9882,83 @@ public:
             "metadata write is outside the mapped allocation");
     const std::vector<uint32_t> words(size / sizeof(value), value);
     LibKernel::Memory::WriteBacking(address, words.data(), size);
+  }
+
+  void CheckImagelessPageInvalidation() {
+    constexpr const char *name = "ImagelessPageInvalidation";
+    constexpr uintptr_t base = 0x000000020c000000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t imageless_offset = 0x200000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    {
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto desc = MakeLinearDesc(base, width * height * 4, vk::Format::eR8G8B8A8Unorm,
+                                 Prospero::BufferFormat::k8_8_8_8UNorm,
+                                 Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      // CPU write faults arrive while the GPU thread holds the cache lock to record draws.
+      const auto invalidate_while_locked = [&](uint64_t address) {
+        auto lock = TextureCacheTestAccess::Lock(texture_cache);
+        std::binary_semaphore done{0};
+        std::thread writer([&] {
+          texture_cache.InvalidateMemory(address, sizeof(uint32_t));
+          done.release();
+        });
+        const bool unblocked = done.try_acquire_for(std::chrono::seconds(5));
+        lock.unlock();
+        writer.join();
+        return unblocked;
+      };
+      Require(name, "imageless page",
+              invalidate_while_locked(base + imageless_offset) &&
+                  !texture_cache.GetImage(image).IsCpuDirty(),
+              "a write to a page without images waited for the texture cache lock");
+      texture_cache.InvalidateMemory(base, sizeof(uint32_t));
+      Require(name, "image page", texture_cache.GetImage(image).IsDefinitelyCpuDirty(),
+              "a write to an image page did not invalidate the image");
+      TextureCacheTestAccess::DeleteImage(texture_cache, image);
+      Require(name, "unregistered image page", invalidate_while_locked(base),
+              "a write to the pages of a removed image waited for the texture cache lock");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   static TextureCache::ImageDesc MakeLinearDesc(
@@ -42744,6 +42822,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--imageless-invalidation-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImagelessPageInvalidation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -42943,6 +43026,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
+  vulkan.CheckImagelessPageInvalidation();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
   if (rasterization) {

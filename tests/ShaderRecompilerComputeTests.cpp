@@ -3127,7 +3127,7 @@ public:
         processor->BufferInit();
         (void)context.GetBufferCache().ObtainBuffer(watched_clock, sizeof(uint64_t), true);
         watched_before = context.GetBufferCache().IsRegionGpuModified(watched_clock, sizeof(uint64_t));
-        for (const auto destination : {watched_clock, clock_base + 0x2800}) {
+        for (const uint64_t destination : {watched_clock, uint64_t {clock_base + 0x2800}}) {
           auto timestamp = make_release_mem(
               3, 0, reinterpret_cast<void *>(destination), 0, 0x14u, 0);
           Pm4Execution timestamp_execution;

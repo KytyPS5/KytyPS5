@@ -11184,41 +11184,178 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
-  auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "subtractive S_SETPC_B64 table did not select dispatcher fallback");
-  const auto jump = std::find_if(
-      result.program.block_info.begin(),
-      result.program.block_info.end(), [](const auto &block) {
-        return !block.terminator.indirect_targets.empty();
-      });
-  const auto block_pc = [&](uint32_t id) {
-    const auto block =
-        std::find_if(result.program.block_info.begin(),
-                     result.program.block_info.end(),
-                     [=](const auto &info) { return info.id == id; });
-    return block != result.program.block_info.end() ? block->start_pc
-                                                            : UINT32_MAX;
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  const auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(!graph.unsupported && !graph.irreducible,
+        "subtractive S_SETPC table did not build structured control flow");
+  std::vector<uint32_t> cfg_compare_values;
+  uint32_t cfg_true_target = UINT32_MAX;
+  uint32_t cfg_false_target = UINT32_MAX;
+  const auto cfg_block_pc = [&](uint32_t id) {
+    const auto block = std::find_if(graph.blocks.begin(), graph.blocks.end(),
+                                    [=](const auto &info) { return info.id == id; });
+    return block != graph.blocks.end() ? block->start_pc : UINT32_MAX;
   };
-  Check(jump != result.program.block_info.end() &&
-            jump->terminator.indirect_targets.size() == 2 &&
-            jump->terminator.indirect_target_pcs ==
-                std::vector<uint32_t>({0x38u, 0x40u}) &&
-            jump->terminator.indirect_selector_values ==
-                std::vector<uint32_t>({0u, 4u, 8u}) &&
-            jump->terminator.indirect_selector_targets.size() == 3 &&
-            block_pc(jump->terminator.indirect_selector_targets[0]) == 0x38u &&
-            block_pc(jump->terminator.indirect_selector_targets[1]) == 0x40u &&
-            block_pc(jump->terminator.indirect_selector_targets[2]) == 0x38u &&
-            std::ranges::none_of(
-                result.program.block_info,
-                [](const auto &info) { return info.start_pc == 0x04u; }),
-        "subtractive S_SETPC_B64 table targets or selector mapping changed");
+  for (const auto &block : graph.blocks) {
+    if (block.terminator.condition !=
+        ShaderRecompiler::CFG::BranchCondition::SelectorEq) continue;
+    cfg_compare_values.push_back(block.terminator.compare_value);
+    cfg_true_target = cfg_block_pc(block.terminator.true_block);
+    cfg_false_target = cfg_block_pc(block.terminator.false_block);
+  }
+  Check(cfg_compare_values == std::vector<uint32_t>({4u}) &&
+            cfg_true_target == 0x40u && cfg_false_target == 0x38u,
+        "subtractive S_SETPC CFG did not retain its bounded selector compare");
+
+  auto result = RecompileForTest(shader, options);
+  const bool has_dispatcher =
+      result.ir_dump.find("mode=dispatcher") != std::string::npos;
+  const bool has_unreachable_pc = std::ranges::any_of(
+      result.program.block_info,
+      [](const auto &info) { return info.start_pc == 0x04u; });
+  if (has_dispatcher || has_unreachable_pc) {
+    std::fprintf(stderr,
+                 "S_SETPC dword fixture diagnostics: dispatcher=%u unreachable_pc04=%u\n",
+                 has_dispatcher ? 1u : 0u, has_unreachable_pc ? 1u : 0u);
+    for (const auto &info : result.program.block_info) {
+      std::fprintf(stderr,
+                   "  block id=%u pc=0x%08x term=%u condition=%u true=%u false=%u compare=0x%08x\n",
+                   info.id, info.start_pc,
+                   static_cast<unsigned>(info.terminator.kind),
+                   static_cast<unsigned>(info.terminator.condition),
+                   info.terminator.true_block, info.terminator.false_block,
+                   info.terminator.compare_value);
+    }
+    std::fprintf(stderr, "  IR dump:\n%s\n", result.ir_dump.c_str());
+  }
+  Check(!has_dispatcher && !has_unreachable_pc,
+        "subtractive S_SETPC table did not lower to structured control flow");
   Check((result.ir_dump.find("SLoadDword") == std::string::npos),
         "subtractive S_SETPC_B64 table load reached normal IR");
-  Check(SpirvContainsOpcode(result.spirv, 251),
-        "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
+  Check(SpirvContainsOpcode(result.spirv, 250),
+        "subtractive S_SETPC_B64 compare chain lacks OpBranchConditional");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestSetpcDwordJumpTableAliasedLoadSelector() {
+  // The scaled index is also the scalar-load destination. After the load, it contains
+  // the selected relative target delta and remains unchanged through S_SETPC.
+  const uint32_t shader[] = {
+      EncodeSop2(0x07, 19, 0, 130),       // s_min_u32 s19, s0, 2
+      EncodeSop2(0x1e, 19, 19, 130),      // s_lshl_b32 s19, s19, 2
+      EncodeSop1(0x1f, 22, 0),            // s_getpc_b64 s[22:23]
+      EncodeSop2(0x00, 22, 22, 255),      // s_add_u32 s22, s22, literal
+      0x00000040u,                        // table base pc 0x4c - getpc end pc 0x0c
+      EncodeSop2(0x04, 23, 23, 128),       // s_addc_u32 s23, s23, 0
+      EncodeSmem0(0x00, 19, 11),          // SMEM sbase is an SGPR-pair index: s[22:23]
+      (19u << 25u),                       // s_load_dword s19, s[22:23], s19
+      EncodeSopp(0x0c, 0),                // s_waitcnt 0
+      EncodeSop2(0x01, 22, 22, 19),       // s_sub_u32 s22, s22, s19
+      EncodeSop2(0x05, 23, 23, 128),      // s_subb_u32 s23, s23, 0
+      EncodeSop1(0x20, 0, 22),            // s_setpc_b64 s[22:23]
+      EncodeSMovB32(1, 129),              // case 0, pc 0x30
+      EncodeSopp(0x02, 4),                // branch to endpgm
+      EncodeSMovB32(2, 129),              // case 1, pc 0x38
+      EncodeSopp(0x02, 2),                // branch to endpgm
+      EncodeSMovB32(3, 129),              // case 2, pc 0x40
+      EncodeSopp(0x02, 0),                // branch to endpgm
+      EncodeSopp(0x01, 0),                // endpgm, table base pc 0x4c
+      0x0000001cu, 0x00000014u, 0x0000000cu, // backward deltas to 0x30, 0x38, 0x40
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  const auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  if (graph.unsupported || graph.irreducible) {
+    std::fprintf(stderr,
+                 "aliased S_SETPC CFG diagnostics: unsupported=%u irreducible=%u "
+                 "failure=%s block=%u pc=0x%08x reason=%s\n",
+                 graph.unsupported ? 1u : 0u, graph.irreducible ? 1u : 0u,
+                 ShaderRecompiler::CFG::FailureKindToString(graph.failure_kind).c_str(),
+                 graph.failure_block, graph.failure_pc,
+                 graph.unsupported_reason.c_str());
+    std::fprintf(stderr, "  CFG:\n%s\n",
+                 ShaderRecompiler::CFG::GraphToString(graph).c_str());
+    for (const auto &instruction : decoded.instructions) {
+      std::fprintf(stderr,
+                   "  decoded pc=0x%08x opcode=%u words=%u raw0=0x%08x raw1=0x%08x\n",
+                   instruction.pc, static_cast<unsigned>(instruction.opcode),
+                   instruction.word_count, instruction.raw[0], instruction.raw[1]);
+    }
+  }
+  Check(!graph.unsupported && !graph.irreducible,
+        "aliased S_SETPC table was not lowered into structured control flow");
+
+  std::vector<uint32_t> compare_values;
+  std::vector<uint32_t> selected_target_pcs;
+  for (const auto &block : graph.blocks) {
+    if (block.terminator.condition !=
+        ShaderRecompiler::CFG::BranchCondition::SelectorEq) continue;
+    compare_values.push_back(block.terminator.compare_value);
+    const auto target = std::find_if(graph.blocks.begin(), graph.blocks.end(),
+                                     [&](const auto &candidate) {
+                                       return candidate.id == block.terminator.true_block;
+                                     });
+    Check(target != graph.blocks.end(),
+          "aliased S_SETPC compare has no resolved target block");
+    selected_target_pcs.push_back(target->start_pc);
+  }
+  Check(compare_values == std::vector<uint32_t>({0x1cu, 0x14u}) &&
+            selected_target_pcs == std::vector<uint32_t>({0x30u, 0x38u}),
+        "aliased S_SETPC did not dispatch on the loaded deltas with the last entry as default");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto compiled = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(compiled.spirv);
+
+  auto overwritten = std::vector<uint32_t>(std::begin(shader), std::end(shader));
+  overwritten.insert(overwritten.begin() + 9, EncodeSMovB32(19, 129));
+  ShaderRecompiler::Decoder::Program overwritten_decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(overwritten, overwritten_decoded);
+  const auto overwritten_graph =
+      ShaderRecompiler::CFG::BuildGraph(overwritten_decoded);
+  Check(overwritten_graph.unsupported &&
+            overwritten_graph.failure_kind ==
+                ShaderRecompiler::CFG::FailureKind::InvalidBranchTarget,
+        "aliased S_SETPC table accepted a delta register overwritten before dispatch");
+
+  auto invalid_target = std::vector<uint32_t>(std::begin(shader), std::end(shader));
+  invalid_target[21] = UINT32_MAX; // delta exceeds the PC-relative base
+  ShaderRecompiler::Decoder::Program invalid_target_decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(invalid_target, invalid_target_decoded);
+  const auto invalid_target_graph =
+      ShaderRecompiler::CFG::BuildGraph(invalid_target_decoded);
+  Check(invalid_target_graph.unsupported &&
+            invalid_target_graph.failure_kind ==
+                ShaderRecompiler::CFG::FailureKind::InvalidBranchTarget,
+        "aliased S_SETPC table accepted a target inside its data table");
+
+  auto duplicate_delta = std::vector<uint32_t>(std::begin(shader), std::end(shader));
+  duplicate_delta[21] = duplicate_delta[19];
+  ShaderRecompiler::Decoder::Program duplicate_decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(duplicate_delta, duplicate_decoded);
+  const auto duplicate_graph = ShaderRecompiler::CFG::BuildGraph(duplicate_decoded);
+  Check(!duplicate_graph.unsupported && !duplicate_graph.irreducible,
+        "aliased S_SETPC table rejected duplicate deltas with the same target");
+  const auto duplicate_compare = std::find_if(
+      duplicate_graph.blocks.begin(), duplicate_graph.blocks.end(),
+      [](const auto &block) {
+        return block.terminator.condition ==
+               ShaderRecompiler::CFG::BranchCondition::SelectorEq;
+      });
+  Check(duplicate_compare != duplicate_graph.blocks.end() &&
+            duplicate_compare->terminator.compare_value == 0x14u,
+        "duplicate S_SETPC delta was not collapsed to its common target");
+  const auto target_pc = [&](uint32_t id) {
+    const auto target = std::find_if(
+        duplicate_graph.blocks.begin(), duplicate_graph.blocks.end(),
+        [=](const auto &block) { return block.id == id; });
+    return target == duplicate_graph.blocks.end() ? UINT32_MAX : target->start_pc;
+  };
+  Check(target_pc(duplicate_compare->terminator.true_block) == 0x38u &&
+            target_pc(duplicate_compare->terminator.false_block) == 0x30u,
+        "duplicate S_SETPC delta changed the selector's true or default target");
 }
 
 void TestNewShaderRecompilerExpVertexOutputs() {
@@ -14986,10 +15123,15 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--setpc-dword-only") == 0) {
+    TestNewShaderRecompilerSetpcDwordJumpTable();
+    TestSetpcDwordJumpTableAliasedLoadSelector();
+    return 0;
+  }
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -15115,6 +15257,7 @@ int main() {
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();
+  TestSetpcDwordJumpTableAliasedLoadSelector();
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();

@@ -475,10 +475,14 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 		return false;
 	}
 	uint32_t selector_code = UINT32_MAX;
-	if (!ScalarOperandCode(load.src1, selector_code) || selector_code == offset_code ||
+	if (!ScalarOperandCode(load.src1, selector_code) ||
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
 		return false;
 	}
+	// Some compilers use the scaled selector register as the table-load destination too:
+	// the load replaces the index with the selected relative target offset. That loaded offset
+	// remains live until S_SETPC and is an exact selector for the corresponding target.
+	const bool selector_is_loaded_offset = selector_code == offset_code;
 
 	const size_t table_word = table_pc / 4u;
 	if ((table_pc & 3u) != 0 || table_word > program.code.size() ||
@@ -496,7 +500,7 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 		}
 		const auto target_pc = (target_base - offset) & ~3u;
 		AddUnique(targets, target_pc);
-		selector_values.push_back(i * 4u);
+		selector_values.push_back(selector_is_loaded_offset ? offset : i * 4u);
 		selector_target_pcs.push_back(target_pc);
 	}
 	if (targets.empty()) {

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <optional>
@@ -245,6 +246,37 @@ private:
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
+
+// An indexed draw of count indices, the first head of them real and the others zero, from a host
+// copy holding at most capacity indices. The copy holds copy_count indices: the head, then zeros.
+// The first draw takes first_count of them; the rest zero indices follow in draws of at most chunk
+// indices from index head of the copy. first_count and chunk are whole primitives of period
+// indices, so list primitives keep their indices; strips only regroup all-zero primitives.
+struct ZeroTailDraws {
+	uint32_t copy_count  = 0;
+	uint32_t first_count = 0;
+	uint32_t chunk       = 0;
+	uint32_t rest        = 0;
+
+	// Calls draw(first index in the copy, index count) for each draw, in order. Without a plan
+	// (rest 0), one draw of count indices.
+	template <typename F>
+	void ForEachDraw(uint32_t count, F&& draw) const {
+		if (rest == 0) {
+			draw(0u, count);
+			return;
+		}
+		draw(0u, first_count);
+		for (uint32_t left = rest; left != 0;) {
+			const auto size = std::min(left, chunk);
+			draw(copy_count - size, size);
+			left -= size;
+		}
+	}
+};
+// False when the head and two primitives of zeros do not fit the capacity.
+[[nodiscard]] bool PlanZeroTailDraws(uint32_t count, uint32_t head, uint32_t period,
+                                     uint64_t capacity, ZeroTailDraws& draws);
 
 // The draw is a depth or stencil copy that DepthStencilCopy performs instead of drawing.
 [[nodiscard]] bool IsDepthStencilCopyDraw(const HW::Context& hw);

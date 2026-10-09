@@ -628,13 +628,17 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
+	// Indexed draws from a host copy with a zero tail; rest 0 draws all indices at once.
+	ZeroTailDraws zero_tail;
 };
 
 struct DrawIndexBufferSource {
 	uint64_t      address   = 0;
-	const void*   host_data = nullptr;
-	uint64_t      size      = 0;
-	vk::IndexType type      = vk::IndexType::eUint16;
+	// Host copy: size bytes from host_data, then zero_size zero bytes.
+	const void*   host_data          = nullptr;
+	uint64_t      size               = 0;
+	uint64_t      zero_size          = 0;
+	vk::IndexType type               = vk::IndexType::eUint16;
 	uint32_t      guest_element_size = 0;
 	// Bound with its size: fetches past it read zero (index_buffer_range_enabled).
 	bool sized = false;
@@ -947,18 +951,25 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
                                               const DrawIndexBufferSource& source) {
 	PreparedIndexBuffer prepared;
 	prepared.type  = source.type;
-	prepared.size  = source.size;
+	prepared.size  = source.size + source.zero_size;
 	prepared.sized = source.sized;
-	if (source.size == 0) {
+	if (prepared.size == 0) {
 		if (source.sized) {
 			prepared.buffer =
 			    buffer.GetContext().GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle();
 		}
 		return prepared;
 	}
-	if (source.host_data != nullptr) {
+	if (source.host_data != nullptr || source.zero_size != 0) {
 		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		prepared.offset = stream.Copy(source.host_data, source.size, 16);
+		const auto [data, offset] = stream.Map(prepared.size, 16);
+		EXIT_IF(data == nullptr);
+		if (source.size != 0) {
+			std::memcpy(data, source.host_data, source.size);
+		}
+		std::memset(data + source.size, 0, source.zero_size);
+		stream.Commit();
+		prepared.offset = offset;
 		prepared.buffer = stream.Handle();
 	} else {
 		auto [buffer_ptr, offset] =
@@ -1012,6 +1023,40 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
+bool PlanZeroTailDraws(uint32_t count, uint32_t head, uint32_t period, uint64_t capacity,
+                       ZeroTailDraws& draws) {
+	EXIT_IF(period == 0 || head > count);
+	draws = {};
+	if (count <= capacity) {
+		draws.copy_count  = count;
+		draws.first_count = count;
+		return true;
+	}
+	if (head > capacity || capacity - head < 2u * period) {
+		return false;
+	}
+	const auto zeros  = static_cast<uint32_t>(std::min<uint64_t>(capacity - head, count - head));
+	draws.copy_count  = head + zeros;
+	draws.first_count = draws.copy_count - draws.copy_count % period;
+	draws.chunk       = zeros - zeros % period;
+	draws.rest        = count - draws.first_count;
+	return true;
+}
+
+// Indices per list primitive; 1 for strips and fans, whose split only regroups zero primitives.
+static uint32_t PrimitivePeriod(const HW::UserConfig& ucfg, const DrawRenderState& state) {
+	switch (ucfg.GetPrimType()) {
+		case Prospero::PrimitiveType::kLineList: return 2;
+		case Prospero::PrimitiveType::kTriList:
+		case Prospero::PrimitiveType::kRectList:
+		case Prospero::PrimitiveType::kRectListLegacy: return 3;
+		case Prospero::PrimitiveType::kQuadListLegacy: return 4;
+		case Prospero::PrimitiveType::kPatch:
+			return std::max(state.vertex_info[0].tess.input_control_points, 1u);
+		default: return 1;
+	}
+}
+
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
@@ -1026,8 +1071,10 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kRectListLegacy:
 		case Prospero::PrimitiveType::kPatch:
 			if (draw.IsIndexed()) {
-				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
-				                      emit.first_instance);
+				emit.zero_tail.ForEachDraw(draw.index_count, [&](uint32_t first, uint32_t count) {
+					vk_buffer.drawIndexed(count, draw.instance_count, first, emit.vertex_offset,
+					                      emit.first_instance);
+				});
 			} else {
 				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
 				               emit.first_instance);
@@ -1035,11 +1082,15 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
-			for (uint32_t i = 0; i < draw.index_count; i += 4) {
-				if (draw.IsIndexed()) {
-					vk_buffer.drawIndexed(4, draw.instance_count, i, emit.vertex_offset,
-					                      emit.first_instance);
-				} else {
+			if (draw.IsIndexed()) {
+				emit.zero_tail.ForEachDraw(draw.index_count, [&](uint32_t first, uint32_t count) {
+					for (uint32_t i = 0; i < count; i += 4) {
+						vk_buffer.drawIndexed(4, draw.instance_count, first + i, emit.vertex_offset,
+						                      emit.first_instance);
+					}
+				});
+			} else {
+				for (uint32_t i = 0; i < draw.index_count; i += 4) {
 					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,
 					               emit.first_instance);
 				}
@@ -1428,25 +1479,28 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.limit           = args.index_limit;
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
 
-	const bool            zero_tail = args.index_count > args.index_limit;
-	std::vector<uint32_t> expanded_indices;
-	if (index_source.guest_element_size == 1 ||
-	    (zero_tail && !m_context.GetGraphics().index_buffer_range_enabled)) {
+	const bool zero_tail = args.index_count > args.index_limit;
+	const bool host_copy = index_source.guest_element_size == 1 ||
+	                       (zero_tail && !m_context.GetGraphics().index_buffer_range_enabled);
+	// Only the indices inside INDEX_BUFFER_SIZE are copied; the zeros after them are filled in
+	// the stream buffer.
+	std::vector<uint8_t> head_indices;
+	const uint32_t       host_size = index_source.guest_element_size == 4 ? 4u : 2u;
+	if (host_copy) {
 		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
-		const auto host_size = index_source.guest_element_size == 4 ? 4u : 2u;
-		expanded_indices.resize((uint64_t {args.index_count} * host_size + 3) / 4);
-		auto* expanded = reinterpret_cast<uint8_t*>(expanded_indices.data());
+		head_indices.resize(uint64_t {bound} * host_size);
 		if (index_source.guest_element_size == 1) {
 			const auto* src = static_cast<const uint8_t*>(args.index_addr);
 			for (uint32_t i = 0; i < bound; i++) {
 				const uint16_t index = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
-				std::memcpy(expanded + uint64_t {i} * sizeof(index), &index, sizeof(index));
+				std::memcpy(head_indices.data() + uint64_t {i} * sizeof(index), &index,
+				            sizeof(index));
 			}
-		} else {
-			std::memcpy(expanded, args.index_addr, index_source.size);
+		} else if (bound != 0) {
+			std::memcpy(head_indices.data(), args.index_addr, index_source.size);
 		}
-		index_source.host_data = expanded;
-		index_source.size      = uint64_t {args.index_count} * host_size;
+		index_source.host_data = head_indices.data();
+		index_source.size      = head_indices.size();
 	} else if (zero_tail) {
 		index_source.sized = true;
 	}
@@ -1472,6 +1526,16 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
 	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
 	emit.first_instance = native_indirect ? 0 : instance_offset;
+	if (host_copy) {
+		// The copy fits a quarter of the stream buffer; a longer zero tail is drawn in chunks.
+		const auto capacity =
+		    m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream).Size() / 4 / host_size;
+		if (!PlanZeroTailDraws(args.index_count, bound, PrimitivePeriod(ucfg, state), capacity,
+		                       emit.zero_tail)) {
+			EXIT("index buffer copy of %u indices exceeds the stream buffer\n", bound);
+		}
+		index_source.zero_size = uint64_t {emit.zero_tail.copy_count - bound} * host_size;
+	}
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);

@@ -667,6 +667,157 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// Two SRT DWORDs read through a user-data pointer, with a buffer descriptor built from them.
+Libs::Graphics::ShaderRecompiler::IR::Program PointerSrtProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 2;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &low = block.AppendNewInst(ValueOpcode::GetUserData,
+                                  {Value(static_cast<ScalarReg>(0))});
+  auto &high = block.AppendNewInst(ValueOpcode::GetUserData,
+                                   {Value(static_cast<ScalarReg>(1))});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(&low), Value(&high)});
+  for (uint32_t slot = 0; slot < 2; ++slot) {
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(slot * 4u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back({Value(&read), slot});
+  }
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  auto &base = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(0u)});
+  auto &size = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(1u)});
+  auto &records = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&size), Value(1u)});
+  DescriptorSource source;
+  source.dwords = {Value(&base), Value(0u), Value(&records), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  return program;
+}
+
+void TestWalkerFollowsInputsAcrossWalks() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = ExtractResourcePlan(PointerSrtProgram());
+  std::array<uint32_t, 2> first{0x1000u, 7u};
+  std::array<uint32_t, 2> second{0x2000u, 9u};
+  std::array<uint32_t, 2> user_data{};
+  const auto point = [&](const std::array<uint32_t, 2> &table) {
+    const auto address = reinterpret_cast<uint64_t>(table.data());
+    user_data = {static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u)};
+  };
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto walk = [&](uint32_t base, uint32_t size) {
+    return MaterializeResources(plan, runtime, snapshot, specialization) &&
+           snapshot.flattened_srt == std::vector<uint32_t>{base, size} &&
+           snapshot.buffers[0].dwords[0] == base && snapshot.buffers[0].dwords[2] == size + 1u;
+  };
+  point(first);
+  Check(walk(0x1000u, 7u), "first walk read wrong SRT values");
+  point(second);
+  Check(walk(0x2000u, 9u), "a later walk reused values of another SRT");
+  point(first);
+  first[1] = 11u;
+  Check(walk(0x1000u, 11u), "a later walk reused memory contents of an earlier one");
+  auto &replaced = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+  replaced.SetArg(0, plan.srt_reads[0].value.ResolveInstruction()->Arg(0));
+  replaced.SetArg(1, Value(0u));
+  replaced.SetArg(2, Value(0u));
+  replaced.SetArg(3, Value(true));
+  replaced.SetFlags(SrtReadFlags{.index = 0});
+  plan.srt_reads[1].value = Value(&replaced);
+  // The descriptor keeps its own clone of the former read.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0x1000u, 0x1000u} &&
+            snapshot.buffers[0].dwords[2] == 12u,
+        "a replaced SRT read value was not followed");
+  DescriptorSource extra;
+  extra.dwords = {Value(3u), Value(4u)};
+  extra.dword_count = 2;
+  plan.descriptor_sources.push_back(extra);
+  DescriptorValue value;
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(1, value) && value.dword_count == 2 &&
+            value.dwords[0] == 3u && value.dwords[1] == 4u,
+        "an appended descriptor source was not evaluated");
+  plan.descriptor_sources[0].dwords[1] = Value(9u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[1] == 9u,
+        "a replaced descriptor DWORD was not followed");
+}
+
+void TestWalkerRecompilesChangedProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  auto &block = AddValueBlock(program);
+  auto &input = block.AppendNewInst(ValueOpcode::GetUserData,
+                                    {Value(static_cast<ScalarReg>(0))});
+  auto &sum = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&input), Value(1u)});
+  const std::array<uint32_t, 1> user_data{40u};
+  uint32_t result = 0;
+  Check(SrtWalker(program, {.user_data = user_data}).Evaluate(Value(&sum), result) && result == 41u,
+        "user-data sum was not evaluated");
+  sum.SetArg(1, Value(2u));
+  Check(SrtWalker(program, {.user_data = user_data}).Evaluate(Value(&sum), result) && result == 42u,
+        "a walk of a changed program used its previous form");
+}
+
+void TestWalkerKeepsLazyReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.user_data_count = 1;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  const auto read = [&](uint32_t offset) -> Inst & {
+    auto &inst = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(offset), Value(0u), Value(true)});
+    inst.SetFlags(MemoryFlags{.index = 0});
+    return inst;
+  };
+  auto &good = read(0u);
+  auto &bad = read(4u);
+  auto &flag = block.AppendNewInst(ValueOpcode::GetUserData,
+                                   {Value(static_cast<ScalarReg>(0))});
+  auto &taken = block.AppendNewInst(ValueOpcode::INotEqual32, {Value(&flag), Value(0u)});
+  auto &select = block.AppendNewInst(ValueOpcode::SelectU32,
+                                     {Value(&taken), Value(&good), Value(&bad)});
+  auto &both = block.AppendNewInst(ValueOpcode::LogicalAnd, {Value(&taken), Value(&bad)});
+  auto &twice = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&bad), Value(&bad)});
+  struct Reads { uint32_t count = 0; } reads;
+  std::array<uint32_t, 1> user_data{1u};
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory = [](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->count;
+        words[0] = 0x55u;
+        return address == 0x1000u;
+      },
+      .userdata = &reads};
+  uint32_t result = 0;
+  Check(SrtWalker(program, runtime).Evaluate(Value(&select), result) && result == 0x55u &&
+            reads.count == 1,
+        "a select evaluated its other operand");
+  user_data[0] = 0u;
+  reads = {};
+  Check(SrtWalker(program, runtime).Evaluate(Value(&both), result) && result == 0u &&
+            reads.count == 0,
+        "a false left operand did not short-circuit a logical AND");
+  reads = {};
+  Check(!SrtWalker(program, runtime).Evaluate(Value(&twice), result) && reads.count == 1,
+        "a failed read did not stop its consumer");
+  reads = {};
+  user_data[0] = 1u;
+  Check(!SrtWalker(program, runtime).Evaluate(Value(&both), result) && reads.count == 1,
+        "a failed right operand of a true logical AND was accepted");
+}
+
 } // namespace
 
 namespace Common {
@@ -696,6 +847,9 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestWalkerFollowsInputsAcrossWalks();
+  TestWalkerRecompilesChangedProgram();
+  TestWalkerKeepsLazyReads();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

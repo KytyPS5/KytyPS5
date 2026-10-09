@@ -1077,8 +1077,9 @@ void TestBitScanKeyRange() {
 void TestBitScanMaskProof() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   // The host evaluates a bit scan's entry mask only when every back edge clears its bits.
-  enum class Next { GainsBitBehindAnd, ExecSelect, VccSelect };
-  for (const auto variant : {Next::GainsBitBehindAnd, Next::ExecSelect, Next::VccSelect}) {
+  enum class Next { GainsBitBehindAnd, ExecSelect, VccSelect, SwapsThroughSibling };
+  for (const auto variant : {Next::GainsBitBehindAnd, Next::ExecSelect, Next::VccSelect,
+                             Next::SwapsThroughSibling}) {
     Fixture fixture(ShaderType::Pixel);
     fixture.program.wave_size = 64u;
     auto *entry = fixture.block;
@@ -1109,6 +1110,11 @@ void TestBitScanMaskProof() {
         {fixture.Emit(ValueOpcode::GetAttribute, {Value(2u), Value(0u)}), Value(0u)});
     auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
     phi.AddPhiOperand(entry, initial);
+    Inst *sibling = nullptr;
+    if (variant == Next::SwapsThroughSibling) {
+      sibling = &header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      sibling->AddPhiOperand(entry, fixture.UserData(3));
+    }
     const auto mask = Value(&phi);
     fixture.block = header;
     const auto nonzero = fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), mask});
@@ -1148,7 +1154,12 @@ void TestBitScanMaskProof() {
         fixture.Emit(ValueOpcode::BitwiseAnd32, {mask, fixture.Emit(ValueOpcode::BitwiseNot32, {bit})});
     const auto gained = fixture.Emit(ValueOpcode::BitwiseOr32, {mask, Value(0x80000000u)});
     Value next;
-    if (variant == Next::GainsBitBehindAnd) {
+    if (variant == Next::SwapsThroughSibling) {
+      // mask takes the sibling's current value, which starts from another word: in the body a
+      // header phi is its current-iteration value, never its back arm.
+      sibling->AddPhiOperand(sample, cleared);
+      next = Value(sibling);
+    } else if (variant == Next::GainsBitBehindAnd) {
       // gained & (c ? gained : mask) is gained when c holds: the select proves nothing.
       next = fixture.Emit(ValueOpcode::BitwiseAnd32,
           {gained, fixture.Emit(ValueOpcode::SelectU32, {other_lane, gained, mask})});

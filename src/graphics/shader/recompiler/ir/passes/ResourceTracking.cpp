@@ -1372,15 +1372,13 @@ private:
 		    });
 	}
 
-	// The value a phi arm carries: sibling phis of the same header resolve to their own arm
-	// and lane selects whose predicate holds on the arm resolve to the selected value.
+	// The value a phi arm carries: lane selects whose predicate holds on the arm resolve to the
+	// selected value. A sibling header phi stays as is: in the loop body it holds its
+	// current-iteration value, not the value of its back arm.
 	Value ArmValue(Value value, const Inst& phi, uint32_t arm, uint32_t depth = 0) const {
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr || depth > 16u) return value;
-		if (inst->GetOpcode() == ValueOpcode::Phi && inst->Parent() == phi.Parent() &&
-		    inst->NumArgs() == phi.NumArgs() && inst->PhiBlock(arm) == phi.PhiBlock(arm))
-			return ArmValue(inst->Arg(arm), phi, arm, depth + 1u);
 		if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
 			const auto predicate = ArmValue(inst->Arg(0), phi, arm, depth + 1u);
 			if (predicate.IsImmediate() && predicate.GetType() == Type::U1)

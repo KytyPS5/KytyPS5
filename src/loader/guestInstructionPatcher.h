@@ -54,6 +54,9 @@ struct GuestInstructionPatchResult {
 
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size);
+// Jump tables are read only from these ranges of a registered module: guest-readable,
+// not writable, and final when patching runs.
+void RegisterGuestInstructionPatchReadOnlyData(void* module_ptr, uint64_t addr, uint64_t size);
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks.

@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <unordered_set>
 #include <vector>
 #include <xbyak/xbyak.h>
@@ -48,11 +49,14 @@ using s64 = int64_t;
 
 constexpr size_t NearJumpSize = 5;
 
+using ReadOnlyRange = std::pair<uintptr_t, uintptr_t>;
+
 struct PatchModule {
-	std::mutex           mutex {};
-	u8*                  start = nullptr;
-	u8*                  end   = nullptr;
-	std::set<u8*>        patched;
+	std::mutex                 mutex {};
+	u8*                        start = nullptr;
+	u8*                        end   = nullptr;
+	std::set<u8*>              patched;
+	std::vector<ReadOnlyRange> read_only_data;
 	Xbyak::CodeGenerator patch_gen;
 	Xbyak::CodeGenerator trampoline_gen;
 	bool                 trampoline_exhaustion_reported = false;
@@ -337,6 +341,13 @@ bool IsCalleeSavedRegister(ZydisRegister reg) {
 	}
 }
 
+// A call keeps only the callee-saved registers.
+bool DefinesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
+	return WritesRegister(decoded, reg) ||
+	       (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL &&
+	        !IsCalleeSavedRegister(reg));
+}
+
 // MOVZX r32, r8/r16 and MOV r32, r32 clear every bit above their source.
 std::optional<ZydisRegister> ZeroExtendingSource(const DecodedCodeInstruction& decoded) {
 	const auto& destination = decoded.operands[0];
@@ -410,9 +421,11 @@ public:
 	}
 
 	// Instructions that last write `reg` on some path to `address`. Fails when the value can come
-	// from the caller, from a call that clobbers it, or through an edge that is not known.
+	// from a call that clobbers it, through an edge that is not known, or from the caller unless
+	// `entry_reached` is given, which is then set when it can.
 	[[nodiscard]] std::optional<std::set<uintptr_t>>
-	ReachingDefinitions(uintptr_t function_start, uintptr_t address, ZydisRegister reg) const {
+	ReachingDefinitions(uintptr_t function_start, uintptr_t address, ZydisRegister reg,
+	                    bool* entry_reached = nullptr) const {
 		const auto start = Index(address);
 		if (!start) {
 			return std::nullopt;
@@ -423,7 +436,12 @@ public:
 		while (!pending.empty()) {
 			const u32 current = pending.back();
 			pending.pop_back();
-			if (m_addresses[current] == function_start || m_predecessors[current].empty()) {
+			if (m_addresses[current] == function_start) {
+				if (entry_reached == nullptr) {
+					return std::nullopt;
+				}
+				*entry_reached = true;
+			} else if (m_predecessors[current].empty()) {
 				return std::nullopt;
 			}
 			for (const u32 predecessor: m_predecessors[current]) {
@@ -640,8 +658,8 @@ std::optional<JumpTableIndex> BoundJumpTableIndex(const DecodedFunction& functio
 			}
 		}
 		std::erase_if(guards,
-		              [&](const Guard& guard) { return WritesRegister(decoded, guard.reg); });
-		if (!WritesRegister(decoded, index_reg)) {
+		              [&](const Guard& guard) { return DefinesRegister(decoded, guard.reg); });
+		if (!DefinesRegister(decoded, index_reg)) {
 			continue;
 		}
 		const auto source = ZeroExtendingSource(decoded);
@@ -671,7 +689,7 @@ FindJumpTableAddress(const DecodedFunction& function, LazyControlFlowGraph& grap
 	for (size_t count = 0; count < MaxPatternInstructions && !StartsStraightPath(function, cursor);
 	     ++count) {
 		cursor = std::prev(cursor);
-		if (WritesRegister(cursor->second, table_reg)) {
+		if (DefinesRegister(cursor->second, table_reg)) {
 			const auto address = DecodeRipRelativeLea(cursor->second, table_reg);
 			return address ? std::optional {std::pair {*address, cursor->first}} : std::nullopt;
 		}
@@ -698,7 +716,7 @@ FindJumpTableAddress(const DecodedFunction& function, LazyControlFlowGraph& grap
 std::optional<std::vector<uintptr_t>>
 ResolveJumpTableSum(const DecodedFunction& function, LazyControlFlowGraph& graph,
                     uintptr_t add_address, uintptr_t function_start, uintptr_t function_end,
-                    uintptr_t data_start, uintptr_t data_end) {
+                    std::span<const ReadOnlyRange> read_only_data) {
 	const auto add = function.instructions.find(add_address);
 	if (add == function.instructions.end() ||
 	    add->second.instruction.mnemonic != ZYDIS_MNEMONIC_ADD ||
@@ -710,6 +728,9 @@ ResolveJumpTableSum(const DecodedFunction& function, LazyControlFlowGraph& graph
 	}
 	const ZydisRegister target_reg = add->second.operands[0].reg.value;
 	const ZydisRegister table_reg  = add->second.operands[1].reg.value;
+	if (IsSameRegister(target_reg, table_reg)) {
+		return std::nullopt;
+	}
 
 	constexpr size_t MaxPatternInstructions = 64;
 	auto             cursor                 = add;
@@ -731,7 +752,7 @@ ResolveJumpTableSum(const DecodedFunction& function, LazyControlFlowGraph& graph
 		    RegisterWidth(source.mem.index) == 64 && source.mem.scale == sizeof(s32) &&
 		    source.mem.disp.value == 0) {
 			load = cursor;
-		} else if (WritesRegister(decoded, target_reg) || WritesRegister(decoded, table_reg)) {
+		} else if (DefinesRegister(decoded, target_reg) || DefinesRegister(decoded, table_reg)) {
 			return std::nullopt;
 		}
 	}
@@ -756,8 +777,13 @@ ResolveJumpTableSum(const DecodedFunction& function, LazyControlFlowGraph& graph
 
 	constexpr u64 MaxJumpTableEntries = 4096;
 	const u64     table_size          = index->max_index + 1;
-	if (index->max_index >= MaxJumpTableEntries || table_address < data_start ||
-	    table_address >= data_end || table_size > (data_end - table_address) / sizeof(s32)) {
+	// The table must be final when patching runs: guest-readable and never written.
+	const bool in_read_only_data =
+	    std::ranges::any_of(read_only_data, [&](const ReadOnlyRange& range) {
+		    return table_address >= range.first && table_address < range.second &&
+		           table_size <= (range.second - table_address) / sizeof(s32);
+	    });
+	if (index->max_index >= MaxJumpTableEntries || !in_read_only_data) {
 		return std::nullopt;
 	}
 	std::vector<uintptr_t> targets;
@@ -779,7 +805,7 @@ ResolveJumpTableSum(const DecodedFunction& function, LazyControlFlowGraph& graph
 std::optional<std::vector<uintptr_t>>
 ResolveBoundedJumpTable(const DecodedFunction& function, LazyControlFlowGraph& graph,
                         uintptr_t branch_address, uintptr_t function_start, uintptr_t function_end,
-                        uintptr_t data_start, uintptr_t data_end) {
+                        std::span<const ReadOnlyRange> read_only_data) {
 	const auto branch = function.instructions.find(branch_address);
 	if (branch == function.instructions.end() ||
 	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
@@ -797,7 +823,7 @@ ResolveBoundedJumpTable(const DecodedFunction& function, LazyControlFlowGraph& g
 			break;
 		}
 		cursor = std::prev(cursor);
-		if (WritesRegister(cursor->second, target_reg)) {
+		if (DefinesRegister(cursor->second, target_reg)) {
 			definitions = std::set {cursor->first};
 		}
 	}
@@ -810,7 +836,7 @@ ResolveBoundedJumpTable(const DecodedFunction& function, LazyControlFlowGraph& g
 	std::vector<uintptr_t> targets;
 	for (const uintptr_t definition: *definitions) {
 		const auto sum = ResolveJumpTableSum(function, graph, definition, function_start,
-		                                     function_end, data_start, data_end);
+		                                     function_end, read_only_data);
 		if (!sum) {
 			return std::nullopt;
 		}
@@ -821,25 +847,197 @@ ResolveBoundedJumpTable(const DecodedFunction& function, LazyControlFlowGraph& g
 	return targets;
 }
 
-// An indirect jump right after the frame pointer is restored leaves the function (tail call).
-bool IsIndirectTailJump(const DecodedFunction& function, uintptr_t branch_address) {
-	const auto branch = function.instructions.find(branch_address);
-	if (branch == function.instructions.end() || branch == function.instructions.begin() ||
-	    function.branch_targets.contains(branch_address)) {
+// RSP relative to the function entry before each instruction reached over known edges, or
+// nullopt where paths disagree. RBP follows `mov rbp, rsp` so a frame torn down through RBP
+// (`leave`, `mov rsp, rbp`, `lea rsp, [rbp + disp]`) keeps a known depth.
+std::map<uintptr_t, std::optional<s64>> StackDepths(const DecodedFunction& function,
+                                                    uintptr_t              function_start) {
+	struct State {
+		std::optional<s64> rsp;
+		std::optional<s64> rbp;
+		bool               operator==(const State&) const = default;
+	};
+	const auto step = [](const DecodedCodeInstruction& decoded, const State& in) {
+		const auto& destination = decoded.operands[0];
+		const auto& source      = decoded.operands[1];
+		const auto  mnemonic    = decoded.instruction.mnemonic;
+		const auto  offset      = [](std::optional<s64> base, s64 delta) {
+			return base ? std::optional {*base + delta} : std::nullopt;
+		};
+		State out = in;
+		if (decoded.stack_pointer_delta) {
+			out.rsp = offset(in.rsp, *decoded.stack_pointer_delta);
+		} else if (mnemonic == ZYDIS_MNEMONIC_LEAVE) {
+			out.rsp = offset(in.rbp, sizeof(u64));
+		} else if (mnemonic == ZYDIS_MNEMONIC_MOV &&
+		           destination.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		           destination.reg.value == ZYDIS_REGISTER_RSP &&
+		           source.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		           source.reg.value == ZYDIS_REGISTER_RBP) {
+			out.rsp = in.rbp;
+		} else if (mnemonic == ZYDIS_MNEMONIC_LEA &&
+		           destination.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		           destination.reg.value == ZYDIS_REGISTER_RSP &&
+		           source.mem.base == ZYDIS_REGISTER_RBP &&
+		           source.mem.index == ZYDIS_REGISTER_NONE) {
+			out.rsp = offset(in.rbp, source.mem.disp.value);
+		} else if (decoded.changes_stack_pointer) {
+			out.rsp = std::nullopt;
+		}
+		if (WritesRegister(decoded, ZYDIS_REGISTER_RBP)) {
+			const bool frame = mnemonic == ZYDIS_MNEMONIC_MOV &&
+			                   destination.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			                   destination.reg.value == ZYDIS_REGISTER_RBP &&
+			                   source.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			                   source.reg.value == ZYDIS_REGISTER_RSP;
+			out.rbp          = frame ? in.rsp : std::nullopt;
+		}
+		return out;
+	};
+
+	std::map<uintptr_t, State> states {{function_start, State {.rsp = 0}}};
+	std::vector<uintptr_t>     pending {function_start};
+	while (!pending.empty()) {
+		const uintptr_t address = pending.back();
+		pending.pop_back();
+		const auto instruction = function.instructions.find(address);
+		if (instruction == function.instructions.end()) {
+			continue;
+		}
+		const auto& decoded = instruction->second;
+		const State out     = step(decoded, states.at(address));
+		const auto  flow    = [&](uintptr_t target, const State& state) {
+			if (!function.instructions.contains(target)) {
+				return;
+			}
+			const auto [entry, inserted] = states.try_emplace(target, state);
+			State merged                 = entry->second;
+			if (merged.rsp != state.rsp) {
+				merged.rsp = std::nullopt;
+			}
+			if (merged.rbp != state.rbp) {
+				merged.rbp = std::nullopt;
+			}
+			if (inserted || merged != entry->second) {
+				entry->second = merged;
+				pending.push_back(target);
+			}
+		};
+		const auto& meta = decoded.instruction.meta;
+		if (!IsControlFlowTerminator(decoded.instruction)) {
+			flow(address + decoded.instruction.length, out);
+		}
+		if (meta.category == ZYDIS_CATEGORY_COND_BR || meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+			flow(GetRelativeTarget(decoded), out);
+		} else if (meta.category == ZYDIS_CATEGORY_CALL) {
+			flow(GetRelativeTarget(decoded),
+			     State {.rsp = out.rsp ? std::optional {*out.rsp - 8} : std::nullopt,
+			            .rbp = out.rbp});
+		}
+		if (const auto table = function.jump_table_targets.find(address);
+		    table != function.jump_table_targets.end()) {
+			for (const uintptr_t target: table->second) {
+				flow(target, out);
+			}
+		}
+	}
+	std::map<uintptr_t, std::optional<s64>> depths;
+	for (const auto& [address, state]: states) {
+		depths.emplace(address, state.rsp);
+	}
+	return depths;
+}
+
+// A pointer read from memory without an index (a vtable or import slot) whose base is RIP, an
+// argument or such a pointer itself. Stack slots and indexed tables can hold computed targets.
+bool IsPointerSlot(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                   uintptr_t function_start, uintptr_t address, const ZydisDecodedOperand& operand,
+                   bool check_base) {
+	if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY || operand.size != 64 ||
+	    operand.mem.index != ZYDIS_REGISTER_NONE || operand.mem.segment == ZYDIS_REGISTER_FS ||
+	    operand.mem.segment == ZYDIS_REGISTER_GS) {
 		return false;
 	}
-	const auto  previous = std::prev(branch);
-	const auto& decoded  = previous->second;
-	return previous->first + decoded.instruction.length == branch_address &&
-	       (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEAVE ||
-	        (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POP &&
-	         decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-	         decoded.operands[0].reg.value == ZYDIS_REGISTER_RBP));
+	const ZydisRegister base = operand.mem.base;
+	if (base == ZYDIS_REGISTER_RIP) {
+		return true;
+	}
+	if (base == ZYDIS_REGISTER_NONE || IsStackPointerRegister(base) ||
+	    IsSameRegister(base, ZYDIS_REGISTER_RBP)) {
+		return false;
+	}
+	if (!check_base) {
+		return true;
+	}
+	bool       entry_reached = false;
+	const auto definitions =
+	    graph.Get().ReachingDefinitions(function_start, address, base, &entry_reached);
+	return definitions && std::ranges::all_of(*definitions, [&](uintptr_t definition) {
+		       const auto& decoded = function.instructions.at(definition);
+		       return decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+		              decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		              decoded.operands[0].reg.value == base &&
+		              IsPointerSlot(function, graph, function_start, definition,
+		                            decoded.operands[1], false);
+	       });
+}
+
+// Every value `reg` can hold before `address` comes from the caller, a pointer slot, a constant
+// outside the function, or a copy of such a value. A caller cannot hold an address inside it.
+bool HoldsExternalAddress(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                          uintptr_t function_start, uintptr_t function_end, uintptr_t address,
+                          ZydisRegister reg, int depth) {
+	bool       entry_reached = false;
+	const auto definitions =
+	    graph.Get().ReachingDefinitions(function_start, address, reg, &entry_reached);
+	return definitions && (entry_reached || !definitions->empty()) &&
+	       std::ranges::all_of(*definitions, [&](uintptr_t definition) {
+		       const auto& decoded = function.instructions.at(definition);
+		       const auto& source  = decoded.operands[1];
+		       if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_MOV ||
+		           decoded.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+		           decoded.operands[0].reg.value != reg) {
+			       return false;
+		       }
+		       switch (source.type) {
+			       case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+				       return source.imm.value.u < function_start ||
+				              source.imm.value.u >= function_end;
+			       case ZYDIS_OPERAND_TYPE_MEMORY:
+				       return IsPointerSlot(function, graph, function_start, definition, source,
+				                            true);
+			       case ZYDIS_OPERAND_TYPE_REGISTER:
+				       return depth > 0 && RegisterWidth(source.reg.value) == 64 &&
+				              HoldsExternalAddress(function, graph, function_start, function_end,
+				                                   definition, source.reg.value, depth - 1);
+			       default: return false;
+		       }
+	       });
+}
+
+// An indirect jump leaves the function (tail call) when the stack is back at its entry depth and
+// the target is an address from outside the function, never a value computed in it.
+bool IsIndirectTailJump(const DecodedFunction& function, LazyControlFlowGraph& graph,
+                        const std::map<uintptr_t, std::optional<s64>>& stack_depths,
+                        uintptr_t function_start, uintptr_t function_end,
+                        uintptr_t branch_address) {
+	constexpr int MaxCopyDepth = 4;
+	const auto    depth        = stack_depths.find(branch_address);
+	if (depth == stack_depths.end() || depth->second != 0) {
+		return false;
+	}
+	const auto& target = function.instructions.at(branch_address).operands[0];
+	if (target.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+		return IsPointerSlot(function, graph, function_start, branch_address, target, true);
+	}
+	return target.type == ZYDIS_OPERAND_TYPE_REGISTER && RegisterWidth(target.reg.value) == 64 &&
+	       HoldsExternalAddress(function, graph, function_start, function_end, branch_address,
+	                            target.reg.value, MaxCopyDepth);
 }
 
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
-                               uintptr_t data_start, uintptr_t data_end,
-                               bool resolve_jump_tables = true) {
+                               std::span<const ReadOnlyRange> read_only_data,
+                               bool                           resolve_jump_tables = true) {
 	DecodedFunction               function;
 	std::vector<uintptr_t>        blocks {function_start};
 	std::unordered_set<uintptr_t> visited;
@@ -896,9 +1094,8 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 			if (!resolve_jump_tables || resolved_indirect_branches.contains(branch_address)) {
 				continue;
 			}
-			const auto targets =
-			    ResolveBoundedJumpTable(function, graph, branch_address, function_start,
-			                            function_end, data_start, data_end);
+			const auto targets = ResolveBoundedJumpTable(
+			    function, graph, branch_address, function_start, function_end, read_only_data);
 			if (!targets) {
 				continue;
 			}
@@ -922,19 +1119,26 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 	const bool consistent =
 	    std::ranges::all_of(function.jump_table_targets,
 	                        [&](const auto& table) {
-		                        return ResolveBoundedJumpTable(
-		                                   function, graph, table.first, function_start,
-		                                   function_end, data_start, data_end) == table.second;
+		                        return ResolveBoundedJumpTable(function, graph, table.first,
+		                                                       function_start, function_end,
+		                                                       read_only_data) == table.second;
 	                        }) &&
 	    std::ranges::adjacent_find(function.instructions, [](const auto& lhs, const auto& rhs) {
 		    return lhs.first + lhs.second.instruction.length > rhs.first;
 	    }) == function.instructions.end();
 	if (!consistent && resolve_jump_tables) {
-		return DecodeFunction(function_start, function_end, data_start, data_end, false);
+		return DecodeFunction(function_start, function_end, read_only_data, false);
 	}
+	std::optional<std::map<uintptr_t, std::optional<s64>>> stack_depths;
 	function.has_indirect_branch = std::ranges::any_of(indirect_branches, [&](uintptr_t branch) {
-		return !function.jump_table_targets.contains(branch) &&
-		       !IsIndirectTailJump(function, branch);
+		if (function.jump_table_targets.contains(branch)) {
+			return false;
+		}
+		if (!stack_depths) {
+			stack_depths = StackDepths(function, function_start);
+		}
+		return !IsIndirectTailJump(function, graph, *stack_depths, function_start, function_end,
+		                           branch);
 	});
 	return function;
 }
@@ -1895,9 +2099,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		}
 
 		++result.function_count;
-		auto function =
-		    DecodeFunction(function_start, function_end, reinterpret_cast<uintptr_t>(module->start),
-		                   reinterpret_cast<uintptr_t>(module->end));
+		auto function = DecodeFunction(function_start, function_end, module->read_only_data);
 		if (analyze_red_zone) {
 			AnalyzeRedZoneLiveness(function);
 		}
@@ -2115,6 +2317,16 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
 	                        std::forward_as_tuple(static_cast<u8*>(module_ptr), module_size,
 	                                              static_cast<u8*>(trampoline_area_ptr),
 	                                              trampoline_area_size));
+}
+
+void RegisterGuestInstructionPatchReadOnlyData(void* module_ptr, uint64_t addr, uint64_t size) {
+	auto module = g_patch_modules.find(reinterpret_cast<u64>(module_ptr));
+	EXIT_IF(module == g_patch_modules.end());
+	const auto start = reinterpret_cast<u64>(module->second.start);
+	const auto end   = reinterpret_cast<u64>(module->second.end);
+	EXIT_IF(size == 0 || addr < start || addr >= end || size > end - addr);
+	std::unique_lock lock {module->second.mutex};
+	module->second.read_only_data.emplace_back(addr, addr + size);
 }
 
 void UnregisterGuestInstructionPatchModule(void* module_ptr) {

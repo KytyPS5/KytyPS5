@@ -71,7 +71,9 @@ FetchContent_Declare(
 	GIT_REPOSITORY https://github.com/Exzap/ZArchive.git
 	GIT_TAG d2c717730092c7bf8cbb033b12fd4001b7c4d932
 	GIT_SHALLOW FALSE
-	PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
+	# Restore the pinned sources first: CMake < 3.30 reruns this step on every reconfigure.
+	PATCH_COMMAND "${GIT_EXECUTABLE}" checkout -- .
+	COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
 		"${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
 	SOURCE_SUBDIR kyty-library-only
 )

@@ -1285,6 +1285,54 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
+void CheckScalarReadOverlap() {
+  constexpr const char *name = "ScalarReadOverlap";
+  // Touching ranges merge; a read that ends where a write begins does not overlap it.
+  std::vector<GuestRange> writes{{0x3000, 0x100}, {0x1000, 0x100}, {0x1100, 0x80},
+                                 {0x1040, 0x10}, {0x5000, 0x40}};
+  MergeGuestRanges(writes);
+  Require(name, "merge",
+          writes == std::vector<GuestRange>{{0x1000, 0x180}, {0x3000, 0x100}, {0x5000, 0x40}},
+          "written ranges were not sorted and merged");
+  using Reads = std::vector<std::pair<uint64_t, uint64_t>>;
+  Require(name, "edges",
+          !ScalarReadsMayOverlap(Reads{{0x0f00, 0x100}, {0x1180, 0x1e80}, {0x3100, 4}}, writes) &&
+              ScalarReadsMayOverlap(Reads{{0x2000, 4}, {0x117c, 8}}, writes) &&
+              ScalarReadsMayOverlap(Reads{{0x0f00, 0x5000}}, writes) &&
+              ScalarReadsMayOverlap(Reads{{0x2000, 0}}, writes) &&
+              !ScalarReadsMayOverlap(Reads{{0x2000, 0}}, {}),
+          "merged write ranges gave a wrong overlap decision at range edges");
+  // Random draws: the decision matches the pairwise check of every read and write.
+  uint64_t state = 0x9e3779b97f4a7c15ull;
+  const auto next = [&state](uint64_t bound) {
+    state ^= state << 13u;
+    state ^= state >> 7u;
+    state ^= state << 17u;
+    return state % bound;
+  };
+  for (int draw = 0; draw < 2000; draw++) {
+    std::vector<GuestRange> written;
+    for (auto count = next(6); count != 0; count--) {
+      written.push_back({0x10000 + next(64) * 0x40, 1 + next(0x200)});
+    }
+    Reads reads;
+    for (auto count = 1 + next(8); count != 0; count--) {
+      reads.emplace_back(0x10000 + next(80) * 0x30, 1 + next(0x80));
+    }
+    bool pairwise = false;
+    for (const auto [address, size] : reads) {
+      for (const auto range : written) {
+        pairwise |= address < range.End() && range.address < address + size;
+      }
+    }
+    auto merged = written;
+    MergeGuestRanges(merged);
+    Require(name, "random draws", ScalarReadsMayOverlap(reads, merged) == pairwise,
+            "merged write ranges disagreed with the pairwise overlap check");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -41971,6 +42019,7 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckScalarReadOverlap();
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);

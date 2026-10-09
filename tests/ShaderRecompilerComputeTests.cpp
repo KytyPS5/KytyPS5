@@ -35496,7 +35496,12 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
   ShaderComputeInputInfo compute{};
   CompiledShader compiled;
   compiled.program = std::move(program);
-  constexpr std::array ordinals{0u, 1u, 2u, 3u, 3u, 2u, 1u, 0u};
+  // The pattern covers both wave64 halves; lanes 60-63 fall past the map and select the root.
+  std::array<u32, 60> ordinals{};
+  for (u32 lane = 0; lane < ordinals.size(); ++lane) {
+    constexpr std::array pattern{0u, 1u, 2u, 3u, 3u, 2u, 1u, 0u, 2u, 3u, 1u};
+    ordinals[lane] = pattern[lane % pattern.size()];
+  }
   compiled.resources.flattened_srt.push_back(ordinals.size());
   compiled.resources.flattened_srt.insert(compiled.resources.flattened_srt.end(),
                                           ordinals.begin(), ordinals.end());

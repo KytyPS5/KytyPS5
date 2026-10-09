@@ -386,6 +386,7 @@ struct PipelineCache::ProgramCache {
 			    entry->resources, entry->specialization, reuse_enabled, reused));
 			resource_hits += reused;
 			materializations += !reused;
+			if (reuse_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
 			if (reuse_enabled && entry->last_permutation < entry->permutations.size()) {
 				const auto& candidate = entry->permutations[entry->last_permutation];
 				const auto& layout = candidate.program.bindings;
@@ -509,6 +510,15 @@ struct PipelineCache::ProgramCache {
 		    enabled, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(source_hits),
 		    static_cast<unsigned long long>(resource_hits), static_cast<unsigned long long>(materializations),
 		    static_cast<unsigned long long>(permutation_hits));
+		if (enabled) {
+			std::printf("NHL27PROGRAMMISS: cold=%llu base=%llu regs=%llu groups=%llu read_failed=%llu memory_changed=%llu\n",
+			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Cold)]),
+			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ShaderBase)]),
+			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Registers)]),
+			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Workgroups)]),
+			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ReadFailed)]),
+			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::MemoryChanged)]));
+		}
 		last_stats = now;
 	}
 
@@ -529,6 +539,7 @@ struct PipelineCache::ProgramCache {
 	struct LastSource { const ProgramKey* key = nullptr; SourceEntry* source = nullptr; };
 	std::array<LastSource, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> last_sources {};
 	uint64_t lookups = 0, source_hits = 0, resource_hits = 0, materializations = 0, permutation_hits = 0;
+	std::array<uint64_t, static_cast<size_t>(ResourceMemo::Miss::Count)> resource_misses {};
 	std::chrono::steady_clock::time_point last_stats = std::chrono::steady_clock::now();
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;

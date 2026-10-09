@@ -46,18 +46,34 @@ class ResourceMemo {
     }
 
 public:
+    enum class Miss { None, Cold, ShaderBase, Registers, Workgroups, ReadFailed, MemoryChanged, Count };
+    Miss LastMiss() const { return m_last_miss; }
+
     bool Refresh(const ShaderRecompiler::IR::ResourcePlan& plan, const Runtime& runtime,
                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,
                  ShaderRecompiler::IR::ResourceSpecialization& specialization,
                  bool enabled, bool& reused) {
         reused = false;
-        if (enabled && m_valid && m_plan == &plan && m_shader_base == runtime.shader_base &&
-            RegisterInputsEqual(runtime.user_data) &&
-            std::ranges::equal(m_workgroups, runtime.workgroup_counts)) {
+        m_last_miss = Miss::None;
+        bool inputs_equal = enabled;
+        if (enabled) {
+            if (!m_valid || m_plan != &plan) m_last_miss = Miss::Cold;
+            else if (m_shader_base != runtime.shader_base) m_last_miss = Miss::ShaderBase;
+            else if (!RegisterInputsEqual(runtime.user_data)) m_last_miss = Miss::Registers;
+            else if (!std::ranges::equal(m_workgroups, runtime.workgroup_counts)) m_last_miss = Miss::Workgroups;
+            inputs_equal = m_last_miss == Miss::None;
+        }
+        if (inputs_equal) {
             bool equal = true;
             for (const auto& read: m_reads) {
                 m_check.resize(read.values.size());
-                if (!ReadValues(runtime, read.strict, read.address, m_check) || m_check != read.values) {
+                if (!ReadValues(runtime, read.strict, read.address, m_check)) {
+                    m_last_miss = Miss::ReadFailed;
+                    equal = false;
+                    break;
+                }
+                if (m_check != read.values) {
+                    m_last_miss = Miss::MemoryChanged;
                     equal = false;
                     break;
                 }
@@ -102,6 +118,7 @@ public:
     }
 
 private:
+    Miss m_last_miss = Miss::None;
     bool RegisterInputsEqual(std::span<const uint32_t> current) const {
         if (current.size() != m_user_data.size()) return false;
         for (const auto index: m_register_inputs) {

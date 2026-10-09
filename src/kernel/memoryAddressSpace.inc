@@ -806,8 +806,8 @@ public:
 			return false;
 		}
 
-		// Mapping changes still exclude this. The page tracker changes each page under its region
-		// lock, so concurrent callers never protect the same page.
+		// Mapping changes still exclude this. PageManager holds its own region lock while it
+		// protects a page, so concurrent callers never protect the same page.
 		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}

@@ -1143,13 +1143,13 @@ void TextureCache::MaterializeViewClear(ImageId id, const ImageDesc& desc) {
 	MaterializeColorClear(id, desc, desc.view_info.base_layer);
 }
 
-void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
-                                       uint32_t metadata_base_layer) {
-	const bool        desc_metadata = desc.info.metadata.kind == ImageMetadataKind::Dcc ||
-	                                  desc.info.metadata.kind == ImageMetadataKind::Cmask;
+void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& binding,
+                                         uint32_t metadata_base_layer) {
+	const bool        binding_metadata = binding.info.metadata.kind == ImageMetadataKind::Dcc ||
+	                                     binding.info.metadata.kind == ImageMetadataKind::Cmask;
 	ImageMetadataInfo target {};
 	bool              use_target = false;
-	if (desc.type == BindingType::Texture || desc.type == BindingType::Storage) {
+	if (binding.type == BindingType::Texture || binding.type == BindingType::Storage) {
 		// A texture or storage view of a fast-cleared color target sees the clear as well, through
 		// the metadata and clear registers of the target's last binding, even if the view has DCC.
 		std::scoped_lock lock {m_lock};
@@ -1157,33 +1157,33 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		target                 = image.info.metadata;
 		use_target =
 		    (target.kind == ImageMetadataKind::Dcc || target.kind == ImageMetadataKind::Cmask) &&
-		    target.clear_register_valid && image.info.data == desc.info.data &&
+		    target.clear_register_valid && image.info.data == binding.info.data &&
 		    image.info.resources.levels == 1 &&
-		    image.info.resources.layers == desc.info.resources.layers &&
-		    desc.info.resources.levels == 1 && desc.view_info.level_count == 1 &&
+		    image.info.resources.layers == binding.info.resources.layers &&
+		    binding.info.resources.levels == 1 && binding.view_info.level_count == 1 &&
 		    !image.info.IsVolume();
 	}
 	// Most lookups are plain textures of images without color metadata: leave before copying.
-	if (!desc_metadata && !use_target) {
-		if (desc.type == BindingType::RenderTarget) {
+	if (!binding_metadata && !use_target) {
+		if (binding.type == BindingType::RenderTarget) {
 			// A target bound without color metadata drops the previous binding's clear state.
 			std::scoped_lock lock {m_lock};
 			auto&            image = m_slot_images[id];
 			if (image.info.metadata.kind == ImageMetadataKind::Dcc ||
 			    image.info.metadata.kind == ImageMetadataKind::Cmask) {
-				image.info.metadata = desc.info.metadata;
+				image.info.metadata = binding.info.metadata;
 			}
 		}
 		return;
 	}
-	ImageDesc clear_desc = desc;
-	auto&     metadata   = clear_desc.info.metadata;
+	// From here on, desc decodes the clear as the color target that owns the metadata.
+	ImageDesc desc = binding;
 	if (use_target) {
-		metadata                    = target;
-		clear_desc.type             = BindingType::RenderTarget;
-		clear_desc.view_info.format = target.clear_format;
+		desc.info.metadata    = target;
+		desc.type             = BindingType::RenderTarget;
+		desc.view_info.format = target.clear_format;
 	}
-	const auto range = metadata.range;
+	const auto range = desc.info.metadata.range;
 	if (!use_target) {
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
@@ -1205,7 +1205,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
 		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
 	}
-	const auto& view           = clear_desc.view_info;
+	const auto& view           = desc.view_info;
 	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
 	const auto  first          = volume_texture ? 0u : metadata_base_layer;
 	const auto  image_first    = volume_texture ? 0u : view.base_layer;
@@ -1226,7 +1226,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
-		if (!DecodeColorClear(clear_desc, code, clear.color)) {
+		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);

@@ -490,7 +490,10 @@ struct PipelineCache::ProgramCache {
 		auto& permutation     = entry->second.permutations.back();
 		permutation.handle.id = ++next_shader_id;
 		// Only programs that compiled are recorded, so a cache never fails earlier than a draw.
-		Record(params, input_info, permutation.specialization, push_data_cursor);
+		// A SWAPPC program also depends on the guest functions it links, which are not recorded.
+		if (!entry->second.call_source) {
+			Record(params, input_info, permutation.specialization, push_data_cursor);
+		}
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 		{
@@ -585,8 +588,9 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
-	Permutation CompileRecipe(const ShaderCacheRecipe&                           recipe,
-	                          std::optional<ShaderRecompiler::IR::ResourcePlan>& plan) const {
+	std::optional<Permutation>
+	CompileRecipe(const ShaderCacheRecipe&                           recipe,
+	              std::optional<ShaderRecompiler::IR::ResourcePlan>& plan) const {
 		InputInfo input_info;
 		EXIT_IF(!DecodeShaderCacheInput(recipe.input, input_info)); // Checked by RecipeKey.
 		// Translation reads the user data count, not the values.
@@ -594,7 +598,12 @@ struct PipelineCache::ProgramCache {
 		const auto options    = MakeOptions(recipe.hash, user_data, recipe.back_code, input_info);
 		const auto stage_name = GetStageNames(recipe.stage).name;
 		DumpShaderOriginal(stage_name, recipe.hash, recipe.code);
-		auto translated = ShaderRecompiler::TranslateProgram(recipe.code, options);
+		const auto source = ShaderRecompiler::PrepareShaderSource(recipe.code, options);
+		// A SWAPPC program links guest functions that the record does not hold.
+		if (source.call) {
+			return std::nullopt;
+		}
+		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
 		if (!plan) {
 			plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
 		}
@@ -611,17 +620,24 @@ struct PipelineCache::ProgramCache {
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 		std::vector<Permutation>                          permutations;
 		for (const auto& recipe: recipes) {
+			std::optional<Permutation> permutation;
 			switch (recipe->stage) {
 				case ShaderType::Pixel:
-					permutations.push_back(CompileRecipe<ShaderPixelInputInfo>(*recipe, plan));
+					permutation = CompileRecipe<ShaderPixelInputInfo>(*recipe, plan);
 					break;
 				case ShaderType::Compute:
-					permutations.push_back(CompileRecipe<ShaderComputeInputInfo>(*recipe, plan));
+					permutation = CompileRecipe<ShaderComputeInputInfo>(*recipe, plan);
 					break;
-				default:
-					permutations.push_back(CompileRecipe<ShaderVertexInputInfo>(*recipe, plan));
-					break;
+				default: permutation = CompileRecipe<ShaderVertexInputInfo>(*recipe, plan); break;
 			}
+			if (!permutation) {
+				// The draw compiles the key itself.
+				for (const auto& compiled: permutations) {
+					device.destroyShaderModule(compiled.handle.module, nullptr);
+				}
+				return std::nullopt;
+			}
+			permutations.push_back(std::move(*permutation));
 		}
 		if (!plan) {
 			return std::nullopt;

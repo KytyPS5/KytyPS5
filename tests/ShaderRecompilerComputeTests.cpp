@@ -37472,6 +37472,20 @@ void CheckShaderCacheRecordPadding() {
           SerializeShaderCache("KytySC1:test\n", {recipes[0]}) ==
               SerializeShaderCache("KytySC1:test\n", {recipes[1]}),
           "padding bytes of the resource specialization reached the record");
+  {
+    ShaderComputeInputInfo async{};
+    async.async_compute = true;
+    ShaderComputeInputInfo decoded{};
+    const auto key = [](const ShaderComputeInputInfo &info) {
+      std::vector<u32> words;
+      BuildStageStaticKey(info, words);
+      return words;
+    };
+    Require(name, "async compute",
+            DecodeShaderCacheInput(EncodeShaderCacheInput(async), decoded) &&
+                decoded.async_compute && key(decoded) == key(async),
+            "the queue of an async compute program was lost in its record");
+  }
   ShaderComputeInputInfo decoded{};
   auto encoded = recipes[0]->input;
   Require(name, "decode",
@@ -37691,6 +37705,59 @@ void CheckShaderCacheConcurrentWaiters(VulkanHarness &vulkan) {
     });
   }
 #endif
+  std::filesystem::remove_all(directory);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A SWAPPC program links guest functions that its record does not hold: a recorded one is left to
+// the draw instead of being compiled ahead from its own code alone.
+void CheckShaderCacheSwappcRecord(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderCacheSwappcRecord";
+  if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+    std::printf("[gpu]     %-32s skipped (non-Release build)\n", name);
+    return;
+  }
+  CachedComputeShader shader;
+  GraphicContext graphics;
+  InitCacheTestGraphics(graphics, vulkan);
+  const auto directory = CacheTestDirectory(name);
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    ShaderComputeInputInfo input{};
+    cache.GetComputeProgram(shader.regs, {}, input);
+    cache.Save();
+  }
+  const auto path = directory / "TEST00000.shaders.bin";
+  const auto file = ReadTestFile(path);
+  const std::span<const uint8_t> bytes(reinterpret_cast<const uint8_t *>(file.data()),
+                                       file.size());
+  const auto line_end = std::ranges::find(bytes, uint8_t{'\n'});
+  const std::string signature(bytes.begin(),
+                              line_end == bytes.end() ? line_end : line_end + 1);
+  ShaderCacheRecipes recipes;
+  Require(name, "saved record",
+          ParseShaderCache(bytes, signature, recipes) && recipes.size() == 1,
+          "the compute program was not recorded");
+  // s_swappc_b64 s[14:15], s[14:15] to a constant target.
+  std::vector<u32> call = {EncodeSMovB32(14, 255u), 0x100u, EncodeSMovB32(15, 128u),
+                           EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  auto recipe = std::make_shared<ShaderCacheRecipe>(*recipes[0]);
+  recipe->hash = 0x5a5a5a5au;
+  recipe->code = call;
+  recipe->specialization = {};
+  const auto data = SerializeShaderCache(signature, {recipe});
+  WriteTestFile(path, std::span(reinterpret_cast<const char *>(data.data()), data.size()));
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    Require(name, "reload", cache.GetProgramStats().recorded == 1,
+            "the SWAPPC record was not loaded");
+    ShaderMapUserData(reinterpret_cast<uint64_t>(call.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(call.size() * sizeof(u32))});
+    cache.WaitForBackgroundCompilation();
+    Require(name, "not compiled ahead", cache.GetProgramStats().compiled_ahead == 0,
+            "a recorded SWAPPC program was compiled without its linked functions");
+  }
   std::filesystem::remove_all(directory);
   std::printf("[gpu]     %-32s ok\n", name);
 }
@@ -42958,7 +43025,8 @@ int main(int argc, char **argv) {
     CheckShaderCacheRecordPadding();
     VulkanHarness vulkan;
     CheckShaderCachePersistence(vulkan);
-  CheckShaderCacheConcurrentWaiters(vulkan);
+    CheckShaderCacheConcurrentWaiters(vulkan);
+    CheckShaderCacheSwappcRecord(vulkan);
     CheckShaderCacheGraphicsPrograms(vulkan);
     return 0;
   }
@@ -43941,6 +44009,7 @@ int main(int argc, char **argv) {
   CheckShaderCacheRecordPadding();
   CheckShaderCachePersistence(vulkan);
   CheckShaderCacheConcurrentWaiters(vulkan);
+  CheckShaderCacheSwappcRecord(vulkan);
   CheckShaderCacheGraphicsPrograms(vulkan);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUnifiedTextureCacheFlow();

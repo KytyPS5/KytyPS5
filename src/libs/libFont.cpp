@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "libs/errno.h"
+#include "libs/fontGlyphImage.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -78,8 +79,6 @@ constexpr int SCE_FONT_TEXT_PARSER_RESULT_TERMINATE = 0;
 constexpr int SCE_FONT_TEXT_PARSER_RESULT_ERROR     = -1;
 constexpr int SCE_FONT_WRITING_FORM_HORIZONTAL      = 0x10;
 constexpr int FONT_BITMAP_MAX_DIM                   = 128;
-// TrueType glyphs are rasterized at the requested size; the limit only rejects absurd scales.
-constexpr int FONT_GLYPH_MAX_DIM                    = 4096;
 constexpr int FONT_ERROR_INVALID_PARAMETER          = static_cast<int>(0x80460002u);
 constexpr int FONT_ERROR_INVALID_FONT_HANDLE        = static_cast<int>(0x80460005u);
 constexpr int FONT_ERROR_NO_SUPPORT_CODE            = static_cast<int>(0x80460041u);
@@ -863,29 +862,16 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
 	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
 
-	int x0 = 0;
-	int y0 = 0;
-	int x1 = 0;
-	int y1 = 0;
-	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale_x, scale_y, &x0, &y0,
-	                            &x1, &y1);
-
-	const auto width  = static_cast<uint32_t>(std::clamp(x1 - x0, 0, FONT_GLYPH_MAX_DIM));
-	const auto height = static_cast<uint32_t>(std::clamp(y1 - y0, 0, FONT_GLYPH_MAX_DIM));
-	// Keep at least one byte so that blank glyphs still get a valid address.
-	image->assign(std::max<size_t>(static_cast<size_t>(width) * height, 1), 0);
+	uint32_t width  = 0;
+	uint32_t height = 0;
+	if (!detail::rasterize_stb_glyph(&font->font_info, static_cast<int>(code), scale_x, scale_y,
+	                                 image, &width, &height)) {
+		return false;
+	}
 	trans_image->address      = image->data();
 	trans_image->width_byte   = width;
 	trans_image->image_width  = width;
 	trans_image->image_height = height;
-
-	if (width == 0 || height == 0) {
-		return true;
-	}
-
-	stbtt_MakeCodepointBitmap(&font->font_info, image->data(), static_cast<int>(width),
-	                          static_cast<int>(height), static_cast<int>(width), scale_x, scale_y,
-	                          static_cast<int>(code));
 
 	return true;
 }

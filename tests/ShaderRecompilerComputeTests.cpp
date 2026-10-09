@@ -35496,7 +35496,8 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
   ShaderComputeInputInfo compute{};
   CompiledShader compiled;
   compiled.program = std::move(program);
-  // The pattern covers both wave64 halves; lanes 60-63 fall past the map and select the root.
+  // The pattern covers both wave64 halves; lanes 60-63 fall past the map and select the root,
+  // which is ordinal 0 (resource 0) by construction.
   std::array<u32, 60> ordinals{};
   for (u32 lane = 0; lane < ordinals.size(); ++lane) {
     constexpr std::array pattern{0u, 1u, 2u, 3u, 3u, 2u, 1u, 0u, 2u, 3u, 1u};
@@ -35509,7 +35510,8 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
   for (u32 resource = 0; resource < 4u; ++resource) {
     const auto width = resource + 1u;
     const auto layers = resource == 3u ? 2u : 1u;
-    std::vector<u32> pixels(width * layers * 4u, std::bit_cast<u32>(float(resource)));
+    // Nonzero values keep the root (ordinal 0) distinct from a null or out-of-bounds read.
+    std::vector<u32> pixels(width * layers * 4u, std::bit_cast<u32>(float(resource + 1u)));
     // Slice 1 of the array candidate holds a value no other layer or candidate has.
     if (layers == 2u)
       std::fill(pixels.begin() + width * 4u, pixels.end(), std::bit_cast<u32>(30.0f));
@@ -35556,7 +35558,7 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
     test.expected.assign(wave_size * 3u, 0u);
     for (u32 lane = 0; lane < wave_size; ++lane) {
       const auto resource = lane < ordinals.size() ? ordinals[lane] : 0u;
-      const auto texel = std::bit_cast<u32>(resource == 3u ? 30.0f : float(resource));
+      const auto texel = std::bit_cast<u32>(resource == 3u ? 30.0f : float(resource + 1u));
       test.expected[lane * 3u] = texel;
       test.expected[lane * 3u + 1u] = texel;
       test.expected[lane * 3u + 2u] = resource + 1u;

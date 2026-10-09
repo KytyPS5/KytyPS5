@@ -563,6 +563,14 @@ KYTY_HW_CTX_PARSER(HwCtxSetColorInfo) {
 	    static_cast<Prospero::ChannelType>(KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, NUMBER_TYPE));
 	r.channel_order =
 	    static_cast<Prospero::ChannelOrder>(KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, COMP_SWAP));
+	if (r.format == Prospero::ChannelLayout::k11_11_10 && r.channel_type == Prospero::ChannelType::kUNorm) {
+		static std::atomic_uint reported = 0;
+		if (reported.fetch_add(1) < 32u) {
+			std::fprintf(stdout, "RenderTargetFormatRegister: direct slot=%u offset=0x%x word=0x%08x\n",
+			             param, cmd_offset, buffer[0]);
+			std::fflush(stdout);
+		}
+	}
 	r.cmask_fast_clear_enable  = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, FAST_CLEAR) != 0;
 	r.fmask_compression_enable = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, COMPRESSION) != 0;
 	r.blend_clamp              = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, BLEND_CLAMP) != 0;
@@ -1981,6 +1989,29 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
+		if (cmd_offset >= Pm4::CB_COLOR0_INFO && cmd_offset <= Pm4::CB_COLOR7_INFO &&
+		    (cmd_offset - Pm4::CB_COLOR0_INFO) % 15u == 0u &&
+		    KYTY_PM4_GET(value, CB_COLOR0_INFO, FORMAT) ==
+		        static_cast<uint32_t>(Prospero::ChannelLayout::k11_11_10) &&
+		    KYTY_PM4_GET(value, CB_COLOR0_INFO, NUMBER_TYPE) ==
+		        static_cast<uint32_t>(Prospero::ChannelType::kUNorm)) {
+			static std::atomic_uint reported = 0;
+			if (reported.fetch_add(1) < 8u) {
+				const auto source_address = reinterpret_cast<uint64_t>(indirect_buffer + 1);
+				uint32_t backing_word = 0;
+				const bool backing_read = LibKernel::Memory::TryReadBacking(
+				    source_address, &backing_word, sizeof(backing_word));
+				uint32_t clean_word = 0;
+				const bool clean_read = LibKernel::Memory::TryReadGpuCleanBacking(
+				    source_address, &clean_word, sizeof(clean_word));
+				std::fprintf(stdout, "RenderTargetFormatSource: offset=0x%x word=0x%08x "
+				             "address=0x%016" PRIx64 " backing_read=%d backing_word=0x%08x "
+				             "clean_read=%d clean_word=0x%08x control=0x%08x\n",
+				             cmd_offset, value, source_address, backing_read, backing_word,
+				             clean_read, clean_word, buffer[2]);
+				std::fflush(stdout);
+			}
+		}
 
 		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
 			continue;
@@ -2696,6 +2727,14 @@ void GraphicsInitJmpTablesCxIndirect() {
 			    KYTY_PM4_GET(value, CB_COLOR0_INFO, NUMBER_TYPE));
 			info.channel_order =
 			    static_cast<Prospero::ChannelOrder>(KYTY_PM4_GET(value, CB_COLOR0_INFO, COMP_SWAP));
+			if (info.format == Prospero::ChannelLayout::k11_11_10 && info.channel_type == Prospero::ChannelType::kUNorm) {
+				static std::atomic_uint reported = 0;
+				if (reported.fetch_add(1) < 32u) {
+					std::fprintf(stdout, "RenderTargetFormatRegister: indirect slot=%u offset=0x%x word=0x%08x\n",
+					             slot, cmd_offset, value);
+					std::fflush(stdout);
+				}
+			}
 			info.cmask_fast_clear_enable  = KYTY_PM4_GET(value, CB_COLOR0_INFO, FAST_CLEAR) != 0;
 			info.fmask_compression_enable = KYTY_PM4_GET(value, CB_COLOR0_INFO, COMPRESSION) != 0;
 			info.blend_clamp              = KYTY_PM4_GET(value, CB_COLOR0_INFO, BLEND_CLAMP) != 0;

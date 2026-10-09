@@ -1265,6 +1265,17 @@ bool PipelineCache::SaveDriverCacheLocked(bool checkpoint) {
 		return false;
 	}
 
+	const auto save_begin = std::chrono::steady_clock::now();
+	const bool trace_save = std::getenv("KYTY_PIPELINE_CACHE_PHASE_TRACE") != nullptr;
+	const auto trace = [&](const char* phase, size_t bytes = 0) {
+		if (!trace_save) return;
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		    std::chrono::steady_clock::now() - save_begin).count();
+		std::printf("DriverCacheSavePhase: checkpoint=%u phase=%s bytes=%zu elapsed_ms=%" PRId64 "\n",
+		            checkpoint ? 1u : 0u, phase, bytes, elapsed);
+		std::fflush(stdout);
+	};
+	trace("begin");
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -1288,8 +1299,10 @@ bool PipelineCache::SaveDriverCacheLocked(bool checkpoint) {
 		return false;
 	}
 	payload.resize(size);
+	trace("driver-data", payload.size());
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	trace("hash", payload.size());
 	if (m_has_saved_driver_cache_hash && payload_hash == m_saved_driver_cache_hash &&
 	    Common::File::IsFileExisting(m_driver_cache_path)) {
 		if (!checkpoint) {
@@ -1312,10 +1325,14 @@ bool PipelineCache::SaveDriverCacheLocked(bool checkpoint) {
 		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
 		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
 	}
+	trace("write", payload.size());
 	const bool flushed = !file.IsInvalid() && file.Flush();
+	trace("flush", payload.size());
 	file.Close();
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+	const bool complete = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
+	const bool renamed = complete && Common::File::RenameFile(temp_path, m_driver_cache_path);
+	trace("rename", payload.size());
+	if (!renamed) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return false;
@@ -1729,12 +1746,24 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const bool trace_pipeline = std::getenv("KYTY_PIPELINE_PHASE_TRACE") != nullptr;
+	if (trace_pipeline) {
+		std::printf("PipelineCreationPhase: kind=graphics phase=begin vs=%" PRIu64 " ps=%" PRIu64
+		            " vs_hash=0x%016" PRIx64 " ps_hash=0x%016" PRIx64 "\n", vs_id, ps_id,
+		            vertex_info[0].stage.program ? vertex_info[0].stage.program->shader_hash : 0,
+		            ps_active && ps_input_info->stage.program ? ps_input_info->stage.program->shader_hash : 0);
+		std::fflush(stdout);
+	}
 	const auto creation_begin = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
 	const auto creation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	    std::chrono::steady_clock::now() - creation_begin).count();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	if (trace_pipeline) {
+		std::printf("PipelineCreationPhase: kind=graphics phase=done vs=%" PRIu64 " ps=%" PRIu64 " elapsed_ms=%" PRId64 "\n", vs_id, ps_id, creation_ms);
+		std::fflush(stdout);
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -1765,6 +1794,11 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	const bool trace_pipeline = std::getenv("KYTY_PIPELINE_PHASE_TRACE") != nullptr;
+	if (trace_pipeline) {
+		std::printf("PipelineCreationPhase: kind=compute phase=begin id=%" PRIu64 " hash=0x%016" PRIx64 "\n", compute_program.id, input_info.stage.program->shader_hash);
+		std::fflush(stdout);
+	}
 	const auto creation_begin = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
 	const auto creation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1773,6 +1807,10 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
+	if (trace_pipeline) {
+		std::printf("PipelineCreationPhase: kind=compute phase=done id=%" PRIu64 " elapsed_ms=%" PRId64 "\n", compute_program.id, creation_ms);
+		std::fflush(stdout);
+	}
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 	CheckpointDriverCacheLocked(static_cast<uint64_t>(creation_ms));

@@ -1,5 +1,2085 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-09 18:40 UTC** (both formatted frontiers compile; clean exit after interruption):
+
+- Native7afac3cd / installed EXEa2b62ef9 / original eboot5178 run181524 ended
+  exit0 at18:37:03UTC, timedOut=false/memoryGuard=false,1178 completed pipelines.
+  Last previously fatal CS9d4c341d4e05f879 now passes resource planning/SPIR-V
+  and actual pipeline1340 creation (165446ms); prioraf9e also passes. The user
+  interrupted the chat around this stage; closure cause is not established,
+  so exit0 does not establish successful startup. Cache1012582765B saved.
+- Last owned-window1824 capture shows loading arc only. No final menu/entry
+  evidence. PID36648 ended; no active native game/build/test found. Next: warm
+  original retry after preserving current files, and inspect SharpEmu PR926
+  for additional shared mechanisms. User explicitly authorizes committing all
+  current files and continuing bring-up; no push/merge authorization.
+
+
+Checkpoint **2026-10-09 18:15 UTC** (wide formatted core installed; original retry active):
+
+- Core `7afac3cd0a7d3cd80035efae70eb4f3be9f5a581` extends formatted GPU-selected
+  reads to XY/XYZ/XYZW with common transferred-component bounds. Resource
+  RED174837 -> GREEN175338; compute RED175209 -> CPU175420; six width/wave
+  numeric/backing/fault GPUAV175543 PASS. Final registered GPUAV180052 PASS10/10
+  includes unchanged X numeric oracle. Complete resource tracking/admissions
+ 181300 PASS3/3 after correcting old GPU-fallback/typed metadata expectations;
+  host snapshot/table guards explicitly checked. Other-game/full-wave proof absent.
+- Native emulator181435 PASS; installed SHAa2b62ef9fa273ddb903541b72c7b894f1f866ffaeb143766dc100ed1b9c1866c.
+  PreviousEXE142a and full driver cache backed up in
+  `_Build/analysis/anyps5-continuation-20261009T134838Z/`.
+- ACTIVE original eboot5178 run
+  `_Build/runs/game-20261009-181524-anyps5-formatted-wide-native`, PID36648,
+ 1800s/28GiB/240s close grace,1280x720 normal async Performance, timing only.
+  Source frozen; no native tests/build concurrently. Await real frontier/menu.
+  Previous4d5 run passed af9e pipeline then natural321 at9d4c formattedXYZ,
+ 1172 pipelines; loading arc then black, no menu/entry or issue108 milestone.
+
+
+Checkpoint **2026-10-09 17:47 UTC** (formatted-X runtime frontier passed; next XYZ gap):
+
+- Core4d5a2376 / native EXE142a67f7, original eboot5178 run172811 ended
+  naturally321 at17:45:22UTC,1172 completed pipelines, no deadline/memory guard.
+  Prior fatal CSaf9e passed TrackResources, SPIR-V and actual pipeline1319
+  (51434ms); subsequent kernels compile. Window1735 loading arc; window1745
+  black. No menu/game entry or issue108 milestone. PID9100 ended/streams drained.
+- New fatal CS9d4c341d4e05f879 PC704: private registered source confirms
+  MUBUFopcode2 BUFFER_LOAD_FORMAT_XYZ IDXEN; runtimeformat unrecorded. Required
+  independent wide-formatted regression added to test debt. Resource admission
+  native RED174837 confirmed. Next: shared XY/XYZ/XYZW transfer bounds/conversion
+  and width/selector/EXEC/null/full-backing GPU proof before another native retry.
+- Original game untouched; installed EXE142a, previous8a9407/cache backed up.
+  Existing unrelated dirtydiagnostics/docs preserved. No push/issue108 post.
+
+
+Checkpoint **2026-10-09 17:28 UTC** (formatted-X core installed; original retry active):
+
+- Separate core `4d5a2376b7a99ea3dc065b55d20b47692b2df344`, native emulator
+  build172716 PASS; installed SHA142a67f7a8c7f0bc6bdd5491fbcd273a62e9aa2b379c362151c786aff35a2392.
+  Previous EXE8a9407 and full1002959326-byte driver cache preserved under
+  `_Build/analysis/anyps5-continuation-20261009T134838Z/`.
+- ACTIVE bounded original eboot5178 run
+  `_Build/runs/game-20261009-172811-anyps5-formatted-x-native`, PID9100,
+ 1800s/28GiB/240s close grace,1280x720 normal async Performance, timing-only.
+  Source frozen, no simultaneous native tests/build. Original game unchanged.
+- At17:45UTC the previously fatal CSaf9e060c8c9207ba passes resource planning,
+  SPIR-V and actual pipeline creation1319 (51434ms); subsequent kernels compile.
+  Owned-window window-1745.png is black after the earlier visible loading arc.
+  Menu/entry pending.
+- Formatted-X GPUAV17151532/64/fault PASS; registered affected17240710/10,
+  admission172520, seven indirect/BDA GPUAV172550 PASS. Await real workload
+  outcome. Previous run150855 was loading UI then natural321 at formatted X;
+  no menu/game entry or issue108 publication milestone.
+
+
+Checkpoint **2026-10-09 17:27 UTC** (GPU-selected formatted X proved; native retry pending):
+
+- Previous active run150855 ended naturally321 at15:31:20UTC,1158 pipelines,
+  no deadline/memory guard; exact captured blocker is BUFFER_LOAD_FORMAT_X at
+  CSaf9e060c8c9207ba PC0x230. Loading arc in window1518 is visible pixels only;
+  menu/game entry pending. Installed EXE remains8a9407 / core8c5beaa1.
+- New shared formatted-X/BDA support and strict runtime format/selector/type
+  faults are locally uncommitted. ResourceRED155757 -> GREEN164341;
+  GPU admissionRED163638 -> GPUAV171515 numeric/backing/fault PASS32/64.
+  Actual fault parserRED161846 -> GREEN162713; actual hosttrap scoped
+  RED170719 -> GREEN171049. Fixture setup failures explicitly excluded.
+  Registered neighborGPUAV172407 PASS10/10; admission172520 PASS.
+- Next: finish indirect/BDA neighbors, commit completed core separately, native
+  build/install with exact hashes/backups, bounded original-game retry. No
+  other-game GPU corpus/full-suite/menu proof or issue108 publication.
+
+
+Checkpoint **2026-10-09 15:23 UTC** (new native core installed; original-game retry active):
+
+- Core `8c5beaa14c3a81103c27b9ca70278286648a50ed` on integer64 transfer6e401f7c;
+  native emulator150534 PASS. Installed SHA-256
+  `8a9407a8b3348ecfb29e537ca64cb7efa69eded3328b733af5d302e5ecac04c7`
+  at15:08:21UTC. OldEXE335/full988710222B cache preserved in
+  `_Build/analysis/anyps5-continuation-20261009T134838Z/`.
+- ACTIVE PID30308 `_Build/runs/game-20261009-150855-anyps5-reuse-native`,
+  original eboot5178/1280x720, normal async Performance/timing-only1800s/28GiB,
+  240s close grace. Source inputs frozen; no native build/test concurrently.
+  Foreground owned-window capture `window-1518.png` visually shows only the white
+  loading arc on black; real visible pixels/loading UI, no menu/game entry proof.
+  Earlier `window-progress.png` was black. Focus restored after each capture.
+- At15:17:50UTC:827 complete pipelines/987 optimizer calls, max compute creation
+  1529ms; baseline600s had570 pipelines/max19995ms. Driver cache is warmer, so
+  these are observations, not an isolated causal speedup claim. LastCS060b20af;
+  no captured new fatal. Observe final outcome/new blocker before changing code.
+  Issue108 remains unpublished: loading arc is not an authorized publication milestone.
+
+Checkpoint **2026-10-09 15:07 UTC** (AnyPS5 integer64 transfer and early stride reuse proved; native build in progress):
+
+- Local core `6e401f7c` completes32 integer64 comparisons (25 additions), and
+  `8c5beaa1` adds compiler-proved early rawDWORD stride artifact reuse plus fresh
+  renderer stride metadata. Current tests include explicit VOPC/VOP3 wave32/64,
+  all predicates/partial+zero EXEC/VCC+SCC guards, pointer identity and real
+  renderer numeric/backing checks. Prior dirty timing diagnostics preserved;
+  no push or issue108 publication in this session.
+- Integer64 nativeRED140128 -> CPU GREEN140748, GPUAV141131 PASS7,
+  registered141600 PASS2/2. Stride cache RED142849 -> GREEN143351; actual metadata
+  RED143036 -> GREEN144025. Actual renderer145227 GPUAV32/64 PASS, final registered
+ 145614 PASS4/4; six exact-specialization negatives (byte/typed/atomic/scalar/
+  swizzle/ADD_TID) plus zero. AffectedGPUAV145854 PASS5/5; CPU150125 PASS4/4.
+  Native emulator build now owns execution slot; source frozen until it completes.
+- Latest actual original eboot5178/EXE335/f20 retry134839:600s budget, graceful0
+  at13:58:48UTC/no memory guard.570 completed pipelines; cache988710222B saved.
+  Optimizer692 calls/sum185876ms vscompute creation sum79667ms (not wall partitions).
+  No visual menu/entry proof or issue108 milestone. New fixes not yet retried.
+  Installed EXE remains335 at this checkpoint; upcoming build/install will be
+  recorded explicitly. Full shader_cfg scalar EXEC baseline remains unresolved.
+- AnyPS5 public100% is generated from1166 enum/list matches, not all instructions'
+  GPU execution. Generic Kyty MIMG flags cover many distinct AnyPS5 names;
+  remaining sync/GDS/RT/ABI paths require their own contracts and proof. Review:
+  [AnyPS5 source audit](anyps5-usefulness-review.md). Next: install completed native
+  core, bounded longer original workload, measure actual frontier/performance and
+  regress any new semantic blocker before expanding support.
+
+Checkpoint **2026-10-09 12:56 UTC** (AnyPS5 scalar transfer proved; bounded original-game smoke complete):
+
+- Core/tests local commit `f20f2bd8e6196f184b2abf4b72e28ea9c481dd6a`; seven
+  RDNA2 scalar SOP1 operations adapted from AnyPS5 `d70b89989473` (see
+  [source review](anyps5-usefulness-review.md)). Existing renderer diagnostic
+  diffs preserved byte-for-byte; no push or issue108 publication.
+- Native intended CPU RED124105 -> same GREEN124320. GPUAV124535 PASS7 numeric
+  cases (four wave32/wave64 + in-place alias variants, three existing scalar
+  neighbors). Final registered CPU/GPUAV CTest124727 PASS2/2 (0.54s/65.27s),
+  source/runtime data and guards unchanged. Native emulator125056 PASS;
+  installed SHA-256 `335749799ad684bffe587eb7eb1753b8326df50581ddeaa875a2c7a3ff367d4a`.
+  Previous EXE87a9 and985153519B driver cache preserved in
+  `_Build/analysis/anyps5-study-20261009/`.
+- Actual original eboot5178/1280x720, normal async Performance/no new diagnostics:
+  `_Build/runs/game-20261009-125238-anyps5-scalar-smoke`.120s deadline,
+  close requested/graceful exit0 at12:54:54UTC, no memory guard/forced cleanup;
+  driver cache loaded985153519B and checkpointed985689265B. Stderr empty;
+  window capture is black (`smoke-window.png` in analysis); PrintWindow capture
+  is not swapchain readback. No visible menu, game entry or new pixel milestone.
+  Original eboot independently rehashed unchanged after run; no process remains.
+- Final remote read-back finds tested coref20f2bd8 already on origin/yotei-windows-bringup;
+  this session performed no push (tracking reflog reports update by push; publisher
+  was not identified). Review commit remains local; CI not checked. No issue108 post.
+- Fresh read-back also closed prior034619 warm retry:3600s/graceful0 at04:46:35UTC,
+  cache985153519B; finalCS1215 still112657ms pipeline preparation. Old02:30 ACTIVE
+  checkpoint is superseded. New SOP1 support has no measured Yotei boot benefit.
+  Current runtime boundary remains before confirmed menu. Next: measured longer
+  original workload and independent regression for any next blocker; investigate
+  full compiled-artifact disk cache if compiler reload is material, separately
+  from expensive driver pipeline creation. Full shader_cfg baseline EXEC debt
+  remains unresolved; synthetic checks are not cross-game/runtime proof.
+
+Checkpoint **2026-10-09 02:30 UTC** (runtime stride fix committed; actual retry active):
+
+- Local core `daca7b2315d6e64aa8304b5669a0f9f0733a0018` on fixture repair
+  dc3ef360; original dirty diagnostic source/docs preserved. No push. Positive
+  non-atomic raw DWORD stride moves to current shader-data metadata; native offsets,
+  byte limits, zero-stride/typed/atomic semantics and resource caps preserved.
+- Native intended CPU RED012655 -> unchanged GREEN013216; final CPU021239 PASS5/5.
+  GPUAV015627 six independent numeric read/store/sentinel cases (8/48, actual64,
+  ADD_TID/OOB). Final affected GPUAV021354 PASS6/6: raw stride, compact metadata,
+  bounded vertex/pixel, zero-stride and typed stores. Actual renderer021848 PASS2/2
+  (full immutable snapshot admission guards and read-only aligned upload).
+  Full shader_cfg remains baseline-failing at scalar descriptor EXEC assertion;
+  production-only reversal021044 proves unrelated. Do not call full suite green.
+- Native emulator022125 PASS; exact-commit incremental022643 PASS. Installed
+  SHA-256 `87a9a607f79d232755510530031711f449c6082e08e08e1313ead31738bf5ddc`
+  at02:28:02.970Z; old98cd executable preserved in wrapper directory.
+- ACTIVE PID33436 same normal async Performance3600s/28GiB/240sclose-grace:
+  `_Build/runs/game-20261009-022803-runtime-stride-capture`.
+  Wrapper `_Build/analysis/yotei-runtime-stride-20261009-022644-e606bd/run.ps1`
+  owns existing480x270 diagnostic4d98 eboot selection and original5178 restoration.
+  Source frozen/no native build/test concurrently. Current compilation continues;
+  actual first-scene performance/menu/game-entry outcome PENDING. No issue108 post.
+- Other SRT mapping-offset variants are genuinely different: read-only diagnostics
+  disprove alpha equivalence. Their correction needs separate synthetic proof.
+  Next observe original workload after stride fix and record next real blocker.
+
+Checkpoint **2026-10-09 02:14 UTC** (raw DWORD runtime stride proved; neighbors pending):
+
+- Local HEAD8df60ac2 + NEW uncommitted generic raw DWORD stride metadata/test fix
+  and preserved original diagnostics. Baseline native CPU012655 intended failure
+  "raw ordinary stride changes produced different SPIR-V modules" -> unchanged
+  GREEN013216. Final affected native CPU021239 PASS5/5 (module/cache identity,
+  checkpoint/reuse, bounded shared access). Runtime stride8/48 emits byte-identical
+  SPIR-V while current renderer shader data publishes the real stride. Zero-stride,
+  typed/formatted and atomic address paths remain specialized; limits unchanged.
+- Native GPUAV015627 PASS6/6: independent full-backing read/store oracle, sentinels,
+  stride8/48, actual guestwave64 and ADD_TID/OOB rows. Initial GPU harness build/
+  backing-address setup errors were NOT REDs or semantic evidence. Registered
+  affected GPUAV021354 currently running; do not build/edit source concurrently.
+- Broader CPU020101 found obsolete SMOV fixture using s[48:51] zero-stride/mode0
+  descriptor while only s[0:3] had raw-mode defaults. Test now supplies valid
+  descriptor12; oracle unchanged. Then020813 full suite hit "scalar descriptor
+  planning retained an unrelated native execution mask". Scoped production-only
+  reversal021044 reproduced SAME baseline failure; exact saved hashes restored
+  before final021239. Full shader_cfg remains NOT GREEN; separate test debt.
+- Native game234326 ended3600s deadline, graceful0 at00:43:44.643Z, no forced
+  cleanup/memory guard/fatal; compatible846963327B cache saved. Original5178
+  restored/rehashed00:43:45.066Z. Earlier oldVS1135/PSc428 passage stays proved.
+  First-scene heavy family variants cost116..140s each; lastCS1244. Window2355
+  black, previous2319 loading arc; no menu/game entry/issue108 milestone.
+- Read-only Linux diagnostics found TRUE SRT mapping index changes (260 vs263);
+  constant sets equal does NOT imply equivalent bodies. Canonicalize-IDs32s/module
+  did not equalize them; rejected diagnostic, no production canonicalization/reuse.
+  Artefacts `_Build/analysis/constant-id-canonicalization-20261009/`.
+- Next: finish affected GPU/renderer checks, native build/install and bounded game
+  retry with the completed fix; examine remaining mapping-offset performance
+  independently. No new commit/push yet; installed EXE98cd still OLD8df source.
+
+Checkpoint **2026-10-08 23:43 UTC** (old vertex blocker passed in game; warm retry active):
+
+- Same local HEAD `8df60ac24f35436bdb1b9fffb0161b7a5eb41990` + preserved dirty
+  diagnostics; installed EXE SHA-256
+  `98cd3bfa998b0af1b1b00a439126268b1dde2ee9c947df3157236272f536c4ab`.
+  No new production edit/build/commit/push. Old VS1135 resource-planning blocker
+  PASSED in actual native game:127528SPIR-Vwords, graphicsVS965/PS9647364ms.
+  Old PSc428297659words also PASSED graphicsVS937/PS93624ms and PS94120ms.
+- `_Build/runs/game-20261008-231226-vertex-resume-capture` reached988 completed
+  pipelines/lastCS1134; timed out1800s during first-scene pipeline preparation.
+  Requested close succeeded, exit0 at23:42:33.822Z, no forced cleanup/memory guard
+  or fatal. Peak observed working set~26.7GB; CSbedb95313a1a6a6c1121 took116920ms.
+  One783.7MB checkpoint write took110200ms alongside G: disk queue; subsequent
+  final806986099B cache save2541ms completed. Compatible cache retained.
+- Window2319 shows white loading arc on black;2314/2324 black. No menu/game entry
+  or issue108 milestone. Shown343/frame724 is NOT proof of game-entry progress.
+  Original eboot5178 restored and independently rehashed; wrapper resolution-probe
+  confirms23:42:34.503Z. Final game shutdown record/streams are complete.
+- New native same-source warm retry PID43836, started23:43:26 UTC:
+  `_Build/runs/game-20261008-234326-vertex-warm-resume-capture`. Performance,
+  normal async,3600s/28GiB and240s close grace. Longer OWNED launcher lifetime
+  chosen for measured first-load117s pipelines/110s cache write; no OS/GPU timeout,
+  guest/device resource limit or validation policy changed. Wrapper
+  `_Build/analysis/yotei-warm-resume-20261008-234125-7cda38/run.ps1` owns temporary
+  existing480x270 diagnostic eboot selection/restoration. Source frozen; no native
+  build/test concurrently. Monitor final runtime/new blocker; menu/entry pending.
+
+Checkpoint **2026-10-08 23:13 UTC** (resume/recovery; bounded retry active):
+
+- Verified branch `yotei-windows-bringup`, HEAD `8df60ac24f35436bdb1b9fffb0161b7a5eb41990`.
+  Existing dirty source diagnostics and documentation preserved; no new source fix,
+  native build, commit or push in this resumed session. Installed native executable
+  SHA-256 `98cd3bfa998b0af1b1b00a439126268b1dde2ee9c947df3157236272f536c4ab`.
+- Previous `game-20261008-113259-vertex-srt-capture` PID51560 is absent. Its
+  `run.json` lacks a final outcome; last progress11:47:15 UTC/23.68GB and last
+  stdout is CS6cc64dee32dc7094 optimization315230words. No fatal logged, exit
+  reason/timeout/memory-guard result UNKNOWN. No `_kyty.txt` or visual readback
+  saved. Do not treat this interrupted record as a reproduced semantic defect.
+- Old wrapper left diagnostic eboot4d98 active. Verified preserved original5178
+  and absence of emulator, atomically restored original with exact hash check;
+  preserved diagnostic separately. Evidence:
+  `_Build/analysis/yotei-vertex-srt-20261008-113100-b133b7/recovery-20261009.json`.
+- Current retry verified actual old vertex1135e3d2715c8ba2 admission/compilation:
+  `1971_new_shader_vs_1135e3d2715c8ba2.spv`127528words; graphics VS965/PS964
+  created7364ms. Old pixelc428297659words also created VS937/PS93624ms and
+  VS937/PS94120ms. This confirms passage of prior resource-planning/binding gates;
+  window2319.png shows only a white loading arc on black, no menu/game entry.
+- New same-executable native retry PID20400:
+  `_Build/runs/game-20261008-231226-vertex-resume-capture`; normal asynchronous
+  Performance1800s/28GiB/120sclose-grace. Wrapper
+  `_Build/analysis/yotei-resume-20261008-231225-3bb29c/run.ps1` owns temporary
+  saved480x270 diagnostic selection and exact original restoration. Source frozen;
+  no concurrent native build/test. Final runtime result pending; no menu/game-entry
+  proof or issue108 milestone/comment.
+
+Checkpoint **2026-10-08 11:26 UTC** (bounded vertex byte descriptor loop verified; retry next):
+
+- Local HEAD8df60ac2 (test wave64 followup) on corea0e548bc. Existing scalar SRT
+  dominance/range/count/coherent-read/budget proof and materialization now admit
+  Vertex as well as Compute/Pixel. Renderer admits proved vertex-owned snapshots;
+  mesh/unproved stages, DMA writes, cross-stage aliases and pixel/vertex ordered
+  write overlaps remain errors. Workgroup-axis proof stays compute-only; raw
+  GPU-selected unbounded byte BDA admission unchanged/closed. No title/hash/address
+  behavior. Generic CPU byte-loop shares existing pixel fixture/count/zero/DMA tests.
+- Independent native CPU RED102631 -> same GREEN103900; separate real renderer
+  vertex-snapshot RED103328 before admission change. Final CPU111940 PASS3/3
+  including full resource_tracking, vertex/pixel proof, explicit vertex workgroup
+  rejection. Earlier full suite111540 found obsolete stage-only negatives; only
+  proved VertexStage cases moved to positives, unknown/undef/cyclic/conditional
+  provenance and byte/typed restrictions remain tested.
+- Final GPUAV vertex numeric105059 eight cases: count0..3 and OOB offset, unsigned
+  bytes17/43/199, sum259. Same fixture with actual guestwave64 added112218 PASS;
+  no wave32 coercion claimed. Final affected GPUAV111213 PASS5/5 (vertex/pixel,
+  metadata, optimization and scalar-selector guards); legacy vertex13-buffer /
+  indexed753 fixture111536 GPUAV PASS. Initial GPU fixture CFG/zero-layout/oracle
+  setup errors104448/104706/104910 were corrected, not production REDs; PS helper
+  intentionally exports fixedZ0.75/W1 while observed X/Y carry the vertex sum.
+- Expanded renderer native110209 PASS20 rejected/13 allowed: vertex/pixel own
+  snapshots, both directions of cross-stage writer/read owner, ordered flags,
+  invalid ranges/counts, DMA/atomic protections.105454 failed guest-memory reserve
+  before boundaries, not GREEN; supervisor had committed13.5GiB plus child13.5GiB.
+  Harness now defers parent arena until sequential workers exit; guest limits,
+  external processes/pagefile and emulator initialization are unchanged.
+- Exact captured static-key diagnostic103203 round-trips vertex input and scratch0
+  (manifest scratch628885250/metadata_complete=false is untrusted). Root graph
+  Phi0/+1*196, source ReadConst slots32..35; post-fix104148 tracking PASS29 bounded
+  reads. Diagnostic key/graph code removed before corecommit; no runtime payloads
+  fabricated and no GPU execution claimed from this audit.
+- Last actual37/EXEd103 run100400 natural321 at10:20:55.4311903 UTC, no guards;
+  original5178 restored10:20:55.658Z. PSa3 gate passed4065ms; OLD PSc428 also
+  PASSED:297659 optimized words/graphics VS933PS9327383ms and later shaders.
+  Latest fatal VS1135e3d2715c8ba2 PC1738 BUFFER_LOAD_UBYTE, raw op8/imm32.
+  Window remains loading arc; no menu/game entry or issue108 milestone. New
+  native emulator build/install/retry with8df next; sources/tests local/unpushed.
+- Original dirty source39/8/37 and temp cache/pipeline40/2/stash/docs preserved.
+  Render-target/depth snapshot alias coverage remains explicit separate debt.
+  Published last verifiede498/CI37742919546 all3OS not the new local source.
+
+
+Checkpoint **2026-10-08 10:16 UTC** (actual renderer gate passed; graphics warm-up continues):
+
+- Native37bdd695+preserved diagnostics/EXEd1033654 run100400 ACTIVE PID50792,
+  Performance1800s/28GiB+120s close grace, normal asynchronous queue scheduling;
+  no concurrent native build/test. Wrapper analysis/yotei-pixel-srt-binding-
+ 20261008-100200-d23eb8/run.ps1 owns original5178 restoration. Source frozen.
+- Actual earlier renderer pixel snapshot gate PASSED: VS470/PS469 with PS
+  a3e721ed134f81a5/VSda06be18b19a619f creates graphics pipeline4065ms, followed
+  by later graphics work. No stage/dma/alias guard bypass; shared37 fix native
+  admission evidence above. Exact old pixelc428 is not present yet; still pending.
+- By10:15:38 pipeline IDs645/644 are creating (hundreds of graphics variants);
+  shown326/fps0 at current compile sample. Owned-window image
+  window-after-pixel-binding.png visually remains loading white arc on black.
+  No menu/game entry or GPU readback; no issue108 milestone/comment. Compilation
+  progress does not prove gameplay. Cache/world warm-up continues inside limits.
+- Native build095957/install exactSHA
+  d1033654b336b5050cb0ef09cef51f528ae33a3976bcd5d97189acb77c0ce005.
+  Original diagnostics39/8/37/temp40/2/stash/dirty docs preserved. Followups local;
+  published last verifiede498/CI37742919546 all3OS separate. No push/main merge/release.
+
+
+Checkpoint **2026-10-08 10:00 UTC** (renderer pixel snapshot admission; retry next):
+
+- Local HEAD37bdd695. Shared renderer now admits immutable SRT owned by Pixel
+  or Compute, retaining vertex-owned rejection/DMA writer and valid range/count
+  checks. All active graphics runtimes preflight declared buffer/image writes
+  against snapshots BEFORE descriptor preparation; companion stages without
+  their own snapshot are allowed. Read-before-own-write exception remains
+  compute-only and cannot bypass another stage's snapshot. Pixel ordered alias
+  is explicitly rejected until proved. No title/hash/address exception.
+- Native intended renderer RED093304 -> same focused GREEN093822. Final exact
+  pixel upload footprint probe095104 PASS; complete native admission095251
+  PASS16 rejected/10 allowed, including cross VS writer/PS snapshot overlap,
+  disjoint and ordered flag. Scalar selector/write neighbors095550 PASS. All are
+  renderer admission/binding checks, not rendered game proof. Combined GPUAV
+ 094201 caught a fixture assertion before RebindBuffers(upload not yet performed);
+  moved after upload. GPUAV094519 then failed VMA allocation before expected
+  boundaries, NOT GREEN; final native uninstrumented tests passed, no validation
+  or resource limit was weakened. Other games unavailable.
+- Warm a4/EXEfe0d run090720 naturally EXIT321 at09:28:56.0554181 UTC, no guards,
+  original eboot5178 restored09:28:56.2935304. Pixel stage2 immutable snapshot
+  renderer gate was latest fatal. Last compiled PSa3e721ed134f81a5 emits100386
+  optimized words with VSda06 9335words. Exact old pixelc428 passage is STILL
+  UNPROVED (not present in this run log); do not infer it from this earlier gate.
+  No visually confirmed menu/game entry or issue108 update.
+- Cache reuse measured: four5490 pipelines76/79/83/79ms versus135..146sec cold.
+  New real variants still compile134496/141179/142514/89349/142114/139052ms.
+  fc6 cold0537/warm0601 equal671595words but12 OpIMul operands differ constants
+ 8 vs48; these are semantic stride variants, not safe to coerce/reuse. Independent
+  runtime-stride/code-reuse regression lead recorded in test debt, no such fix yet.
+- Native emulator build/install/current-fix game retry next with Performance,
+ 1800s/28GiB +120s close grace. Original diagnostics39/8/37 and temp cache/pipeline
+ 40/2 preserved; only new6-line renderDraw preflight committed. Original stash/
+  dirty docs intact. Published last verified e498/CI37742919546 all3OS separate
+  from local followups. No push/force/main merge/release/issue publication.
+
+
+Checkpoint **2026-10-08 09:06 UTC** (Performance cold run completed; warm-cache retry next):
+
+- Same a4fba3c4+diagnostics/EXEfe0d56ef run083514 reached1800s CPU lifetime guard,
+  then NORMAL owned close exit0 at09:05:43.9647085 UTC. No memory guard/forced kill.
+  Increased bounded120s cleanup grace allowed final25.4s cache save707211641B;
+  original eboot5178 restored09:05:44.390Z. No owned emulator remains. Lifetime
+  guard exit0 is not a naturally completed game launch or menu/game-entry proof.
+- Shown317 by final progress sample; window-heavy-compile.png has2533 nonblack
+  pixels/small white upper-right arc resembling a loading indicator. No GPU
+  readback, no visually confirmed menu/game entry. Pixelc428 still not reached;
+  do not claim bounded pixel-loop fix verified in game yet. No issue108 post.
+- Four heavy5490 variants finished145646/139754/135431/138705ms; fc6 compute
+  id263129858ms;1158 id26687188ms. Expensive first-use work now saved. Existing
+  Performance recipe gave actualordinary module reductions but no dramatic
+  improvement to cooperative driver compile. Source/core unchanged since2c;
+ 36/a4 only reusable GPU optimization tests. Next exact same binary/Performance
+  normal async bounded1800s warm-cache retry, unique wrapper and original safeguards.
+
+
+Checkpoint **2026-10-08 08:54 UTC** (visually nonzero owned window; Performance run active):
+
+- Native tested sourcea4fba3c4 + preserved diagnostics, installed
+  SHAfe0d56ef8335359f35b7b2fdfa755eb6a10ee40448387e120cf83913655bf16b.
+  Performance normal async run083514 ACTIVE PID4044, bounded1800s/28GiB+120s
+  close grace; no concurrent builds/tests. Exact original restore owned by
+  analysis/yotei-performance-20261008-083335-c3d155/run.ps1. Source inputs frozen.
+- Owned foreground-window image window-heavy-compile.png visually contains a
+  small white arc near the upper-right, resembling a loading indicator. This is
+  a nonzero WINDOW capture, not GPU readback or a visually confirmed menu/game entry.
+  Earlier all-black captures remain distinct. No issue108 milestone/comment.
+- Runtime still compiling5490 variants: first id249661722words145646ms;
+  second completed and third id251661964words began. Shown288 at08:53:32, CPU
+  active/memory~25.7GB, no guard reached. Shader c428 not reached yet. Large module
+  remains a cooperative dispatch problem; metadata grouping is a separate fix.
+- Performance CPU selection082247/saved cooperative-file0823441.2s
+ 681618->661988words; native GPUAV0829136 numeric cases PASS, includes actual
+  cooperative=1 LDS/multiwave and split=0 wave64/precision MAD/typed byte paths.
+  Runtime ordinary pixelcb2 module256914->193245 and csE52 168203->129844 observed;
+  these size changes do not prove a driver-speed/game compatibility result.
+- Fresh last published PR497 sourcee498 and CI37742919546 all3OS GREEN verified
+ 08:08. Local2c/36/a4 unpublished in this task; no force/main merge/release. User
+  goal remains confirmed entry into game. All tests/pixels/menu/gameplay separate.
+
+
+Checkpoint **2026-10-08 08:31 UTC** (Performance-mode validation; runtime retry next):
+
+- Local HEADa4fba3c4 (a4fba3c4d300663d7d1c048e1e917a08f3d16fed), with test-only
+  followups36dff594/a4 on2c metadata lowering. Existing launcher defaults to
+  Performance; direct CLI previously None. Native CPU optimization082247 PASS;
+  bounded saved5490 cooperative-file audit0823441.2s/681618->661988words. This
+  modest reduction does not establish a driver-speed fix or game progress.
+- Existing Performance path numerical GPUAV082431 PASS5 cases; logs show those
+  wave64 cases use split lowering(cooperative=0). Expanded unchanged LDS multiwave
+  reduction082913 PASS6 cases and proves cooperative=1 recipe as well; precision
+  MAD, raw/formatted bytes and full/sparse wave64 count guards retained. No new
+  production optimization recipe or timeout policy. Native build/install next.
+- Normal2c/EXE4ead run080547 timed out900s at5490 fourth681k permutation, still
+  before pixelc428; shown302, owned visual image black. Large860-way switch is
+  cooperative PC dispatch (outlined helper calls), NOT buffer metadata. The
+  completed compact metadata fix is valid but does not change this specific module.
+  Correct prior performance lead accordingly; all speculative equivalences unproved.
+- Supervisor finalized08:21:04 without exitCode; restoration safety guard refused
+  while process teardown was not yet confirmed. Owned process subsequently absent;
+  strict recover-original.ps1 verified no emulator and restored original5178 at
+ 08:22:47.228Z. No native process remains. Cache675984644B checkpoint finished,
+  shutdown reported unchanged. Do not report this probe as native-1 or a clean exit.
+- Next Performance normal asynchronous retry bounded1800s/28GiB +120s close grace,
+  matching measured repeated CPU compile/cache costs. GPU scheduling and driver
+  timeouts unchanged; original resolution backup/hash safeguards retained. No menu,
+  game entry, issue108 post/push/merge/release. Published e498 exactCI37742919546
+  all3OS remains separate from local source. Diagnostics39/8/37 and temp40/2 intact.
+
+
+Checkpoint **2026-10-08 08:11 UTC** (compact-metadata native game run active; published state refreshed):
+
+- Local tested source2c746bb0 + preserved39/8/37 and temporary cache/pipeline40/2
+  diagnostics. Native emulator080320/install PASS; exact installed SHA256
+ 4ead288887581c1e4156e77023371c513c15ee5f5d6fa67a7f7f248cbdc732ef.
+  Normal bounded900s/28GiB run080547-compact-metadata-capture ACTIVE PID47928;
+  source inputs frozen, no concurrent build/test. Wrapper
+  analysis/yotei-compact-metadata-20261008-080445-2e79d9/run.ps1 owns restoration.
+  Shown273 at08:10:33; owned-window visual capture still black. Pixelc428 not reached
+  yet; no verified menu/game entry. Do not infer game progress from counter alone.
+- Live PR497 read-back08:08 confirms PUBLISHEDe4985763, mergeable/CLEAN and exact
+  CI37742919546 PASS Windows/Linux/macOS. Tracking-ref reflog records external push
+  at07:21:17 UTC; this task did not issue that push. Earlier notes using published
+  e2/ahead10 were based on an older ref. Current2c746bb0 is one local commit ahead;
+  its native proof is separate from CI. No push/merge/release/issue108 post here.
+- Current runtime is still processing new6cc compute permutations (~315k words).
+  Original cold/warm baseline681k/860-case delay is recorded above; no comparison
+  claim until matching runtime metadata reaches the compacted heavy shader.
+
+
+Checkpoint **2026-10-08 08:03 UTC** (local compact buffer metadata; game retry next):
+
+- Local HEAD2c746bb0, ten ahead of published PR497/e2c3454d. Shared bounded buffer
+  metadata retains every valid selector and groups equivalent stride/native-remap/
+  zero-OOB/format-compatibility classes. Dynamic offset/byte-limit loads use the
+  actual renderer-published ShaderData entry. Singletons retain constant metadata;
+  unsupported hosts, typed fallback, bounds and volatile/atomic semantics unchanged.
+- Intended native CPU RED074209 labels399/words14865 -> unchanged GREEN074410
+  labels99/words11690 (initial focused lowering). Final registered074750 GPUAV
+  PASS7/7: CPU budget, raw/formatted numeric, pixel readback/decorations, formatted
+  full/sparse wave64 count guard, zero-stride modes, format-store neighboring cases.
+  Large515 stride/add-TID/formatted neighbors075850 numeric native GPU PASS3/3,
+ 133s total, WITHOUT GPUAV. Prior combined GPUAV075438 timed out120s during huge
+  instrumentation compile; not GREEN/semantic RED. No driver reset. Other games absent.
+- Experimental compact partial4-lane wave64+barrier fixture074931/075139 was
+  rejected in existing resource planning before metadata emission; removed from
+  this positive suite and recorded as separate unproved root/EXEC debt. Production
+  admission was not loosened. Earlier fixture failures073301/073602/073828/074030
+  precede valid RED; fixture now uses a bounded vector mask before readfirstlane
+  and four64-entry tables within unchanged default512 logical-buffer ceiling.
+- Both normal e498/EXE60629 runs065629/warm071239 timed out900s before pixelc428.
+  Second ended07:27:57.8280181 UTC/native-1 with owned forcedcleanup; no memory
+  guard, original eboot5178 restored. Shown154/visual black. Compute5490 repeated
+ 681k-word variants take134397/141030/136994ms; cache checkpoint105615ms. This
+  is measured compiler/cache delay, not proof that the pending pixel fix failed.
+- New emulator build/install/normal bounded retry next. No menu/game entry or
+  issue108 publication. Original39/8/37 diagnostics, temporary cache/pipeline40/2,
+  dirty docs and original stash preserved; no new push/force/main merge/release.
+
+
+Checkpoint **2026-10-08 06:55 UTC** (local bounded pixel descriptor loop; native runtime retry next):
+
+- Local HEADe4985763, nine ahead of published e2c3454d. Pixel-stage scalar bounded
+  descriptor loops now reuse existing dominance, coherent snapshot and budget proof;
+  workgroup selectors stay compute-only, DMA writers and unsafe aliases remain rejected.
+  Buffer-format GPU-selected BDA admission remains closed; no title/hash/address branch.
+- Intended synthetic native CPU RED030356 -> same GREEN030943. Required readonly
+  fragment SSBO decorations separately RED043228/051528 -> GREEN044102/052427;
+  final numeric pixel GPUAV060544 passes counts0/1/2/3 with sums0/1/3/6, no VUIDs.
+  Final registered CPU resource_tracking+pixel065412 PASS2/2; pixel decorations/readback,
+  compute formatted EXEC guard/bounded zero-stride/format stores065335 GPUAV PASS5/5.
+  Full suite's obsolete raw DWORD rejection aligned with independently proven72be
+  admission; control-dependent formatted phi rejection remains tested. New zero-trip
+  and DMA-writer tests prove empty reads and transactional snapshot preservation.
+- Last normal72be/EXE7af247b1 game015949 passed PC3280 then naturally exited321
+  at02:10:19.5454098 UTC at pixelc428 PC37f0 BUFFER_LOAD_FORMAT_X. Original eboot5178
+  restored, no guards. CPU exact captured static-key probe023420 reproduces cause,
+  post-fix033203 translates the capture; this is source audit, not game execution.
+  Temporary key/operand diagnostics removed before commit; preserved39/8/37 source
+  diagnostics and temporary cache/pipeline40/2 logger untouched. Emulator build/install
+  and actual retry with this new fix are next. No pixels/menu/game-entry claim or issue108 post.
+- Native emulator065546/install PASS, EXE60629e603b4a8d3b07bf92f8c2b6c372ebbad04fbc1d9e3cca9956e6a6965cb9.
+  Normal900s run065629 reached shown154 (visual window still black) and compute5490
+  id249681342words/860-way switch, then id250681618words; timeout guard/owned forced
+  cleanup at07:11:47.8667743 UTC/native-1. No memory guard, original eboot5178 restored.
+  Pixelc428 not reached; this does not verify the new fix in game. Saved cache progress
+  retained; exact same binary warm-cache bounded retry next, no concurrent build/test.
+
+- Candidate fixture diagnosis included explicit OFFEN=false and stride4/records1;
+  earlier fixture/API/build errors are not production REDs. Other games unavailable.
+  Published PR497 exact e2 CI37704056031 all3OS previously verified GREEN; new fix is local.
+
+
+Checkpoint **2026-10-08 01:58 UTC** (packedCB passed in normal game; next descriptor fix validated):
+
+- Local HEAD72be9e34, eight ahead of published e2c3454d. Shared raw single-DWORD
+  GPU-selected descriptor admission now uses the already-tested one-component
+  BDA emitter; no backend rewrite or title/hash/address exception. Native same
+  numerical GPUAV RED014248 -> GREEN014532;19 rows cover four OOB modes/stride/
+  offsets/soffset/unaligned crossings/complete last payload/invalid/inactive/
+  swizzle/sentinels. DWORD+ushort+typed/formatted/signed16/write/atomic guards
+ 014931 PASS2/2, wide vectors/address/snapshot/stride/format015237 PASS.
+  Native emulator015646 PASS; install and next bounded game retry pending.
+- Normal ec26997d+preserved+temporary diagnostics/EXEa0b99068 run012532 naturally
+  ended01:36:39.530581 UTC/native321, no900s/memory guard/forcedcleanup. Original
+  eboot5178 restored and wrapper finalized; no owned native process remains.
+- **Old packedCB blocker passed** on480x270 profile: PSe82bdf234f518f8c emits39346
+  words; VS918/PS917 graphics pipeline completes1510ms and later work follows.
+  No normalized-to-float substitution. Native numerical+real backing proof in
+  earlier checkpoint; original-resolution validation remains pending.
+- Prior CS8457 id294/220047words driver creation took367727ms, then continued.
+  Different resource permutations still create huge1111/1377-way switches; retain
+  grouped metadata lowering as independent performance debt, not a title shortcut.
+- New actual fatal: pixelc428451cf6d96d04 PC3280 rejects a GPU-selected rawDWORD
+  descriptor. Private words e0302024/80000502 decode BUFFER_LOAD_DWORD, imm36.
+  Capture metadata/code37056B under run012532/shaders/dispatched. This supplies
+  the general synthetic regression trigger, not production address/hash logic.
+- Visually inspected window-loading.png and window-after-cb.png remain black.
+  No menu, game entry or gameplay proof; no issue108 publication. Normal queue
+  scheduling preserved, no driver reset. Native scalar admission fix is local.
+- New wrapper analysis/yotei-indirect-dword-20261008-015647-315216;
+  installed hash/run/readback to record after install/retry. Three original source
+  deltas39/8/37 and temporary cache/pipeline40/2 preserved; dirty docs/stash intact.
+  Published exact e2 CI37704056031 all3OS still verified GREEN, no extra push/merge.
+
+Checkpoint **2026-10-08 01:24 UTC** (local packed UNorm color exports; game retry next):
+
+- Local HEADec26997d, seven ahead of published PR497/e2c3454d. New shared CB
+  support preserves actual11/11/10 and10/11/11 UNorm semantics with exact4-byte
+  R32_UINT attachment backing and explicit FP32 color-export packing. CB round-
+  by-half uses an exact two-U32 significand product, independently of buffer/
+  image RNE; no float substitution or title/hash/address special case.
+- Final admission RED005850 -> unchanged numerical GPUAV GREEN010603;
+  both widths/four orders/zero/max/unequal/half-LSB/clamp/NaN/Inf/mixed floatMRT0+
+  packedMRT2, distinct shader key and real shared CB/texture raw backing/guest
+  download/adjacent sentinel. Producer and neighbors011934 PASS5/5; expected
+  partial-export refusal011250. CPU admission011712 passes after updating old
+  CB-closed byte-size expectation to the independently tested4-byte footprint.
+  Native emulator012319 PASS; install/normal bounded retry is next.
+- Blend, truncation, partial-component exports/write masks, multisample/dual-source
+  and non-FP32 source remain explicit unsupported cases. Fully masked targets
+  retain no unused conversion. Sampling/atomics/compare/D16 gates unchanged.
+  New source/tests are local-only. Three original dirty source diagnostics39/8/37
+  preserved; temporary cache/pipeline logger40/2 stays uncommitted.
+- Prior cache-budget source6f5c15bf + diagnostics/EXE991acf8a run002103 naturally
+  ended00:32:38.533897 UTC/native321, no900s/memory guard or forcedcleanup.
+  Its CS8457 id291/220167 words finally completed383090ms; huge switch shapes
+ 1111/1377 captured for future shared metadata-lowering regression. This was a
+  long driver compile, not proof of a GPU hang or DCE defect. Earlier checkpoint
+  write32695ms recorded; valuable compiler work was saved (finalcache635455874B).
+- That prior run passed storage admission and reached the old packedCB at480x270,
+  slot2/mask7f/mode9/unblended/single sample/PSe82. Original eboot5178 restored,
+  no owned native process remained. New support's game effect is still unproved.
+  Source/runtime audit is not menu, rendered pixels or game entry. No issue108 post.
+- Analysis/tests: packed-unorm-cb-20261008-005251-ee05d1,
+  yotei-cache-budget-20261008-001938-02bba0,
+  new launch wrapper yotei-packed-cb-20261008-012320-01c863. Next run on corrected
+  native executable, visually inspect; new failures require independent RED/GREEN.
+  Published exact-head CI37704056031 remains verified all3OS GREEN; no new push,
+  force push/main merge/release/issue publication inferred.
+
+Checkpoint **2026-10-08 00:20 UTC** (local cache persistence budget; runtime diagnosis continues):
+
+- User requests continued work until confirmed game entry. No current menu/game-entry
+  proof and no issue108 update. Published PR497 e2c3454d exact CI37704056031 now
+  verified PASS Windows/Linux/macOS; local follow-up remains unpublished.
+- Local HEAD6f5c15bf, six commits ahead of origin. New shared host-cache correction
+  budgets intermediate checkpoints by measured persistence cost; first/cheap/valuable
+  long compilation/deferred progress/no-work/uint64 boundaries covered. Dirty work
+  survives save failure; pending count saturates. The original save body and
+  unconditional shutdown Save remain unchanged. CPU intended RED001418 -> same
+  unchanged GREEN001548; registered cache identity/mode/reuse/checkpoint001730 PASS4/4.
+  Native emulator build001939 PASS, install/retry next. No guest behavior was changed.
+- Diagnostic555d run235414:360s guard, graceful exit0 at00:00:18, no memory guard;
+  shown181 by last sample, black visual capture.175 compute creates total67618ms,
+  of which65514ms in CS6cc64dee32dc7094, maxprior_perms19. No pending compute create
+  at shutdown; earlier captured6cc also had~296..313k SPIR-V words. This does not
+  establish DCE as the cause of the900s delay.
+- Sync-only555d run000254 confirms many actual dispatches complete in~100..400us;
+  CPU sampler's hottest owned thread is repeatedly in NtFlushBuffersFile and
+  NtSetInformationFile. It was gracefully stopped for narrower instrumentation
+  at00:06:54, finalized00:07:10/native0; original eboot5178 restored.
+- Normal asynchronous1a + temporary timing logger/EXEd8d972d2 run000848 confirms
+  actual633936331B cache save26500ms (hash173/write26414/flush26458/rename26500ms),
+  with earlier write2046ms and unchanged probes172..183ms.180s guard ended
+ 00:12:07/native-1 with owned forcedcleanup, no memory guard; shown190/pstg3.
+  This is a measured delay contributor, not the complete900s stall explanation.
+- Three original source diagnostic deltas39/8/37 preserved. New cache/pipeline
+  timing logger is temporary, uncommitted, outside the completed policy change.
+  Analysis: yotei-phase-capture-20261007-235409-591ffa,
+  yotei-sync-phase-20261008-000243-bb94f1, yotei-cache-io-20261008-000824-127810,
+  and yotei-cache-budget-20261008-001938-02bba0. Original game restored after each
+  completed probe; no native operation overlaps. Next bounded normal retry with
+  exact shader/pipeline/cache phase capture; packedCB remains pending behind it.
+
+Checkpoint **2026-10-07 23:50 UTC** (PR497 mergeable at fresh read-back; newest CI pending; bounded runtime stall):
+
+- Published PR497 head `e2c3454d`: current main `de626649` is an ancestor;
+  fresh REST read-back confirms mergeable=true. Main advanced during validation;
+  extra merges `7be73338`/`e2c3454d` preserve tested draw contracts while adopting
+  new AudioOut2/AMPR and macOS lock changes. Current exact-head CI37704056031
+  is still running; do not label this newer head CI-GREEN yet.
+  Initial merges `8328681d`/`d585b0c9` resolved55 files/260 chunks while retaining
+  branch resource/wave64/F64/image/scratch semantics and compatible upstream
+  memory/kernel/archive/window changes. Incompatible upstream shader frontends
+  remain deferred; do not claim their implementation was integrated.
+- Prior exact-head CI [37696776012](https://github.com/KytyPS5/KytyPS5/actions/runs/37696776012)
+  PASS Windows/Linux/macOS; release skipped (draft PR), no main merge or release.
+  The first run37689453288 failed old scalar OOB oracle/macOS address deduction.
+  `1511939a` repairs tests with known descriptor-OOB zero/no callback and an
+  in-bounds unreadable control, plus portable explicit uint64_t addresses.
+  `e4c255df` ports main liveness DCE while retaining branch Value/F64 storage.
+  Independent dead-Phi/planning RED221644 -> unchanged native GREEN222227;
+  external roots/live recurrence/direct Identity edges/second-pass marks covered.
+- Local HEAD `1a795a82`, five commits ahead of published PR: `814725ee` captures
+  missing compute.needs_lds_barriers; `7730fd11` packs normalized raw32 storage
+  writes; `33a115c9` merges CI repairs and subsequent local merges retain the newest published base.
+  These extra changes
+  are local-only, without CI proof for their exact head. Original three dirty
+  source diagnostics and three dirty docs preserved; stash90414133 retained,
+  patch/decisions/CI logs under `_Build/analysis/pr497-conflicts-20261007-205349/`.
+- Diagnostic rungame212925 identifies compute e519/root24/source31/PC4328 as
+  direct IMAGE_STORE, format30, dmask7/raw32, no sampler/atomic/compare/indirect.
+  Storage fix reuses PackFormatComponent with exact4-byte R32_UINT backing;
+  sample/atomic/compare/D16/CB remain closed. Same GPUAV RED213801 -> unchanged
+  GREEN214014; both layouts/swizzles/finite boundaries/clamp/NaN/Inf/oneLSB/sparse
+  mask whole-element overwrite/unwritten texels plus real renderer storage
+  binding/upload/download and adjacent guest sentinel. RDNA2 ISA8.2.4 specifies
+  zero for omitted store components; older prospective preservation debt corrected.
+- After DCE integration: native scalar222227, resource tracking222605,
+  materialization222626, affected CFG222639 and GPUAV stores/loads/packed-float/
+  scaled/selector222726 PASS. Existing full shader_cfg literal-word assertion
+  and sampled-depth Dref disassembly expectation222832 remain documented debt;
+  do not describe all tests as GREEN. The first merge's CPU-only unmap ownership
+  integration independently passed unchanged GPUAV RED211522 -> GREEN211806.
+- Storage-only native7730/EXE1f99 retry at480x270 game215021 naturally ended
+ 21:54:04.114404 UTC/native321 after222.56s, no guards, old packedCB blocker.
+  Original-eboot rungame215546 naturally ended22:00:37.080742 UTC/native321 after
+ 290.00s, same layout6/type0/order0, RefreshShaders slot2/PSe82bdf234f518f8c,
+  decoded MRT union7f, actual target3840x2160. This confirms storage admission
+  no longer stops that source on the original workload; no menu/game-entry proof.
+- Latest33a + preserved diagnostics native build223317/install PASS, exact EXE
+  `555d2c0e23891241c9d3f4468ea118084c37b471eff3188a95b8cd793f86509d`.
+  Bounded480x270 game223527 hit900s guard, then owned forced cleanup/native-1 at
+ 22:50:45.647591 UTC; memory guard false, last observed shown190/23GiB, no new
+  fatal shader error or packedCB lookup in this run. Exact stalled phase/hash is
+  not captured with diagnostics disabled; this is a regressed advancement result
+  relative to7730 retries, not proof DCE causes the delay or a speed benchmark.
+  SPIR-V/cache/state differ. Cache payload630040201B preserved. Visually inspected
+  window-dce-loading.png is black; earlier7730 lowres screenshot has a spinner.
+- Original eboot SHA5178 independently restored/checked, exact installed SHA555d
+  checked; no owned emulator/harness/Ninja/MSBuild/clang remains. Wrapper/atomic
+  restore `_Build/analysis/yotei-dce-integrated-20261007-223318-7e6f48/`; run logs
+  `_Build/runs/game-20261007-223527-normal-native-game/`. No issue108 comment:
+  neither visually confirmed menu nor confirmed game entry reached.
+- Next identify the exact pending pipeline/stall with bounded diagnostic capture,
+  then CPU/IR/scheduling regression before any correction. Do not repeat driver
+  resets or cold uninstrumented long runs. PackedCB numeric/register/use contract
+  remains pending behind the latest stall; no UNorm-to-float coercion or dropped
+  reachable attachment. Menu, game entry and gameplay remain explicitly pending.
+
+- Latest base validation: AudioOut2/audio timing/haptics231507/231635/231641 PASS;
+  full native local-head build233106 PASS. Kernel-file suite231648 reaches and
+  passes the new APR collision/re-resolution cases, then fails at unrelated native
+  socket-option expectation; no whole-suite GREEN claim. New native-indirect
+  upstream fixture reproduced230803, but the upstream predicate candidate also
+  failed230923 under this frontend. Restore old matched renderer/test pair;
+  do not publish an unproved offset fix. Its generic fixture patch is retained
+  outside tracked source for separate SGPR/fetch-contract diagnosis.
+- Installed emulator remains tested33a/EXE555d from the bounded retry. Latest
+  build233106 is not installed or game-tested; no active native process remains.
+
+
+- While final checks ran, main advanced again. Published mergesfd599760/e2c3454d
+  resolve the test-selector conflict by retaining SNORM and adding int16 coverage,
+  and adopt character-device stat behavior. Native int16 GPUAV233853 PASS;
+  /dev/random, urandom, APR and filesystem cases executed before the same unrelated
+  Net socket-option assertion234314. Latest published head e2c3454d is mergeable=true
+  on fresh REST read-back; CI37704056031 is running. These facts supersede earlier
+  current-head statements; prior e4 exact-head CI remains verified all-platformGREEN.
+- Local latest-head changes are merged and not newly installed. Installed555d and
+  the bounded33a runtime remain the exact current executable/run evidence. Original
+  diagnostic source adds remain39/8/37; no unvalidated indirect-offset patch retained.
+
+
+Checkpoint **2026-10-06 21:26 UTC** (local PR integration verified; earlier packed-image use exposed):
+
+- Local HEAD59c26be4, branch yotei-windows-bringup,14 commits ahead of origin.
+  User explicitly authorizes useful PR integration into this branch and conflict
+  resolution. No push or upstream mutation. New local commits: d982a98c packed
+  UNorm raw32 loads;9b18ea75 unused-image regression;31e54af9 semantic PR1112;
+  e7ba687f live image width admission;59c26be4 PR1111 Windows path quoting.
+  Existing dirty PM4/render-target diagnostics and large previous docs preserved.
+- Packed normalized descriptors previously became null because known-format metadata
+  omitted them. Both11/11/10 and10/11/11 now retain exact4-byte integer backing and
+  decode normalized FP32 components for raw32 loads. Intended descriptor RED202110,
+  scoped metadata-absence RED202738 after aligning guest/native4x4 extents;
+  unchanged GPU/GPUAV numerical GREEN, zero/maxima/one-LSB/unequal RGB/default
+  alpha/swizzle constants and real renderer upload/download/sentinel. Sampling,
+  storage writes, atomics,D16 and CB stay closed pending independent proof.
+- PR1112 head9c324c6c / semantic31fb7208: independent native CPU RED204919
+  (index>=source_count) -> unchanged GREEN205633. Conflicts in materialization and
+  shaderCfgTests resolved keeping our copy/first buffer remap and gather tests.
+  Excluded upstream-main merges and format-only f0cb8162. A semantic integration
+  test (live raw32 plus removed D16 metadata) RED210004 -> same GREEN210247;
+  resource plan retains actual image liveness, while live D16 remains rejected.
+  PR1111 head610c839b / semantic0e3dc1be: actual Windows executable-in-space-path
+  RED210528 -> unchanged GREEN210924; ordinary save_data_memory210824 PASS.
+- Reviewed12 relevant PRs; artifacts _Build/analysis/pr-review-20261006/decisions.json.
+  #1119 rejected for zero-filled unreadable resources and removed alias errors;
+  #1118 assumes image stores cannot alias descriptor tables and converts high-bit
+  U32 selectors to null;#1117 omits ordered-count launch ordering. #1115 is a
+  possible storage-conversion lead but opens unproved sampling/width behavior;
+  not integrated. Other candidates need their own matching semantic regressions.
+  Upstream1111/1112 Windows/Linux CI passed,macOS failed; native proof is Windows.
+- Final59c26be4+preserved diagnostics native checks: resource_tracking/admission
+  210953 PASS4.57s/.01s; registered unused-image211052 PASS; GPUAV normalized loads,
+  packed float roundtrip/scaled filtering211156 PASS1.05s/1.14s/.68s. Native build/
+  install211412 PASS, exact installed EXE
+  d65295f67b12f0a49280c1c2019a147a00583dfe2cf074231231838be0ff4f27.
+- New900s/28GiB bounded480x270 run game-20261006-211642-normal-native-game ended
+  naturally21:16:57.504546 UTC/native321 afterabout14.61s, no guards/forced cleanup.
+  It fails EARLIER than the previous CB error: compute e519fa9713f7b8e3 rejects
+  "packed UNorm image format supports raw image loads only". This is regressed
+  runtime advancement exposing a previously-null descriptor use, not improved boot
+  or resolved CB behavior. Actual sampled/store/D16/compare cause not distinguished
+  yet. No current pixels/menu/game entry proof. Core cache618288620B preserved.
+  Original eboot SHA5178 restored automatically and independently checked; no owned
+  emulator/build/harness remains. Wrapper/artifacts:
+  _Build/analysis/low-resolution-integrated-20261006-211413-728ddb/.
+- Next identify exact format/root/use PC and failing capability in this shader;
+  independent synthetic RED/GREEN before opening it. Existing dispatched e519
+  capture223637 has18352B code but lacks compute.needs_lds_barriers; direct CPU
+  audit exited input_error, not emulator RED. Do not silently fabricate metadata,
+  revert to fake null descriptors, or infer sampler/store from the aggregate guard.
+  Previous CB layout6/type0 remains pending behind the earlier boundary. No push
+  or issue108 intermediate publication; playable game entry still pending.
+
+Checkpoint **2026-10-06 20:01 UTC** (bounded 480x270 probe; same packed-target blocker):
+
+- User explicitly authorizes lowering resolution for faster development retries;
+  retain original-resolution validation after a completed correction. The older
+  blurred output was a 480x270 internal surface enlarged to the desktop, not
+  evidence that changing window dimensions changes guest rendering resolution.
+- Native diagnostic-only build/install PASS:
+  `_Build/checks/20261006-195144-5225911-kyty_emulator/`, installed EXE SHA-256
+  `bed81987038151bc43859bc36ea93c8aee832ba74d07beee8a01eca32097b677`.
+  HEAD `08dfdade` plus preserved uncommitted diagnostics. Added bounded source
+  backing/clean-read observations in indirect context register handling and
+  failing surface dimensions/blend state. No format conversion or error bypass.
+- Probe `_Build/runs/game-20261006-195253-normal-native-game/run.json` used the
+  existing hash-verified diagnostic game SHA `4d98c4cf`, 900s/28GiB bounds,
+  redzone/Fifo, Vulkan/shader/GPUAV validation and shader dumps OFF. Source frozen,
+  no overlapping build/tests. Owned PID50920 ended naturally at19:56:09.3314436 UTC,
+  native exit321 after196.132s, no timeout/memory guard/forced cleanup.
+  Wrapper `_Build/analysis/low-resolution-probe-20261006-195227-e351f8/run.ps1`
+  atomically preserved the original and restored it after process termination;
+  `resolution-probe.json` and independent SHA check confirm original game SHA
+  `5178cf80b86e3b6644a3324ebb4f61a3336ee5ccc17d83e84f71bfee86134d86`.
+- Same exact blocker: layout6/type0/order0, RefreshShaders slot2, PS e82bdf234f518f8c.
+  Failing target is **480x270**, one sample/fragment, blend disabled, clamp enabled,
+  bypass disabled. First eight bounded indirect source observations have identical
+  CPU, backing and clean-read words `0x8018`; no evidence of stale backing in
+  these observations. Do not generalize that sample to every later register write.
+  Visually inspected `window-initial.png`: black loading screen with white spinner,
+  no menu/game entry/gameplay. Durable core payload618288620B preserved.
+- The lower-resolution probe reached the same failure in3m16s, versus9m46s in
+  earlier original-resolution run052933. This is useful retry evidence, not an
+  isolated speed benchmark: cache warmth, resolution and diagnostics differ.
+  Use the smaller diagnostic profile for quick retries of this reproduced blocker;
+  closing it still requires the original-resolution workload.
+- Native exact PS decoder/CFG audit PASS:
+  `_Build/checks/20261006-195721-8277234-shader_cfg_tests/` (971 instructions,
+  structured44 blocks). Before structurization all41 blocks reachable from entry.
+  Locally inspected end-block39 EXP instructions include MRT2 atPC0x15f8/en0xf,
+  alongside MRT0..6. Artifact `packed-target-cfg-evidence.json` in probe folder.
+  Static CFG reachability does not prove the runtime branch was taken. Audit
+  explicitly skips pixel translation/resource materialization/SPIR-V/GPU execution.
+  An initial PowerShell invocation rejected malformed harness arguments before
+  running; corrected file-backed invocation produced the recorded PASS.
+- Next establish the legal packed-UNorm CB contract, then independent semantic
+  RED/GREEN and exact native packed render/export/readback cases. Do not replace
+  UNorm with float or discard a reachable attachment. AMD PAL keeps NUMBER_TYPE
+  separate; a shader-buffer format implementation is not CB hardware proof.
+  No production semantic fix, commit/push or issue108 publication in this step.
+  Playable goal remains pending.
+
+Checkpoint **2026-10-06 18:55 UTC** (resume: packed-target evidence and shader inventory):
+
+- Latest normal run `_Build/runs/game-20261006-052933-normal-native-game/run.json`
+  finished at 05:39:19.182665 UTC, native exit 321; timeout and memory guard false.
+  Exact installed EXE SHA-256 matches that run:
+  `3e3513c2b6f9c76056642a6f726d6257f3135306de016a82f0c03901dda40eac`.
+  No active emulator, shader harness, Ninja or MSBuild found at resume.
+  HEAD remains `08dfdade`; existing dirty diagnostics/docs preserved, no build,
+  runtime retry or production behavior change in this checkpoint.
+- Raw indirect CB_COLOR2_INFO register is `0x00008018` at offset `0x33a`.
+  The failing draw has active PS `e82bdf234f518f8c`, 6400 code bytes, decoded
+  nonempty MRT export union `0x7f`, output mode 9 and normal CB mode 1.
+  Slot 2 is present in shader code; treating it as absent is not justified.
+  Its exact registered manifest/binary already exists in
+  `_Build/runs/yotei-integrated-20261005-223637-vertex-access-capture-noval/shaders/registered/ps_e82bdf234f518f8c_556489d9735846dc.json`.
+  The export union does not prove execution of every conditional export.
+  Layout 6/type 0/order 0 remains the runtime blocker; numeric interpretation
+  still needs a primary contract and an independent semantic RED before fixing.
+- Counted the larger preserved registration capture: **21884 metadata records,
+  21873 distinct XXH3 code-content hashes**: CS 7243, PS 9808, GS 4810,
+  HS front 7, HS back 5. The old extracted container has only 825 records,
+  606 code files and 602 SHA-256-distinct contents; it is not the game's total.
+  Count method is confirmed by `src/libs/agc.cpp` and sample manifests per stage.
+  Artifact `_Build/analysis/shader-inventory-20261006-185537-f834b2.json`.
+  Registered code does not prove dispatch, GPU compilation or full-game coverage.
+- Latest durable driver-cache payload is 617943592 bytes (about 589 MiB).
+  Existing batch auditor checks CPU decoding/CFG and supported compute tracking;
+  it does not materialize complete runtime resources or precompile native pipelines.
+  An offline GPU warmup needs captured resource specialization and graphics state,
+  including host-feature compatibility; one source can have several pipelines.
+  No new GPU warmup or compilation claim. No push or issue #108 publication.
+  Menu/game entry/gameplay remain unverified on the current executable.
+
+Checkpoint **2026-10-06 05:08 UTC** (packed RT actual-export diagnosis; normal retry active):
+
+- DiagnosticC2 rungame044518 naturallyended04:56:03.466UTC/native321; own47384/
+  supervisor7640 absent, finalstreams, no guards/forcedcleanup. Contextconfirmed
+  callerRefreshShaders, slot2/registeroutputmask0x7f, CBmode1(normal), PSactive1,
+  PSaddr0x8000351e00, target_output_mode9. This provesprecompilemapping lookup,
+  not thatslot2 is actuallyexported bycode. Existingformat6/type0 rejection kept.
+- Current diagnostic-only dirtyrenderDraw delta additionally preparesbounded PS
+  code and decodes EXP instructions onunsupportedlookup, printinghash/codebytes/
+  unionMRTexportmask. No newtype interpretation/exportmask/formatbehavior fix.
+  Nativebuild _Build/checks/20261006-050308-7721471-kyty_emulator/ PASS/install0,
+  exactEXEfc534e034e1db5e89b6d95b8f9383fa2939b7fa6c5aa63158f460d6243558cd4,
+  source08dfdade+uncommittedcontextdiagnostics inrenderDraw/colorRenderTarget.
+- ACTIVE own31108/Windowssupervisor30840 since05:06:01.835UTC:
+  _Build/runs/game-20261006-050601-normal-native-game/run.json, live logs.
+  OriginalSHA5178/redzone/fullscreen2560x1440/Fifo/silent/dumps+allvalidationOFF,
+  same3600s/28GiB bounds/nativelease. Sourcefrozen/no tests/build overlap.
+  Initialshown26 only, no menu/gameentry. Cache616761325B payloadpreserved.
+- Next establishwhether actualEXPwrites slot2 before choosingformat/planningfix.
+  Liveexport contract canexcludeinactive slots, but do notcoerceUNorm->Float or
+  dropanydeclaredrequiredoutput. Unknown/unsupporteddecode mustfailconservatively.
+  PrimaryPALformat/NUMBER_TYPE code givesno proof ofignoredtype0. No semanticRED
+  orfix forpackedformat yet. Plan/debt/previoushandoffs retainallcompletedfixproof.
+  No push/issue108 comment; userplayableoutcome stillpending, continue.
+
+Checkpoint **2026-10-06 04:46 UTC** (packed RT context-only normal retry active):
+
+- Nativebuild _Build/checks/20261006-044338-0399914-kyty_emulator/ PASS/install0.
+  Source08dfdade plus UNCOMMITTED diagnostic-only renderDraw.cpp/colorRenderTarget.cpp
+  delta: before unsupported-format lookup, printcaller/slot/masks/CBmode and PSstate
+  or explicit resolve flags. Existing format interpretation/rejection preserved.
+  First diagnostic build044151 had a local variable typo, corrected before valid
+  build; no RED/format behavior-fix claim. Exact installed/builtEXE
+  c2e71acd1c9b50e34ab8e653e10c3754bd9f860076febba52a66658d4ac8455b.
+- ACTIVE own47384/Windowssupervisor7640 since04:45:18.551UTC:
+  _Build/runs/game-20261006-044518-normal-native-game/run.json, live streamlogs.
+  OriginalSHA5178/redzone/fullscreen2560x1440/Fifo/silent/dumps+allvalidationOFF;
+  same3600s/28GiB bounds, sharednative lockheld, no tests/build/sourceedit overlap.
+  Initialshown62 only; no currentmenu/gameentry. Corecache615354867B preserved.
+- AMD primary PAL GFX9/GFX10 ColorTargetView code explicitly populates NUMBER_TYPE
+  fromColorSurfNum independently ofFORMAT; this does not prove stale type0 can
+  beignored forpackedfloat. Actualcaller/CB operation needed before independent
+  semanticRED. RefreshShaders currently looksup exportmapping using registermask
+  before translated PSactualMRToutputs, even if PSinactive; inactive/stale state
+  is a lead, not proof ofthisfailure. ResolveRenderColorTarget skipszero mask/base
+  unless explicitlyignore_target_mask. Format6/type0 stillunsupported asbefore.
+- Next capture precisecaller onthisnormalretry, derivecorrect sharedcontract,
+  recordrequiredtest thenfix. Currentcode onlydiagnosticdelta, no permission
+  gate/push/issue108 comment. Usercontinueuntilplayable remainspending.
+
+Checkpoint **2026-10-06 04:36 UTC** (FMASK stage passed; render-target format blocker):
+
+- Native08dfdade/SHAb361 normal original rungame-20261006-041213-normal-native-game
+  ended04:29:10.472UTC/native321, own32080/supervisor40776 absent; streams finalized,
+  no timeout/28GiB guard/forcedcleanup. OriginalSHA5178/redzone/fullscreen2560x1440/
+  noDebug preserved. Actualspinner04:23:51/shown256, no menu/gameentry in retry.
+- Earlier sampler33, image513 and sampledFMASK failures passed. Next actualerror
+  unsupported render-target format combination layout6/type0/order0 at
+  src/graphics/host_gpu/renderer/image/textureCommon.cpp:142. Here layout6 is guest
+  k11_11_10, type0 kUNorm. Resolver returns k11_11_10UNorm, but format/storage/host
+  mapping supports k11_11_10UInt and Float only. Do not assume UNorm can be coerced
+  to float or disabledattachment skipped; determine actual color-buffer contract
+  and caller use first. PM4direct/indirect parsers both read NUMBER_TYPE bits8..10.
+- Cache payload loaded613123768B -> checkpointed615354867B, preserved. New selector
+  CPU/GPU semantic+alias checks remainPASS. Runtime startup improvement not quantified;
+  no sampledFMASK admission/silencing, no driverreset/debugger/profiler/readback.
+- New required format regression debt recorded next. Primary AMD CB register docs
+  describe packed11/11/10 color layouts as float-only, but ignored numeric-selector
+  behavior has not been proved; do not derive it only from game type0. Alternative
+  normalized packing/clear-only/disabled use need distinction before semantics fix.
+  No source edits for this format blocker yet. Core/tests/CMake08dfdade committed,
+  olddirtydocs preserved. No push/issue108 comment, playable goal stillpending.
+
+Checkpoint **2026-10-06 04:14 UTC** (scalar selector fix installed; original normal retry active):
+
+- Source/local08dfdadeaa6b3d90b9e9fda0b93e649d23d8464f installed after nativebuild
+  _Build/checks/20261006-041020-3989383-kyty_emulator/ PASS/install0. ExactEXE
+  SHA256b3612559ca850b716add6f4e06100b9a75d477bb0937a1e4c336beed29cac152.
+  Core/tests/CMake committed; prior dirtydocs preserved, no push.
+- ACTIVE own32080/Windows supervisor40776 since04:12:13.823UTC, streaminglogs:
+  _Build/runs/game-20261006-041213-normal-native-game/run.json. OriginalgameSHA5178
+  unchanged; redzone/fullscreen2560x1440/Fifo/silent/dumps+allvalidationOFF, same
+  3600s/28GiB bounds. Sharednative slot held; source inputs frozen/no test/build
+  overlap. Initialshown40 only, no currentmenu/gameentry/realFPS claim.
+- Previous diagnostic12336/supervisor41476 naturallyexited32103:33:15.107UTC;
+  explicitFMASK sampledroot8/pc0648/key113a8 atsamplerbytes, cache613123768B preserved.
+  New scalar-domain independent CPURED034102 -> unchangedGREEN035130 and expanded
+ 035655 PASS; fullresource_tracking0407324.17s. NumericGPUAV035828 PASS; native
+  paddedimage/buffer writer guardRED040225 -> GREEN040520. Finalregistered040847
+  .50s+1.49sPASS, no timeout/reset. No new sampledFMASK admission or illegalcandidate
+  removal: unavailable/oversized proof fallsback, reachablewrappedFMASK stillrejects.
+- Current actual inputbuffer extent/coherence/read-only checks and passingFMASK
+  stage remain runtimePENDING. If finiteproof works, fewer native variants should
+  reduce preparation; no measuredstartup improvement yet. Helpers/status now
+  _Build/analysis/scalar-selector-snapshot-20261006/ with B361 hashchecks.
+  Continue towardactualQuality and controllablegameplay, no intermediateissue108
+  comment (prior visualmenu comment5994262387 remains lastauthorizedmilestone).
+
+Checkpoint **2026-10-06 04:11 UTC** (coherent scalar selector domain fix verified; native retry pending):
+
+- Normal diagnostic032325 source896ca780+detail/EXE4e2890 ended03:33:15.107UTC/
+  native321, no timeout/memory guard/forcedcleanup; own12336/supervisor41476 absent.
+  Actual FMASK failure: image250/root8/pc0648, sampledtrue/storagefalse/comparefalse,
+  format159, firstkey0x113a8. Stride872/offset204 places descriptor atrow81+140,
+  within sampler-word bytes. Do not interpret it as missing indirect IMAGE_LOAD.
+  CapturedIR has rawU32 scalar index-buffer read at a DWORD-aligned shifted offset.
+- Completed local08dfdadeaa6b3d90b9e9fda0b93e649d23d8464f extends shared inline
+  resource planning with optional scalar selector source metadata. Compute caller
+  opts into coherent DWORD-value snapshots; derive exact wrapped bytekeys from
+  the full finite readable word domain, retain zero for incomplete/OOB reads.
+  Bulk reads reuse64MiB total work budget; distinct-values/probes remain65536,
+  failed/unknown/too-large proof retains old conservativewrapped domain. Shared
+  address/size domains are cached per materialization; no whole-device allocation.
+- Captured selector byte ranges become immutable; existing buffer and full padded
+  image writer admission checks remain mandatory. Other bounded coefficient reads
+  preceding writes cannot bypass checks for newly captured selector bytes. No
+  sampledFMASK admission, fakezero descriptor, title/hash/address code or skipped
+  reachable unsupportedwork. If input really wraps toFMASK it still rejects.
+- Independent CPU intendedRED034102 -> unchangedGREEN035130. Expanded035655 PASS:
+  reachable ordinary descriptors/mappings, immutableinput ranges, huge U32 wrapping
+  tokey32 stillFMASKreject, missingdata/offline/overbudget conservative reject,
+  empty/partialword definedzero, disjointwriter allowed/aliasedwriter transactionally
+  rejected. Finalresource_tracking040732 PASS4.17s incl existing affected cases.
+- NativeGPUAV numerical ordinarysamples with unreachableFMASK/prefixguard035828
+  PASS. Independent native renderer admissionRED040225: selector bytes overlap
+  writablebuffer/paddedimage despite old coefficient-before-write flag; children
+  wronglyreturned0 on unchangedrenderer guard. SameGREEN040520 PASS after guarding
+  bypass; legacyordered/disjoint neighbors remainallowed. Final registered CPU/GPU
+  selectors040847 PASS .50s +1.49s, no timeouts/reset. Artifacts _Build/checks/.
+- Native emulator build inprogress from committed08dfdade, source inputs frozen,
+  no gameactive. Install/new originalnormalretry pending; installedgame stillold
+  diagnostic4e2890 until install. Actual index-source extent/coherence and passing
+  runtimeFMASK stage remain unproved. No other-game corpus/playableclaim/push or
+  issue108 comment. Preserve originalSHA5178 and corecache613123768B.
+
+Checkpoint **2026-10-06 03:25 UTC** (FMASK detail-only normal retry active):
+
+- Native build _Build/checks/20261006-032029-0591928-kyty_emulator/ PASS, install0.
+  Source896ca780 plus UNCOMMITTED diagnostic-only FMASK error detail; not a behavior
+  fix. Exact built/installedEXE SHA2564e28901d2abb920b9e8bbf8821a271920b6fd71752cfaab131bee7cdbc7bf4fa.
+  Old FMASK rejection condition preserved. No added admission/zero/selection skip.
+- ACTIVE own12336/Windows supervisor41476 since03:23:25.707UTC, normal bounded
+  _Build/runs/game-20261006-032325-normal-native-game/run.json. SameoriginalSHA5178,
+  redzone/fullscreen2560x1440/Fifo/silent/dumps+allvalidationOFF, 3600s/28GiB bounds.
+  Initialshown23 only; no menu/gameplay claim. Cache613123768B retained. Source
+  inputs frozen, no concurrent test/build. Build was completed before newlaunch.
+- CPU capturedshader audit031443 previously establishes five inline IMAGE_SAMPLE
+  roots with raw U32 index from a scalar buffer; does not capture current FMASK
+  descriptor or prove selector domain. This retry should identifyactualimage/root,
+  operation PC, storage/compare/sampled flags, format and first mappedbytekey.
+  No debugger/profiler/graphics dump enabled. Further semantics/testdesign await
+  this cause; no indirect-FMASK-load fix guessed from sparseerror.
+- Helpers _Build/analysis/indirect-fmask-20261006/ copied with new4E hash checks.
+  Previous36488/supervisor35268 already absent after natural321. No push/issue108
+  comment; continue toward actual playable outcome.
+
+Checkpoint **2026-10-06 03:21 UTC** (native capacity fixes pass; FMASK provenance diagnosis):
+
+- Installed/tested896ca780/SHAffc81f normal original rungame-025652 ended
+ 03:06:59.227UTC/native321, own36488/supervisor35268 absent, both streams final,
+  no timeout/28GiB guard/forcedcleanup. Old sampler33 and combinedimage513 guards
+  passed; next samecompute34be6ffcc212383c: "FMASK requires a direct image load".
+  Actualspinner03:00:28/shown233, lastshown252; no menu/gameentry. Corecache loaded
+ 610628405B and checkpointed613123768B, preserved. OriginalSHA5178/noDebug/redzone.
+- New debt recorded before behavior changes. Current sparse FMASK check groups
+  storage, compare, indirect and sampled restrictions; do not assume merely an
+  indirect-load gap or suppress it. Core behavior is unchanged for this blocker.
+- Existing private capture found: _Build/runs/yotei-integrated-20260906-000309-b63f4e/
+  shaders/dispatched/compute_34be6ffcc212383c_45e7cc5240e4dbe4.json + siblingbin.
+  Current native CPU audit _Build/checks/20261006-031443-4165859-shader_cfg_tests/
+  PASS through resource_tracking only, no materialization/GPU/runtime proof;
+  exact2976B content hash checked, 453instructions, 14logical images, one sampler,
+  five sampled pairs. Roots6..10 allinline IMAGE_SAMPLE_RAW, offsets152/296/204/
+ 236/220, stride872, selector_limit0. Selector is raw U32 ReadConstBuffer from
+  index buffer; no proved bitmask/narrow width in capturedIR. Thus sampled FMASK
+  or an over-approximated wrapped key remains possible, not a diagnosed load fix.
+- Temporary diagnostic-only error detail added to ResourceMaterialization.cpp:
+  original guard retained, reportsimage/root/usePC/storage/compare/root_sampled/
+  format/first mappedbyte key. No fake descriptor, new FMASK admission or masks.
+  Native emulator build now active via check-native-change; source896ca780 plus
+  diagnostic dirty delta, no concurrent game. Next install its exacthash and
+  original bounded normal retry to identify realcause before semantic RED/fix.
+- AMD primary RDNA2 ISA cached _Build/analysis/rdna2-isa-budget.pdf/.txt, public
+  documentation URLs checked (old AMD fetch401; official new document located).
+  Preservecaptures/game/caches. No push/issue108 comment; playable goal pending.
+
+Checkpoint **2026-10-06 02:58 UTC** (combined-image fix installed; normal retry active):
+
+- Completed local fix896ca780cefa39ef668f48f6ac35e2dc374e2961, after sampler07bea78d.
+  Native build _Build/checks/20261006-025511-5347797-kyty_emulator/ PASS, install0;
+  exact built/installed EXE SHA256ffc81fbd87176b825c5f0e22201bb55281b814452a476f16be5712f57b1276c3.
+- Image CPU intended RED024406 -> unchanged GREEN024522; final resource_tracking
+ 0251284.13s and descriptor_budget025255 PASS. Native GPUAV combined514 independent
+  numeric/sentinel test0250158.39s, shared inline025326 and FMASK/integer025414 PASS.
+  Logical and per-table512 unchanged, host aggregate image ceiling derived from
+  real limits, final typed/mip/other descriptor budget retained. No cross-game claim.
+- ACTIVE own game36488/supervisor35268 since02:56:52.160UTC:
+  _Build/runs/game-20261006-025652-normal-native-game/run.json. Independent background
+  caller0; streams live. OriginalgameSHA5178, redzone/fullscreen2560x1440/Fifo,
+  diagnostics+dumps+validationOFF, same3600s/28GiB bounds. Shared execution lock held;
+  source inputs frozen, no tests/build overlapping. Initial shown16 only, no current
+  menu/gameentry proof. Prior07 run passed sampler33 then failed combined image513
+  at02:39:29.981/native321; cache610628405B payload preserved.
+- Next verify new normalrun passes combinedimage blocker, reach actual Quality
+  selection and controllable gameplay; record new semantic regression if another
+  blocker occurs. No push/issue108 comment; user asks continue until playable.
+
+Checkpoint **2026-10-06 02:54 UTC** (sampler fix passed original blocker; combined-image fix under validation):
+
+- Normal game022841 native07bea78d/SHA8626 ended02:39:29.981UTC/native321;
+  own49428/supervisor51068 absent, streams finalized, no timeout/memory guard or
+  forcedcleanup. OriginalSHA5178/redzone/noDebug unchanged. Actual spinner shown255
+  at02:32:31, no menu/gameplay in this retry. Pipeline cache loaded609930772B,
+  checkpointed610628405B. CPU continued and native GPU status was1%/10488MiB;
+  no GPU reset, debugger, profiler or guest/frame readback.
+- Earlier sampler33 error passed. Next shared blocker same compute34be6ffcc212383c:
+  combined native image513 rejected by compiler512; currenttable123 candidates,
+  size71504/stride872/probes8921. Independent debt recorded before production edits.
+- Combined-image test minimal native CPU intended RED:
+  _Build/checks/20261006-024406-8095823-resource_tracking_tests/ rejects image513
+  across two independently bounded256-row tables. Unchanged GREEN024522 PASS,
+  preserving all514 original descriptors and per-root key mappings; budgets513,
+ 512,1,0 fail transactionally. Binding allocation retains all514. The first test
+  build024339 had an invalid fixture enum name, corrected before valid RED;
+  build failure is excluded from reproduction evidence.
+- Working correction derives aggregate native image ceiling from typed sampled/
+  storage stage/layout ceilings plus maxPerStageResources, grows ImageRemap for
+  actual candidates, preserves logical512 and per-table512/probe work budgets.
+  Final layout still validates individual classes, storage mips, other resource
+  types and combined graphics stages. No guessed constants or resource bypass.
+- Native GPUAV final combined514 numeric/sentinel test025015 PASS8.39s, no timeout.
+  Initial GPU fixture024704 rejected at preserved per-table513 candidate limit
+  before GPU work because its selector was unbounded. Corrected fixture to use
+  the same dominating256 guard as CPU; first/last numeric oracle unchanged,
+  out-of-range selector explicitly leaves output and adjacent sentinels. No
+  production per-table guard weakened. Actual device aggregate ceiling2097152.
+- Final resource_tracking025128 PASS4.13s, descriptor_budget025255 PASS incl typed
+  limits, mips, auxiliary descriptors and overflow arithmetic. Shared inline GPU
+  neighbor and FMASK neighbor verification in progress. Commit/build/install/new
+  normal retry pending. Installed emulator still07bea78d/SHA8626. Other-game GPU
+  corpus absent; no playable claim/push/issue108 update.
+
+Checkpoint **2026-10-06 02:29 UTC** (fixed native Release installed; normal game retry active):
+
+- Native emulator source/local commit07bea78df2b125ec52cf143175b605156b5cc37f;
+  _Build/checks/20261006-022746-5624816-kyty_emulator/ buildPASS, install0.
+  Exact built/installed executable SHA2568626d0f127cbc79da20921c7395ded55676a9129d6b00991ae8a8dd2134e78b4.
+- ACTIVE game49428/supervisor51068, started02:28:41.441UTC;
+  _Build/runs/game-20261006-022841-normal-native-game/run.json. Independent
+  background launcher returned0, stdout/stderr stream live. Original ebootSHA5178
+  unchanged; redzone/fullscreen2560x1440/Fifo, alldiagnostics/validation/dumpsOFF.
+  3600s/28GiB bounds unchanged, shared native slot held, no concurrent source
+  change/build/test. Initial shown8 verified, no current menu/gameplay claim.
+- Native sampler fix CPU/GPUAV proof in next checkpoint. Durable cache preserved.
+  Runtime crossing old33-sampler failure, Quality selection and actual gameentry
+  pending. No push/issue108 comment; continue toward playable user outcome.
+
+Checkpoint **2026-10-06 02:27 UTC** (native sampler capacity fixed; normal retry pending):
+
+- Local completed fix `07bea78df2b125ec52cf143175b605156b5cc37f` separates
+  original logical guest sampler limit 32 from expanded native descriptors.
+  SrtRuntime receives min(stage sampler limit, layout sampler limit); dynamically
+  sized sampler plans preserve descriptor origins, pair mappings, filtering and
+  integer borders. Numeric class clones also consume the same budget. Final
+  renderer layout still validates combined graphics stages and other resources.
+- Independent synthetic native CPU RED: `_Build/checks/20261006-021845-4513498-resource_tracking_tests/`
+  rejects the 33rd distinct inline sampler with the intended semantic message.
+  Identical GREEN: `.../20261006-021949-5805146-resource_tracking_tests/`.
+  Expanded neighbors: `.../20261006-022203-6525207-resource_tracking_tests/` PASS;
+  budgets 32, zero and class-clone overflow reject transactionally; six numeric
+  class bindings retain point filtering/integer border semantics.
+- Final native resource_tracking CTest PASS 4.11s (`.../20261006-022418-5549665-resource_tracking_tests/`);
+  descriptor_budget PASS .03s (`.../20261006-022513-5407955-descriptor_budget_tests/`).
+  GPUAV exact sampled values for candidate slots crossing 32 plus explicit null
+  fallback PASS (`.../20261006-022238-1407526-shader_recompiler_compute_tests/`);
+  final isolated CTest PASS .71s (`.../20261006-022548-5675436-shader_recompiler_compute_tests/`).
+  Actual RTX 5060 Ti separate sampler ceiling 1048576; vectors grow only for actual
+  candidates, never allocate the whole device ceiling. Existing integer/packed/
+  float sampling neighbors PASS (`.../20261006-022618-5837901-shader_recompiler_compute_tests/`).
+- Tests use reusable synthetic data, no title/hash/address exception, guest cap
+  increase or descriptor substitution. Other-game GPU corpus unavailable; no
+  cross-game compatibility/runtime proof from these tests. Build/install and
+  original normal retry pending; until install exact emulator remains B4/SHA87.
+  Preserve original gameSHA5178, core cache, no-debug/redzone/fullscreen quality
+  intent. No push or issue comment; playable user goal still pending.
+
+Checkpoint **6 октября 2026 года, 02:05 UTC** (stable background run finalized; sampler-capacity blocker):
+
+- Current installed/tested emulator/source remains b4eae640/SHA87f24c32,
+  original gameSHA5178cf80. Generic workflowHEAD4133be94 adds normal independent
+  Windows background supervisor and streaminglogs, not another emulatorbuild.
+  Own29472/supervisor21808 finalized/absent; no source edits/tests/build overlap.
+- Run _Build/runs/game-20261006-011540-normal-native-game/ started01:15:40.260,
+  ended01:53:34.472UTC/native321, streams EOF, no timeout/28GiB guard/forcedkill.
+  --redzone/fullscreen2560x1440/Fifo/silent/allvalidation+dumpsOFF; no debugger/
+  profiler/readback. Actualspinner/shown221-254 captured, then newpipelines before
+  explicit failure. No guessedpercent ofpreparedframes, mainmenu/gameentry/FPS
+  claim. Stablebackground avoids prior interruptedWSLcommand/logloss; actual
+  shellcaller exit0 while supervisor persists, liveUTF8stdout/stderr retained.
+- Current blocker compute34be6ffcc212383c pc05e8: inline sampled pair requires
+ 33 samplers whilecompilerpolicy32; size71504/stride872/probes8921/pairs172.
+  Original guard rejects before usable nativepipeline; no fabricatedsampler or
+  suppression. BuildSamplerPlan has corresponding fixed32 mapping/binding/usage
+  arrays and classclone budget, so single constantincrease is not a fix. Required
+  independent host-derived capacity/class/transaction regression added to debt.
+- Previous001807 actually accepted Medium->Standard->Quality and survived the
+  oldDIVstage with --redzone; Qualityselection00:48:57/shown1018 andconfirmation
+ 00:50:41/fade00:52:11 remain captured. Later thatrun lostsupervisor/finalization
+  (nativeexitUNKNOWN), not labeled guestcrash. The currentnormalretry did not yet
+  reach another settingsscreen before newmaterialization failure. PreviousQuality
+  choice is proof of UIselection, not savedprofile/mainmenu/playablegame.
+- Durable corepayload609930772B (file609930957B) preserved, original/proprietary
+  files untouched. ExistingCPUredzoneproof .17s, normal launcherDryRun/busyguard/
+  nativebackgroundlaunch/streaming/gracefulclose/noinheritedterminalpipe proof;
+  no repeatedfullsuite orGPUreset. Samplerproductionfix remainsPENDING; next
+  focusedCPU intendedRED then unchangedGREEN+neighbors/nativeGPU, rebuild/install
+  once and originalnormalretry. No blind limits, debugmode orlowresfallback.
+- Workflowcommits7eae9dd1/4133be94 localonly; dirtypriorplan/debt preserved. No
+  push/merge/issue108 comment. Userplayablegoal NOT achieved; next external
+  checkpoint ONLY visuallyconfirmedactualgameentry, prior menumilestone retained.
+
+Checkpoint **6 октября 2026 года, 01:20 UTC** (normal Windows background launcher verified; game retry active):
+
+- Runtime001807 reached/acceptedQuality at00:48:57/00:50:41, then shown1123
+  stalled after settings. Lastverified00:57:12: responsive, working28022267904B
+  (~26.1GiB, below28GiB). Supervising WSLcommand returned143; both44940 and
+  supervisor disappeared before finalizer. run.json initialonly, stdout/stderr
+  missing. No matching WindowsError/Hang/WER last30m and no LinuxOOM log;
+  nativeexit/reason/actualguard status UNKNOWN. Do not label it another guest
+  divide crash orcompletedgame. interruption-observation.json records the limit.
+  Durable corecache563762684B payload preserved, no arbitraryguard/cap increase.
+- Generic normal tool extended in local `4133be94`: -Background uses hidden native
+  Windows shell execution, separating supervisor handles from terminal pipes.
+  Both childlogs stream line-by-line/flush while active; existingbounded cleanup
+  and sharednative-check lease remain. End-to-end startup verified. First trial
+  worker inheritedterminalpipes, detected because caller session stayedopen;
+  ownstartupgame18496 gracefullyclosed01:13:27, native0/finished01:14:44 with
+  bothstreamsdrained, noguard/forcedkill. Corrected background caller exits0 in
+  <1s while its Windows supervisor and game remainlive. No emulatorcore changes.
+- ACTIVE native game29472/supervisor21808, since01:15:40UTC:
+  _Build/runs/game-20261006-011540-normal-native-game/run.json.
+  NormalRelease sameB4/SHA87f24c32/originalgame5178cf80, --redzone/fullscreen
+  2560x1440/Fifo/allvalidation+dumpsOFF, no debugger/profiler/readback. Supervisor
+  3600s/28GiB unchanged, sharedlockheld; no overlappingtest/build/sourcechanges.
+  wrapper _Build/normal-supervisor-20261006-011539-2021a5.ps1 and UTF16logadjacent.
+  Live stdout/stderr readable: corecache loaded, newcheckpoint566637138B;
+  actualspinner01:18:39/shown221, gameentry/Qualityselection in THISretry pending.
+- PriorQualityacceptance screenshot/ui-state preserved under001807. Normal
+  keyboard SendInput/focus+owner+hash guards validated acrossallsettings; inputs
+  released. No pressedkeys in currentretry. Helpers under
+  _Build/analysis/workgroup-capacity-20261006/{capture,cross-foreground,left-foreground}.ps1
+  stilluseexactSHA87. Next complete normalUI in stable backgroundrun and prove
+  actualgameentry; no firstscene/mainmenu/gameplay/FPS/colorcorrectness claim.
+- Oneexisting CPUredzonecheck(.17s) and launcherDryRun/busyguard/realstart/
+  gracefulclose/logEOF/diffchecks only, no repeatedfullsuite/emulatorrebuild.
+  Sourceemulator remains b4eae640; workflowcommits7eae9dd1/4133be94 do not
+  represent a new testedemulator orpublishedPR/CI. Dirtypriorplan/debt preserved.
+  No push/merge/newissue108 comment; nextpublicationONLY actualconfirmedgameentry.
+
+Checkpoint **6 октября 2026 года, 00:55 UTC** (original-resolution Quality accepted; normal retry active):
+
+- Native executable unchanged localb4eae640/SHA87f24c32, originalgameSHA5178cf80.
+  ACTIVE owned44940/run001807 since00:18:07, --redzone/fullscreen2560x1440/Fifo,
+  debugger/profiler/validation/dumps/readback OFF, original3600s/28GiB bounds.
+  No builds/core/tests changes during this runtime, no new nativeUIFPS claim.
+- Actual foreground SendInput confirmed Medium->Standard, screenshot00:40:30
+  shown581; then Standard->GraphicsMode/Performance00:44:59/shown797. Keyboard
+  layout04090409, focus/owner/hash guards, each helperfinally releases key andexit0.
+  Earlier60s input duringMedium fade had no proven selection, repeated once
+  afterprompt. Newnormal keyboard input is verified from visible guest transitions.
+- Left750ms00:47:40->00:47:41 selectsQuality: actualwhiteCross/higher-resolution
+  target30FPS screen captured00:48:57/shown1018. Cross1000ms00:50:40->00:50:41
+  accepted, Quality screen fadesout00:52:11/shown1122. All keys released; next
+  scene/gameentry remains pending. Normal screenshot and ui-state/interactions
+  manifests under _Build/runs/yotei-20261006-001807-original-resolution-redzone-nodiag/.
+- Runtime now exceeds previous17min guestinteger exception and passes that same
+  setup stage. No recurrence observed with existing --redzone protection. This
+  supports the red-zone lead; no counterfactual gamecrash/crossgameproof claim.
+  Existing native CPU protected/unprotected syntheticPASS .17s recorded below.
+- Local workflow commit `7eae9dd1`: tools/run-native-game.ps1 andtoolsREADME provide
+  a generic Windows normalgame launch. Discovers repo/install paths, hashes exact
+  executable/eboot, always enablesWindows stack protection, fullscreen/silent/
+  no-debug args, per-child diagnosticenv cleanup, redirects/drains both streams,
+  sharednative-check lease/activeprocess guard and boundedownedcleanup. No build/
+  test cycle or gamefile patch; limits configurable with same3600s/28GiB defaults.
+  DryRun prints exactexpected args/hashes; active44940 conflictcheck deliberately
+  rejected without a secondgame/runfolder. DiffcheckPASS; no new artificialtests.
+  Workflowcommit does not change installed/source emulatorb4 or prove gameplay.
+- Next verify actualscene after Quality, then use ordinary input toward gameentry.
+  No push/merge/newissue108 comment; prior menucomment retained, nextauthorized
+  external milestone ONLY actualconfirmedgameentry. Fullcolor/audio/FPS unproved.
+
+Checkpoint **6 октября 2026 года, 00:19 UTC** (Windows red-zone protection enabled; normal original-resolution retry active):
+
+- Current native build/source remains localb4eae640, installedSHA87f24c32,
+  original gameSHA5178cf80. No core or gamefile changes and no repeated fullsuite.
+  Verified no previous game/build/test process alive before next native run.
+- Read-only ELF/SELF extraction now identifies the complete faulting leaf function
+  and the divisor producer: copy globalDWORD into[rsp-0x74], test the source value
+  forzero and branchaway before entering table loop; later external memory accesses
+  precede DIV. All live locals extend toRSP-128. This is a concrete Windows/SysV
+  red-zone lead, not evidence for an initially empty buckettable. Originalinstruction
+  matches OSdump; small private disassembly remains ignored, no guestcode edits.
+- Previous normal runner omitted --redzone; config default isfalse. Runtime linker
+  then entirely bypasses the existing memory-fault red-zone patcher (prior mapped
+  size lacks8MiB trampoline). Microsoftx64 stack contract treats memory belowRSP
+  asvolatile; disabled protection cannot preserve SysV leaf locals across Windows
+  exceptions. Actual causal overwrite still requires runtime comparison, no masking.
+- Existing native synthetic --red-zone-patcher-only PASS00:17:12/EXE11C2D122,
+  0.17s: fixture asserts modeled unprotected-corrupt result and protected exact
+  sentinel preservation under a bounded Windows memory exception. Artifact
+  _Build/checks/20261006-001623-4316002-virtual_memory_allocation_tests/. No new
+  production correction/test expectation invented for this workflow setting.
+- ACTIVE owned44940 since00:18:07UTC,
+  _Build/runs/yotei-20261006-001807-original-resolution-redzone-nodiag/run.json.
+  Same originalhash/fullscreen2560x1440/Fifo/silentlogs/validation+dumpsOFF;
+  --redzone enables existing platform ABI protection, not diagnostics. Only unchanged
+  3600s/28GiB supervisor; no source edits/builds/GPU tests during game. Cache preserved.
+  Next verify normal menu, use actual foreground input and selectQuality, then
+  confirm gameentry. No success/crashfix/Quality/gameplay/FPS claim yet.
+- User reiterates fast precise progress toward playing. Only focused existing
+  CPUcheck used; no fullbaseline repeats, driver reset, lowresolution restoration,
+  sourceexception/gamepatch or capabilitylimit change. No push/merge/issue108 update.
+
+Checkpoint **6 октября 2026 года, 00:10 UTC** (original-resolution sharp menu confirmed; native guest divide fault):
+
+- Local committed emulator `b4eae640f700bb1dbd25bd1d98605d523c7e8aa2`, exact
+  installed/built SHA256 `87f24c328f3f6b81eec47ad9c9f6e8fb7c546ff5344f63d0c137a8022679ef36`.
+  Shared workgroup-capacity correction has native CPU RED/unchanged GREEN,
+  expanded boundary cases, numerical65537-group GPUAV and nearest coefficient
+  neighbor PASS; full resource_tracking PASS3.99s. Source clean committed;
+  preexisting dirty launch-plan/test-debt edits preserved, no push/CI claim.
+- Finalized `_Build/runs/yotei-20261005-234419-original-resolution-nodiag/`:
+ 23:44:19.896UTC ->00:01:29.156UTC, native0xC0000094, both streams complete,
+  owned44484 absent. No timeout/28GiB guard/forcedcleanup, no validation/debugger/
+  dumps/readback/profiler. Original game file SHA5178cf80 restored and retained,
+  original4K/dynamic-resolution table, fullscreen2560x1440/Fifo/silentlogs.
+  Old diagnostic480x270 copy and original backup preserved outside tracked files.
+- Actual sharp Medium menu confirmed23:51:00/shown296,23:52:21/shown298,
+ 23:58:11/shown308 withwhiteCrosshint. Original-resolution text/tree/fire details
+  visibly sharper than previous480x270 run. After ownedPostMessageCross60s,
+ 23:59:05.813->00:00:05.870/helper0/keyreleased, captured00:00:35/shown313 still
+  Medium. No Standard/Quality/actualgameentry/coloraccuracy or playableFPS proof.
+  ForegroundSendInput helper subsequently withheld before any input because the
+  game already exited. Do not attribute crash to input or newreserve without proof.
+- WindowsApplicationError1000/PID44484 at00:01:16.802 reportsc0000094, unknown
+  module/address0x90113378e. Existing local WER dump63MB gives samePC/thread36976.
+  Read-only offline parsing, no live debugger: main guestmodulebase0x900000000,
+  actual instruction unsignedDIV32 at[rsp-0x74], EDX0/EAXffff087d, then remainder
+  indexes a pointer table. Exception therefore implies zero divisor; the stack
+  DWORD/producer is outside captured memory, so empty-table/red-zone/API/coherence
+  cause remains unproved. No gamecode patch, exceptionmask or fabricated zero.
+  Ignored evidence `_Build/analysis/workgroup-capacity-20261006/crash-context.json`,
+  smallfaultcode binaries/parser; full OS dump stays local, never shared/copied.
+- Persistent cache loaded542376395B; final durablecheckpoint547858142B preserved.
+  prepared counts recordedflip requests, not remaining/totalshader work. Complete
+  shader/pipeline prewarm cannot be derived from rawcode alone; runtime variants,
+  metadata and pipeline states are needed. Cached compiler work cannot fix this
+  guest integer exception or independently prove fast GPU execution.
+- Next identify zero table-size producer and prove the shared guest/API/ABI
+  mechanism with a minimal synthetic native regression before any productionfix.
+  Read-only scalar-perDWORD coherent-query performance lead added to testdebt;
+  GPU drain already512KiB-coalesced, no measured causal/performance claim.
+  No further identical game retries before diagnosis; no policy/guard widening.
+  Next issue108 publication ONLY confirmedgameentry; prior menucomment retained.
+
+Checkpoint **5 октября 2026 года, 23:45 UTC** (native Release original-resolution replay active):
+
+- Local `b4eae640f700bb1dbd25bd1d98605d523c7e8aa2` workgroup coefficient
+  capacity correction built/installed PASS; exact built/installed SHA256
+  `87f24c328f3f6b81eec47ad9c9f6e8fb7c546ff5344f63d0c137a8022679ef36`.
+  Native checks and independent RED/GREEN are in the checkpoint below; no
+  core edits/builds/GPU tests while this original game retry runs.
+- ACTIVE owned44484 since23:44:19UTC,
+  `_Build/runs/yotei-20261005-234419-original-resolution-nodiag/run.json`,
+  original game SHA5178cf80 (hashguard), no diagnostic480x270 alteration.
+  Fullscreen2560x1440/Fifo/silentlogs, validation/dumps false and process-only
+  diagnostic env removal; no readbacks, profiler, probes or periodic captures.
+  Supervisor only3600s/28GiB; no guard widening. Installed helperhashes updated
+  in `_Build/analysis/workgroup-capacity-20261006/`; next screenshot/input only
+  normal UI confirmation, keys must release before capture.
+- Next confirm first original-resolution pixels, chooseQuality in normal guest
+  UI, then actual game entry. No Quality/sharpness/gameplay/color correctness
+  claim yet. Prior233030 failed original-resolution run is finalized below,
+  diagnostic game file retained as separate backup, persistent cache preserved.
+  Issue108 next external comment only actual confirmedgameentry; no push/merge.
+- One-off DesktopCopy23:46:07 captures an actual white loading spinner at shown222
+  after passing the old130560 reserve error. First original-resolution nonzero
+  pixel proof is loading-only, no menu/Quality/scene-color/game-entry claim.
+- Original-resolution Medium setup menu visually confirmed23:51:00/shown296
+  (`window-original-stage-2.png`),23:52:21/shown298 (`window-medium-ready.png`).
+  Compared with old231529 capture, glyphs and fire/tree edges are visibly sharper.
+  No whiteCross prompt yet, no input sent in this run; Quality still pending.
+  Actual frame advance is slow; titlefps60 measures hostwindow loop only.
+
+Checkpoint **5 октября 2026 года, 23:43 UTC** (workgroup snapshot capacity fixed and validated; native build active):
+
+- Local committed emulator source `a025b5a72c70915fdbdf4e624c354f0822809749`;
+  native build/install PASS, installed SHA256
+  `a1e03dc7b2e0a2a4177cebf8460449116fe6dffeafab3628b27b584079582166`.
+  Focused unsigned16 regression proofs remain in the checkpoint below. No new
+  core changes, builds or GPU tests during the active game.
+- User requests normal maximum picture quality without debugging. The first
+  no-debug run231529 still used the old diagnostic game executable: all three
+  initial resolutions and dynamic-resolution table reduced eightfold. Prior
+  native230937 registration log explicitly reports480x270 guest output, enlarged
+  by linear presentation to2560x1440; larger window alone does not restore detail.
+  No Quality selection proved in that run. One owned Cross input27:07-27:37,
+  key released/helper0; Medium remained in captured view. Run ended on requested
+  graceful close23:29:45/native0, streams drained, owned47596 absent, no forced
+  cleanup/timeout/memory guard. Driver payload542344503B saved and preserved.
+- Original game executable restored23:30:14, verifiedSHA256
+  `5178cf80b86e3b6644a3324ebb4f61a3336ee5ccc17d83e84f71bfee86134d86`.
+  Original backup retained; diagnostic4d98 copy preserved as
+  `eboot.bin.kyty-diagnostic-480x270-20261005T233011Z` outside tracked source.
+  Preflight/restoration evidence:
+  `_Build/analysis/vertex-gpu-selected-1135-20261006/game-resolution-{preflight,restored}.json`.
+- Native original-resolution retry finalized: owned19352, started23:30:30UTC,
+  `_Build/runs/yotei-20261005-233030-original-resolution-nodiag/run.json`.
+  Fullscreen2560x1440/Fifo, Release, printf/shaderlog Silent, Vulkan/shader/GPUAV
+  validation false, graphics dump false, diagnostic env removed process-locally;
+  no readback, profiler, WM_NULL probes or periodic diagnostic captures. Supervisor
+  only original3600s/28GiB bounds. Original4K/dynamic-resolution game file is
+  hash-guarded; actual selected Quality and visible internal resolution remain
+  pending normal guest UI. Game entry and accurate colors remain unproved.
+- `prepared` increments per recorded flip request in videoOut.cpp, not a total
+  shader count or finite startup worklist. Existing persistent driver cache loads
+  and checkpoints reached pipelines. Complete offline prewarm needs replayable
+  actual pipeline state, variants and metadata; rawshader corpus alone cannot
+  supply all future runtime-generated combinations or eliminate execution stalls.
+- Original-resolution retry ended23:30:41.706/native321 (no guard/forced kill),
+  streams drained and owned19352 absent. Compute5be616 workgroup-axis snapshot
+  count130560 exceeds old stable65536 reserve before rendered4K/UI. Persistent
+  driver cache loaded successfully, so this is a shared snapshot-capacity blocker.
+- Independent native CPU intendedRED23:34:30 (EXE1240BE0E) on public65537-row
+  WorkgroupId coefficient fixture; unchangedGREEN23:35:21 (EXEF2650E2F).
+  Corrected only dispatch-axis reserves with size tiers within existing64MiB
+  storage budget. Kept16-bit selector cap, coherence/write/address guards and
+  small-grid layout; no game-specificbranch/globallimitraise. ExpandedCPU PASS
+  _Build/checks/20261005-233717-4159482-resource_tracking_tests covers tier
+  stability/boundaries, first/last/all exactwords,3axes sharedreads/zero padding,
+  missinglastword/transaction, zero grid withUINT_MAX axis and over-budget reject.
+  Native numericGPU65537-row test PASS23:40:38/EXEEFE42359: every output and
+  immutable input/neighbor sentinel exact, noVUID. First fixture confused unrelated
+  ShaderData and dedicatedflattened_srt storage; placement check corrected only,
+  numericoracle unchanged. ExistingcooperativeBDA coefficient GPUAVPASS23:41:31;
+  complete resource_tracking CPU PASS3.99s/23:41. Source correction committed
+  separately as `b4eae640f700bb1dbd25bd1d98605d523c7e8aa2`; native emulator build
+  active. Source frozen until build ends, no game/build overlap, no fullsuite claim.
+- Next finish GPU/affected validation, commit separately, build/install and retry
+  original resolution before Quality normal UI/game entry. No issue108 intermediate comment, push or merge;
+  prior menu publication remains, next authorized milestone actual game entry.
+
+Checkpoint **5 октября 2026 года, 23:07 UTC** (unsigned16 GPU-selected buffer load fixed; native build active):
+
+- Local `a025b5a7`: shared unsigned16-bit indirect-buffer read support. Actual
+  1135 vertex capture pc1398 is BUFFER_LOAD_USHORT (zero-extension), not DWORDx1.
+  Registered capture14272B obtained in bounded223637 diagnostic; native0/close
+  at22:39:25, owned40512 absent. Original rawBDA vectors and unsupported classes
+  preserved, no title/hash/address exceptions or fabricated resource bindings.
+- Native CPU intendedRED22:44:34 (9E22B304) then unchangedGREEN22:47:01 (2F190D0C).
+  Focused GPUAV20case numericGREEN23:00:48 (12BE30DF): exactushort data/zeroextend,
+  first/last2-byte range, DWORDcrossing, OOBmodes, SOFFSET, swizzle/null/EXEC and
+  neighbor sentinels. Fixture's first attempt restored all32 lanes despite one
+  guestthread; IR identified a test output race. Restored originalmask1, values
+  unchanged; no speculative productionmask fix. Existingindirect7neighborsPASS
+  23:03; full resource_tracking CPU suitePASS23:04:52 in3.89s. No fullsuiteGREEN.
+- Artifacts _Build/checks/20261005-{224415,224645,230000,230254}*/,
+  _Build/logs/indirect-ushort-resource-tracking-final-20261006.log*, actualcapture
+  _Build/analysis/vertex-gpu-selected-1135-20261006/ and223637run/shaders/registered.
+  New CTest shader_indirect_ushort_load selects the exact isolatedGPU regression.
+- Native emulator build active through tools/check-native-change.ps1 / selected
+  kyty_emulator target/windows-local.cmd. Core/tests/CMake frozen until it ends.
+  Next install/hash and bounded warm original retry with535725251-byte cache
+  payload preserved. No concurrentGPU/game. Installedold402ceb50 untilinstall.
+- User asks fast and accurate progress toward playing: minimum focusedloop,
+  cache reuse, no redundantabsence/fullbaseline cycles. Workflow841 retained;
+  old metadata baseline remains debt, no unsupportedcase suppression/limitraise.
+  Menu milestone already issue108 comment5994262387; next externalstatus only
+  actually confirmedgameentry, no push/merge. Current color/gameentry unproved.
+
+Checkpoint **5 октября 2026 года, 22:26 UTC** (native retry finalized; faster validation workflow committed):
+
+- Local tested emulator source `d2bafa93858529e3119609ac09b82a35a0f754e4`, installed
+  SHA `402ceb5026604e81ee0818ed59533c0f4ab077af565da303d7766efc2ea4d996`.
+  Retry212706 finalized22:02:34.846UTC, native321 after719 compute completions.
+  Both streams drained, emulator51156/supervisor41980 absent; all input helpers
+  exited0 and keys released. No original28GiB/480s/3600s guard or forced cleanup.
+- Current native build visibly passed Medium→Standard→Performance; settings
+  accepted21:49:19.618, actual532-frame screenshot2150 and2154 remains dark fire
+  background. Real12ch/48kHz/3072-byte ATRAC9 initialization confirmed again.
+  No further rendered game-entry scene/heardPCM/color-accuracy proof. Window
+  answered every post-start100ms WM_NULL probe within0–2ms until process exit.
+- New shared resource-tracking blocker: vertex `1135e3d2715c8ba2`, pc1398,
+  GPU-selected descriptor access rejected because indirect fallback requires raw
+  DWORDx2/x3/x4 load. Need inspect actual decoded type/count, then independent
+  lightweight CPU resource_tracking RED and bounded numerical GPU GREEN. Added
+  exact requirement to test debt; no speculative type widening/zero resources.
+- Peak working27150970880B (~25.29GiB), private14628888576B (~13.62GiB). No memory
+  guard/AppHang observed this time; cache warmth/layout differences prevent a
+  causal claim that GC fixed the old memory/hang problem. Driver payload checkpoint
+  grew512077120→535725251B and is preserved. Cold post-settings pipeline timings
+  include142.860s/75.207s/109.293s, while smaller cached entries are milliseconds.
+- Workflow local commit `841df2c3001dbe481fa13314bdcf8e6f906a0bd1` (installed emulator remains tested d2/402ceb50).
+  User now explicitly requests faster tests/builds. Focused cycle: one minimal
+  RED, unchanged GREEN plus closest neighbors; broader affected validation once
+  at completion, reuse identical baseline evidence. Versioned skill and both
+  installed Windows/WSL copies synchronized. No policy weakening or GPU overlap.
+- Workflow fix isolates native input fingerprint from docs/workflow notes in
+  generate_version.cmake. Native temp-git CMake reproduction: old docs change
+  rewrote version header; fixed docs preserve content AND timestamp, while C++
+  and test changes still alter identity. Two redundant global dirty scans are
+  also removed by reusing the recorded source diff. New tools/check-native-change.ps1 builds
+  one target then one explicit mode/CTest regex, bounds workers/cleanup, records
+  artifacts, and rejects active game/build/test conflicts. Native focused LRU smoke
+  PASS: incremental build1.995s, CTest0.17s; no full suite or game retry for this
+  workflow-only change. Shader pipeline cold-compilation remains separate work.
+- Menu milestone already published issue108 comment5994262387 withPR497.
+  Next external update ONLY actual confirmed game entry; no push/merge/comments.
+  Game/saves/caches and preexisting dirty plan/debt edits preserved. Next use the
+  short loop for the vertex blocker, then a bounded warm original retry.
+
+Checkpoint **5 октября 2026 года, 21:52 UTC** (current d2 replay accepted all first-launch settings, post-settings compilation active):
+
+- Local source `d2bafa93858529e3119609ac09b82a35a0f754e4` corrects shared texture
+  GC candidate selection: safely retained GPU-owned textures no longer hide clean
+  reclaimable entries beyond the candidate limit. Only seven core lines, reusable
+  synthetic fixture and CTest registration; no title/hash/address exceptions.
+- Independent unchanged oracle native clean GPUAV RED `21:15:37` / EXE352AFFEB
+  on exact17529 production bytes, intended protected_count9 clean-tail failure;
+  unchanged GREEN `21:16:40` / EXEC242D794. Added0/9/10/12 protected-prefix,
+  exact pressured GPU readback/guest sentinels, twelve clean-image and six recursive
+  depth/stencil-pair budget cases PASS21:19:29/EXE7613A30E. Image views and buffer
+  GC neighbors PASS. Both streams/manifest/cleanup retained in
+  `_Build/logs/texture-gc-*-clean-gpuav-20261005.log{,.stderr,.run.json}`.
+- Broad cache-flow test remains baseline RED at `reused metadata owner retirement`.
+  Scoped absence of ONLY owned seven-line core fix repeats identical phase/error
+  at21:21:10 / EXEC1BFBD6D. Fixed source bytes restored; no full-suite GREEN or
+  other-game compatibility claim. The initial stale Epic implicit-layer manifest
+  is excluded with process-only empty VK_IMPLICIT_LAYER_PATH; explicit Khronos
+  validation/GPUAV stays enabled. No registry edits or error suppression.
+- Finalized previous game133643 at14:21:26/native0xCFFFFFFF: WERAppHangB1 and
+  ApplicationHang1002, no original guard/cleanup request recorded. It was creating
+  new cooperative54904 variant after661 pipelines, shown507; peak26.33GiB WS.
+  Preserved512077120-byte cache, stderr empty, game entry still unproved. Cause
+  and initiator of Windows hang termination unknown; not labeled GPU TDR/leak.
+- Exact last681588-word module passes native spirv-val. Isolated no-dispatch
+  three-create lifecycle PASS:147828ms cold,125/94ms cached,2.996GiB peak WS;
+  immediate destruction of pipeline/cache/module/device/instance retains~2.78GiB
+  WS in the process. No delayed allocator/lifetime invariant or synthetic leak
+  RED. Artifacts `_Build/analysis/post-settings-lifecycle-20261005/`.
+- Native committed d2bafa emulator/test builds and installation PASS through
+  windows-local.cmd. Scoped native GPUAV CTest3/3 PASS21:25:26UTC (1.83s);
+  `_Build/analysis/post-settings-lifecycle-20261005/ctest.*` retains streams,
+  bounded manifest and cleanup. Built/installed EXE SHA256
+  `402ceb5026604e81ee0818ed59533c0f4ab077af565da303d7766efc2ea4d996` matches.
+- ACTIVE `_Build/runs/yotei-integrated-20261005-212706-protected-gc-memory-warm-noval`,
+  emulator51156, tool session4018, supervisor log
+  `_Build/logs/supervisor-protected-gc-20261005-2127.txt`. Starts21:27:07.036UTC,
+  deadline22:27:07UTC, unchanged28GiB/480s/3600s, validationOFF. Preserved cache
+  file512077305B (payload512077120B, SHA94280e12521ff660510769a71da9ba1265e6613d
+  a98a6193e099194b0f9123be); game/saves untouched. No inputs yet, no other native
+  builds/GPU tests. Core/tests/CMake frozen. Ignored replay samples memory and
+  sends bounded100ms WM_NULL only to its own verified window every30s.
+- Actual first shots2128/2129 show loading; `window-2132-stage.png` shown378
+  then visually confirms Change Difficulty / Medium. First bounded Cross30s
+  21:33:05.769→21:33:35.881 exits0/key-up; `window-2134-after-medium-cross.png`
+  still Medium with now-white Cross hint. Second Cross180s
+  21:35:16.651→21:38:16.728 exits0/key-up. `window-2139-after-medium-cross-second.png`
+  shown396 and `window-2141-stage.png` shown400 show Medium UI removed, dark fire
+  background; next Standard/Graphics/game-entry scene not yet visible. All keys
+  released, exact `interactions.json`; do not infer settings completion/game entry.
+  Actual `window-2144-stage.png` shown411 confirms delayed Select an Experience /
+  Standard. Wait for the white Cross prompt before next bounded confirmation;
+  no Standard input sent yet. Graphics Mode and game entry remain unverified.
+  Subsequently `window-2145-standard-ready.png` shown440 confirms white Cross;
+  Standard Cross30s21:46:47.946→21:47:17.971 exits0/key-up. Actual
+  `window-2148-after-standard-cross.png` shown499 confirms Graphics Mode /
+  Performance already selected, white Cross. No new arrow input needed.
+  Performance Cross5s21:49:14.567→21:49:19.618 exits0/key-up; actual
+  `window-2150-after-performance-cross.png` shown532 shows settings removed.
+  This run thus passed Medium→Standard→Performance. All keys up; no game entry
+  or color-accuracy proof. Older pending statements above describe earlier shots.
+- Own window continues responding within0–2ms during compilation after one
+  startup timeout. Around21:43 working set~22GiB, private~10GiB, many new small
+  variants still complete; compiler/frame counters are diagnostic only. GC's effect
+  on the former guard/AppHang remains unproved. Post-settings working set rises
+  to~23.6GiB around21:50; next verify real next UI/game entry before any input.
+  Frozen core/tests/CMake, no concurrent build/GPU regression.
+- Menu milestone remains user-defined first-launch settings, already published
+  in issue108 comment5994262387 withPR497. Next external update ONLY confirmed
+  game entry. No source push/merge; existing plan/debt edits preserved.
+
+Checkpoint **5 октября 2026 года, 14:04 UTC** (current replay accepted Performance, all inputs released):
+
+- Native source `17529f8241624b2ab79002e384a8b2daeb086702`, installed EXE
+  SHA256 `3bc052af7203667ea7e63308d6f22eaa83ffb759880d62ced30f27be9b9f7f2e`
+  reverified. Only plan/debt dirty; no core/test/build changes. Prior game and
+  isolated probe cleaned up before launch; no other native builds/GPU tests.
+- Prior run `130216` visually accepted Medium → Standard → Performance, then
+  hit its unchanged 28 GiB working-set guard. Native own-window close succeeded,
+  exit 0 at 13:25:34.608; no timeout, forced kill or driver reset. No game entry.
+- Last actual `1971_da4ff122` snapshot passes native CPU spirv-val. Existing
+  exact-layout native pipeline-only probe also succeeds in 117.716 s, exit 0,
+  stderr empty, no timeout or 8 GiB guard. Peak working set 3281620992 B
+  (3.06 GiB), private 3448729600 B; late sample falls to 1517056000 B working set.
+  This shows a substantial compile peak, not an independently proved leak.
+  Artifacts: `_Build/analysis/performance-memory-bound-pipeline-20261005/`.
+- New `133643-ds-finite-memory-replay-noval` starts 13:36:43.143 UTC:
+  owned emulator 30268 / supervisor 43380 / tool 5414, log
+  `supervisor-20261005-133642-e95d89.txt`. Original limits remain 3600 s
+  (deadline 14:36:43 UTC), 480 s progress, 28 GiB, validation off. Preserved
+  492622718-byte cache includes completed variants; game and saves untouched.
+  Ignored launcher adds `memory-samples.jsonl` and bounds diagnostic log draining
+  to keep the existing guards responsive. No emulator behavior changes.
+- Actual normal guest inputs prove Medium → Standard → Performance on this run.
+  Medium Cross180s released13:46:59.110; early post-input Medium still visible,
+  then delayed Standard verified in `window-135715-stage.png` shown255.
+  Standard Cross180s released14:01:50.014, helper exit0; screenshot
+  `window-140200-after-standard-cross.png` shown456 shows Graphics Mode /
+  Performance already selected, white Cross hint. No new arrow input needed.
+  Performance Cross5s14:02:42.800→14:02:47.835 exits0/key up; settings removed
+  in `window-140320-after-performance.png` shown507. All keys released; exact
+  sequence in run `interactions.json`. Current colors and game entry unproved.
+- Continue this bounded native run toward the next actual UI/game-entry scene.
+  Source frozen, no builds/GPU tests or limit increases. Latest memory sampling
+  around23–24GiB after settings. Do not infer game entry from shader completion,
+  readback counts or removed settings. Existing RT/BVH skip remains a missing
+  capability; Performance avoidance/causal color link unproved.
+- Menu milestone is first-launch settings per user. Issue #108 comment
+  5994262387 already published/read back with PR #497 link; next external status
+  ONLY confirmed game entry. No push/merge. Full suite known baseline failures.
+
+Checkpoint **5 октября 2026 года, 13:32 UTC** (settings passed; memory guard ended native run, isolated diagnosis active):
+
+- Native committed source `17529f8241624b2ab79002e384a8b2daeb086702`, installed
+  EXE SHA256 `3bc052af7203667ea7e63308d6f22eaa83ffb759880d62ced30f27be9b9f7f2e`.
+  Core/tests/CMake frozen; only plan/debt dirty. No build or GPU test alongside game.
+- Finalized `130216-ds-finite-replay-warm-noval`, started13:02:16.974 UTC.
+  Original28GiB working-set guard triggered after675 pipelines / shown756;
+  own WM_CLOSE succeeded, native exit0 at13:25:34.608 UTC. No timeout, forced
+  kill or driver reset. Own49948/43120 and native build/tests absent13:26.
+  Both streams finalized, stderr empty. Bounds3600s/480s/28GiB unchanged. Preserved483595993-byte cache from prior graceful
+  exit0 run120227; game/saves unchanged across launch. Working set24.74GiB at13:16.
+- Actual bounded own-window inputs and screenshots prove Medium → Standard →
+  Graphics Mode / Quality. Dpad Right 1500ms (13:17:03.753→13:17:05.302) visibly
+  selected Performance in `window-131724-after-right.png`; Cross5s released
+  13:17:49.690, helper exit0. `window-131810-after-performance-cross.png` shown756
+  shows settings removed and dark fire scene. All keys released; exact sequence
+  in run `interactions.json`. No subsequent game entry or color accuracy proved.
+- Warm replay completed cached post-settings variants in77–86ms. New ordinary
+  `1158e78f` variants take77.799/73.175s; new cooperative`fc6f8c56`137.096s.
+  Native CPU spirv-val Vulkan1.3 PASS13:23:24 on actual430297-word1158module
+  (`_Build/analysis/ds-finite-performance-spirv-validation-20261005/`), structural
+  only. Read-only13:20 PCs change inside nvgpucomp64.dll. Latest `da4ff122`
+  variant completed117.133s before memory guard. Cache492622718B verified after
+  close. Compiler/cache progress is not visible game-entry proof.
+- Exact last actual `1971_da4ff122` snapshot passes native CPU spirv-val13:30:22.
+  Bound layout verified from SPIR-V: storage buffers0[27],51–54[1], matching
+  existing native pipeline-only probe. Diagnostic probe24392/tool58639 started
+  with180s/8GiB guards and memory sampling, no dispatch, no source/build change.
+  Output `_Build/analysis/performance-memory-bound-pipeline-20261005/`.
+  Growth cause unproved; do not raise game guard or call this a synthetic RED.
+- Current run too records actual12-channel48kHz/3072-byte ATRAC9 initialization
+  and the existing RT/BVH dispatch-skip warning opcodee6. Thus Performance has not
+  proved avoidance of BVH at this stage; it is not a color correction.
+  Missing BVH capability has a primary-ISA test-debt entry; no BVH core fix/test
+  has been implemented. Scene remains dark; heard PCM/gameplay pending.
+- User counts first-launch settings as menu milestone. Issue108 comment5994262387
+  already published/readback verified with PR497 link. Next external status ONLY
+  confirmed game entry; no source push/merge. Full suite knownbaselineRED.
+
+Checkpoint **5 октября 2026 года, 12:32 UTC** (current native DS retry accepted all first-launch settings):
+
+- Source `17529f8241624b2ab79002e384a8b2daeb086702`, native EXE SHA256
+  `3bc052af7203667ea7e63308d6f22eaa83ffb759880d62ced30f27be9b9f7f2e`.
+  Owned run `120227-ds-finite-warm-noval`, emulator 31280 / supervisor 7648,
+  original deadline 13:02:27 UTC, 480s successful-compute/frame and 28 GiB guards.
+- Visually confirmed Medium → Standard → Quality on this installed build too.
+  Medium second bounded Cross 180s released 12:27:22.688, Standard shown529;
+  Standard Cross 5s released 12:28:15.761, Quality shown579;
+  Quality Cross 30s released 12:31:02.606, settings gone at shown679.
+  Exact interactions and key-up exits0 in run `interactions.json`. All keys up,
+  no further input active. Screenshots show actual UI, not counter inference.
+- Current actual guest log again confirms `AJM ATRAC9 initialized: 48000 Hz,
+  12 ch, frame_samples=256, superframe=3072 bytes/4 frames`. Former audio
+  initialization fault has not recurred at this stage. Heard PCM remains unproved.
+  New compute `fc6f8c56eb7e168f`, cooperative wave64, is being compiled after
+  Quality. Snapshot `window-123116-after-quality-cross.png` shows dark fire scene
+  with settings removed; no subsequent title/start screen or game entry proved.
+- User counts first-launch settings as menu milestone. Issue #108 comment
+  5994262387 already reports it and links PR #497; remote readback verified.
+  Next external status ONLY after confirmed game entry. No push/merge.
+- DS correctness tests pass; actual scene remains too dark, so no color correction
+  claim. Full suite still baseline failures, no other-game GPU corpus. Continue
+  current bounded run toward game entry; preserve core/tests/CMake freeze and
+  cache/save/game. No concurrent native build/GPU tests or driver reset.
+
+Checkpoint **5 октября 2026 года, 12:26 UTC** (current retry reaches first-launch Medium; bounded input active):
+
+- Native source `17529f82`, installed EXE `3bc052af…`, active run `120227`.
+  Actual `window-122033.png` shows Change Difficulty / Medium with the dark scene
+  background. Thus first-launch settings render again after the DS correction;
+  color accuracy remains unproved. Later main/title screen and game entry pending.
+- First bounded own-window Cross 30s ran 12:22:33.885 → 12:23:03.909 UTC, exited
+  0 and released the key. `window-122317-after-medium-cross.png` still shows Medium;
+  no accepted transition proved. Pipeline compilation allowed only about one new
+  displayed frame during that attempt; exact missed-input cause remains unproved.
+- Second Cross helper starts 12:24:22.624 UTC for the existing maximum 180s;
+  helper session 11901, release expected 12:27:22.624. Do NOT focus/capture while
+  held. Own emulator 31280/supervisor 7648; original run deadline 13:02:27 unchanged.
+  At 12:25 shown 434 with new frames, but no stage inferred from counters.
+  `interactions.json` records attempts. Await key-up, then capture actual stage.
+- The user's menu milestone is the first-launch settings. Its earlier verified
+  result is posted in issue comment 5994262387 with PR #497 link; remote readback
+  verified. Next issue update ONLY after confirmed game entry. No push/merge.
+  Preserve source freeze/cache/save/game; no concurrent native build/GPU regression.
+
+Checkpoint **5 октября 2026 года, 12:17 UTC** (user confirms first-launch settings count as menu milestone):
+
+- User clarification: the first-launch settings are the menu milestone. This was
+  already visually verified on native source `29d32a5c`: Medium → Standard →
+  Quality, with bounded own-window Cross input accepting each stage. Re-viewed
+  `104233/window-105650.png` (Select an Experience / Standard) and
+  `104233/window-110205.png` (Graphics Mode / Quality) in this turn. The previous
+  conservative main/title-menu requirement was an assistant assumption.
+- Posted the verified settings-menu milestone with PR #497 link to issue #108:
+  https://github.com/KytyPS5/KytyPS5/issues/108#issuecomment-5994262387 . Explicitly
+  states local changes are not pushed, scene colors remain too dark, full suite
+  has baseline failures, game entry/gameplay unproved. Next external status only
+  after confirmed game entry; no source push/merge.
+- Current DS-fix retry `120227` / source `17529f82` / EXE `3bc052af…` still active
+  with owned emulator 31280 and supervisor 7648; unchanged deadline 13:02:27 UTC.
+  Actual `window-user-menu-check-1215.png` shows loading indicator, no settings
+  yet; no input sent in this run. Read-only thread sample shows changing NVIDIA
+  compiler PCs, and further pipelines complete. Five new large variants took
+  about 139–149 seconds each. One actual current 681k-word SPIR-V module passed
+  bounded native CPU `spirv-val` at 12:12; this is not GPU/color/menu proof.
+- Continue current run and accept first-launch settings as soon as visibly ready;
+  then work toward game entry and investigate colors. Keep core/tests/CMake frozen
+  and cache/save/game intact. No concurrent build/GPU regression or driver reset.
+
+Checkpoint **5 октября 2026 года, 12:12 UTC** (active native retry after DS fix):
+
+- Committed source `17529f8241624b2ab79002e384a8b2daeb086702`; native Windows build
+  and installation passed. Both executable hashes are
+  `3bc052af7203667ea7e63308d6f22eaa83ffb759880d62ced30f27be9b9f7f2e`.
+  Only documentation is dirty; core, tests and CMake remain frozen during the run.
+  Independent DS RED/GREEN, neighboring GPUAV tests and scoped CTest 6/6 passed;
+  all 16 corpus outcomes match the pre-fix baseline. Full suite still has baseline
+  failures; no other-game GPU corpus is available.
+- Active run `_Build/runs/yotei-integrated-20261005-120227-ds-finite-warm-noval`:
+  emulator PID 31280, supervisor PID 7648. Started 12:02:27 UTC; original total
+  deadline 13:02:27 UTC, frame/successful-compute watchdog 480 seconds, memory cap
+  28 GiB, validation off. Preserved game, saves and 451288980-byte warm cache.
+  No metadata recorder, native build or GPU regression runs concurrently.
+- Actual screenshots `window-120320.png` and `window-121010.png` show a black
+  background and loading indicator, NOT a settings screen or main menu. No input
+  has been sent. At shown 346 the driver compiles new resource-layout variants of
+  compute shader `54904fb419d79e49`; completed variants take about 148–150 seconds.
+  Successful pipeline creation advances the existing bounded watchdog and saves
+  the cache; a shown-frame counter is not visual progress proof.
+- Next: observe the actual settings/menu transition, then use bounded Cross input
+  only on a visibly ready screen. Prepared helper has exact executable/hash guards
+  and releases the key in `finally`; avoid focus captures while a key is held.
+  Dark scene colors, main/title menu and gameplay remain unproved. Update issue
+  #108 only after verified menu, then verified game entry, with the PR #497 link.
+  No push, driver reset or title-specific correction is authorized/performed.
+- Upstream main reread at 12:01 remains `72e4989b` (trophy notification change).
+
+Checkpoint **5 октября 2026 года, 12:00 UTC** (DS completed local commit; native emulator build active):
+
+- Local17529f8241624b2ab79002e384a8b2daeb086702, eightcore/tests/CMakefiles only;
+  independent native cleanRED/unchangedGREEN and neighbors recorded below. Five
+  exact fixedbytes restored/SHA256verified after corpusbaseline; native restored
+  shadercfgD1601FA1 and final scopedCTest6/6 PASS11:56. Tests built beforecommit
+  from identical fixed source bytes; no fullsuitegreen/crossgame/menuclaim.
+- Exact16headerprofile corpus status/phase/error matches scoped29d baseline:
+  7resource_trackingPASS/8unsupporteddecode/1CPU30s timeout. Othergamecorpus absent,
+  metadata runtimeincomplete; actualcolors/NaN-denormal-tieextras pending.
+- NativeWindows emulator build54024 active throughwindows-local.cmd; core/tests/
+  CMake FROZEN untildone. Onlydocsdirty. Next install/nativehash + bounded original
+  retry toward menu. New ignored launcher ds-finite-warm-noval retains original
+  3600s/480s/28GiB/validationOFF and cache; no metadata debug recorder because
+  real12ch creator/init alreadyproved. Source-specific input guards afterhash.
+- Last game104233/nativeaudio29dF413 gracefullyended0 afterQuality and actual
+ 12ch initialization; no main/titlemenu/gameentry/heardPCM/calibratedcolors.
+  Preserve451288980B warmcache/game/save. Existing RTunsupported warning retained;
+  no driverreset/titleexceptions/subagents/push orissue108 status beforemenu.
+
+Checkpoint **5 октября 2026 года, 11:54 UTC** (DS proof complete, exact corpus baseline equal, fixed source restored):
+
+- DS clean native GPUAV RED11:35/4DDE1D66 on29d then unchanged GREEN11:39/
+  94CA8596, fourfinite/unusedDATA1/GDSguard/inactiveEXEC cases. CPUdecoderGREEN;
+  fiveGPUAV multiwave/GDS/truecmpswap neighbors PASS11:42/BDEB2EAF. Oldspec-invalid
+  comparefixture explicitly corrected min(4,9)=4/max(4,1)=4 and PASS11:46.
+  Native actualIR/validator CPU PASS11:46/shadercfg6B9EDF80; scopedCTest6/6PASS.
+- Corrected rawDSopcode18..25 corpus16 headerprofiles: sevenresource_trackingPASS,
+  eightunsupporteddecode, one30sCPUtimeout. Exact scoped removal ONLY owned five
+  DS corefiles/nativebaseline shadercfg6240EB58 repeats SAME all16 status/phase/
+  error, includingcs_00012684timeout. Comparison ds-minmax-corpus-baseline-
+  comparison-20261005.json; overlapping unsupportedMIMG e5/e6/DS e1/SOPP19 across8.
+  Not fullsuite/backend/GPU/crossgameproof; othergame corpus unavailable.
+- Five exact FIXED bytes restored/SHA256verified; saved scope manifest+restored.json
+  under _Build/analysis/ds-float-core-scope-baseline-20261005. Fixed source is active.
+  Serial restored shadercfg build9830 active, source/tests/CMake FROZEN untildone.
+  No extra upstream NaN/denormal/tie policy, no title/address/hash exceptions.
+  Next separatecompletedcorecommit, nativeemulator/installhash/retrytomenu.
+- Installedaudioemu still29d32a5c/F41301AD; lastoriginalrun104233 gracefullyclosed
+  native0 at11:28 afteractual12ch48k/3072bytes initialization/Qualityacceptance.
+  Lastshown827/darkfire, no main/titlemenu/gameentry/heardPCM/calibratedcolors.
+  Warmcache451288980B preserved. No issue108 status/push, no driverreset/subagents.
+  ExistingRTBVHskip warning is unsupported limitation, not game compatibility.
+
+Checkpoint **5 октября 2026 года, 11:30 UTC** (audio retry completed past former fault; DS native RED next):
+
+- Source29d32a5c/exactF41301AD retry104233 visually passed Medium/Standard/
+  Quality; owned input released, actual12channel ATRAC9 initialization confirmed
+  at11:03:38 (48k/3072bytes/4frames). Old C0000094 absent. Heard audio/main-title
+  menu/gameplay/color calibration still NOT proved; no issue108 update or push.
+- Intentional scoped WM_CLOSE requested11:26:28 to proceed with independent DS
+  regression. Game exits gracefully11:28:33.553/native0, recorder observesEXIT0;
+  supervisor finalizes11:28:36/native0, both streams read. No forced kill, watchdog,
+  driver reset or guest fault. Own49956/45472/44336 and emulator/tests/Ninja/MSBuild
+  absent after corrected CIM check11:29UTC. Preserved451288980B disk warmcache.
+  Last shown827; new expensive pipeline674/142542ms completed during graceful exit.
+- Native structural CPU validation five actual new large SPIR-V modules PASS;
+  thread sample shows NVIDIA compiler work, not a GPU hang. Real saved54904fb4
+  shader contains six DS min/max at3b74-3b9c with differingDATA0 and DATA1=v0.
+  Updated primary AMD XML specifies ADDR+DATA0 only; current decoder/backend use
+  phantom comparison. Relation to dark settings scene still unproved.
+- Independent finite six-pair/DATA1-invariance + GDS guard + inactive EXEC tests
+  and separate decoder oracle now integrated; production unchanged29d32a5c.
+  Native RED build starts only after runtime cleanup. Do not change core before
+  intended RED; keep special NaN/denormal/tie upstream policy unproved/unported.
+- Run stdout warns ray tracing unimplemented/skips BVH dispatch4f07b07b3d8c8406.
+  Existing unsupported-capability limitation recorded, not a new compatibility
+  workaround or gameplay proof. Current10bit surface ordinary SDR, not PQ.
+  DS selective correction/retry next; preserve game/save/cache, no title exceptions.
+
+Checkpoint **5 октября 2026 года, 10:40 UTC** (extended ATRAC9 shared decode proved; native game retry next):
+
+- Local completed commit29d32a5c9d64acaa0281d8a4d5975923d5466827 extends ATRAC9
+  in ajm.cpp/atrac9_decoder.h. Shared config geometry and actual independent mono
+  decoder states, channel interleaving/per-channel last-frame padding; standard
+  FE/haptics/NGS2 initializer preserved. No game/hash/address switch or silence.
+- Intended native RED10:30:59/test332627C4 rejects5valid metadata/decode layouts
+  after nonzero reference success; unchanged GREEN10:35:38/test16723B32 passes.
+  Additional Float/S16/S32/direct-reference+12channel AJM batch neighbors PASS
+  10:37:56/testC6CD3E6B. Native rebuilt existing audio targets and CTest4/4 PASS
+  10:40 (new extended, old config, NGS2 sampler, audio-out port); both streams read.
+- Isolated Linux actual packet probe48valid mono frames and exact3072B confirms
+  lead only, not Windows actual audio/menu. Independent interoperability source
+  PS5PCEM baa718…; no public Sony SDK proof of every layout. Other-game corpus
+  unavailable, fullsuite still baseline failures. Last game remains100823/native
+  C0000094 after viewedQuality; actual new native emulator retry not yet launched.
+- Next commit completed source/tests/CMake separately, serial native emulator
+  build/install/hash, original warmed retry to main/title menu. Colors remain dark
+  in last capture, calibrated correctness unproved. No issue108 update/push.
+
+Checkpoint **5 октября 2026 года, 10:28 UTC** (SNORM8 runtime finished; extended ATRAC9 creator captured):
+
+- Native source ebe7a6f0/exact B6C525F3 retry100823 viewed Medium400, Standard448,
+  Quality501. Own Cross5s for each screen released; timestamps in interactions.json.
+  Scene remains very dark; SNORM8 correction alone does not prove color accuracy.
+  No main/title menu or gameplay, no issue108 status/push.
+- Early owned metadata write100952bebc captures byte-by-byte assembly at guest
+  90030df25/29/31/39 ending30 72 c0 fe10:25:41.649UTC. R8=12/R10=3072,
+  R15=metadata100952beb0, matching independent multistream geometry. Full code/
+  context/buffers in run/audio-metadata-origin-early. Creator now directly proved,
+  not RIFF copy/NGS2/endian-shaped guess; detailed field producer analysis pending.
+- Original guest DIV9003502d2/ESI0 first/second10:25:41/42; native debugEXIT
+  C0000094 at10:25:47.349 and run.json finalized10:25:50 exit-1073741676. Both
+  stdout4687B/stderr0 read, no timeout/driver reset. Own41848/supervisor35168/
+  recorder46900 and build/tests absent/hash unchanged; warmcache427262642B saved.
+- Native independent multistream test inserted after cleanup: metadata 2/6/12/36
+  channels, sample-rate/size variations, real nonzero PCM from separate mono
+  references, per-channel final padding, two SFs, continuation/reset/gapless/
+  short-input/output and invalid signatures/counts. Current production unchanged;
+  native RED build starts serially. Linux-only isolated mono fixture probe validated
+ 36 synthetic variants, not native Windows emulator evidence. Follow RED before fix.
+
+Checkpoint **5 октября 2026 года, 10:09 UTC** (ACTIVE native SNORM8 retry with early metadata watch):
+
+- New independent ATRAC9 format lead (10:20UTC): PS5PCEM baa718235a37d310d91ac001f4d92cdc8099a69c
+  ajm_codec.zig describes extended30-sync interleaved mono substreams. Raw30 72 c0 fe
+  gives12ch/48k/4x64bytes/channel =3072bytes, matching original fault packet and
+  nearby12channel metadata. Canonical mono FE7007F0. Endian-only hypothesis discarded;
+  actual decoder/geometry synthetic RED pending, no production audio change or
+  silence fallback. See first audio debt section; SDK/all-layout proof limited.
+- Source ebe7a6f068505cdad9595dfdb778d6e83b5b1c6f native build/install PASS,
+  build and installed SHA256b6c525f30e7bb9d34d8780b98d830260348cfe885b17cf6005ab4fe8ead39edd.
+  Title dirty suffix from documentation-only worktree; core/tests/CMake committed.
+  Native source/test/GPU regressions frozen during original game retry.
+- Run100823-snorm8-warm-audio-metadata-early-noval starts10:08:23.573UTC;
+  ownPID41848/hiddenWindows supervisor35168/tool session12090, logs supervisor-
+  20261005-100822-4c85f3.txt UTF16. Total3600s deadline11:08:23UTC/480s progress/
+  28GiB/validationOFF. Recorder46900 starts10:08:23.923,3500s deadline~11:06:44;
+  own17threads DR0write4 armed10:08:24.444 (~0.9s after game launch), newthreads
+  armed. Native diagnostic valid+forced own-error synthetic checks proved10:02.
+- Early lead100952bebc first observes guest libc heap zeroing10:08:32/rip9100105b3;
+  old late watches missed this initialization. No targetFEC07230/provenance yet.
+  Allocation/content identity remains to verify at actual target. Never hard-kill
+  recorder while watches live; preserve ownslot restoration/detach finally.
+- Actual capture314 at10:09 stored; inspect pixels before stage/input inference.
+  No input yet. Preserve warmcache/game/saves. No main/title menu/gameplay or
+  actual calibrated color correction claim. No issue108 update/push.
+- Remote upstreammain re-read10:07 still72e4989b/06:24trophy notifications,
+  unrelated port pending; selectively proved SNORM8 ebe7a6f0 already local.
+
+Checkpoint **5 октября 2026 года, 10:06 UTC** (SNORM8 shared store correction committed; retry preparation):
+
+- Local commit ebe7a6f0 corrects shared8bit SNORM float-to-integer stores, all
+  scalar/pair/RGBA MUBUF and MTBUF formats; no game/hash/address exceptions.
+  Selective upstream de9c15fa lead, only independently proved finite SNORM8.
+- Native GPUAV intended RED09:53 on productionb3667d29/new synthetic oracle:
+  expected7f7f0081/actual00000000 withsentinels preserved; no VUID/timeout.
+  Unchanged8cases GREEN09:54/native4dbad1b3. Existing formattedstores12 and
+  D16neighbors2 PASS; CTestscoped5/5 PASS09:58. CPU-only cooperativeadmission
+  corpus2/2 resource_tracking PASS10:02, no other game corpus available.
+  Fullsuite still baseline failures; actual darkscene/menu win not claimed.
+- Native emulator build starting serially through windows-local.cmd, source/
+  tests/CMake frozen. Install/hash verification and actual Yotei retry pending.
+- Prepared ignored early data-watch DLL captures own metadata lead100952bebc
+  from startup, avoids late source instruction watch which missed target.
+  Independent native synthetic writer valid and own-capture-error checks both
+  12exact readbacks/targetexit0/recorderexit0/nativeexit00000000 recorded10:02.
+  OwnfreeDR0/restoration/finally, no RF/data/code modification, unrelated faults
+  forwarded. Actual guest allocation/source/API contract not yet proved.
+- New bounded native supervisor prospective, independent of terminal session;
+  total3600s/480s progress/28GiB, earlyrecorder3500s restores before total bound.
+  No new launch yet; prior091337fault records/nativeexitUNKNOWN preserved.
+- Main/title menu/game entry and colors pending; no issue108 status/push.
+
+Checkpoint **5 октября 2026 года, 09:48 UTC** (run091337 stopped after Quality; audio fault captured):
+
+- Same sourceb3667d29/exact7ce9d837. Actual Standard410 and Quality450/499
+  viewed; Quality5s Cross09:45:47-52 released. After acceptance, integer DIV
+  at guest9003502d2/ESI0 captured first09:46:09 and secondchance09:46:10,
+  recorderv2 ends0 after debugEXIT09:46:15. Config descriptor raw30 72 c0 fe
+  unchanged; original API/metadata source contract remains unproved.
+- Watch at verified RIFF helper9003a64d6 observes32 ordinary stack-source
+  FE7007F0 configs but no targetFEC07230. Therefore target origin at this helper
+  not proved; nearby candidate headers are snapshots, not provenance. Do not
+  change AJM/NGS2/endian handling from candidate matches alone.
+- Runner70706 returns143 and initial run.json remains unfinalized; actual native
+  emulator exit code UNKNOWN. Separate termination-observation.json records
+  this limit. stdout4096B ends midline/cachecheckpoint, stderr0 both inspected;
+  own46244/children/emulator/test/Ninja/MSBuild/probe absent09:46UTC, installed
+  hash unchanged. Both native input helpers ended0/keysreleased. Preserve cache.
+- Menu/game entry/colors pending; no issue108 update, no push. Read-only new
+  candidate metadata snapshots may guide next creator capture; native SNORM8
+  shared-store regression/port remains pending until independent RED.
+
+Checkpoint **5 октября 2026 года, 09:44 UTC** (ACTIVE runtime46244; Standard and Quality visually confirmed):
+
+- Same run091337/sourceb3667d29/exact7ce9d837/runner70706/recorder19589
+  within original10:13:37UTC deadline. No core/tests/build edits during runtime.
+- Foreground-guarded input attempts released on user desktop focus loss; actual
+  scoped own-window WM_KEYDOWN/UP native J maps SDL scan13/key106 without focus
+  gain. Own-window180s input09:34:42-09:37:42 ended/released; viewed410 screenshot
+  09:43UTC confirms SELECT AN EXPERIENCE/STANDARD. Then own-window5s input
+  09:43:38-09:43:43 ended/released; viewed450 at09:44UTC confirms GRAPHICS MODE/
+  QUALITY, initially dim UI. Actual settings proof, not main/title menu/game entry.
+  Interactions/timestamps/captures in run; user call overlay excluded from guest.
+- Recorderv2 ordinary stack-source contexts remain; no targetFEC07230 capture,
+  diagnostic errors or unrelated exception suppression. No audio production fix.
+- CPU-only native validation24selected actual unique SPIR-V modules PASS09:28
+  (manifest/results actual-color-spirv-validation-20261005); fullsuite notgreen.
+- Next confirm current Quality screen once visible, continue toward menu while
+  bounded audio metadata-origin recorder is active. Colors still unresolved;
+  no arbitrary gamma, no issue108 status, push or save/cache/game reset.
+
+Checkpoint **5 октября 2026 года, 09:29 UTC** (ACTIVE runtime46244; scoped actual SPIR-V validation):
+
+- Same run091337/sourceb3667d29/exact7ce9d837/runner70706/recorder19589 remains
+  within original10:13:37UTC deadline. No production/audio/DS edits or nativebuild.
+- Actual viewed210 black,214/216/220 show CHANGE DIFFICULTY/MEDIUM/fire,
+  growing UI brightness; counter differs from prior runs, do not equate stages.
+  Capture0925 withheld after foreground failure (no image),0926actual220 viewed.
+  Input helper180s foreground-checked J starts09:27:47UTC, bounded through
+  ~09:30:47; releases immediately on foreground loss/ownprocess end. Record
+  actual keyboard events/outcome after release; no Standard/menu yet verified.
+- Metadata-sourcev2 observes ordinary RIFF configs wordf00770fe on stack
+  source7eddbfe18/output7eddbfdf8 (also7edee3e18/df8); first32 contexts retained,
+  no targetFEC07230/origin capture or diagnosticerror. Old heap-only assumption
+  disproved; no unrelated exception suppressed. Target/API proof pending.
+- CPU-only native spirv-val --target-env vulkan1.3 validates24 selected unique
+  actual runtime modules09:28UTC, all exit0/no messages. Includes15large6cc
+  variants and recent compute/VS/PS color-path modules (one overlapsselection).
+  744unique modules at snapshot; do NOT claim fullcorpus/runtimepixel proof.
+  Manifest exactfile/SHA256 and bothstreamsresults under ignored
+  _Build/analysis/actual-color-spirv-validation-20261005/{manifest,results}.json.
+  Native GPU regressions completed before game unchanged; fullsuite notgreen.
+- Colors/main/title menu/gameplay pending. No issue108 update or push. Preserve
+  game/saves/cache, let recorder restore ownedslots/finally at own deadline.
+
+Checkpoint **5 октября 2026 года, 09:14 UTC** (ACTIVE same-source warmed retry46244, diagnosticv2):
+
+- Run091337/sourceb3667d29/exact7ce9d837/PID46244 starts09:13:37UTC,
+  total3600s/deadline10:13:37UTC, progresswatchdog480s/28GiB/validationOFF.
+  Runner70706 active. Preserved394819293B cache; no new emulator/source edit.
+- Metadata-source v2 recorder19589 arms79threads09:14:22UTC after exact guest
+  instruction4byte signature verification. OwnDR0 only; native synthetic valid
+  and capture-error safety checks12readbacks/exit0 each proved below. Actual
+  metadata writer/API contract still pending; no source/capture inference yet.
+  Recorder3550s deadline~10:13:32UTC; let restore-ownedslots/detach finally.
+- No input or settings visually verified in this retry yet. Source/tests/CMake
+  frozen; no nativebuild/GPU tests. Use only v2 source instruction helper; v1
+  failure diagnostic remains preserved/excluded from emulator regressions.
+  Menu/colors/game entry still pending; no issue108 status or push.
+
+Checkpoint **5 октября 2026 года, 09:12 UTC** (diagnostic interruption isolated; own-trap checks completed):
+
+- Run090311/sourceb3667d29/exact7ce9d837 ends09:06:53UTC exit80000004,
+  shown386/compute405. No input sent; actual viewed311/384 only spinner, not
+  settings. Earlier commentary inference from counter corrected. Cache latest
+  checkpoint394819293B preserved; stdout3067B/stderr0 inspected.
+- Cause is ignored diagnostic v1: fixed heap-range assumption throws at its own
+  execution breakpoint before recording source, then forwards single-step into
+  game. Recorder26595 exits1. Not emulator audio/regression/menu evidence; no
+  metadata-origin inference. Own21656/children/emulator/build/test absent/hash
+  unchanged. Preserve run/helper v1 and use only prospective v2.
+- v2 records mapped20B guest instruction source even on guest stack, handles
+  only proven ownDR0 trap on capture errors, sets RF/resumes exact instruction,
+  restores ownedslots/forwards unrelated exceptions. No guest code/data edit.
+  Independent bounded native synthetic code-probe valid source outside former
+  heap range captures09:11UTC; partial20B operand logs own-error/restores09:12UTC.
+  Both12exact readbacks/targetexit0/recorderexit0. Artifacts
+  _Build/analysis/audio-source-probe-v2-20261005/{valid,partial}; diagnostic
+  correctness checks only, no emulator/audio ABI contract RED/GREEN.
+- Next verify native ownprocess cleanup and retry same source/cache with v2.
+  Explicit60min/480s watchdog/28GiB budget remains a prospective wall-clock
+  diagnostic; host timeout policy/source production unchanged. Menu/color target
+  pending, no issue108 update/push. Preserve original game/save/cache.
+
+Checkpoint **5 октября 2026 года, 09:04 UTC** (ACTIVE same-source warmed retry21656):
+
+- Run090311/sourceb3667d29/exact7ce9d837/PID21656 starts09:03:11UTC,
+  explicit3600s diagnostic total deadline10:03:11UTC; keep480s progress watchdog,
+  28GiB/validationOFF/diagnostic480x270. Preserved394283326B cache/game/saves.
+  Prior30min bound reached only11setupframes while successful compiler advanced;
+  longer wall budget does not alter host/GPU timeout or emulator production.
+- Runner54883 active, metadata-source instruction recorder26595 arms79threads
+  09:03:42UTC at independently observed guest copy0x9003a64d6 after4byte code
+  signature verification. No code/data patch; firstchance own DR0 only consumed,
+  RF skips own execute breakpoint once, unrelated/fatal exceptions forwarded.
+  Recorder3550s deadline~10:02:52UTC, restore free-owned slots/finally/detach.
+- Early311 window capture stored, actual visual observation next. No input yet.
+  Current source/tests/CMake frozen, no nativebuild/GPU tests while runtime active.
+  Input native J mapping confirmed; previous keyboard log shows two full45s
+  holds, first hold was released early by native events~7.5s (cause unproved).
+  Main/title menu/gameplay and actual calibrated colors remain pending.
+- No audio production fix; code-watch captures provenance, not API contract.
+  No issue108 update or push. Preserve all captures/raw guest diagnostics ignored.
+
+Checkpoint **5 октября 2026 года, 09:01 UTC** (run082958 ended cleanly; prospective metadata-code diagnostic):
+
+- Run082958/sourceb3667d29/exact7ce9d837 ends09:00:13UTC, total1800s deadline,
+  timedOut=true/gracefulCloseSucceeded=true/actual exit0. Native runner23442 and
+  recorder88944 both end0; CIM37360/children/emulator/tests/Ninja/MSBuild absent.
+  Installed hash unchanged; stdout7204B/stderr0 both read. Cache preserved/saved
+  394283326B (previous360308953B); no reset or production change.
+- Completed native compute pipelines523, last shown391. Actual viewed last
+  captures389/391 still CHANGE DIFFICULTY/MEDIUM and fire, very dark. Three
+  bounded Cross45s attempts all released/focus restored, no Standard observed.
+  Last08:58:46-08:59:31. Rendering advances slowly between successful native
+  compiler calls (some~120s); main/menu/gameplay and calibrated colors pending.
+- Video-out log registers0x8100000022000000 ordinary10bitUNorm, not explicit
+  BT2100 PQ format. Early setup maxRGB35/26/20 rises to1022/940/767 by389;
+  fade versus emulation error unresolved, no arbitrary gamma/core color change.
+- Fixed-address metadata watch had no writes/fault; current allocation identity
+  still unproved. Prospective ignored watch-task-audio-metadata-source-instruction-
+  20261005.ps1 uses verified guest copy instruction0x9003a64d6 signature guard,
+  captures current RSI20B input/RCX output/caller for FEC07230. Only own free DR0;
+  RF resumes own instruction once; restore slots/forward unrelated exceptions.
+  PowerShell parse and diagnostic C# compile PASS; actual capture not yet tested.
+- Next same-source warmed-cache run may need explicit longer total diagnostic
+  budget:30min reached only11setupframes, successful compile progress continued.
+  Keep480s progress watchdog/28GiB and host timeout policy unchanged. No blind
+  shader semantics/perf rewrite. Verify controls/current state before new launch.
+  No issue108 status or push. User menu target remains pending.
+
+Checkpoint **5 октября 2026 года, 08:54 UTC** (ACTIVE runtime observation):
+
+- Current run082958/sourceb3667d29/exact7ce9d837/PID37360 still active within
+  original08:59:58UTC deadline; runner23442 and metadata recorder88944. Native
+  compute creation advances453 at08:45 to493 at08:52; not a proved GPU hang.
+- Window314/351 viewed spinner only. New viewed window-image-rebind-383-
+  observation.png (actual counter384) and window-image-rebind-after-medium-
+  cross.png (385) show CHOOSE DIFFICULTY / MEDIUM and fire background, very dark.
+  Desktop call overlay is external and excluded from guest-color evidence.
+  Present readbacks382/383/384 maxRGB35,26,20 ->293,267,177 ->441,418,315
+  (10bit). This may include fade; calibrated color/root cause still unproved.
+- Bounded native J/Cross45s08:52:22-08:53:06 released/focus restored; after
+  capture still Medium. Do not claim Standard/Quality/main menu. No watched
+  metadata writes or fault yet; current identity of old watched allocation not
+  proved. Source/tests/CMake frozen, no audio change, no issue108 update/push.
+
+Checkpoint **5 октября 2026 года, 08:30 UTC** (ACTIVE game37360/sourceb3667d29):
+
+- Shared view-acquisition fix committedb3667d2934685e9c810b369add4537e611609fd7.
+  Native Windows emulator build/install PASS; logsimage-rebind-emulator-{build,
+  install}-20261005.log/.stderr; only existing compiler/Qt catalog warnings.
+  Exact build/install SHA2567ce9d837bdc99321860cdedbb7df2e3a4740adceccde69143e688a0a0e54e71d.
+  Clean worktree before runtime docs; native CIM no emulator/test/build beforelaunch.
+- Run082958 starts08:29:58UTC/deadline08:59:58UTC:1800s/480s watchdog/28GiB,
+  validationOFF/diagnostic480x270. Preserved360308953B cache/game/saves.
+  Runner23442 active/PID37360; metadata-origin recorder attaching with exact hash
+  and1750s own deadline. Restore own debug slots/forward unrelated/fault exceptions.
+- Native unchanged regression4cases and CTest3/3 proved below; old R32/D32
+  neighboring fixture baseline failure separately verified, full suite not green.
+  Actual colors/setup/main menu/earlier audio metadata writer pending.
+- Source/tests/CMake frozen; serialize builds/GPU tests while game/recorder active.
+  Use new exact-hash press-task-cross-image-rebind-native-bounded-45s helper only
+  after visually verified settings. No blind input, issue108 update or push.
+
 Checkpoint **5 октября 2026 года, 08:26 UTC** (shared overlapping-view fix completed; native emulator build next):
 
 - Selective upstream a2f85178: RebindImages acquires each view immediately after

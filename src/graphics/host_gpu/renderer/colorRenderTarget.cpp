@@ -167,6 +167,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	width  = rt.attrib2.width + 1;
 	height = rt.attrib2.height + 1;
+	if (Prospero::RenderTargetBytesPerElement(
+		    Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type).buffer_format) == 0u) {
+		std::fprintf(stdout, "RenderTargetFormatContext: caller=ResolveRenderColorTarget slot=%u mask=0x%x "
+		             "mode=%u ignore_mask=%d exact_format=%d dimensions=%ux%u\n",
+		             rt_slot, mask, static_cast<unsigned>(hw.GetColorControl().mode),
+		             ignore_target_mask, exact_format, width, height);
+		std::fflush(stdout);
+	}
 	const auto target_format =
 	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
 	const auto bytes_per_element = target_format.bytes_per_element;

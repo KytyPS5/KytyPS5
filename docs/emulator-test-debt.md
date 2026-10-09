@@ -1,5 +1,1311 @@
 # Emulator regression test debt
 
+## GPU-selected formatted XYZ (2026-10-09, new native frontier)
+
+Core4d5a/EXE142a original5178 run172811 naturally exited32117:45:22UTC,
+1172 pipelines, no deadline/memory guard. Previousaf9e formattedX pipeline1319
+created51434ms; window1735 loading arc, window1745 black, no menu/entry.
+NewCS9d4c341d4e05f879 PC704: private registered source confirms MUBUFopcode2
+BUFFER_LOAD_FORMAT_XYZ IDXEN; actual runtimeformat remains unrecorded.
+Resource RED174837 -> same GREEN175338; compute RED175209 -> CPU175420,
+six XY/XYZ/XYZW32/64 GPUAV175543 PASS. Twelve rows per width/wave include
+aggregate partial/OOB records, conversions/repeated sources/constants/odd
+halfwords, address/destination overlap, EXEC/null, entire4096-DWORD backing,
+transferred reserved selector faults and ignored untransferred selectors.
+No full-wave occupancy or other-game proof. Registered GPUAV180052 PASS10/10;
+full resource_tracking/admissions181300 PASS3/3 after correcting old GPU-fallback
+and typed metadata expectations. Native retry pending. Initial175110 name-assignment build failure is not semantic RED.
+Required independent RED: truly GPU-selected formatted3-component load. Same
+GREEN plus XY/XYZ/XYZW32/64 numeric conversion/swizzle/repeatedcomponents,
+constants, aggregate transferred-element bounds, null/EXEC/mapped address,
+full backing and reserved transferred-selector faults. Preserve typed/D16/
+store/atomic rejection; do not implement wide loads as independent partial
+reads. Use the existing formatted transfer contract and shared helper.
+
+
+## GPU-selected formatted buffer load X (2026-10-09, exact blocker confirmed)
+
+Synthetic proof completed locally: resource RED155757 -> GREEN164341;
+GPU fixture admission RED163638 -> numeric wave32/64/fault GPUAV171515 PASS.
+Actual parser RED161846 -> GREEN162713; real host fault trap scoped RED170719
+-> GREEN171049. Registered neighbor GPUAV17240710/10 and admission172520 PASS.
+Full backing/28 rows/4 invalid descriptors, exact flags; ADD_TID lane0 only.
+Native game retry pending. Typed/D16/wide-formatted/store/atomic expansion and
+other-game corpus remain unproved; do not infer them from formatted X proof.
+
+Captured source cs_af9e060c8c9207ba_d656bb5d885ddee5.bin from registered015949
+has PC0x230 MUBUF opcode0 BUFFER_LOAD_FORMAT_X, IDXEN, descriptor s16:s19.
+Registered capture has runtime_resources_captured=false; format value remains
+unproved. The preceding aggregate raw-load error does NOT identify a subword
+operation. Required synthetic native RED: formatted32x1 load through a truly
+GPU-selected descriptor, actual indirect tracking/no fake host bindings. Then
+read-only BDA format conversion/swizzle/default/OOB/numeric oracle and explicit
+unsupported runtime format/selector fault propagation. Use AnyPS5 RuntimeBuffer
+format dispatch as reference; preserve raw/BDA/ownership/typed/write/atomic
+boundaries, full element bounds and mapped-address checks. Runtime formats must
+not silently fall back to raw reads or zeros as success. New fault reporting,
+if needed, requires GPU fault record and actual host error-path proof. No title/
+hash/PC/address branch in production. Read-only source root diagnostics permitted.
+
+## GPU-selected raw subword read (2026-10-09, separate potential gap)
+
+Native8c5/EXE8a9407 original5178 run150855 naturally exited321 at15:31:20UTC,
+no deadline/memory guard.1158 completed pipelines/lastCS1324; captured fatal
+CSaf9e060c8c9207ba PC0x230 at resource tracking: unproved live GPU descriptor
+only admitted rawDWORD or unsigned16. Loading arc observed, no menu/entry.
+Required before expanding admission: independent synthetic CPU RED for U8/S8/S16
+GPU-selected descriptors, untouched reference payloads; same GREEN + native
+GPU/GPUAV values for high bytes/sign boundaries, odd and crossed-DWORD halfwords,
+last valid/OOB/null/masked reads, stride/OOB_SELECT0..3/SOFFSET/swizzle/ADD_TID,
+actualwave32/64 and whole-backing sentinels. Keep formatted/typed/writes/atomics
+rejected. Compare AnyPS5 RuntimeBufferLoad/widenSubdword to AMD raw8/16 ISA,
+retain guest BDA mapping checks and bounded lifetime; no guessed resource payload,
+physical-pointer shortcut, title/hash/address gate or relaxed device limits.
+Exact opcode/descriptor form remains to confirm from capture; aggregate error
+alone is not proof all rejected shapes are supported.
+
+## Runtime raw stride compiled-artifact reuse (2026-10-09, completed locally)
+
+Core `8c5beaa1`: native cache RED142849 -> GREEN143351; renderer metadata
+RED143036 -> GREEN144025. Actual renderer GPUAV145227 wave32/wave64 numeric
+read/store/backing PASS; final registeredGPUAV145614 PASS4/4, six real-cache
+negative scenarios. AffectedGPUAV145854 PASS5/5; CPU150125 PASS4/4. Initial
+142441 API setup and GPU fixture wave mismatch were corrected before verified
+proof; neither is claimed as a semantic RED. Native build/install/retry pending.
+
+Measured normal600s run134839:570 completed pipelines,692 optimizer calls,
+optimizer sum185876ms vscompute creation79667ms. Operation sums are not
+wall-time partitions. Existing positive rawDWORD stride emits equal SPV8/48,
+but ProgramCache compares exact ResourceSpecialization and recompiles before
+post-compile module reuse; renderer publishes packed stride from compiled info.
+Required independent native REDs before changing production: real cache request
+8->48 returns another compiled program object; real RebindBuffers with cached
+stride8/current snapshot48 publishes old8. Then same GREEN and real renderer
+GPU numeric read/store/unchanged backing,8->48->8/zero/mixed-byte/typed/atomic/
+swizzle/ADD_TID/topology boundaries. Reuse requires a compiler-owned proof that
+all actual accesses to a slot consume dynamic rawDWORD stride; bounded-table,
+scalar, typed/formatted, byte/short and atomic paths stay exact-specialized.
+Never ignore unrelated specialization/layout/descriptor ownership changes.
+
+## AnyPS5 complete integer64 comparison family (2026-10-09, completed locally)
+
+Core `6e401f7c`: intended native decoderRED140128 -> CPU GREEN140748;
+GPUAV141131 PASS7; final registeredCPU/GPUAV141600 PASS2/2. Corrected input
+loadX3->loadX4 before numeric GREEN, unchanged oracle; DPP/DPP8 rejects.
+
+AnyPS5d70b8998 contains all V_CMP/V_CMPX I64/U64 predicates, while Kyty
+recognizes only7 of32. AMD RDNA2 VOPC161..167/176..183/224..231/240..247 is
+the contract. Required unchanged decoder RED for32 synthetic encodings in both
+VOPC/VOP3 forms, then same GREEN. Numeric GPU oracle must use dynamic per-lane
+64-bit pairs (signed min/max/-1/0, unsigned high-word/low-word edges), all eight
+predicates, full/partial/zero EXEC, preserve VCC on CMPX, preserve SCC, both guest
+wave sizes, and existing compare neighbors. Keep64-bit DPP/DPP8 rejection.
+No public-list enum badge is execution proof. Original f20/native335 normal
+600s retry134839 endeddeadline/graceful0 at13:58:48UTC; no memory guard/fatal,
+no verified menu. Source inputs remained frozen through the completed run.
+
+## AnyPS5 scalar SOP1 support gap (2026-10-09, completed locally)
+
+Core/tests `f20f2bd8`: BREV_B64, BCNT0_B32/B64, FF0_B32/B64, SEXT_I8/I16.
+AMD RDNA2 scalar arithmetic/bit ISA is the contract; AnyPS5d70b8998 supplies
+adaptation reference. Native intended decoder RED124105 -> same CPU GREEN124320;
+GPUAV124535 PASS7 numeric cases; final registered CTest124727 PASS2/2.
+Independent dynamic-input oracle checks32/64 widths, SCC set/preserve,
+first-zero31/32/63/-1, sign boundaries, in-place alias and untouched backing/guards.
+Actual guestwave32/wave64, no coerced wave size. Unsupported0x23 still rejects.
+Native emulator125056 PASS; EXE33574979 installed. Bounded original eboot5178
+smoke125238 ended120s/close/graceful0 at12:54:54UTC, no memory guard/forced cleanup;
+black window capture only, no menu/game entry or measured boot benefit. Full
+shader_cfg scalar-descriptor EXEC baseline below remains separate/unresolved.
+Evidence `_Build/analysis/anyps5-study-20261009/`, `_Build/checks/20261009-124*/`
+and `_Build/runs/game-20261009-125238-anyps5-scalar-smoke/`.
+
+## Full shader_cfg scalar descriptor execution-mask baseline (2026-10-09)
+
+Full native020813 fails "scalar descriptor planning retained an unrelated native
+execution mask" after SMOV fixture repaired with valid s[48:51] descriptor.
+Native scoped production-only reversal021044 reproduces SAME failure with stride
+fix absent, preserving original unrelated diagnostics. Production patch restored
+and exact file hashes checked. This is separate baseline debt; do not claim full
+shader_cfg GREEN from focused checks. Required before a separate correction:
+inspect scalar planning/EXEC ownership contract, isolated unchanged minimal RED,
+then same GREEN and numeric/descriptor/zero-trip/conditional provenance neighbors.
+Raw runtime-stride patch does not suppress the failure.
+
+## Ordinary raw DWORD runtime stride (2026-10-09, regression in progress)
+
+Native8df/EXE98cd warm234326 completed past oldVS1135/PSc428, then reached
+CS1244 before3600s deadline. Graceful0/no memory guard/fatal, original5178 restored
+00:43:45UTC, compatible846963327B cache persisted. Loading/black only, no menu.
+Heavy cooperative family variants repeatedly cost116..140s. Read-only comparisons
+show additional true SRT mapping-offset differences; general ID canonicalization
+cost32s/module and did NOT establish equivalence. Do not reuse unequal modules.
+Existing stride8/48 source lead is independent: ordinary BufferByteAddress embeds
+packed_stride while native byte offsets/limits already use current shader data.
+Required CPU RED: unchanged synthetic raw DWORD read/store emits one module for
+stride8 and48, with dynamic index and exact native binding metadata. Test added to
+shaderCfgTests --raw-buffer-stride-module-only, intended native RED012655 -> unchanged GREEN013216. Final CPU021239 PASS5/5.
+GPUAV015627 PASS6/6 stride8/48, guest64, ADD_TID/OOB/sentinels; final neighbors021354 PASS6/6
+and real renderer021848 PASS2/2. Coredaca7b23/native022643/EXE87a9 installed; actual
+normal retry022803 ACTIVE PID33436. No menu/game-entry proof. Then current stride publication/unchanged numeric
+GPU/GPUAV read+write, OOB/offset/zero/add-TID/swizzle/typed/atomic boundaries and
+native renderer/binding neighbors; preserve all guards and actual resource data.
+Other mapping-offset variants remain separate unresolved performance work.
+
+## First-scene pipeline preparation cost (2026-10-08, measured lead)
+
+Actual native8df/EXE98cd retry231226 passed oldVS1135 andPSc428, then completed
+988pipelines before1800s launcher deadline. Graceful exit0/no memory guard/fatal;
+lastCS1134, window only loading arc/black. Newbed1121/cooperative64 module472189
+words/6095labels/386barriers/3functions/249-case switches, pipeline116920ms.
+Metadata threads64x1x1/LDS128dwords, no guessed guest payload. Final compatible
+806986099B driver cache saved2541ms; intermediate783725618B write110200ms with
+G: disk queue. These are measured first-load costs, not a new semantic RED.
+Same-source native warm retry234326/3600s+240sclose-grace is next to distinguish
+cached load from continuing unsupported runtime work. Resource limits unchanged.
+Before any shared performance correction, require independent synthetic cooperative
+wave64/helper/LDS dispatcher fixture, linear-size compiler invariants and unchanged
+numeric GPU/GPUAV oracle with neighbor/full-wave/zero-work/branch/barrier coverage.
+Do not skip shader work, force reuse between different static states, fake resources
+or modify OS/GPU timeout policy. Ordinary stride8/48 debt below remains separate.
+
+## Vertex bounded scalar descriptor byte read (2026-10-08)
+
+Completed locallya0e548bc+wave64 test8df60ac2. Native CPU RED102631->GREEN103900;
+renderer RED103328 -> final native11020920rejected/13allowed. CPU1119403/3,
+GPUAV1050598numeric cases/count/unsigned199/OOB and explicitguest64 test112218
+PASS; affectedGPUAV1112135/5 +legacy13-bufferindexed753111536 PASS. Workgroup
+axis and unsupported typed/byte-DMA gates remain closed. Static-key diagnostic
+103203 reproduces rootPhi0/+1*196/ReadConst32..35, scratch0 vsbadmanifest;104148
+tracking29bounded reads, no payload/materialization/GPU proof. Diagnostic removed.
+Harness arena supervisor fixed after unrelated105454 commit-pressure failure; no
+emulator/guest limits changed. Actual native8df/EXE98cd retry231226 passed old VS1135:127528words,
+graphicsVS965/PS9647364ms. Same run oldPSc428297659words, VS937/PS93624ms
+and VS937/PS94120ms. Gate passage is proved; runtime still active, white loading
+arc/window2319 only, no menu or game entry.
+
+
+37/EXEd103 normalPerformance100400 natural32110:20:55.431Z, no guards;
+original5178 restored10:20:55.658Z. RendererPSa3 gate passed/pipeline4065ms;
+oldPSc428 passed/recompiled297659words and graphics7383ms, later work followed.
+New fatal vertex1135e3d2715c8ba2 PC1738, private e0202020/80010040 decodes
+BUFFER_LOAD_UBYTE(op8) imm32. Four descriptor DWORDs ReadConstBuffer(offset=IMul32)
+rooted in GetBufferResource(ReadConst x4); bounded=no. Capture metadata_complete
+false and bogus scratch628885250 must not be trusted as compiler inputs.
+Required independent native CPU RED: vertex scalar bounded descriptor loop, raw
+unsigned-byte use, exact coherent table footprint/count/zero/DMA/writer negatives;
+same ISA loop/table proof as compute/pixel, no workgroup-axis admission. Then actual
+vertex GPU numeric output/readback/renderer binding and neighboring graphics stage
+cross-alias guards. Keep GPU-selected unbounded raw-byte BDA gate closed; no title/
+hash/address exception or fabricated capture payload. Diagnose index proof before
+stage expansion, and native game retry afterwards. No menu or game entry.
+
+
+## Pixel immutable SRT renderer binding gate (2026-10-08)
+
+Completed locally37bdd695: intended native RED093304 -> same GREEN093822;
+exact upload footprint095104 PASS; final native matrix09525116 rejected/10 allowed
+and scalar-selector/write neighbors095550 PASS. Cross-stage preflight checks
+buffer/image writers before bindings; compute-own ordered exception cannot skip
+another owner's snapshot, pixel ordered overlap remains rejected. Vertex-owned
+snapshots/DMA writes/range/count/atomic aliases stay closed. GPUAV094519 allocation
+failure was unrelated, not proof; final native tests uninstrumented. Native emulator
+and actual game retry pending. Render-target/depth attachment vs snapshot overlap
+is separate unproved graphics debt; do not claim exhaustive attachment alias coverage.
+Last actual PSa3 compiled; oldc428 passage not proved by this renderer fatal.
+
+
+Warm a4/EXEfe0d normalPerformance090720 naturally exited321 at09:28:56.055Z,
+no lifetime/memory guards; original5178 restored09:28:56.293Z. Compiler passed
+prior pixel bounded-loop planning failure and reached renderer descriptors.cpp899:
+immutable SRT snapshot requires compute without DMA writes, stage2/dma_write0.
+Required synthetic native RED: real renderer PrepareBindings on independent pixel
+snapshot, exact immutable range and flattened payload; no acquisition-side failure
+accepted as RED. Preserve vertex-owned snapshot rejection and DMA-write guard.
+Prove graphics companion vertex/pixel declared writers are checked against every
+stage's snapshot BEFORE descriptor/cache acquisition; overlap/disjoint/atomic/
+ordered-own-write and resource count/range negatives. Then same GREEN and native
+build/original retry. No title/hash/address special case or snapshot bypass.
+
+
+## Raw ordinary-buffer stride permutation cost (2026-10-08, diagnostic lead)
+
+Same a4/EXEfe0d Performance warm090720 reuses four5490 pipelines in76..83ms, but
+new fc6 variant recompiles134496ms. Cold0537 and warm0601 have identical671595
+word counts, differ by12 OpIMul operands referencing constants8 vs48. These are
+REAL semantic variants, not proven equivalent; do not force cache reuse or ignore
+stride. Warm newly encountered5490 variants287/288/290 cost141179/142514/142114ms.
+Required before any shared correction: bounded independent raw buffer stride8/48
+address/read/write and exact bounds regression; zero stride/OOB modes/add-TID/
+alignment/mixed typed/raw/atomic restrictions and renderer metadata publication.
+If making stride runtime data, prove unchanged GPU/GPUAV output and valid module
+reuse with correct current metadata; preserve guest ABI, host limits and typed
+format distinctions. This is performance debt, no production change made here.
+Current native game still active/frozen; no menu/entry or issue108 milestone.
+
+
+## Bounded buffer metadata control-flow expansion (2026-10-08)
+
+Runtime correction08:31: actual heavy5490 module is unchanged681k after2c. Its
+860-case switch is cooperative PC dispatcher of outlined helpers, NOT metadata.
+Do not cite metadata grouping as fixing that runtime delay. Independent metadata
+CPU/GPU proofs remain valid. Performance existing bounded recipe CPU082247 PASS;
+actual saved cooperative module082344681618->661988 in1.2s. GPUAV0829136 numeric
+cases including cooperative=1 multiwave LDS reduction pass. Next bounded normal
+Performance game retry; no performance/menu/game-entry claim from source audit.
+
+
+Completed locally2c746bb0: metadata classes share labels; actual native offsets and
+limits remain dynamically selected. Singleton constants and default unreachable
+selectors preserved. Native intended CPU RED074209 -> GREEN074410; final registered
+GPUAV074750 PASS7/7. Large515 native numerical neighbors075850 PASS3/3 WITHOUT GPUAV;
+combined instrumented075438 timed out120s during compile, not semantic evidence.
+Native emulator/runtime retry pending; no game/menu proof and no limit increase.
+
+
+Normal e498/EXE60629 runs065629 and warm071239 both timed out900s before pixelc428.
+Warm5490 compute variants681342/681618/681594words take134397/141030/136994ms;
+860-way switch becomes thousands of blocks through cooperative lowering. Cache
+checkpoint can take105615ms. No memory guard; originals restored after owned cleanup.
+Required independent native CPU RED: four bounded64-entry tables, three stride
+classes, different byte bounds/offsets, typed fallback and OOB; bound metadata CFG
+by actual semantic classes rather than rows. GPU/GPUAV read+store numeric oracle,
+wave32/cooperative64, sparse/native remap/zero-stride/fallback neighbors. Preserve
+all valid-selector checks, host descriptor limits, byte limits, volatile/atomic
+semantics; no title/hash exceptions. Native intended RED074209 (labels399/words14865) -> unchanged GREEN074410
+(labels99/words11690); GPUAV raw/formatted numeric074510 PASS. Final registered
+074750 GPUAV PASS7/7 (includes existing full/sparse wave64 count-guard neighbors).
+Experimental compact fixture wave64+partial4+barrier was rejected by existing
+resource planning at PC38/3c in074931/075139, before metadata emission; keep its
+root/EXEC proof as separate unproved debt, not an optimization regression. Its
+numeric oracle was never executed. Existing515-row stride/add-TID/formatted
+neighbors and original retry are next. No production admission was relaxed.
+
+
+## Pixel-stage bounded scalar formatted descriptor loop (2026-10-08)
+
+Completed locally e4985763: intended native CPU RED030356 -> unchanged GREEN030943;
+readonly SSBO native RED043228/051528 -> GREEN044102/052427. Final numeric pixel
+GPUAV060544 count0/1/2/3 sums0/1/3/6 no VUIDs; registered CPU065412 PASS2/2 and
+pixel+compute neighbors GPUAV065335 PASS5/5, including writable formatted buffers.
+Zero-trip reads none; DMA writer failure leaves snapshot/specialization unchanged.
+Compute workgroup-only proof, budgets, alias restrictions and typed GPU-selected
+rejections retained. Temporary captured-key/operand diagnostics removed before commit.
+Native emulator/runtime retry next; no menu/game entry proof. Original private
+capture033203 source translation passed, separate from synthetic regression/runtime.
+
+
+Normal72be9e34/EXE7af247b1 run015949 naturally ended321 at02:10:19, no guards;
+originaleboot5178 restored. Pixelc428 now passes rawDWORD PC3280 and fails PC37f0
+BUFFER_LOAD_FORMAT_X. Bounded CPU-only key reconstruction round-trips all captured
+static inputs (no runtime payload fabrication/GPU access), then reproduces same
+tracking failure in023420. Descriptor DWORDs are ReadConstBuffer(offset=Phi*196)
+with a0/+1 induction and SRT-backed four-word table root, not a known format
+literal. ProveBoundedSrtRead/PlanBoundedReads/MaterializeBoundedReads only admit
+compute. Keep formatted GPU-selected BDA gate closed; first prove an independently
+bounded pixel scalar loop can retain/materialize its real typed table and exact
+coherent read footprint, with count/zero/OOB/unsafe-root/writer negatives and native
+formatted pixel readback. Reuse established dominance/budget/snapshot machinery;
+workgroup-axis proof stays compute-only. No unbounded enum guesses or fake resources.
+Temporary diagnostics: analysis/pixel-formatted-probe-20261008-023237-8ad128,
+ShaderBatchAudit.cpp key replay + ResourceTracking.cpp bounded operand graph logger;
+not a fix/semantic RED. Preserve originals and remove or isolate before committing.
+
+## GPU-selected raw DWORD descriptor load in pixel stage (2026-10-08)
+
+Completed locally72be9e34: original GPUAV RED014248 -> unchanged GREEN014532;
+registered DWORD/ushort + admission guards014931 PASS2/2; vectors and related
+address/snapshot/stride/format neighbors015237 PASS. Existing BDA emitter unchanged.
+Native emulator015646 PASS, install/retry next. No new push/game-entry proof.
+
+Same native numerical fixture RED014248 -> unchanged GPUAV GREEN014532. Existing
+one-component BDA emitter is unchanged; shared raw32 admission now includesDWORDx1.
+All19 rows (four OOB modes, stride/offset/soffset/unaligned crossing/last payload/
+invalid descriptor/inactive lane/swizzle and sentinels) pass. Formatted/typed/
+signed16/write/atomic gates remain closed; registered guard+ushort/vector neighbors
+and original runtime retry are next. Core fix remains local/unpublished.
+
+Nativeec26997d+diagnostics/EXEa0b99068 normal480x270 run012532 naturally ended321
+at01:36:39.530581 UTC, no900s/memory guard; originaleboot5178 restored. Old packedCB
+PSe82 now compiled to39346 words and graphics VS918/PS917 completed1510ms. This
+closes that admission/pipeline blocker on the smaller profile; both visual captures
+remain black, no menu/game entry proof. Prior CS8457 id294/220047words completed
+367727ms. Next fatal: pixelc428451cf6d96d04 PC3280 GPU-selected buffer descriptor.
+Private raw0xe0302024/0x80000502 decodes MUBUF BUFFER_LOAD_DWORD(op0xc), immediate36.
+Metadata+37056B capture under runs/game-20261008-012532-packed-cb-capture/shaders/dispatched/.
+
+Required independent unchanged native GPU/GPUAV raw single-DWORD fixture: GPU
+selected row through load/readfirstlane/descriptor fetch, stride/index/offset/soffset,
+OOB modes0..3, complete last DWORD/OOB tail, unaligned cross-DWORD bytes, swizzle,
+invalid descriptor, inactive lane, output/guest sentinels. Existing scalar indirect
+BDA emitter already accepts one component; admission only allows unsigned16 and
+DWORDx2/x3/x4. First intended RED before extending the raw32 classifier; preserve
+formatted/typed/signed16/write/atomic restrictions and existing ushort/vector cases.
+Then native build and bounded normal game retry; no title/hash/address behavior.
+
+## Packed normalized color export (2026-10-08)
+
+Completed locally ec26997d: GPUAV same positive cases GREEN010603; expanded
+producer/unsupported-state and neighboring float/alpha/load/store011934 PASS5/5.
+Expected partial-export refusal011250; CPU admission011712 PASS after replacing
+old unproved-CB footprint0 expectation with the now-tested four-byte footprint.
+Native emulator012319 PASS; install/normal runtime retry next. Blend, truncation,
+partial-component exports/write masks, multisample and non-FP32 source remain
+explicit errors; fully masked targets require no conversion. No game/menu proof.
+
+Corrected independent channel-order oracle uses declared Agbr mapping3/1/0;
+final intended native admission RED005850 -> unchanged numeric GPUAV GREEN010603.
+Both widths/four orders/41 single-target samples+mixedMRT2/cache identity and real
+shared CB/texture backing/download/sentinel pass. Exact positive FP32 half-LSB
+packing uses a two-U32 significand product, avoiding intermediate FP32 rounding;
+buffer/image RNE remains default. Producer/unsupported-state neighbors and original
+normal game retry remain pending. No title/hash/address behavior, push or menu proof.
+First005252 fixture build error and010313 API-overload build error are not REDs.
+
+Normal6f5c15bf+diagnostics/EXE991acf8a run002103 naturally ended321 at00:32:38,
+no900s/memory guard; originaleboot5178 restored. CS8457 creation completed383090ms
+and expensive work was checkpointed; final runtime blocker is unchanged packedCB
+layout6/type0/order0, slot2, PSe82, full decoded MRT mask7f, mode9 FP32, unblended
+single-sample480x270 surface. This supersedes the unknown-phase stall lead: no
+DCE causality or speed claim. Captures/logs under runs/game-20261008-002103-cache-budget-capture.
+
+Required independent synthetic CPU admission + native GPU color-export/readback
+RED/GREEN, both packed widths, four orders, zero/max/unequal/half-LSB/clamp/NaN/Inf,
+mixed float MRT0 + packed MRT2, distinct shader permutation and real shared
+render-target/texture raw backing/upload/download/adjacent guest sentinel.
+Keep blending/partial-component exports and unsupported rounding explicit.
+CB ROUND_BY_HALF differs from buffer/image RNE; do not reuse their packer without
+an explicit rounding policy. Preserve actual UNorm numeric interpretation; no
+float substitution. AMD primary GCN3 data/MRT table and CB conversion definitions:
+https://gpuopen.com/download/AMD_GCN3_Instruction_Set_Architecture_rev1.1.pdf
+https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/R6xx_3D_Registers.pdf
+New input metadata fields are initially unused test seams, not production support.
+
+## Slow driver-cache checkpoint I/O on the GPU command lane (2026-10-08)
+
+Native unchanged policy fixture RED001418 -> GREEN001548. Cheap1000-creation
+burst now retains pending work after one save; eventual cooldown/long compilation/
+initial/cheap/no-work/uint64 boundaries pass. Source correction measures actual
+checkpoint cost, budgets intermediate I/O, saturates pending count and retains
+pending work on save failure. Original SaveDriverCacheLocked and unconditional
+shutdown Save remain unchanged. Cache identity/validation-mode/SPIR-V-reuse/checkpoint neighbors001730 PASS4/4.
+Local fix6f5c15bf committed separately; native build001939 PASS. Normal bounded
+retry with independent pipeline/cache timing is next; no push or game/menu proof.
+
+Native1a795a82 + preserved diagnostics + temporary cache timing logger,
+EXEd8d972d2, normal asynchronous480x270 run000848 confirms a633936331B
+checkpoint took26500ms: hash173ms, write26414ms, flush26458ms, rename26500ms.
+An earlier write took2046ms; unchanged probes172..183ms. Optional host persistence
+currently stalls the command lane every16 creations or after an expensive creation.
+The180s probe reached shown190/pstg3, then owned guard/forcedcleanup; no menu proof.
+Original eboot5178 restored. Artifacts: runs/game-20261008-000848-cache-io-capture
+and analysis/yotei-cache-io-20261008-000824-127810. This is a measured contributor,
+not proof it explains the entire previous900s runtime stall.
+
+Required independent native CPU RED/GREEN for checkpoint cadence using measured
+save cost and elapsed time: a simulated burst of cheap pipeline creations must
+not pay repeated26s writes, deferred work must eventually checkpoint, initial/
+cheap checkpoints and valuable long compilation must remain eligible, no work
+must remain false, and uint64 time boundaries must not wrap. Preserve unchanged
+unconditional shutdown Save, write/flush/rename/hash/driver/validation identity and the16/5s
+eligibility triggers. Apply cost budget only to intermediate persistence, then
+cache identity/validation neighbors, native build/install and bounded normal retry.
+Keep pipeline/driver/GPU phase diagnosis separate; no DCE rollback or guest workaround.
+
+## Native indirect offset ownership (latest main420bb51d, 2026-10-07)
+
+Candidate integration deferred: independent native GPUAV RED230803 at auto draw;
+the unmodified upstream fetch_embedded predicate candidate still failed230923.
+Do not publish it as a fix. Branch SGPR/fetch contracts need separate diagnosis;
+restore old production/test pair, retain generic fixture patch outside tracked
+source in pr497-conflicts analysis. No failing test removed from the branch's
+existing harness; the new upstream-dependent fixture is not yet integrated.
+
+
+Main advanced during PR497 validation; native indirect fetch programs consume
+base-vertex/instance offsets through their guest SGPRs. The branch still supplies
+the same offsets to Vulkan, potentially applying them twice. Import main420's
+independent synthetic indexed/auto native raster fixture first; capture intended
+RED before adopting its decoded fetch_embedded/offset_source-based correction.
+Preserve rewritten-fetch/Vulkan offset and ordinary draw-state neighbors, with
+GPU pixel readback unchanged. No title/hash/address gate. AudioOut2/AMPR changes
+from the same new base require their existing targeted native checks.
+
+
+## Bounded stall after DCE integration (2026-10-07 22:50 UTC)
+
+Native33a115c9+preserved diagnostics/EXE555d game223527 exceeded900s at480x270,
+owned cleanup/native-1; no28GiB guard. Last observed shown190, black capture,
+cache630040201B, originaleboot5178 restored, no process remains. Exact pending
+shader/pipeline/phase is unknown; no diagnostic hash or fatal context captured.
+Earlier7730 retries passed storage admission and reached packedCB layout6/type0
+at480x270 and3840x2160. Latest advancement regressed, cause not isolated:
+source/SPIR-V/cache differ, so do not claim DCE causality or speed improvement.
+
+Required first read-only/bounded capture of phase/hash/IR/resource shape, then
+independent CPU compiler/IR/resource-plan or scheduling regression matching that
+cause. Preserve expected numerical/readback behavior and existing liveness roots;
+no speculative DCE rollback, guessed timeouts/limits or GPU reset loops. A host
+compiler-progress invariant may be needed before any further potentially hanging
+GPU reproduction. Menu/game-entry/gameplay remain unproved.
+
+
+## Paired DCE integration after PR497 CI read-back (2026-10-07 22:16 UTC)
+
+Completed: native same-fixture RED221644 -> GREEN222227; affected resources/CFG/
+GPUAV222605/222626/222639/222726 pass, native build223317. Public commits1511939a/
+e4c255df and exact-head CI37696776012 PASS all three platforms. Main branch IR
+layout/F64 retained. Existing sampled-depth disassembly expectation222832 remains
+old debt, corroborated September27 evidence; it never reached numerical execution.
+
+
+Publishedd585 Windows/Linux CI failed the old scalar-buffer OOB planning oracle;
+production+the October2 clean-scalar regression already require known OOB zero
+without a memory probe. Update this stale expectation and retain an unreadable
+in-bounds negative/control; no production scalar-read change. macOS compile
+failed mixed uintptr_t/uint64_t initializer-list deduction in the depth fixture;
+use an explicit uint64_t array without changing addresses or numerical oracles.
+
+After the OOB fixture repair, unchanged main-provided TestDeadPhiCyclesAndPlanningRoots
+is intended native CPU RED221644: old branch DCE retains a dead Phi/increment SCC.
+Port upstream95c89229's liveness traversal and its small live marker while preserving
+branch Value/F64/storage abstractions. Same unchanged GREEN must retain direct
+Identity edges, live recurrence and external planning roots, remove dead cycles,
+and clear old marks on a second pass. Then affected scalar/resource/CFG/GPU checks,
+native build and bounded game retry. Keep the core patch separate from test-only
+portability/oracle changes. No removal of failing tests or broad architecture replacement.
+
+
+## Direct packed UNorm raw32 storage writes (2026-10-07 21:29 UTC)
+
+Native d585b0c9 + preserved diagnostics + packed-use error detail, EXE4a7c792f,
+480x270 bounded game212925 ended naturally/native321 after17.27s, no guards.
+Exact use: image/root24, source31, PC0x4328, format30, storage=true, atomic=false,
+compare=false, root_sampled=false, width mismatch0, indirect=false. The preserved
+same-hash capture decodes IMAGE_STORE/Dim2D/dmask7/raw32 at that PC. Original
+eboot5178 restored; no owned native process remains.
+
+Completed locally in7730fd11: shared formatted-component packing for raw32
+normalized storage writes, fixed4-byte native backing. Same numerical GPUAV
+RED213801 -> unchanged GREEN214014; expanded stores/loads/packed-float/scaled/
+selector214532 PASS5/5. Real storage binding/upload/download and sentinels pass.
+CPU resource tracking/admission214403 PASS; atomic/compare/sample/D16 transactional
+rejections retained. Original game retry and original-resolution confirmation
+remain pending; CB support is unchanged. No push of this follow-up fix yet.
+
+Intended RED confirmed on unchanged production admission at
+`_Build/checks/20261007-213801-4632464-shader_recompiler_compute_tests/`: genuine
+format30/IMAGE_STORE rejected by raw-load-only gate, not a build/input failure.
+The numerical fixture and real-storage-backing checks remain unchanged for GREEN.
+
+Required independent unchanged native GPU RED/GREEN: both11/11/10 and10/11/11
+layouts, exact packed bytes, zero/max/quarter/half/three-quarter, clamping, NaN/Inf,
+one-LSB, inverse swizzle, sparse DMASK and nonwritten texel sentinels. Real renderer
+storage binding/upload/download must retain4-byte backing and adjacent guest bytes.
+Reuse the established formatted-component packer; keep sample/atomic/compare/D16/CB
+admission closed. RDNA2 ISA section8.2.4 specifies entire-element writes: omitted
+components become zero, rather than retaining old fields. This corrects the older
+prospective partial-component-preservation requirement; use that primary contract
+in the new sparse-mask oracle. RDNA2 reference retained in
+`_Build/analysis/rdna2-isa-budget.pdf`; normalized conversion contract:
+https://github.khronos.org/Vulkan-Site/spec/latest/chapters/fundamentals.html
+
+
+## CPU-only unmap must not wait for unrelated GPU work (2026-10-07)
+
+The merge candidate retained unconditional scheduler Finish in RenderContext::UnmapMemory.
+Independent native GPUAV `gpu_command_lane` RED at
+`_Build/checks/20261007-211522-8046356-shader_recompiler_compute_tests/`
+failed specifically at `CPU-only unmap with pending host retirement` after the
+fixture released its bounded timeline gate and drained owned threads. No driver reset.
+The unregistered CPU range must retire without submitting/waiting for unrelated
+GPU commands. Buffer/image ownership or pending priority callbacks still requires
+the scheduler drain. Preserve the test unchanged; admit upstream's cache-ownership
+query with the branch's image model, then rerun this same regression and neighbors.
+
+
+Same unchanged native GPUAV `gpu_command_lane` GREEN passed at
+`_Build/checks/20261007-211806-3027197-shader_recompiler_compute_tests/`.
+The cache-ownership query and pending-priority guard are upstream's shared
+mechanism; the branch image model is retained. Adjacent scheduler/ring/draw-offset
+checks previously passed; no title or address-specific behavior.
+
+
+
+## Reachable packed UNorm use in compute e519 (2026-10-06 21:26 UTC)
+
+Native59c26be4+preserved diagnostics/EXEd65295f6 bounded480x270 rungame211642
+ended naturally21:16:57.504546 UTC/native321, no guards/forcedcleanup. Original
+ebootSHA5178 restored and checked, no owned process remains. It stops earlier
+than the old CB error: compute e519fa9713f7b8e3 fails the new raw32-only UNorm
+gate. A descriptor previously became null due to missing known-format metadata.
+Runtime advancement is regressed; do not claim improved boot. Exact gate reason
+(sample,storage,compare,atomic,D16), format/root/usePC require read-only diagnosis.
+Existing223637 dispatched compute_e519fa9713f7b8e3_7b111caaa5beb65a has18352B code,
+but lacks needs_lds_barriers; direct CPU audit is input_error, not semantic RED.
+
+Required independent next regression before extension: actual reachable operation,
+exact packed bits/normalized values and guest/output sentinels, zero/maxima/one-LSB,
+distinct RGB/swizzle and operation boundaries. For storage prove rounding/clamp,
+partial-component preservation and NaN handling; for sampling prove requested
+filtering/border/LOD behavior rather than force nearest. Keep D16 and CB distinct.
+Consider useful portions of PR1115 only after semantic RED/GREEN; no title/hash/
+address behavior or fake descriptors. Then bounded lowres retry and original
+resolution when closing a corrected runtime blocker. Existing CB remains pending.
+
+## Eliminated image instruction remapping, upstream PR #1112 (2026-10-06)
+
+Candidate head9c324c6c, semantic commit31fb7208 (format-only f0cb8162 excluded).
+Imported its independent compute unused-load and pixel live-sample/dead-load
+fixtures before behavior changes. Native shader_cfg_tests intended RED204919
+hits ImageRemap index>=source_count on a removed instruction's stale metadata;
+source d982a98c plus test/previous preserved diagnostics, no GPU execution.
+Required same GREEN, retained live image binding/valid SPIR-V and nearby affected
+resource tracking/packed-image tests. Preserve guards for actual live instructions.
+After resolving the cherry-pick conflicts, the unchanged PR fixtures pass native
+CPU205633. Merge preserves our copy/first buffer remap and gather tests. A second
+independent IR regression checks live normalized raw32 plus removed D16 metadata:
+our width gate must use actual live image accesses, not stale memory_info entries.
+Completed local e7ba687f: intended RED210004 -> same GREEN210247; final full
+resource_tracking/admission210953 PASS. PR1112 integrated31e54af9, final registered
+unused-image CPU211052 PASS. Fallback without liveness metadata remains conservative.
+Local integration authorized; no push, no upstream merge or issue108 publication.
+
+## Packed normalized image load prerequisite (2026-10-06)
+
+Before enabling a packed normalized render target, prove its storage interpretation
+independently. New synthetic native IMAGE_LOAD fixtures for both 11/11/10 and
+10/11/11 UNorm widths: zero/maxima/one-LSB/unequal fields, actual f32 register
+bits, RGB/default alpha and explicit swizzle constants; same-width raw R32Uint
+host surface. Fixed-point oracle is field/(2^width-1), not packed-float decoding.
+Required intended RED is existing materialization's unsupported format30 rejection,
+then unchanged numerical GREEN and existing packed integer/float neighbors.
+Diagnosis refined before production edits: the native fixture's valid format30
+descriptor is instead erased by ValidImageDescriptor/IsKnownFormat and becomes
+a null descriptor (format0). Intended CPU RED202110 fails the unchanged descriptor
+preservation invariant expected30/actual0. Earlier201803 bounded readback shows
+raw packed words, but that run did not retain a valid typed descriptor and is not
+used as numeric semantics proof. First201723 build was aborted after noticing a
+wrong selector; only task-owned Ninja/clang were stopped. No reproduction claim.
+Keep filtering, storage writes and CB admission unsupported until separately proved;
+no forced nearest filtering for normalized sampling. No game/title/address fixture.
+R6xx/R7xx primary NUMBER_TYPE-ignore rule is generation-specific and cannot alone
+justify changing PS5 CB semantics. Completed local d982a98c: scoped metadata RED202738 -> unchanged numerical
+GPU/GPUAV GREEN. Final211156 covers both widths/all four fixtures, real raw
+renderer backing/download/sentinel and packed float/scaled filtering neighbors.
+CPU210953 checks D16/sample/store/dead-metadata boundaries. CB stays closed;
+runtime now exposes the earlier e519 use above, no boot improvement claimed.
+
+## Render-target packed 11/11/10 format with numeric selector zero (2026-10-06)
+
+20:01 UTC update: bounded diagnostic 480x270 retry game-20261006-195253
+reproduces the same layout6/type0/order0 error in196.132s, native321/no guards.
+EXEBED81987, original game SHA5178 restored and independently checked after
+termination. Actual failing surface480x270, single sample/fragment, blend off,
+clamp on, bypass off. First eight indirect source observations are identical
+CPU/backing/clean-read0x8018; no stale backing evidence within this sample.
+No normalized-to-float substitution, partial-attachment drop or production fix.
+Native exact pixel capture audit195721 PASS through decoder/CFG only (971
+instructions,44 structured blocks); all41 pre-structured blocks reachable.
+Block39 includes MRT2 EXP atPC0x15f8/en0xf along with MRT0..6; it cannot be
+excluded merely by absent static export. Runtime branch execution and legal
+packed-UNorm raster semantics still unproved; semantic RED remains pending.
+Artifacts `_Build/analysis/low-resolution-probe-20261006-195227-e351f8/`
+and `_Build/checks/20261006-195721-8277234-shader_cfg_tests/`.
+Use the authorized smaller profile for quick retries, then original resolution
+for closing a corrected runtime blocker; different cache warmth is not a speed
+benchmark. Buffer pack/unpack support alone does not prove CB numeric semantics.
+
+Resume evidence 18:55 UTC: last normal run game-20261006-052933 ended naturally
+05:39:19.182665 UTC/exit321, no guard. Installed EXE3e3513c2 matches run.json;
+no active native game/build/harness found. Diagnostic raw indirect register
+CB_COLOR2_INFO=0x00008018 at0x33a; PS e82bdf234f518f8c/6400B has decoded MRT
+export union0x7f, including slot2. Existing registered manifest/binary is
+`_Build/runs/yotei-integrated-20261005-223637-vertex-access-capture-noval/shaders/registered/ps_e82bdf234f518f8c_556489d9735846dc.json`.
+Thus absent-export fallback is not justified by current evidence. Union of
+decoded EXP instructions does not establish actual conditional execution.
+Next distinguish legal numeric format from wrong command/state provenance;
+the existing semantic RED requirement below stays pending. No core behavior
+change, build, test or repeated game launch performed during this diagnosis.
+
+Native08dfdade/b361 normal original rungame041213 ended04:29:10.472UTC/native321,
+no guards/forcedcleanup, owned32080/supervisor40776 absent and streams finalized.
+It passes earlier sampler/image/FMASK blockers, then TextureGetRenderTargetFormat
+rejects layout6/type0/order0. Current enum layout k11_11_10, type kUNorm; guest
+ResolveRenderTargetFormat yields k11_11_10UNorm (30), host format and size table
+support only packedUInt (34) and packedFloat (36). Corecache615354867B preserved.
+Spinner visuallyseen04:23:51/shown256, no currentmenu/gameentry/playability proof.
+
+Read-only diagnosis first: actual CB operation and numeric-format contract,
+active/render versus metadata/clear carrier, raw register parsing and channel
+ordering. Both direct/indirect PM4 parser currently decode NUMBER_TYPE8..10.
+AMD primary register documents say packed11/11/10 CB formats are float-only, but
+this does not yet prove that numeric selector0 may be ignored; avoid guessing
+float conversion, fabricated normalized values or dropping required attachments.
+
+Required independent native CPU intended RED before behavior correction: legal
+register/API encoding with independently specified exact format/bytes/channel
+mapping and pixel packing/interpretation, same GREEN. Preserve unsupportedformat
+and numeric/order cases. NativeGPU render-export/readback and sampled/storage
+roundtrip with distinguishable components, orders and boundary values plus
+nearest existing packed target cases, then original bounded normal game retry.
+If actual use is inactive or metadata-only, reproduce that shared resource-
+planning contract rather than admit unsupported raster numeric semantics.
+Current production unchanged for this blocker; no runtime/Q/game claim.
+
+## Coherent scalar selector domains for inline resources (2026-10-06)
+
+Diagnostic-only native896ca780+delta/EXE4e2890 normalrun032325 ended03:33:15.107UTC/
+native321, no guards/forcedcleanup, own12336/supervisor41476 absent. Exact failure:
+compute34be6ffcc212383c image250/root8/pc0648, storagefalse/comparefalse,
+root_sampledtrue, FMASKformat159, firstkey0x113a8=70568. With stride872/offset204,
+this points to row81+140 (sampler-word bytes), not a normal record-start image.
+CapturedIR confirms selector raw U32 scalar-buffer word at an offset shifted by2;
+no proven value bound. Do not simply admit indirectFMASKload or sampledFMASK.
+
+Required independent CPU RED before behavior edits: synthetic readable readonly
+index buffer with only ordinary record IDs, inline material table includes valid
+ordinary records plus a valid but unreachable sampled-FMASK descriptor at a
+wrapped interior offset. Materialization must use a proved coherent selector
+snapshot to preserve exact reachable ordinary descriptors, and retain full
+wrapped-U32 behavior when no such proof/callback exists. Readonly/index-domain
+capture must track immutable ranges and enforce all existing buffer and actual
+padded-image writer-alias guards; raw address writes or unavailable/dirty data
+cannot be treated as trusted. Never drop a reachable unsupported FMASK descriptor.
+
+Neighbors: input includes huge U32 value that really wraps to FMASK key32 -> same
+unsupported error; missing selector data -> conservative fallback/reject, no
+partial commit; duplicate IDs/out-of-range/partial word/zero default; aliased
+shader buffer writers and actual storage-image writers rejected, no bound or
+coherence suppression. The native renderer currently also skips alias checks when
+older bounded coefficient reads precede writes; new selector snapshots must not
+inherit that unrelated proof. Required native host admission RED with selector
+marker plus coefficient-before-write flag and an actual padded image/buffer overlap;
+unchanged GREEN after guarding that bypass, legacy ordered/disjoint neighbors.
+Reuse existing64MiB snapshot work budget and finite probe limits, avoid unbounded scans or whole-device allocations. Mechanism now completed
+in local08dfdadeaa6b3d90b9e9fda0b93e649d23d8464f: optional compute coherent selector
+snapshots, exact U32-wrapped keys, protected source ranges, conservative fallback.
+CPU intendedRED034102 -> unchangedGREEN035130; expanded035655 input/alias/partial/
+work-bound/real-wrapped-FMASK casesPASS. Finalresource_tracking0407324.17sPASS.
+NativeGPUAV numeric/readback035828PASS; native actual paddedimage/buffer writer
+admission intendedRED040225 -> unchangedGREEN040520, legacyordered/disjointPASS.
+Finalregistered selectors040847 .50+1.49sPASS. _Build/checks/ artifacts. Native
+build/install/current game retry still needed; actual input extent/coherence and
+runtimepass remain unproved, so the runtimeblocker staysopen. No playableclaim.
+
+## Indirect FMASK candidate semantics (2026-10-06; new normal-run blocker)
+
+Native896ca780/SHAffc81f normal original-resolution rungame-025652 ended
+03:06:59.227UTC/native321, no timeout/memory guard/forcedcleanup; own36488 and
+supervisor35268 absent, streams finalized. It passes prior sampler33 and combined
+image513 checks, then compute34be6ffcc212383c rejects "FMASK requires a direct image
+load". Spinner captured03:00:28/shown233, no menu/gameentry. Cachepayload613123768B
+preserved. Normal Release/originalgameSHA5178/redzone/no diagnostics unchanged.
+
+Read-only diagnosis required first: determine whether the FMASK candidate belongs
+to a legitimate IMAGE_LOAD root or an over-approximated IMAGE_SAMPLE table. Existing
+check rejects storage, compare, indirect and sampled use together; current sparse
+error does not distinguish them. Do not assume indirect alone or silence illegal
+sampling. Identify root/use PC and format/selector provenance via existing local
+capture or bounded diagnostic error detail if needed, preserve proprietary data.
+
+Required independent semantic CPU RED before behavior changes: bounded table with
+FMASK identity sample-to-fragment mapping and ordinary image candidates, observable
+selector and EXEC result, supported raw32 IMAGE_LOAD only. Keep sampling/storage/
+compare/unsupported widths rejected. Derive guest/hardware FMASK load behavior and
+host sample layout contract from primary documentation; do not invent zero data
+or flatten nonidentity sample storage. If actual failure is sampled/over-approximated
+FMASK instead, reproduce that shared domain-planning problem independently first.
+Then unchanged GREEN, nearest direct FMASK/heterogeneous/indirect load cases and
+bounded native GPU exact readback before rebuilding and retrying original game.
+Current FMASK production behavior unchanged. Playable outcome still pending.
+
+## Combined native image candidates beyond logical capacity (2026-10-06)
+
+Native07bea78d/SHA8626 normal original-resolution retry022841 exited321 at
+02:39:29.981UTC, no timeout/28GiB guard/forcedcleanup; owned49428/supervisor51068
+absent and both streams finalized. It passes the earlier sampler33 error and
+compute34be6ffcc212383c instead rejects combined image513 against compiler512:
+size71504/stride872/probes8921/current table123 candidates. Durable core payload
+610628405B retained. Loading spinner visually confirmed atshown255; no gameentry.
+
+Required independent native CPU intended RED before mechanism edits: multiple
+bounded synthetic tables each within512, combined native descriptors beyond512,
+exact original image values and per-root selector mapping. Keep logical guest
+image admission and per-table work bounds separate from combined native stage
+image operands. Check lower host budget rejection is transactional, fmask compaction
+and ordinary/sampled/storage/mip accounting remain correct. If using host-derived
+aggregate image ceiling, derive it from sampled+storage typed stage/layout limits
+and stage resources; final layout still accounts other resource classes, shared
+stages and storage mips. Avoid a global constant increase, fabricated descriptors,
+rewritten addresses, pair collapse without semantic proof or stage skipping.
+
+Synthetic mechanism proof completed in local896ca780cefa39ef668f48f6ac35e2dc374e2961:
+native CPU intended RED024406 -> unchanged GREEN024522; budgets513/512/1/0
+transactional, all514 descriptor values and root mappings, native binding count.
+First test build024339 failed from a fixture enum typo and is not RED evidence.
+Final resource_tracking025128 PASS4.13s; descriptor_budget025255 PASS with typed
+limits, storage mips, auxiliary descriptors, zero and overflow checks. Native
+GPUAV combined514 test025015 PASS8.39s: independent first/last float values,
+explicit out-of-range selector leaves sentinels and neighboring guard intact.
+Initial GPU fixture024704 failed at preserved per-table work bound before GPU
+execution; bounded256 selector fixture corrected, numeric oracle unchanged.
+Shared inline GPU025326 and FMASK/integer load GPU025414 PASS. Artifacts under
+_Build/checks/. Core keeps logical512/per-table512/probe budgets, derives aggregate
+native stage image ceiling from actual device limits, and uses sized ImageRemap;
+final native layout still checks typed families, mips and other descriptors.
+Native build/install/original normal game retry pending; runtime blocker remains
+open until it passes there. No other-game GPU corpus or playable runtime proof.
+
+## Inline sampled-pair native sampler capacity (2026-10-06; current original-resolution blocker)
+
+Stable background normal rungame-20261006-011540/nativeB4/SHA87f24 ended
+01:53:34.472UTC/native321, bothstreamfiles finalized. No timeout/memoryguard or
+forcedcleanup; sourceoriginal5178/--redzone/noDebug unchanged. No repeat guest
+DIVexception. Compute34be6ffcc212383c pc05e8 materialization rejects sampler33
+(size71504, stride872, probes8921, pairs172) against ShaderInfo::MaxSamplers32.
+Corecache lastcheckpoint609930772B preserved. Actualgameentry still unproved.
+
+Required minimal independent native CPU RED BEFORE core edits: reusable inline
+image+sampler table with33 distinct genuine sampler descriptors (observable root
+and candidate mapping), hostbudget allowing33 versus32. Preserve conservative
+logical guestlimit32 separately from materialized native descriptor expansion.
+Current BuildSamplerPlan also has fixed32 mapping/binding/usage arrays and may
+clone samplerclasses, so raising only the first guard is insufficient. Derive
+per-stage/set sampler descriptor budget and totalresource/accounting from actual
+Vulkan limits, include samplerclass clones, and retain transactional reject when
+budget32 or finaltype expansion exceeds budget. Do not increaseglobalguest limits
+blindly or collapse different filtering/depth/coordinate semantics to pass.
+
+After intended CPU RED/unchanged GREEN, nearest existing inline sampler/pair/class
+neighbors and available synthetic native GPU sampled image readback across first,
+32nd/33rd slots, then build/install and retry originalnormalgame. No game/hash/
+address code, fake/nullsampler substitutions, stage skipping or bound suppression.
+Exact shader capture is absent in the no-debug run. Generic synthetic proof now
+completed in local fix 07bea78d: native CPU intended RED021845 -> unchanged
+GREEN021949, expanded transactional/class neighbors022203, full resource_tracking
+4.11s022418 and descriptor_budget .03s022513 PASS. Native GPUAV33 sampler readback,
+null fallback and ordinary neighbor022238 PASS; final registered CTest022548
+.71s PASS; integer/packed/float sampling022618 PASS. Actual device native sampler
+ceiling1048576, logical guest cap32 preserved. Artifacts under _Build/checks/.
+Normal original game retry remains required before closing the runtime blocker.
+No other-game GPU corpus or gameplay proof. No title/hash/address bypass.
+
+## Original-resolution no-debug integer divide exception (2026-10-06)
+
+Native retry234419/localb4eae640/EXE87f24 ended00:01:29.156UTC with
+0xC0000094 (integer divide-by-zero), no guard/timeout/forcedkill. Originalgame
+SHA5178 restored; sharp Medium menu visuallyconfirmed atshown296-313,
+WhiteCrosshint shown308. Owned60s PostMessageCross23:59:05-00:00:05 released,
+helper0;00:00:35 stillMedium, no Standard/Quality/gameentry confirmation.
+ForegroundSendInput attempt afterexit withheld before any input. Both streams
+finalized, owned44484 absent. Corecache loaded542376395B, checkpoint547858142B.
+No game/shader dump/debugger/profiler or validation in this normalgame launch.
+
+Next read task-specific Windows crash event/report to locate host versus guest
+fault. Required independent regression before production changes: identify exact
+shared operation and legal zero/empty boundary from ISA/API/ABI, then minimal
+CPU fixture that produces the same meaningful divide error/result on current
+production. Keep unsupported errors and avoid generic exception masking/fakezero
+results. Native build/semantic RED-GREEN only after path identified. Do not replay
+identical crashed game repeatedly or attribute it to the recent reserve fix/input
+without evidence. Missing crash context must be an explicit limit.
+Windows event1000/PID44484 at00:01:16.802 and existing WER dump locate the
+fault at guestmain0x90113378e (base0x900000000): unsignedDIV32 [rsp-0x74],
+EDX0/EAXffff087d, remainder indexes a pointertable. Thus zero divisor is implied
+(no unsigned quotient overflow withEDX0), but stackDWORD/its producer is not
+captured. This is guestcode fault, not a symbolized hostcapacity function. No
+red-zone/empty-hash/API/coherence cause yet; require source/ABI evidence before
+fixing. Ignored _Build/analysis/workgroup-capacity-20261006/crash-context.json;
+OS dump remains local, no live attach or replicated full memory in shared notes.
+
+Read-only performance lead: bounded workgroup snapshots call clean-memory reader
+perDWORD; native coherent callback does texture/buffer ownership queries and
+backing map locks perword. GPU dirty readback already widens to512KiB, so repeated
+GPU downloads are NOT proved. A future batching change needs exact same source
+words/coherence/alias/unmapped/wrapped/transactional guarantees and independent
+callback/work-budget regression; actual contribution to current slowframes is
+unmeasured. No speculative batching code introduced in this retry.
+
+Read-only follow-up00:19: original guestfunction explicitly tests initial divisor
+forzero after storing it atRSP-0x74, then performs faultable external accesses with
+that local live; leafuses full128-byte redzone. Prior normal launcher omitted
+--redzone (defaultfalse), bypassing existing Windows protection. Native existing
+--red-zone-patcher-only PASS00:17:12/EXE11C2D122/.17s; fixture proves disabled
+corruption/protected exactsentinel against modeled Windows fault. No production
+edit. Next bounded original-resolution run001807 enables --redzone with debugger,
+validation, shaderdump/profiler/readback off; owned44940 active. This is testing
+an existing correctness setting, not confirmed gamecrashfix. Keep causal link
+pending actual previousstage and use foreground keyboardinput only after prompt.
+
+## Original-resolution workgroup coefficient snapshot capacity (2026-10-05)
+
+Native no-debug original-resolution retry233030/sourcea025/EXEa1e03 exited321
+at23:30:41.706UTC after loading542344503B driver cache. No timeout/memoryguard
+or forced kill; streams complete, owned19352 absent. Restored original game
+SHA5178cf80, diagnostic480x270 preserved separately. New failure is shared
+MaterializeBoundedReads: workgroup-axis count130560 exceeds stable reserve65536
+for compute5be616. No high-resolution rendered frame/Quality/game entry proved.
+
+Required independent native CPU regression BEFORE production edits: synthetic
+WorkgroupId-indexed scalar coefficient table with >65536 launched x groups,
+exact first/last words and unused-tail sentinels; multiple columns/shared reads,
+zero dispatch, unreadable source, axis/count validity and transactional rejection
+beyond existing64MiB snapshot budget. WorkgroupId is32-bit with dispatch domain,
+not a16-bit descriptor selector (Vulkan interfaces WorkgroupId contract).
+Use size-tiered stable reserve derived from actual launch and existing storage
+budget, preserving old small-grid layout and within-tier pipeline identity;
+keep selector count65536 and write-alias/clean-reader/address guards separate.
+Do not increase global descriptor budgets or suppress errors. Existing32769
+workgroup-column rejection expectation is the former software ceiling, not ISA;
+update it only with independent semantic evidence and retain true budget reject.
+After intended RED/unchanged GREEN, numeric nativeGPU snapshot readback above
+old bound, focused existing workgroup/coefficient neighbors, then build/install
+and retry original resolution without debug. No concurrent execution slots.
+
+Native CPU intendedRED23:34:30/EXE1240BE0E; identical original fixture
+GREEN23:35:21/EXEF2650E2F. Expanded CPU casesPASS23:37:35/EXE4131DDE3;
+actual per-index data, tier boundaries65537/100000/131072/131073,3-axis columns,
+shared-source memoization/zero padding, missinglastword/transaction, zero grid
+withUINT_MAX axis and over64MiB pre-read rejection. No16-bit selector cap change.
+Existing32769-axis rejection changed to supported tier transition because the
+old limit was software reservation, with true8388609*2-column budget rejection
+retained. No expectations based on actual game output.
+Native GPUAV numeric65537-group GREEN23:40:38/EXEEFE42359: actual immutable
+coefficient snapshot load and exact output/input/neighbor sentinels, noVUID.
+First GPU fixture expected the unrelated ShaderData storage fallback, while
+bounded coefficients use dedicated flattened_srt. Corrected ONLY that placement
+check; numericoracle unchanged. TypedIR requires ReadBoundedSrtU32 and SPIR-V
+flattened_srt/no physical-pointer fallback. Existing cooperativeBDA coefficient
+neighbor GPUAVPASS23:41; full resource_tracking CPU PASS3.99s/23:41.
+Artifacts _Build/checks/20261005-{233417,233512,233717,233946,234059,234127}*/.
+Source correction validated and committed separately as local b4eae640. Native high-res
+original retry only after emulator build/install/hash; no gameentry proof yet.
+
+## GPU-selected vertex raw buffer load width (2026-10-05; native runtime blocker)
+
+Original retry212706/source locald2bafa93/EXE402ceb50 passed all first-launch
+settings and real12ch ATRAC9 initialization, then ended22:02:34.846UTC/native321.
+No watchdog/memory guard, forced kill or WindowsAppHang observed. New vertex
+1135e3d2715c8ba2/pc1398 fails resource tracking: GPU-selected descriptor fallback
+requires raw DWORDx2/x3/x4 load. Peak25.29GiB; shown532 is still the old dark scene,
+not game entry. Both streams finalized; emulator51156/supervisor41980 absent.
+
+Diagnostic223637 captured registered gs_1135e3d2715c8ba2_5c0764798df35917.bin
+(14272B) before execution; exactpc1398 wordsE0283000/80010100 decode MUBUF
+opcode10 BUFFER_LOAD_USHORT: one16-bit unsigned value zero-extended to VGPR.
+Shared correction now admits only unsigned16-bit raw scalar load in addition to
+existingDWORDx2/x3/x4; formatted/typed/signed/8-bit/scalarDWORD/store paths stay
+unsupported. Backend uses real16-bit physical load, two-byte mode3 payload bounds,
+zero-extension and unchanged descriptor addressing/other OOB modes/EXEC guards.
+Native CPU intendedRED22:44:34/9E22B304 then unchangedGREEN22:47:01/2F190D0C.
+Numerical20case GPUAVGREEN23:00:48/12BE30DF after correcting ONLY fixture's
+EXEC restoration from all32 lanes to original1 lane. Oracles unchanged. Earlier
+inactive mismatch was a test output race (IR proved initial mask invocation<1),
+not a production defect; no masking code/expectation weakened. Active cases had
+already matched. Real first/last halfword, DWORD crossing, allOOBmodes, SOFFSET,
+swizzle/null/EXECinactive and exactneighbor sentinels PASS. Seven existingindirect
+load/address/format neighbors GPUAVPASS23:03; complete native resource_tracking
+suite PASS23:04:52 in3.89s. Local a025b5a7 commits the correction; emulator build
+active. Broad metadata baseline remains recorded, no unrelated full-suite rerun. Artifacts
+_Build/checks/20261005-{224415,224645,230000,230254}*/ and ignoredcaptureanalysis.
+
+Source not in static4.3MBall_shaders corpus (runtime-generated variant). Own
+40512 gracefullyclosed/native0 at22:39:25 aftercapture, no guard/forcedkill;
+streams finalized/cache preserved. Native CPU regression now extends the existing
+GPU-selected raw admission fixture with that UInt16 case and retains vector,
+rawDWORDx1, formatted/typed/8-bit/signed/store rejection neighbors.
+Primary AMD RDNA2 ISA tableBufferInstructions opcode10 and section8.1 bounds;
+local official rdna2-isa-budget.txt. Independent LLVM per-byte strictbuffer OOB
+contract: https://llvm.org/docs/AMDGPUUsage.html . No originalgame-specificbytes
+or hashes in tests/production; actual capture stays under ignored_Build.
+
+Required minimal regression: determine actual decoded load opcode/count/type,
+then synthetic guest/IR GPU-produced four-word descriptor feeding that access.
+Use lightweight resource_tracking_tests for CPU intended RED; retain neighboring
+supportedx2/x3/x4, invalid descriptor/bounds and unsupported formatted/atomic/store
+rejections. Do not assume the captured access is rawx1 before inspecting it.
+After shared tracking/backend correction, run the same bounded native numerical
+GPU oracle for first/last element and exact neighboring sentinels, then closest
+indirect-load neighbors. One focused cycle and final affected validation; reuse
+current baseline metadata failure instead of rebuilding its absence again.
+Preserve535725251-byte driver-cache payload; original game retry only after fix.
+No shader/title/address exception, zero-resource fallback or guard suppression.
+
+## DCC/HTile metadata reuse retirement (2026-10-05; current native baseline RED)
+
+Independent current native GPUAV broad cache-flow runs fail at
+`reused metadata owner retirement` on both d2 fixed GC and scoped17529 GC bytes:
+retiring an old DCC image loses expected live HTile slice state. Logs
+texture-gc-cache-flow-{baseline-check,unfixed-current-baseline}-clean-gpuav-
+20261005.log{,.stderr,.run.json}; this is a baseline correctness lead, not a
+proved cause of Yotei dark pixels or AppHang and not a GC-fix regression.
+
+Required next minimal native RED: isolate only shared metadata allocation reused
+from color DCC to two-slice depth HTile. Establish independently observed slice0
+written/uncleared and slice1 cleared; retire old color owner, bind depth again,
+and verify live metadata identity and per-slice state. Also retire final depth
+owner and require metadata removal. Record values before and after retirement
+and after rebind to identify the actual transition; do not infer which API
+caused it from a compound assertion. Keep CPU-write coherence/imported-clear
+behavior and real Vulkan depth readback, no fabricated clear flags. Test alone
+on exact current unfixed bytes, then unchanged GREEN for the owning cache/meta
+mechanism and its existing alias/HTile neighbors. Game link remains pending.
+Do not edit core/tests or build this regression during active212706 game.
+
+## Texture GC protected-prefix starvation (2026-10-05; native regression pending)
+
+Read-only follow-up to measured memory pressure: PR977/8dd843e6 identifies
+protected textures consuming the LRU candidate budget. Current shared native
+TextureCache has that same scan-before-filter mechanism. This is an independent
+cache correctness/performance defect lead; its causal link to Yotei AppHang or
+working-set guard remains unproved. Do not port the unrelated accounting hunk
+without a separate regression.
+
+Required independent fixture: cold linear1x1 images, 0/9/10/12 GPU-owned safe
+protected entries before two clean reclaimable entries. Nonpressured GC must
+preserve protected GPU content and reach both eligible entries within the ten
+candidate budget. Under pressure, retire/download those protected entries and
+verify exact GPU words and neighboring guest sentinels. Keep existing recursive
+depth/stencil ten-candidate budget regression unchanged. Native GPUAV RED against
+17529f82, unchanged GREEN after shared preselection only, then cache neighbors.
+Artifacts _Build/logs/texture-gc-protected-prefix-*. Production/game effect pending.
+
+Executable standalone regression now registered as texture_cache_protected_gc /
+--texture-gc-protected-prefix-only. RED test SHA7238c0271b900227c2473ad4daf64d4e
+7857a710468c7f8a61b3819f71413c1d, production SHA b3d229761282fcbccba18af900ed250f
+6cb09a0eb3a5ae62d5a8d6761860f412. Native clean GPUAV RED21:15:37UTC / EXE352AFFEB
+fails the intended protected_count9 clean-tail oracle, not timeout or VUID.
+Only owned seven-line production patch was absent; exact baseline bytes checked.
+The initial broad cache test is already baseline RED on video-out metadata, so
+this fixture is independent of it. Test integration compile errors are not RED.
+Initial GREEN passed all four numerical cases but teardown caught a stale Epic
+implicit-overlay manifest in the host loader. Process-only VK_IMPLICIT_LAYER_PATH
+uses an empty test folder per Khronos loader contract, while explicit Khronos
+validation/GPUAV stays enabled; no validation error suppression or registry edit.
+Clean initial GREEN exit0 / EXE22414E14, then clean independent RED above with
+identical test/source oracle. Fixed source restored byte-for-byte for final GREEN.
+https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderApplicationInterface.md
+
+Final unchanged-oracle clean GPUAV GREEN21:16:40UTC/EXEC242D794 PASS exit0.
+Added neighboring independent clean12-image ten-candidate and six recursive
+D32/stencil-pair budget oracles PASS with prefix/pressure/readback/sentinels
+21:19:29UTC/EXE7613A30E; image-view and dirty buffer-GC GPUAV neighbors also PASS.
+Broader UnifiedTextureCacheFlow remains RED at reused metadata owner retirement.
+Scoped absence of ONLY owned seven-line fix with exact17529 production bytes
+repeats IDENTICAL phase/error21:21:10UTC/EXEC1BFBD6D; fixed run failed there
+21:19:43UTC. This is current baseline evidence, no broad suite GREEN claim.
+Core fixed bytes restored; locald2bafa93 committed. Native build/install and
+committed scoped GPUAV CTest3/3 PASS. Original212706 replay active with exact
+EXE402ceb50, original limits and memory/own-window responsiveness diagnostics;
+current screenshots still loading. No game-effect claim.
+No other-game corpus; GC fix does not prove Yotei memory/Windows-hang resolution.
+
+## Post-settings Windows AppHang (2026-10-05; diagnosis pending)
+
+Finalized run133643/source17529f82/EXE3bc052af ended14:21:26.270UTC with
+native0xCFFFFFFF. Supervisor recorded no memory/progress/total guard or cleanup
+request; Windows Application event1002 and WER event1001 report AppHangB1 at the
+same time. This identifies Windows hang termination, not its cause or initiator.
+Latest in-flight operation is cooperative54904 compute pipeline creation after
+661 successful creations; shown507 stayed unchanged after settings. Peak sampled
+working set28275372032B/private16684023808B; final sample26858307584/16156315648B.
+Preserved cache512077120B; both streams retained, stderr empty, no game entry.
+
+Diagnostic next: exact last681588-word module SHA1845865845088138c5b052ffa18ebad6
+56f1dcd2b6e69ccd0304be4d1200bbd0, validated descriptor layout0[27],51..54[1].
+Standalone bounded native create/destroy with three same-device cached creations,
+phase-specific working/private samples, no dispatch, under8GiB/240s guards.
+Artifacts _Build/analysis/post-settings-lifecycle-20261005/. This is diagnosis,
+not a synthetic RED or production fix. If retained lifecycle ownership is proved
+incorrect, add a reusable independent lifecycle regression before core changes.
+If it is not, instrument bounded own-window responsiveness on the next original
+retry; distinguish compiler progress, UI event-pump stalls and memory retention.
+Do not infer GPU hang/TDR, leak or gameplay from this exit code alone.
+
+Native exact-module spirv-val PASS21:04:25UTC. Standalone lifecycle diagnostic
+PASS21:06:54UTC (three successful creates; no dispatch; both streams retained,
+stderr empty; timeout/memoryguard false). First creation147828ms; cached repeats
+125/94ms. Peak working3216777216B. Phase-specific samples: ready79646720B;
+after first destroy2976915456B; cache/module/device/instance destruction still
+~2986MB working/~3237MB private immediately. No delayed post-destroy samples,
+allocator live-allocation invariant or synthetic leak RED; retained process
+memory does not prove an emulator lifetime leak. Probe PID45240 cleaned up.
+Generated standalone diagnostic target built through windows-local.cmd; original
+build.ninja restored byte-for-byte (SHAf639edd264a308ea403ae80144caecb1f5435fac
+271537067d72de32eac8d568) before any regular native build. Core unchanged.
+
+## Post-settings native memory bound (2026-10-05; diagnosis pending)
+
+Source17529f82 / EXE3bc052af, run130216: normal UI selects Performance and
+accepts settings; no game entry. Original28GiB working-set guard triggered after
+675 compute completions / shown756, native graceful close succeeded, exit0 at
+13:25:34.608UTC. Not a crash, timeout or independently reproduced memory leak.
+Both streams retained (stderr empty); cache preserved492622718B on disk.
+Latest completed cooperative `da4ff122` variant took117.133s; snapshot actual
+`1971_new_shader_cs_da4ff1222c09f131.spv` is retained in
+`_Build/analysis/performance-memory-bound-pipeline-20261005/` with hash/bindings.
+
+Before another long retry, validate this exact module and measure a bounded
+pipeline-only creation/destruction outside the game with its admitted descriptor
+layout and native device features. Sample working/private memory before, during
+and after creation; distinguish cold compilation peak from retained pipelines,
+shader modules and renderer resources. No dispatch needed for this diagnosis.
+No speculative production patch or memory-limit increase. If a lifetime leak is
+identified, first prove it with reusable synthetic native lifecycle/ownership
+fixtures and an independent invariant, then unchanged GREEN and affected cache/
+resource-neighbor cases. A watchdog event alone is not semantic RED evidence.
+
+Diagnostic completed: native CPU spirv-val PASS 13:30:22 on exact hash
+45c929c8309578c24fbb6f7883cf93e0be9eec583e9b236750a1df9c4ec97ef2.
+Descriptor layout verified: storage buffers binding0[27],51–54[1]. Existing
+native probe SHA DB7FF1C2D3B8B6B903EC76CF8BA12137D87E96F9F8A1D513BB0F2E60BB5AE596,
+no pipeline cache, disable optimization matching native cooperative flags:
+117.716s creation/cleanup PASS, exit0, stderr empty, timeout/memoryguard false.
+Peak sampled working set3281620992B, private3448729600B; final live sample
+1517056000B working set. Sampling cannot assign the late drop to a precise
+create/destroy phase; no after-destroy lifetime invariant or leak RED proved.
+No dispatch/readback, therefore no numerical or gameplay proof. Same-source
+bounded replay133643 now includes memory sampling, preserves28GiB guard and
+uses492622718-byte cache. No speculative production memory fix.
+
+## RDNA2 BVH intersections (2026-10-05; observed missing capability, regression pending)
+
+Final stdout of native `120227` / source `17529f82` / installed `3bc052af…`
+reports an existing skip of BVH compute shader `4f07b07b3d8c8406`, pc1738,
+raw MIMG opcodee6. Settings are visibly rendered and accepted; background remains
+very dark. This warning is a concrete color investigation lead, not proof that
+RT caused the darkness. No RT implementation or color fix is claimed.
+
+Current Decoder::DecodeProgram stops at e6/e7 and marks `has_bvh`; compute
+ShaderRecompiler returns `skip_dispatch`. Its comment describes a temporary
+workaround until the player selects a guest mode without RT. Do not extend this
+skip or fabricate hit/miss outputs. Unchanged-source warm replay `130216` is
+active; inspect normal Graphics Mode / Performance before interpreting its effect.
+
+Required synthetic regressions before a core implementation:
+
+- CPU decoder/IR tests for BVH32/BVH64, contiguous and NSA operands, A16 off/on,
+  full 4-dword output, descriptor and encoding restrictions. Keep the instructions
+  before AND after the BVH operation; no successful truncated/skipped program.
+- Independent finite synthetic four-child box intersections, hit/miss and distance
+  sorting, then triangle intersection in both return modes. Bound every allocation,
+  node fetch and shader loop; exact sentinels/EXEC-inactive and neighboring-memory
+  guards, high address words, first/last valid nodes and invalid descriptor bounds.
+- Native Windows intended RED on unchanged behavior, same unchanged oracle GREEN
+  only after shared decoder/typed IR/resource/backend semantics. Native GPUAV
+  readback after CPU proof; no host driver reset. Do not run builds/GPU tests while
+  current game is active. Other-game corpus unavailable; no compatibility claim.
+
+Primary contract: AMD RDNA2 ISA section8.2.10/tables48–50, local official PDF
+`_Build/analysis/rdna2-isa-budget.pdf` and extracted text. Ray VGPRs number11/8
+(BVH32 A16off/on) or12/9 (BVH64); 128bit BVH SRD is distinct from ordinary image
+SRD, with address, bounds, box growth/sort and triangle return mode. Preserve
+DMASKf/D16zero/R128one/UNRMone/DIMzero/LWEzero/TFEzero/SSAMPzero restrictions.
+https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf
+Current web PDF fetch returned401; local earlier official copy supplies the text.
+AMD GPURT official hardware-node definitions are a separate primary layout lead:
+https://github.com/GPUOpen-Drivers/gpurt/blob/7b226d48b46b7e92fec3b9ecc5712e5bf2bf3dd9/src/shadersClean/common/gfx10/BoxNode1_0.hlsli
+Do not assume RDNA3/4 or desktop GPURT layout is console-compatible without
+checking actual descriptor/node metadata and the applicable RDNA2 contract.
+No synthetic test is yet executed for this capability; tests remain pending.
+
+## ATRAC9 mono substream multiplexing (2026-10-05; native RED/GREEN proved, original game initialization verified)
+
+Completed local commit29d32a5c9d64acaa0281d8a4d5975923d5466827 implements
+shared AJM configuration geometry and real independent mono decoder histories,
+frame-major channel interleaving and per-channel padding on the last frame.
+Ordinary FE configurations/haptics and NGS2 numeric-word initialization remain
+unchanged. Native Windows original retry104233/source29d32a5c/exactF41301AD visually
+passes Medium/Standard/Quality; Quality input released11:03:47UTC. Actual target
+creator11:03:38.077/R8=12/R10=3072 followed by AJM ATRAC9 initialized48000Hz,
+12ch/frame_samples256/superframe3072bytes/4frames (_kyty.txt line23492595).
+Old guest C0000094 not observed; later large shader compilation progresses.
+Intentional scoped close11:26:28 completes gracefully11:28:33/native0, manifest
+finalized11:28:36/native0. Both streams read/owned processes absent; warmcache
+451288980B preserved. No timeout/forced kill/driver reset, no main-title menu.
+This proves actual extended initialization past the former fault, not heard PCM,
+movie playback, main/title menu or gameplay. Those remain unverified.
+
+Required regression is executable in tests/ShaderRecompilerComputeTests.cpp,
+CheckAjmAt9Multistream/--ajm-at9-multistream-only, CTest ajm_at9_multistream.
+It covers metadata2/6/12/36channels and rate/byte-count/exponent variations;
+nonzero Float/S16/S32 synthetic mono spectral frames with independent per-channel
+LibAtrac9 references, two superframes and exact interleaved PCM; final per-channel
+padding, single-frame continuation/reset, gapless257-sample skip/137-sample limit,
+short input/output retries and sentinels. Invalid signature/reserved fields and
+38/64channel counts leave metadata unchanged. Twelve-channel AJM batch control/
+run checks real decoder output and sideband counters. No proprietary packet
+fixture is versioned. Other-game audio corpus unavailable; no cross-game claim.
+
+- Native intended RED10:30:59UTC, unchanged productionebe7a6f0/testEXE
+  332627c4af75de5de89dacc7ccf099bcd5fa9582cb9c7d4cea58902e833080ef:
+  all5 valid metadata and all5 decoder initialization cases rejected, after
+  independent nonzero mono references succeed. Expected harnessFail C0000409;
+  no build/dependency failure or timeout. Both streams/manifest retained in
+  _Build/logs/ajm-multistream-red-20261005.log{,.stderr,.run.json}.
+- Same unchanged oracle GREEN10:35:38UTC/testEXE
+  16723b32c5bdfe78e79bb1db785ce289ec9e9b1c347b443d3f1ab66295dac42d,
+  all Float cases/metadata/padding/continuation/reset/gapless/bounds PASS, exit0.
+  Added S16/S32 and12channel batch neighbors PASS10:37:56UTC/testEXE
+  c6cd3e6bf621e2d91f4e07878627da4e83a548035d74d3abebcf62a178d523b7.
+- Native existing audio targets rebuilt; bounded CTest4/4 PASS10:40UTC:
+  ajm_at9_multistream, ajm_at9_configuration, ngs2_sampler, audio_out2_port;
+  both streams read/exit0/no timeout, ajm-multistream-final-ctest-20261005.log.
+  Full suite still has prior baseline failures; scoped tests do not prove menu.
+
+Contract lead: primary independent interoperability implementation
+https://github.com/iStark/PS5PCEM/blob/baa718235a37d310d91ac001f4d92cdc8099a69c/src/hle/ajm_codec.zig .
+Extended config has sync30, byte2 low7bits40, sample-rate index in byte1 high
+nibble, channel pairs in byte1 low nibble/byte2 high bit, frame bytes per mono
+stream=(byte3>>2)+1 and superframe exponent=byte3&3. This is independent
+implementation evidence, not public Sony SDK proof of all extension/layouts.
+Actual raw30 72 c0 fe gives12ch/48k/64bytes per mono frame/4frames/256samples
+per frame, ordinary mono configFE7007F0 and3072-byte superframe. Geometry agrees
+with captured3072-byte input and nearby12channel metadata. Isolated Linux-only
+actual packet probe decodes48mono frames/nonzeroPCM and consumes exactly3072B;
+it validates the lead, not native Windows emulator/audio/menu operation.
+
+Run100823 sourceebe7a6f0/B6C525F3 after viewedMedium/Standard/Quality ended
+nativeC0000094 on guestDIV9003502d2/ESI0. Early metadata watch directly captured
+bytes30/72/C0/FE written at guest90030df25/29/31/39 at10:25:41.649UTC;
+R8=12,R10=3072,R15=metadata100952beb0. The captured instruction sequence reverses
+a numerical stack config into raw bytes; ordinary RIFF helper was not the
+creator. Source/root lead now directly observed; an endian-only normalization,
+NGS2 change or silence/haptics fallback is unjustified. Earlier unproved word-
+candidate patch stays unapplied. Manifest finalized10:25:50/nativeC0000094,
+both streams read/owned processes absent/hash unchanged/warmcache preserved.
+Native RED began only after runtime/recorder cleanup. Preparatory Linux-only
+synthetic36variant probe is not native RED/GREEN. Original retry finished gracefully; native DS regression began after verified cleanup.
+
+## SNORM formatted buffer store endpoints (2026-10-05; upstream candidate, native RED/GREEN and scoped neighbors proved)
+
+Candidate de9c15fa changes shared formatted stores for SNORM/scaled types.
+Read-only current core converts SNORM16 but leaves SNORM8 raw float bits before
+packing. Required independent minimal oracle: signed normalized -1,0,+1 and
+finite clamping -2/+2 in8bit scalar/pair/RGBA stores, MUBUF descriptor and MTBUF
+explicit formats. Exact127/-127 endpoints, preserve neighboring bytes/words,
+and16bit currently supported neighbor. Do not copy upstream fraction/tie/NaN
+oracles without AMD contract proof. Primary normalized representation/conversion:
+https://docs.vulkan.org/spec/latest/chapters/fundamentals.html#fundamentals-fixedfpconv
+requires exact endpoints; host contract alone does not resolve all guest format
+rounding/special cases. Executable finite endpoint regression is now in the native harness and CTest;
+its independent RED/GREEN evidence is recorded below.
+Additional packed2bit signed-format exception and scaled truncation/NaN need
+primary guest ISA proof before full upstream port. Current actual Yotei dark
+scene link unproved; do not claim this candidate fixes game colors. Keep sources/
+tests frozen during run091337, no nativebuild or GPUtests while runtime active.
+
+Native GPUAV RED09:53:16UTC, unfixed productionb3667d29 plus independent
+8case test; native EXE SHA2562270c7e6ef927216a8dd620c5a658f36f3257db1017e93baa7bcfd139b711847.
+DescriptorSnorm8EndpointsAndClamp exact readback expected7f7f0081, actual00000000;
+neighbor deadbeef/cafef00d preserved, intended conversion failure. Test exit
+c0000409 through harness fail-fast; no timeout/VUID. Both streams saved
+snorm8-endpoints-red-gpuav-20261005.log{,.stderr,.run.json}. Earlier harness
+integration compile errors corrected before this result, not counted as RED.
+Selected correction scope only SNORM8, reusing shared clamp/normalized rounding;
+existing SNORM16/Unorm/float/scaled/packed2bit behavior unchanged. Do not import
+unproved upstream scaled/NaN/packed2bit changes or claim actual game colors fixed.
+
+Unchanged8case native GPUAV GREEN09:54:57UTC/native EXE
+4dbad1b3007b0449f8c3a74f93fb975f4f201f5bbe650f481d972df14e283b86,
+all exact readbacks, exit0/no VUID or timeout. Core correction10lines shared
+EncodeFormattedStoreComponent only finite SNORM8 clamp[-1,+1]*127/signed
+conversion, preserving prior normalized rounding policy and byte merge/bounds.
+Existing12formatted store cases GREEN09:55UTC, D16load/store2cases GREEN09:57;
+CTest scoped5/5 GREEN09:58 (new endpoints, image rebind, packedfloat, scaled
+filtering, FP32 MAD). Logs snorm8-{endpoints-green-gpuav,endpoints-neighbor-
+formatted-stores-gpuav,endpoints-neighbor-d16-gpuav,final-ctest-gpuav}-20261005.
+Native CPU-only cooperative-admission corpus2/2 PASS10:02/resource_tracking;
+report snorm8-cooperative-admission-cpu-20261005. Not backend emission/GPU or
+cross-game proof; no other independent game's corpus available. Actual native retries after this fix visually passed Medium/Standard/Quality;
+scene remains dark, calibrated colors/main-title menu unproved. Fullsuite notgreen.
+
+## Audio code-origin diagnostic own-trap handling (2026-10-05; workflow, synthetic native checks)
+
+Run090311 sourceb3667d29/exact7ce9d837 ends09:06:53UTC exit80000004.
+Diagnostic v1 assumed source/output pointers in heap0x1000000000..0x2000000000;
+on its own verified execution breakpoint it threw before recording context, so
+single-step was incorrectly forwarded. This is a diagnostic-induced interruption,
+NOT emulator/audio defect RED or a menu result. Both streams preserved, stderr0;
+prior fixed-address diagnostic files unchanged. No metadata origin inference.
+Ignored v2 handles only independently identified ownDR0 event even on capture
+failure, sets RF for one resumed instruction, restores own watches and records
+mapped source20B/caller before inference. No guest code/data/operands modified.
+Independent native synthetic probe has same4byte instruction signature, source
+outside former heap assumption, then one with only17mapped bytes while its single
+byte read is valid. Valid target09:11UTC captures source20B; partial09:12UTC logs
+expected own-capture error and restores watches. Both preserve all12 readbacks
+and targetexit0/recorderexit0; no bounded timeout. Artifacts ignored under
+_Build/analysis/audio-source-probe-v2-20261005/{valid,partial}/. Workflow evidence
+only; no artificial production emulator test or audio contract GREEN. Use only
+watch-task-audio-metadata-source-instruction-v2-20261005.ps1 for next game.
+
+## LDS float min/max operands (2026-10-05; independent native RED/GREEN, neighbors and corpus baseline proved)
+
+Completed local commit17529f8241624b2ab79002e384a8b2daeb086702 corrects
+decoder explicit ADDR+DATA0, typed IR
+address/DATA0/EXEC, existing EmitFloatAtomicReplacement applied to native/packed
+LDS and GDS atomics. Per-lane EXEC, address bounds and real atomic retry remain.
+No title/hash/address exceptions or new NaN/denormal/tie policy. Extra special-
+value contract remains debt; actual darkscene/menu effect unproved.
+
+Primary independent contract: updated AMD RDNA2 machine-readable XML says DS_MIN/
+MAX_F32 select the minimum/maximum of LDS and DATA0, no DATA1 input.
+https://gpuopen.com/machine-readable-isa/ and official archive
+https://gpuopen.com/download/machine-readable-isa/latest/ ; XML SHA256
+ d671ecbc36543674ab59e9b2feffd56718fd2137e7ad913c314f2e2508b9f4f7.
+Older PDF DATA2 pseudo-code conflicts with this newer explicit operand table;
+upstream e85279ea supplied the lead, not the oracle. Saved actual54904fb4 shader
+has six min/max at3b74-3b9c with distinctDATA0 and unusedDATA1=v0. Game image
+causation still unproved; no calibrated colors/main-menu claim.
+
+Executable regressions in ShaderRecompilerComputeTests.cpp cover separate
+CPU source-count oracle and six independent finite positive/negative pairs,
+DATA1 variations, offset cells, GDS neighboring guard and inactive EXEC. Explicit
+S_BARRIER publishes LDS and orders ordinary reads after atomics; first preliminary
+RED also had a GPUAV race and is preserved/excluded from clean-validation proof.
+
+- Native intended CPU RED11:32:56/test31390092: wrong source-count, C0000409.
+- Clean native GPUAV RED11:35:53/test4DDE1D66 on unchanged29d32a5c:
+  expected[2,4,-9,-1,-2,1], actual[4,3,-2,-1,1,1], exactfloat bits saved.
+  No VUID/race/validationerror/timeout; intended harnessC0000409.
+  _Build/logs/ds-float-finite-contract-synchronized-red-gpuav-20261005.log{,.stderr,.run.json}.
+- Same unchanged synchronized oracle GREEN11:39:53/test94CA8596, four GPUAV
+  cases exactPASS, CPU decoderGREEN11:39:52; no validationerror/timeout.
+- Five additional GPUAV neighbors PASS11:42:58/testBDEB2EAF: min/max with256
+  guest lanes/two groups and unusedDATA1, old cooperative min, GDS/subdword,
+  real buffer compare-and-swap. Old dormant compare-operand oracle9/1 corrected
+  explicitly from primary min(4,9)=4/max(4,1)=4, synchronized and PASS11:46:27.
+- Existing dormant shadercfg translation fixture now runnable: actual IR has
+  address/DATA0/EXEC with exactDATA0 literals and native SPIR-V validates;
+  PASS11:46:26/shadercfg6B9EDF80. Native scoped CTest6/6 PASS, fourDS entries
+  plus prior SNORM8 and ATRAC9. Full suite still has known baseline failures.
+
+Corpus: first raw encoding selection used wrong shift17, not affected coverage;
+corrected bits18..25 selects16 header-profile manifests (raw literals can still
+be false positives). Native fixed audit sevenPASS throughresource_tracking,
+eightdecodeUnsupported(MIMG e5/e6,DS e1,SOPP19 groups overlap across8shaders),
+one30s CPU timeout(cs_00012684). Runtime metadata incomplete, not backend/GPU
+or other-game compatibility proof. Other-game corpus unavailable.
+
+Exact baseline: preserve fixed five ownedDS corefiles+SHA256, temporarily restore
+ONLY them to29d32a5c, serial native shadercfg6240EB58 and identical16manifest
+30s audit. All16 status/phase/error match fixed report, including same timeout;
+no newly introduced corpus refusal observed. Both reports and comparison saved:
+_Build/shader-audits/ds-minmax-cpu-{v2,baseline29d}-20261005,
+_Build/analysis/ds-minmax-corpus-baseline-comparison-20261005.json.
+All five exact fixed bytes restored/SHA256verified11:53; restored native shadercfg
+build PASS/shadercfgD1601FA1; final restored native CTest6/6 PASS11:56.
+Unrelated fixes/tests preserved; no reset or driver recovery. Native emulator
+build/install for `17529f82` passed; installed SHA256
+`3bc052af7203667ea7e63308d6f22eaa83ffb759880d62ced30f27be9b9f7f2e`.
+Original retry `120227-ds-finite-warm-noval` is active. At 12:17 UTC it is still
+loading new large shader variants; no new-run settings/input/color result yet.
+One actual current SPIR-V module passed bounded native CPU Vulkan 1.3 structural
+validation at 12:12. User clarified the already verified first-launch settings
+count as the menu milestone; gameplay remains pending. See the launch checkpoint.
+
 ## Overlapping image dimensions and view acquisition (2026-10-05; native RED/GREEN and scoped neighbors proved)
 
 Candidate upstream a2f851788f3f4edc7649c9b31f27215b05febb6d corrects shared

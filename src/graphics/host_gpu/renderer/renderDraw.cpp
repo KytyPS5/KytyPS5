@@ -9,6 +9,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
@@ -25,7 +26,9 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -888,6 +891,40 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt = ctx.GetRenderTarget(slot);
 		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
+			if (Prospero::RenderTargetBytesPerElement(
+				    Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type).buffer_format) == 0u) {
+				std::fprintf(stdout, "RenderTargetFormatContext: caller=RefreshShaders slot=%u mask=0x%x "
+				             "mode=%u ps_active=%d ps_addr=0x%016" PRIx64 " output_mode=%u\n",
+				             slot, color_output_mask, static_cast<unsigned>(ctx.GetColorControl().mode),
+				             state.ps_active, pixel_shader_info.ps_regs.data_addr,
+				             shader_regs.target_output_mode[slot]);
+				std::fflush(stdout);
+				std::fprintf(stdout, "RenderTargetFormatSurface: slot=%u base=0x%016" PRIx64
+				             " dimensions=%ux%u samples_log2=%u fragments_log2=%u "
+				             "blend_enable=%d blend_clamp=%d blend_bypass=%d\n",
+				             slot, rt.base.addr, rt.attrib2.width + 1u, rt.attrib2.height + 1u,
+				             rt.attrib.num_samples, rt.attrib.num_fragments,
+				             ctx.GetBlendControl(slot).enable, rt.info.blend_clamp,
+				             rt.info.blend_bypass);
+				std::fflush(stdout);
+				if (pixel_shader_info.ps_regs.data_addr != 0) {
+					ShaderPixelInputInfo observed;
+					const auto params = PrepareProgram(pixel_shader_info, shader_regs, target_export_mapping, observed);
+					ShaderRecompiler::Decoder::Program decoded;
+					ShaderRecompiler::Decoder::DecodeProgram(params.code, decoded);
+					uint32_t exports = 0;
+					for (const auto& instruction: decoded.instructions) {
+						if (instruction.opcode == ShaderRecompiler::Decoder::Opcode::EXP &&
+						    instruction.exp.target < 8u && instruction.exp.en != 0u) {
+							exports |= 1u << instruction.exp.target;
+						}
+					}
+					std::fprintf(stdout, "RenderTargetFormatContext: ps_hash=0x%016" PRIx64
+					             " code_bytes=%zu decoded_mrt_exports=0x%x\n",
+					             params.hash, params.code.size_bytes(), exports);
+					std::fflush(stdout);
+				}
+			}
 			target_export_mapping[slot] =
 			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 			                                 rt.info.channel_order)

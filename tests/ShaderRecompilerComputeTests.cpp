@@ -192,7 +192,7 @@ struct BufferCacheTestAccess {
   }
 
   static bool HasWatchedRanges(const BufferCache &cache) {
-    return !cache.m_watched.Empty() || !cache.m_watch_changed.Empty();
+    return !cache.m_watches.empty() || !cache.m_watched.Empty();
   }
 };
 
@@ -10876,6 +10876,23 @@ public:
         Require(name, "native color clear after HTile reuse", read_texel() == expected,
                 "the former HTile entry swallowed the native color metadata fill");
         check_expanded_metadata();
+        if (&fill_case == &cases.front()) {
+          // Watching an overlapping range must not hide a change from the first watch.
+          auto &buffers = context.GetBufferCache();
+          const uint64_t first = base + 0x1c0000;
+          const uint64_t second = first + 0x1000;
+          // A written request uploads the whole range, so no page stays CPU-dirty.
+          (void)buffers.ObtainBuffer(first, 0x3000, true);
+          buffers.WatchRange(first, 0x2000);
+          Require(name, "fresh watch", buffers.IsWatchedRangeUnchanged(first, 0x2000),
+                  "a new watch reported a change");
+          (void)buffers.ObtainBuffer(second, 0x100, true);
+          buffers.WatchRange(second, 0x2000);
+          Require(name, "overlapping watches",
+                  !buffers.IsWatchedRangeUnchanged(first, 0x2000) &&
+                      buffers.IsWatchedRangeUnchanged(second, 0x2000),
+                  "watching an overlapping range cleared a change of the first watch");
+        }
         RenderExecutorTestAccess::ResetBindings(executor);
         resources.UnmapMemory(base, allocation_size);
         Require(name, "unmap drops metadata clear decisions",

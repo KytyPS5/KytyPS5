@@ -82,8 +82,8 @@ public:
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
-	// A watched range stays unchanged until a GPU write, upload or invalidation reaches it, or
-	// the CPU dirties it.
+	// A watch stays unchanged until a GPU write, upload or invalidation reaches its range, a
+	// shader writes through an address, or the CPU dirties it. Each watch keeps its own state.
 	void               WatchRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsWatchedRangeUnchanged(uint64_t vaddr, uint64_t size);
 	void               UnwatchRange(uint64_t vaddr, uint64_t size);
@@ -139,8 +139,16 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
-	RangeSet                                           m_watched;
-	RangeSet                                           m_watch_changed;
+	struct Watch {
+		uint64_t size           = 0;
+		uint64_t address_writes = 0;
+		bool     changed        = false;
+	};
+	std::map<uint64_t, Watch> m_watches;
+	// Union of the watches, to skip unwatched changes quickly.
+	RangeSet                                          m_watched;
+	uint64_t                                          m_max_watch_size = 0;
+	uint64_t                                          m_address_writes = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

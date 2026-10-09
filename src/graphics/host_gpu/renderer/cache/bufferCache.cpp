@@ -266,28 +266,44 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::WatchRange(uint64_t vaddr, uint64_t size) {
+	m_watches.insert_or_assign(vaddr, Watch {size, m_address_writes, false});
 	m_watched.Add(vaddr, size);
-	m_watch_changed.Subtract(vaddr, size);
+	m_max_watch_size = std::max(m_max_watch_size, size);
 }
 
 bool BufferCache::IsWatchedRangeUnchanged(uint64_t vaddr, uint64_t size) {
-	return m_watched.Contains(vaddr, size) && !m_watch_changed.Intersects(vaddr, size) &&
+	const auto found = m_watches.find(vaddr);
+	return found != m_watches.end() && found->second.size == size && !found->second.changed &&
+	       found->second.address_writes == m_address_writes &&
 	       !m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
 void BufferCache::UnwatchRange(uint64_t vaddr, uint64_t size) {
-	m_watched.Subtract(vaddr, size);
-	m_watch_changed.Subtract(vaddr, size);
+	const auto end = vaddr + size;
+	std::erase_if(m_watches, [&](const auto& watch) {
+		return watch.first < end && vaddr < watch.first + watch.second.size;
+	});
+	m_watched.Clear();
+	for (const auto& [address, watch]: m_watches) {
+		m_watched.Add(address, watch.size);
+	}
 }
 
 void BufferCache::NotifyAddressWrites() {
-	m_watched.ForEach(
-	    [this](uint64_t begin, uint64_t end) { m_watch_changed.Add(begin, end - begin); });
+	m_address_writes++;
 }
 
 void BufferCache::NotifyChange(uint64_t vaddr, uint64_t size) {
-	if (m_watched.Intersects(vaddr, size)) {
-		m_watch_changed.Add(vaddr, size);
+	if (!m_watched.Intersects(vaddr, size)) {
+		return;
+	}
+	// A watch starting before vaddr - m_max_watch_size ends before vaddr.
+	const auto end = vaddr + size;
+	for (auto it = m_watches.lower_bound(vaddr - std::min(vaddr, m_max_watch_size));
+	     it != m_watches.end() && it->first < end; ++it) {
+		if (it->first + it->second.size > vaddr) {
+			it->second.changed = true;
+		}
 	}
 }
 

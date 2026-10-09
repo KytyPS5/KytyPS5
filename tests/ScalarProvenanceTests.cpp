@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -597,6 +598,84 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
+void TestVertexBranchSelects() {
+  using namespace Libs::Graphics::ShaderRecompiler;
+  for (unsigned variant = 0; variant != 7; ++variant) {
+    Fixture fixture(4);
+    fixture.program.stage = variant == 1 ? ShaderType::Compute : ShaderType::Vertex;
+    fixture.program.dispatcher_fallback = variant == 2;
+    auto *entry = fixture.program.blocks[0];
+    auto *taken = fixture.program.blocks[1];
+    auto *other = fixture.program.blocks[2];
+    auto *merge = fixture.program.blocks[3];
+    entry->AddBranch(taken);
+    entry->AddBranch(other);
+    taken->AddBranch(merge);
+    other->AddBranch(merge);
+    auto &branch = fixture.program.block_info[0];
+    branch.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    branch.terminator.true_block = 1;
+    branch.terminator.false_block = 2;
+    fixture.program.block_info[1].terminator.kind = CFG::TerminatorKind::Branch;
+    fixture.program.block_info[1].terminator.true_block = 3;
+    fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Branch;
+    fixture.program.block_info[2].terminator.true_block = 3;
+    const auto value = fixture.Emit(ValueOpcode::GetVectorRegister,
+                                    {Value(static_cast<VectorReg>(0))});
+    const auto predicate = fixture.Emit(ValueOpcode::IEqual32, {value, Value(0u)});
+    const auto negated = fixture.Emit(ValueOpcode::LogicalNot, {predicate});
+    const auto condition = fixture.Emit(ValueOpcode::ConditionRef, {negated},
+                                        uint64_t(CFG::BranchCondition::ExecZero));
+    branch.condition = fixture.Emit(ValueOpcode::LogicalNot, {condition});
+    const auto write = fixture.Emit(ValueOpcode::WriteLane,
+                                     {value, Value(99u), Value(0u)}, 0, 1);
+    const auto selected = fixture.Emit(ValueOpcode::SelectU32,
+                                        {predicate, Value(42u), write}, 0, 1);
+    const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {selected}, 0, 1);
+    const auto opposite = fixture.Emit(ValueOpcode::SelectU32,
+                                        {predicate, Value(43u), value}, 0, 2);
+    const auto opposite_use = fixture.Emit(ValueOpcode::ReferenceU32, {opposite}, 0, 2);
+    const auto unguarded = fixture.Emit(ValueOpcode::SelectU32,
+                                         {predicate, Value(44u), value}, 0, 3);
+    const auto unguarded_use = fixture.Emit(ValueOpcode::ReferenceU32, {unguarded}, 0, 3);
+    if (variant == 3) {
+      other->AddBranch(taken); // The predicate is no longer known on entry.
+      auto &alternate = fixture.program.block_info[2];
+      alternate.condition = predicate;
+      alternate.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      alternate.terminator.true_block = 1;
+      alternate.terminator.false_block = 3;
+    }
+    if (variant == 4) fixture.Emit(ValueOpcode::ReferenceU32, {write}, 0, 1);
+    if (variant == 5) {
+      const auto read = fixture.Emit(ValueOpcode::ReadLane, {write, Value(0u)}, 0, 1);
+      fixture.Emit(ValueOpcode::ReferenceU32, {read}, 0, 1);
+    }
+    if (variant == 6) {
+      const auto lane = fixture.Emit(ValueOpcode::LaneId, {}, 0, 1);
+      fixture.Emit(ValueOpcode::ReferenceU32, {lane}, 0, 1);
+    }
+    ValidateProgram(fixture.program, false);
+    FoldVertexBranchSelects(fixture.program);
+    ValidateProgram(fixture.program, false);
+    const bool folded = variant == 0 || variant == 4;
+    Check(use.Instruction()->Arg(0).Resolve() == (folded ? Value(42u) : selected),
+          "vertex edge folding changed an unproven or wave-sensitive value");
+    Check(opposite_use.Instruction()->Arg(0).Resolve() ==
+              ((variant == 0 || variant == 3 || variant == 4) ? value : opposite),
+          "negative vertex edge did not preserve its inactive value");
+    Check(unguarded_use.Instruction()->Arg(0).Resolve() == unguarded,
+          "vertex predicate was assumed after control-flow reconvergence");
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+    const bool retains_write = std::ranges::any_of(fixture.BlockAt(1), [](const Inst &inst) {
+      return inst.GetOpcode() == ValueOpcode::WriteLane;
+    });
+    Check(retains_write == (variant != 0),
+          "dead inactive WriteLane survived or an observable WriteLane was removed");
+  }
+}
+
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -734,6 +813,7 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
+    TestVertexBranchSelects();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();

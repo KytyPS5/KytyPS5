@@ -523,6 +523,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			FrameDump::TraceWrite("cs-image", d.address, d.address + d.size, "dispatch", program.shader_hash);
 		}
 	}
+	if (FrameDump::TraceCsEnabled(program.shader_hash)) {
+		std::vector<uint8_t> written(bindings.images.size(), 0);
+		for (size_t i = 0; i < written.size() && i < program.info.images.size(); i++) {
+			written[i] = program.info.images[i].written ? 1 : 0;
+		}
+		FrameDump::TraceDispatch(program.shader_hash, thread_group_x, thread_group_y, thread_group_z, bindings,
+		                         written);
+	}
 	if (FrameDump::Active()) {
 		std::vector<FrameDump::StorageUse> uses(bindings.images.size());
 		for (size_t i = 0; i < uses.size() && i < program.info.images.size(); i++) {

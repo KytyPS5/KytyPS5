@@ -170,7 +170,7 @@ void QueueBuffer(vk::Buffer buf, uint64_t offset, uint64_t range, uint64_t addr,
 	BufReq r;
 	r.buf    = buf;
 	r.offset = offset;
-	r.size   = std::min<uint64_t>(range, 65536);
+	r.size   = std::min<uint64_t>(range, (4ull << 20));
 	r.seq    = seq;
 	r.label  = label;
 	r.addr   = addr;
@@ -289,7 +289,17 @@ void ProcessBuffers() {
 			vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
 			const auto* d = static_cast<const uint8_t*>(p.mapped);
 			g_buflog += WordsText(d, static_cast<size_t>(std::min<uint64_t>(p.req.size, 256)));
-			if (p.req.size < 65536) {
+			{
+				size_t nz = 0;
+				const size_t nd = static_cast<size_t>(p.req.size / 4);
+				for (size_t k = 0; k < nd; k++) {
+					uint32_t w;
+					std::memcpy(&w, d + k * 4, 4);
+					nz += w != 0;
+				}
+				g_buflog += "    nonzero dwords: " + std::to_string(nz) + " / " + std::to_string(nd) + "\n";
+			}
+			if (p.req.size <=(4ull << 20)) {
 				std::snprintf(line, sizeof(line), "%s/buf_%05u_%s_%s.bin", g_dir.c_str(), p.req.seq,
 				              p.req.label.c_str(), Hex(p.req.addr).c_str());
 				if (FILE* f = std::fopen(line, "wb")) {
@@ -1156,6 +1166,76 @@ std::vector<uint64_t>& TraceList() {
 	return list;
 }
 } // namespace
+
+namespace {
+std::vector<uint64_t>& TraceCsList() {
+	static std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> v;
+		if (const char* e = std::getenv("KYTY_DBG_TRACE_CS"); e != nullptr && *e != '\0') {
+			const std::string s = e;
+			size_t            pos = 0;
+			while (pos < s.size()) {
+				size_t n = s.find(',', pos);
+				if (n == std::string::npos) n = s.size();
+				const auto a = std::strtoull(s.substr(pos, n - pos).c_str(), nullptr, 16);
+				if (a != 0) v.push_back(a);
+				pos = n + 1;
+			}
+		}
+		return v;
+	}();
+	return list;
+}
+} // namespace
+
+bool TraceCsEnabled(uint64_t cs_hash) noexcept {
+	static const bool on = !TraceCsList().empty();
+	if (!on) return false;
+	for (const auto h : TraceCsList()) {
+		if (h == cs_hash) return true;
+	}
+	return false;
+}
+
+void TraceDispatch(uint64_t cs_hash, uint32_t gx, uint32_t gy, uint32_t gz, const PreparedBindings& b,
+                   std::span<const uint8_t> image_written) {
+	static std::atomic<uint64_t> count {0};
+	const uint64_t               n = count.fetch_add(1);
+	if (n >= 24 && (n % 64) != 0) return;
+	std::printf("NHL27CS: #%" PRIu64 " cs=0x%016" PRIx64 " groups=%ux%ux%u guest_flip=%" PRIu64 "\n", n, cs_hash,
+	            gx, gy, gz, g_trace_frame.load());
+	if (b.runtime != nullptr && b.runtime->resources != nullptr) {
+		const auto& ud = b.runtime->resources->user_data;
+		std::printf("NHL27CS:   user_data(%zu):", ud.size());
+		for (size_t i = 0; i < ud.size() && i < 32; i++) std::printf(" %08x", ud[i]);
+		std::printf("\n");
+	}
+	std::printf("NHL27CS:   shader_data(%zu):", b.shader_data.size());
+	for (size_t i = 0; i < b.shader_data.size() && i < 16; i++) std::printf(" %08x", b.shader_data[i]);
+	std::printf("\n");
+	for (size_t i = 0; i < b.images.size(); i++) {
+		const auto& im = b.images[i];
+		std::printf("NHL27CS:   img[%zu]: %s view_base_level=%u view_base_layer=%u%s\n", i,
+		            DescribeImage(im.desc).c_str(), im.desc.view_info.base_level, im.desc.view_info.base_layer,
+		            (i < image_written.size() && image_written[i]) ? " WRITTEN" : "");
+	}
+	for (size_t i = 0; i < b.buffer_sources.size(); i++) {
+		const auto& s = b.buffer_sources[i];
+		if (s.address == 0 || s.size == 0) {
+			std::printf("NHL27CS:   buf[%zu]: null\n", i);
+			continue;
+		}
+		const size_t dwords = static_cast<size_t>(std::min<uint64_t>(s.size, 65536) / 4);
+		const auto*  p      = reinterpret_cast<const uint32_t*>(s.address);
+		size_t       nz     = 0;
+		for (size_t k = 0; k < dwords; k++) nz += p[k] != 0;
+		std::printf("NHL27CS:   buf[%zu]: guest 0x%" PRIx64 " size=%" PRIu64 " nonzero_dwords(first 64KB, CPU view)=%zu/%zu first8:",
+		            i, s.address, s.size, nz, dwords);
+		for (size_t k = 0; k < 8 && k < dwords; k++) std::printf(" %08x", p[k]);
+		std::printf("\n");
+	}
+	std::fflush(stdout);
+}
 
 bool TraceEnabled() noexcept {
 	static const bool on = !TraceList().empty();

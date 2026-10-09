@@ -91,6 +91,13 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 [[nodiscard]] bool TraceEnabled() noexcept;
 void TraceWrite(const char* what, uint64_t begin, uint64_t end, const char* kind, uint64_t hash);
 
+// KYTY_DBG_TRACE_CS=<hex cs hash>[,...]: for every dispatch of those compute shaders (first 24, then every
+// 64th) print groups, user-data, shader_data, every image (addr/size/format/type/mips/layers/view, WRITTEN)
+// and every buffer source (guest addr/size, nonzero dwords + first 8 dwords of the CPU view).
+[[nodiscard]] bool TraceCsEnabled(uint64_t cs_hash) noexcept;
+void TraceDispatch(uint64_t cs_hash, uint32_t gx, uint32_t gy, uint32_t gz, const PreparedBindings& bindings,
+                   std::span<const uint8_t> image_written);
+
 } // namespace FrameDump
 } // namespace Libs::Graphics
 

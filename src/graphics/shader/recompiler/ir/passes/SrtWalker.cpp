@@ -525,6 +525,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
+		// Without a memory reader the walker dereferences the guest address directly. A zero or
+		// near-zero address is a null/guard page and must never be read: guests may legitimately
+		// pass null descriptor pointers, which has to evaluate as "unknown" rather than fault.
+		constexpr uint64_t MinimumGuestAddress = 0x10000;
+		if (address < MinimumGuestAddress) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;

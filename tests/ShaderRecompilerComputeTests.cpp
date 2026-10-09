@@ -227,6 +227,13 @@ struct TextureCacheTestAccess {
     return std::unique_lock(cache.m_lock);
   }
 
+  // Stands in for a host format without color attachment support.
+  static vk::ImageUsageFlags ReplaceImageUsage(TextureCache &cache, ImageId id,
+                                               vk::ImageUsageFlags usage) {
+    auto lock = Lock(cache);
+    return std::exchange(cache.m_slot_images[id].backing.usage, usage);
+  }
+
   static void ClearImage(TextureCache &cache, CommandBuffer &command, ImageId id,
                          const vk::ImageSubresourceRange &range,
                          const vk::ClearValue &clear) {
@@ -10749,6 +10756,23 @@ public:
         Require(name, "complete fill after partial fill",
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
+
+        // Aliased views clear through an attachment on the CPU path as well.
+        if (!fill_case.reuse_unorm) {
+          paint();
+          const auto attachment_usage = TextureCacheTestAccess::ReplaceImageUsage(
+              texture_cache, color.image_id,
+              texture_cache.GetImage(color.image_id).backing.usage &
+                  ~vk::ImageUsageFlagBits::eColorAttachment);
+          fill_metadata(metadata_words);
+          bind();
+          Require(name, "non-attachment image clears through readback",
+                  !context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size) &&
+                      read_texel() == expected,
+                  "a conditional attachment clear targeted an image without attachment usage");
+          (void)TextureCacheTestAccess::ReplaceImageUsage(texture_cache, color.image_id,
+                                                          attachment_usage);
+        }
 
         // Consuming a clear key updates metadata backing without invalidating
         // a pooled image whose first texel precedes the metadata range.

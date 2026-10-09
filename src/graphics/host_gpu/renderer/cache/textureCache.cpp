@@ -1239,8 +1239,12 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 	{
 		std::scoped_lock lock {m_lock};
 		const auto&      image = m_slot_images[id];
+		// Conditional clears need a color attachment; transfer clears ignore the predicate.
+		const auto features = m_graphics.GetFormatProperties(view.format).optimalTilingFeatures;
 		if (image.info.IsVolume() || image.info.samples != 1 || image.depth_id ||
-		    image.backing.image == nullptr) {
+		    image.backing.image == nullptr ||
+		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) ||
+		    !(features & vk::FormatFeatureFlagBits::eColorAttachment)) {
 			return false;
 		}
 	}

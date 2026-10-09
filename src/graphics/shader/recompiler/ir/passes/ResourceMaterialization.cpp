@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -638,9 +639,23 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				// Tolerate mixed candidates instead of aborting: the shader is specialised for the
+				// first typed candidate, and the others are treated as that same class. Some
+				// guests index tables holding images of differing format/dimension, and aborting
+				// makes those titles unplayable. Rendering of the mismatching images may be wrong.
+				static std::atomic<uint32_t> warned {0};
+				if (warned.fetch_add(1, std::memory_order_relaxed) < 8u) {
+					std::printf("Warning: indirect image table at pc 0x%08x has incompatible "
+					            "candidates; using the first typed candidate for all\n",
+					            program.info.images[root_index].first_use_pc);
+					std::fflush(stdout);
+				}
+				image.numeric_class     = image_class.numeric_class;
+				image.dimension         = image_class.dimension;
+				image.mip_count         = image_class.mip_count;
+				image.conversion_format = image_class.conversion_format;
+				image.shader_swizzle    = image_class.shader_swizzle;
+				image.cube              = image_class.cube;
 			}
 		}
 	}

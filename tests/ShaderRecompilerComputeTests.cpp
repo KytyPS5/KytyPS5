@@ -16962,10 +16962,9 @@ public:
 
     const auto &fragment_bind = fragment.program.bindings;
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
-    const auto *gds_binding =
-        ShaderRecompiler::IR::FindBinding(fragment_bind, Kind::Gds);
+    const bool has_gds = fragment_bind.descriptor_counts[static_cast<size_t>(Kind::Gds)] != 0;
     Buffer gds_buffer;
-    if (gds_binding != nullptr) {
+    if (has_gds) {
       Require(test.name, "graphics", !test.gds_initial.empty(),
               "GDS descriptor requested without initial data");
       const auto gds_dwords = std::max(
@@ -16976,7 +16975,7 @@ public:
     vk::DescriptorSetLayout descriptor_layout = nullptr;
     vk::DescriptorPool descriptor_pool = nullptr;
     vk::DescriptorSet descriptor_set = nullptr;
-    if (gds_binding != nullptr) {
+    if (has_gds) {
       vk::DescriptorSetLayoutBinding binding{};
       binding.binding =
           ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, Kind::Gds);
@@ -17159,7 +17158,7 @@ public:
     rendering.pColorAttachments = &color;
     cmd.beginRendering(rendering);
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-    if (gds_binding != nullptr) {
+    if (has_gds) {
       vk::DescriptorBufferInfo gds_info{gds_buffer.buffer, 0,
                                         gds_buffer.size};
       vk::WriteDescriptorSet write{};
@@ -17185,7 +17184,7 @@ public:
     cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
     cmd.draw(3, test.layers, 0, 0);
     cmd.endRendering();
-    if (gds_binding != nullptr) {
+    if (has_gds) {
       vk::BufferMemoryBarrier barrier{};
       barrier.sType = vk::StructureType::eBufferMemoryBarrier;
       barrier.srcAccessMask =
@@ -17206,7 +17205,7 @@ public:
     auto pixel = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
     pixel.resize(4 * test.width * test.height * test.layers);
     std::vector<u32> gds;
-    if (gds_binding != nullptr) {
+    if (has_gds) {
       gds = ReadBuffer(test.name, gds_buffer, test.expected_gds.size());
     }
 

@@ -206,7 +206,9 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t table_offset = 0,
-                         uint32_t table_shader_offset = 0, bool nested = false) {
+                         uint32_t table_shader_offset = 0, bool nested = false,
+                         std::vector<ValueOpcode> image_ops = {ValueOpcode::ImageSampleRaw},
+                         Decoder::ImageDimension dimension = Decoder::ImageDimension::Dim2D) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -266,15 +268,27 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
   const auto image = fixture->Image(image_words, 0x10f0);
   const auto sampler =
       fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
-  MemoryInfo sample;
-  sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress()},
-                                     fixture->AddMemory(sample, 0x10f0));
-  const auto sampled_x =
-      fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
-  fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  for (const auto op : image_ops) {
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = dimension;
+    if (op == ValueOpcode::ImageGatherRaw) sample.dmask = 1u;
+    const auto address = fixture->ImageAddress();
+    const auto flags = fixture->AddMemory(sample, 0x10f0);
+    const auto zero = Value(0u);
+    Value sampled;
+    if (op == ValueOpcode::ImageRead)
+      sampled = fixture->Emit(op, {image, address, Value(true)}, flags);
+    else if (op == ValueOpcode::ImageQueryDimensions)
+      sampled = fixture->Emit(op, {image, address}, flags);
+    else if (op == ValueOpcode::ImageGatherRaw)
+      sampled = fixture->Emit(op, {image, sampler, address, zero, zero, zero, zero}, flags);
+    else
+      sampled = fixture->Emit(op, {image, sampler, address}, flags);
+    const auto sampled_x =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
+    fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  }
   return fixture;
 }
 
@@ -786,6 +800,59 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             endpoint.watched_reads == 0u,
         "batched descriptor read crossed the 48-bit endpoint");
+}
+
+void TestIndirectImageTableOperations() {
+  using Type = Libs::Graphics::Prospero::ImageType;
+  const auto descriptor = [](uint32_t identity, Type type) {
+    auto words = std::array<uint32_t, 8>{identity, 75u << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u),
+        0u, 0u, 0u, 0u};
+    if (type == Type::kColor2DMsaa) {
+      words[3] |= 1u << 16u; // two fragments
+      words[5] |= 1u << 4u;
+    }
+    return words;
+  };
+  const auto materializes = [&](std::vector<ValueOpcode> ops, Decoder::ImageDimension dimension,
+                                std::initializer_list<Type> records) {
+    auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, false, std::move(ops), dimension);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    std::vector<uint32_t> selected;
+    for (const auto type : records) {
+      DescriptorSource source;
+      source.dword_count = 8u;
+      const auto value = descriptor(0x30u + static_cast<uint32_t>(selected.size()), type);
+      for (uint32_t word = 0; word < value.size(); ++word) source.dwords[word] = Value(value[word]);
+      selected.push_back(static_cast<uint32_t>(plan.descriptor_sources.size()));
+      plan.descriptor_sources.push_back(source);
+    }
+    plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->sources =
+        std::move(selected);
+    std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u, 0x2000u, 48u << 16u, 5u, 0u};
+    LinearTestMemory memory;
+    memory.fail_address = 0x3000u;
+    SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  constexpr auto Dim2D = Decoder::ImageDimension::Dim2D;
+  constexpr auto sample = ValueOpcode::ImageSampleRaw;
+  Check(materializes({sample}, Dim2D, {Type::kColor2D, Type::kColor3D}),
+        "a plain sample refused a table of mixed dimensions");
+  // Loads, gathers and queries read through the root's view only.
+  for (const auto &ops : std::initializer_list<std::vector<ValueOpcode>>{
+           {ValueOpcode::ImageRead}, {ValueOpcode::ImageGatherRaw},
+           {ValueOpcode::ImageQueryDimensions}, {sample, ValueOpcode::ImageRead},
+           {sample, ValueOpcode::ImageGatherRaw}}) {
+    Check(materializes(ops, Dim2D, {Type::kColor2D, Type::kColor2D}),
+          "an image operation refused a table of one dimension");
+    Check(!materializes(ops, Dim2D, {Type::kColor2D, Type::kColor3D}),
+          "an image operation without per-candidate views accepted mixed dimensions");
+  }
 }
 
 void TestBitScanKeyRange() {
@@ -3977,6 +4044,7 @@ int main() {
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("indirect image table operations", TestIndirectImageTableOperations);
     Run("bit scan key range", TestBitScanKeyRange);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);

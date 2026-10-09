@@ -612,9 +612,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2DMsaa ||
 			       dimension == Decoder::ImageDimension::Dim2DMsaaArray;
 		};
-		// A plain sample reads the selected record with the record's own dimension, as the T#
-		// drives the hardware; derivatives, offsets and gathers are laid out for one dimension.
-		// Candidates keep one numeric class, which selects the table's sampler variant.
+		// Only image_sample selects each record's own view, sampled with the record's dimension
+		// as the T# drives the hardware; derivatives and offsets are laid out for one dimension.
+		// Candidates keep one numeric class, which selects the sampler variant.
 		const auto& base_root    = program.info.images[root_index];
 		uint32_t    sample_flags = 0;
 		for (const auto& memory: program.memory_info) {
@@ -623,11 +623,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 		const bool mixed_dimensions =
-		    base_root.resource_class == ImageResourceClass::Sampled && !base_root.written &&
-		    !base_root.atomic &&
+		    base_root.sample_only &&
 		    (sample_flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagCd |
-		                     Decoder::ImageSampleFlagOffset | Decoder::ImageSampleFlagCompare |
-		                     Decoder::ImageSampleFlagGatherHorizontal)) == 0u;
+		                     Decoder::ImageSampleFlagOffset | Decoder::ImageSampleFlagCompare)) ==
+		        0u;
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {

@@ -841,6 +841,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
+	prepared.push_dwords_valid = false;
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
@@ -1254,6 +1255,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
 			has_push_data = true;
 		}
+	}
+
+	// Keep this draw's push-constant block on each stage for the frame dump (FrameDump::OnDraw).
+	for (auto* prepared: prepared_bindings) {
+		prepared->push_dwords       = push_data.dwords;
+		prepared->push_dwords_valid = has_push_data;
 	}
 
 	if (has_push_data) {

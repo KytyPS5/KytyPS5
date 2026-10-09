@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 
 #include <set>
@@ -156,6 +157,21 @@ std::string WordsText(const uint8_t* p, size_t bytes, const char* indent = "    
 	return s;
 }
 
+// Dword lines with explicit indices, 8 per line: "<tag> <seq> ps=0x<hash> dwords: [i]=0x........".
+void DwordLines(std::string& out, const char* tag, uint32_t seq, uint64_t ps_hash, const uint32_t* data,
+                size_t count) {
+	char b[96];
+	for (size_t i = 0; i < count; i++) {
+		if (i % 8 == 0) {
+			std::snprintf(b, sizeof(b), "%s %05u ps=0x%016" PRIx64 " dwords:", tag, seq, ps_hash);
+			out += b;
+		}
+		std::snprintf(b, sizeof(b), " [%zu]=0x%08x", i, data[i]);
+		out += b;
+		if (i % 8 == 7 || i + 1 == count) out += "\n";
+	}
+}
+
 void QueueBuffer(vk::Buffer buf, uint64_t offset, uint64_t range, uint64_t addr, uint64_t guest_size,
                  uint32_t seq, const std::string& label) {
 	if (!buf || range == 0 || range == VK_WHOLE_SIZE) return;
@@ -209,6 +225,51 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) 
 				g_buflog += WordsText(reinterpret_cast<const uint8_t*>(addr),
 				                      static_cast<size_t>(std::min<uint64_t>(size, 256)));
 			}
+		}
+	}
+	// Explicit dword dumps for pixel-shader draws (lighting investigation). Dword index = [i].
+	if (b.runtime != nullptr && b.runtime->resources != nullptr && b.runtime->program &&
+	    b.runtime->program->stage == ShaderType::Pixel) {
+		const auto& prog = *b.runtime->program;
+		const auto& r    = *b.runtime->resources;
+		// USERDATA: [i] is user-data register user_data_base + i.
+		std::snprintf(line, sizeof(line), "USERDATA %05u ps=0x%016" PRIx64 " first_reg=%u count=%zu\n", seq, ps_hash,
+		              prog.user_data_base, static_cast<size_t>(r.user_data.size()));
+		g_buflog += line;
+		DwordLines(g_buflog, "USERDATA", seq, ps_hash, r.user_data.data(), r.user_data.size());
+		// SRT: the flattened_srt buffer bound at binding NativeBinding(stage, FlattenedSrt) (= 109 for PS).
+		const uint32_t srt_binding = ShaderRecompiler::IR::NativeBinding(
+		    prog.stage, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt);
+		const bool srt_bound = ShaderRecompiler::IR::FindBinding(
+		                           prog.bindings, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr;
+		if (!srt_bound) {
+			std::snprintf(line, sizeof(line), "SRT %05u ps=0x%016" PRIx64 " binding=%u not bound\n", seq, ps_hash,
+			              srt_binding);
+			g_buflog += line;
+		} else {
+			const uint64_t bytes = static_cast<uint64_t>(r.flattened_srt.size()) * 4u;
+			std::string    fname = "(write failed)";
+			char           path[640];
+			std::snprintf(path, sizeof(path), "%s/srt_%05u_%016" PRIx64 "_b%u.bin", g_dir.c_str(), seq, ps_hash,
+			              srt_binding);
+			if (FILE* f = std::fopen(path, "wb")) {
+				std::fwrite(r.flattened_srt.data(), 1, static_cast<size_t>(bytes), f);
+				std::fclose(f);
+				fname = std::filesystem::path(path).filename().string();
+			}
+			std::snprintf(line, sizeof(line), "SRT %05u ps=0x%016" PRIx64 " binding=%u size=%" PRIu64 " -> %s\n", seq,
+			              ps_hash, srt_binding, bytes, fname.c_str());
+			g_buflog += line;
+			DwordLines(g_buflog, "SRT", seq, ps_hash, r.flattened_srt.data(),
+			           std::min<size_t>(r.flattened_srt.size(), 1024));
+		}
+		// PUSH: the 32-dword push-constant block committed for this draw (SPIR-V access chain index = [i]).
+		if (b.push_dwords_valid) {
+			DwordLines(g_buflog, "PUSH", seq, ps_hash, b.push_dwords.data(), b.push_dwords.size());
+		} else {
+			std::snprintf(line, sizeof(line), "PUSH %05u ps=0x%016" PRIx64 " none (no push-constant block for this draw)\n",
+			              seq, ps_hash);
+			g_buflog += line;
 		}
 	}
 	g_buflog += "  shader_data (" + std::to_string(b.shader_data.size()) + " dwords):\n";

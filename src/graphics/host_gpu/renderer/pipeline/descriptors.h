@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -46,6 +47,9 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+	// Push-constant block committed for the draw (frame dump only; valid when push_dwords_valid).
+	std::array<uint32_t, ShaderRecompiler::IR::PushData::DwordCount> push_dwords {};
+	bool                                                              push_dwords_valid = false;
 };
 
 [[nodiscard]] vk::DescriptorType

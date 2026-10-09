@@ -567,6 +567,29 @@ static void DbgLogSmallTextureDraw(const PreparedBindings* ps, const DrawRenderS
 }
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
+// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS_ADDR): sampled/storage bindings of a draw that overlap the
+// address filter. Only called while the filter is set.
+static void LogDepthAliasBinds(uint64_t seq, std::span<PreparedBindings* const> stages) {
+	for (const auto* stage: stages) {
+		for (const auto& binding: stage->images) {
+			const auto& info = binding.desc.info;
+			if (!DepthAliasLog::Want(info.data.address, info.data.size) ||
+			    !DepthAliasLog::TakeLine()) {
+				continue;
+			}
+			std::printf("NHL27DEPTH: bind #%llu draw addr=0x%llx size=0x%llx fmt=%s extent=%ux%u "
+			            "usage=%s\n",
+			            static_cast<unsigned long long>(seq),
+			            static_cast<unsigned long long>(info.data.address),
+			            static_cast<unsigned long long>(info.data.size),
+			            vk::to_string(info.pixel_format).c_str(), info.extent.width,
+			            info.extent.height,
+			            binding.desc.type == TextureCache::BindingType::Texture ? "sampled"
+			                                                                    : "storage");
+		}
+	}
+}
+
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
@@ -579,8 +602,29 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
 	state.num_color_attachments = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
+	// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): one sequence number per draw, shared by its depth,
+	// colour and bind lines. Without the address filter only depth-target draws take one.
+	const uint64_t dbg_seq = DepthAliasLog::Enabled() && (depth.image_id || DepthAliasLog::Filtered())
+	                             ? DepthAliasLog::NextSeq()
+	                             : 0;
+	if (DepthAliasLog::Enabled() && DepthAliasLog::Filtered()) {
+		LogDepthAliasBinds(dbg_seq, stages);
+	}
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
+		if (DepthAliasLog::Enabled() && DepthAliasLog::Filtered() &&
+		    DepthAliasLog::Want(target.desc.info.data.address, target.desc.info.data.size) &&
+		    DepthAliasLog::TakeLine()) {
+			// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS_ADDR): colour render target overlapping the window.
+			const auto ext = target.Extent();
+			std::printf("NHL27DEPTH: color_draw #%llu rt%u addr=0x%llx size=0x%llx fmt=%s "
+			            "extent=%ux%u mip=%u layer=%u\n",
+			            static_cast<unsigned long long>(dbg_seq), target.target_slot,
+			            static_cast<unsigned long long>(target.desc.info.data.address),
+			            static_cast<unsigned long long>(target.desc.info.data.size),
+			            vk::to_string(target.desc.info.pixel_format).c_str(), ext.width, ext.height,
+			            target.guest_mip_level, target.guest_array_layer);
+		}
 		const auto owner = cache.m_slot_images.try_get(target.image_id);
 		if (owner == nullptr || (!owner->registered && !owner->info.data.Empty()) ||
 		    owner->binding.needs_rebind) {
@@ -649,14 +693,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
-		if (meta_clear &&
 		if (DepthAliasLog::Enabled()) {
 			// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): depth draws that clear, or that write blindly.
 			const auto& dcl = buffer.GetRegisters().GetDepthControl();
 			const bool  blind_always =
 			    dcl.zfunc == static_cast<uint8_t>(vk::CompareOp::eAlways) && !dcl.z_write_enable;
-			const auto seq = DepthAliasLog::NextSeq();
-			if ((depth.depth_clear_enable || depth.stencil_clear_enable || blind_always) &&
+			const auto seq = dbg_seq;
+			// With the address filter, every draw whose depth target overlaps the window.
+			const bool depth_hit =
+			    DepthAliasLog::Filtered()
+			        ? DepthAliasLog::Want(depth.desc.info.data.address,
+			                              depth.desc.info.data.size)
+			        : (depth.depth_clear_enable || depth.stencil_clear_enable || blind_always);
+			if (depth_hit &&
 			    DepthAliasLog::TakeLine()) {
 				const auto& dex = depth.desc.info.extent;
 				std::printf("NHL27DEPTH: depth_draw #%llu addr=0x%llx %ux%u fmt=%s zwrite=%d "
@@ -674,6 +723,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
+		if (meta_clear &&
 			EXIT("failed to consume HTile clear state\n");
 		}
 		auto& image = cache.GetImage(depth.image_id);

@@ -318,7 +318,9 @@ void TextureCache::DeleteImage(ImageId id) {
 void TextureCache::FreeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
-		if (DepthAliasLog::Enabled() && DepthAliasLog::TakeLine()) {
+		if (DepthAliasLog::Enabled() &&
+		    DepthAliasLog::Want(image.info.data.address, image.info.data.size) &&
+		    DepthAliasLog::TakeLine()) {
 			// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): GPU-written content dropped without a download.
 			std::printf("NHL27DEPTH: free_gpu_modified_no_download addr=0x%llx size=0x%llx "
 			            "fmt=%s extent=%ux%u depth=%d\n",
@@ -818,7 +820,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
-	if (DepthAliasLog::Enabled() && DepthAliasLog::TakeLine()) {
+	if (DepthAliasLog::Enabled() &&
+	    DepthAliasLog::WantEither(cached.info.data.address, cached.info.data.size,
+	                              requested.data.address, requested.data.size) &&
+	    DepthAliasLog::TakeLine()) {
 		// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): depth image recreated from an incompatible image.
 		// "ever uploaded" is not tracked per image; buffer_modified/cpu_dirty are the closest state.
 		std::printf("NHL27DEPTH: depth_recreate old addr=0x%llx size=0x%llx fmt=%s backing=%s "
@@ -947,7 +952,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
-	if (DepthAliasLog::Enabled() && DepthAliasLog::TakeLine()) {
+	if (DepthAliasLog::Enabled() &&
+	    DepthAliasLog::WantEither(requested.data.address, requested.data.size,
+	                              cached.info.data.address, cached.info.data.size) &&
+	    DepthAliasLog::TakeLine()) {
 		// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): partial overlap that falls through without a copy.
 		std::printf("NHL27DEPTH: partial_overlap_skipped requested addr=0x%llx size=0x%llx "
 		            "fmt=%s | cached addr=0x%llx size=0x%llx fmt=%s freed=%d\n",
@@ -1431,6 +1439,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			} else if (desc.type == BindingType::Texture && DepthAliasLog::Enabled() &&
+			           DepthAliasLog::Want(inserted.info.data.address, inserted.info.data.size) &&
 			           DepthAliasLog::TakeLine()) {
 				// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): sampled image created fresh, nothing to upload.
 				std::printf("NHL27DEPTH: fresh_no_upload addr=0x%llx size=0x%llx fmt=%s extent=%ux%u "

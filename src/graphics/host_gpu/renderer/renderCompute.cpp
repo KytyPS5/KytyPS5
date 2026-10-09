@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -504,6 +505,29 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		ResetBindings();
 		return;
+	}
+	if (DepthAliasLog::Enabled() && DepthAliasLog::Filtered()) {
+		// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS_ADDR): compute image bindings overlapping the window.
+		const auto seq = DepthAliasLog::NextSeq();
+		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
+			const auto& info = bindings.images[i].desc.info;
+			if (!DepthAliasLog::Want(info.data.address, info.data.size) ||
+			    !DepthAliasLog::TakeLine()) {
+				continue;
+			}
+			const auto& resource = program.info.images[i];
+			const bool  sampled  = resource.resource_class ==
+			                      ShaderRecompiler::IR::ImageResourceClass::Sampled;
+			std::printf("NHL27DEPTH: bind #%llu cs hash=0x%016llx addr=0x%llx size=0x%llx "
+			            "fmt=%s extent=%ux%u usage=%s written=%d\n",
+			            static_cast<unsigned long long>(seq),
+			            static_cast<unsigned long long>(program.shader_hash),
+			            static_cast<unsigned long long>(info.data.address),
+			            static_cast<unsigned long long>(info.data.size),
+			            vk::to_string(info.pixel_format).c_str(), info.extent.width,
+			            info.extent.height, sampled ? "sampled" : "storage",
+			            resource.written ? 1 : 0);
+		}
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch",

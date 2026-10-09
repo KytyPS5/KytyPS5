@@ -4,6 +4,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -518,6 +520,20 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	}
 	uint32_t word = 0;
+	// The walker evaluates scalar loads ahead of time, including ones in paths this dispatch
+	// never takes, so a null/guard-page pointer must not abort resource materialization. Guests
+	// legitimately leave optional descriptor pointers null; such a load reads as zero, which
+	// every consumer already treats as a null descriptor.
+	constexpr uint64_t MinimumGuestAddress = 0x10000;
+	if (address < MinimumGuestAddress) {
+		static std::atomic_uint warnings = 0;
+		if (warnings.fetch_add(1) < 16) {
+			std::printf("Warning: shader SRT read from null guest address 0x%llx; using zero\n",
+			            static_cast<unsigned long long>(address));
+		}
+		result = 0u;
+		return true;
+	}
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
@@ -525,11 +541,6 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		// Without a memory reader the walker dereferences the guest address directly. A zero or
-		// near-zero address is a null/guard page and must never be read: guests may legitimately
-		// pass null descriptor pointers, which has to evaluate as "unknown" rather than fault.
-		constexpr uint64_t MinimumGuestAddress = 0x10000;
-		if (address < MinimumGuestAddress) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;

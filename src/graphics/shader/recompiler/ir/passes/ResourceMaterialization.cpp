@@ -1094,11 +1094,24 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+// Reports which check rejected a shader before the caller aborts, so failures are diagnosable.
+static bool MaterializeFail(int line, const ResourcePlan& program) {
+	std::printf("Shader resources: materialization failed at ResourceMaterialization.cpp:%d "
+	            "stage=%d hash=%016llx tracking_complete=%d srt_plan_complete=%d "
+	            "needs_spec_memory=%d capture_reads=%d control_flow=%zu\n",
+	            line, static_cast<int>(program.stage),
+	            static_cast<unsigned long long>(program.shader_hash),
+	            program.resource_tracking_complete ? 1 : 0, program.srt_plan_complete ? 1 : 0,
+	            program.requires_specialization_memory ? 1 : 0,
+	            program.capture_specialization_reads ? 1 : 0, program.control_flow.size());
+	return false;
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
-		return false;
+		return MaterializeFail(__LINE__, program);
 	}
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;
@@ -1115,7 +1128,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtWalker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
+		return MaterializeFail(__LINE__, program);
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
@@ -1132,7 +1145,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
-			return false;
+			return MaterializeFail(__LINE__, program);
 		}
 		if (active.empty() || active[source]) {
 			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
@@ -1146,11 +1159,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
-		if (base_index >= program.info.buffers.size()) return false;
+		if (base_index >= program.info.buffers.size()) return MaterializeFail(__LINE__, program);
 		const auto& base = program.info.buffers[base_index];
 		if (i < program.info.buffers.size()) {
 			const auto* source = Source(program, base.source);
-			if (source == nullptr) return false;
+			if (source == nullptr) return MaterializeFail(__LINE__, program);
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
@@ -1158,10 +1171,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        NormalizeIndirectStoreBuffer))
-						return false;
+						return MaterializeFail(__LINE__, program);
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
-				return false;
+				return MaterializeFail(__LINE__, program);
 			}
 		}
 		auto&                descriptor_value = snapshot.buffers[i];
@@ -1205,7 +1218,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
-			return false;
+			return MaterializeFail(__LINE__, program);
 		}
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
@@ -1223,11 +1236,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {
-				return false;
+				return MaterializeFail(__LINE__, program);
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
-				return false;
+				return MaterializeFail(__LINE__, program);
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				snapshot.images[i].dwords.fill(0);
@@ -1237,7 +1250,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
-			return false;
+			return MaterializeFail(__LINE__, program);
 		}
 		if (program.info.samplers[i].gather_lod) {
 			const auto control = snapshot.samplers[i].dwords[2];

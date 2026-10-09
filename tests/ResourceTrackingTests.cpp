@@ -853,6 +853,12 @@ void TestIndirectImageTableOperations() {
     Check(!materializes(ops, Dim2D, {Type::kColor2D, Type::kColor3D}),
           "an image operation without per-candidate views accepted mixed dimensions");
   }
+  // A sampler cannot read a multisampled record; image_load fetches its samples.
+  Check(materializes({ValueOpcode::ImageRead}, Decoder::ImageDimension::Dim2DMsaa,
+                     {Type::kColor2DMsaa, Type::kColor2DMsaa}),
+        "image_load refused a multisampled table");
+  Check(!materializes({sample}, Dim2D, {Type::kColor2DMsaa, Type::kColor2DMsaa}),
+        "a sample accepted a multisampled table");
 }
 
 void TestBitScanKeyRange() {

@@ -607,7 +607,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
 		};
-		// Indirect tables are only sampled, and no sample reads a multisampled record.
+		// A sampler cannot read a multisampled record; image_load fetches its samples.
+		const bool sampled = std::ranges::any_of(
+		    program.info.sampled_pairs, [&](const auto& pair) { return pair.image == root_index; });
 		const auto is_msaa = [](Decoder::ImageDimension dimension) {
 			return dimension == Decoder::ImageDimension::Dim2DMsaa ||
 			       dimension == Decoder::ImageDimension::Dim2DMsaaArray;
@@ -642,7 +644,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
-			if (is_msaa(image.dimension) || image.numeric_class != image_class.numeric_class ||
+			if ((sampled && is_msaa(image.dimension)) ||
+			    image.numeric_class != image_class.numeric_class ||
 			    (!same_coordinates && !mixed_dimensions &&
 			     !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||

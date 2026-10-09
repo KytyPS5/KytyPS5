@@ -38,8 +38,8 @@ public:
 
 	// End of pipe: after all earlier commands complete. Otherwise when the command is reached.
 	void Write(uint64_t vaddr, uint32_t size, bool end_of_pipe);
-	// Stores the values that completions left to the GPU thread, in their order. Called by
-	// every write, and before a range is unmapped.
+	// Stores the values that completions left to the GPU thread, in their order. A completion
+	// that leaves one queues this on the GPU thread; every write and an unmap call it too.
 	void StoreRetries();
 
 	// Conversion of host ticks at or after previous.device_base.
@@ -72,6 +72,7 @@ private:
 	void               Calibrate();
 	void               Resolve();
 	void               Complete(const Batch& batch);
+	void               QueueRetries();
 
 	GraphicContext&        m_graphics;
 	CommandScheduler&      m_scheduler;
@@ -85,6 +86,7 @@ private:
 	std::mutex             m_mutex;
 	std::vector<Retry>     m_retries;
 	bool                   m_retrying        = false;
+	bool                   m_retry_queued    = false;
 	bool                   m_calibrated      = false;
 	uint64_t               m_first_ticks     = 0;
 	uint64_t               m_first_reference = 0;

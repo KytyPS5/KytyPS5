@@ -30,6 +30,8 @@ public:
 	void               Shutdown();
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
+	// False once the GPU stops accepting work, instead of a fatal error.
+	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.

@@ -17,6 +17,7 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <vector>
 
@@ -38,6 +39,9 @@ public:
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
+	// Queues work on the GPU thread from any thread, including completion callbacks that can
+	// outlive the guest GPU. False when no GPU accepts work.
+	[[nodiscard]] bool                      PostGpuCommand(Common::UniqueFunction<void>&& command);
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
@@ -84,6 +88,7 @@ private:
 	GpuTimestamps             m_gpu_timestamps;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	std::mutex                m_gpu_mutex;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

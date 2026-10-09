@@ -9,6 +9,7 @@
 #include "graphics/presentation/upscaleRuntime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -177,7 +178,7 @@ struct XessFgBridge::Impl {
 	};
 
 	GraphicContext&                         graphics;
-	bool                                    available         = false;
+	std::atomic<bool>                       available         {false};
 	PFN_vkGetMemoryWin32HandlePropertiesKHR memory_properties = nullptr;
 	PFN_vkImportSemaphoreWin32HandleKHR     import_semaphore  = nullptr;
 	ComPtr<IDXGIFactory4>                   factory;
@@ -375,7 +376,7 @@ struct XessFgBridge::Impl {
 
 	// D3D12 has finished every submitted copy and present.
 	void WaitD3d12() {
-		if (!queue) return;
+		if (!queue || !released) return;
 		queue->Signal(released.Get(), ++release_value);
 		if (released->GetCompletedValue() < release_value)
 			released->SetEventOnCompletion(release_value, nullptr);

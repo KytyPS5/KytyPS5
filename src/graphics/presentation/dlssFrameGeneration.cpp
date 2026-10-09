@@ -10,6 +10,7 @@
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -115,7 +116,8 @@ bool CaptureDlssFgInputs(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 struct DlssFrameGeneration::Impl {
-	bool        initialized = false, available = false, enabled = false, logged = false;
+	bool              initialized = false, logged = false;
+	std::atomic<bool> available {false}, enabled {false};
 	bool        device_extensions_ready = false;
 	uint32_t    presented               = 0;
 	uint64_t    total_presented         = 0;
@@ -875,17 +877,25 @@ void* DlssFrameGeneration::NativeWindow() const {
 void DlssFrameGeneration::Shutdown() {
 	// The swap chain released its shared images; D3D12 objects go before the Vulkan device.
 	m_impl->bridge.reset();
-	if (m_impl->xefg) m_impl->available = m_impl->enabled = false;
+	if (m_impl->xefg) {
+		m_impl->available = false;
+		m_impl->enabled   = false;
+	}
 #if defined(KYTY_HAS_DLSS)
 	m_impl->external_context.reset();
 	m_impl->external_retired.clear();
 	// Keep DLL code loaded through deferred releases and Vulkan teardown.
 #endif
-	if (m_impl->external) m_impl->available = m_impl->enabled = false;
+	if (m_impl->external) {
+		m_impl->available = false;
+		m_impl->enabled   = false;
+	}
 #if defined(KYTY_HAS_DLSS_FG)
 	auto& impl = *m_impl;
 	if (impl.initialized) impl.shutdown();
-	impl.initialized = impl.available = impl.enabled = false;
+	impl.initialized = false;
+	impl.available   = false;
+	impl.enabled     = false;
 	impl.device_extensions_ready                     = false;
 	// The global Vulkan dispatcher retains the proxy function addresses until
 	// instance/device destruction completes. Keep the module loaded for that.

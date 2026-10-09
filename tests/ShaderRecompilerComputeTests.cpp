@@ -1338,6 +1338,8 @@ struct TestCase {
   float expected_float_tolerance = 0.0f;
   std::vector<u32> gds_initial;
   std::vector<u32> expected_gds;
+  // Pages whose BDA fault bit and fault summary bit the dispatch must set.
+  std::vector<uint64_t> expected_fault_pages;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
@@ -5195,6 +5197,82 @@ public:
               "staged BDA updates were stale, overwritten before their read, or incompletely flushed");
     }
     DestroyBuffer(&readback);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckFaultBufferSummary() {
+    constexpr const char *name = "FaultBufferSummary";
+    // Two faults in different summary words, and a page bit without its summary bit.
+    constexpr std::array<uint64_t, 3> addresses{0x0000000207c00000ull, 0x0000000247c00000ull,
+                                                0x0000000287c00000ull};
+    constexpr auto span_bits = std::countr_zero(BufferCache::FAULT_SUMMARY_SPAN);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetBufferCache();
+    auto &faults = *cache.GetFaultBuffer();
+    std::vector<uint64_t> words;
+    for (size_t i = 0; i < addresses.size(); ++i) {
+      const auto page = BufferCache::PageIndex(addresses[i]);
+      const auto group = page >> (5 + span_bits);
+      const u32 page_bit = 1u << (page & 31u);
+      const u32 group_bit = 1u << (group & 31u);
+      const auto summary = BufferCache::FAULT_BITMAP_WORDS + (group >> 5);
+      Require(name, "layout",
+              std::ranges::find(words, page >> 5) == words.end() &&
+                  std::ranges::find(words, summary) == words.end(),
+              "test pages share fault words");
+      words.push_back(page >> 5);
+      words.push_back(summary);
+      scheduler.Current().Handle().updateBuffer(faults.Handle(), (page >> 5) * sizeof(u32),
+                                                sizeof(u32), &page_bit);
+      const u32 summary_value = i != 2 ? group_bit : 0u;
+      scheduler.Current().Handle().updateBuffer(faults.Handle(), summary * sizeof(u32),
+                                                sizeof(u32), &summary_value);
+    }
+    vk::MemoryBarrier written{};
+    written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    written.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &written, 0, nullptr, 0, nullptr);
+    cache.ProcessFaultBuffer();
+    auto readback = CreateHostBuffer(name, words.size() * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst,
+                                     std::vector<u32>(words.size()));
+    std::vector<vk::BufferCopy> copies;
+    for (size_t i = 0; i < words.size(); ++i) {
+      copies.push_back({words[i] * sizeof(u32), i * sizeof(u32), sizeof(u32)});
+    }
+    vk::MemoryBarrier processed{};
+    processed.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    processed.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eTransfer, {}, 1, &processed, 0, nullptr, 0, nullptr);
+    scheduler.Current().Handle().copyBuffer(faults.Handle(), readback.buffer,
+                                            static_cast<u32>(copies.size()), copies.data());
+    vk::MemoryBarrier copied{};
+    copied.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    copied.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 1, &copied, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+    const auto values = ReadBuffer(name, readback, words.size());
+    DestroyBuffer(&readback);
+    for (size_t i = 0; i < 2; ++i) {
+      Require(name, "summarized faults",
+              BufferCacheTestAccess::PageOwner(cache, addresses[i]) != BufferId{} &&
+                  values[i * 2] == 0 && values[i * 2 + 1] == 0,
+              "a summarized fault was not reported, or its bits were not cleared");
+    }
+    // The pass reads only the bitmap words that a summary bit names.
+    Require(name, "unsummarized bit",
+            BufferCacheTestAccess::PageOwner(cache, addresses[2]) == BufferId{} &&
+                values[4] != 0,
+            "the pass scanned a bitmap word whose summary bit was clear");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -15219,6 +15297,34 @@ public:
     return sampler;
   }
 
+  std::vector<u32> ReadFaultWords(const char *shader_name, std::span<const uint64_t> words) {
+    auto readback = CreateHostBuffer(shader_name, words.size() * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst,
+                                     std::vector<u32>(words.size()));
+    std::vector<vk::BufferCopy> copies;
+    for (size_t i = 0; i < words.size(); ++i) {
+      copies.push_back({words[i] * sizeof(u32), i * sizeof(u32), sizeof(u32)});
+    }
+    auto cmd = BeginCommands(shader_name, "fault readback");
+    vk::MemoryBarrier before{};
+    before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+    before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                        vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr,
+                        0, nullptr);
+    cmd.copyBuffer(m_fault_buffer.buffer, readback.buffer, static_cast<u32>(copies.size()),
+                   copies.data());
+    vk::MemoryBarrier after{};
+    after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                        {}, 1, &after, 0, nullptr, 0, nullptr);
+    EndSubmitAndFree(shader_name, "fault readback", cmd);
+    auto values = ReadBuffer(shader_name, readback, words.size());
+    DestroyBuffer(&readback);
+    return values;
+  }
+
   std::vector<u32> ReadBuffer(const char *shader_name, const Buffer &buffer,
                               size_t dword_count) {
     if (!buffer.coherent) {
@@ -18663,8 +18769,8 @@ private:
                        vk::BufferUsageFlagBits::eTransferDst;
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
-    m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+    m_fault_buffer = CreateDeviceBuffer(shader_name, BufferCache::FAULT_BUFFER_SIZE,
+                                        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -18901,6 +19007,16 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
     const auto gds_actual =
         vulkan->ReadBuffer(test.name, gds_buffer, test.expected_gds.size());
     CompareWords(test, "GDS readback", test.expected_gds, gds_actual);
+  }
+  for (const auto page : test.expected_fault_pages) {
+    constexpr auto span_bits = std::countr_zero(BufferCache::FAULT_SUMMARY_SPAN);
+    const auto group = page >> (5 + span_bits);
+    const std::array<uint64_t, 2> words{page >> 5, BufferCache::FAULT_BITMAP_WORDS + (group >> 5)};
+    const auto values = vulkan->ReadFaultWords(test.name, words);
+    Require(test.name, "fault readback", (values[0] >> (page & 31)) & 1u,
+            "the faulting page has no fault bit");
+    Require(test.name, "fault readback", (values[1] >> (group & 31)) & 1u,
+            "the faulting page has no fault summary bit");
   }
   if (!test.expected_storage_image_rgba.empty()) {
     auto image_actual = vulkan->ReadImage(test.name, &storage_image);
@@ -30798,6 +30914,33 @@ TestCase FlatLoadVariants() {
   return test;
 }
 
+TestCase FlatLoadRecordsFaultSummary() {
+  using O = ShaderOpcode;
+  // An unmapped page reads zero and records both its fault bit and its summary bit.
+  constexpr uint64_t Unmapped = 0x0000001f00000000ull;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeFlat0(0x0c, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendVMovU32(&code, 22, static_cast<u32>(Unmapped));
+  AppendVMovU32(&code, 23, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 0));
+  code.push_back(EncodeFlat1(1, 0x7d, 0, 22));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "FlatLoadRecordsFaultSummary";
+  test.code = std::move(code);
+  test.initial = {0x11223344u, 0x55667788u};
+  test.expected = {0x11223344u, 0u};
+  test.bda_mappings = {{0, 0}};
+  test.expected_fault_pages = {BufferCache::PageIndex(Unmapped)};
+  test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase FlatSubdwordLoadsApplyByteOffset() {
   using O = ShaderOpcode;
 
@@ -36710,6 +36853,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(FlatLoadDlcCaptured(64));
   AddCase(FlatLoadVariants);
   AddCase(FlatSubdwordLoadsApplyByteOffset);
+  AddCase(FlatLoadRecordsFaultSummary);
   cases.push_back(GlobalLoadShortD16Captured(32));
   cases.push_back(GlobalLoadShortD16Captured(64));
   AddCase(FlatLoadShortD16AddressSegments);
@@ -42941,6 +43085,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckFaultBufferSummary();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

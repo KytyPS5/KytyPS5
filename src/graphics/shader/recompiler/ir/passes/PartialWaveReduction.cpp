@@ -77,6 +77,10 @@ bool IsExecBounded(Value value, std::unordered_set<const Inst*>& visiting) {
 		case ValueOpcode::LogicalAnd:
 			result = IsExecBounded(inst->Arg(0), visiting) || IsExecBounded(inst->Arg(1), visiting);
 			break;
+		case ValueOpcode::LogicalOr:
+			// Or is false in a lane only if both terms are: both must be bounded.
+			result = IsExecBounded(inst->Arg(0), visiting) && IsExecBounded(inst->Arg(1), visiting);
+			break;
 		case ValueOpcode::Phi:
 			result = inst->NumArgs() != 0;
 			for (size_t i = 0; result && i < inst->NumArgs(); i++) {
@@ -235,13 +239,25 @@ std::optional<Reduction> MatchReduction(Value source) {
 			std::unordered_set<const Inst*> visiting;
 			if (!neutral.IsImmediate() || neutral.GetType() != Type::U32 ||
 			    neutral.U32() != NeutralOf(*op) || !IsExecBounded(fill->Arg(0), visiting)) {
+				const auto bounded = [](Value v) {
+					std::unordered_set<const Inst*> fresh;  // `visiting` is polluted after the first query
+					return IsExecBounded(v, fresh);
+				};
+				const auto* cond = InstOf(fill->Arg(0));
+				std::string operands;
+				if (cond != nullptr && cond->GetOpcode() != ValueOpcode::Phi) {
+					for (size_t i = 0; i < cond->NumArgs() && i < 2; i++) {
+						operands += " arg" + std::to_string(i) + "=" + OpName(cond->Arg(i)) + "/" +
+						            std::to_string(bounded(cond->Arg(i)));
+					}
+				}
 				g_diag.Note(6, "neutral fill rejected: neutral=" +
 				                   (neutral.IsImmediate() ? std::to_string(neutral.U32())
 				                                          : OpName(neutral)) +
 				                   " expected=" + std::to_string(NeutralOf(*op)) +
 				                   " cond=" + OpName(fill->Arg(0)) +
-				                   " cond_exec_bounded=" +
-				                   std::to_string(IsExecBounded(fill->Arg(0), visiting)));
+				                   " cond_exec_bounded=" + std::to_string(bounded(fill->Arg(0))) +
+				                   operands);
 				continue;
 			}
 		}

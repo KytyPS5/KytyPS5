@@ -616,7 +616,7 @@ struct ReductionIr {
 ReductionIr BuildReduction(Fixture &fixture, ValueOpcode op, uint32_t neutral,
                            bool bounded_condition = true,
                            uint32_t perm_select = 0xffffffffu,
-                           bool folded_fill = false) {
+                           bool folded_fill = false, int cond_shape = 0) {
   const auto exec = fixture.Emit(ValueOpcode::LogicalAnd, {Value(true), Value(true)});
   const auto not_exec = fixture.Emit(ValueOpcode::LogicalNot, {exec});
   const auto whole = fixture.Emit(ValueOpcode::LogicalOr, {not_exec, exec});
@@ -625,6 +625,23 @@ ReductionIr BuildReduction(Fixture &fixture, ValueOpcode op, uint32_t neutral,
   Value condition = exec;
   if (!bounded_condition) {
     condition = fixture.Emit(ValueOpcode::IEqual32, {data, Value(7u)});
+  }
+  if (cond_shape != 0) {
+    const auto pred = fixture.Emit(ValueOpcode::IEqual32, {data, Value(7u)});
+    const auto pred2 = fixture.Emit(ValueOpcode::INotEqual32, {data, Value(9u)});
+    switch (cond_shape) {
+    case 1: condition = fixture.Emit(ValueOpcode::LogicalAnd, {exec, pred}); break;
+    case 2: condition = fixture.Emit(ValueOpcode::LogicalAnd, {pred, exec}); break;
+    case 3: condition = fixture.Emit(ValueOpcode::LogicalAnd, {pred, pred2}); break;
+    case 4: condition = fixture.Emit(ValueOpcode::LogicalOr, {pred, exec}); break;
+    case 5: condition = fixture.Emit(ValueOpcode::LogicalOr, {exec, exec}); break;
+    case 6: condition = fixture.Emit(ValueOpcode::LogicalOr, {pred, pred2}); break;
+    case 7: {  // nested: And(pred, And(pred2, exec))
+      condition = fixture.Emit(ValueOpcode::LogicalAnd,
+                               {pred, fixture.Emit(ValueOpcode::LogicalAnd, {pred2, exec})});
+      break;
+    }
+    }
   }
   Value current = folded_fill
                       ? data
@@ -736,6 +753,25 @@ void TestPartialWaveReductionRejectsUnprovenPatterns() {
     BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu);
     Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 0,
           "compute reduction was rewritten");
+  }
+}
+
+void TestPartialWaveReductionCompoundFillCondition() {
+  // v = And(exec-bounded, pred) ? x : neutral is neutral for never-launched lanes: accepted.
+  for (const int shape : {1, 2, 5, 7}) {
+    Fixture fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu, true, 0xffffffffu, false, shape);
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 2,
+          "compound exec-bounded fill condition was rejected");
+  }
+  // Or needs both operands bounded; And of two unbounded terms proves nothing.
+  for (const int shape : {3, 4, 6}) {
+    Fixture fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu, true, 0xffffffffu, false, shape);
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 0,
+          "unproven compound fill condition was accepted");
   }
 }
 
@@ -942,6 +978,7 @@ int main() {
     TestPartialWaveReductionStructure();
     TestPartialWaveReductionFoldedFill();
     TestPartialWaveReductionRejectsUnprovenPatterns();
+    TestPartialWaveReductionCompoundFillCondition();
     TestPartialWaveReductionEquivalence();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();

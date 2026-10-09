@@ -1245,9 +1245,10 @@ bool RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto&       ucfg     = buffer.GetUserConfig();
 	const auto& hw       = buffer.GetRegisters();
 	const auto  mode     = hw.GetColorControl().mode;
-	// Metadata, copy and resolve modes act on the draw count on the CPU.
+	// Metadata, copy, resolve and depth or stencil clear draws act on the draw count on the CPU.
 	if (!graphics.draw_indirect_count_enabled || args.max_count == 0 || args.stride % 4 != 0 ||
 	    args.arguments % 4 != 0 || args.count_address % 4 != 0 || mode > 1 ||
+	    hw.GetRenderControl().depth_clear_enable || hw.GetRenderControl().stencil_clear_enable ||
 	    IsDepthStencilCopyDraw(hw) || !DrawHasValidVertexShader(buffer.GetShaders())) {
 		return false;
 	}

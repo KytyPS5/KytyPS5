@@ -16803,6 +16803,20 @@ public:
         Require("GpuIndirectDraw", "zero count keeps the CPU value", zero_count(5u) == 5,
                 "a draw that did not run lost the NUM_INSTANCES set on the CPU");
 
+        // A depth or stencil clear acts on the CPU, which knows whether a draw runs.
+        auto render_control = registers.GetRenderControl();
+        render_control.depth_clear_enable = true;
+        registers.SetRenderControl(render_control);
+        Require("GpuIndirectDraw", "depth clear stays on the CPU",
+                !RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                    {.arguments = arguments_base, .max_count = 1, .stride = 20,
+                     .indexed = true, .index_base = index_address, .index_type_and_size = 1,
+                     .index_buffer_size = 3},
+                    1u),
+                "a depth clear draw ran with a count the CPU cannot see");
+        render_control.depth_clear_enable = false;
+        registers.SetRenderControl(render_control);
+
         // Rewritten fetches keep the base vertex and first instance; the commands follow the
         // arguments and the count at their exact, unaligned addresses.
         {

@@ -12,25 +12,34 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderCacheFile.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
+#include "kytyShaderCacheVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <stop_token>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -71,15 +80,22 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+// Persistent caches belong to one code version, device and driver. The driver also checks its
+// own header; the prefix ties the data to the code that made it.
+std::string CacheSignature(std::string_view format, std::string_view version,
+                           const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
 	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	return fmt::format("{}:{}:{:08x}:{:08x}:{:08x}:{}\n", format, version, properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
+}
+
+std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+	return CacheSignature("KytyPC1", KYTY_GIT_REVISION, properties);
 }
 
 std::string PipelineCacheTitleId() {
@@ -286,14 +302,91 @@ struct PipelineCache::ProgramCache {
 		}
 	};
 
-	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
+	using ProgramMap = std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>;
 
+	// The recorded permutations of one source key. Workers compile queued jobs; the GPU thread
+	// takes a job when it first needs its key, waiting for it or compiling it itself.
+	struct Job {
+		enum class State { Dormant, Queued, Running, Done, Taken };
+
+		State                      state = State::Dormant;
+		ShaderCacheRecipes         recipes;
+		std::optional<SourceEntry> result;
+	};
+
+	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
+	static constexpr auto        PeriodicSaveInterval = std::chrono::seconds(60);
+
+	struct StageNames {
+		const char* label = nullptr;
+		const char* name  = nullptr;
+	};
+
+	static StageNames GetStageNames(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Vertex: return {"ShaderRecompiler VS", "vs"};
+			case ShaderType::Mesh: return {"ShaderRecompiler MS", "ms"};
+			case ShaderType::Local: return {"ShaderRecompiler LS", "ls"};
+			case ShaderType::TessellationControl: return {"ShaderRecompiler HS", "hs"};
+			case ShaderType::TessellationEvaluation: return {"ShaderRecompiler DS", "ds"};
+			case ShaderType::Pixel: return {"ShaderRecompiler PS", "ps"};
+			case ShaderType::Compute: return {"ShaderRecompiler CS", "cs"};
+			default: EXIT("invalid pipeline shader stage\n");
+		}
+		return {};
+	}
+
+	template <typename InputInfo>
+	static ShaderType GetStage(const InputInfo& input_info) {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			return input_info.logical_stage;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			return ShaderType::Pixel;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+			return ShaderType::Compute;
+		}
+	}
+
+	// The same options for a draw and for a recorded recipe; `input_info` must outlive them.
+	template <typename InputInfo>
+	static ShaderRecompiler::CompileOptions
+	MakeOptions(uint64_t hash, std::span<const uint32_t> user_data,
+	            std::span<const uint32_t> back_code, const InputInfo& input_info) {
+		const auto                       stage = GetStage(input_info);
+		ShaderRecompiler::CompileOptions options;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			options.input_info.vertex = &input_info;
+			options.user_data_base    = 8;
+			options.wave_size         = input_info.wave_size;
+			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
+				options.user_data_base = 0;
+				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+			}
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			options.input_info.pixel = &input_info;
+			options.wave_size        = input_info.wave_size;
+		} else {
+			options.input_info.compute = &input_info;
+			options.wave_size          = input_info.wave_size;
+		}
+		options.stage       = stage;
+		options.shader_hash = hash;
+		options.user_data   = user_data;
+		options.back_code   = back_code;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.early_dump  = options.dump_ir;
+		options.dump_label  = GetStageNames(stage).label;
+		return options;
+	}
+
+	// Safe on any thread: the GPU thread numbers the program when it adopts it.
 	Permutation CompilePermutation(const char*                                  stage_name,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> function_code) {
+	                               uint32_t                  push_data_start_dword,
+	                               std::span<const uint32_t> function_code) const {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
@@ -313,30 +406,24 @@ struct PipelineCache::ProgramCache {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id = 0, .module = module},
 		};
 	}
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
-		ShaderType stage;
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			stage = input_info.logical_stage;
-		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			stage = ShaderType::Pixel;
-		} else {
-			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-			stage = ShaderType::Compute;
-		}
-
+		const auto stage           = GetStage(input_info);
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
+		auto entry = programs.find(lookup_key);
+		if (entry == programs.end()) {
+			entry = Adopt(lookup_key);
+		}
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -362,46 +449,8 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		ShaderStageInputInfo stage_input {};
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			stage_input.vertex = &input_info;
-		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			stage_input.pixel = &input_info;
-		} else {
-			stage_input.compute = &input_info;
-		}
-		const char* label = nullptr;
-		const char* stage_name = nullptr;
-		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; stage_name = "vs"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; stage_name = "ms"; break;
-			case ShaderType::Local: label = "ShaderRecompiler LS"; stage_name = "ls"; break;
-			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; stage_name = "hs"; break;
-			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; stage_name = "ds"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; stage_name = "ps"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
-			default: EXIT("invalid pipeline shader stage\n");
-		}
-		ShaderRecompiler::CompileOptions options;
-		options.stage       = stage;
-		options.shader_hash = params.hash;
-		options.user_data   = user_data;
-		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.early_dump  = options.dump_ir;
-		options.dump_label  = label;
-		options.input_info  = stage_input;
-
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			options.user_data_base = 8;
-			options.wave_size = input_info.wave_size;
-			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
-				options.user_data_base = 0;
-				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
-			}
-		} else {
-			options.wave_size = input_info.wave_size;
-		}
+		const auto options    = MakeOptions(params.hash, user_data, params.back_code, input_info);
+		const auto stage_name = GetStageNames(stage).name;
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
@@ -436,9 +485,16 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
-		const auto& permutation = entry->second.permutations.back();
+		auto& permutation     = entry->second.permutations.back();
+		permutation.handle.id = ++next_shader_id;
+		// Only programs that compiled are recorded, so a cache never fails earlier than a draw.
+		Record(params, input_info, permutation.specialization, push_data_cursor);
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		{
+			std::lock_guard lock(job_mutex);
+			stats.compiled++;
+		}
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [key, source]: programs) {
@@ -456,28 +512,375 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// Moves the background result for `key` into the cache. Without one, marks the key so that a
+	// later prefetch does not compile it a second time.
+	ProgramMap::iterator Adopt(const ProgramKey& key) {
+		std::optional<SourceEntry> result;
+		{
+			std::unique_lock lock(job_mutex);
+			auto [iter, inserted] = jobs.try_emplace(key);
+			auto& job             = iter->second;
+			if (inserted) {
+				job.state = Job::State::Taken;
+				return programs.end();
+			}
+			switch (job.state) {
+				case Job::State::Taken: return programs.end();
+				case Job::State::Running: {
+					const auto begin = std::chrono::steady_clock::now();
+					WaitForJob(lock, job);
+					stats.waited++;
+					stats.waited_us +=
+					    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+					                              std::chrono::steady_clock::now() - begin)
+					                              .count());
+					result = std::move(job.result);
+					break;
+				}
+				case Job::State::Done: result = std::move(job.result); break;
+				case Job::State::Dormant:
+				case Job::State::Queued:
+					// Not started yet: compiling here is faster than waiting behind other jobs.
+					std::erase(queue, &job);
+					job.state = Job::State::Running;
+					lock.unlock();
+					result = CompileJob(job.recipes);
+					lock.lock();
+					stats.compiled += result ? result->permutations.size() : 0;
+					break;
+			}
+			job.state = Job::State::Taken;
+			job.result.reset();
+			job.recipes = {};
+		}
+		if (!result) {
+			return programs.end();
+		}
+		for (auto& permutation: result->permutations) {
+			permutation.handle.id = ++next_shader_id;
+		}
+		return programs.emplace(key, std::move(*result)).first;
+	}
+
+	void WaitForJob(std::unique_lock<std::mutex>& lock, const Job& job) {
+		job_done.wait(lock, [&job] { return job.state == Job::State::Done; });
+	}
+
+	template <typename InputInfo>
+	Permutation CompileRecipe(const ShaderCacheRecipe&                           recipe,
+	                          std::optional<ShaderRecompiler::IR::ResourcePlan>& plan) const {
+		InputInfo input_info;
+		std::memcpy(&input_info, recipe.input.data(), sizeof(input_info));
+		// Translation reads the user data count, not the values.
+		const std::vector<uint32_t> user_data(recipe.user_data_count, 0u);
+		const auto options    = MakeOptions(recipe.hash, user_data, recipe.back_code, input_info);
+		const auto stage_name = GetStageNames(recipe.stage).name;
+		DumpShaderOriginal(stage_name, recipe.hash, recipe.code);
+		auto translated = ShaderRecompiler::TranslateProgram(recipe.code, options);
+		if (!plan) {
+			plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+		}
+		return CompilePermutation(stage_name, options, std::move(translated), recipe.specialization,
+		                          recipe.push_data_start, {});
+	}
+
+	// Compiles every recipe of one source key; safe on any thread.
+	std::optional<SourceEntry> CompileJob(const ShaderCacheRecipes& recipes) const {
+		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+		std::vector<Permutation>                          permutations;
+		for (const auto& recipe: recipes) {
+			switch (recipe->stage) {
+				case ShaderType::Pixel:
+					permutations.push_back(CompileRecipe<ShaderPixelInputInfo>(*recipe, plan));
+					break;
+				case ShaderType::Compute:
+					permutations.push_back(CompileRecipe<ShaderComputeInputInfo>(*recipe, plan));
+					break;
+				default:
+					permutations.push_back(CompileRecipe<ShaderVertexInputInfo>(*recipe, plan));
+					break;
+			}
+		}
+		if (!plan) {
+			return std::nullopt;
+		}
+		std::optional<SourceEntry> entry;
+		entry.emplace(std::move(*plan), nullptr);
+		entry->permutations = std::move(permutations);
+		return entry;
+	}
+
+	// The key a recipe compiles to, or nothing for input that this build cannot use.
+	static std::optional<ProgramKey> RecipeKey(const ShaderCacheRecipe& recipe) {
+		ProgramKey key {
+		    .stage           = recipe.stage,
+		    .hash            = recipe.hash,
+		    .user_data_count = recipe.user_data_count,
+		    .code_size       = static_cast<uint32_t>(recipe.code.size()),
+		};
+		if (recipe.input.size() != ShaderCacheInputSize(recipe.stage)) {
+			return std::nullopt;
+		}
+		switch (recipe.stage) {
+			case ShaderType::Pixel: {
+				ShaderPixelInputInfo info;
+				std::memcpy(&info, recipe.input.data(), sizeof(info));
+				if (info.input_num > std::size(info.interpolator_settings)) {
+					return std::nullopt;
+				}
+				BuildStageStaticKey(info, key.static_state);
+				break;
+			}
+			case ShaderType::Compute: {
+				ShaderComputeInputInfo info;
+				std::memcpy(&info, recipe.input.data(), sizeof(info));
+				BuildStageStaticKey(info, key.static_state);
+				break;
+			}
+			default: {
+				ShaderVertexInputInfo info;
+				std::memcpy(&info, recipe.input.data(), sizeof(info));
+				if (info.logical_stage != recipe.stage || info.resources_num < 0 ||
+				    info.resources_num > ShaderVertexInputInfo::RES_MAX) {
+					return std::nullopt;
+				}
+				BuildStageStaticKey(info, key.static_state);
+				break;
+			}
+		}
+		return key;
+	}
+
+	template <typename InputInfo>
+	void Record(const ShaderParams& params, const InputInfo& input_info,
+	            const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	            uint32_t                                            push_data_start) {
+		if (cache_path.empty()) {
+			return;
+		}
+		auto recipe             = std::make_shared<ShaderCacheRecipe>();
+		recipe->stage           = GetStage(input_info);
+		recipe->user_data_count = params.user_data_count;
+		recipe->push_data_start = push_data_start;
+		recipe->hash            = params.hash;
+		recipe->code.assign(params.code.begin(), params.code.end());
+		recipe->back_code.assign(params.back_code.begin(), params.back_code.end());
+		auto input  = input_info;
+		input.stage = {};
+		recipe->input.resize(sizeof(input));
+		std::memcpy(recipe->input.data(), &input, sizeof(input));
+		recipe->specialization = specialization;
+		std::lock_guard lock(job_mutex);
+		recipes.push_back(std::move(recipe));
+		dirty = true;
+		if (std::chrono::steady_clock::now() - last_save > PeriodicSaveInterval) {
+			last_save      = std::chrono::steady_clock::now();
+			save_requested = true;
+			StartWorkers();
+			job_ready.notify_one();
+		}
+	}
+
+	void Load(const std::filesystem::path& path, std::string signature) {
+		cache_path      = path;
+		cache_signature = std::move(signature);
+		std::vector<uint8_t> data;
+		ShaderCacheRecipes   loaded;
+		size_t               parsed    = 0;
+		const auto           path_text = Common::PathToString(path);
+		if (ReadShaderCacheFile(path, data) &&
+		    !ParseShaderCache(data, cache_signature, loaded, &parsed)) {
+			PipelineCacheLog(
+			    "Shader cache: invalidating {} (graphics code, device or driver changed)",
+			    path_text);
+		}
+		{
+			std::lock_guard lock(job_mutex);
+			for (auto& recipe: loaded) {
+				auto key = RecipeKey(*recipe);
+				if (!key) {
+					continue;
+				}
+				auto& job     = jobs[std::move(*key)];
+				auto& trigger = triggers[XXH3_64bits(recipe->code.data(),
+				                                     recipe->code.size() * sizeof(uint32_t))];
+				if (std::ranges::find(trigger, &job) == trigger.end()) {
+					trigger.push_back(&job);
+				}
+				job.recipes.push_back(recipe);
+				recipes.push_back(std::move(recipe));
+			}
+			// The next save drops a damaged tail, unusable records or a stale file.
+			dirty     = parsed != data.size() || recipes.size() != loaded.size();
+			last_save = std::chrono::steady_clock::now();
+			PipelineCacheLog("Shader cache: {} recorded programs in {} sources from {}",
+			                 recipes.size(), jobs.size(), path_text);
+		}
+		ShaderSetMapObserver(
+		    [](void* user, uint64_t hash) {
+			    static_cast<ProgramCache*>(user)->OnShaderMapped(hash);
+		    },
+		    this);
+	}
+
+	// The game loaded a shader: compile its recorded programs before the first draw needs them.
+	void OnShaderMapped(uint64_t hash) {
+		std::lock_guard lock(job_mutex);
+		const auto      trigger = triggers.find(hash);
+		if (trigger == triggers.end()) {
+			return;
+		}
+		for (auto* job: trigger->second) {
+			if (job->state == Job::State::Dormant) {
+				job->state = Job::State::Queued;
+				queue.push_back(job);
+			}
+		}
+		triggers.erase(trigger);
+		StartWorkers();
+		job_ready.notify_all();
+	}
+
+	// Called with job_mutex held.
+	void StartWorkers() {
+		if (!workers.empty()) {
+			return;
+		}
+		const auto count = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 8u);
+		for (uint32_t i = 0; i < count; i++) {
+			workers.emplace_back([this](std::stop_token stop) { WorkerLoop(stop); });
+		}
+	}
+
+	void WorkerLoop(const std::stop_token& stop) {
+		std::unique_lock lock(job_mutex);
+		for (;;) {
+			job_ready.wait(lock, [this, &stop] {
+				return stop.stop_requested() || !queue.empty() || save_requested;
+			});
+			if (stop.stop_requested()) {
+				return;
+			}
+			if (save_requested) {
+				save_requested = false;
+				lock.unlock();
+				SaveRecipes();
+				lock.lock();
+				continue;
+			}
+			auto* job = queue.front();
+			queue.pop_front();
+			job->state = Job::State::Running;
+			running++;
+			lock.unlock();
+			auto result = CompileJob(job->recipes);
+			lock.lock();
+			stats.compiled_ahead += result ? result->permutations.size() : 0;
+			job->result = std::move(result);
+			job->state  = Job::State::Done;
+			running--;
+			job_done.notify_all();
+		}
+	}
+
+	void SaveRecipes() {
+		std::lock_guard    save_lock(save_mutex);
+		ShaderCacheRecipes snapshot;
+		{
+			std::lock_guard lock(job_mutex);
+			if (!dirty || cache_path.empty()) {
+				return;
+			}
+			snapshot = recipes;
+			dirty    = false;
+		}
+		const auto data = SerializeShaderCache(cache_signature, snapshot);
+		if (!WriteShaderCacheFile(cache_path, data)) {
+			std::lock_guard lock(job_mutex);
+			dirty = true;
+			PipelineCacheLog("Shader cache: failed to write {}", Common::PathToString(cache_path));
+			return;
+		}
+		PipelineCacheLog("Shader cache: saved {} recorded programs ({} bytes) to {}",
+		                 snapshot.size(), data.size(), Common::PathToString(cache_path));
+	}
+
+	void WaitForBackgroundCompilation() {
+		std::unique_lock lock(job_mutex);
+		job_done.wait(lock, [this] { return queue.empty() && running == 0; });
+	}
+
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
-		for (const auto& [key, entry]: programs) {
-			(void)key;
+		if (!cache_path.empty()) {
+			ShaderSetMapObserver(nullptr, nullptr);
+		}
+		{
+			std::lock_guard lock(job_mutex);
+			for (auto& worker: workers) {
+				worker.request_stop();
+			}
+		}
+		job_ready.notify_all();
+		workers.clear();
+		if (!cache_path.empty()) {
+			PipelineCacheLog("Shader cache: {} programs compiled when needed, {} compiled ahead, "
+			                 "{} waits ({} ms)",
+			                 stats.compiled, stats.compiled_ahead, stats.waited,
+			                 stats.waited_us / 1000u);
+		}
+		auto destroy = [this](const SourceEntry& entry) {
 			for (const auto& permutation: entry.permutations) {
 				device.destroyShaderModule(permutation.handle.module, nullptr);
+			}
+		};
+		for (const auto& [key, entry]: programs) {
+			destroy(entry);
+		}
+		for (const auto& [key, job]: jobs) {
+			if (job.result) {
+				destroy(*job.result);
 			}
 		}
 	}
 
-	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	ProgramMap                                                  programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+
+	// Shared with the workers and the shader map observer, under job_mutex.
+	std::mutex                                          job_mutex;
+	std::condition_variable                             job_done;
+	std::condition_variable                             job_ready;
+	std::unordered_map<ProgramKey, Job, ProgramKeyHash> jobs;
+	std::unordered_map<uint64_t, std::vector<Job*>>     triggers;
+	std::deque<Job*>                                    queue;
+	uint32_t                                            running = 0;
+	ShaderCacheRecipes                                  recipes;
+	bool                                                dirty          = false;
+	bool                                                save_requested = false;
+	std::chrono::steady_clock::time_point               last_save;
+	ProgramStats                                        stats;
+	std::mutex                                          save_mutex;
+	std::filesystem::path                               cache_path;
+	std::string                                         cache_signature;
+	// Declared last: destroyed first, before the state the workers use.
+	std::vector<std::jthread> workers;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	InitializeDriverCache();
+	InitializeCaches("_PipelineCache", PipelineCacheTitleId());
+}
+
+PipelineCache::PipelineCache(GraphicContext& graphics, const std::filesystem::path& directory,
+                             const std::string& title_id)
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+	InitializeCaches(directory, title_id);
 }
 
 PipelineCache::~PipelineCache() {
@@ -497,8 +900,8 @@ PipelineCache::~PipelineCache() {
 	}
 }
 
-void PipelineCache::InitializeDriverCache() {
-	const auto title_id = PipelineCacheTitleId();
+void PipelineCache::InitializeCaches(const std::filesystem::path& directory,
+                                     const std::string&           title_id) {
 	if (title_id.empty()) {
 		return;
 	}
@@ -506,6 +909,9 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
+	m_program_cache->Load(directory / (title_id + ".shaders.bin"),
+	                      CacheSignature("KytySC1", KYTY_GRAPHICS_CACHE_VERSION,
+	                                     m_graphics.GetPhysicalDeviceProperties()));
 	const std::string_view git_hash     = KYTY_GIT_HASH;
 	const std::string_view git_revision = KYTY_GIT_REVISION;
 	if (git_hash == "unknown" || git_revision == "unknown") {
@@ -516,8 +922,11 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
+	InitializeDriverCache(directory / (title_id + ".bin"));
+}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+void PipelineCache::InitializeDriverCache(const std::filesystem::path& cache_path) {
+	m_driver_cache_path     = cache_path;
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -584,6 +993,7 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
+	m_program_cache->SaveRecipes();
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -639,6 +1049,17 @@ void PipelineCache::Save() {
 	                 Common::PathToString(m_driver_cache_path));
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
+}
+
+PipelineCache::ProgramStats PipelineCache::GetProgramStats() const {
+	std::lock_guard lock(m_program_cache->job_mutex);
+	auto            stats = m_program_cache->stats;
+	stats.recorded        = m_program_cache->recipes.size();
+	return stats;
+}
+
+void PipelineCache::WaitForBackgroundCompilation() {
+	m_program_cache->WaitForBackgroundCompilation();
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(

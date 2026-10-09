@@ -5217,6 +5217,15 @@ public:
                   !cache.IsRegionCpuModified(base + idle_offset, buffer_size),
               "the first sweep did not upload every registered buffer");
 
+      // A page dirtied outside the log (the test takes the entry) shows whether a sweep
+      // visits a buffer without logged CPU writes: a full sweep would upload it.
+      constexpr uint32_t idle_value = 0xd0000003u;
+      CpuWrite(idle_offset + page, idle_value);
+      std::vector<GuestRange> taken;
+      Require(name, "idle write logged",
+              tracker.TakeCpuDirtyLog(taken) && !taken.empty(),
+              "the idle buffer write was not logged");
+
       // CPU writes to scattered pages, and a buffer registered over pages written while
       // no buffer covered them.
       for (size_t i = 0; i < written_offsets.size(); i++) {
@@ -5226,30 +5235,11 @@ public:
       std::memcpy(memory + late_offset + page, &late_value, sizeof(late_value));
       const auto late = cache.FindBuffer(base + late_offset, buffer_size);
 
-      // A region without CPU writes is not visited: its tracker lock stays held meanwhile.
-      std::binary_semaphore idle_locked{0};
-      std::binary_semaphore idle_release{0};
-      std::binary_semaphore sweep_done{0};
-      std::jthread holder([&] {
-        tracker.ForEachUploadRange(
-            base + idle_offset, page, true, [](uint64_t, uint64_t) noexcept {},
-            [&]() noexcept {
-              idle_locked.release();
-              idle_release.acquire();
-            });
-      });
-      idle_locked.acquire();
-      std::jthread sweeper([&] {
-        context.PrepareBda();
-        sweep_done.release();
-      });
-      const bool sweep_skipped_idle = sweep_done.try_acquire_for(std::chrono::seconds(5));
-      idle_release.release();
-      holder.join();
-      sweeper.join();
-      tracker.UnmarkRegionAsGpuModified(base + idle_offset, page);
-      Require(name, "idle region", sweep_skipped_idle,
-              "the sweep visited a region without CPU writes since the previous one");
+      context.PrepareBda();
+      Require(name, "idle buffer",
+              cache.IsRegionCpuModified(base + idle_offset + page, page) &&
+                  GpuWord(idle, idle_offset + page) == Initial(idle_offset + page),
+              "the sweep visited a buffer without CPU writes logged since the previous one");
       for (size_t i = 0; i < written_offsets.size(); i++) {
         const auto owner = written_offsets[i] < second_offset ? first : second;
         Require(name, "scattered CPU writes",

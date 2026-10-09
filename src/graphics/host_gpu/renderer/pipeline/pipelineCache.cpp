@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -24,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -368,6 +370,7 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		const auto compile_begin = std::chrono::steady_clock::now();
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
@@ -386,6 +389,20 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, source]: programs) {
 			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
 		}
+		const auto compile_us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(
+		        std::chrono::steady_clock::now() - compile_begin).count());
+		g_frame_stats.compiles.fetch_add(1, std::memory_order_relaxed);
+		g_frame_stats.compile_us.fetch_add(compile_us, std::memory_order_relaxed);
+		auto previous_max = g_frame_stats.compile_us_max.load(std::memory_order_relaxed);
+		while (compile_us > previous_max &&
+		       !g_frame_stats.compile_us_max.compare_exchange_weak(previous_max, compile_us)) {
+		}
+		// One line per compile: which guest shader, how many variants of it exist now, and how
+		// long this one took. A shader with dozens of variants is being re-specialized per draw.
+		std::printf("Compiled %s %016llx variant #%zu in %.1f ms\n", stage_name,
+		            static_cast<unsigned long long>(params.hash),
+		            entry->second.permutations.size(), static_cast<double>(compile_us) / 1000.0);
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
 		            counts[static_cast<size_t>(ShaderType::Vertex)],

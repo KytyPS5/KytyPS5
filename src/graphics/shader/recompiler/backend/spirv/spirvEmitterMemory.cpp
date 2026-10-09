@@ -121,8 +121,20 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	uint32_t stride_value = 0;
+	if (state.program.bindings.memory_stride_count != 0 && stride != 0u &&
+	    mem.kind == IR::ResourceKind::Buffer && mem.data_bits == 32u &&
+	    !mem.formatted && !mem.typed &&
+	    !state.program.info.buffers[mem.resource].atomic) {
+		const auto native = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers,
+		                                          mem.resource);
+		stride_value = EmitAndConstant(state, EmitShaderDataDwordLoad(state,
+		    state.program.bindings.memory_stride_dword + native), 0x3fffu);
+	} else {
+		stride_value = ConstantU32(state, stride);
+	}
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
+	                              stride_value,
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;

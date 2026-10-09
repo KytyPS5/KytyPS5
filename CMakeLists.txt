@@ -663,6 +663,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --videoout-vrr-status-only)
 	add_test(NAME shader_spirv_optimization
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-optimization-only)
+	add_test(NAME raw_buffer_stride_module
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --raw-buffer-stride-module-only)
+	set_tests_properties(raw_buffer_stride_module PROPERTIES TIMEOUT 30)
 	add_test(NAME pipeline_cache_identity
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
 	add_test(NAME pipeline_cache_checkpoint
@@ -706,6 +709,9 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME shader_performance_optimization_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --performance-optimization-readback-only)
+	add_test(NAME raw_buffer_runtime_stride
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --raw-buffer-runtime-stride-only)
+	set_tests_properties(raw_buffer_runtime_stride PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	set_tests_properties(shader_performance_optimization_readback PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	add_test(NAME compact_bounded_metadata
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compact-bounded-metadata-only)

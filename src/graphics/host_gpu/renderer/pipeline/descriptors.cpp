@@ -1313,6 +1313,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset, buffer_limit, program.stage, i));
 		pack_memory_offset(i, buffer_offset);
 		prepared.shader_data[layout.memory_limit_dword + i] = buffer_limit;
+		if (layout.memory_stride_count != 0) {
+			prepared.shader_data[layout.memory_stride_dword + i] =
+			    program.info.buffers[resource].packed_stride & 0x3fffu;
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

@@ -120,6 +120,27 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(buffers.size());
 	next.memory_limit_dword  = next.memory_offset_dword + (next.memory_offset_count + 3u) / 4u;
+	// Raw DWORD address arithmetic can consume the current stride without changing
+	// its instruction types. Keep zero-stride, typed and atomic specializations.
+	const auto positive_stride = [&](uint32_t resource) {
+		const auto& buffer = program.info.buffers[resource];
+		return !buffer.atomic && (buffer.packed_stride & 0x3fffu) != 0u;
+	};
+	const bool raw_dword = std::ranges::any_of(program.blocks, [&](const Block* block) {
+		return std::ranges::any_of(*block, [&](const Inst& inst) {
+			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None) return false;
+			const auto& memory = program.memory_info[inst.Flags<MemoryFlags>().index];
+			if (memory.kind != ResourceKind::Buffer || memory.data_bits != 32u ||
+			    memory.formatted || memory.typed || memory.planning_only) return false;
+			return memory.buffer_table == UINT32_MAX ? positive_stride(memory.resource)
+			    : std::ranges::any_of(program.info.buffer_tables[memory.buffer_table].resources,
+			                          positive_stride);
+		});
+	});
+	if (raw_dword) {
+		next.memory_stride_dword = next.memory_limit_dword + next.memory_offset_count;
+		next.memory_stride_count = next.memory_offset_count;
+	}
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 

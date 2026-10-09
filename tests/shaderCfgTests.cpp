@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -12921,6 +12922,42 @@ void TestBoundedBufferSharedAccessSpirv() {
         "formatted fallback lost the compatible group or incompatible candidate");
 }
 
+void TestRawBufferStrideModuleReuse() {
+  using namespace ShaderRecompiler;
+  using V = IR::Value;
+  using O = IR::ValueOpcode;
+  F64CertificateFixture f;
+  const auto index = f.UnknownU32();
+  auto& handle = f.block->AppendNewInst(O::GetBufferResource,
+      {V(0u), V(0u), V(0u), V(0u)});
+  handle.SetFlags<uint32_t>(0u);
+  f.program.memory_info.push_back({.kind = IR::ResourceKind::Buffer,
+                                  .resource = 0u, .data_bits = 32u});
+  auto& load = f.block->AppendNewInst(O::LoadBufferU32,
+      {V(&handle), index, V(0u), V(0u), V(true)});
+  load.SetFlags(IR::MemoryFlags{.index = 0u});
+  auto& store = f.block->AppendNewInst(O::StoreBufferU32,
+      {V(&handle), index, V(4u), V(0u), V(&load), V(true)});
+  store.SetFlags(IR::MemoryFlags{.index = 0u});
+  f.program.info.buffers.push_back({.packed_stride = 8u, .read = true, .written = true});
+  f.program.srt_plan_complete = f.program.resource_tracking_complete = true;
+  f.program.shader_info_complete = true;
+  IR::AllocateBindings(f.program, IR::PushData::NoStart);
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 32u;
+  compute.threads_num[1] = compute.threads_num[2] = 1u;
+  compute.wave_size = 32u;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  const auto stride8 = Spirv::EmitProgram(f.program, input, {}, f.host);
+  CheckSpirvBinaryValidates(stride8);
+  f.program.info.buffers[0].packed_stride = 48u;
+  const auto stride48 = Spirv::EmitProgram(f.program, input, {}, f.host);
+  CheckSpirvBinaryValidates(stride48);
+  Check(stride8 == stride48,
+        "raw ordinary stride changes produced different SPIR-V modules");
+}
+
 void TestSplitWave64IntegerReciprocalSeedSpirv() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
@@ -19487,6 +19524,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_SPIRV_OPTIMIZATION_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--raw-buffer-stride-module-only") == 0) {
+    Libs::Graphics::TestRawBufferStrideModuleReuse();
+    std::puts("KYTY_RAW_BUFFER_STRIDE_MODULE_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-pipeline-flags-only") == 0) {
     Libs::Graphics::TestCooperativePipelineDisablesDriverOptimization();
     std::puts("KYTY_COOPERATIVE_PIPELINE_FLAGS_PASS");
@@ -19954,6 +19996,7 @@ int main(int argc, char* argv[]) {
   TestF64CertificateReciprocalNonzeroProof();
   TestSplitWave64IntegerReciprocalSeedSpirv();
   Libs::Graphics::TestBoundedBufferSharedAccessSpirv();
+  Libs::Graphics::TestRawBufferStrideModuleReuse();
   Libs::Graphics::TestFormattedBackingByteBounds();
   TestF64CertificatePhiPredecessorProvenance();
   TestUnusedNativeF64EmissionHasCompleteRequirements();

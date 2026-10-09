@@ -99,6 +99,10 @@ void ValidateNativeProgram(const IR::Program& program) {
 	    program.bindings.memory_limit_dword !=
 	        program.bindings.memory_offset_dword +
 	            (program.bindings.memory_offset_count + 3u) / 4u ||
+	    (program.bindings.memory_stride_count != 0 &&
+	     (program.bindings.memory_stride_count != buffers.size() ||
+	      program.bindings.memory_stride_dword !=
+	          program.bindings.memory_limit_dword + program.bindings.memory_offset_count)) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||

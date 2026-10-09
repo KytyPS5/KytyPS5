@@ -1972,6 +1972,10 @@ CompiledShader CompileCase(const TestCase &test,
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
+    if (result.program.bindings.memory_stride_count != 0) {
+      packed_user_data[result.program.bindings.memory_stride_dword + i] =
+          result.program.info.buffers.at(resource).packed_stride & 0x3fffu;
+    }
   }
   const auto execution = ShaderRecompiler::PlanComputeExecution(
       result.program, options.input_info, workgroup_limits);
@@ -34169,6 +34173,35 @@ TestCase BoundedBufferZeroStrideCandidates(u32 variant) {
   return test;
 }
 
+TestCase RawBufferRuntimeStride(u32 stride, u32 wave = 32u, bool add_tid = false) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave == 64u ? (stride == 8u ? "RawBufferRuntimeStride8Wave64" : "RawBufferRuntimeStride48Wave64")
+      : add_tid ? (stride == 8u ? "RawBufferRuntimeStride8AddTid" : "RawBufferRuntimeStride48AddTid")
+      : (stride == 8u ? "RawBufferRuntimeStride8" : "RawBufferRuntimeStride48");
+  test.has_compute_info = test.has_user_data = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = 4u;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1u;
+  test.compute_info.wave_size = wave;
+  test.use_descriptor_buffer_ranges = true;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.user_data = MakeStructuredStorageBufferData(stride, 4u, add_tid);
+  test.initial.assign(stride + 16u, 0xdeadbeefu);
+  for (u32 row = 0; row < 4u; ++row) test.initial[row * stride / 4u] = 100u + row;
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < 4u; ++lane) {
+    const u32 row = add_tid ? 2u * lane : lane;
+    if (row < 4u) test.expected[row * stride / 4u + 1u] = 100u + row;
+  }
+  test.code = {EncodeMubuf0(0x0c, 0u, true, false), EncodeMubuf1(4u, 0u, 0u),
+               EncodeMubuf0(0x1c, 4u, true, false), EncodeMubuf1(4u, 0u, 0u)};
+  AppendEnd(&test.code);
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase TBufferCapturedZeroStrideOob(bool raw_bounds = false, bool scalar = false) {
   using O = ShaderOpcode;
   TestCase test;
@@ -43127,6 +43160,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXAddTidUsesLaneIndex);
   AddCase(BufferStoreFormatXDropsOutOfRangeRecord);
   AddCase(TBufferLoadVariants);
+  AddCase([] { return RawBufferRuntimeStride(8u); });
+  AddCase([] { return RawBufferRuntimeStride(48u); });
+  AddCase([] { return RawBufferRuntimeStride(8u, 64u); });
+  AddCase([] { return RawBufferRuntimeStride(48u, 64u); });
+  AddCase([] { return RawBufferRuntimeStride(8u, 32u, true); });
+  AddCase([] { return RawBufferRuntimeStride(48u, 32u, true); });
   AddCase([] { return TBufferCapturedZeroStrideOob(); });
   AddCase([] { return TBufferCapturedZeroStrideOob(true); });
   AddCase([] { return TBufferCapturedZeroStrideOob(false, true); });
@@ -49642,6 +49681,19 @@ if (argc == 1) {
       test.optimize_spirv=true;
       RunCase(&vulkan,test);
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--raw-buffer-runtime-stride-only") == 0) {
+    auto stride8 = RawBufferRuntimeStride(8u);
+    auto stride48 = RawBufferRuntimeStride(48u);
+    const auto first = CompileCase(stride8);
+    const auto second = CompileCase(stride48);
+    Require("RawBufferRuntimeStride", "module reuse", first.spirv == second.spirv,
+            "only the raw stride changed, but the shader module changed");
+    VulkanHarness vulkan;
+    for (auto test : {stride8, stride48, RawBufferRuntimeStride(8u, 64u),
+                     RawBufferRuntimeStride(48u, 64u), RawBufferRuntimeStride(8u, 32u, true),
+                     RawBufferRuntimeStride(48u, 32u, true)}) RunCase(&vulkan, test);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--compact-bounded-metadata-only") == 0) {

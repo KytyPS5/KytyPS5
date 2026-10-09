@@ -24,9 +24,10 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
-	// Writes data to the backing of a range no watcher protects, or returns false. A watcher
-	// registering meanwhile waits for the store: a cache reads the stored bytes or sees the
-	// store fail. The range covers at most two pages.
+	// Writes data to the backing of a range no watcher protects. False, with nothing written, when
+	// a watcher protects it or it has no backing alias. A watcher registering meanwhile waits for
+	// the store: a cache reads the stored bytes or sees the store fail. The range covers at most
+	// two pages.
 	[[nodiscard]] bool StoreUnwatched(uint64_t vaddr, uint64_t size, const void* data);
 
 private:

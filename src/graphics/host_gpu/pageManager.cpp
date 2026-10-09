@@ -303,8 +303,8 @@ struct PageManager::Impl {
 				return false;
 			}
 		}
-		Libs::LibKernel::Memory::WriteBacking(vaddr, data, size);
-		return true;
+		// Private memory (program data, stacks) has no backing alias to write through.
+		return Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size);
 	}
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;

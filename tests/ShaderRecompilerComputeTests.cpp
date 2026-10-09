@@ -3354,6 +3354,34 @@ public:
       Require("GpuCommandLane", "timestamp before later completions",
               queued_after != 0 && queued_after == read_clock(ordered_clock),
               "a completion queued after a timestamp ran before its value was stored");
+
+      // Program data and stacks are GPU-visible without a backing alias: their values go
+      // through the GPU thread like a watched page.
+      LibKernel::Memory::InstallGpuResources(&context);
+      const auto program_clock = LibKernel::Memory::AllocateProgramMemory(
+          0x0000000200a00000ull, clock_size, Common::VirtualMemory::Mode::ReadWrite,
+          "gpu_clock_program_data");
+      if (program_clock != 0) {
+        gpu.SendCommandSync([&] {
+          processor->BufferInit();
+          auto timestamp = make_release_mem(
+              3, 0, reinterpret_cast<void *>(program_clock + 8), 0, 0x14u, 0);
+          Pm4Execution timestamp_execution;
+          (void)processor->Process(timestamp_execution, timestamp);
+          gpu_scheduler.Finish();
+          gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+        });
+        gpu.WaitForIdle();
+      }
+      const auto program_value = program_clock != 0 ? read_clock(program_clock + 8) : 0;
+      const bool program_released =
+          program_clock != 0 &&
+          Libs::LibKernel::Memory::KernelMunmap(program_clock, clock_size) == 0;
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      Require("GpuCommandLane", "timestamp to program data",
+              program_released && program_value + clock_tolerance >= batch_before &&
+                  program_value <= Sync::ReadReferenceClock() + clock_tolerance,
+              "a timestamp to memory without a backing alias was lost");
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&

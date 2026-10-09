@@ -215,6 +215,8 @@ std::vector<ProtectionCall> g_protection_log;
 std::mutex g_protection_log_mutex;
 // Called once by the next backing write, before it is applied.
 std::function<void()> g_before_next_backing_write;
+// Private memory (program data, stacks) has no backing alias.
+bool g_backing_available = true;
 
 void ResetProtectionLog() {
   g_protection_calls = 0;
@@ -979,6 +981,22 @@ void TestStoreUnwatchedExcludesRegistration() {
   Check(crossing, "a store across two unwatched pages failed");
 }
 
+void TestStoreUnwatchedWithoutBacking() {
+  PageManager page_manager;
+  auto *memory = Allocate(page_manager, 1);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  std::memset(memory, 0, 16);
+  const uint64_t value = 0x1122334455667788ull;
+  g_backing_available = false;
+  const bool refused = !page_manager.StoreUnwatched(base + 8, sizeof(value), &value);
+  g_backing_available = true;
+  uint64_t stored = 0;
+  std::memcpy(&stored, memory + 8, sizeof(stored));
+  Release(memory);
+  Check(refused && stored == 0,
+        "a completion store to memory without a backing alias did not fall back");
+}
+
 void TestGpuUnmarkUsesRegionMask() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1242,7 +1260,10 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
-void WriteBacking(uint64_t vaddr, const void *data, uint64_t size) noexcept {
+bool TryWriteBacking(uint64_t vaddr, const void *data, uint64_t size) {
+  if (!g_backing_available) {
+    return false;
+  }
   std::function<void()> before;
   {
     std::lock_guard lock(g_protection_log_mutex);
@@ -1252,6 +1273,7 @@ void WriteBacking(uint64_t vaddr, const void *data, uint64_t size) noexcept {
     before();
   }
   std::memcpy(reinterpret_cast<void *>(vaddr), data, size);
+  return true;
 }
 
 } // namespace Libs::LibKernel::Memory
@@ -1280,6 +1302,7 @@ int main(int argc, char **argv) {
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
   TestStoreUnwatchedExcludesRegistration();
+  TestStoreUnwatchedWithoutBacking();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();

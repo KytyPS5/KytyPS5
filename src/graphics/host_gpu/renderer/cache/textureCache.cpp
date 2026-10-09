@@ -18,9 +18,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -1595,15 +1598,36 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	auto& image = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
-	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
-	const auto layers = image.info.IsVolume()
-	                        ? std::max(image.info.extent.depth >> range.baseMipLevel, 1u)
-	                        : image.backing.layers;
-	EXIT_IF(command.IsInvalid() || image.depth_id || !range.aspectMask || range.levelCount == 0 ||
-	        range.levelCount > image.info.resources.levels - range.baseMipLevel ||
-	        range.layerCount == 0 || range.baseArrayLayer >= layers ||
-	        range.layerCount > layers - range.baseArrayLayer ||
-	        (range.aspectMask & aspects) != range.aspectMask);
+	EXIT_IF(command.IsInvalid() || image.depth_id);
+	// The base mip is validated before it is used as a shift or subtracted from the level count.
+	const bool base_mip_valid = range.baseMipLevel < image.info.resources.levels;
+	const auto layers         = image.info.IsVolume() && base_mip_valid
+	                                ? std::max(image.info.extent.depth >> range.baseMipLevel, 1u)
+	                                : image.backing.layers;
+	if (!base_mip_valid || !range.aspectMask || range.levelCount == 0 ||
+	    range.levelCount > image.info.resources.levels - range.baseMipLevel ||
+	    range.layerCount == 0 || range.baseArrayLayer >= layers ||
+	    range.layerCount > layers - range.baseArrayLayer ||
+	    (range.aspectMask & aspects) != range.aspectMask) {
+		// Skip a clear outside the image instead of aborting; log the first ones for diagnosis.
+		static std::atomic<uint32_t> logged_skips {0};
+		if (logged_skips.fetch_add(1, std::memory_order_relaxed) < 32) {
+			const auto message = fmt::format(
+			    "TextureCache: skipped out-of-range clear: aspect=0x{:x}/0x{:x} levels={}+{}/{} "
+			    "layers={}+{}/{} backing_layers={} volume={} depth={} stencil={} format={} "
+			    "extent={}x{}x{} samples={} addr=0x{:x} size=0x{:x}\n",
+			    static_cast<uint32_t>(range.aspectMask), static_cast<uint32_t>(aspects),
+			    range.baseMipLevel, range.levelCount, image.info.resources.levels,
+			    range.baseArrayLayer, range.layerCount, layers, image.backing.layers,
+			    image.info.IsVolume(), image.info.IsDepth(), image.info.HasStencil(),
+			    static_cast<int>(image.backing.format), image.info.extent.width,
+			    image.info.extent.height, image.info.extent.depth, image.info.samples,
+			    image.info.data.address, image.info.data.size);
+			LOGF_COLOR(Log::Color::BrightYellow, "%s", message.c_str());
+			std::fputs(message.c_str(), stderr);
+		}
+		return;
+	}
 	const bool full_subresources = range.baseMipLevel == 0 &&
 	                               range.levelCount == image.info.resources.levels &&
 	                               range.baseArrayLayer == 0 && range.layerCount == layers;

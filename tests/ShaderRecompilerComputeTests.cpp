@@ -18369,7 +18369,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
-  bool m_calibrated_timestamps = false;
+  PFN_vkGetCalibratedTimestampsKHR m_calibrated_timestamps = nullptr;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -18403,7 +18403,7 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
-    m_runtime_context.calibrated_timestamps_enabled = m_calibrated_timestamps;
+    m_runtime_context.get_calibrated_timestamps = m_calibrated_timestamps;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
@@ -18687,6 +18687,7 @@ private:
     // GPU clock writes use the main calibration path when the device provides it.
     const auto available_extensions =
         m_physical_device.enumerateDeviceExtensionProperties().value;
+    const char *calibrated_timestamps = nullptr;
     for (const char *name : {VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
                              VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME}) {
       if (std::any_of(available_extensions.begin(), available_extensions.end(),
@@ -18694,7 +18695,7 @@ private:
                         return std::strcmp(extension.extensionName, name) == 0;
                       })) {
         device_extensions.push_back(name);
-        m_calibrated_timestamps = true;
+        calibrated_timestamps = name;
         break;
       }
     }
@@ -18714,6 +18715,13 @@ private:
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
+    if (calibrated_timestamps != nullptr) {
+      m_calibrated_timestamps =
+          std::strcmp(calibrated_timestamps,
+                      VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0
+              ? VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsKHR
+              : VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsEXT;
+    }
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
     vk::CommandPoolCreateInfo pool_info{};

@@ -243,7 +243,9 @@ void TestSrtAliasesRetainReadPolicy() {
   program.descriptor_sources.push_back({.dwords = {Value(&first), Value(0u)},
                                        .dword_count = 2});
   DescriptorSource indirect;
-  indirect.indirect_descriptor.emplace().sources = {0, 1};
+  DescriptorSource::IndirectDescriptor desc;
+  desc.sources = {0, 1};
+  indirect.indirect_descriptor.emplace(std::move(desc));
   program.descriptor_sources.push_back(indirect);
   auto plan = ExtractResourcePlan(program);
   for (const auto &inst : plan.value_storage) {

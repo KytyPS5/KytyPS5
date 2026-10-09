@@ -23,9 +23,11 @@
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -315,9 +317,63 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 }
 
+namespace {
+
+// KYTY_ALIAS_WRITEBACK=1 enables the aliased-image writeback/upload experiment. Off by default.
+bool AliasWritebackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ALIAS_WRITEBACK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+enum class AliasAction : int { Writeback, ForcedUpload, DepthInitFromGuest };
+
+// One NHL27ALIAS line per (action, address); 5000 lines in total.
+void AliasLogOnce(AliasAction action, uint64_t address, uint64_t size, const char* detail) {
+	static constexpr uint32_t MaxLines = 5000;
+	static std::mutex mutex;
+	static std::set<std::pair<int, uint64_t>> seen;
+	static uint32_t lines = 0;
+	std::lock_guard lock(mutex);
+	if (lines >= MaxLines || !seen.insert({static_cast<int>(action), address}).second) {
+		return;
+	}
+	lines++;
+	static const char* const names[] = {"writeback", "forced_upload", "depth_init_from_guest"};
+	std::printf("NHL27ALIAS: %s addr=0x%llx size=0x%llx %s\n", names[static_cast<int>(action)],
+	            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+	            detail);
+}
+
+} // namespace
+
+bool TextureCache::WriteBackAliasedImage(ImageId id) {
+	// The guest copy must be current before any later upload reads it, so wait for the download
+	// and for the deferred guest write-back. Not possible outside an active scheduler.
+	if (!m_scheduler.Active() || CommandScheduler::InDeferredOperation()) {
+		return false;
+	}
+	const auto& image = m_slot_images[id];
+	const auto  address = image.info.data.address;
+	const auto  size    = image.info.data.size;
+	const auto  format  = vk::to_string(image.backing.format);
+	if (!DownloadImageMemory(id)) {
+		return false;
+	}
+	m_scheduler.Finish();
+	m_scheduler.DrainPriorityOperations();
+	AliasLogOnce(AliasAction::Writeback, address, size, format.c_str());
+	return true;
+}
+
 void TextureCache::FreeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
+		if (AliasWritebackEnabled()) {
+			(void)WriteBackAliasedImage(id);
+		}
 		if (DepthAliasLog::Enabled() &&
 		    DepthAliasLog::Want(image.info.data.address, image.info.data.size) &&
 		    DepthAliasLog::TakeLine()) {
@@ -798,7 +854,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
 		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
-		if (copy_supported) {
+		if (copy_supported && AliasWritebackEnabled() && !cached.IsGpuModified()) {
+			// Experiment: the old image was never GPU-written, so its contents are not
+			// authoritative. Populate the replacement from guest memory instead of copying.
+			copy_path = "guest_upload";
+			replacement.MarkBufferModified();
+			AliasLogOnce(AliasAction::DepthInitFromGuest, cached.info.data.address,
+			             cached.info.data.size, vk::to_string(requested.pixel_format).c_str());
+		} else if (copy_supported) {
 			copy_path = "CopyImage";
 			CopyImage(replacement_id, cached_id);
 		} else {
@@ -1438,6 +1501,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
+			} else if (AliasWritebackEnabled()) {
+				// Experiment: a fresh image must not stay uninitialized; upload guest memory.
+				inserted.MarkBufferModified();
+				AliasLogOnce(AliasAction::ForcedUpload, inserted.info.data.address,
+				             inserted.info.data.size, vk::to_string(desc.info.pixel_format).c_str());
 			} else if (desc.type == BindingType::Texture && DepthAliasLog::Enabled() &&
 			           DepthAliasLog::Want(inserted.info.data.address, inserted.info.data.size) &&
 			           DepthAliasLog::TakeLine()) {

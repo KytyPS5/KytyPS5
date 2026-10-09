@@ -162,6 +162,8 @@ private:
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// KYTY_ALIAS_WRITEBACK experiment: synchronous download to guest memory before a free.
+	[[nodiscard]] bool WriteBackAliasedImage(ImageId id);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

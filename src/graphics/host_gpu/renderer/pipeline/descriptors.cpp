@@ -792,6 +792,16 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
+	if (sampler.gather_lod &&
+	    static_cast<Prospero::SamplerMipFilter>(descriptor.MipFilter()) !=
+	        Prospero::SamplerMipFilter::kNone) {
+		// GatherMip selects the guest mip explicitly using a per-level image view. Vulkan
+		// gather operations require point mip selection and zero LOD bias, so normalize
+		// only the host sampler copy; the shader snapshot retains the guest state.
+		descriptor.fields[2] &= ~((0x3u << 26u) | 0xfffffu);
+		descriptor.fields[2] |=
+		    static_cast<uint32_t>(Prospero::SamplerMipFilter::kPoint) << 26u;
+	}
 	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
 }
 

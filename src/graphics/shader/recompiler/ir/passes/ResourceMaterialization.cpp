@@ -1252,16 +1252,6 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
 			return MaterializeFail(__LINE__, program);
 		}
-		if (program.info.samplers[i].gather_lod) {
-			const auto control = snapshot.samplers[i].dwords[2];
-			const auto filter = (control >> 26u) & 3u;
-			// MipNone always selects the base level. Explicit point gathers currently require
-			// encoded-zero primary and secondary bias; linear primary-mip selection is unsupported.
-			if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
-				return SpecializationFail(
-				    "explicit-LOD gather requires mip filtering None or Point with zero LOD biases");
-			}
-		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);

@@ -706,6 +706,45 @@ void TestBackingReadExcludesWritesAndUnmap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestTrackerProtectionDuringBackingRead() {
+	using namespace Libs::LibKernel::Memory;
+	using Mode                  = Common::VirtualMemory::Mode;
+	const char*        test     = "TrackerProtectionDuringBackingRead";
+	constexpr uint64_t original = 0x123456789abcdef0ull;
+	const auto         base     = MapNamedFlexible(test, SceKernelPageSize * 2, SceKernelProtCpuRw,
+	                                               "tracker_protection_during_read");
+	std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
+	std::counting_semaphore<2> entered {0};
+	std::counting_semaphore<2> resume {0};
+	g_backing_reads_entered  = &entered;
+	g_continue_backing_reads = &resume;
+	TestSetBackingReadCallback(ParkBackingRead);
+	uint64_t    value   = 0;
+	bool        read_ok = false;
+	std::thread reader([&] { read_ok = TryReadSparseBacking(base, &value, sizeof(value)); });
+	const bool  reader_parked = entered.try_acquire_for(std::chrono::seconds(5));
+	// The GPU thread protects tracked pages while guest threads read guest memory.
+	std::binary_semaphore protected_page {0};
+	bool                  protect_ok = false;
+	std::thread           tracker([&] {
+		protect_ok = ProtectGuestHostMemory(base + SceKernelPageSize, SceKernelPageSize, Mode::Read);
+		protected_page.release();
+	});
+	const bool concurrent = protected_page.try_acquire_for(std::chrono::seconds(5));
+	resume.release();
+	reader.join();
+	tracker.join();
+	TestSetBackingReadCallback(nullptr);
+	const bool restored =
+	    ProtectGuestHostMemory(base + SceKernelPageSize, SceKernelPageSize, Mode::ReadWrite);
+	CheckOk(test, KernelMunmap(base, SceKernelPageSize * 2), "KernelMunmap");
+	Check(test, reader_parked && concurrent,
+	      "tracker protection waited for a backing read to finish");
+	Check(test, read_ok && value == original && protect_ok && restored,
+	      "backing read or tracker protection failed");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -4419,6 +4458,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
+		RunTest(TestTrackerProtectionDuringBackingRead);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestSparseReadDuringDirectCommit);
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
@@ -4476,6 +4516,7 @@ int main(int argc, char** argv) {
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
+	RunTest(TestTrackerProtectionDuringBackingRead);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);

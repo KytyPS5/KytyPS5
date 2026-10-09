@@ -33677,7 +33677,10 @@ TestCase DsOrderedCountFollowsWaveLaunchOrder() {
   test.initial.assign(waves * 2u, 0xdeadbeefu);
   test.gds_initial.assign(
       ShaderRecompiler::IR::OrderedAppendReleaseCounter + 1u, 0);
-  test.expected_gds = {waves};
+  // Every wave adds one at address 0 and releases its slot once.
+  test.expected_gds = test.gds_initial;
+  test.expected_gds[0] = waves;
+  test.expected_gds[ShaderRecompiler::IR::OrderedAppendReleaseCounter] = waves;
   test.dispatch_x = waves;
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
@@ -33733,7 +33736,10 @@ TestCase DsOrderedCountRanksPastElevenBits() {
   test.initial.assign(waves * 2u, 0xdeadbeefu);
   test.gds_initial.assign(
       ShaderRecompiler::IR::OrderedAppendReleaseCounter + 1u, 0);
-  test.expected_gds = {waves};
+  // Every wave adds one at address 0 and releases its slot once.
+  test.expected_gds = test.gds_initial;
+  test.expected_gds[0] = waves;
+  test.expected_gds[ShaderRecompiler::IR::OrderedAppendReleaseCounter] = waves;
   test.dispatch_x = waves;
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;

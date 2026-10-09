@@ -1032,11 +1032,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 		for (const auto [address, size]: reads) {
-			{
-				for (const auto written: image_writes) {
-					if (ImageRangeOverlaps(address, size, written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
-					}
+			for (const auto written: image_writes) {
+				if (ImageRangeOverlaps(address, size, written.address, written.size)) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
 				}
 			}
 			for (const auto* writer: prepared_bindings) {

@@ -143,7 +143,10 @@ static void StartCapture() {
 	const auto capture_id   = std::chrono::duration_cast<std::chrono::microseconds>(
 	                              std::chrono::system_clock::now().time_since_epoch())
 	                              .count();
-	const auto capture_path = "_RenderDoc/kyty_" + std::to_string(capture_id);
+	const char* capture_dir = std::getenv("KYTY_RENDERDOC_DIR");
+	const auto  capture_path =
+	    std::string(capture_dir != nullptr && capture_dir[0] != '\0' ? capture_dir : "_RenderDoc") +
+	    "/kyty_" + std::to_string(capture_id);
 	g_api->SetCaptureFilePathTemplate(capture_path.c_str());
 	g_api->StartFrameCapture(nullptr, nullptr);
 	if (g_api->IsFrameCapturing() == 0) {

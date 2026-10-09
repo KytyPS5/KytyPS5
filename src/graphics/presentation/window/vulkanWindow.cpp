@@ -76,6 +76,29 @@ vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noe
 	return features;
 }
 
+// RenderDoc compatibility: KYTY_RENDERDOC_COMPAT=1 forces it on, =0 forces off; otherwise it is
+// auto-enabled when RenderDoc's Vulkan layer is requested for this process.
+// KYTY_RDC_SKIP_EXT (comma list of extension names) overrides the default skip list.
+static bool RenderDocCompat() {
+	static const bool v = [] {
+		const char* e = std::getenv("KYTY_RENDERDOC_COMPAT");
+		if (e != nullptr && e[0] != '\0') return e[0] != '0';
+		const char* l = std::getenv("VK_INSTANCE_LAYERS");
+		return (l != nullptr && std::strstr(l, "RENDERDOC") != nullptr) ||
+		       std::getenv("ENABLE_VULKAN_RENDERDOC_CAPTURE") != nullptr;
+	}();
+	return v;
+}
+
+static bool RenderDocSkipsExtension(const char* name) {
+	if (!RenderDocCompat()) return false;
+	const char* list = std::getenv("KYTY_RDC_SKIP_EXT");
+	if (list == nullptr) {
+		list = "VK_AMD_buffer_marker,VK_EXT_device_fault";
+	}
+	return std::strstr(list, name) != nullptr;
+}
+
 static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions, const char* name) {
 	return std::any_of(extensions.begin(), extensions.end(),
 	                   [name](const auto& ext) { return strcmp(ext.extensionName, name) == 0; });
@@ -1057,6 +1080,10 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 	                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
 	                             VK_AMD_BUFFER_MARKER_EXTENSION_NAME}) {
+			if (RenderDocSkipsExtension(extension)) {
+				LOGF("RenderDoc compat: skipping %s\n", extension);
+				continue;
+			}
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

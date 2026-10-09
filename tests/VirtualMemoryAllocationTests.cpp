@@ -4108,6 +4108,124 @@ void TestReciprocalSquareRootBesideJumpTables() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// An indirect jump through a value from outside the function is a tail call only if no label of
+// the function has its address taken: here a later call resumes at a stored label that a
+// borrowed-bytes patch would cover.
+void TestReciprocalSquareRootBesideAddressTakenLabels() {
+	const char* test = "ReciprocalSquareRootBesideAddressTakenLabels";
+	constexpr uint64_t module_size = 0x4000;
+	constexpr uint64_t segment_size = 0x1000;
+	constexpr uint64_t allocation_size = module_size * 2;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+			0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_label_test");
+	Check(test, mapping != 0, "failed to allocate address-taken label test code");
+	InstructionTestScope restore {mapping, allocation_size};
+	restore.InstallHandler(test);
+	using GuestFunction = void(KYTY_SYSV_ABI*)(uint64_t*, const uint32_t*, uint32_t*);
+	using StoreFunction = void(KYTY_SYSV_ABI*)(uint64_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const auto other_function = mapping + 0x800;
+	const auto external_target = mapping + segment_size;
+	const std::array<uintptr_t, 2> function_starts {mapping, other_function};
+	auto* relocated_slot = reinterpret_cast<uint64_t*>(mapping + 0x3000);
+	enum class Source { NotTaken, LeaInFunction, LeaInFunctionMemoryJump, EntryOffset, LeaInOtherFunction, Relocation };
+	struct Variant {
+		Source source;
+		const char* name;
+	};
+	const std::array<Variant, 6> variants {{
+			{Source::NotTaken, "no label address taken"},
+			{Source::LeaInFunction, "lea in the function"},
+			{Source::LeaInFunctionMemoryJump, "lea in the function, jump through memory"},
+			{Source::EntryOffset, "offset from the function entry"},
+			{Source::LeaInOtherFunction, "lea in another function"},
+			{Source::Relocation, "relocated pointer"},
+	}};
+	for (const auto& variant: variants) {
+		const auto source = variant.source;
+		const std::string context = std::string(" (") + variant.name + ")";
+		std::memset(reinterpret_cast<void*>(mapping), 0xcc, module_size);
+		*reinterpret_cast<uint8_t*>(external_target) = 0xc3; // ret
+		Xbyak::CodeGenerator code(segment_size, reinterpret_cast<void*>(mapping));
+		Xbyak::Label start;
+		Xbyak::Label resume;
+		// A resumable function: a saved state is a label to continue at, as a protothread does.
+		if (source == Source::LeaInFunctionMemoryJump) {
+			code.cmp(code.qword[code.rdi], 0);
+			code.je(start, Xbyak::CodeGenerator::T_NEAR);
+			code.jmp(code.ptr[code.rdi]);
+		} else {
+			code.mov(code.rax, code.qword[code.rdi]);
+			code.test(code.rax, code.rax);
+			code.jz(start, Xbyak::CodeGenerator::T_NEAR);
+			code.jmp(code.rax);
+		}
+		code.L(start);
+		if (source == Source::LeaInFunction || source == Source::LeaInFunctionMemoryJump) {
+			code.lea(code.rcx, code.ptr[code.rip + resume]);
+			code.mov(code.qword[code.rdi], code.rcx);
+		}
+		code.vmovups(code.xmm1, code.ptr[code.rsi]);
+		code.vrsqrtps(code.xmm0, code.xmm1);
+		code.L(resume);
+		code.inc(code.dword[code.rdx + 16]);
+		code.vmovups(code.ptr[code.rdx], code.xmm0);
+		if (source == Source::EntryOffset) {
+			// The entry is the base of label offsets.
+			const auto offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(resume.getAddress()) - mapping);
+			code.lea(code.rcx, code.ptr[code.rip + reinterpret_cast<const void*>(mapping)]);
+			code.add(code.rcx, offset);
+			code.mov(code.qword[code.rdi], code.rcx);
+		}
+		code.ret();
+		Check(test, code.getSize() < other_function - mapping, "address-taken label fixture is too large" + context);
+		code.setSize(other_function - mapping);
+		if (source == Source::LeaInOtherFunction) {
+			code.lea(code.rax, code.ptr[code.rip + resume]);
+			code.mov(code.qword[code.rdi], code.rax);
+		}
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate address-taken label fixture" + context);
+		const auto resume_address = reinterpret_cast<uint64_t>(resume.getAddress());
+		*relocated_slot = resume_address;
+		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), module_size,
+																								reinterpret_cast<void*>(mapping + module_size), module_size);
+		if (source == Source::Relocation) {
+			const std::array<uint64_t, 1> relocated {resume_address};
+			Loader::RegisterGuestInstructionPatchCodeAddresses(reinterpret_cast<void*>(mapping), relocated);
+		}
+		const auto result = Loader::PatchGuestInstructions(mapping, segment_size, function_starts, false, true);
+		const bool taken = source != Source::NotTaken;
+		Check(test, Xbyak::GetError() == 0 && result.reciprocal_sqrt.found == 1 &&
+										result.reciprocal_sqrt.native == (taken ? 0u : 1u) &&
+										result.reciprocal_sqrt.trapped == (taken ? 1u : 0u),
+					(taken ? "a jump that can reach a taken label let the patcher borrow bytes over it"
+								 : "a tail call with no label address taken kept VRSQRTPS on the trap path") +
+							context);
+		const std::array<uint32_t, 4> input {0x40800000, 0x3f800000, 0x41800000, 0x3e800000};
+		const std::array<uint32_t, 4> roots {0x3f000000, 0x3f800000, 0x3e800000, 0x40000000};
+		uint64_t state = 0;
+		std::array<uint32_t, 5> output {};
+		auto traps_before = g_instruction_traps;
+		function(&state, input.data(), output.data());
+		Check(test, std::equal(roots.begin(), roots.end(), output.begin()) && output[4] == 1 &&
+										static_cast<uint64_t>(g_instruction_traps - traps_before) == (taken ? 1u : 0u),
+					"first call lost exact results or its patch" + context);
+		switch (source) {
+			case Source::NotTaken: state = external_target; break;
+			case Source::LeaInOtherFunction: reinterpret_cast<StoreFunction>(other_function)(&state); break;
+			case Source::Relocation: state = *relocated_slot; break;
+			default: break;
+		}
+		Check(test, state == (taken ? resume_address : external_target), "resume state was not stored" + context);
+		traps_before = g_instruction_traps;
+		function(&state, input.data(), output.data());
+		Check(test, output[4] == (taken ? 2u : 1u) && g_instruction_traps == traps_before,
+					"resuming at the stored label did not continue after it" + context);
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 // The red-zone liveness analysis must follow resolved jump-table edges: here the red zone is
 // read only in a case, so it is live across the table load before the dispatch.
 void TestRedZoneLivenessAcrossJumpTables() {
@@ -4872,6 +4990,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
 		RunTest(TestReciprocalSquareRootBesideJumpTables);
+		RunTest(TestReciprocalSquareRootBesideAddressTakenLabels);
 		RunTest(TestRedZoneLivenessAcrossJumpTables);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
@@ -4887,6 +5006,7 @@ int main(int argc, char** argv) {
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
 	RunTest(TestReciprocalSquareRootBesideJumpTables);
+	RunTest(TestReciprocalSquareRootBesideAddressTakenLabels);
 	RunTest(TestRedZoneLivenessAcrossJumpTables);
 	RunTest(TestPackedBitFieldExtract);
 	RunTest(TestCpuExtensionContexts);

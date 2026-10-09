@@ -3127,6 +3127,15 @@ public:
       alignas(16) uint64_t predicate_label = 0;
       uint32_t predicated_ran = 0;
       uint32_t branch_ran = 0;
+      alignas(uint64_t) uint64_t reset_label = 0;
+      alignas(uint64_t) uint64_t half_label = 0;
+      constexpr uint64_t overwritten_clock = clock_base + 32;
+      // DMA_DATA needs a guest range.
+      auto *filled_label = reinterpret_cast<uint32_t *>(clock_base + 40);
+      *filled_label = 0;
+      bool reset_deferred = false;
+      bool later_writes_read = false;
+      uint32_t reset_cond_ran = 0;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
@@ -3256,6 +3265,47 @@ public:
             static_cast<uint32_t>(then_address >> 32u), 5, 0, 0, 0};
         Pm4Execution branch_execution;
         (void)processor->Process(branch_execution, branch);
+        // A write after a deferred label or GPU clock value wins over it, for later reads and
+        // in memory.
+        const auto process = [&](auto packet) {
+          Pm4Execution execution;
+          return processor->Process(execution, packet) == Pm4ProcessResult::Complete;
+        };
+        const auto write_data = [&](const void *address, uint32_t value) {
+          const auto a = reinterpret_cast<uint64_t>(address);
+          return process(std::array<uint32_t, 5>{KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+                                                 static_cast<uint32_t>(a),
+                                                 static_cast<uint32_t>(a >> 32u), value});
+        };
+        (void)process(make_release_mem(1, 0, &reset_label, 1));
+        reset_deferred = reset_label == 0;
+        const bool reset_written = write_data(&reset_label, 0);
+        const auto reset_address = reinterpret_cast<uint64_t>(&reset_label);
+        const auto reset_ran_address = reinterpret_cast<uint64_t>(&reset_cond_ran);
+        (void)process(std::array<uint32_t, 10>{
+            KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), static_cast<uint32_t>(reset_address),
+            static_cast<uint32_t>(reset_address >> 32u), 0, 5,
+            KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(reset_ran_address),
+            static_cast<uint32_t>(reset_ran_address >> 32u), 1});
+        (void)process(make_release_mem(2, 0, &half_label, 0x1111111122222222ull));
+        const bool half_written =
+            write_data(reinterpret_cast<const uint8_t *>(&half_label) + 4, 0x33333333u);
+        (void)process(make_release_mem(1, 0, filled_label, 5));
+        const auto filled_address = reinterpret_cast<uint64_t>(filled_label);
+        const bool filled = process(std::array<uint32_t, 7>{
+            KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, 0xabcdu, 0,
+            static_cast<uint32_t>(filled_address), static_cast<uint32_t>(filled_address >> 32u),
+            4});
+        (void)process(make_release_mem(3, 0, reinterpret_cast<void *>(overwritten_clock), 0,
+                                       0x14u, 0));
+        const bool clock_written =
+            process(std::array<uint32_t, 6>{
+                KYTY_PM4(6, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(overwritten_clock),
+                static_cast<uint32_t>(overwritten_clock >> 32u), 0x89abcdefu, 0x01234567u});
+        later_writes_read = reset_written && half_written && filled && clock_written &&
+                            wait_passes(&reset_label, 0, false) &&
+                            wait_passes(&half_label, 0x3333333322222222ull, true) &&
+                            wait_passes(filled_label, 0xabcdu, false);
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -3283,6 +3333,11 @@ public:
       Require("GpuCommandLane", "predication and branch on deferred labels",
               predicated_ran == 1 && branch_ran == 1,
               "predication or COND_INDIRECT_BUFFER missed a label deferred to completion");
+      Require("GpuCommandLane", "write after a deferred label",
+              reset_deferred && later_writes_read && reset_cond_ran == 0 && reset_label == 0 &&
+                  half_label == 0x3333333322222222ull && *filled_label == 0xabcdu &&
+                  read_clock(overwritten_clock) == 0x0123456789abcdefull,
+              "a deferred label or GPU clock value hid or overwrote a later write");
       // More timestamps than queries in flight, over fewer slots: every slot holds the time of
       // its last write, in recording order.
       constexpr uint32_t batch_slots = 1000;

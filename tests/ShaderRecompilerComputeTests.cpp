@@ -35426,11 +35426,12 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
         {Value(x), Value(y), Value(slice), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
          Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
   };
-  const auto add_memory = [&](u32 components, bool mip = false) {
+  const auto add_memory = [&](u32 components, bool mip = false,
+                              Dimension dimension = Dimension::Dim2DArray) {
     MemoryInfo memory{};
     memory.kind = ResourceKind::Image;
     memory.dmask = 0x1;
-    memory.image_dimension = Dimension::Dim2DArray;
+    memory.image_dimension = dimension;
     memory.image_address_components = components;
     memory.image_has_mip = mip;
     program.memory_info.push_back(memory);
@@ -35451,15 +35452,19 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
   auto &query = block->AppendNewInst(ValueOpcode::ImageQueryDimensions,
                                      {Value(&image), Value(&make_address(0u, 0u, 0u))},
                                      add_memory(1));
+  // A 2D load supplies (x, y, LOD): the 2D-array candidate reads layer 0 at LOD 1.
+  auto &read_mip = block->AppendNewInst(
+      ValueOpcode::ImageRead, {Value(&image), Value(&make_address(0u, 0u, 1u)), Value(true)},
+      add_memory(3, true, Dimension::Dim2D));
 
   auto &output = block->AppendNewInst(ValueOpcode::GetBufferResource,
                                       {Value(0u), Value(0u), Value(0u), Value(0u)});
   output.SetFlags<u32>(0u);
   program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
   const MemoryFlags store_flags{static_cast<u32>(program.memory_info.size() - 1u), 0u};
-  auto &lane_offset = block->AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(12u)});
+  auto &lane_offset = block->AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(16u)});
   u32 field = 0;
-  for (auto *result : {&read, &gather, &query}) {
+  for (auto *result : {&read, &gather, &query, &read_mip}) {
     auto &x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4, {Value(result), Value(0u)});
     auto &offset =
         block->AppendNewInst(ValueOpcode::IAdd32, {Value(&lane_offset), Value(field++ * 4u)});
@@ -35512,12 +35517,19 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
     const auto layers = resource == 3u ? 2u : 1u;
     // Nonzero values keep the root (ordinal 0) distinct from a null or out-of-bounds read.
     std::vector<u32> pixels(width * layers * 4u, std::bit_cast<u32>(float(resource + 1u)));
+    // Mip 1 holds 101 + resource; the array candidate's layers hold 200 and 300.
+    const auto mip_width = std::max(width / 2u, 1u);
+    std::vector<u32> mip(mip_width * layers * 4u, std::bit_cast<u32>(float(resource + 101u)));
+    if (layers == 2u) {
+      std::fill(mip.begin(), mip.begin() + mip_width * 4u, std::bit_cast<u32>(200.0f));
+      std::fill(mip.begin() + mip_width * 4u, mip.end(), std::bit_cast<u32>(300.0f));
+    }
     // Slice 1 of the array candidate holds a value no other layer or candidate has.
     if (layers == 2u)
       std::fill(pixels.begin() + width * 4u, pixels.end(), std::bit_cast<u32>(30.0f));
     textures.push_back(vulkan.CreateImageMips(
         name, width, 1, vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eSampled,
-        {pixels}, 4u, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+        {pixels, mip}, 4u, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
         resource == 3u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
   }
   const auto native_sampler = vulkan.CreateSampler(name);
@@ -35554,14 +35566,16 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
     }
     Require(name, "nonuniform fetched image", nonuniform_fetch,
             "the arrayed load lacks its nonuniform image decoration");
-    test.initial.assign(wave_size * 3u, 0xdeadbeefu);
-    test.expected.assign(wave_size * 3u, 0u);
+    test.initial.assign(wave_size * 4u, 0xdeadbeefu);
+    test.expected.assign(wave_size * 4u, 0u);
     for (u32 lane = 0; lane < wave_size; ++lane) {
       const auto resource = lane < ordinals.size() ? ordinals[lane] : 0u;
       const auto texel = std::bit_cast<u32>(resource == 3u ? 30.0f : float(resource + 1u));
-      test.expected[lane * 3u] = texel;
-      test.expected[lane * 3u + 1u] = texel;
-      test.expected[lane * 3u + 2u] = resource + 1u;
+      test.expected[lane * 4u] = texel;
+      test.expected[lane * 4u + 1u] = texel;
+      test.expected[lane * 4u + 2u] = resource + 1u;
+      test.expected[lane * 4u + 3u] =
+          std::bit_cast<u32>(resource == 3u ? 200.0f : float(resource + 101u));
     }
     auto buffer = vulkan.CreateStorageBuffer(name, test.initial, test.initial.size());
     vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, native_sampler,

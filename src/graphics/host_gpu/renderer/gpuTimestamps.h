@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUTIMESTAMPS_H_
 
 #include "common/common.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -76,8 +77,12 @@ public:
 
 	// End of pipe: after all earlier commands complete. Otherwise when the command is reached.
 	void Write(uint64_t vaddr, uint32_t size, bool end_of_pipe);
-	// Stores the values that completions left to the GPU thread, in their order. A completion
-	// that leaves one queues this on the GPU thread; every write and an unmap call it too.
+	// Runs a guest-visible completion effect, such as an interrupt, from a completion callback
+	// after the values before it: now, or on the GPU thread right after the ones left to it.
+	void Signal(Common::UniqueFunction<void>&& effect);
+	// Stores the values that completions left to the GPU thread and runs the effects queued
+	// behind them, in their order. A completion that leaves one queues this on the GPU thread;
+	// every write and an unmap call it too.
 	void StoreRetries();
 
 	// Conversion of host ticks at or after previous.device_base.
@@ -99,10 +104,12 @@ private:
 		bool                 resolved = false;
 	};
 
+	// A value to store, or an effect to run when it has one.
 	struct Retry {
-		uint64_t vaddr = 0;
-		uint64_t value = 0;
-		uint32_t size  = 0;
+		uint64_t                     vaddr = 0;
+		uint64_t                     value = 0;
+		uint32_t                     size  = 0;
+		Common::UniqueFunction<void> effect;
 	};
 
 	[[nodiscard]] bool SampleClocks(uint64_t& ticks, uint64_t& reference) const;

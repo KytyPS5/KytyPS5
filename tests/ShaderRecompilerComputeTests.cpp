@@ -1396,6 +1396,14 @@ void CheckGpuClockCalibration() {
     resumed &= near(clock.Convert(device_ticks(actual, reference + second / 2)),
                     reference + second / 2);
   }
+  // A first write long after the first sample still anchors the clock.
+  GpuTimestamps::Clock late_clock(mask, nominal);
+  late_clock.Sample(device_ticks(actual, start_reference), start_reference);
+  const auto late = start_reference + 40 * 60 * second;
+  late_clock.Sample(device_ticks(actual, late), late);
+  resumed &= late_clock.Anchored() &&
+             near(late_clock.Convert(device_ticks(actual, late + second / 1000)),
+                  late + second / 1000);
   Require("GpuClockCalibration", "calibrated narrow counter",
           accurate && monotonic && corrected && rate_measured && resumed,
           "a calibrated narrow GPU counter lost the guest clock across a wrap");

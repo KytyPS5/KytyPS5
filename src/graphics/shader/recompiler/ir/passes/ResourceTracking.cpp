@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -79,6 +80,105 @@ uint32_t PossibleU32Bits(Value value) {
 	return PossibleU32Bits(value, [](Value at) { return at.Resolve(); });
 }
 
+// Every value `value & mask` can take, when the expression proves a handful of them.
+bool PossibleMaskedValues(Value value, uint32_t mask, std::vector<uint32_t>& out,
+                          uint32_t depth = 0) {
+	constexpr size_t MaxValues = 8;
+	const auto       add       = [&](uint32_t candidate) {
+		if (std::ranges::find(out, candidate) == out.end()) {
+			out.push_back(candidate);
+		}
+		return out.size() <= MaxValues;
+	};
+	value = value.Resolve();
+	if (mask == 0) {
+		return add(0);
+	}
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32 && add(value.U32() & mask);
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 16) {
+		return false;
+	}
+	const auto immediate = [&](size_t index, uint32_t& result) {
+		const auto arg = inst->Arg(index).Resolve();
+		if (!arg.IsImmediate() || arg.GetType() != Type::U32) {
+			return false;
+		}
+		result = arg.U32();
+		return true;
+	};
+	const auto combine = [&](Value a, uint32_t mask_a, Value b, uint32_t mask_b, auto&& op) {
+		std::vector<uint32_t> left;
+		std::vector<uint32_t> right;
+		if (!PossibleMaskedValues(a, mask_a, left, depth + 1) ||
+		    !PossibleMaskedValues(b, mask_b, right, depth + 1)) {
+			return false;
+		}
+		for (const auto x: left) {
+			for (const auto y: right) {
+				if (!add(op(x, y) & mask)) {
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+	const auto through = [&](Value source, uint32_t source_mask, auto&& map) {
+		std::vector<uint32_t> values;
+		if (!PossibleMaskedValues(source, source_mask, values, depth + 1)) {
+			return false;
+		}
+		return std::ranges::all_of(values, [&](uint32_t x) { return add(map(x) & mask); });
+	};
+	uint32_t a = 0;
+	uint32_t b = 0;
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::SelectU32:
+			return PossibleMaskedValues(inst->Arg(1), mask, out, depth + 1) &&
+			       PossibleMaskedValues(inst->Arg(2), mask, out, depth + 1);
+		case ValueOpcode::BitwiseOr32:
+			return combine(inst->Arg(0), mask, inst->Arg(1), mask,
+			               [](uint32_t x, uint32_t y) { return x | y; });
+		case ValueOpcode::BitwiseAnd32:
+			if (immediate(1, a)) {
+				return through(inst->Arg(0), mask & a, [](uint32_t x) { return x; });
+			}
+			return combine(inst->Arg(0), mask, inst->Arg(1), mask,
+			               [](uint32_t x, uint32_t y) { return x & y; });
+		case ValueOpcode::ShiftLeftLogical32:
+			if (!immediate(1, a)) {
+				return false;
+			}
+			a &= 31u;
+			return through(inst->Arg(0), mask >> a, [a](uint32_t x) { return x << a; });
+		case ValueOpcode::ShiftRightLogical32:
+			if (!immediate(1, a)) {
+				return false;
+			}
+			a &= 31u;
+			return through(inst->Arg(0), mask << a, [a](uint32_t x) { return x >> a; });
+		case ValueOpcode::BitFieldUExtract: {
+			if (!immediate(1, a) || !immediate(2, b) || a >= 32u || b == 0u || b > 32u - a) {
+				return false;
+			}
+			const uint32_t field = b == 32u ? UINT32_MAX : (1u << b) - 1u;
+			return through(inst->Arg(0), (mask & field) << a, [a](uint32_t x) { return x >> a; });
+		}
+		case ValueOpcode::BitFieldInsert: {
+			if (!immediate(2, a) || !immediate(3, b) || a >= 32u || b == 0u || b > 32u - a) {
+				return false;
+			}
+			const uint32_t field = (b == 32u ? UINT32_MAX : (1u << b) - 1u) << a;
+			return combine(
+			    inst->Arg(0), mask & ~field, inst->Arg(1), (mask & field) >> a,
+			    [a, field](uint32_t x, uint32_t y) { return (x & ~field) | ((y << a) & field); });
+		}
+		default: return false;
+	}
+}
+
 bool IsNoncanonicalFlatAddress(Value high, Value active) {
 	high = high.Resolve();
 	active = active.Resolve();
@@ -87,6 +187,15 @@ bool IsNoncanonicalFlatAddress(Value high, Value active) {
 	while (const auto* select = high.TryInstruction()) {
 		if (select->GetOpcode() != ValueOpcode::SelectU32 || select->Arg(0).Resolve() != active) break;
 		high = select->Arg(1).Resolve();
+	}
+	// The aperture match reads address bits [63:48] only, whatever the low half holds.
+	std::vector<uint32_t> tags;
+	if (PossibleMaskedValues(high, 0xffff0000u, tags) && !tags.empty() &&
+	    std::ranges::all_of(tags, [](uint32_t tag) {
+		    return tag == (Decoder::PrivateApertureHigh & 0xffff0000u) ||
+		           tag == (Decoder::SharedApertureHigh & 0xffff0000u);
+	    })) {
+		return true;
 	}
 	uint32_t lower = 0, upper = UINT32_MAX;
 	if (high.IsImmediate() && high.GetType() == Type::U32) {

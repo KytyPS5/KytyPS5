@@ -32,6 +32,13 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// One fault bit per page, followed by one summary bit per FAULT_SUMMARY_SPAN bitmap words.
+	static constexpr uint64_t FAULT_BITMAP_WORDS  = CACHING_NUMPAGES / 32;
+	static constexpr uint32_t FAULT_SUMMARY_SPAN  = 64;
+	static constexpr uint64_t FAULT_SUMMARY_WORDS = FAULT_BITMAP_WORDS / FAULT_SUMMARY_SPAN / 32;
+	static constexpr uint64_t FAULT_BUFFER_SIZE =
+	    (FAULT_BITMAP_WORDS + FAULT_SUMMARY_WORDS) * sizeof(uint32_t);
+	static_assert(CACHING_NUMPAGES % (32 * FAULT_SUMMARY_SPAN * 32) == 0);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE

@@ -859,6 +859,16 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                          const HW::AaConfig& aa_config) {
+	bool single_sample = std::ranges::all_of(
+	    colors, [](const auto& color) { return color.desc.info.samples == 1u; });
+	if (depth.image_id) {
+		return single_sample && depth.desc.info.samples == 1u;
+	}
+	return colors.empty() ? render_sample_count(aa_config.msaa_num_samples) == 1u : single_sample;
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            uint32_t color_output_mask, DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -887,7 +897,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info, DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info, ctx.GetAaConfig()));
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -929,6 +939,14 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
 		return false;
+	}
+
+	// Shader outputs identify active attachments; finalize centroid after resolving them.
+	if (state.ps_active &&
+	    state.ps_input_info.ps_single_sample !=
+	        DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info,
+	                             buffer.GetRegisters().GetAaConfig())) {
+		RefreshShaders(buffer, draw, color_output_mask, state);
 	}
 
 	return true;

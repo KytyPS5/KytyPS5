@@ -163,6 +163,7 @@ enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne,
 enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
 struct ShaderPixelInputInfo {
+	bool ps_single_sample = false;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       wave_size                    = 64;

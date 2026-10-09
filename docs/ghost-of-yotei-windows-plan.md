@@ -1,5 +1,40 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-09 20:34 UTC** (warm original retry reaches independent image/sampler frontier; Windows handoff):
+
+- Tested compiledbc4b4d4d / installedEXEf2683c3d99e97cffab8d536ebbbb5abd4d0c485d533f02bc6f5d8003d4b857b9,
+  original5178 run200619 naturally exits32120:28:24UTC,1237 complete pipelines,
+  no deadline/memoryguard. Game47764 and supervisor31612 ended; native slot idle.
+- Both prioraf9eX/9d4cXYZ resource/pipeline frontiers pass. New fatal pixel
+  PS07b3d5ecac4aad8a PC6d0: inline image and sampler require same material buffer
+  and selector. Required independent synthetic RED recorded in test debt. No
+  fabricated sampler/correlation or limit change. No menu/game entry evidence.
+- [Pinned SharpEmu926 audit](sharpemu-pr926-usefulness-review.md) records runtime
+  descriptor/image waterfall and storage-only draw candidates plus existing
+  DCC/range/cache overlap. No new production port from PR926 at this checkpoint.
+- User requests stop at this checkpoint and transfer context AND this Codex
+  session to native Windows. Save dedicated shared handoff and one session
+  transcript; preserve other sessions/auth/live databases. Resume in
+  G:\repos\KytyPS5, same UUID/model, no second model turn from WSL. Issue108
+  remains unpublished: no authorized visual menu/entry milestone.
+
+
+Checkpoint **2026-10-09 20:22 UTC** (current files committed; SharpEmu review and warm original retry):
+
+- Checkpoint bc4b4d4d commits all eight previously dirty source/docs files per
+  explicit user instruction. Native build200525 PASS; installedEXEf2683c3d99e97cffab8d536ebbbb5abd4d0c485d533f02bc6f5d8003d4b857b9.
+  PriorEXEa2b/cache preserved; original eboot5178 untouched. No push/issue post.
+- ACTIVE `_Build/runs/game-20261009-200619-sharpemu-review-warm-native`, game
+  PID47764/native supervisor31612, normalasync Performance1280x720/timingonly
+ 1800s/28GiB/240s closegrace. Source frozen; no simultaneous native tests/builds.
+  At20:17:57UTC897 complete pipelines. Read final streams/ownedwindow for outcome.
+- [SharpEmu926 audit](sharpemu-pr926-usefulness-review.md), pinned848fceef,
+ 369files/404commits. Candidate storage-only draws: preserve vertex/pixel writes
+  without framebuffer, strict stale-PS behavior and real shader ownership;
+  independent RED still required. DCC/range/cache paths partly overlap existing
+  Kyty support; no blind369-file transfer. Menu/entry pending.
+
+
 Checkpoint **2026-10-09 18:40 UTC** (both formatted frontiers compile; clean exit after interruption):
 
 - Native7afac3cd / installed EXEa2b62ef9 / original eboot5178 run181524 ended

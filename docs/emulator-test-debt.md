@@ -1,5 +1,31 @@
 # Emulator regression test debt
 
+## Independent inline image and sampler sources (2026-10-09, current native frontier)
+
+Nativecheckpointbc4/EXEf268/original5178 warmrun200619 naturally exits321 at
+20:28:24UTC,1237 complete pipelines, no deadline/memoryguard. Both formatted
+frontiersaf9e/9d4c now pass. New pixel shader07b3d5ecac4aad8a PC6d0 rejects
+inline image and sampler not sharing material buffer/selector. No menu/entry.
+Required before production: synthetic pixel image+sampler sourced from different
+material roots/selectors, independent numeric texture/filter/LOD results; same
+RED/GREEN, correlated-source neighbors, wave32/64 and nonuniform cases, full
+resource/device budget/bounds/ownership rejection boundaries. Compare pinned
+SharpEmu926848fceef resource/dense-image waterfall planning and persistent
+bindless heap; do not force selectors to match, fake samplers or raise limits.
+No production change started at handoff; shader/loop/ABI-only proof is not menu.
+
+## Draws that only write storage (2026-10-09, PR926 candidate; not current fatal)
+
+SharpEmu RenderExecutor.Targets.cs retains vertex/pixel writes without framebuffer.
+Kyty PrepareDrawRenderState currently skips no-color/no-depth/!ps_active draws
+regardless of vertex writes. Required independent actualDrawAuto RED: one
+vertex raw buffer store with no framebuffer, full backing/sentinels; same GREEN,
+pixel-only storage writes, zero-work/disabled stalePS/depth/color neighbors,
+proper shader write ownership/barriers and valid empty-attachment rendering.
+Use existing IR::HasShaderMemoryWrites. Preserve supported guest shader effects,
+not merely BDA-read presence. No production change started before handoff.
+
+
 ## GPU-selected formatted XYZ (2026-10-09, new native frontier)
 
 Core4d5a/EXE142a original5178 run172811 naturally exited32117:45:22UTC,

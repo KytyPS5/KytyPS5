@@ -207,6 +207,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		device.getProperties(&device_properties);
 
 		const auto reject = [&](const std::string& reason) {
+			if (Config::RenderDocEnabled()) {
+				LOGF("RenderDoc: device rejected: %s: %s\n", device_properties.deviceName.data(),
+				     reason.c_str());
+			}
 			LOGF("%s\n", reason.c_str());
 			out_rejections +=
 			    skip_device ? "; " : fmt::format("\n  {}: ", device_properties.deviceName.data());
@@ -254,6 +258,30 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		device_features2.pNext = &features13;
 
 		device.getFeatures2(&device_features2);
+		if (Config::RenderDocEnabled()) {
+			LOGF("RenderDoc: GPU=%s; vendor=0x%x; device=0x%x; driver(raw)=%u; Vulkan=%u.%u.%u; "
+			     "BDA=%u; BDA captureReplay=%u; shaderInt64=%u\n",
+			     device_properties.deviceName.data(), device_properties.vendorID,
+			     device_properties.deviceID, device_properties.driverVersion,
+			     VK_VERSION_MAJOR(device_properties.apiVersion),
+			     VK_VERSION_MINOR(device_properties.apiVersion),
+			     VK_VERSION_PATCH(device_properties.apiVersion), features12.bufferDeviceAddress,
+			     features12.bufferDeviceAddressCaptureReplay,
+			     device_features2.features.shaderInt64);
+			const auto extensions = EnumerateVulkan<vk::ExtensionProperties>(
+			    "vkEnumerateDeviceExtensionProperties",
+			    [&](uint32_t* count, vk::ExtensionProperties* values) {
+				    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
+			    });
+			for (const auto& ext: extensions) {
+				LOGF("RenderDoc: available device extension %s (version %u)\n",
+				     ext.extensionName.data(), ext.specVersion);
+			}
+			for (const auto* ext: device_extensions) {
+				LOGF("RenderDoc: required device extension %s; available=%u\n", ext,
+				     HasExtension(extensions, ext) ? 1u : 0u);
+			}
+		}
 		const auto required_features12 = WindowContext::RequiredVulkan12Features();
 		const auto required_features13 = WindowContext::RequiredVulkan13Features();
 
@@ -264,6 +292,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		const auto check_feature = [&](vk::Bool32 supported, const char* name,
 		                               vk::Bool32 required = VK_TRUE) {
+			if (Config::RenderDocEnabled()) {
+				LOGF("RenderDoc: device feature %s; required=%u; available=%u\n", name, required,
+				     supported);
+			}
 			if (required == VK_TRUE && supported != VK_TRUE) {
 				reject(fmt::format("{} is not supported", name));
 			}
@@ -591,6 +623,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	// VulkanFindPhysicalDevice already checked the required creation features. These
 	// requirements are specific to this creation path and are not part of device selection.
+	if (Config::RenderDocEnabled()) {
+		LOGF("RenderDoc: creation-only required features: shaderInt64=%u; "
+		     "vertexPipelineStoresAndAtomics=%u; dualSrcBlend=%u (all require 1)\n",
+		     supported_features2.features.shaderInt64,
+		     supported_features2.features.vertexPipelineStoresAndAtomics,
+		     supported_features2.features.dualSrcBlend);
+	}
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.dualSrcBlend != VK_TRUE);
@@ -693,7 +732,25 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	vk::Device device = nullptr;
 
+	if (Config::RenderDocEnabled()) {
+		for (const auto* ext: device_extensions) {
+			LOGF("RenderDoc: enabling device extension %s\n", ext);
+		}
+		LOGF("RenderDoc: vkCreateDevice begin; BDA=%u; BDA captureReplay requested by app=%u; "
+		     "shaderInt64=%u\n",
+		     features12.bufferDeviceAddress, features12.bufferDeviceAddressCaptureReplay,
+		     device_features.shaderInt64);
+		LOGF("RenderDoc: compatibility mode=%u; meshShader=%u; workgroupMemoryExplicitLayout=%u; "
+		     "shaderSharedInt64Atomics=%u; deviceFault=%u\n",
+		     RenderDocCompat() ? 1u : 0u, mesh_features.meshShader,
+		     workgroup_layout.workgroupMemoryExplicitLayout, features12.shaderSharedInt64Atomics,
+		     device_fault.deviceFault);
+		Log::Flush();
+	}
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
+	if (Config::RenderDocEnabled()) {
+		LOGF("RenderDoc: vkCreateDevice result=%s\n", vk::to_string(result).c_str());
+	}
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
 		return nullptr;
@@ -981,7 +1038,14 @@ void WindowContext::CreateVulkan() {
 	inst_info.ppEnabledLayerNames =
 	    (r.enable_validation_layers ? r.required_layers.data() : nullptr);
 
+	if (Config::RenderDocEnabled()) {
+		LOGF("RenderDoc: vkCreateInstance begin\n");
+		Log::Flush();
+	}
 	const vk::Result result = vk::createInstance(&inst_info, nullptr, &graphic_ctx.instance);
+	if (Config::RenderDocEnabled()) {
+		LOGF("RenderDoc: vkCreateInstance result=%s\n", vk::to_string(result).c_str());
+	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eErrorIncompatibleDriver:

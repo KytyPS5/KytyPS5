@@ -35513,7 +35513,8 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
                                           ordinals.begin(), ordinals.end());
   std::vector<VulkanHarness::Image> textures;
   for (u32 resource = 0; resource < 4u; ++resource) {
-    const auto width = resource + 1u;
+    // Width 2 or more keeps a valid two-level chain for every candidate.
+    const auto width = resource + 2u;
     const auto layers = resource == 3u ? 2u : 1u;
     // Nonzero values keep the root (ordinal 0) distinct from a null or out-of-bounds read.
     std::vector<u32> pixels(width * layers * 4u, std::bit_cast<u32>(float(resource + 1u)));
@@ -35573,7 +35574,7 @@ void CheckIndirectImageOperations(VulkanHarness &vulkan) {
       const auto texel = std::bit_cast<u32>(resource == 3u ? 30.0f : float(resource + 1u));
       test.expected[lane * 4u] = texel;
       test.expected[lane * 4u + 1u] = texel;
-      test.expected[lane * 4u + 2u] = resource + 1u;
+      test.expected[lane * 4u + 2u] = resource + 2u;
       test.expected[lane * 4u + 3u] =
           std::bit_cast<u32>(resource == 3u ? 200.0f : float(resource + 101u));
     }

@@ -1221,6 +1221,7 @@ void EmitProgram(EmitterState& state) {
 		ctx.cooperative_phases = &cooperative->phases;
 	}
 	DefineGetBdaPointer(state);
+	DefineIndirectFormattedX(state);
 	DefineCooperativeWaveFunctions(state);
 	DefineFPMadFunction(state);
 	for (const auto* block: program.blocks) {

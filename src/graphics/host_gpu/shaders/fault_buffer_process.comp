@@ -19,8 +19,15 @@ layout(std430, binding = 1) buffer output_buf32 {
 
 void main() {
     const uint id = gl_GlobalInvocationID.x;
+    if (id >= fault_buffer.length()) {
+        return;
+    }
     uint word = fault_buffer[id];
     fault_buffer[id] = 0u;
+    if (id == fault_buffer.length() - 1u) {
+        atomicOr(download_buffer32[1], word);
+        return;
+    }
     const uint base_bit = id * 32u;
     while (word != 0u) {
         const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;

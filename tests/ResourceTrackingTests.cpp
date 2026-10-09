@@ -8994,6 +8994,26 @@ void TestCleanScalarBufferOutOfBounds() {
 
 } // namespace
 
+void TestGpuSelectedFormattedBufferReadAdmission() {
+  Fixture fixture;
+  fixture.program.srt_plan_complete = true;
+  const auto handle = fixture.Buffer({fixture.Emit(ValueOpcode::LaneId), Value(1u),
+      Value(16u), Value((static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32UInt) << 12u) |
+                       Libs::Graphics::DstSel(4, 5, 6, 7) | (3u << 28u))});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  memory.data_dwords = memory.component_count = 1u;
+  memory.data_bits = 32u;
+  memory.formatted = true;
+  const auto flags = fixture.AddMemory(memory, 0x40u);
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+      {handle, Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+  TrackResources(fixture.program);
+  Check(fixture.program.memory_info[flags.index].kind == ResourceKind::IndirectBuffer &&
+            fixture.program.info.uses_dma && fixture.program.info.buffers.empty(),
+        "GPU-selected formatted read acquired a fabricated host descriptor");
+}
+
 void TestGpuSelectedRawBufferAdmission() {
   struct Case { ValueOpcode opcode; uint32_t words; bool formatted; bool typed; bool admitted;
                 uint32_t bits = 32; bool signed_data = false; };
@@ -9047,6 +9067,11 @@ void TestGpuSelectedRawBufferAdmission() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-formatted-buffer-only") == 0) {
+      TestGpuSelectedFormattedBufferReadAdmission();
+      std::cout << "KYTY_GPU_SELECTED_FORMATTED_BUFFER_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-raw-buffer-only") == 0) {
       TestGpuSelectedRawBufferAdmission();
       std::cout << "KYTY_GPU_SELECTED_RAW_BUFFER_PASS\n";
@@ -9319,6 +9344,7 @@ int main(int argc, char** argv) {
     Run("pixel bounded formatted loop", TestPixelBoundedFormattedDescriptorLoop);
     Run("vertex bounded byte loop", TestVertexBoundedByteDescriptorLoop);
     Run("GPU-selected raw buffers", TestGpuSelectedRawBufferAdmission);
+    Run("GPU-selected formatted buffer X", TestGpuSelectedFormattedBufferReadAdmission);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

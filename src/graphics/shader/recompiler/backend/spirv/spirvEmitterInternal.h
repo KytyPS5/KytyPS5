@@ -414,6 +414,7 @@ struct EmitterState {
 	std::vector<uint32_t> memory_byte_limits {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
+	uint32_t                                         indirect_formatted_x_function = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         fpmad_function          = 0;
 	std::unordered_map<uint64_t, uint32_t>            bitcast_values;
@@ -869,6 +870,7 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineIndirectFormattedX(EmitterState& state);
 
 
 inline uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) { return Unary(state, static_cast<spv::Op>(opcode), type, value); }

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ComputeExecution.h"
+#include "graphics/shader/recompiler/RuntimeDescriptorFault.h"
 #include <deque>
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -7,6 +8,7 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
+#include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -1401,6 +1403,7 @@ struct TestCase {
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool check_shader_swizzle = true;
   bool compile_only = false;
+  std::optional<u32> expected_runtime_descriptor_fault;
   size_t storage_buffer_range_dwords = 0;
   bool use_descriptor_buffer_ranges = false;
   bool force_specialized_buffer_access = false;
@@ -2467,6 +2470,90 @@ public:
             "raw stride backing release failed");
     std::printf("[renderer] RawStrideArtifactReuse metadata=%u gpu=%u wave=%u variant=%s ok\n",
                 metadata_only, execute, wave, variant);
+  }
+
+  void CheckRuntimeDescriptorFaultParser(bool mixed = false) {
+    constexpr const char* name = "RuntimeDescriptorFaultParser";
+    std::vector<u32> words(mixed ? 65u : 64u, 0u);
+    words.back() = mixed ? 3u : 1u; // Dedicated runtime-error word follows the page bitmap.
+    if (mixed) words[0] = 1u << 7u;
+    auto input = CreateStorageBuffer(name, words, words.size());
+    auto output = CreateStorageBuffer(name, {}, 2048u);
+    const auto module = CreateShaderModule(name,
+        std::vector<u32>(std::begin(FAULT_BUFFER_PROCESS_SPV), std::end(FAULT_BUFFER_PROCESS_SPV)));
+    const std::array bindings{
+        vk::DescriptorSetLayoutBinding{0u, vk::DescriptorType::eStorageBuffer, 1u,
+                                        vk::ShaderStageFlagBits::eCompute, nullptr},
+        vk::DescriptorSetLayoutBinding{1u, vk::DescriptorType::eStorageBuffer, 1u,
+                                        vk::ShaderStageFlagBits::eCompute, nullptr}};
+    vk::DescriptorSetLayout layout;
+    vk::DescriptorSetLayoutCreateInfo layout_info{};
+    layout_info.bindingCount = bindings.size(); layout_info.pBindings = bindings.data();
+    RequireVk(name, "layout", m_device.createDescriptorSetLayout(&layout_info, nullptr, &layout),
+              "create fault parser layout");
+    vk::PipelineLayout pipeline_layout;
+    vk::PipelineLayoutCreateInfo pipeline_info{};
+    pipeline_info.setLayoutCount = 1u; pipeline_info.pSetLayouts = &layout;
+    RequireVk(name, "pipeline layout", m_device.createPipelineLayout(&pipeline_info, nullptr, &pipeline_layout),
+              "create fault parser pipeline layout");
+    vk::ComputePipelineCreateInfo create{};
+    create.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    create.stage.module = module; create.stage.pName = "main";
+    create.layout = pipeline_layout;
+    vk::Pipeline pipeline;
+    RequireVk(name, "pipeline", m_device.createComputePipelines(nullptr, 1u, &create, nullptr, &pipeline),
+              "create fault parser pipeline");
+    const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 2u};
+    vk::DescriptorPoolCreateInfo pool_info{};
+    pool_info.maxSets = 1u; pool_info.poolSizeCount = 1u; pool_info.pPoolSizes = &pool_size;
+    vk::DescriptorPool pool;
+    RequireVk(name, "pool", m_device.createDescriptorPool(&pool_info, nullptr, &pool), "create fault pool");
+    vk::DescriptorSetAllocateInfo allocate{};
+    allocate.descriptorPool = pool; allocate.descriptorSetCount = 1u; allocate.pSetLayouts = &layout;
+    vk::DescriptorSet set;
+    RequireVk(name, "set", m_device.allocateDescriptorSets(&allocate, &set), "allocate fault set");
+    const std::array infos{vk::DescriptorBufferInfo{input.buffer, 0u, input.size},
+                          vk::DescriptorBufferInfo{output.buffer, 0u, output.size}};
+    std::array<vk::WriteDescriptorSet, 2> writes{};
+    for (u32 i = 0; i < writes.size(); ++i) {
+      writes[i].dstSet = set; writes[i].dstBinding = i; writes[i].descriptorCount = 1u;
+      writes[i].descriptorType = vk::DescriptorType::eStorageBuffer; writes[i].pBufferInfo = &infos[i];
+    }
+    m_device.updateDescriptorSets(writes.size(), writes.data(), 0u, nullptr);
+    auto cmd = BeginCommands(name, "parser");
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0u, 1u, &set, 0u, nullptr);
+    cmd.dispatch(mixed ? 2u : 1u, 1u, 1u);
+    EndSubmitAndFree(name, "parser", cmd);
+    const auto actual = ReadBuffer(name, output, 2048u);
+    Require(name, "runtime fault propagation", actual[0] == (mixed ? 1u : 0u) &&
+        actual[1] == (mixed ? 3u : 1u) && (!mixed || actual[2] == (7u << BufferCache::CACHING_PAGEBITS)),
+            "runtime descriptor fault was treated as a guest page fault");
+    DestroyBuffer(&input); DestroyBuffer(&output);
+    m_device.destroyDescriptorPool(pool, nullptr); m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(layout, nullptr); m_device.destroyShaderModule(module, nullptr);
+    std::printf("[gpu] RuntimeDescriptorFaultParser ok\n");
+  }
+
+  [[noreturn]] void TriggerRuntimeDescriptorFault(const char* mode) {
+    const u32 flag = std::strcmp(mode, "format") == 0 ? ShaderRecompiler::InvalidBufferFormat :
+        std::strcmp(mode, "selector") == 0 ? ShaderRecompiler::InvalidBufferSelector :
+        ShaderRecompiler::InvalidBufferType;
+    RenderContext context(RuntimeContext());
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto* fault = context.GetBufferCache().GetFaultBuffer();
+      fault->Fill(fault->Size()-sizeof(u32), sizeof(u32), flag);
+      std::printf("KYTY_RUNTIME_DESCRIPTOR_FAULT_READY %s\n", mode);
+      context.GetBufferCache().ProcessFaultBuffer();
+      context.GetCommandScheduler().Finish();
+      std::printf("KYTY_RUNTIME_DESCRIPTOR_FAULT_RETURNED %s\n", mode);
+    });
+    std::_Exit(0);
   }
 
   void CheckHostImageAllocation() {
@@ -18934,6 +19021,26 @@ void CheckSampledHtileArrayClearDiscovery() {
                           &barrier, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (test.expected_runtime_descriptor_fault) {
+      Require(test.name, "descriptor fault binding", uses_bda,
+              "runtime descriptor test did not bind the BDA fault channel");
+      auto fault_readback = CreateHostBuffer(test.name, sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {});
+      auto copy = BeginCommands(test.name, "descriptor fault readback");
+      vk::BufferMemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      barrier.buffer = m_fault_buffer.buffer; barrier.offset = 0u; barrier.size = m_fault_buffer.size;
+      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      copy.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
+                           {}, 0u, nullptr, 1u, &barrier, 0u, nullptr);
+      const vk::BufferCopy region{m_fault_buffer.size - sizeof(u32), 0u, sizeof(u32)};
+      copy.copyBuffer(m_fault_buffer.buffer, fault_readback.buffer, 1u, &region);
+      EndSubmitAndFree(test.name, "descriptor fault readback", copy);
+      const auto faults = ReadBuffer(test.name, fault_readback, 1u);
+      DestroyBuffer(&fault_readback);
+      Require(test.name, "runtime descriptor faults", faults[0] == *test.expected_runtime_descriptor_fault,
+              "runtime descriptor fault flags were lost or spuriously generated");
+    }
     if (flattened_buffer.buffer != nullptr) {
       DestroyBuffer(&flattened_buffer);
     }
@@ -22149,7 +22256,8 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+        shader_name, BufferCache::CACHING_NUMPAGES / 8 + ShaderRecompiler::RuntimeDescriptorFaultBytes,
+        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -32878,6 +32986,116 @@ TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(true);
 }
 
+TestCase BufferLoadFormatXGpuSelectedDescriptors(u32 wave = 32u, bool faults = false) {
+  using F = Prospero::BufferFormat;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  struct Row {
+    F format; u32 first, second, expected;
+    u32 selector = 4u, records = 16u, offset = 0u;
+    bool null = false, active = true;
+    u32 type = 0u;
+    u32 index = 0u, stride = 0u, mode = 3u, soffset = 0u;
+    bool swizzle = false, add_tid = false;
+  };
+  std::vector<Row> rows{
+      {F::k32UInt, 0xdeadbeefu, 0u, 0xdeadbeefu},
+      {F::k32SInt, 0x80000001u, 0u, 0x80000001u},
+      {F::k32Float, 0x3f000000u, 0u, 0x3f000000u},
+      {F::k8UInt, 0xab807fffu, 0u, 128u, 4u, 16u, 2u},
+      {F::k8SInt, 0xab807fffu, 0u, 0xffffff80u, 4u, 16u, 2u},
+      {F::k8UNorm, 0xab807fffu, 0u, std::bit_cast<u32>(128.0f/255.0f), 4u, 16u, 2u},
+      {F::k16UInt, 0xabcd8001u, 0u, 0xcd80u, 4u, 16u, 1u},
+      {F::k16SInt, 0xabcd8001u, 0u, 0xffff8001u},
+      {F::k16Float, 0x3c00u, 0u, 0x3f800000u},
+      {F::k32_32Float, 0xbf800000u, 0x3f000000u, 0x3f000000u, 5u},
+      {F::k8UInt, 0u, 0u, 1u, 1u, 0u},
+      {F::k16Float, 0u, 0u, 0x3f800000u, 1u, 0u},
+      {F::k8UInt, 0u, 0u, 0u, 0u, 0u},
+      {F::k32UInt, 0x12345678u, 0u, 0u, 4u, 3u},
+      {F::k32_32Float, 0x3f800000u, 0x3f000000u, 0u, 5u, 4u},
+      {F::k32UInt, 0u, 0u, 0u, 4u, 16u, 0u, true},
+      {F::k32UInt, 0u, 0u, 0x13579bdfu, 4u, 16u, 0u, false, false},
+  };
+  if (faults) rows = {
+      {F::kInvalid, 0u, 0u, 0u},
+      {static_cast<F>(127u), 0u, 0u, 0u},
+      {F::k32UInt, 0u, 0u, 0u, 2u},
+      {F::k32UInt, 0u, 0u, 0u, 4u, 16u, 0u, false, true, 1u}};
+  if (!faults) {
+    const auto add = [&](u32 mode, u32 records, u32 stride, u32 index, u32 offset,
+                         u32 expected, u32 soffset = 0u, bool swizzle = false, bool tid = false) {
+      Row row{F::k32UInt, 0x11223344u, 0x55667788u, expected};
+      row.mode=mode; row.records=records; row.stride=stride; row.index=index; row.offset=offset;
+      row.soffset=soffset; row.swizzle=swizzle; row.add_tid=tid; rows.push_back(row);
+    };
+    add(0u,1u,8u,0u,4u,0x55667788u);
+    add(0u,1u,8u,0u,8u,0u);
+    add(0u,1u,8u,1u,0u,0u);
+    add(1u,1u,8u,0u,8u,0xa5a5a5a5u);
+    add(1u,1u,8u,1u,0u,0u);
+    add(2u,0u,8u,0u,0u,0u);
+    add(2u,1u,8u,1u,0u,0xa5a5a5a5u);
+    add(3u,8u,0u,0u,2u,0x55667788u,2u);
+    add(3u,7u,0u,0u,2u,0u,2u);
+    add(0u,2u,8u,1u,0u,0x55667788u,0u,true);
+    add(3u,16u,8u,0u,0u,0x11223344u,0u,false,true);
+  }
+  TestCase test;
+  test.name = faults ? "GpuSelectedFormatXFaults" :
+      wave == 64u ? "GpuSelectedFormatXWave64" : "GpuSelectedFormatXWave32";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.initial.resize(4096u, 0xa5a5a5a5u);
+  test.initial[0] = 0xdeadbeefu; test.initial[rows.size()+1u] = 0xcafef00du;
+  for (u32 i = 0; i < rows.size(); ++i) {
+    const auto& row = rows[i];
+    const u32 data = 8192u + i * 128u;
+    const uint64_t address = row.null ? 0u : GuestBase + data;
+    const std::array<u32,4> descriptor{static_cast<u32>(address), static_cast<u32>(address >> 32u) |
+        (row.stride << 16u) | (row.swizzle ? 1u << 31u : 0u),
+        row.records, row.selector | (static_cast<u32>(row.format) << 12u) | (row.mode << 28u) |
+        (row.type << 30u) | (row.add_tid ? 1u << 23u : 0u)};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin()+128u+i*4u);
+    test.initial[data/4u] = row.first; test.initial[data/4u+1u] = row.second;
+    test.initial[64u+i] = static_cast<u32>(rows.size())-1u-i;
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < rows.size(); ++i) {
+    const auto selected = static_cast<u32>(rows.size())-1u-i;
+    const auto& row = rows[selected];
+    AppendVMovU32(&test.code, 30u, (64u+i)*4u);
+    AppendBufferLoadDword(&test.code, 0u, 30u);
+    test.code.push_back(EncodeVop1(0x02u, 20u, Vgpr(0u)));
+    test.code.push_back(EncodeSop2(0x26u, 20u, 20u, InlineU32(16u)));
+    test.code.push_back(EncodeSmem0(0x0au, 8u, 0u));
+    test.code.push_back(EncodeSmem1(512u, 20u));
+    test.code.push_back(0xbf8c0000u);
+    AppendVMovU32(&test.code, 20u, row.index);
+    AppendVMovU32(&test.code, 21u, row.offset);
+    AppendSMovLiteral(&test.code, 22u, row.soffset);
+    AppendVMovLiteral(&test.code, 2u, 0x13579bdfu);
+    if (!row.active) {
+      AppendSMovLiteral(&test.code, 126u, 0u); AppendSMovLiteral(&test.code, 127u, 0u);
+    }
+    test.code.push_back(EncodeMubuf0(0x00u, 0u, true, true));
+    test.code.push_back(EncodeMubuf1(2u, 2u, 20u, 22u));
+    if (!row.active) {
+      AppendSMovLiteral(&test.code, 126u, 1u); AppendSMovLiteral(&test.code, 127u, 0u);
+    }
+    AppendStoreVgpr(&test.code, 2u, i+1u);
+    test.expected[i+1u] = row.expected;
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0u}};
+  test.opcodes = {ShaderOpcode::BUFFER_LOAD_DWORD, ShaderOpcode::BUFFER_LOAD_FORMAT_X,
+                 ShaderOpcode::BUFFER_STORE_DWORD};
+  test.expected_runtime_descriptor_fault = faults ? 7u : 0u;
+  test.required_spirv = {"read_runtime_formatted_x", "OpFunctionCall", "OpAtomicOr"};
+  test.max_spirv_words = 180000u;
+  return test;
+}
+
 TestCase BufferLoadUshortGpuSelectedDescriptors() {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
@@ -43500,6 +43718,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
+  AddCase([] { return BufferLoadFormatXGpuSelectedDescriptors(); });
+  AddCase([] { return BufferLoadFormatXGpuSelectedDescriptors(64u); });
+  AddCase([] { return BufferLoadFormatXGpuSelectedDescriptors(32u, true); });
   AddCase(BufferLoadFormatXyResource88UintExtractsBytes);
   AddCase(BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents);
   AddCase(BufferStoreFormatXyResource88UintWritesBytes);
@@ -49566,10 +49787,44 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const bool admission_parent=argc==2 &&
       (std::strcmp(argv[1],"--immutable-srt-binding-admission-only")==0 ||
-       std::strcmp(argv[1],"--scalar-selector-write-admission-only")==0);
+       std::strcmp(argv[1],"--scalar-selector-write-admission-only")==0 ||
+       std::strcmp(argv[1],"--runtime-descriptor-host-faults-only")==0);
   // Child workers each need the real guest arena. The supervising process
   // must not reserve another 13.5 GiB before they run sequentially.
   EnsureConfigInitialized(!admission_parent);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 3 && std::strcmp(argv[1], "--runtime-descriptor-host-fault") == 0) {
+    VulkanHarness vulkan;
+    vulkan.TriggerRuntimeDescriptorFault(argv[2]);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--runtime-descriptor-host-faults-only") == 0) {
+    constexpr std::array cases{
+        RendererFailureCase{"format", "unsupported runtime format"},
+        RendererFailureCase{"selector", "reserved runtime dst_sel"},
+        RendererFailureCase{"type", "invalid runtime type"}};
+    CheckRendererFailureCases("RuntimeDescriptorHostFault", "--runtime-descriptor-host-fault",
+        "KYTY_RUNTIME_DESCRIPTOR_FAULT_READY ", "KYTY_RUNTIME_DESCRIPTOR_FAULT_RETURNED ", cases);
+    return 0;
+  }
+#endif
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-format-x-cpu-only") == 0) {
+    auto test = BufferLoadFormatXGpuSelectedDescriptors(); test.compile_only = true;
+    RunCase(nullptr, test);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-format-x-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors(64u));
+    RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors(32u, true));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--runtime-descriptor-fault-parser-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRuntimeDescriptorFaultParser();
+    vulkan.CheckRuntimeDescriptorFaultParser(true);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--raw-stride-artifact-cache-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRawStrideArtifactReuse();
@@ -50418,10 +50673,10 @@ if (argc == 1) {
     M metadata{};
     Require("IndirectDwordAdmission","raw32",metadata.SupportsIndirectBufferLoad(O::LoadBufferU32),
             "raw32 descriptor load admission was lost");
-    metadata.formatted=true;
-    Require("IndirectDwordAdmission","formatted rejection",!metadata.SupportsIndirectBufferLoad(O::LoadBufferU32),
+    metadata.formatted=true; metadata.data_dwords=metadata.component_count=2u;
+    Require("IndirectDwordAdmission","formatted wide rejection",!metadata.SupportsIndirectBufferLoad(O::LoadBufferU32x2),
             "formatted descriptor loads were admitted without conversion proof");
-    metadata.formatted=false;metadata.typed=true;
+    metadata.formatted=false; metadata.data_dwords=metadata.component_count=1u; metadata.typed=true;
     Require("IndirectDwordAdmission","typed rejection",!metadata.SupportsIndirectBufferLoad(O::LoadBufferU32),
             "typed descriptor loads were admitted without conversion proof");
     metadata.typed=false;metadata.data_bits=16;metadata.data_signed=true;

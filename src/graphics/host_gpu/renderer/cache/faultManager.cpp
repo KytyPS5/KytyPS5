@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/RuntimeDescriptorFault.h"
 
 #include <bit>
 #include <cinttypes>
@@ -26,7 +27,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     BufferCache::CACHING_NUMPAGES / 8 + ShaderRecompiler::RuntimeDescriptorFaultBytes),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -74,7 +75,16 @@ FaultManager::~FaultManager() {
 	m_graphics.device.destroyDescriptorSetLayout(m_fault_process_desc_layout, nullptr);
 }
 
+Buffer* FaultManager::GetFaultBuffer() {
+	if (!m_fault_buffer_initialized) {
+		m_fault_buffer.Fill(0u, m_fault_buffer.Size(), 0u);
+		m_fault_buffer_initialized = true;
+	}
+	return &m_fault_buffer;
+}
+
 void FaultManager::ProcessFaultBuffer() {
+	if (!m_fault_buffer_initialized) return;
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
@@ -121,7 +131,7 @@ void FaultManager::ProcessFaultBuffer() {
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32 + 1u;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
@@ -132,6 +142,14 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
+		const auto descriptor_fault = static_cast<uint32_t>(faults[0] >> 32u);
+		if ((descriptor_fault & ShaderRecompiler::InvalidBufferFormat) != 0u)
+			EXIT("GPU-selected buffer descriptor uses an unsupported runtime format");
+		if ((descriptor_fault & ShaderRecompiler::InvalidBufferSelector) != 0u)
+			EXIT("GPU-selected buffer descriptor uses a reserved runtime dst_sel");
+		if ((descriptor_fault & ShaderRecompiler::InvalidBufferType) != 0u)
+			EXIT("GPU-selected buffer descriptor has an invalid runtime type");
+		EXIT_IF(descriptor_fault != 0u);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);

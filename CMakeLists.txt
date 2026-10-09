@@ -789,6 +789,23 @@ if(BUILD_TESTING)
 	add_test(NAME shader_indirect_dword_load
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-dword-only)
 	set_tests_properties(shader_indirect_dword_load PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+	add_test(NAME shader_gpu_selected_format_x_admission
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --gpu-selected-formatted-buffer-only)
+	add_test(NAME shader_gpu_selected_format_x_spirv
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-selected-format-x-cpu-only)
+	add_test(NAME shader_gpu_selected_format_x_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-selected-format-x-only)
+	add_test(NAME shader_runtime_descriptor_fault_parser
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --runtime-descriptor-fault-parser-only)
+	set_tests_properties(shader_gpu_selected_format_x_admission shader_gpu_selected_format_x_spirv
+		PROPERTIES TIMEOUT 60)
+	set_tests_properties(shader_gpu_selected_format_x_gpu PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
+	set_tests_properties(shader_runtime_descriptor_fault_parser PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+	if(WIN32)
+		add_test(NAME shader_runtime_descriptor_host_faults
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --runtime-descriptor-host-faults-only)
+		set_tests_properties(shader_runtime_descriptor_host_faults PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+	endif()
 	add_test(NAME shader_indirect_ushort_load
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-ushort-only)
 	set_tests_properties(shader_indirect_ushort_load PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)

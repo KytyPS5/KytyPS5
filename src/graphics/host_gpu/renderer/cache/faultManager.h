@@ -19,7 +19,7 @@ public:
 	~FaultManager();
 	KYTY_CLASS_NO_COPY(FaultManager);
 
-	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
+	[[nodiscard]] Buffer* GetFaultBuffer();
 	void                  ProcessFaultBuffer();
 
 private:
@@ -30,6 +30,7 @@ private:
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
+	bool                                       m_fault_buffer_initialized = false;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;

@@ -3150,6 +3150,35 @@ public:
                   !watched_after,
               "a watched clock destination was not stored through a fault");
 
+      // A value left to the GPU thread lands without another GPU clock write: a guest waiting
+      // for the only timestamp it wrote to a watched page must not wait for the next one.
+      constexpr uint64_t lone_clock = clock_base + 0x3800;
+      bool lone_before = false;
+      LibKernel::Memory::InstallGpuResources(&context);
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        (void)context.GetBufferCache().ObtainBuffer(lone_clock, sizeof(uint64_t), true);
+        lone_before = context.GetBufferCache().IsRegionGpuModified(lone_clock, sizeof(uint64_t));
+        auto timestamp = make_release_mem(
+            3, 0, reinterpret_cast<void *>(lone_clock), 0, 0x14u, 0);
+        Pm4Execution timestamp_execution;
+        (void)processor->Process(timestamp_execution, timestamp);
+        gpu_scheduler.Finish();
+      });
+      const auto lone_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      uint64_t lone_value = 0;
+      while ((lone_value = read_clock(lone_clock)) == 0 &&
+             std::chrono::steady_clock::now() < lone_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      gpu.WaitForIdle();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      Require("GpuCommandLane", "lone timestamp on a watched page",
+              lone_before && lone_value != 0 && lone_value + clock_tolerance >= batch_before &&
+                  lone_value <= Sync::ReadReferenceClock() + clock_tolerance &&
+                  lone_value == read_clock(lone_clock),
+              "a timestamp left to the GPU thread waited for another GPU clock write");
+
       // Destinations deferred behind a watched one in the same batch are stored too: memory
       // the GPU cannot see by the next timestamp, a range being unmapped by its unmap.
       constexpr uintptr_t cpu_clock_base = 0x0000000200800000ull;

@@ -29,13 +29,19 @@ RenderContext::~RenderContext() {
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
-	m_gpu       = std::make_unique<GuestGpu>(*this);
+	std::lock_guard lock(m_gpu_mutex);
+	m_gpu = std::make_unique<GuestGpu>(*this);
 }
 
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
-		m_gpu.reset();
+		std::unique_ptr<GuestGpu> gpu;
+		{
+			std::lock_guard lock(m_gpu_mutex);
+			gpu.swap(m_gpu);
+		}
+		gpu.reset();
 	}
 	if (m_video_out != nullptr) {
 		if (m_command_scheduler.Active()) {
@@ -49,6 +55,11 @@ void RenderContext::ShutdownGpu() {
 GuestGpu& RenderContext::GetGpu() const {
 	EXIT_IF(m_gpu == nullptr);
 	return *m_gpu;
+}
+
+bool RenderContext::PostGpuCommand(Common::UniqueFunction<void>&& command) {
+	std::lock_guard lock(m_gpu_mutex);
+	return m_gpu != nullptr && m_gpu->TrySendCommand(std::move(command));
 }
 
 VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {

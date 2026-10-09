@@ -86,6 +86,7 @@ public:
 	// the CPU dirties it.
 	void               WatchRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsWatchedRangeUnchanged(uint64_t vaddr, uint64_t size);
+	void               UnwatchRange(uint64_t vaddr, uint64_t size);
 	// Shader address writes have no known range.
 	void NotifyAddressWrites();
 

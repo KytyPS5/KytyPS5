@@ -275,6 +275,11 @@ bool BufferCache::IsWatchedRangeUnchanged(uint64_t vaddr, uint64_t size) {
 	       !m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+void BufferCache::UnwatchRange(uint64_t vaddr, uint64_t size) {
+	m_watched.Subtract(vaddr, size);
+	m_watch_changed.Subtract(vaddr, size);
+}
+
 void BufferCache::NotifyAddressWrites() {
 	m_watched.ForEach(
 	    [this](uint64_t begin, uint64_t end) { m_watch_changed.Add(begin, end - begin); });

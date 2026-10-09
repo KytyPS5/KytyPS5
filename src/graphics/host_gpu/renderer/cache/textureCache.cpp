@@ -2104,6 +2104,10 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	std::erase_if(m_meta_clear_decisions, [&](const auto& entry) {
+		return entry.first < address + size && address < entry.first + entry.second.size;
+	});
+	m_buffer_cache.UnwatchRange(address, size);
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {

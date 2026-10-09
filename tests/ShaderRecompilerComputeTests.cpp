@@ -190,6 +190,10 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static bool HasWatchedRanges(const BufferCache &cache) {
+    return !cache.m_watched.Empty() || !cache.m_watch_changed.Empty();
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -225,6 +229,10 @@ struct TextureCacheTestAccess {
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
+  }
+
+  static size_t MetaClearDecisionCount(const TextureCache &cache) {
+    return cache.m_meta_clear_decisions.size();
   }
 
   // Stands in for a host format without color attachment support.
@@ -10870,6 +10878,10 @@ public:
         check_expanded_metadata();
         RenderExecutorTestAccess::ResetBindings(executor);
         resources.UnmapMemory(base, allocation_size);
+        Require(name, "unmap drops metadata clear decisions",
+                TextureCacheTestAccess::MetaClearDecisionCount(texture_cache) == 0 &&
+                    !BufferCacheTestAccess::HasWatchedRanges(context.GetBufferCache()),
+                "unmapped metadata kept its watched range or cached clear decision");
         scheduler.Finish();
       });
       context.ShutdownGpu();

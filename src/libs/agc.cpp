@@ -79,11 +79,16 @@ void EmergencyShutdown() {
 	if (g_renderer == nullptr) {
 		return;
 	}
-	// A crash on the thread that already holds this mutex would deadlock on Lock(); TryLock()
-	// just skips the save in that case instead of hanging the crash handler.
-	if (g_renderer->GetMutex().TryLock()) {
+	auto& mutex = g_renderer->GetMutex();
+	if (mutex.IsHeldByCurrentThread()) {
+		// The crashing thread already owns this lock, so Save() would run with partially
+		// updated renderer/Vulkan state and do blocking file I/O from inside a crash handler;
+		// skip the save rather than risk corrupting the cache or hanging here.
+		return;
+	}
+	if (mutex.TryLock()) {
 		g_renderer->GetPipelineCache().Save();
-		g_renderer->GetMutex().Unlock();
+		mutex.Unlock();
 	}
 }
 

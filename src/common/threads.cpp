@@ -141,6 +141,29 @@ struct MutexPrivate {
 #else
 	std::recursive_mutex m_mutex;
 #endif
+
+	// The underlying primitive is recursive on every platform, so TryLock() always
+	// succeeds for a thread that already holds the lock and can't be used to test
+	// ownership. These track the owner explicitly instead.
+	// m_depth is only ever touched by the owning thread while it holds the lock, so
+	// it needs no synchronization; m_owner is atomic because other threads read it.
+	void Acquired() {
+		m_depth++;
+		m_owner.store(Thread::GetThreadIdUnique(), std::memory_order_relaxed);
+	}
+
+	void Releasing() {
+		if (--m_depth == 0) {
+			m_owner.store(0, std::memory_order_relaxed);
+		}
+	}
+
+	[[nodiscard]] bool HeldByCurrentThread() const {
+		return m_owner.load(std::memory_order_relaxed) == Thread::GetThreadIdUnique();
+	}
+
+	std::atomic<int> m_owner {0};
+	int              m_depth {0};
 };
 
 struct CondVarPrivate {
@@ -267,9 +290,12 @@ void Mutex::Lock() {
 #else
 	m_mutex->m_mutex.lock();
 #endif
+	m_mutex->Acquired();
 }
 
 void Mutex::Unlock() {
+	// Clear ownership before releasing: afterwards another thread may own the lock.
+	m_mutex->Releasing();
 #ifdef KYTY_WIN_CS
 	LeaveCriticalSection(&m_mutex->m_cs);
 #else
@@ -279,10 +305,20 @@ void Mutex::Unlock() {
 
 bool Mutex::TryLock() {
 #ifdef KYTY_WIN_CS
-	return (TryEnterCriticalSection(&m_mutex->m_cs) != 0);
+	if (TryEnterCriticalSection(&m_mutex->m_cs) == 0) {
+		return false;
+	}
 #else
-	return m_mutex->m_mutex.try_lock();
+	if (!m_mutex->m_mutex.try_lock()) {
+		return false;
+	}
 #endif
+	m_mutex->Acquired();
+	return true;
+}
+
+bool Mutex::IsHeldByCurrentThread() const {
+	return m_mutex->HeldByCurrentThread();
 }
 
 CondVar::CondVar(): m_cond_var(std::make_unique<CondVarPrivate>()) {}

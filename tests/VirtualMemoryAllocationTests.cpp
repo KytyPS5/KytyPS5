@@ -1481,6 +1481,116 @@ void TestPartialUnmapPreservesHostPermissions() {
 }
 #endif
 
+#if defined(__linux__)
+volatile sig_atomic_t g_watch_fault_signal  = 0;
+uint64_t              g_watch_fault_address = 0;
+bool                  g_watch_fault_write   = false;
+
+// Resolves a write-watch fault the way the page tracker does: release the write watch.
+void WatchFaultHandler(int signal_number, siginfo_t* info, void* native_context) {
+	const auto* context   = static_cast<ucontext_t*>(native_context);
+	g_watch_fault_signal  = signal_number;
+	g_watch_fault_address = reinterpret_cast<uint64_t>(info->si_addr);
+	g_watch_fault_write   = (context->uc_mcontext.gregs[REG_ERR] & 0x2) != 0;
+	const auto page       = g_watch_fault_address & ~(SceKernelPageSize - 1);
+	if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(
+	        page, SceKernelPageSize, Common::VirtualMemory::Mode::ReadWrite, false)) {
+		std::abort();
+	}
+}
+
+// Host mappings over [vaddr, vaddr + size), and the permissions of the one holding vaddr.
+int HostMappings(uint64_t vaddr, uint64_t size, std::string* first_perms) {
+	FILE* maps = std::fopen("/proc/self/maps", "r");
+	if (maps == nullptr) {
+		return -1;
+	}
+	int  count     = 0;
+	char line[512] = {};
+	while (std::fgets(line, sizeof(line), maps) != nullptr) {
+		unsigned long long start = 0;
+		unsigned long long end   = 0;
+		char               perms[8] = {};
+		if (std::sscanf(line, "%llx-%llx %7s", &start, &end, perms) != 3 ||
+		    end <= vaddr || start >= vaddr + size) {
+			continue;
+		}
+		if (start <= vaddr && vaddr < end) {
+			*first_perms = perms;
+		}
+		count++;
+	}
+	std::fclose(maps);
+	return count;
+}
+
+void TestTrackerWriteWatchKeepsView() {
+	const char* test = "TrackerWriteWatchKeepsView";
+	using Common::VirtualMemory::Mode;
+	using Libs::LibKernel::Memory::ProtectGuestHostMemory;
+	constexpr uint64_t pages = 8;
+	const auto         base  = MapNamedFlexible(test, SceKernelPageSize * pages, SceKernelProtCpuRw,
+	                                            "tracker_write_watch");
+	const auto         page  = [base](uint64_t index) { return base + index * SceKernelPageSize; };
+	const auto         word  = [](uint64_t address) {
+                return reinterpret_cast<volatile uint64_t*>(address + 8);
+	};
+	const bool page_tables = Libs::LibKernel::Memory::TestGuestWriteProtectsViews();
+
+	// Watch every other page for writes, as the tracker does after uploads.
+	bool watched = true;
+	for (uint64_t i = 0; i < pages; i += 2) {
+		watched = watched && ProtectGuestHostMemory(page(i), SceKernelPageSize, Mode::Read, false);
+	}
+	std::string perms;
+	const int   mappings = HostMappings(base, SceKernelPageSize * pages, &perms);
+
+	struct sigaction action {};
+	struct sigaction old_segv {};
+	struct sigaction old_bus {};
+	action.sa_sigaction = WatchFaultHandler;
+	action.sa_flags     = SA_SIGINFO;
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGSEGV, &action, &old_segv);
+	sigaction(SIGBUS, &action, &old_bus);
+
+	g_watch_fault_signal = 0;
+	*word(page(2))       = 0x5741544348ull;
+	const int  write_signal  = g_watch_fault_signal;
+	const bool write_fault   = write_signal != 0 && g_watch_fault_address == page(2) + 8 &&
+	                           g_watch_fault_write && *word(page(2)) == 0x5741544348ull;
+	g_watch_fault_signal     = 0;
+	*word(page(1))           = 1;
+	const bool unwatched_ok  = g_watch_fault_signal == 0;
+
+	// An access watch over a write-watched page, then removed: reads pass, writes still fault.
+	const bool access_watch = ProtectGuestHostMemory(page(4), SceKernelPageSize, Mode::NoAccess) &&
+	                          ProtectGuestHostMemory(page(4), SceKernelPageSize, Mode::Read);
+	g_watch_fault_signal    = 0;
+	const auto value        = *word(page(4));
+	const bool read_ok      = g_watch_fault_signal == 0 && value == 0;
+	*word(page(4))          = 2;
+	const bool rewatched    = g_watch_fault_signal != 0 && g_watch_fault_address == page(4) + 8;
+
+	sigaction(SIGSEGV, &old_segv, nullptr);
+	sigaction(SIGBUS, &old_bus, nullptr);
+	const bool released = ProtectGuestHostMemory(base, SceKernelPageSize * pages, Mode::ReadWrite);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * pages),
+	        "KernelMunmap");
+
+	Check(test, watched && access_watch && released, "tracker protection failed");
+	Check(test, write_fault, "a write to a watched page did not fault as a write");
+	Check(test, unwatched_ok && read_ok, "an unwatched access faulted");
+	Check(test, rewatched, "removing an access watch dropped the write watch");
+	if (page_tables) {
+		// Write watches live in the page tables: the view keeps one read-write mapping.
+		Check(test, mappings == 1 && perms.rfind("rw", 0) == 0 && write_signal == SIGBUS,
+		      "write watches split the guest view or changed its protection");
+	}
+	std::printf("[host]    %-48s ok (%s)\n", test, page_tables ? "page tables" : "mprotect");
+}
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void TestWindowsBackingViewPermissions() {
 	const char* test = "WindowsBackingViewPermissions";
@@ -4498,6 +4608,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
+	RunTest(TestTrackerWriteWatchKeepsView);
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestWindowsBackingViewPermissions);

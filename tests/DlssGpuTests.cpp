@@ -1004,6 +1004,14 @@ void GeometryMotionCase(GraphicContext& graphics, RenderContext& renderer) {
 	          pixel_inputs.geometry_motion_dword == UINT32_MAX &&
 	          ordinary.vertex[0].id != native.vertex[0].id && ordinary.pixel.id != native.pixel.id,
 	      "instrumented shader permutation leaked into ordinary guest draws");
+	const auto default_programs = renderer.GetPipelineCache().GetGraphicsPrograms(
+	    vertex_regs, pixel_regs, registers.GetShaderRegisters(), registers, user, mapping, true,
+	    vertex_inputs, pixel_inputs);
+	Check(vertex_inputs[0].geometry_motion_dword == UINT32_MAX &&
+	          pixel_inputs.geometry_motion_dword == UINT32_MAX &&
+	          default_programs.vertex[0].id == ordinary.vertex[0].id &&
+	          default_programs.pixel.id == ordinary.pixel.id,
+	      "default shader lookup unexpectedly instrumented geometry motion");
 	Check(programs(true).vertex[0].id == native.vertex[0].id,
 	      "geometry shader cache failed to reuse its native permutation");
 	auto occupied_code = vertex_code;

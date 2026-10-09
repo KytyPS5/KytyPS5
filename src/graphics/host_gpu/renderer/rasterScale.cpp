@@ -161,6 +161,7 @@ struct RasterScaler::Impl {
 		// leave it blocky. Depth, stencil and integer formats stay nearest.
 		const bool linear =
 		    aspects == vk::ImageAspectFlagBits::eColor &&
+		    !(original.geometry_motion_attachment && slot == RENDER_COLOR_ATTACHMENTS_MAX - 1) &&
 		    static_cast<bool>(
 		        graphics.GetFormatProperties(guest.backing.format).optimalTilingFeatures &
 		        vk::FormatFeatureFlagBits::eSampledImageFilterLinear);

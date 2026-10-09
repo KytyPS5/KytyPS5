@@ -658,7 +658,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
-	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    info->access_violation_cause != Common::HostException::AccessViolationCause::Other) {
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -668,7 +669,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		const auto cause = info->access_violation_cause ==
+		                           Common::HostException::AccessViolationCause::WriteProtect
+		                       ? Libs::LibKernel::Memory::GpuFaultCause::WriteProtect
+		                       : Libs::LibKernel::Memory::GpuFaultCause::Protection;
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr, cause)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}

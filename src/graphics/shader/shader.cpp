@@ -602,6 +602,17 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
+	if (info.pixel_input != nullptr) {
+		key.push_back(1u);
+		key.push_back(info.pixel_input->input_num);
+		key.push_back(static_cast<uint32_t>(info.pixel_input->parameter_mode));
+		for (uint32_t i = 0; i < info.pixel_input->input_num && i < 32u; i++) {
+			key.push_back(info.pixel_input->interpolator_settings[i]);
+		}
+		key.push_back(info.pixel_input->custom_interpolation_mask);
+	} else {
+		key.push_back(0u);
+	}
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));

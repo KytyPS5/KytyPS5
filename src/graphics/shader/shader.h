@@ -123,7 +123,10 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_topology       = 0;
 };
 
+struct ShaderPixelInputInfo;
+
 struct ShaderVertexInputInfo {
+	const ShaderPixelInputInfo* pixel_input = nullptr;
 	static constexpr int RES_MAX = 32;
 
 	ShaderBufferResource    resources[RES_MAX];

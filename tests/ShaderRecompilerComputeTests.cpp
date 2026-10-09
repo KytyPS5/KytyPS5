@@ -5200,6 +5200,63 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Runs `body` with renderer allocations whose new device memory has every bit set: device
+  // memory contents are undefined, and memory reused from freed allocations is often nonzero.
+  template <typename Body> void WithDirtyDeviceMemory(const char *name, Body &&body) {
+    EnsureRuntimeContext();
+    struct Dirtier {
+      VulkanHarness *harness;
+      const char *name;
+    } dirtier{this, name};
+    VmaDeviceMemoryCallbacks callbacks{};
+    callbacks.pfnAllocate = [](VmaAllocator, uint32_t type, VkDeviceMemory memory,
+                               VkDeviceSize size, void *user) {
+      const auto &self = *static_cast<const Dirtier *>(user);
+      self.harness->FillDeviceMemory(self.name, type, memory, size);
+    };
+    callbacks.pUserData = &dirtier;
+    VmaVulkanFunctions functions{};
+    functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
+    functions.vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+    VmaAllocatorCreateInfo allocator_info{};
+    allocator_info.instance = m_instance;
+    allocator_info.physicalDevice = m_physical_device;
+    allocator_info.device = m_device;
+    allocator_info.pVulkanFunctions = &functions;
+    allocator_info.vulkanApiVersion = VK_API_VERSION_1_3;
+    allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    allocator_info.pDeviceMemoryCallbacks = &callbacks;
+    VmaAllocator dirty = nullptr;
+    RequireVk(name, "dirty allocator",
+              static_cast<vk::Result>(vmaCreateAllocator(&allocator_info, &dirty)),
+              "vmaCreateAllocator");
+    auto *const original = std::exchange(m_runtime_context.allocator, dirty);
+    body();
+    m_runtime_context.allocator = original;
+    vmaDestroyAllocator(dirty);
+  }
+
+  void FillDeviceMemory(const char *name, uint32_t type, vk::DeviceMemory memory,
+                        vk::DeviceSize size) {
+    vk::BufferCreateInfo buffer_info{};
+    buffer_info.size = size & ~vk::DeviceSize{3};
+    buffer_info.usage = vk::BufferUsageFlagBits::eTransferDst;
+    vk::Buffer buffer = nullptr;
+    RequireVk(name, "dirty memory", m_device.createBuffer(&buffer_info, nullptr, &buffer),
+              "vkCreateBuffer");
+    vk::MemoryRequirements requirements{};
+    m_device.getBufferMemoryRequirements(buffer, &requirements);
+    // Memory that no transfer buffer can bind holds no renderer buffer either.
+    if (((requirements.memoryTypeBits >> type) & 1u) != 0 && requirements.size <= size) {
+      RequireVk(name, "dirty memory", m_device.bindBufferMemory(buffer, memory, 0),
+                "vkBindBufferMemory");
+      auto cmd = BeginCommands(name, "dirty memory");
+      cmd.fillBuffer(buffer, 0, VK_WHOLE_SIZE, ~0u);
+      EndSubmitAndFree(name, "dirty memory", cmd);
+    }
+    m_device.destroyBuffer(buffer, nullptr);
+  }
+
   void CheckFaultBufferSummary() {
     constexpr const char *name = "FaultBufferSummary";
     // Two faults in different summary words, and a page bit without its summary bit.
@@ -5215,6 +5272,8 @@ public:
     scheduler.Begin(registers, user_config, shaders);
     auto &cache = context.GetBufferCache();
     auto &faults = *cache.GetFaultBuffer();
+    // Only the fixture's words may be set when the pass runs.
+    faults.Fill(0, faults.Size(), 0);
     std::vector<uint64_t> words;
     for (size_t i = 0; i < addresses.size(); ++i) {
       const auto page = BufferCache::PageIndex(addresses[i]);
@@ -5273,6 +5332,35 @@ public:
             BufferCacheTestAccess::PageOwner(cache, addresses[2]) == BufferId{} &&
                 values[4] != 0,
             "the pass scanned a bitmap word whose summary bit was clear");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckFaultBufferStartsCleared() {
+    constexpr const char *name = "FaultBufferStartsCleared";
+    WithDirtyDeviceMemory(name, [&] {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &faults = *context.GetBufferCache().GetFaultBuffer();
+      auto readback =
+          CreateHostBuffer(name, faults.Size(), vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::BufferCopy copy{0, 0, faults.Size()};
+      scheduler.Current().Handle().copyBuffer(faults.Handle(), readback.buffer, 1, &copy);
+      vk::MemoryBarrier copied{};
+      copied.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      copied.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &copied, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto values = ReadBuffer(name, readback, faults.Size() / sizeof(u32));
+      DestroyBuffer(&readback);
+      Require(name, "initial contents",
+              std::ranges::all_of(values, [](u32 value) { return value == 0; }),
+              "a new fault buffer starts with fault or summary bits set");
+    });
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -43086,6 +43174,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckFaultBufferSummary();
+  vulkan.CheckFaultBufferStartsCleared();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

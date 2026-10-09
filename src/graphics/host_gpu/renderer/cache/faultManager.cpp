@@ -77,6 +77,11 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create fault-buffer pipeline");
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
+
+	// Device memory starts undefined, and the parser reports every set bit. The renderer is
+	// created before guest commands bind the scheduler, so the clear has its own submission.
+	m_fault_buffer.Fill(m_scheduler.BeginCommand(), 0, m_fault_buffer.Size(), 0);
+	m_scheduler.Submit();
 }
 
 FaultManager::~FaultManager() {

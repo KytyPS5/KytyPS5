@@ -317,31 +317,47 @@ bool GpuTimestamps::WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size) {
 	uint64_t serial = 0;
 	{
 		std::lock_guard lock(m_mutex);
-		serial                  = ++m_label_serial;
-		m_pending_labels[vaddr] = {value, size, serial};
+		serial = ++m_label_serial;
+		m_pending_labels.push_back({vaddr, value, size, serial});
 	}
 	CurrentBatch().writes.push_back({vaddr, value, 0, size, true, serial});
 	m_unstored.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 
-bool GpuTimestamps::PendingLabel(uint64_t vaddr, uint32_t size, uint64_t& value) {
-	std::lock_guard lock(m_mutex);
-	const auto      label = m_pending_labels.find(vaddr);
-	if (label == m_pending_labels.end() || label->second.size != size) {
-		return false;
+std::vector<GpuTimestamps::Label> GpuTimestamps::PendingLabels(uint64_t vaddr, uint32_t size) {
+	std::vector<Label> labels;
+	std::lock_guard    lock(m_mutex);
+	for (const auto& label: m_pending_labels) {
+		if (label.vaddr < vaddr + size && vaddr < label.vaddr + label.size) {
+			labels.push_back(label);
+		}
 	}
-	value = label->second.value;
-	return true;
+	return labels;
 }
 
-void GpuTimestamps::LabelStored(uint64_t vaddr, uint64_t serial) {
+uint64_t GpuTimestamps::ApplyLabels(const std::vector<Label>& labels, uint64_t vaddr, uint32_t size,
+                                    uint64_t value) {
+	// Byte by byte: a 64-bit read can cover a 32-bit label, or a 32-bit read half of a 64-bit one.
+	for (const auto& label: labels) {
+		const auto begin = std::max(vaddr, label.vaddr);
+		const auto end   = std::min(vaddr + size, label.vaddr + label.size);
+		std::memcpy(reinterpret_cast<uint8_t*>(&value) + (begin - vaddr),
+		            reinterpret_cast<const uint8_t*>(&label.value) + (begin - label.vaddr),
+		            end - begin);
+	}
+	return value;
+}
+
+void GpuTimestamps::LabelStored(uint64_t serial) {
 	if (serial == 0) {
 		return;
 	}
 	std::lock_guard lock(m_mutex);
-	const auto      label = m_pending_labels.find(vaddr);
-	if (label != m_pending_labels.end() && label->second.serial == serial) {
+	const auto      label = std::lower_bound(
+	    m_pending_labels.begin(), m_pending_labels.end(), serial,
+	    [](const Label& pending, uint64_t value) { return pending.serial < value; });
+	if (label != m_pending_labels.end() && label->serial == serial) {
 		m_pending_labels.erase(label);
 	}
 }
@@ -437,7 +453,7 @@ void GpuTimestamps::Complete(const Batch& batch) {
 			value = Clock::Convert(previous, current, ticks & m_mask, m_mask);
 		}
 		if (!deferred && m_context.StoreAtCompletion(write.vaddr, &value, write.size)) {
-			LabelStored(write.vaddr, write.serial);
+			LabelStored(write.serial);
 			stored++;
 			continue;
 		}
@@ -524,7 +540,7 @@ void GpuTimestamps::StoreRetries() {
 				retry.effect();
 			} else {
 				std::memcpy(reinterpret_cast<void*>(retry.vaddr), &retry.value, retry.size);
-				LabelStored(retry.vaddr, retry.serial);
+				LabelStored(retry.serial);
 				stored++;
 			}
 		}

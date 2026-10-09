@@ -5202,22 +5202,14 @@ public:
 
   // Runs `body` with renderer allocations whose new device memory has every bit set: device
   // memory contents are undefined, and memory reused from freed allocations is often nonzero.
+  // Memory dedicated to one resource cannot be bound to the poisoning buffer and stays as is,
+  // so blocks are made large enough to hold the page table.
   template <typename Body> void WithDirtyDeviceMemory(const char *name, Body &&body) {
     EnsureRuntimeContext();
-    struct Dirtier {
-      VulkanHarness *harness;
-      const char *name;
-    } dirtier{this, name};
-    VmaDeviceMemoryCallbacks callbacks{};
-    callbacks.pfnAllocate = [](VmaAllocator, uint32_t type, VkDeviceMemory memory,
-                               VkDeviceSize size, void *user) {
-      const auto &self = *static_cast<const Dirtier *>(user);
-      self.harness->FillDeviceMemory(self.name, type, memory, size);
-    };
-    callbacks.pUserData = &dirtier;
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+    functions.vkAllocateMemory = &AllocatePoisonedMemory;
     VmaAllocatorCreateInfo allocator_info{};
     allocator_info.instance = m_instance;
     allocator_info.physicalDevice = m_physical_device;
@@ -5225,19 +5217,43 @@ public:
     allocator_info.pVulkanFunctions = &functions;
     allocator_info.vulkanApiVersion = VK_API_VERSION_1_3;
     allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-    allocator_info.pDeviceMemoryCallbacks = &callbacks;
+    allocator_info.preferredLargeHeapBlockSize = 2 * BufferCache::BDA_PAGETABLE_SIZE;
     VmaAllocator dirty = nullptr;
     RequireVk(name, "dirty allocator",
               static_cast<vk::Result>(vmaCreateAllocator(&allocator_info, &dirty)),
               "vmaCreateAllocator");
+    s_poisoning = this;
+    s_poisoning_name = name;
+    m_largest_poisoned_memory = 0;
     auto *const original = std::exchange(m_runtime_context.allocator, dirty);
     body();
     m_runtime_context.allocator = original;
+    s_poisoning = nullptr;
     vmaDestroyAllocator(dirty);
   }
 
-  void FillDeviceMemory(const char *name, uint32_t type, vk::DeviceMemory memory,
-                        vk::DeviceSize size) {
+  static VKAPI_ATTR VkResult VKAPI_CALL AllocatePoisonedMemory(
+      VkDevice device, const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *callbacks,
+      VkDeviceMemory *memory) {
+    const auto result =
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(device, info, callbacks, memory);
+    for (auto *next = static_cast<const VkBaseInStructure *>(info->pNext); next != nullptr;
+         next = next->pNext) {
+      if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+        const auto *dedicated = reinterpret_cast<const VkMemoryDedicatedAllocateInfo *>(next);
+        if (dedicated->buffer != VK_NULL_HANDLE || dedicated->image != VK_NULL_HANDLE) {
+          return result;
+        }
+      }
+    }
+    if (result == VK_SUCCESS && s_poisoning != nullptr) {
+      s_poisoning->PoisonDeviceMemory(info->memoryTypeIndex, *memory, info->allocationSize);
+    }
+    return result;
+  }
+
+  void PoisonDeviceMemory(uint32_t type, vk::DeviceMemory memory, vk::DeviceSize size) {
+    const char *name = s_poisoning_name;
     vk::BufferCreateInfo buffer_info{};
     buffer_info.size = size & ~vk::DeviceSize{3};
     buffer_info.usage = vk::BufferUsageFlagBits::eTransferDst;
@@ -5253,6 +5269,7 @@ public:
       auto cmd = BeginCommands(name, "dirty memory");
       cmd.fillBuffer(buffer, 0, VK_WHOLE_SIZE, ~0u);
       EndSubmitAndFree(name, "dirty memory", cmd);
+      m_largest_poisoned_memory = std::max(m_largest_poisoned_memory, size);
     }
     m_device.destroyBuffer(buffer, nullptr);
   }
@@ -5275,6 +5292,8 @@ public:
       scheduler.Begin(registers, user_config, shaders);
       auto &cache = context.GetBufferCache();
       auto &table = *cache.GetBdaPageTableBuffer();
+      Require(name, "dirty memory", m_largest_poisoned_memory >= table.Size(),
+              "no poisoned memory block can hold the page table");
       const auto &buffer = cache.GetBuffer(cache.FindBuffer(base, 2 * page));
       auto readback = CreateHostBuffer(name, entries.size() * sizeof(vk::DeviceAddress),
                                        vk::BufferUsageFlagBits::eTransferDst, {});
@@ -5401,6 +5420,8 @@ public:
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
       auto &faults = *context.GetBufferCache().GetFaultBuffer();
+      Require(name, "dirty memory", m_largest_poisoned_memory >= faults.Size(),
+              "no poisoned memory block can hold the fault buffer");
       auto readback =
           CreateHostBuffer(name, faults.Size(), vk::BufferUsageFlagBits::eTransferDst, {});
       const vk::BufferCopy copy{0, 0, faults.Size()};
@@ -18993,6 +19014,9 @@ private:
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
+  vk::DeviceSize m_largest_poisoned_memory = 0;
+  inline static VulkanHarness *s_poisoning = nullptr;
+  inline static const char *s_poisoning_name = nullptr;
   std::unique_ptr<RenderContext> m_renderer;
 };
 

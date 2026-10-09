@@ -915,6 +915,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 uint32_t CommandProcessor::ResolveNumInstances() {
+	m_last_instance_args_addr = 0;
 	if (m_pending_instances.empty()) return m_num_instances;
 	// Read immutable bytes captured when each indirect packet executed. Guest arguments may
 	// already have been overwritten, so reading their current addresses would be incorrect.
@@ -928,6 +929,20 @@ uint32_t CommandProcessor::ResolveNumInstances() {
 		if (count == 0) continue;
 		std::memcpy(&m_num_instances, bytes.data() + static_cast<uint64_t>(count - 1) *
 		            it->stride + offsetof(vk::DrawIndirectCommand, instanceCount), sizeof(uint32_t));
+		m_last_instance_args_addr = it->args_addr;
+		const bool zero = m_num_instances == 0;
+		const bool fixed = zero && InstanceZeroDiag::FixEnabled();
+		if (fixed) {
+			// Mirror SetNumInstances(): a zero instance count is clamped to 1.
+			m_num_instances = 1;
+			InstanceZeroDiag::NoteFixApplied();
+		}
+		if (zero && InstanceZeroDiag::Enabled() && InstanceZeroDiag::TakeLine()) {
+			std::printf("NHL27INST: resolve_zero args=0x%llx count_word=%u max=%u stride=%u "
+			            "indexed=%d fixed=%d\n",
+			            static_cast<unsigned long long>(it->args_addr), count, it->max_count,
+			            it->stride, it->indexed ? 1 : 0, fixed ? 1 : 0);
+		}
 		break;
 	}
 	m_pending_instances.clear();
@@ -938,7 +953,11 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	ResolveNativeShaderRegisters();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = ResolveNumInstances();
+		const bool from_pending = !m_pending_instances.empty();
+		args.instance_count     = ResolveNumInstances();
+		args.instance_source    = from_pending ? InstanceZeroDiag::kSourcePending
+		                                       : InstanceZeroDiag::kSourcePersist;
+		args.instance_args_addr = m_last_instance_args_addr;
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -1206,7 +1225,11 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	ResolveNativeShaderRegisters();
 	if (args.instance_count == 0) {
-		args.instance_count = ResolveNumInstances();
+		const bool from_pending = !m_pending_instances.empty();
+		args.instance_count     = ResolveNumInstances();
+		args.instance_source    = from_pending ? InstanceZeroDiag::kSourcePending
+		                                       : InstanceZeroDiag::kSourcePersist;
+		args.instance_args_addr = m_last_instance_args_addr;
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }

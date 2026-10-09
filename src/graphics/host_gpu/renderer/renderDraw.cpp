@@ -1555,6 +1555,33 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
+// DIAGNOSTIC (KYTY_DBG_ZERO_INSTANCE): a draw dropped by the zero index/vertex or instance
+// count check, with the instance source and the depth/colour target registers it would use.
+static void LogZeroInstanceDraw(const char* kind, uint64_t submit_id, CommandBuffer& buffer,
+                                uint32_t count, uint32_t instance_count, uint8_t instance_source,
+                                uint64_t instance_args_addr) {
+	if (!InstanceZeroDiag::Enabled() || !InstanceZeroDiag::TakeLine()) {
+		return;
+	}
+	const auto& regs       = buffer.GetRegisters();
+	const auto& depth_rt   = regs.GetDepthRenderTarget();
+	const auto& depth_size = regs.GetDepthDepthSizeXY();
+	const auto& dc         = regs.GetDepthControl();
+	const uint64_t depth   = depth_rt.z_write_base_addr != 0 ? depth_rt.z_write_base_addr
+	                                                         : depth_rt.z_read_base_addr;
+	const uint64_t rt0     = regs.GetRenderTarget(0).base.addr;
+	const char*    src     = instance_source == InstanceZeroDiag::kSourcePending   ? "pending"
+	                         : instance_source == InstanceZeroDiag::kSourcePersist ? "persist"
+	                                                                               : "explicit";
+	std::printf("NHL27INST: %s #%llu count=%u instances=%u src=%s args=0x%llx depth=0x%llx "
+	            "%ux%u zwrite=%d ztest=%d zfunc=%u rt0=0x%llx\n",
+	            kind, static_cast<unsigned long long>(submit_id), count, instance_count, src,
+	            static_cast<unsigned long long>(instance_args_addr),
+	            static_cast<unsigned long long>(depth), depth_size.x_max + 1u,
+	            depth_size.y_max + 1u, dc.z_write_enable ? 1 : 0, dc.z_enable ? 1 : 0,
+	            static_cast<unsigned>(dc.zfunc), static_cast<unsigned long long>(rt0));
+}
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
@@ -1571,6 +1598,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
+		LogZeroInstanceDraw("index", submit_id, buffer, args.index_count, args.instance_count,
+		                    args.instance_source, args.instance_args_addr);
 		return;
 	}
 
@@ -1684,6 +1713,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
+		LogZeroInstanceDraw("auto", submit_id, buffer, args.vertex_count, args.instance_count,
+		                    args.instance_source, args.instance_args_addr);
 		return;
 	}
 

@@ -10,6 +10,11 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <memory>
 #include <span>
@@ -56,6 +61,57 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// DIAGNOSTIC helpers for KYTY_DBG_ZERO_INSTANCE (instance-zero draw logging) and
+// KYTY_INSTANCE_ZERO_FIX (clamp a resolved zero instance count to 1). Both off by default.
+namespace InstanceZeroDiag {
+
+constexpr uint32_t kMaxLines = 3000;
+
+// Where DrawIndexArgs/DrawAutoArgs::instance_count came from when it was resolved in
+// CommandProcessor (0 = passed in explicitly by the caller).
+constexpr uint8_t kSourceExplicit = 0;
+constexpr uint8_t kSourcePending  = 2; // from a pending indirect snapshot
+constexpr uint8_t kSourcePersist  = 3; // persisted m_num_instances (SET_NUM_INSTANCES or default)
+
+inline bool Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_ZERO_INSTANCE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+inline bool FixEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INSTANCE_ZERO_FIX");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// Returns true while the shared line budget is not exhausted.
+inline bool TakeLine() {
+	static std::atomic<uint32_t> lines {0};
+	return lines.fetch_add(1) < kMaxLines;
+}
+
+// Counts zero_fix applications; logs the first one and then at most every 5 seconds.
+inline void NoteFixApplied() {
+	static std::atomic<uint64_t> applied {0};
+	static std::atomic<int64_t>  last_log_ns {0};
+	const uint64_t               total = applied.fetch_add(1) + 1;
+	const auto   now_tp = std::chrono::steady_clock::now().time_since_epoch();
+	const int64_t now   = std::chrono::duration_cast<std::chrono::nanoseconds>(now_tp).count();
+	const int64_t last  = last_log_ns.load();
+	if ((total == 1 || now - last >= 5'000'000'000LL) && TakeLine()) {
+		last_log_ns.store(now);
+		std::printf("NHL27INST: zero_fix applied total=%llu\n",
+		            static_cast<unsigned long long>(total));
+	}
+}
+
+} // namespace InstanceZeroDiag
+
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;
@@ -65,6 +121,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Diagnostics only: see InstanceZeroDiag.
+	uint8_t  instance_source     = InstanceZeroDiag::kSourceExplicit;
+	uint64_t instance_args_addr  = 0;
 };
 
 class Buffer;
@@ -97,6 +156,9 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Diagnostics only: see InstanceZeroDiag.
+	uint8_t  instance_source    = InstanceZeroDiag::kSourceExplicit;
+	uint64_t instance_args_addr = 0;
 };
 
 struct SubmitInfo {

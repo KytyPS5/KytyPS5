@@ -186,6 +186,8 @@ private:
 	uint32_t m_num_instances = 1;
 	friend struct CommandProcessorTestAccess;
 	uint32_t ResolveNumInstances();
+	// Diagnostics: args address of the snapshot the last ResolveNumInstances() took its count from.
+	uint64_t                        m_last_instance_args_addr = 0;
 	std::vector<NativeIndirectDraw> m_pending_instances;
 	void ResolveNativeShaderRegisters();
 	void CancelNativeShaderRegister(uint32_t location);

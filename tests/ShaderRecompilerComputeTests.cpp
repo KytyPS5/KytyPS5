@@ -3150,6 +3150,77 @@ public:
                   !watched_after,
               "a watched clock destination was not stored through a fault");
 
+      // Destinations deferred behind a watched one in the same batch are stored too: memory
+      // the GPU cannot see by the next timestamp, a range being unmapped by its unmap.
+      constexpr uintptr_t cpu_clock_base = 0x0000000200800000ull;
+      constexpr uintptr_t unmapped_clock_base = 0x0000000200900000ull;
+      std::array<int64_t, 2> retry_direct_offsets{-1, -1};
+      const auto map_clock_memory = [&](uintptr_t base, int64_t &offset) {
+        void *memory = reinterpret_cast<void *>(base);
+        return Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                   0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), clock_size,
+                   clock_size, 0, &offset) == 0 &&
+               Libs::LibKernel::Memory::KernelMapDirectMemory(
+                   &memory, clock_size, 0x33, 0x10, offset, clock_size) == 0 &&
+               memory == reinterpret_cast<void *>(base);
+      };
+      Require("GpuCommandLane", "retried clock destinations",
+              map_clock_memory(cpu_clock_base, retry_direct_offsets[0]) &&
+                  map_clock_memory(unmapped_clock_base, retry_direct_offsets[1]),
+              "retried clock destination mapping failed");
+      context.MapMemory(unmapped_clock_base, clock_size);
+      LibKernel::Memory::InstallGpuResources(&context);
+      bool rewatched = true;
+      uint64_t cpu_early = 0;
+      uint64_t unmapped_early = 0;
+      uint64_t unmapped_at_unmap = 0;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        const auto write_timestamp = [&](uint64_t destination) {
+          auto timestamp = make_release_mem(
+              3, 0, reinterpret_cast<void *>(destination), 0, 0x14u, 0);
+          Pm4Execution timestamp_execution;
+          (void)processor->Process(timestamp_execution, timestamp);
+        };
+        const auto complete = [&] {
+          gpu_scheduler.Finish();
+          gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+        };
+        const auto batch_behind_watched = [&](uint64_t destination) {
+          (void)context.GetBufferCache().ObtainBuffer(watched_clock, sizeof(uint64_t), true);
+          rewatched &= context.GetBufferCache().IsRegionGpuModified(watched_clock,
+                                                                    sizeof(uint64_t));
+          write_timestamp(watched_clock);
+          write_timestamp(destination);
+          complete();
+        };
+        batch_behind_watched(cpu_clock_base);
+        cpu_early = read_clock(cpu_clock_base);
+        write_timestamp(clock_base + 0x2800);
+        complete();
+        batch_behind_watched(unmapped_clock_base);
+        unmapped_early = read_clock(unmapped_clock_base);
+        context.UnmapMemory(unmapped_clock_base, clock_size);
+        unmapped_at_unmap = read_clock(unmapped_clock_base);
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      const auto cpu_value = read_clock(cpu_clock_base);
+      const auto retry_limit = Sync::ReadReferenceClock() + clock_tolerance;
+      Require("GpuCommandLane", "timestamps retried behind a watched one",
+              rewatched && cpu_early == 0 && unmapped_early == 0 &&
+                  cpu_value + clock_tolerance >= batch_before && cpu_value <= retry_limit &&
+                  unmapped_at_unmap + clock_tolerance >= batch_before &&
+                  unmapped_at_unmap <= retry_limit,
+              "a timestamp deferred behind a watched destination was dropped");
+      for (size_t index = 0; index < retry_direct_offsets.size(); index++) {
+        const auto base = index == 0 ? cpu_clock_base : unmapped_clock_base;
+        Require("GpuCommandLane", "retried clock destination release",
+                Libs::LibKernel::Memory::KernelMunmap(base, clock_size) == 0 &&
+                    Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                        retry_direct_offsets[index], clock_size) == 0,
+                "retried clock destination release failed");
+      }
+
       // Completion work queued after a timestamp, like the interrupt of its packet, sees it.
       constexpr uint64_t ordered_clock = clock_base + 0x2c00;
       uint64_t queued_after = 0;

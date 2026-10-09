@@ -38,6 +38,9 @@ public:
 
 	// End of pipe: after all earlier commands complete. Otherwise when the command is reached.
 	void Write(uint64_t vaddr, uint32_t size, bool end_of_pipe);
+	// Stores the values that completions left to the GPU thread, in their order. Called by
+	// every write, and before a range is unmapped.
+	void StoreRetries();
 
 	// Conversion of host ticks at or after previous.device_base.
 	[[nodiscard]] static uint64_t ToReference(const Segment& previous, const Segment& current,
@@ -69,7 +72,6 @@ private:
 	void               Calibrate();
 	void               Resolve();
 	void               Complete(const Batch& batch);
-	void               StoreRetries();
 
 	GraphicContext&        m_graphics;
 	CommandScheduler&      m_scheduler;

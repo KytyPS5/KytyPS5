@@ -9,7 +9,6 @@
 #include <memory>
 #include <span>
 #include <string_view>
-#include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -22,7 +21,7 @@ struct ShaderCacheRecipe {
 	uint64_t              hash            = 0;
 	std::vector<uint32_t> code;
 	std::vector<uint32_t> back_code;
-	// Bytes of the stage input info (vertex, pixel or compute) without its runtime pointers.
+	// The stage input info (vertex, pixel or compute) from EncodeShaderCacheInput.
 	std::vector<uint8_t>                         input;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 
@@ -31,14 +30,17 @@ struct ShaderCacheRecipe {
 
 using ShaderCacheRecipes = std::vector<std::shared_ptr<const ShaderCacheRecipe>>;
 
-static_assert(std::is_trivially_copyable_v<ShaderVertexInputInfo>);
-static_assert(std::is_trivially_copyable_v<ShaderPixelInputInfo>);
-static_assert(std::is_trivially_copyable_v<ShaderComputeInputInfo>);
-static_assert(std::is_trivially_copyable_v<ShaderRecompiler::IR::ResourceSpecialization::Buffer>);
-static_assert(std::is_trivially_copyable_v<ShaderRecompiler::IR::ResourceSpecialization::Image>);
-
-// Size of the input info a stage records, or 0 for a stage the cache does not hold.
+// Size of the encoded input info a stage records, or 0 for a stage the cache does not hold.
 size_t ShaderCacheInputSize(ShaderType stage);
+
+// Stores the input info field by field, without padding bytes and runtime pointers, so that equal
+// fields always give equal bytes. Decoding fails on a size mismatch or an invalid bool.
+std::vector<uint8_t> EncodeShaderCacheInput(const ShaderVertexInputInfo& info);
+std::vector<uint8_t> EncodeShaderCacheInput(const ShaderPixelInputInfo& info);
+std::vector<uint8_t> EncodeShaderCacheInput(const ShaderComputeInputInfo& info);
+bool DecodeShaderCacheInput(std::span<const uint8_t> data, ShaderVertexInputInfo& info);
+bool DecodeShaderCacheInput(std::span<const uint8_t> data, ShaderPixelInputInfo& info);
+bool DecodeShaderCacheInput(std::span<const uint8_t> data, ShaderComputeInputInfo& info);
 
 std::vector<uint8_t> SerializeShaderCache(std::string_view          signature,
                                           const ShaderCacheRecipes& recipes);

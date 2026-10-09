@@ -85,6 +85,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -94,6 +95,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -37404,6 +37406,86 @@ void WriteTestFile(const std::filesystem::path &path, std::span<const char> data
   file.write(data.data(), static_cast<std::streamsize>(data.size()));
 }
 
+// An object built over memory filled with `fill`: its padding bytes keep that value.
+template <typename T>
+struct GarbageBacked {
+  alignas(T) unsigned char bytes[sizeof(T)];
+  explicit GarbageBacked(unsigned char fill) { std::memset(bytes, fill, sizeof(bytes)); }
+  T &Make() { return *new (bytes) T; }
+};
+
+template <typename T, typename F>
+bool SameEncodingOverGarbage(F set) {
+  GarbageBacked<T> first(0xaa);
+  GarbageBacked<T> second(0x55);
+  auto &left = first.Make();
+  auto &right = second.Make();
+  set(left);
+  set(right);
+  return EncodeShaderCacheInput(left) == EncodeShaderCacheInput(right);
+}
+
+// Equal fields give equal records whatever the padding bytes of the recorded structures hold.
+void CheckShaderCacheRecordPadding() {
+  constexpr const char *name = "ShaderCacheRecordPadding";
+  Require(name, "compute input",
+          SameEncodingOverGarbage<ShaderComputeInputInfo>([](auto &info) {
+            info.float_mode = 0xc3;
+            info.group_id[1] = true;
+          }),
+          "padding bytes of the compute input info reached the record");
+  Require(name, "pixel input",
+          SameEncodingOverGarbage<ShaderPixelInputInfo>([](auto &info) {
+            info.input_num = 2;
+            info.ps_pos_x = true;
+          }),
+          "padding bytes of the pixel input info reached the record");
+  Require(name, "vertex input",
+          SameEncodingOverGarbage<ShaderVertexInputInfo>([](auto &info) {
+            info.resources_num = 1;
+            info.clip_space.enabled = true;
+            info.fetch_embedded = true;
+          }),
+          "padding bytes of the vertex input info reached the record");
+  ShaderCacheRecipes recipes;
+  for (const unsigned char fill : {0xaa, 0x55}) {
+    GarbageBacked<ShaderComputeInputInfo> input(fill);
+    auto &info = input.Make();
+    info.float_mode = 0xc3;
+    auto recipe = std::make_shared<ShaderCacheRecipe>();
+    recipe->stage = ShaderType::Compute;
+    recipe->code = {0xbf810000u};
+    recipe->input = EncodeShaderCacheInput(info);
+    recipe->specialization.buffers.resize(1);
+    recipe->specialization.images.resize(1);
+    auto *buffer = recipe->specialization.buffers.data();
+    auto *image = recipe->specialization.images.data();
+    std::memset(static_cast<void *>(buffer), fill, sizeof(*buffer));
+    std::memset(static_cast<void *>(image), fill, sizeof(*image));
+    new (buffer) ShaderRecompiler::IR::ResourceSpecialization::Buffer;
+    new (image) ShaderRecompiler::IR::ResourceSpecialization::Image;
+    buffer->zero_stride_oob = true;
+    image->cube = true;
+    recipes.push_back(std::move(recipe));
+  }
+  Require(name, "specialization",
+          SerializeShaderCache("KytySC1:test\n", {recipes[0]}) ==
+              SerializeShaderCache("KytySC1:test\n", {recipes[1]}),
+          "padding bytes of the resource specialization reached the record");
+  ShaderComputeInputInfo decoded{};
+  auto encoded = recipes[0]->input;
+  Require(name, "decode",
+          DecodeShaderCacheInput(encoded, decoded) && decoded.float_mode == 0xc3 &&
+              EncodeShaderCacheInput(decoded) == encoded,
+          "the compute input info changed through its record");
+  for (auto &byte : encoded) {
+    byte = 2;
+  }
+  Require(name, "invalid bool", !DecodeShaderCacheInput(encoded, decoded),
+          "a record with an invalid bool was decoded");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckShaderCacheFileFormat() {
   constexpr const char *name = "ShaderCacheFileFormat";
   ShaderCacheRecipes recipes;
@@ -37494,6 +37576,17 @@ void CheckShaderCachePersistence(VulkanHarness &vulkan) {
             "the program compiled ahead did not create a pipeline");
   }
   {
+    // Another cache created and destroyed meanwhile leaves this cache notified of mapped shaders.
+    PipelineCache cache(graphics, directory, "TEST00000");
+    const auto other_directory = CacheTestDirectory("ShaderCacheOther");
+    { PipelineCache other(graphics, other_directory, "TEST00000"); }
+    std::filesystem::remove_all(other_directory);
+    shader.Map();
+    cache.WaitForBackgroundCompilation();
+    Require(name, "two caches", cache.GetProgramStats().compiled_ahead == 1,
+            "another cache removed or replaced the shader map observer of this cache");
+  }
+  {
     // A different shader input is compiled where it is needed and recorded too.
     PipelineCache cache(graphics, directory, "TEST00000");
     auto regs = shader.regs;
@@ -37517,6 +37610,75 @@ void CheckShaderCachePersistence(VulkanHarness &vulkan) {
     Require(name, "other version", cache.GetProgramStats().recorded == 0,
             "a cache with another signature was used");
   }
+  std::filesystem::remove_all(directory);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A recorded program that the lookup thread compiles itself is in flight like a worker job until it
+// ends, so a concurrent waiter wakes only after it and sees its result.
+void CheckShaderCacheConcurrentWaiters(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderCacheConcurrentWaiters";
+  if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+    std::printf("[gpu]     %-32s skipped (non-Release build)\n", name);
+    return;
+  }
+  CachedComputeShader shader;
+  GraphicContext graphics;
+  InitCacheTestGraphics(graphics, vulkan);
+  const auto directory = CacheTestDirectory(name);
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    ShaderComputeInputInfo input{};
+    cache.GetComputeProgram(shader.regs, {}, input);
+    cache.Save();
+  }
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    std::binary_semaphore started{0};
+    std::binary_semaphore release{0};
+    cache.SetRecordedCompileHook([&] {
+      started.release();
+      release.acquire();
+    });
+    // The shader is not mapped: the lookup takes the dormant job and compiles it itself.
+    std::thread lookup([&] {
+      ShaderComputeInputInfo input{};
+      cache.GetComputeProgram(shader.regs, {}, input);
+    });
+    started.acquire();
+    const auto during = cache.GetProgramStats();
+    uint64_t seen_by_waiter = 0;
+    std::thread waiter([&] {
+      cache.WaitForBackgroundCompilation();
+      seen_by_waiter = cache.GetProgramStats().compiled;
+    });
+    release.release();
+    lookup.join();
+    waiter.join();
+    const auto after = cache.GetProgramStats();
+    Require(name, "in flight", during.in_flight == 1,
+            "a recorded program compiled by the lookup thread was not in flight");
+    Require(name, "waiter", seen_by_waiter == 1,
+            "a waiter woke before the recorded program compiled by the lookup thread ended");
+    Require(name, "finished", after.in_flight == 0 && after.compiled == 1 &&
+                                  after.compiled_ahead == 0,
+            "the recorded program was not compiled exactly once by the lookup thread");
+  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  {
+    // Programs are looked up by one thread only; another thread is refused.
+    PipelineCache cache(graphics, directory, "TEST00000");
+    ShaderComputeInputInfo input{};
+    cache.GetComputeProgram(shader.regs, {}, input);
+    ExpectFatal("ShaderCacheLookupThread", [&] {
+      std::thread other([&] {
+        ShaderComputeInputInfo other_input{};
+        cache.GetComputeProgram(shader.regs, {}, other_input);
+      });
+      other.join();
+    });
+  }
+#endif
   std::filesystem::remove_all(directory);
   std::printf("[gpu]     %-32s ok\n", name);
 }
@@ -42781,8 +42943,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--pipeline-cache-only") == 0) {
     CheckShaderCacheFileFormat();
+    CheckShaderCacheRecordPadding();
     VulkanHarness vulkan;
     CheckShaderCachePersistence(vulkan);
+  CheckShaderCacheConcurrentWaiters(vulkan);
     CheckShaderCacheGraphicsPrograms(vulkan);
     return 0;
   }
@@ -43762,7 +43926,9 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   CheckShaderCacheFileFormat();
+  CheckShaderCacheRecordPadding();
   CheckShaderCachePersistence(vulkan);
+  CheckShaderCacheConcurrentWaiters(vulkan);
   CheckShaderCacheGraphicsPrograms(vulkan);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUnifiedTextureCacheFlow();

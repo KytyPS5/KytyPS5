@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -117,10 +118,13 @@ public:
 		uint64_t recorded       = 0; // Recipes known to the shader cache.
 		uint64_t waited         = 0; // Lookups that waited for a background compilation.
 		uint64_t waited_us      = 0;
+		uint64_t in_flight      = 0; // Recorded programs being compiled now, on any thread.
 	};
 	[[nodiscard]] ProgramStats GetProgramStats() const;
 	// Blocks until every queued background compilation has finished (tests).
 	void WaitForBackgroundCompilation();
+	// Runs on the compiling thread before recorded programs are compiled (tests).
+	void SetRecordedCompileHook(std::function<void()> hook);
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;

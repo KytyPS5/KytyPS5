@@ -314,10 +314,11 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
-// Receives the code hash of every shader the game maps, on the mapping thread. Setting an
-// observer waits for a running notification to end; nullptr removes it.
+// Observers receive the code hash of every shader the game maps, on the mapping thread. Removing
+// an observer removes only its own registration and waits for a running notification to end.
 using ShaderMapObserver = void (*)(void* user, uint64_t hash);
-void     ShaderSetMapObserver(ShaderMapObserver observer, void* user);
+void     ShaderAddMapObserver(ShaderMapObserver observer, void* user);
+void     ShaderRemoveMapObserver(ShaderMapObserver observer, void* user);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

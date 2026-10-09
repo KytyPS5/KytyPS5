@@ -32,6 +32,7 @@
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -413,6 +414,7 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
+		CheckLookupThread();
 		const auto stage           = GetStage(input_info);
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
@@ -512,6 +514,14 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// `programs` and `lookup_key` belong to the one thread that looks programs up (the GPU thread);
+	// workers only touch jobs, under job_mutex.
+	void CheckLookupThread() {
+		const auto      current = std::this_thread::get_id();
+		std::thread::id owner;
+		EXIT_IF(!lookup_thread.compare_exchange_strong(owner, current) && owner != current);
+	}
+
 	// Moves the background result for `key` into the cache. Without one, marks the key so that a
 	// later prefetch does not compile it a second time.
 	ProgramMap::iterator Adopt(const ProgramKey& key) {
@@ -539,15 +549,22 @@ struct PipelineCache::ProgramCache {
 				}
 				case Job::State::Done: result = std::move(job.result); break;
 				case Job::State::Dormant:
-				case Job::State::Queued:
+				case Job::State::Queued: {
 					// Not started yet: compiling here is faster than waiting behind other jobs.
 					std::erase(queue, &job);
 					job.state = Job::State::Running;
+					running++;
+					const auto hook = compile_hook;
 					lock.unlock();
-					result = CompileJob(job.recipes);
+					result = CompileJob(job.recipes, hook);
 					lock.lock();
 					stats.compiled += result ? result->permutations.size() : 0;
+					// Ends like a worker job, so that every waiter sees it finish.
+					job.state = Job::State::Done;
+					running--;
+					job_done.notify_all();
 					break;
+				}
 			}
 			job.state = Job::State::Taken;
 			job.result.reset();
@@ -562,15 +579,16 @@ struct PipelineCache::ProgramCache {
 		return programs.emplace(key, std::move(*result)).first;
 	}
 
+	// Wakes once the job has ended, whether its result is still there (Done) or adopted (Taken).
 	void WaitForJob(std::unique_lock<std::mutex>& lock, const Job& job) {
-		job_done.wait(lock, [&job] { return job.state == Job::State::Done; });
+		job_done.wait(lock, [&job] { return job.state != Job::State::Running; });
 	}
 
 	template <typename InputInfo>
 	Permutation CompileRecipe(const ShaderCacheRecipe&                           recipe,
 	                          std::optional<ShaderRecompiler::IR::ResourcePlan>& plan) const {
 		InputInfo input_info;
-		std::memcpy(&input_info, recipe.input.data(), sizeof(input_info));
+		EXIT_IF(!DecodeShaderCacheInput(recipe.input, input_info)); // Checked by RecipeKey.
 		// Translation reads the user data count, not the values.
 		const std::vector<uint32_t> user_data(recipe.user_data_count, 0u);
 		const auto options    = MakeOptions(recipe.hash, user_data, recipe.back_code, input_info);
@@ -585,7 +603,11 @@ struct PipelineCache::ProgramCache {
 	}
 
 	// Compiles every recipe of one source key; safe on any thread.
-	std::optional<SourceEntry> CompileJob(const ShaderCacheRecipes& recipes) const {
+	std::optional<SourceEntry> CompileJob(const ShaderCacheRecipes&    recipes,
+	                                      const std::function<void()>& hook) const {
+		if (hook) {
+			hook();
+		}
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 		std::vector<Permutation>                          permutations;
 		for (const auto& recipe: recipes) {
@@ -618,14 +640,11 @@ struct PipelineCache::ProgramCache {
 		    .user_data_count = recipe.user_data_count,
 		    .code_size       = static_cast<uint32_t>(recipe.code.size()),
 		};
-		if (recipe.input.size() != ShaderCacheInputSize(recipe.stage)) {
-			return std::nullopt;
-		}
 		switch (recipe.stage) {
 			case ShaderType::Pixel: {
 				ShaderPixelInputInfo info;
-				std::memcpy(&info, recipe.input.data(), sizeof(info));
-				if (info.input_num > std::size(info.interpolator_settings)) {
+				if (!DecodeShaderCacheInput(recipe.input, info) ||
+				    info.input_num > std::size(info.interpolator_settings)) {
 					return std::nullopt;
 				}
 				BuildStageStaticKey(info, key.static_state);
@@ -633,14 +652,16 @@ struct PipelineCache::ProgramCache {
 			}
 			case ShaderType::Compute: {
 				ShaderComputeInputInfo info;
-				std::memcpy(&info, recipe.input.data(), sizeof(info));
+				if (!DecodeShaderCacheInput(recipe.input, info)) {
+					return std::nullopt;
+				}
 				BuildStageStaticKey(info, key.static_state);
 				break;
 			}
 			default: {
 				ShaderVertexInputInfo info;
-				std::memcpy(&info, recipe.input.data(), sizeof(info));
-				if (info.logical_stage != recipe.stage || info.resources_num < 0 ||
+				if (!DecodeShaderCacheInput(recipe.input, info) ||
+				    info.logical_stage != recipe.stage || info.resources_num < 0 ||
 				    info.resources_num > ShaderVertexInputInfo::RES_MAX) {
 					return std::nullopt;
 				}
@@ -665,10 +686,7 @@ struct PipelineCache::ProgramCache {
 		recipe->hash            = params.hash;
 		recipe->code.assign(params.code.begin(), params.code.end());
 		recipe->back_code.assign(params.back_code.begin(), params.back_code.end());
-		auto input  = input_info;
-		input.stage = {};
-		recipe->input.resize(sizeof(input));
-		std::memcpy(recipe->input.data(), &input, sizeof(input));
+		recipe->input          = EncodeShaderCacheInput(input_info);
 		recipe->specialization = specialization;
 		std::lock_guard lock(job_mutex);
 		recipes.push_back(std::move(recipe));
@@ -716,11 +734,11 @@ struct PipelineCache::ProgramCache {
 			PipelineCacheLog("Shader cache: {} recorded programs in {} sources from {}",
 			                 recipes.size(), jobs.size(), path_text);
 		}
-		ShaderSetMapObserver(
-		    [](void* user, uint64_t hash) {
-			    static_cast<ProgramCache*>(user)->OnShaderMapped(hash);
-		    },
-		    this);
+		ShaderAddMapObserver(MapObserver, this);
+	}
+
+	static void MapObserver(void* user, uint64_t hash) {
+		static_cast<ProgramCache*>(user)->OnShaderMapped(hash);
 	}
 
 	// The game loaded a shader: compile its recorded programs before the first draw needs them.
@@ -772,8 +790,9 @@ struct PipelineCache::ProgramCache {
 			queue.pop_front();
 			job->state = Job::State::Running;
 			running++;
+			const auto hook = compile_hook;
 			lock.unlock();
-			auto result = CompileJob(job->recipes);
+			auto result = CompileJob(job->recipes, hook);
 			lock.lock();
 			stats.compiled_ahead += result ? result->permutations.size() : 0;
 			job->result = std::move(result);
@@ -814,16 +833,20 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
-		if (!cache_path.empty()) {
-			ShaderSetMapObserver(nullptr, nullptr);
-		}
+		ShaderRemoveMapObserver(MapObserver, this);
 		{
 			std::lock_guard lock(job_mutex);
+			// Jobs that never started stay dormant; running jobs end as Done and wake waiters.
+			for (auto* job: queue) {
+				job->state = Job::State::Dormant;
+			}
+			queue.clear();
 			for (auto& worker: workers) {
 				worker.request_stop();
 			}
 		}
 		job_ready.notify_all();
+		job_done.notify_all();
 		workers.clear();
 		if (!cache_path.empty()) {
 			PipelineCacheLog("Shader cache: {} programs compiled when needed, {} compiled ahead, "
@@ -848,6 +871,7 @@ struct PipelineCache::ProgramCache {
 
 	ProgramMap                                                  programs;
 	ProgramKey                                                  lookup_key;
+	std::atomic<std::thread::id>                                lookup_thread;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 
@@ -859,6 +883,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, std::vector<Job*>>     triggers;
 	std::deque<Job*>                                    queue;
 	uint32_t                                            running = 0;
+	std::function<void()>                               compile_hook;
 	ShaderCacheRecipes                                  recipes;
 	bool                                                dirty          = false;
 	bool                                                save_requested = false;
@@ -1055,11 +1080,17 @@ PipelineCache::ProgramStats PipelineCache::GetProgramStats() const {
 	std::lock_guard lock(m_program_cache->job_mutex);
 	auto            stats = m_program_cache->stats;
 	stats.recorded        = m_program_cache->recipes.size();
+	stats.in_flight       = m_program_cache->running;
 	return stats;
 }
 
 void PipelineCache::WaitForBackgroundCompilation() {
 	m_program_cache->WaitForBackgroundCompilation();
+}
+
+void PipelineCache::SetRecordedCompileHook(std::function<void()> hook) {
+	std::lock_guard lock(m_program_cache->job_mutex);
+	m_program_cache->compile_hook = std::move(hook);
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(

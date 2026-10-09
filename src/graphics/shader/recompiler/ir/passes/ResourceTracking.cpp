@@ -1015,6 +1015,8 @@ private:
 		Value condition;
 		bool positive;
 		LaneQuantifier lanes = LaneQuantifier::All;
+		// An EXEC branch leaves only the lanes that satisfy it active.
+		bool exec = false;
 	};
 
 	bool NonzeroOnEntry(Value value, const Block* block) const {
@@ -1108,6 +1110,8 @@ private:
 				const bool nonzero = kind == CFG::BranchCondition::ExecNonZero ||
 				                     kind == CFG::BranchCondition::VccNonZero;
 				if (!scalar && !zero && !nonzero) break;
+				edge.exec = kind == CFG::BranchCondition::ExecZero ||
+				            kind == CFG::BranchCondition::ExecNonZero;
 				// SCC is uniform. Negating a lane reduction exchanges all and any.
 				edge.lanes = scalar || (zero == edge.positive) ? LaneQuantifier::All
 				                                              : LaneQuantifier::Any;
@@ -1353,15 +1357,17 @@ private:
 		return 32u;
 	}
 
-	// Lanes reaching the incoming block of a phi arm satisfy every positive edge predicate
-	// on their way from the loop header; selects on those predicates take their true arm.
+	// Active lanes reaching the incoming block of a phi arm satisfy every positive edge
+	// predicate that holds for all lanes or sets EXEC on their way from the loop header;
+	// selects on those predicates take their true arm.
 	bool HoldsOnArm(Value predicate, const Inst& phi, uint32_t arm) const {
 		const auto* incoming = phi.PhiBlock(arm);
 		if (incoming == phi.Parent()) return false;
 		return GuardedOnEntry(
 		    incoming, [&](const Block* block) { return block == phi.Parent(); },
 		    [&](const EdgePredicate& edge) {
-			    return edge.positive && Implies(edge.condition, predicate);
+			    return edge.positive && (edge.lanes == LaneQuantifier::All || edge.exec) &&
+			           Implies(edge.condition, predicate);
 		    });
 	}
 

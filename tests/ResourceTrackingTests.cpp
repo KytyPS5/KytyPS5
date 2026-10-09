@@ -1068,8 +1068,8 @@ void TestBitScanKeyRange() {
 void TestBitScanMaskProof() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   // The host evaluates a bit scan's entry mask only when every back edge clears its bits.
-  enum class Next { GainsBitBehindAnd, ExecSelect };
-  for (const auto variant : {Next::GainsBitBehindAnd, Next::ExecSelect}) {
+  enum class Next { GainsBitBehindAnd, ExecSelect, VccSelect };
+  for (const auto variant : {Next::GainsBitBehindAnd, Next::ExecSelect, Next::VccSelect}) {
     Fixture fixture(ShaderType::Pixel);
     fixture.program.wave_size = 64u;
     auto *entry = fixture.block;
@@ -1108,9 +1108,12 @@ void TestBitScanMaskProof() {
         CFG::BranchCondition::SccZero);
     const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
     fixture.block = guard;
-    // s_and_saveexec + s_cbranch_execz: only lanes with `lane` set reach the sample.
-    guard->condition =
-        fixture.Emit(ValueOpcode::ConditionRef, {lane}, CFG::BranchCondition::ExecNonZero);
+    // s_and_saveexec + s_cbranch_execz leaves only lanes with `lane` set active at the sample;
+    // s_cbranch_vccnz keeps EXEC, so lanes without it reach the sample too.
+    guard->condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {lane},
+        variant == Next::VccSelect ? CFG::BranchCondition::VccNonZero
+                                   : CFG::BranchCondition::ExecNonZero);
     fixture.block = sample;
     const auto offset = fixture.Emit(ValueOpcode::IAdd32,
         {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(344u)});
@@ -1141,7 +1144,7 @@ void TestBitScanMaskProof() {
       next = fixture.Emit(ValueOpcode::BitwiseAnd32,
           {gained, fixture.Emit(ValueOpcode::SelectU32, {other_lane, gained, mask})});
     } else {
-      // Every lane reaching the back edge has `lane` set, so the select clears a bit.
+      // Under the EXEC guard every active lane has `lane` set, so the select clears a bit.
       next = fixture.Emit(ValueOpcode::SelectU32, {lane, cleared, gained});
     }
     phi.AddPhiOperand(sample, next);
@@ -1152,7 +1155,7 @@ void TestBitScanMaskProof() {
     Check(indirect.has_value() &&
               (indirect->selector_mask.Resolve() == initial.Resolve()) == proven,
           proven ? "a bit scan mask cleared under its EXEC guard lost its entry value"
-                 : "a bit scan mask that gains bits was evaluated from its entry value");
+                 : "a bit scan mask that may gain bits was evaluated from its entry value");
   }
 }
 

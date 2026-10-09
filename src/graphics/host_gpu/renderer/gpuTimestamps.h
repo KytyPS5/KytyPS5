@@ -121,6 +121,7 @@ private:
 	uint64_t               m_issued = 0;
 	std::atomic<uint64_t>  m_retired {0};
 	std::mutex             m_mutex;
+	std::mutex             m_store_mutex;
 	std::vector<Retry>     m_retries;
 	bool                   m_retrying     = false;
 	bool                   m_retry_queued = false;

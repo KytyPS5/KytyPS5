@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import statistics
 from pathlib import Path
 
@@ -35,13 +36,19 @@ def summarize(path, start, end):
                 # An interrupted process can leave one incomplete buffered row.
                 discarded += 1
                 continue
+            if not all(math.isfinite(value) for value in row.values()):
+                raise ValueError(f"{path}: non-finite measurement at CSV line {reader.line_num}")
             if start * 1000 <= row["elapsed_ms"] <= end * 1000:
                 rows.append(row)
     if len(rows) < 2:
         raise ValueError(f"{path}: fewer than two samples in the selected interval")
     elapsed = (rows[-1]["elapsed_ms"] - rows[0]["elapsed_ms"]) / 1000
+    if not math.isfinite(elapsed) or elapsed <= 0:
+        raise ValueError(f"{path}: selected interval must have positive elapsed time")
     # The first selected row closes an interval that starts outside the window.
     intervals = [row["frame_ms"] for row in rows[1:] if row["frame_ms"] > 0]
+    if not intervals:
+        raise ValueError(f"{path}: no positive frame intervals in the selected interval")
     present = [row["present_ms"] for row in rows]
     new_frames = sum(int(row["new_frame"]) for row in rows)
     result = {
@@ -90,7 +97,8 @@ def main():
     args = parser.parse_args()
     if args.start < 0 or args.end <= args.start:
         parser.error("use 0 <= start < end")
-    print(json.dumps([summarize(path, args.start, args.end) for path in args.traces], indent=2))
+    print(json.dumps([summarize(path, args.start, args.end) for path in args.traces],
+                     indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

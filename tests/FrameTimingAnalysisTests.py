@@ -12,6 +12,37 @@ spec.loader.exec_module(analysis)
 
 
 class FrameTimingAnalysisTests(unittest.TestCase):
+    def summarize_rows(self, rows):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            path.write_text(
+                "elapsed_ms,frame_ms,present_ms,new_frame,dlss_evaluated\n" + rows,
+                encoding="utf-8",
+            )
+            return analysis.summarize(path, 0, float("inf"))
+
+    def test_non_finite_measurements_are_rejected(self):
+        for value in ("nan", "inf", "-inf"):
+            for column in range(5):
+                with self.subTest(value=value, column=column):
+                    fields = ["10", "10", "1", "1", "0"]
+                    fields[column] = value
+                    with self.assertRaisesRegex(ValueError, "non-finite"):
+                        self.summarize_rows(
+                            "0,0,1,1,0\n" + ",".join(fields) + "\n20,10,1,1,0\n"
+                        )
+
+    def test_zero_or_negative_elapsed_time_is_rejected(self):
+        for rows in ("10,10,1,1,0\n10,10,1,1,0\n",
+                     "20,10,1,1,0\n10,10,1,1,0\n"):
+            with self.subTest(rows=rows):
+                with self.assertRaisesRegex(ValueError, "positive elapsed time"):
+                    self.summarize_rows(rows)
+
+    def test_no_positive_intervals_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "no positive frame intervals"):
+            self.summarize_rows("0,0,1,1,0\n10,0,1,1,0\n20,-1,1,1,0\n")
+
     def test_transition_before_window_does_not_count_as_stall(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"

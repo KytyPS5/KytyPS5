@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/RuntimeDescriptorFault.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include <deque>
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -38412,6 +38413,58 @@ TestCase Wave64CrossHalfLaneAndLds() {
   return test;
 }
 
+void CheckWave64ConditionRefHandoff() {
+  namespace IR = ShaderRecompiler::IR;
+  namespace E = ShaderRecompiler::Spirv::Emitter;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  IR::ResourceSpecialization specialization;
+  E::EmitterState state(program, {}, specialization);
+  E::ValueEmitContext lower(state);
+  E::ValueEmitContext upper(state);
+  upper.other_half = &lower;
+  upper.half = 1u;
+  for (bool predicate : {false, true}) {
+    IR::Inst condition(IR::ValueOpcode::ConditionRef);
+    condition.SetArg(0, IR::Value(predicate));
+    const auto predicate_id = state.builder.AllocateId();
+    lower.Define(condition, predicate_id);
+    Require("Wave64ConditionRefHandoff", "condition handoff",
+            E::EmitConditionRef(upper, condition) == predicate_id,
+            "upper wave half replaced the existing predicate with a literal");
+    lower.definitions.clear();
+  }
+}
+
+TestCase Wave64FalseScalarConditionHighHalf() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "Wave64FalseScalarConditionHighHalf";
+  test.initial.assign(320u, 0xdeadbeefu);
+  test.initial[64] = 31u;
+  test.expected = test.initial;
+  std::fill_n(test.expected.begin(), 64u, 11u);
+  auto& code = test.code;
+  AppendVMovU32(&code, 1u, 7u);
+  AppendSmemLoadOpcode(&code, 0x08u, 20u, 256u);
+  code.push_back(EncodeSopc(0x06u, 20u, InlineU32(7u)));
+  const auto branch = code.size();
+  code.push_back(0u);
+  AppendVMovU32(&code, 1u, 11u);
+  code[branch] = EncodeSopp(0x05u, static_cast<u32>(code.size() - branch - 1u));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1u, 0u, 0u);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_BUFFER_LOAD_DWORD, O::S_CMP_EQ_U32,
+                  O::S_CBRANCH_SCC1, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.has_compute_info = true;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.threads_num[0] = 64u;
+  test.compute_info.threads_num[1] = 1u;
+  test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1u;
+  return test;
+}
+
 TestCase Wave64RawMasksAndScalarBranch() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -50798,6 +50851,13 @@ if (argc == 1) {
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
     RunCase(&vulkan, BufferStoreFormatXAddTidUsesLaneIndex());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-condition-ref-provenance-only") == 0) {
+    CheckWave64ConditionRefHandoff();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64FalseScalarConditionHighHalf());
+    std::puts("KYTY_WAVE64_CONDITION_REF_PROVENANCE_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {

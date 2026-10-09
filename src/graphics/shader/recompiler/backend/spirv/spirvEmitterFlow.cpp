@@ -711,7 +711,8 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const bool split_compute = ctx.state.compute_execution.IsSplitWave64();
 	if (ctx.other_half == nullptr && !split_compute) return ctx.Arg(inst, 0);
 	// Packed graphics and physical compute halves share one scalar branch decision.
-	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	if (ctx.other_half != nullptr && ctx.half != 0)
+		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction ||
 	    (split_compute && (kind == CFG::BranchCondition::SccZero ||

@@ -1316,6 +1316,7 @@ struct TestCase {
   std::vector<u32> storage_image_r32ui;
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
+  std::vector<std::pair<std::string, size_t>> spirv_counts;
   std::vector<std::string> forbidden_spirv;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
@@ -1340,6 +1341,7 @@ struct TestCase {
   std::vector<u32> expected_gds;
   // Pages whose BDA fault bit and fault summary bit the dispatch must set.
   std::vector<uint64_t> expected_fault_pages;
+  std::vector<uint64_t> fault_free_pages;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
@@ -1586,7 +1588,8 @@ void CheckRectListShaders() {
 }
 
 void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
-  if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
+  if (test.required_spirv.empty() && test.forbidden_spirv.empty() &&
+      test.spirv_counts.empty()) {
     return;
   }
 
@@ -1606,6 +1609,13 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
     if (text.find(forbidden) != std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
            std::string("found forbidden text: ") + forbidden);
+    }
+  }
+  for (const auto &[counted, expected] : test.spirv_counts) {
+    const auto actual = CountText(text, counted);
+    if (actual != expected) {
+      Fail(test.name, "SPIR-V disassembly",
+           counted + " count=" + std::to_string(actual) + ", expected=" + std::to_string(expected));
     }
   }
 }
@@ -15879,6 +15889,9 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
+      cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
+                       BufferCache::BDA_ZERO_PAGE_SLOT * sizeof(vk::DeviceAddress),
+                       sizeof(vk::DeviceAddress), &m_bda_zero_page.device_address);
       for (const auto &[guest_base, backing] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
@@ -18709,6 +18722,7 @@ private:
     if (m_device != nullptr) {
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
       DestroyBuffer(&m_fault_buffer);
+      DestroyBuffer(&m_bda_zero_page);
       DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
@@ -18934,6 +18948,8 @@ private:
                        vk::BufferUsageFlagBits::eTransferDst;
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
+    m_bda_zero_page = CreateStorageBuffer(
+        shader_name, {}, BufferCache::CACHING_PAGESIZE / sizeof(u32), true);
     m_fault_buffer = CreateDeviceBuffer(shader_name, BufferCache::FAULT_BUFFER_SIZE,
                                         usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
@@ -19013,6 +19029,7 @@ private:
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
+  Buffer m_bda_zero_page;
   GraphicContext m_runtime_context{};
   vk::DeviceSize m_largest_poisoned_memory = 0;
   inline static VulkanHarness *s_poisoning = nullptr;
@@ -19185,6 +19202,12 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
             "the faulting page has no fault bit");
     Require(test.name, "fault readback", (values[1] >> (group & 31)) & 1u,
             "the faulting page has no fault summary bit");
+  }
+  for (const auto page : test.fault_free_pages) {
+    const std::array<uint64_t, 1> words{page >> 5};
+    const auto values = vulkan->ReadFaultWords(test.name, words);
+    Require(test.name, "fault readback", ((values[0] >> (page & 31)) & 1u) == 0,
+            "a page without a faulting access has a fault bit");
   }
   if (!test.expected_storage_image_rgba.empty()) {
     auto image_actual = vulkan->ReadImage(test.name, &storage_image);
@@ -31109,6 +31132,95 @@ TestCase FlatLoadRecordsFaultSummary() {
   return test;
 }
 
+TestCase BdaLoadsLookUpPagesWithoutBranches() {
+  using O = ShaderOpcode;
+  // Block-level BDA loads look their pages up without a branch and check their faults later;
+  // only the dword after an unaligned FLAT address keeps a checked lookup.
+  constexpr uint64_t GuestBase = 0x10000;
+  constexpr uint64_t Unmapped = 0x0000002f00000000ull;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 8, GuestBase);
+  AppendSMovLiteral(&code, 9, 0);
+  code.push_back(EncodeSop2(0x00, 8, 8, 4)); // the group ID keeps the base dynamic
+  code.push_back(EncodeSmem0(0x02, 12, 4));  // S_LOAD_DWORDX4 s[12:15], s[8:9]
+  code.push_back(EncodeSmem1(0, 0x7d));
+  AppendVMovU32(&code, 20, static_cast<u32>(Unmapped));
+  AppendVMovU32(&code, 21, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 0));
+  code.push_back(EncodeFlat1(4, 0x7d, 0, 20));
+  for (u32 i = 0; i < 4; ++i) {
+    AppendStoreSgpr(&code, 12 + i, i);
+  }
+  AppendStoreVgpr(&code, 4, 4);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BdaLoadsLookUpPagesWithoutBranches";
+  test.code = std::move(code);
+  test.initial.resize(20, 0x55555555u);
+  for (u32 i = 0; i < 4; ++i) {
+    test.initial[16 + i] = 0x11111111u * (i + 1);
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < 4; ++i) {
+    test.expected[i] = test.initial[16 + i];
+  }
+  test.expected[4] = 0;
+  test.bda_mappings = {{GuestBase, 64}};
+  test.expected_fault_pages = {BufferCache::PageIndex(Unmapped)};
+  test.required_spirv = {"get_bda_pointer"};
+  test.spirv_counts = {{"OpFunctionCall %ulong %get_bda_pointer", 1}};
+  test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_LOAD_DWORDX4, O::V_MOV_B32,
+                  O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase IndirectBufferLoadsLookUpPagesWithoutBranches() {
+  // Loads through run-time descriptors guard each dword with EXEC and its bounds, without a
+  // branch or a checked page lookup.
+  auto test = BufferLoadsGpuSelectedDescriptors(1);
+  test.name = "IndirectBufferLoadsLookUpPagesWithoutBranches";
+  test.forbidden_spirv = {"OpFunctionCall %ulong %get_bda_pointer"};
+  return test;
+}
+
+TestCase FlatLoadOfInactiveLaneRecordsNoFault() {
+  using O = ShaderOpcode;
+  // The lookup also runs for inactive lanes, which keep their value and record no fault.
+  constexpr uint64_t Unmapped = 0x0000003f00000000ull;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0x12345678u);
+  AppendVMovU32(&code, 20, static_cast<u32>(Unmapped));
+  AppendVMovU32(&code, 21, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 0)); // V_CMP_NE_U32 vcc, 0, v0
+  code.push_back(EncodeSop1(0x24, 2, 106));          // S_AND_SAVEEXEC_B64 s[2:3], vcc
+  code.push_back(EncodeFlat0(0x0c, 0));
+  code.push_back(EncodeFlat1(1, 0x7d, 0, 20));
+  code.push_back(EncodeSop1(0x04, 126, 2)); // S_MOV_B64 exec, s[2:3]
+  AppendStoreVgpr(&code, 1, 0);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "FlatLoadOfInactiveLaneRecordsNoFault";
+  test.code = std::move(code);
+  test.initial = {0u};
+  test.expected = {0x12345678u};
+  test.bda_mappings = {{0, 0}};
+  test.fault_free_pages = {BufferCache::PageIndex(Unmapped)};
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_NE_U32, O::S_AND_SAVEEXEC_B64, O::FLAT_LOAD_DWORD,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase FlatSubdwordLoadsApplyByteOffset() {
   using O = ShaderOpcode;
 
@@ -37022,6 +37134,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatLoadVariants);
   AddCase(FlatSubdwordLoadsApplyByteOffset);
   AddCase(FlatLoadRecordsFaultSummary);
+  AddCase(BdaLoadsLookUpPagesWithoutBranches);
+  AddCase(FlatLoadOfInactiveLaneRecordsNoFault);
+  AddCase(IndirectBufferLoadsLookUpPagesWithoutBranches);
   cases.push_back(GlobalLoadShortD16Captured(32));
   cases.push_back(GlobalLoadShortD16Captured(64));
   AddCase(FlatLoadShortD16AddressSegments);

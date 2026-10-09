@@ -304,6 +304,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		}
 		ctx.state.lane_half = 0;
 	}
+	FlushDeferredBdaFaults(ctx.state);
 }
 
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {

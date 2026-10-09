@@ -779,37 +779,35 @@ void TestConcurrentColdUploads() {
   auto &tracker = harness.tracker;
   auto *memory = AllocateFixedGuestRange(region_size * 2, region_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
-  std::counting_semaphore<2> start{0};
-  std::counting_semaphore<2> upload_entered{0};
-  std::counting_semaphore<2> finish_upload{0};
-  std::vector<std::jthread> workers;
+  // Uploads never overlap. A cold writable upload holding one region must not stop
+  // another thread from creating a disjoint region.
+  bool second_entered = false;
+  std::atomic_bool second_dirty{false};
   for (const auto page : {address, address + region_size}) {
-    workers.emplace_back([&, page] {
-      start.acquire();
-      uint32_t ranges = 0;
-      tracker.ForEachUploadRange(
-          page, page_size, true,
-          [&](uint64_t upload_address, uint64_t upload_size) noexcept {
-            Check(upload_address == page && upload_size == page_size,
-                  "concurrent cold upload lost its dirty page");
-            ranges++;
-          },
-          [&]() noexcept {
-            Check(ranges == 1, "concurrent cold upload skipped its dirty page");
-            upload_entered.release();
-            finish_upload.acquire();
+    uint32_t ranges = 0;
+    tracker.ForEachUploadRange(
+        page, page_size, true,
+        [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+          Check(upload_address == page && upload_size == page_size,
+                "cold upload lost its dirty page");
+          ranges++;
+        },
+        [&]() noexcept {
+          Check(ranges == 1, "cold upload skipped its dirty page");
+          if (page != address) {
+            return;
+          }
+          std::binary_semaphore query_finished{0};
+          std::jthread query([&] {
+            second_dirty.store(tracker.IsRegionCpuModified(address + region_size, page_size),
+                               std::memory_order_relaxed);
+            query_finished.release();
           });
-    });
+          second_entered = query_finished.try_acquire_for(std::chrono::seconds(5));
+        });
   }
-  start.release(2);
-  const bool first_entered = upload_entered.try_acquire_for(std::chrono::seconds(5));
-  const bool second_entered = upload_entered.try_acquire_for(std::chrono::seconds(5));
-  finish_upload.release(2);
-  for (auto &worker : workers) {
-    worker.join();
-  }
-  Check(first_entered && second_entered,
-        "cold writable uploads serialized disjoint regions");
+  Check(second_entered && second_dirty.load(std::memory_order_relaxed),
+        "cold writable upload serialized a disjoint region");
   for (const auto page : {address, address + region_size}) {
     Check(!tracker.IsRegionCpuModified(page, page_size) &&
               tracker.IsRegionGpuModified(page, page_size) &&
@@ -1113,6 +1111,13 @@ void TestFullRegionGpuUnmarkBatching() {
     Libs::Graphics::TrackingSpinLock lock;
     lock.lock();
     lock.lock();
+  } else if (std::strcmp(name, "overlapping-gpu-dirty-owners") == 0) {
+    tracker.ForEachUploadRange(
+        address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept {
+          std::thread worker([&] { tracker.UnmarkRegionAsGpuModified(address, page_size); });
+          worker.join();
+        });
   } else if (std::strcmp(name, "non-owner-tracking-unlock") == 0) {
     Libs::Graphics::TrackingSpinLock lock;
     lock.lock();
@@ -1179,6 +1184,9 @@ void TestFatalPaths() {
                            "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
     CheckDeathCase(name);
   }
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+  CheckDeathCase("overlapping-gpu-dirty-owners");
+#endif
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX

@@ -29,6 +29,23 @@ void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr,
 	}
 }
 
+MemoryTracker::OwnerScope::OwnerScope(MemoryTracker& tracker) noexcept {
+	const auto current  = std::this_thread::get_id();
+	auto       expected = std::thread::id {};
+	if (tracker.m_owner_thread.compare_exchange_strong(expected, current,
+	                                                   std::memory_order_acquire)) {
+		m_tracker = &tracker;
+	} else if (expected != current) {
+		EXIT("MemoryTracker: GPU-dirty owner operations overlap on two threads\n");
+	}
+}
+
+MemoryTracker::OwnerScope::~OwnerScope() {
+	if (m_tracker != nullptr) {
+		m_tracker->m_owner_thread.store(std::thread::id {}, std::memory_order_release);
+	}
+}
+
 void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                               const char* operation) {
 	ValidateRange(vaddr, size);
@@ -98,6 +115,7 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	const OwnerScope owner(*this);
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		if (!manager->IsModifiedUnlocked<DirtySource::Gpu>(offset, bytes)) {
 			return;

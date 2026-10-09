@@ -258,19 +258,22 @@ struct ZeroTailDraws {
 	uint32_t chunk       = 0;
 	uint32_t rest        = 0;
 
-	// Calls draw(first index in the copy, index count) for each draw, in order. Without a plan
-	// (rest 0), one draw of count indices.
+	// Calls draw(first index in the copy, index count, first instance, instance count) for each
+	// draw, in order. Without a plan (rest 0), one draw of count indices and all instances; with
+	// one, each instance runs all its draws before the next, as one instanced draw does.
 	template <typename F>
-	void ForEachDraw(uint32_t count, F&& draw) const {
+	void ForEachDraw(uint32_t count, uint32_t instances, F&& draw) const {
 		if (rest == 0) {
-			draw(0u, count);
+			draw(0u, count, 0u, instances);
 			return;
 		}
-		draw(0u, first_count);
-		for (uint32_t left = rest; left != 0;) {
-			const auto size = std::min(left, chunk);
-			draw(copy_count - size, size);
-			left -= size;
+		for (uint32_t instance = 0; instance < instances; instance++) {
+			draw(0u, first_count, instance, 1u);
+			for (uint32_t left = rest; left != 0;) {
+				const auto size = std::min(left, chunk);
+				draw(copy_count - size, size, instance, 1u);
+				left -= size;
+			}
 		}
 	}
 };

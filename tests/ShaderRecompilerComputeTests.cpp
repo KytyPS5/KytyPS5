@@ -1285,9 +1285,10 @@ void ExpectFatal(const char *name, Function function) {
 }
 #endif
 
-// The draws of a long zero tail read the indices of the draw in order, from the copy only, and
-// keep list primitives whole.
+// The draws of a long zero tail read the indices of the draw in order, from the copy only, keep
+// list primitives whole, and run each instance completely before the next one.
 void CheckZeroTailDraws() {
+  constexpr uint32_t instances = 3;
   struct Case {
     uint32_t count, head, period;
     uint64_t capacity;
@@ -1302,24 +1303,31 @@ void CheckZeroTailDraws() {
     for (uint32_t i = 0; i < c.head && i < copy.size(); i++) {
       copy[i] = i + 1;
     }
-    std::vector<uint32_t> drawn;
+    // (instance, index) in execution order; an instanced draw runs its instances in order.
+    std::vector<std::pair<uint32_t, uint32_t>> drawn;
     bool whole = true;
     bool inside = true;
-    draws.ForEachDraw(c.count, [&](uint32_t first, uint32_t count) {
-      whole = whole && (count % c.period == 0 || drawn.size() + count == c.count);
-      inside = inside && uint64_t{first} + count <= copy.size();
-      for (uint32_t i = 0; inside && i < count; i++) {
-        drawn.push_back(copy[first + i]);
-      }
-    });
-    bool same = drawn.size() == c.count;
-    for (uint32_t i = 0; same && i < c.count; i++) {
-      same = drawn[i] == (i < c.head ? i + 1 : 0u);
+    draws.ForEachDraw(c.count, instances,
+                      [&](uint32_t first, uint32_t count, uint32_t instance, uint32_t n) {
+                        whole = whole && (count % c.period == 0 ||
+                                          drawn.size() % c.count + count == c.count);
+                        inside = inside && uint64_t{first} + count <= copy.size();
+                        for (uint32_t k = 0; inside && k < n; k++) {
+                          for (uint32_t i = 0; i < count; i++) {
+                            drawn.emplace_back(instance + k, copy[first + i]);
+                          }
+                        }
+                      });
+    bool same = drawn.size() == uint64_t{c.count} * instances;
+    for (uint64_t i = 0; same && i < drawn.size(); i++) {
+      const auto index = static_cast<uint32_t>(i % c.count);
+      same = drawn[i].first == i / c.count &&
+             drawn[i].second == (index < c.head ? index + 1 : 0u);
     }
     Require("ZeroTailDraws", "draws",
             planned && draws.copy_count <= c.capacity && whole && inside && same,
-            "the zero tail draws missed or reordered indices, split a primitive or read past "
-            "the copy");
+            "the zero tail draws missed or reordered indices or instances, split a primitive or "
+            "read past the copy");
   }
   ZeroTailDraws draws;
   Require("ZeroTailDraws", "capacity",

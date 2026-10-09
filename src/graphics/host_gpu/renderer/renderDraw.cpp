@@ -1071,10 +1071,12 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kRectListLegacy:
 		case Prospero::PrimitiveType::kPatch:
 			if (draw.IsIndexed()) {
-				emit.zero_tail.ForEachDraw(draw.index_count, [&](uint32_t first, uint32_t count) {
-					vk_buffer.drawIndexed(count, draw.instance_count, first, emit.vertex_offset,
-					                      emit.first_instance);
-				});
+				emit.zero_tail.ForEachDraw(
+				    draw.index_count, draw.instance_count,
+				    [&](uint32_t first, uint32_t count, uint32_t instance, uint32_t instances) {
+					    vk_buffer.drawIndexed(count, instances, first, emit.vertex_offset,
+					                          emit.first_instance + instance);
+				    });
 			} else {
 				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
 				               emit.first_instance);
@@ -1083,12 +1085,14 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
 			if (draw.IsIndexed()) {
-				emit.zero_tail.ForEachDraw(draw.index_count, [&](uint32_t first, uint32_t count) {
-					for (uint32_t i = 0; i < count; i += 4) {
-						vk_buffer.drawIndexed(4, draw.instance_count, first + i, emit.vertex_offset,
-						                      emit.first_instance);
-					}
-				});
+				emit.zero_tail.ForEachDraw(
+				    draw.index_count, draw.instance_count,
+				    [&](uint32_t first, uint32_t count, uint32_t instance, uint32_t instances) {
+					    for (uint32_t i = 0; i < count; i += 4) {
+						    vk_buffer.drawIndexed(4, instances, first + i, emit.vertex_offset,
+						                          emit.first_instance + instance);
+					    }
+				    });
 			} else {
 				for (uint32_t i = 0; i < draw.index_count; i += 4) {
 					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,

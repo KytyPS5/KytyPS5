@@ -21,10 +21,12 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 	}
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-	                          ConstantU32(state, spv::ScopeSubgroup), source, target);
+	                          ConstantU32(state, spv::ScopeSubgroup), source,
+	                          EmitPhysicalSubgroupLane(state, target));
 	const auto source_exec = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-	                          ConstantU32(state, spv::ScopeSubgroup), exec, target);
+	                          ConstantU32(state, spv::ScopeSubgroup), exec,
+	                          EmitPhysicalSubgroupLane(state, target));
 	const auto source_active =
 	    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
 	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
@@ -1335,7 +1337,8 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
+	                          ConstantU32(state, spv::ScopeSubgroup), atomic,
+	                          EmitPhysicalSubgroupLane(state, source_lane));
 	return result;
 }
 
@@ -1470,7 +1473,8 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
 		                          ConstantU32(state, spv::ScopeSubgroup), predicate);
-		state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), result, ballot, word);
+		state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), result,
+		                          EmitGuestBallot(state, ballot), word);
 		return result;
 	};
 	// RDNA2 permutes independently within each 32-lane half. Intersect the source
@@ -1498,7 +1502,8 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                  EmitFindUMsb32(state, writers)), lane);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), source);
+	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0),
+	                          EmitPhysicalSubgroupLane(state, source));
 	return Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
 }
 

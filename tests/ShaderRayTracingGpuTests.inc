@@ -83,6 +83,42 @@ TestCase FlatStackApertures(u32 wave_size) {
   return test;
 }
 
+// Little Nightmares builds a stack address's high dword with an SDWA word-1 select of the aperture
+// halves (DST_U = PAD), so the low half is zero and the whole dword names the aperture.
+TestCase FlatStackSdwaApertureHalves(u32 wave_size) {
+  TestCase test;
+  test.name = wave_size == 32 ? "FlatStackSdwaApertureHalves32" : "FlatStackSdwaApertureHalves64";
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 86, 0x70008000u);
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 0));
+  for (u32 pass = 0; pass < 2; ++pass) {
+    // VCC set picks the private half (0x7000), clear picks the shared half (0x8000).
+    code.push_back(EncodeSop1(0x04, 106, pass == 0 ? 126u : InlineU32(0)));
+    code.push_back((0x01u << 25) | (21u << 17) | (86u << 9) | 0xf9u);
+    code.push_back(86u | (5u << 8) | (4u << 16) | (1u << 23) | (5u << 24) | (1u << 31));
+    AppendVMovU32(&code, 30, pass == 0 ? 500 : 600);
+    code.push_back(EncodeVop2(0x25, 30, Vgpr(0), 30));
+    code.insert(code.end(), {EncodeFlat0(0x1c, 0), EncodeFlat1(0, 0x7d, 30, 20),
+                             EncodeFlat0(0x0c, 0), EncodeFlat1(26, 0x7d, 0, 20)});
+    AppendStoreVgprAtLaneDwordOffset(&code, 26, 0, pass * wave_size);
+  }
+  AppendEnd(&code);
+  test.expected.resize(2 * wave_size);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    test.expected[lane] = 500 + lane;
+    test.expected[wave_size + lane] = 600 + lane;
+  }
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.scratch_size_dwords = wave_size;
+  test.compute_info.lds_size_dwords = wave_size;
+  test.has_compute_info = true;
+  test.forbidden_spirv = {"get_bda_pointer"};
+  return test;
+}
+
 TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wide = false) {
   TestCase test;
   test.name = barycentrics ? (sorted ? "BvhBarycentricSorted" : "BvhBarycentricUnsorted")

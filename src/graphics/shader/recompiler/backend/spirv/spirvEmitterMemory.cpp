@@ -653,7 +653,8 @@ void ForEachLocalFlatAccess(ValueEmitContext& ctx, const IR::Inst& inst, Fn&& em
 		const auto resource = PrepareMemoryResourceAccess(state, mem);
 		const auto aperture = kind == IR::ResourceKind::Scratch ? Decoder::PrivateApertureHigh
 		                                                       : Decoder::SharedApertureHigh;
-		const auto selected = Binary(state, spv::OpIEqual, TypeBool(state), high, ConstantU32(state, aperture));
+		const auto selected =
+		    Binary(state, spv::OpIEqual, TypeBool(state), high, ConstantU32(state, aperture));
 		const auto valid = AndCondition(state, aligned,
 		    AndCondition(state, selected, EmitMemoryElementInBounds(state, resource, index)));
 		emit(resource, index, valid);

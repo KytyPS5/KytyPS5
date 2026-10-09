@@ -45222,6 +45222,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
   cases.push_back(FlatStackApertures(64));
+  cases.push_back(FlatStackSdwaApertureHalves(32));
+  cases.push_back(FlatStackSdwaApertureHalves(64));
   cases.push_back(BvhIntersections(true, true, 1));
   cases.push_back(BvhIntersections(true, true, 0, true));
   for (bool barycentrics : {false, true}) {
@@ -51347,6 +51349,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, FlatStackApertures(32));
     RunCase(&vulkan, FlatStackApertures(64));
+    RunCase(&vulkan, FlatStackSdwaApertureHalves(32));
+    RunCase(&vulkan, FlatStackSdwaApertureHalves(64));
     RunCase(&vulkan, BvhIntersections(true, true, 1));
     RunCase(&vulkan, BvhIntersections(true, true, 0, true));
     for (bool barycentrics : {false, true}) {

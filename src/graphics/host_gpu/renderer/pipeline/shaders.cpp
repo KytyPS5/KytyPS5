@@ -143,6 +143,9 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	create.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
+	if (!pipeline.uses_push_descriptors) {
+		DescriptorHeap::RegisterLayout(pipeline.descriptor_set_layout, bindings);
+	}
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};

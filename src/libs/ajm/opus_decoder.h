@@ -2,6 +2,9 @@
 
 #include "libs/ajm/decoder.h"
 #include "libs/ajm/ffmpeg_decoder_common.h"
+#include "libs/gameTrace.h"
+#include <atomic>
+#include <vector>
 
 #include <algorithm>
 #include <cstring>
@@ -26,11 +29,13 @@ public:
 	AjmOpusDecoder(uint32_t max_channels, AjmSampleEncoding encoding)
 	    : AjmDecoder(0, 48000, encoding), m_max_channels(max_channels) {}
 
-	~AjmOpusDecoder() override { avcodec_free_context(&m_context); avcodec_free_context(&m_alt); }
+	~AjmOpusDecoder() override { avcodec_free_context(&m_context); avcodec_free_context(&m_alt);
+		avcodec_free_context(&m_s1); }
 
 	AjmDecodeResult Initialize(const void* parameters, size_t parameters_size) override {
 		avcodec_free_context(&m_context);
 		avcodec_free_context(&m_alt);
+		avcodec_free_context(&m_s1);
 		Reset();
 		auto result = MakeResult();
 		// PS5 AJM Opus init parameter block is not the PS4 layout the original code assumed
@@ -72,6 +77,7 @@ public:
 		if (m_context != nullptr) {
 			avcodec_flush_buffers(m_context);
 			if (m_alt != nullptr) avcodec_flush_buffers(m_alt);
+			if (m_s1 != nullptr) avcodec_flush_buffers(m_s1);
 		}
 		m_total_decoded_samples = 0;
 		m_frames_per_packet     = 0;
@@ -144,7 +150,9 @@ public:
 				break;
 			}
 
-			AVFrame* frame = DecodePacket(data, packet_size, &result);
+			const uint32_t ms_end = MultistreamSplit(data, packet_size);
+			AVFrame* frame = ms_end != 0 ? DecodeMultistream(data, packet_size, ms_end, &result) : DecodePacket(data, packet_size, &result);
+			TraceJob(ms_end, packet_size);
 			if (frame == nullptr) {
 				break;
 			}
@@ -218,7 +226,84 @@ public:
 	}
 
 private:
-	AVFrame* DecodePacket(const uint8_t* data, uint32_t size, AjmDecodeResult* result) {
+	// 2ch instances carry two uncoupled mono Opus streams: stream0 in self-delimited framing
+	// (TOC, length, frame; RFC 6716 App. B) followed by stream1 as a normal packet.
+	// Returns the stream0 end offset, or 0 if the packet does not look like that.
+	[[nodiscard]] uint32_t MultistreamSplit(const uint8_t* d, uint32_t size) const {
+		if (m_channels != 2 || size < 4 || (d[0] & 3u) != 0) {
+			return 0;
+		}
+		uint32_t lb  = 1;
+		uint32_t len = d[1];
+		if (len >= 252) {
+			len = d[1] + 4u * d[2];
+			lb  = 2;
+		}
+		const uint32_t end = 1 + lb + len;
+		if (end >= size || (d[end] >> 3u) != (d[0] >> 3u) || (d[end] & 4u) != 0 ||
+		    (d[end] & 3u) != 0) {
+			return 0;
+		}
+		return end;
+	}
+
+	AVFrame* DecodeMultistream(const uint8_t* d, uint32_t size, uint32_t end,
+	                           AjmDecodeResult* result) {
+		const uint32_t lb = (d[1] >= 252) ? 2 : 1;
+		std::vector<uint8_t> p0(d + 1 + lb, d + end);
+		p0.insert(p0.begin(), d[0]);
+		AVCodecContext* c0 = ContextFor(1);
+		if (m_s1 == nullptr) {
+			const auto* codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
+			m_s1              = codec != nullptr ? avcodec_alloc_context3(codec) : nullptr;
+			if (m_s1 != nullptr) {
+				av_channel_layout_default(&m_s1->ch_layout, 1);
+				m_s1->sample_rate = 48000;
+				if (avcodec_open2(m_s1, codec, nullptr) < 0) avcodec_free_context(&m_s1);
+			}
+		}
+		if (c0 == nullptr || m_s1 == nullptr) {
+			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
+			return nullptr;
+		}
+		AVFrame* a = DecodePacket(p0.data(), static_cast<uint32_t>(p0.size()), result, c0);
+		if (a == nullptr) return nullptr;
+		AVFrame* b = DecodePacket(d + end, size - end, result, m_s1);
+		if (b == nullptr) { av_frame_free(&a); return nullptr; }
+		const int n = std::min(a->nb_samples, b->nb_samples);
+		const size_t bps = AjmBytesPerSample(m_sample_encoding);
+		AVFrame* out = av_frame_alloc();
+		out->format = AjmSampleEncodingToAvFormat(m_sample_encoding);
+		out->sample_rate = 48000;
+		out->nb_samples = n;
+		av_channel_layout_default(&out->ch_layout, 2);
+		if (av_frame_get_buffer(out, 0) < 0) {
+			av_frame_free(&out); av_frame_free(&a); av_frame_free(&b);
+			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
+			return nullptr;
+		}
+		for (int i = 0; i < n; i++) {
+			std::memcpy(out->data[0] + (static_cast<size_t>(i) * 2) * bps, a->data[0] + static_cast<size_t>(i) * bps, bps);
+			std::memcpy(out->data[0] + (static_cast<size_t>(i) * 2 + 1) * bps, b->data[0] + static_cast<size_t>(i) * bps, bps);
+		}
+		av_frame_free(&a);
+		av_frame_free(&b);
+		return out;
+	}
+
+	AVCodecContext* m_s1 = nullptr;
+
+	void TraceJob(uint32_t ms_end, uint32_t packet_size) const {
+		if (!GameTrace::Enabled()) return;
+		static std::atomic_int s_n {0};
+		const int              k = s_n.fetch_add(1);
+		if (k < 60) {
+			GameTrace::Line("AJM OPUS pkt#%d instance_ch=%u packet=%u multistream_end=%u", k, m_channels, packet_size, ms_end);
+		}
+	}
+
+	AVFrame* DecodePacket(const uint8_t* data, uint32_t size, AjmDecodeResult* result,
+	                      AVCodecContext* force_ctx = nullptr) {
 		AVPacket* packet = av_packet_alloc();
 		AVFrame*  frame  = av_frame_alloc();
 		if (packet == nullptr || frame == nullptr ||
@@ -229,7 +314,7 @@ private:
 			return nullptr;
 		}
 		std::memcpy(packet->data, data, size);
-		AVCodecContext* ctx = ContextFor((data[0] & 4u) != 0 ? 2u : 1u);
+		AVCodecContext* ctx = force_ctx != nullptr ? force_ctx : ContextFor((data[0] & 4u) != 0 ? 2u : 1u);
 		int rc = ctx != nullptr ? avcodec_send_packet(ctx, packet) : -1;
 		av_packet_free(&packet);
 		if (rc >= 0) {
@@ -261,6 +346,7 @@ private:
 				m_alt->sample_rate = 48000;
 				if (avcodec_open2(m_alt, codec, nullptr) < 0) {
 					avcodec_free_context(&m_alt);
+		avcodec_free_context(&m_s1);
 				}
 			}
 		}

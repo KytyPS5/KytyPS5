@@ -554,6 +554,8 @@ std::optional<u64> DefinitionBound(const DecodedFunction& function, LazyControlF
 		case ZYDIS_MNEMONIC_MOVZX:
 			if (register_source && !IsHighByteRegister(source.reg.value)) {
 				bound = source_bound(source.reg.value);
+			} else if (source.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+				bound = WidthMask(source.size);
 			}
 			break;
 		case ZYDIS_MNEMONIC_AND:
@@ -647,7 +649,10 @@ std::optional<JumpTableIndex> BoundJumpTableIndex(const DecodedFunction& functio
 					max_index = bound - 1;
 				}
 			}
-			if (max_index && IsSameRegister(first.reg.value, index_reg)) {
+			// A narrower compare leaves upper index bits unchecked; a 64-bit index needs 32.
+			const bool covers_index =
+			    RegisterWidth(first.reg.value) >= std::min<u16>(RegisterWidth(index_reg), 32);
+			if (max_index && covers_index && IsSameRegister(first.reg.value, index_reg)) {
 				if (compared_reg && *compared_reg != first.reg.value) {
 					return std::nullopt;
 				}
@@ -658,15 +663,27 @@ std::optional<JumpTableIndex> BoundJumpTableIndex(const DecodedFunction& functio
 				continue;
 			}
 		}
-		std::erase_if(guards,
-		              [&](const Guard& guard) { return DefinesRegister(decoded, guard.reg); });
+		const auto erase_guards = [&] {
+			std::erase_if(guards,
+			              [&](const Guard& guard) { return DefinesRegister(decoded, guard.reg); });
+		};
 		if (!DefinesRegister(decoded, index_reg)) {
+			erase_guards();
 			continue;
 		}
 		const auto source = ZeroExtendingSource(decoded);
+		const auto bound  = source ? std::optional {WidthMask(RegisterWidth(*source))}
+		                           : DefinitionBound(function, graph, function_start, decoded,
+		                                             index_reg, MaxBoundDepth);
+		// A narrower guard holds once the definition clears the index bits above it.
+		for (const auto& guard: guards) {
+			if (bound && IsSameRegister(guard.reg, index_reg) &&
+			    *bound <= WidthMask(RegisterWidth(guard.reg))) {
+				return JumpTableIndex {std::min(*bound, guard.max_index), cursor->first};
+			}
+		}
+		erase_guards();
 		if (!source) {
-			const auto bound =
-			    DefinitionBound(function, graph, function_start, decoded, index_reg, MaxBoundDepth);
 			return bound ? std::optional {JumpTableIndex {*bound, cursor->first}} : std::nullopt;
 		}
 		// A guard checked after this copy bounds the copied register as well.

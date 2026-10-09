@@ -3780,7 +3780,9 @@ void TestReciprocalSquareRootBesideJumpTables() {
 		ConstantIndex,
 		TailCall,
 		TailCallThroughSlot,
+		NarrowGuardMasked,
 		Unbounded,
+		NarrowGuard,
 		IndexRewritten,
 		TwoBases,
 		EnteredPath,
@@ -3812,7 +3814,9 @@ void TestReciprocalSquareRootBesideJumpTables() {
 			{Dispatch::ConstantIndex, "constant index", true, {0, 1, 2, 3}},
 			{Dispatch::TailCall, "tail call", true, {0, 1, 2, 3, 9}},
 			{Dispatch::TailCallThroughSlot, "tail call through a slot", true, {0, 1, 2, 3, 9}},
+			{Dispatch::NarrowGuardMasked, "byte guard of a masked index", true, {0, 1, 2, 3, 9}},
 			{Dispatch::Unbounded, "unbounded", false, {1, 2, 3}},
+			{Dispatch::NarrowGuard, "guard narrower than the index", false, {1, 2, 3, 9}},
 			{Dispatch::IndexRewritten, "index rewritten after the guard", false, {0, 1, 2, 9}, 1},
 			{Dispatch::TwoBases, "two table bases", false, {1, 2, 3, 9}},
 			{Dispatch::EnteredPath, "branch into the dispatch path", false, {1, 2, 3, 9}},
@@ -3911,6 +3915,21 @@ void TestReciprocalSquareRootBesideJumpTables() {
 			case Dispatch::Unbounded:
 				code.mov(code.eax, code.edi);
 				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				break;
+			case Dispatch::NarrowGuardMasked:
+				// The mask clears the bits above the compared byte.
+				code.mov(code.eax, code.edi);
+				code.and_(code.eax, 0xf);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				code.cmp(code.al, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				break;
+			case Dispatch::NarrowGuard:
+				// cmp al bounds only the low byte of the index.
+				code.mov(code.eax, code.edi);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				code.cmp(code.al, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
 				break;
 			case Dispatch::IndexRewritten:
 				code.cmp(code.edi, 3);

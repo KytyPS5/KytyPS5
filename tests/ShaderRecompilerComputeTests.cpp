@@ -35,6 +35,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -52,6 +53,7 @@
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.hpp"
+#include <renderdoc_app.h>
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
 #error "legacy render-target barrier API must remain deleted"
@@ -955,14 +957,16 @@ std::string Hex(u32 value) {
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
 
-void EnsureConfigInitialized() {
+void EnsureConfigInitialized(bool renderdoc = false) {
   static bool config_initialized = false;
   if (!config_initialized) {
     static Common::Subsystems subsystems;
     Common::InitializeThreads();
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
-    options.printf_direction = Config::LogDirection::Silent;
+    options.printf_direction = renderdoc ? Config::LogDirection::Console
+                                        : Config::LogDirection::Silent;
+    options.renderdoc_enabled = renderdoc;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -41584,7 +41588,58 @@ int main(int argc, char **argv) {
 #else
   setenv("KYTY_DPP_PRESERVE_INACTIVE", "1", 1);
 #endif
-  EnsureConfigInitialized();
+  const bool renderdoc_smoke =
+      argc == 2 && std::strcmp(argv[1], "--renderdoc-only") == 0;
+  EnsureConfigInitialized(renderdoc_smoke);
+  if (renderdoc_smoke) {
+#if defined(_WIN32)
+    // renderdoccmd injects the DLL before this process starts. Bind before any
+    // Vulkan call.
+    RenderDocInit();
+    const auto module = GetModuleHandleA("renderdoc.dll");
+    if (module == nullptr) {
+      std::fprintf(
+          stderr,
+          "RenderDoc smoke: launch this test through renderdoccmd capture\n");
+      return 2;
+    }
+    const auto get_api = reinterpret_cast<pRENDERDOC_GetAPI>(
+        GetProcAddress(module, "RENDERDOC_GetAPI"));
+    RENDERDOC_API_1_6_0 *api = nullptr;
+    if (get_api == nullptr ||
+        get_api(eRENDERDOC_API_Version_1_6_0,
+                reinterpret_cast<void **>(&api)) != 1 ||
+        api == nullptr) {
+      std::fprintf(stderr,
+                   "RenderDoc smoke: in-application API unavailable\n");
+      return 2;
+    }
+    VulkanHarness vulkan;
+    auto &renderer = vulkan.RuntimeRenderer();
+    const auto captures_before = api->GetNumCaptures();
+    RenderDocRequestCapture();
+    RenderDocOnGuestFlip(renderer);
+    Require("RenderDocSmoke", "start", api->IsFrameCapturing() != 0,
+            "production capture flow did not start a capture");
+    RunCase(&vulkan, BufferLoadStore());
+    RunCase(&vulkan, BufferAtomicVariants());
+    RunCase(&vulkan, DsAtomic64Contention(true, 32));
+    RenderDocOnGuestFlip(renderer);
+    RenderDocOnGuestFlip(renderer);
+    Require("RenderDocSmoke", "end", api->IsFrameCapturing() == 0,
+            "production capture flow did not end the capture");
+    Require("RenderDocSmoke", "file",
+            api->GetNumCaptures() == captures_before + 1,
+            "capture was not saved");
+    std::printf(
+        "RenderDoc smoke: production capture flow and GPU readback passed\n");
+    return 0;
+#else
+    std::fprintf(
+        stderr, "RenderDoc smoke: this selector currently supports Windows only\n");
+    return 2;
+#endif
+  }
   if (argc == 3 && std::strcmp(argv[1], "--decode-bin") == 0) {
     // Debug: print the decoded guest ISA of a dumped shader binary.
     std::FILE *f = std::fopen(argv[2], "rb");

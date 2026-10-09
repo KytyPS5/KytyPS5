@@ -16,6 +16,8 @@
 
 namespace Libs::Graphics {
 
+struct MemoryTrackerTestAccess;
+
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
@@ -169,7 +171,10 @@ private:
 	std::mutex                                     m_cpu_dirty_log_mutex;
 	// Reserved once: logging from the fault handler never allocates.
 	std::vector<GuestRange> m_cpu_dirty_log;
-	bool                    m_cpu_dirty_log_complete = false;
+	// Written under the log mutex. While false, writes skip the log and its mutex.
+	std::atomic<bool> m_cpu_dirty_log_complete {false};
+
+	friend struct MemoryTrackerTestAccess;
 };
 
 } // namespace Libs::Graphics

@@ -42,6 +42,16 @@
 #include <unistd.h>
 #endif
 
+namespace Libs::Graphics {
+
+struct MemoryTrackerTestAccess {
+  static std::mutex &CpuDirtyLogMutex(MemoryTracker &tracker) {
+    return tracker.m_cpu_dirty_log_mutex;
+  }
+};
+
+} // namespace Libs::Graphics
+
 namespace {
 
 using Libs::Graphics::GuestRange;
@@ -503,6 +513,48 @@ void TestCpuDirtyLog() {
   tracker.UntrackMemory(address, page_size * 4);
   Check(Take() && Logged(address, page_size * 4),
         "untracked memory was not logged as CPU-dirty");
+  Release(memory);
+}
+
+void TestUntakenLogSkipsItsMutex() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto Clean = [&] {
+    tracker.ForEachUploadRange(
+        address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  };
+  Clean();
+
+  // Until a sweep takes the log, CPU writes neither log nor wait for the log mutex.
+  std::unique_lock log_lock(
+      Libs::Graphics::MemoryTrackerTestAccess::CpuDirtyLogMutex(tracker));
+  const auto before = tracker.CpuDirtyGeneration();
+  std::binary_semaphore writes_finished{0};
+  std::jthread writer([&] {
+    tracker.InvalidateRegion(address, 1, [] {});
+    tracker.MarkRegionAsCpuModified(address + page_size, 1);
+    writes_finished.release();
+  });
+  const bool completed = writes_finished.try_acquire_for(std::chrono::seconds(5));
+  log_lock.unlock();
+  writer.join();
+  std::vector<GuestRange> ranges;
+  Check(completed && tracker.CpuDirtyGeneration() > before,
+        "a CPU write waited for a dirty log no sweep took");
+  Check(!tracker.TakeCpuDirtyLog(ranges) && ranges.empty(),
+        "an untaken dirty log did not report its gap");
+
+  Clean();
+  tracker.InvalidateRegion(address + page_size, 1, [] {});
+  Check(tracker.TakeCpuDirtyLog(ranges) && ranges.size() == 1 &&
+            ranges[0] == GuestRange{address + page_size, page_size},
+        "a taken dirty log did not record the next CPU write");
+
+  tracker.UntrackMemory(address, page_size * 2);
   Release(memory);
 }
 
@@ -1303,6 +1355,7 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestCpuDirtyGeneration();
   TestCpuDirtyLog();
+  TestUntakenLogSkipsItsMutex();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

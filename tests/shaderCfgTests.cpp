@@ -14995,7 +14995,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
-void TestLegacyMadRoundingPolicy() {
+void TestLegacyMadRoundingPolicy(bool separate) {
   using namespace ShaderRecompiler;
   const auto emit = [](IR::ValueOpcode opcode) {
     const uint32_t shader[] = {EncodeSopp(0x01)};
@@ -15007,14 +15007,7 @@ void TestLegacyMadRoundingPolicy() {
     CheckSpirvBinaryValidates(binary);
     return binary;
   };
-#if defined(__APPLE__)
-  bool separate = false;
-#else
-  bool separate = true;
-#endif
   const char *value = std::getenv("KYTY_MAD_SEPARATE_ROUNDING");
-  if (value != nullptr && std::strcmp(value, "0") == 0) separate = false;
-  if (value != nullptr && std::strcmp(value, "1") == 0) separate = true;
   const auto mad = emit(IR::ValueOpcode::FPMad32);
   const auto source = DisassembleSpirvBinary(mad);
   Check(SpirvInstructionOpcodeCount(mad, spv::OpFMul) == (separate ? 1u : 0u) && SpirvInstructionOpcodeCount(mad, spv::OpFAdd) == (separate ? 1u : 0u), "MAD policy emitted the wrong FMul/FAdd count");
@@ -15034,8 +15027,11 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
-  TestLegacyMadRoundingPolicy();
-  if (argc == 2 && std::strcmp(argv[1], "--mad-rounding-only") == 0) return 0;
+  if (argc >= 2 && std::strcmp(argv[1], "--mad-rounding-only") == 0) {
+    Check(argc == 3 && (std::strcmp(argv[2], "separate") == 0 || std::strcmp(argv[2], "fused") == 0), "MAD rounding expectation must be separate or fused");
+    TestLegacyMadRoundingPolicy(std::strcmp(argv[2], "separate") == 0);
+    return 0;
+  }
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

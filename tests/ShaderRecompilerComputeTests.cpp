@@ -42143,6 +42143,12 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
+  // The legacy MAD rounding fixtures require separate rounding before the emitter caches its policy.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (_putenv_s("KYTY_MAD_SEPARATE_ROUNDING", "1") != 0) return 1;
+#else
+  if (setenv("KYTY_MAD_SEPARATE_ROUNDING", "1", 1) != 0) return 1;
+#endif
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
@@ -42686,6 +42692,12 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesTwoBitByteOffset());
     RunCase(&vulkan, VectorVop3IntegerOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mad-f32-spirv-only") == 0) {
+    auto test = VectorMadF32RoundsProduct();
+    test.compile_only = true;
+    RunCase(nullptr, test);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-f32-only") == 0) {

@@ -487,6 +487,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	// Sparse residency lets the BDA page table, which spans the whole guest address space, take
+	// device memory only where the guest maps something. Unbound ranges must read as zero, and
+	// the binding goes through the graphics queue.
+	{
+		const auto families = physical_device.getQueueFamilyProperties();
+		graphics.sparse_buffer_enabled =
+		    supported_features2.features.sparseBinding == VK_TRUE &&
+		    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+		    physical_device.getProperties().sparseProperties.residencyNonResidentStrict ==
+		        VK_TRUE &&
+		    queue_family < families.size() &&
+		    static_cast<bool>(families[queue_family].queueFlags &
+			                  vk::QueueFlagBits::eSparseBinding);
+	}
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -560,6 +574,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.robustBufferAccess       = VK_TRUE;
+	device_features.sparseBinding            = graphics.sparse_buffer_enabled ? VK_TRUE : VK_FALSE;
+	device_features.sparseResidencyBuffer    = graphics.sparse_buffer_enabled ? VK_TRUE : VK_FALSE;
 #if !defined(__APPLE__)
 	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
 	device_features.depthClamp  = VK_TRUE;

@@ -104,8 +104,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		m_bda_pagetable_buffer->EnsureResident(table_offset,
+		                                       size_pages * sizeof(vk::DeviceAddress));
+		WriteDataBuffer(*m_bda_pagetable_buffer, table_offset, addresses.data(),
+		                addresses.size() * sizeof(vk::DeviceAddress));
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -113,8 +115,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		m_bda_pagetable_buffer->Fill(table_offset, size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
 }
@@ -221,8 +222,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+      // One entry per 16 KiB page of the whole guest address space (768 MiB). Sparse where the
+      // device allows, so only the parts covering mapped guest memory take device memory.
+      m_bda_pagetable_buffer(
+          graphics.sparse_buffer_enabled
+              ? std::make_unique<Buffer>(graphics, scheduler, AllFlags, BDA_PAGETABLE_SIZE,
+			                             SparseResidency {1ull << 20u})
+			  : std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+			                             BDA_PAGETABLE_SIZE)),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -231,7 +238,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
-	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer->Handle(),
 	                     "BDA Page Table Buffer");
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);

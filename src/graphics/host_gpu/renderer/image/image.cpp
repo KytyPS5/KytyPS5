@@ -722,9 +722,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		// Out of device memory: the texture cache evicts and retries (TextureCache::InsertImage).
+		allocation_failed = true;
+		return;
 	}
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,

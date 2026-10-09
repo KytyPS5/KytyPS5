@@ -73,6 +73,7 @@ public:
 	void RunGarbageCollector();
 
 private:
+	bool EvictForAllocation();
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 

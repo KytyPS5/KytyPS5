@@ -127,10 +127,9 @@ void GpuTimestamps::Clock::Sample(uint64_t ticks, uint64_t reference) {
 	if (static_cast<double>(reference - m_last_reference) / rate_before >=
 	    static_cast<double>(m_mask >> 2u)) {
 		Restart(ticks, reference);
-		if (m_anchored) {
-			m_current  = {ticks, reference, m_current.rate};
-			m_previous = m_current;
-		}
+		m_current  = {ticks, reference, FixedRate(rate_before)};
+		m_previous = m_current;
+		m_anchored = true;
 		return;
 	}
 	if (interval == 0) {

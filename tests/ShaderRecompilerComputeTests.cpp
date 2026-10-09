@@ -1346,7 +1346,7 @@ void CheckGpuClockCalibration() {
                               ticks_per_reference)) &
            mask;
   };
-  const auto near = [&](uint64_t value, uint64_t reference) {
+  const auto close_to = [&](uint64_t value, uint64_t reference) {
     return (value > reference ? value - reference : reference - value) <= tolerance;
   };
   const auto rate_of = [](const GpuTimestamps::Segment &segment) {
@@ -1378,7 +1378,7 @@ void CheckGpuClockCalibration() {
     const bool settled = sample < 2000 || sample > 2020;
     if (settled) {
       for (const uint64_t offset : {second / 2, 3 * second / 2}) {
-        accurate &= near(clock.Convert(device_ticks(actual, reference + offset)),
+        accurate &= close_to(clock.Convert(device_ticks(actual, reference + offset)),
                          reference + offset);
       }
     }
@@ -1393,7 +1393,7 @@ void CheckGpuClockCalibration() {
   bool resumed = true;
   for (int sample = 0; sample < 4; ++sample, reference += 2 * second) {
     clock.Sample(device_ticks(actual, reference), reference);
-    resumed &= near(clock.Convert(device_ticks(actual, reference + second / 2)),
+    resumed &= close_to(clock.Convert(device_ticks(actual, reference + second / 2)),
                     reference + second / 2);
   }
   // A first write long after the first sample still anchors the clock.
@@ -1402,7 +1402,7 @@ void CheckGpuClockCalibration() {
   const auto late = start_reference + 40 * 60 * second;
   late_clock.Sample(device_ticks(actual, late), late);
   resumed &= late_clock.Anchored() &&
-             near(late_clock.Convert(device_ticks(actual, late + second / 1000)),
+             close_to(late_clock.Convert(device_ticks(actual, late + second / 1000)),
                   late + second / 1000);
   Require("GpuClockCalibration", "calibrated narrow counter",
           accurate && monotonic && corrected && rate_measured && resumed,
@@ -1416,7 +1416,7 @@ void CheckGpuClockCalibration() {
     const auto now = start_reference + step * 2 * second;
     nominal_clock.Advance(now);
     for (const uint64_t offset : {uint64_t{0}, second / 2, 19 * second / 10}) {
-      followed &= near(nominal_clock.Convert(device_ticks(0.192, now + offset)),
+      followed &= close_to(nominal_clock.Convert(device_ticks(0.192, now + offset)),
                        now + offset);
     }
   }

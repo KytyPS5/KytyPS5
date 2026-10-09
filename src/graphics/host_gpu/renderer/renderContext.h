@@ -57,8 +57,8 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
-	// Stores a result from a GPU completion callback. False when a cache watches the range: the
-	// GPU thread must store it, as a write there can fault and flush.
+	// Stores a result from a GPU completion callback. False when a cache watches the range or it
+	// has no backing alias: the GPU thread must store it, as a write there can fault and flush.
 	[[nodiscard]] bool StoreAtCompletion(uint64_t vaddr, const void* data, uint64_t size);
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);

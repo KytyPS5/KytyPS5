@@ -338,10 +338,9 @@ void GpuTimestamps::StoreRetries() {
 			m_retrying = true;
 		}
 		// Plain stores fault here like other GPU-thread writes, so the watching caches see them.
+		// Unmapping a range stores its retries first, so every destination is still mapped.
 		for (const auto& retry: retries) {
-			if (m_context.IsMapped(retry.vaddr, retry.size)) {
-				std::memcpy(reinterpret_cast<void*>(retry.vaddr), &retry.value, retry.size);
-			}
+			std::memcpy(reinterpret_cast<void*>(retry.vaddr), &retry.value, retry.size);
 		}
 	}
 }

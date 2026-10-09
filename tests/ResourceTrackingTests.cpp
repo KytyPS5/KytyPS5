@@ -1065,6 +1065,97 @@ void TestBitScanKeyRange() {
   }
 }
 
+void TestBitScanMaskProof() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // The host evaluates a bit scan's entry mask only when every back edge clears its bits.
+  enum class Next { GainsBitBehindAnd, ExecSelect };
+  for (const auto variant : {Next::GainsBitBehindAnd, Next::ExecSelect}) {
+    Fixture fixture(ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *guard = fixture.AddBlock();
+    auto *sample = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(exit);
+    header->AddBranch(guard);
+    guard->AddBranch(sample);
+    guard->AddBranch(exit);
+    sample->AddBranch(header);
+    entry->terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = header};
+    header->terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = exit, .false_block = guard};
+    guard->terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = sample, .false_block = exit};
+    sample->terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator = {.kind = CFG::TerminatorKind::Return};
+    const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto initial = fixture.UserData(2);
+    const auto lane = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(1u), Value(0u)}), Value(0u)});
+    const auto other_lane = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(2u), Value(0u)}), Value(0u)});
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, initial);
+    const auto mask = Value(&phi);
+    fixture.block = header;
+    const auto nonzero = fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), mask});
+    header->condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {fixture.Emit(ValueOpcode::LogicalNot, {nonzero})},
+        CFG::BranchCondition::SccZero);
+    const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    fixture.block = guard;
+    // s_and_saveexec + s_cbranch_execz: only lanes with `lane` set reach the sample.
+    guard->condition =
+        fixture.Emit(ValueOpcode::ConditionRef, {lane}, CFG::BranchCondition::ExecNonZero);
+    fixture.block = sample;
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(344u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < 8u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, offset, Value(0u), Value(true)},
+                                 fixture.AddMemory(memory, 0x100 + word * 4u));
+    }
+    const auto image = fixture.Image(words, 0x128);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x128));
+    const auto bit = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+        {Value(1u), fixture.Emit(ValueOpcode::BitwiseAnd32, {key, Value(31u)})});
+    const auto cleared =
+        fixture.Emit(ValueOpcode::BitwiseAnd32, {mask, fixture.Emit(ValueOpcode::BitwiseNot32, {bit})});
+    const auto gained = fixture.Emit(ValueOpcode::BitwiseOr32, {mask, Value(0x80000000u)});
+    Value next;
+    if (variant == Next::GainsBitBehindAnd) {
+      // gained & (c ? gained : mask) is gained when c holds: the select proves nothing.
+      next = fixture.Emit(ValueOpcode::BitwiseAnd32,
+          {gained, fixture.Emit(ValueOpcode::SelectU32, {other_lane, gained, mask})});
+    } else {
+      // Every lane reaching the back edge has `lane` set, so the select clears a bit.
+      next = fixture.Emit(ValueOpcode::SelectU32, {lane, cleared, gained});
+    }
+    phi.AddPhiOperand(sample, next);
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    const bool proven = variant == Next::ExecSelect;
+    Check(indirect.has_value() &&
+              (indirect->selector_mask.Resolve() == initial.Resolve()) == proven,
+          proven ? "a bit scan mask cleared under its EXEC guard lost its entry value"
+                 : "a bit scan mask that gains bits was evaluated from its entry value");
+  }
+}
+
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
@@ -4052,6 +4143,7 @@ int main() {
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("indirect image table operations", TestIndirectImageTableOperations);
     Run("bit scan key range", TestBitScanKeyRange);
+    Run("bit scan mask proof", TestBitScanMaskProof);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);

@@ -1323,8 +1323,9 @@ private:
 		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi && phi->NumArgs() == 2u &&
 		    phi->GetType() == Type::U32) {
 			for (uint32_t back = 0; back < 2u; ++back) {
-				std::vector<const Inst*> visited;
-				if (!ClearsBitsOf(phi->Arg(back), value, *phi, back, visited)) continue;
+				std::vector<const Inst*> proving;
+				uint32_t                 budget = 256u;
+				if (!ClearsBitsOf(phi->Arg(back), value, *phi, back, proving, budget)) continue;
 				value = ArmValue(phi->Arg(back ^ 1u), *phi, back ^ 1u);
 				break;
 			}
@@ -1383,31 +1384,34 @@ private:
 		return value;
 	}
 
-	// value is mask, or mask with bits cleared, along every lane select and phi merge.
+	// value is mask, or mask with bits cleared, along every lane select and phi merge. Only a
+	// merge still being proven, the scanned phi first, may assume its own claim.
 	bool ClearsBitsOf(Value value, Value mask, const Inst& phi, uint32_t arm,
-	                  std::vector<const Inst*>& visited) const {
+	                  std::vector<const Inst*>& proving, uint32_t& budget) const {
+		if (value.Resolve() == mask) return true;
 		value = ArmValue(value, phi, arm);
 		if (value == mask) return true;
 		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || visited.size() > 64u) return false;
-		// A merge already being proven only feeds back values proven on its other arms.
-		if (std::ranges::find(visited, inst) != visited.end()) return true;
-		visited.push_back(inst);
+		if (inst == nullptr || budget == 0u) return false;
+		--budget;
+		const auto clears = [&](Value operand) {
+			return ClearsBitsOf(operand, mask, phi, arm, proving, budget);
+		};
 		switch (inst->GetOpcode()) {
-			case ValueOpcode::ReadFirstLane:
-				return inst->NumArgs() == 2u && ClearsBitsOf(inst->Arg(0), mask, phi, arm, visited);
-			case ValueOpcode::Phi:
-				for (size_t index = 0; index < inst->NumArgs(); ++index)
-					if (!ClearsBitsOf(inst->Arg(index), mask, phi, arm, visited)) return false;
-				return inst->NumArgs() != 0u;
+			case ValueOpcode::ReadFirstLane: return inst->NumArgs() == 2u && clears(inst->Arg(0));
+			case ValueOpcode::Phi: {
+				if (std::ranges::find(proving, inst) != proving.end()) return true;
+				proving.push_back(inst);
+				bool cleared = inst->NumArgs() != 0u;
+				for (size_t index = 0; cleared && index < inst->NumArgs(); ++index)
+					cleared = clears(inst->Arg(index));
+				proving.pop_back();
+				return cleared;
+			}
 			case ValueOpcode::BitwiseAnd32:
-				return inst->NumArgs() == 2u &&
-				       (ClearsBitsOf(inst->Arg(0), mask, phi, arm, visited) ||
-				        ClearsBitsOf(inst->Arg(1), mask, phi, arm, visited));
+				return inst->NumArgs() == 2u && (clears(inst->Arg(0)) || clears(inst->Arg(1)));
 			case ValueOpcode::SelectU32:
-				return inst->NumArgs() == 3u &&
-				       ClearsBitsOf(inst->Arg(1), mask, phi, arm, visited) &&
-				       ClearsBitsOf(inst->Arg(2), mask, phi, arm, visited);
+				return inst->NumArgs() == 3u && clears(inst->Arg(1)) && clears(inst->Arg(2));
 			default: return MaskOnlyLosesBits(value, mask);
 		}
 	}

@@ -8,7 +8,7 @@
 #include <string>
 
 namespace {
-using Libs::Graphics::DriverCachePolicy::ReplaceFile;
+using Libs::Graphics::DriverCachePolicy::ReplaceCacheFile;
 
 void Check(bool value, const char* message) {
 	if (!value) {
@@ -60,10 +60,10 @@ void TestReplaceKeepsOldFileOnFailure() {
 	const auto dst = directory.Path() / "cache.bin";
 	const auto temp = directory.Path() / "cache.bin.tmp";
 	WriteAll(dst, "old cache");
-	Check(!ReplaceFile(temp, dst), "missing source unexpectedly replaced cache");
+	Check(!ReplaceCacheFile(temp, dst), "missing source unexpectedly replaced cache");
 	Check(std::filesystem::is_regular_file(dst) && ReadAll(dst) == "old cache", "old cache lost when source is missing");
 	std::filesystem::create_directories(temp / "child");
-	Check(!ReplaceFile(temp, dst), "directory unexpectedly replaced cache file");
+	Check(!ReplaceCacheFile(temp, dst), "directory unexpectedly replaced cache file");
 	Check(std::filesystem::is_regular_file(dst) && ReadAll(dst) == "old cache", "old cache lost when rename fails");
 	std::puts("DriverCachePolicyTests: missing source and rename failure preserve old cache");
 }
@@ -74,9 +74,9 @@ void TestReplaceSuccess() {
 	const auto temp = directory.Path() / "cache.bin.tmp";
 	const std::string payload(1024 * 1024 + 37, 'N');
 	WriteAll(temp, payload);
-	Check(ReplaceFile(temp, dst) && ReadAll(dst) == payload && !std::filesystem::exists(temp), "create cache at an absent destination");
+	Check(ReplaceCacheFile(temp, dst) && ReadAll(dst) == payload && !std::filesystem::exists(temp), "create cache at an absent destination");
 	WriteAll(temp, "complete new cache");
-	Check(ReplaceFile(temp, dst) && ReadAll(dst) == "complete new cache" && !std::filesystem::exists(temp), "replace an existing cache completely");
+	Check(ReplaceCacheFile(temp, dst) && ReadAll(dst) == "complete new cache" && !std::filesystem::exists(temp), "replace an existing cache completely");
 	std::puts("DriverCachePolicyTests: absent and existing destinations receive complete cache");
 }
 }

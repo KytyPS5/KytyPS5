@@ -84,10 +84,16 @@ public:
 	void               ProcessFaultBuffer();
 	// GPU-modified ranges nothing has written since MarkUnwritten; a later GPU write drops
 	// them (CPU writes clear the GPU-modified state instead).
-	void MarkUnwritten(uint64_t vaddr, uint64_t size) { m_unwritten.Add(vaddr, size); }
+	void MarkUnwritten(uint64_t vaddr, uint64_t size) {
+		std::scoped_lock lock(m_unwritten_lock);
+		m_unwritten.Add(vaddr, size);
+	}
 	[[nodiscard]] bool IsUnwritten(uint64_t vaddr, uint64_t size) const {
+		std::scoped_lock lock(m_unwritten_lock);
 		return m_unwritten.Contains(vaddr, size);
 	}
+	// BDA stores choose addresses in the shader; serialize readback behind this tick.
+	void NoteUnknownWrite();
 	// Marks a range for the next SynchronizeBda. Any thread.
 	void AddBdaPending(uint64_t vaddr, uint64_t size);
 	// Uploads CPU writes made since the last call to the buffers inside `mapped`.
@@ -152,8 +158,10 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	RangeSet                                           m_unwritten;
+	mutable std::mutex                                 m_unwritten_lock;
 	RangeSet                                           m_current_writes; // in the recording tick
 	uint64_t                                           m_current_writes_tick = 0;
+	uint64_t                                           m_unknown_write_tick = 0;
 	std::unique_ptr<Buffer>                            m_ahead_readback;
 	// CPU-written ranges and new buffers since the last SynchronizeBda. Guest threads add
 	// write faults, so it has its own lock.

@@ -290,6 +290,10 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	{
+		std::scoped_lock lock(m_unwritten_lock);
+		m_unwritten.Subtract(vaddr, size);
+	}
 	m_memory_tracker.InvalidateRegion(
 	    vaddr, size, [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	// After the dirty mark: a concurrent SynchronizeBda then at worst syncs it twice.
@@ -322,9 +326,13 @@ void BufferCache::NoteCurrentWrite(uint64_t vaddr, uint64_t size) {
 	m_current_writes.Add(vaddr, size);
 }
 
+void BufferCache::NoteUnknownWrite() {
+	m_unknown_write_tick = m_scheduler.CurrentTick();
+}
+
 bool BufferCache::CanReadAhead(uint64_t vaddr, uint64_t size) {
 	const auto tick = m_scheduler.CurrentTick();
-	if (m_scheduler.LastPriorityTick() == tick) {
+	if (m_scheduler.LastPriorityTick() == tick || m_unknown_write_tick == tick) {
 		return false;
 	}
 	if (m_current_writes_tick != tick) {
@@ -635,6 +643,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		NoteCurrentWrite(vaddr, size);
+		std::scoped_lock lock(m_unwritten_lock);
 		if (!m_unwritten.Empty()) {
 			m_unwritten.Subtract(vaddr, size);
 		}

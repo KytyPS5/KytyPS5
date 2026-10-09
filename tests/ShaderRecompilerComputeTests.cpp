@@ -169,6 +169,10 @@ struct BufferCacheTestAccess {
     return cache.m_download_buffer;
   }
 
+  static bool CanReadAhead(BufferCache &cache, uint64_t address, uint64_t size) {
+    return cache.CanReadAhead(address, size);
+  }
+
   static void SetUnusedStagingBufferSize(BufferCache &cache, uint64_t size) {
     // Called immediately after cache construction, before any staging reservation.
     std::destroy_at(&cache.m_staging_buffer);
@@ -4043,6 +4047,56 @@ public:
       auto &resources = context;
       auto &cache = resources.GetBufferCache();
       resources.MapMemory(base, allocation_size);
+
+      Require(name, "read-ahead before BDA writes",
+              BufferCacheTestAccess::CanReadAhead(cache, base, 4),
+              "idle recording tick unexpectedly blocked read-ahead");
+      resources.PrepareBda(false);
+      Require(name, "read-only BDA permits read-ahead",
+              BufferCacheTestAccess::CanReadAhead(cache, base, 4),
+              "BDA reads were treated as unknown writes");
+      resources.PrepareBda(true);
+      Require(name, "BDA stores serialize every possible target",
+              !BufferCacheTestAccess::CanReadAhead(cache, base, 4) &&
+                  !BufferCacheTestAccess::CanReadAhead(cache, base + 0x10000, 4),
+              "unknown BDA stores allowed same-tick readback");
+      scheduler.Finish();
+      Require(name, "BDA write guard expires after submission",
+              BufferCacheTestAccess::CanReadAhead(cache, base, 4),
+              "submitted BDA stores kept blocking subsequent read-ahead");
+
+      constexpr uint64_t unknown_target = base + 0x380;
+      constexpr uint32_t old_gpu_value = 0x31415926u;
+      constexpr uint32_t new_gpu_value = 0x27182818u;
+      (void)cache.ObtainBuffer(unknown_target, 4, true, true);
+      cache.FillBuffer(unknown_target, 4, old_gpu_value, false);
+      scheduler.Finish();
+      const auto [unknown_buffer, unknown_offset] =
+          cache.ObtainBuffer(unknown_target, 4, false);
+      resources.PrepareBda(true);
+      // Like an address store, this write has no descriptor range in NoteCurrentWrite.
+      scheduler.Current().Handle().fillBuffer(
+          unknown_buffer->Handle(), unknown_offset, 4, new_gpu_value);
+      Require(name, "readback after an unknown address write",
+              resources.HandleFault(PageFaultAccess::Read, unknown_target),
+              "GPU-dirty address did not trigger readback");
+      uint32_t published_unknown = 0;
+      Require(name, "unknown address write publishes fresh GPU data",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  unknown_target, &published_unknown, sizeof(published_unknown)) &&
+                  published_unknown == new_gpu_value,
+              "read-ahead published the preceding tick's stale GPU value");
+
+      cache.MarkUnwritten(base + first_offset, 16);
+      std::thread invalidation([&] {
+        cache.InvalidateMemory(base + first_offset, 8);
+      });
+      invalidation.join();
+      Require(name, "CPU invalidation removes clear signature eligibility",
+              !cache.IsUnwritten(base + first_offset, 8) &&
+                  cache.IsUnwritten(base + first_offset + 8, 8),
+              "CPU invalidation retained a stale clear mark or removed disjoint marks");
+      cache.InvalidateMemory(base + first_offset + 8, 8);
 
       const auto MarkGpuWrite = [&](uint64_t address, uint64_t size) {
         auto allocation = cache.ObtainBuffer(address, size, true, false);

@@ -943,12 +943,14 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
+	bool has_address_writes = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->program->info.uses_dma;
+		has_address_writes |= stage->runtime->program->has_address_writes;
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(has_address_writes);
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);

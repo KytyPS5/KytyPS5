@@ -1249,9 +1249,12 @@ void CommandProcessor::EmitGlobalBarrier() {
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
+	// A game woken by the interrupt reads the GPU clock values written before it.
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
-		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+		    renderer.GetGpuTimestamps().Signal([&renderer, event_id, interrupt_context_id] {
+			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+		    });
 	    });
 }
 
@@ -1392,7 +1395,8 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, request] {
 		    renderer.GetVideoOut().CompleteFlip(request);
-		    renderer.TriggerInterrupt(event_id, 0);
+		    renderer.GetGpuTimestamps().Signal(
+		        [&renderer, event_id] { renderer.TriggerInterrupt(event_id, 0); });
 	    });
 	GetScheduler().Flush();
 }

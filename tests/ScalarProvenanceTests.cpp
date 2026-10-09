@@ -643,9 +643,44 @@ ReductionIr BuildReduction(Fixture &fixture, ValueOpcode op, uint32_t neutral,
     }
     }
   }
+  Value region_whole = whole;
+  if (cond_shape >= 8) {
+    // Compare-derived masks. The whole-wave EXEC value (region start) is defined after the
+    // compares in blocks 1/2, and either before or after the compare in block 0 (shape 11).
+    const auto fdata = fixture.Emit(ValueOpcode::BitCastF32U32, {data});
+    const auto cmp_in = [&](uint32_t block) {
+      return fixture.Emit(ValueOpcode::FPOrdLessThan32, {fdata, fdata}, 0, block);
+    };
+    const auto make_phi = [&](Value a, Value b) {
+      auto &phi = fixture.BlockAt(0).AppendNewInst(ValueOpcode::Phi);
+      phi.SetFlags(Type::U1);
+      phi.AddPhiOperand(&fixture.BlockAt(1), a);
+      phi.AddPhiOperand(&fixture.BlockAt(2), b);
+      return Value(&phi);
+    };
+    const auto new_region = [&] {
+      const auto e = fixture.Emit(ValueOpcode::LogicalAnd, {Value(true), Value(true)});
+      const auto ne = fixture.Emit(ValueOpcode::LogicalNot, {e});
+      return fixture.Emit(ValueOpcode::LogicalOr, {ne, e});
+    };
+    switch (cond_shape) {
+    case 8: condition = make_phi(cmp_in(1), cmp_in(2)); region_whole = new_region(); break;
+    case 9:
+      condition = make_phi(cmp_in(1), fixture.Emit(ValueOpcode::IEqual32, {data, Value(7u)}, 0, 2));
+      region_whole = new_region();
+      break;
+    case 10: condition = make_phi(cmp_in(1), Value(true)); region_whole = new_region(); break;
+    case 11: region_whole = new_region(); condition = cmp_in(0); break;  // inside the region
+    case 12: condition = fixture.Emit(ValueOpcode::LogicalNot, {cmp_in(1)}); region_whole = new_region(); break;
+    case 13: condition = cmp_in(1); region_whole = new_region(); break;
+    }
+  }
   Value current = folded_fill
                       ? data
                       : fixture.Emit(ValueOpcode::SelectU32, {condition, data, Value(neutral)});
+  if (cond_shape >= 8 && !folded_fill) {
+    current = fixture.Emit(ValueOpcode::SelectU32, {region_whole, current, data});
+  }
   for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
     DppMoveFlags flags;
     flags.control = 0x110u + shift;
@@ -772,6 +807,28 @@ void TestPartialWaveReductionCompoundFillCondition() {
     BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu, true, 0xffffffffu, false, shape);
     Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 0,
           "unproven compound fill condition was accepted");
+  }
+}
+
+void TestPartialWaveReductionCompareDerivedFillCondition() {
+  // V_CMP* writes 0 for inactive lanes: compare results (and phis of them) are exec-bounded when
+  // the compare ran before the whole-wave region. A literal-true phi incoming is the initial EXEC
+  // convention and stays accepted; Not(cmp) is true for inactive lanes; a compare inside the
+  // whole-wave region ran with every lane active.
+  struct Case { int shape; uint32_t rewritten; const char *what; };
+  const Case cases[] = {
+      {13, 2, "plain compare before the region was rejected"},
+      {8, 2, "phi(cmp, cmp) was rejected"},
+      {10, 2, "phi(cmp, initial-exec true) was rejected"},
+      {9, 0, "phi(cmp, integer compare) was accepted"},
+      {11, 0, "compare inside the whole-wave region was accepted"},
+      {12, 0, "Not(cmp) was accepted"},
+  };
+  for (const auto &test : cases) {
+    Fixture fixture(3);
+    fixture.program.stage = ShaderType::Pixel;
+    BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu, true, 0xffffffffu, false, test.shape);
+    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == test.rewritten, test.what);
   }
 }
 
@@ -979,6 +1036,7 @@ int main() {
     TestPartialWaveReductionFoldedFill();
     TestPartialWaveReductionRejectsUnprovenPatterns();
     TestPartialWaveReductionCompoundFillCondition();
+    TestPartialWaveReductionCompareDerivedFillCondition();
     TestPartialWaveReductionEquivalence();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();

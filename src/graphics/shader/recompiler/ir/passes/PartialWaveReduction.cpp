@@ -64,6 +64,48 @@ bool IsAllTrue(Value value) {
 	return is_not_of(a, b) || is_not_of(b, a);
 }
 
+// Start of the whole-wave (s_or_saveexec -1) region of the reduction being matched: the
+// definition of the all-true EXEC value. Compares defined after it in the same block ran with
+// every lane active, so their lane-mask bits are not zero for never-launched lanes.
+thread_local const Inst* g_whole_region = nullptr;
+
+// Vector float compares: V_CMP*/V_CMPX* write 0 to the mask bit of every lane that is inactive
+// under the EXEC in effect when they execute. (Integer compares are not accepted: the IR does not
+// distinguish them from uniform s_cmp results.)
+bool IsVectorFloatCompare(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::FPCmpClass32: return true;
+		default: return false;
+	}
+}
+
+// True when `inst` follows the whole-wave region start in the same block; also true when the
+// region start is unknown (nothing can then be proven).
+bool DefinedInWholeWaveRegion(const Inst* inst) {
+	const auto* start = g_whole_region;
+	if (start == nullptr) return true;
+	if (inst->Parent() != start->Parent()) return false;
+	bool after = false;
+	for (auto& i: *start->Parent()) {
+		if (&i == start) after = true;
+		if (&i == inst) return after;
+	}
+	return true;
+}
+
 // A predicate that can only be true in invocations whose EXEC bit is set, i.e. only in
 // invocations that exist. The initial EXEC is the literal true; refinement is And / Phi only.
 bool IsExecBounded(Value value, std::unordered_set<const Inst*>& visiting) {
@@ -87,7 +129,9 @@ bool IsExecBounded(Value value, std::unordered_set<const Inst*>& visiting) {
 				result = IsExecBounded(inst->Arg(i), visiting);
 			}
 			break;
-		default: break;
+		default:
+			result = IsVectorFloatCompare(inst->GetOpcode()) && !DefinedInWholeWaveRegion(inst);
+			break;
 	}
 	return result;
 }
@@ -232,6 +276,12 @@ std::optional<Reduction> MatchReduction(Value source) {
 
 		// input = Select(c, V, neutral) where c is bounded by EXEC: lanes that were not
 		// launched read the neutral element on hardware.
+		g_whole_region = nullptr;
+		if (const auto* outer = InstOf(cursor);
+		    outer != nullptr && outer->GetOpcode() == ValueOpcode::SelectU32 &&
+		    IsAllTrue(outer->Arg(0))) {
+			g_whole_region = InstOf(outer->Arg(0));
+		}
 		const auto  input = StripAllTrueSelect(cursor);
 		const auto* fill  = input.TryInstruction();
 		if (fill != nullptr && fill->GetOpcode() == ValueOpcode::SelectU32) {

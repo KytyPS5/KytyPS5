@@ -5257,6 +5257,62 @@ public:
     m_device.destroyBuffer(buffer, nullptr);
   }
 
+  void CheckBdaPageTableStartsCleared() {
+    constexpr const char *name = "BdaPageTableStartsCleared";
+    constexpr uintptr_t base = 0x0000000207b00000ull;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    const auto first = BufferCache::PageIndex(base);
+    // Entries around a registered two-page buffer, and at both ends and the middle of the table.
+    const std::array<uint64_t, 7> entries{0, first - 1, first, first + 1, first + 2,
+                                          BufferCache::CACHING_NUMPAGES / 2,
+                                          BufferCache::CACHING_NUMPAGES - 1};
+    WithDirtyDeviceMemory(name, [&] {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetBufferCache();
+      auto &table = *cache.GetBdaPageTableBuffer();
+      const auto &buffer = cache.GetBuffer(cache.FindBuffer(base, 2 * page));
+      auto readback = CreateHostBuffer(name, entries.size() * sizeof(vk::DeviceAddress),
+                                       vk::BufferUsageFlagBits::eTransferDst, {});
+      std::vector<vk::BufferCopy> copies;
+      for (size_t i = 0; i < entries.size(); ++i) {
+        copies.push_back({entries[i] * sizeof(vk::DeviceAddress), i * sizeof(vk::DeviceAddress),
+                          sizeof(vk::DeviceAddress)});
+      }
+      vk::MemoryBarrier written{};
+      written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      written.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eTransfer, {}, 1, &written, 0, nullptr, 0, nullptr);
+      scheduler.Current().Handle().copyBuffer(table.Handle(), readback.buffer,
+                                              static_cast<u32>(copies.size()), copies.data());
+      vk::MemoryBarrier copied{};
+      copied.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      copied.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &copied, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, readback, entries.size() * 2);
+      DestroyBuffer(&readback);
+      for (size_t i = 0; i < entries.size(); ++i) {
+        const auto actual = uint64_t{words[i * 2]} | (uint64_t{words[i * 2 + 1]} << 32);
+        const bool registered = entries[i] == first || entries[i] == first + 1;
+        // A zero entry is what sends an access to the fault path.
+        const auto expected = registered ? buffer.BufferDeviceAddress() + (entries[i] - first) * page
+                                         : vk::DeviceAddress{0};
+        Require(name, "page-table entry", actual == expected,
+                "entry " + std::to_string(entries[i]) +
+                    (registered ? " does not translate its registered page"
+                                : " of an unregistered page is not zero"));
+      }
+    });
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckFaultBufferSummary() {
     constexpr const char *name = "FaultBufferSummary";
     // Two faults in different summary words, and a page bit without its summary bit.
@@ -43173,6 +43229,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckBdaPageTableStartsCleared();
   vulkan.CheckFaultBufferSummary();
   vulkan.CheckFaultBufferStartsCleared();
   vulkan.CheckUnifiedTextureCacheFlow();

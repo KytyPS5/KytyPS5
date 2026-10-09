@@ -233,6 +233,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	// A zero entry marks a page without a buffer, and device memory starts undefined.
+	m_bda_pagetable_buffer.Fill(m_scheduler.BeginCommand(), 0, m_bda_pagetable_buffer.Size(), 0);
+	m_scheduler.Submit();
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);

@@ -197,7 +197,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 } // namespace
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t push_data_start_dword) {
+                                  uint32_t push_data_start_dword, ShaderHostFeatures host_features) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -216,6 +216,16 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info);
+	if (!host_features.buffer_int64_atomics && program.info.buffer_int64_atomics) {
+		Fail(program,
+		     "shader requires shaderBufferInt64Atomics, which is not enabled on the host GPU");
+	}
+	if (!host_features.cull_distance &&
+	    std::ranges::any_of(program.info.outputs, [](const auto& output) {
+		    return output.kind == IR::StageOutputKind::CullDistance;
+	    })) {
+		Fail(program, "shader requires shaderCullDistance, which is not enabled on the host GPU");
+	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

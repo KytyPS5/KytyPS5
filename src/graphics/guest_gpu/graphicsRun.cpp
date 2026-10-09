@@ -114,6 +114,17 @@ bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 	return true;
 }
 
+void GuestGpu::NotifyGuestWrite() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_guest_writes++;
+	for (auto& queue: m_queues) {
+		if (!queue.empty()) {
+			queue.front().blocked = false;
+		}
+	}
+	m_work_available.Signal();
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -458,6 +469,7 @@ void GuestGpu::ThreadRun(void* data) {
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
+		uint64_t                     guest_writes   = 0;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
@@ -500,6 +512,7 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 				has_submission    = true;
+				guest_writes      = gpu->m_guest_writes;
 			}
 		}
 		if (should_stop) {
@@ -526,7 +539,8 @@ void GuestGpu::ThreadRun(void* data) {
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
-			submission.blocked = true;
+			// A write while it ran may be what it waits for.
+			submission.blocked = gpu->m_guest_writes == guest_writes;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -1084,7 +1098,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		std::memcpy(dst, &data, sizeof(data));
+		WriteLabel(dst, data);
 
 		if (with_interrupt) {
 			TriggerEopEventAtEndOfPipe(interrupt_context_id);
@@ -1097,6 +1111,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
+					// Written here, after the GPU clock values before it.
+					m_renderer.GetGpuTimestamps().StoreAll();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					if (with_interrupt) {
@@ -1129,7 +1145,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						m_renderer.GetGpuTimestamps().Write(reinterpret_cast<uint64_t>(dst),
 						                                    sizeof(uint64_t), true);
 					} else {
-						std::memcpy(dst, &value, sizeof(value));
+						WriteLabel(dst, value);
 					}
 
 					if (with_interrupt) {
@@ -1229,6 +1245,15 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
 	                 interrupt_context_id);
+}
+
+template <typename T>
+void CommandProcessor::WriteLabel(T* dst, T value) {
+	// End-of-pipe labels land in packet order with the GPU clock values before them.
+	if (!m_renderer.GetGpuTimestamps().WriteLabel(reinterpret_cast<uint64_t>(dst), value,
+	                                              sizeof(T))) {
+		std::memcpy(dst, &value, sizeof(T));
+	}
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
@@ -1362,7 +1387,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	WriteLabel(static_cast<uint32_t*>(dst_gpu_addr), value);
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
@@ -1388,7 +1413,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	WriteLabel(static_cast<uint32_t*>(dst_gpu_addr), value);
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();

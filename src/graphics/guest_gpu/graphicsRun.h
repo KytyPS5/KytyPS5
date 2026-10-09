@@ -33,6 +33,8 @@ public:
 	// False once the GPU stops accepting work, instead of a fatal error.
 	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// Guest memory changed outside the command streams: waiting submissions poll again now.
+	void NotifyGuestWrite();
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,
@@ -86,6 +88,7 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
+	uint64_t                                       m_guest_writes      = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;

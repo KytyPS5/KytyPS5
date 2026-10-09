@@ -1482,6 +1482,14 @@ void CheckSocketWakeup() {
             Net::Getsockopt(writer, 0xffff, 0x0004, &reuse_address, &reuse_address_size) == 0 &&
             reuse_address != 0,
         "Net SO_REUSEADDR reaches the host socket");
+#if !defined(_WIN32)
+  int reuse_port = 0;
+  uint32_t reuse_port_size = sizeof(reuse_port);
+  Check(Net::Setsockopt(writer, 0xffff, 0x0200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Getsockopt(writer, 0xffff, 0x0200, &reuse_port, &reuse_port_size) == 0 &&
+            reuse_port != 0,
+        "Net SO_REUSEPORT reaches the host socket");
+#endif
   int socket_error = -1;
   uint32_t error_size = sizeof(socket_error);
   *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;

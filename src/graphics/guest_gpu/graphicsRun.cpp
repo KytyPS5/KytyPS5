@@ -1280,14 +1280,14 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 template <typename T>
 T CommandProcessor::ReadLabel(const volatile T* addr) {
-	// A label deferred to completion counts for the commands after it: the host queue runs them
-	// after the work before the label.
-	uint64_t pending = 0;
-	if (m_renderer.GetGpuTimestamps().PendingLabel(reinterpret_cast<uint64_t>(addr), sizeof(T),
-	                                               pending)) {
-		return static_cast<T>(pending);
-	}
-	return *addr;
+	// A label deferred to completion counts for the commands after it, as when it was written
+	// at parse time. Memory is read after the lookup: a label stored meanwhile is in it.
+	const auto vaddr  = reinterpret_cast<uint64_t>(addr);
+	const auto labels = m_renderer.GetGpuTimestamps().PendingLabels(vaddr, sizeof(T));
+	const T    value  = *addr;
+	return labels.empty()
+	           ? value
+	           : static_cast<T>(GpuTimestamps::ApplyLabels(labels, vaddr, sizeof(T), value));
 }
 
 template uint32_t CommandProcessor::ReadLabel(const volatile uint32_t*);

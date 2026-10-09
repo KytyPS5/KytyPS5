@@ -3119,6 +3119,10 @@ public:
       alignas(uint64_t) uint64_t ordered_label = 0;
       uint64_t ordered_label_at_parse = UINT64_MAX;
       uint32_t ordered_label_for_gpu = 0;
+      alignas(uint64_t) uint64_t wide_label = 0;
+      alignas(uint64_t) std::array<uint32_t, 2> narrow_label{0, 0x9abcdef0u};
+      bool other_width_waits = false;
+      bool other_width_deferred = false;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
@@ -3179,6 +3183,36 @@ public:
         // Later commands run after it on the host queue: a GPU-side wait sees it already.
         ordered_label_for_gpu = processor->ReadLabel(
             reinterpret_cast<const volatile uint32_t *>(&ordered_label));
+        // A GPU-side read of another width sees the bytes of the deferred labels it covers.
+        auto wide = make_release_mem(2, 0, &wide_label, 0x1122334455667788ull);
+        Pm4Execution wide_execution;
+        (void)processor->Process(wide_execution, wide);
+        auto narrow = make_release_mem(1, 0, narrow_label.data(), 0x13579bdfu);
+        Pm4Execution narrow_execution;
+        (void)processor->Process(narrow_execution, narrow);
+        other_width_deferred = wide_label == 0 && narrow_label[0] == 0;
+        const auto wait_passes = [&](const void *address, uint64_t reference, bool wide_wait) {
+          const auto a = reinterpret_cast<uint64_t>(address);
+          std::array<uint32_t, 9> packet{};
+          packet[0] = wide_wait ? KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0)
+                                : KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+          packet[1] = 0x10u | 3u;
+          packet[2] = static_cast<uint32_t>(a);
+          packet[3] = static_cast<uint32_t>(a >> 32u);
+          packet[4] = static_cast<uint32_t>(reference);
+          packet[5] = wide_wait ? static_cast<uint32_t>(reference >> 32u) : UINT32_MAX;
+          packet[6] = wide_wait ? UINT32_MAX : 0;
+          packet[7] = wide_wait ? UINT32_MAX : 0;
+          Pm4Execution execution;
+          return processor->Process(execution, std::span<const uint32_t>(
+                                                   packet.data(), wide_wait ? 9u : 7u)) ==
+                 Pm4ProcessResult::Complete;
+        };
+        other_width_waits =
+            wait_passes(&wide_label, 0x55667788u, false) &&
+            wait_passes(reinterpret_cast<const uint8_t *>(&wide_label) + 4, 0x11223344u,
+                        false) &&
+            wait_passes(narrow_label.data(), 0x9abcdef013579bdfull, true);
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -3197,6 +3231,10 @@ public:
                       &ordered_label)) == 0x55667788u,
               "a label was written before the GPU clock value recorded before it, or a "
               "GPU-side read after it missed it");
+      Require("GpuCommandLane", "deferred label read with another width",
+              other_width_deferred && other_width_waits &&
+                  wide_label == 0x1122334455667788ull && narrow_label[0] == 0x13579bdfu,
+              "a GPU-side wait missed part of a deferred label it covers");
       // More timestamps than queries in flight, over fewer slots: every slot holds the time of
       // its last write, in recording order.
       constexpr uint32_t batch_slots = 1000;

@@ -94,6 +94,27 @@ private:
 		return CompileRoot(roots[index], value);
 	}
 	Ref  CompileRoot(ResourcePlan::WalkerRoot& root, Value value);
+	void PrepareRead(const ResourcePlan::WalkerRoot& root, ResourcePlan::WalkerRead& read) const;
+	// A value or a failure, returned in registers by the flat-read path.
+	struct Result {
+		uint64_t value = 0;
+		bool     ok    = false;
+	};
+	Result Get(Ref ref) {
+		if (ref >= InlineRef) {
+			return {ref & ~InlineRef, true};
+		}
+		if (ref < ImmediateRef && m_active_mask == NoRef &&
+		    m_values[ref].generation == m_generation) {
+			return {m_values[ref].value, true};
+		}
+		return GetSlow(ref);
+	}
+	Result GetSlow(Ref ref);
+	Result EvaluateRead(const ResourcePlan::WalkerRoot& root, const ResourcePlan::WalkerRead& read);
+	Result ComputeFastRead(const ResourcePlan::WalkerRead& read);
+	Result ReadWord(uint64_t address) const;
+	static Result ReadThrough(const SrtRuntime& runtime, uint64_t address);
 	bool EvaluateRef(Ref ref, uint64_t& result) {
 		if (ref >= ImmediateRef) {
 			if (ref >= InlineRef) {

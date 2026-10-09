@@ -71,6 +71,47 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	return true;
 }
 
+// DWORD-aligned base address of a read handle's address DWORDs.
+uint64_t ReadBase(uint64_t low, uint64_t high) {
+	return ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask & ~uint64_t {3};
+}
+
+// Byte offset of a scalar-address DWORD read: aligned immediate plus aligned offset operand.
+int64_t ScalarReadOffset(uint32_t immediate, uint64_t offset) {
+	return (static_cast<int64_t>(static_cast<int32_t>(immediate)) & ~int64_t {3}) +
+	       static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+}
+
+// Byte offset of a constant-buffer DWORD read, for a non-negative immediate.
+uint64_t BufferReadOffset(uint32_t immediate, uint64_t offset) {
+	return (uint64_t {immediate} & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
+}
+
+// A DWORD at byte_offset lies within the buffer: stride (in high) times records, or records
+// bytes without a stride.
+bool BufferDwordInBounds(uint64_t byte_offset, uint64_t high, uint64_t records) {
+	const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+	const auto size = stride == 0u ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+	                               : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+	return byte_offset <= size && size - byte_offset >= sizeof(uint32_t);
+}
+
+// Byte offset of a scalar-address or constant-buffer DWORD read.
+int64_t RawReadOffset(bool buffer, uint32_t immediate, uint64_t offset) {
+	return buffer ? static_cast<int64_t>(BufferReadOffset(immediate, offset))
+	              : ScalarReadOffset(immediate, offset);
+}
+
+// Address of a raw DWORD read: within the 48-bit address space, and within the buffer's records
+// for a buffer read.
+bool RawReadAddress(bool buffer, int64_t offset, uint64_t low, uint64_t high, uint64_t records,
+                    uint64_t& address) {
+	if (buffer && !BufferDwordInBounds(static_cast<uint64_t>(offset), high, records)) {
+		return false;
+	}
+	return AddSignedAddress(ReadBase(low, high), offset, address);
+}
+
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
@@ -576,10 +617,12 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 			m_program.walker_immediates.clear();
 			m_program.walker_descriptors.clear();
 			roots.assign(reads.size(), {});
+			m_program.walker_reads.assign(reads.size(), {});
 			for (size_t slot = 0; slot < reads.size(); ++slot) {
 				CompileRoot(roots[slot], reads[slot].value);
 				const auto* inst  = reads[slot].value.ResolveInstruction();
 				roots[slot].clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
+				PrepareRead(roots[slot], m_program.walker_reads[slot]);
 			}
 		}
 	}
@@ -604,6 +647,7 @@ SrtWalker::~SrtWalker() {
 		m_program.walker_nodes.clear();
 		m_program.walker_immediates.clear();
 		m_program.walker_srt_reads.clear();
+		m_program.walker_reads.clear();
 		m_program.walker_descriptors.clear();
 	}
 }
@@ -619,6 +663,90 @@ void SrtWalker::Refresh() {
 		walker->m_values     = walker->m_context.values.data();
 		walker->m_layout     = m_program.walker_layout;
 	}
+}
+
+void SrtWalker::PrepareRead(const ResourcePlan::WalkerRoot& root,
+                            ResourcePlan::WalkerRead&       read) const {
+	read = {};
+	if (root.ref >= ImmediateRef) {
+		return;
+	}
+	const auto& node   = m_program.walker_nodes[root.ref];
+	const bool  buffer = node.opcode == ValueOpcode::ReadConstBuffer;
+	if (!node.compiled || node.kind != WalkerRawRead ||
+	    (!buffer && node.opcode != ValueOpcode::LoadAddressU32) || node.args[0] >= ImmediateRef ||
+	    node.args[1] < InlineRef) {
+		return;
+	}
+	const auto& handle = m_program.walker_nodes[node.args[0]];
+	const auto  offset = node.args[1] & ~InlineRef;
+	if (!handle.compiled || handle.arg_count < 2u ||
+	    (buffer && (handle.arg_count != 4u || static_cast<int32_t>(node.target) < 0))) {
+		return;
+	}
+	read.low    = handle.args[0];
+	read.high   = handle.args[1];
+	read.offset = RawReadOffset(buffer, node.target, offset);
+	if (buffer) {
+		read.records = handle.args[2];
+		read.word3   = handle.args[3];
+	}
+}
+
+// Out of line, so that the callers of Get keep their values in registers.
+[[gnu::noinline]] SrtWalker::Result SrtWalker::GetSlow(Ref ref) {
+	uint64_t   value = 0;
+	const bool ok    = EvaluateRef(ref, value);
+	return {value, ok};
+}
+
+SrtWalker::Result SrtWalker::EvaluateRead(const ResourcePlan::WalkerRoot& root,
+                                          const ResourcePlan::WalkerRead& read) {
+	const auto ref = root.ref;
+	// The clean flag of a root is the aux of its read node: such a read is delegated.
+	if (m_active_mask != NoRef || (m_clean_evaluator != nullptr && root.clean)) {
+		return GetSlow(ref);
+	}
+	auto& memo = m_values[ref];
+	if (memo.generation == m_generation) {
+		return {memo.value, true};
+	}
+	// EvaluateNodeRef and EvaluateRawRead for this node shape: same memo, order and failures.
+	EXIT_IF(m_layout != m_program.walker_layout);
+	if (memo.generation == (m_generation | 1u)) {
+		return {};
+	}
+	memo.generation  = m_generation | 1u;
+	const auto value = ComputeFastRead(read);
+	auto&      entry = m_values[ref];
+	entry.value      = value.value;
+	entry.generation = value.ok ? m_generation : 0u;
+	return value;
+}
+
+SrtWalker::Result SrtWalker::ComputeFastRead(const ResourcePlan::WalkerRead& read) {
+	const auto low = Get(read.low);
+	if (!low.ok) {
+		return {};
+	}
+	const auto high = Get(read.high);
+	if (!high.ok) {
+		return {};
+	}
+	const bool buffer  = read.records != NoRef;
+	Result     records = {};
+	if (buffer) {
+		records = Get(read.records);
+		// The buffer's fourth DWORD is evaluated as EvaluateRawRead does, but not used here.
+		if (!records.ok || !Get(read.word3).ok) {
+			return {};
+		}
+	}
+	uint64_t address = 0;
+	if (!RawReadAddress(buffer, read.offset, low.value, high.value, records.value, address)) {
+		return {};
+	}
+	return ReadWord(address);
 }
 
 SrtWalker::Ref SrtWalker::CompileRoot(ResourcePlan::WalkerRoot& root, Value value) {
@@ -767,22 +895,21 @@ bool SrtWalker::EvaluateRawRead(const ResourcePlan::WalkerNode& node, uint64_t& 
 	if (!handle_arg(0, low) || !handle_arg(1, high) || !Arg(node, 1, offset)) {
 		return false;
 	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	// ComputeFastRead repeats the scalar and constant-buffer steps for prepared reads: keep them in
+	// step.
 	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(node.target));
-	uint64_t   address   = 0;
-	if (node.opcode == ValueOpcode::ReadConstBuffer || vector) {
-		uint64_t records = 0;
-		uint64_t word3   = 0;
+	const bool buffer    = node.opcode == ValueOpcode::ReadConstBuffer || vector;
+	uint64_t   records   = 0;
+	if (buffer) {
+		uint64_t word3 = 0;
 		if (handle.arg_count != 4u || !handle_arg(2, records) || !handle_arg(3, word3)) {
 			return false;
 		}
 		if (immediate < 0) {
 			return false;
 		}
-		const auto byte_offset =
-		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 		if (vector) {
+			const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
 			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
 				return false;
@@ -791,33 +918,43 @@ bool SrtWalker::EvaluateRawRead(const ResourcePlan::WalkerNode& node, uint64_t& 
 				return true;
 			}
 		}
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		// Like a scalar read, the DWORD must stay in the 48-bit address space.
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t) ||
-		    !AddSignedAddress(base & ~uint64_t {3}, static_cast<int64_t>(byte_offset), address)) {
-			return false;
-		}
-	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
-		}
+	}
+	uint64_t address = 0;
+	if (!RawReadAddress(buffer, RawReadOffset(buffer, node.target, offset), low, high, records,
+	                    address)) {
+		return false;
+	}
+	if (!vector) {
+		const auto word = ReadWord(address);
+		result          = word.value;
+		return word.ok;
 	}
 	uint32_t word = 0;
-	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
-	if (reader != nullptr) {
-		if (!reader(m_runtime.userdata, address, {&word, 1})) {
-			return false;
-		}
-	} else {
-		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	const auto reader = m_runtime.read_specialization_memory;
+	if (reader == nullptr || !reader(m_runtime.userdata, address, {&word, 1})) {
+		return false;
 	}
 	result = word;
 	return true;
+}
+
+// Out of line: the reader takes the address of the word.
+[[gnu::noinline]] SrtWalker::Result SrtWalker::ReadThrough(const SrtRuntime& runtime,
+                                                           uint64_t          address) {
+	uint32_t word = 0;
+	if (!runtime.read_memory(runtime.userdata, address, {&word, 1})) {
+		return {};
+	}
+	return {word, true};
+}
+
+SrtWalker::Result SrtWalker::ReadWord(uint64_t address) const {
+	if (m_runtime.read_memory != nullptr) {
+		return ReadThrough(m_runtime, address);
+	}
+	uint32_t word = 0;
+	std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	return {word, true};
 }
 
 bool SrtWalker::EvaluateNode(const ResourcePlan::WalkerNode& node, uint64_t& result) {
@@ -1219,7 +1356,14 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (read.flat_offset >= flat.size()) return false;
 		auto&    evaluator = root.clean ? *m_clean_evaluator : *this;
 		uint64_t wide      = 0;
-		if (!evaluator.EvaluateRef(root.ref, wide)) {
+		const auto& fast      = m_program.walker_reads[slot];
+		if (fast.low != NoRef) {
+			const auto value = evaluator.EvaluateRead(root, fast);
+			if (!value.ok) {
+				return false;
+			}
+			wide = value.value;
+		} else if (!evaluator.EvaluateRef(root.ref, wide)) {
 			return false;
 		}
 		flat[read.flat_offset] = static_cast<uint32_t>(wide);

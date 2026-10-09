@@ -599,6 +599,16 @@ struct ResourcePlan {
 		uint32_t ref   = UINT32_MAX;
 		bool     clean = false; // SRT read evaluated through the clean evaluator
 	};
+	// An SRT read root that is a DWORD read at a constant offset: its handle DWORDs and aligned
+	// offset, so a flat-buffer refresh reads it without the generic dispatch. low is UINT32_MAX
+	// for any other root.
+	struct WalkerRead {
+		uint32_t low     = UINT32_MAX;
+		uint32_t high    = UINT32_MAX;
+		uint32_t records = UINT32_MAX; // constant-buffer reads only, with word3
+		uint32_t word3   = UINT32_MAX;
+		int64_t  offset  = 0;
+	};
 
 	ResourcePlan() = default;
 	~ResourcePlan();
@@ -638,6 +648,7 @@ struct ResourcePlan {
 	mutable std::vector<WalkerNode>      walker_nodes;
 	mutable std::vector<WalkerImmediate> walker_immediates;
 	mutable std::vector<WalkerRoot>      walker_srt_reads;
+	mutable std::vector<WalkerRead>      walker_reads; // per SRT read root
 	mutable std::vector<WalkerRoot>      walker_descriptors;
 	// Counts additions to the arrays above, which may move them: a walker refreshes its
 	// pointers after any compilation before it evaluates again.

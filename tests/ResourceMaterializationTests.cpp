@@ -1,11 +1,14 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -871,6 +874,311 @@ void TestBufferReadPastAddressSpaceFails() {
         "a buffer read past the 48-bit address space was read");
 }
 
+// Flat-buffer reads with constant offsets: scalar address reads (with an unaligned offset
+// operand, a negative immediate and a pointer read from another table) and buffer reads.
+Libs::Graphics::ShaderRecompiler::IR::Program FlatReadProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 4;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const auto memory = [&](ResourceKind kind, uint32_t offset) {
+    MemoryInfo info;
+    info.kind = kind;
+    info.offset = offset;
+    program.memory_info.push_back(info);
+    return static_cast<uint32_t>(program.memory_info.size() - 1u);
+  };
+  const auto user = [&](uint32_t reg) {
+    return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(reg))}));
+  };
+  const auto read = [&](ValueOpcode op, Value handle, uint32_t offset, uint32_t index) {
+    auto &inst = op == ValueOpcode::ReadConstBuffer
+                     ? block.AppendNewInst(op, {handle, Value(offset)})
+                     : block.AppendNewInst(op, {handle, Value(offset), Value(0u), Value(true)});
+    inst.SetFlags(SrtReadFlags{.index = index});
+    const auto slot = static_cast<uint32_t>(program.srt_reads.size());
+    program.srt_reads.push_back({Value(&inst), slot});
+    return Value(&inst);
+  };
+  const auto table = Value(&block.AppendNewInst(ValueOpcode::GetAddressResource, {user(0), user(1)}));
+  read(ValueOpcode::LoadAddressU32, table, 0u, memory(ResourceKind::ScalarAddress, 0xfffffffcu));
+  const auto low = read(ValueOpcode::LoadAddressU32, table, 0u, memory(ResourceKind::ScalarAddress, 0u));
+  // (8 & ~3) + (6 & ~3): the DWORD at 12.
+  const auto high = read(ValueOpcode::LoadAddressU32, table, 6u, memory(ResourceKind::ScalarAddress, 8u));
+  const auto chased = Value(&block.AppendNewInst(ValueOpcode::GetAddressResource, {low, high}));
+  read(ValueOpcode::LoadAddressU32, chased, 4u, memory(ResourceKind::ScalarAddress, 4u));
+  // The buffer's last two DWORDs are read from the table, only through the buffer's handle.
+  const auto nested = [&](uint32_t offset) {
+    auto &inst = block.AppendNewInst(ValueOpcode::LoadAddressU32, {table, Value(0u), Value(0u), Value(true)});
+    inst.SetFlags(SrtReadFlags{.index = memory(ResourceKind::ScalarAddress, offset)});
+    return Value(&inst);
+  };
+  const auto buffer = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+                                                 {user(2), user(3), nested(20u), nested(16u)}));
+  // (4 & ~3) + (6 & ~3): the DWORD at byte 8.
+  const auto first = read(ValueOpcode::ReadConstBuffer, buffer, 6u, memory(ResourceKind::ScalarBuffer, 4u));
+  DescriptorSource source;
+  source.dwords = {low, high, first, Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  return program;
+}
+
+void TestFlatReadsKeepReadSemantics() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = ExtractResourcePlan(FlatReadProgram());
+  std::array<uint32_t, 8> table{};
+  std::array<uint32_t, 4> chased{0x11u, 0x22u, 0x33u, 0x44u};
+  std::array<uint32_t, 4> buffer{0x51u, 0x52u, 0x53u, 0x54u};
+  const auto address = [](const auto &words, size_t word = 0) {
+    return reinterpret_cast<uint64_t>(words.data() + word);
+  };
+  // The table pointer is one DWORD and two bytes in, aligned down by the reads: the negative
+  // immediate reads table[0], then 0 and 12 read table[1] and table[4], the address of the
+  // chased table, and 20 and 16 read table[6] and table[5], the buffer's last two DWORDs.
+  table[0] = 0x99u;
+  table[1] = static_cast<uint32_t>(address(chased));
+  table[4] = static_cast<uint32_t>(address(chased) >> 32u);
+  std::array<uint32_t, 4> user_data{};
+  const auto point = [&](uint64_t table_address, uint32_t records, uint32_t stride) {
+    const auto buffer_address = address(buffer) + 1u;
+    user_data = {static_cast<uint32_t>(table_address), static_cast<uint32_t>(table_address >> 32u),
+                 static_cast<uint32_t>(buffer_address),
+                 static_cast<uint32_t>(buffer_address >> 32u) | (stride << 16u)};
+    table[6] = records;
+  };
+  struct Reads {
+    std::vector<uint64_t>                       addresses;
+    std::vector<std::pair<uint64_t, uint64_t>> mapped;
+    uint64_t                                    fail = 0;
+  } reads;
+  reads.mapped = {{address(table), sizeof(table)}, {address(chased), sizeof(chased)},
+                  {address(buffer), sizeof(buffer)}};
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory = [](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        reads.addresses.push_back(address);
+        for (const auto [base, size] : reads.mapped) {
+          if (address >= base && address - base + words.size_bytes() <= size) {
+            std::memcpy(words.data(), reinterpret_cast<const void *>(address), words.size_bytes());
+            return address != reads.fail;
+          }
+        }
+        return false;
+      },
+      .userdata = &reads};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const std::vector<uint64_t> order{address(table, 0),  address(table, 1), address(table, 4),
+                                    address(chased, 2), address(table, 6), address(table, 5),
+                                    address(buffer, 2)};
+  point(address(table, 1) + 2u, 4u, 4u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0x99u, table[1], table[4], 0x33u, 0x53u} &&
+            reads.addresses == order && snapshot.buffers[0].dwords[2] == 0x53u,
+        "flat reads changed their addresses, order or values");
+  Check(plan.walker_reads.size() == 5u &&
+            std::ranges::all_of(plan.walker_reads, [](const auto &read) { return read.low != UINT32_MAX; }),
+        "flat reads with constant offsets were not prepared for the direct path");
+  chased[2] = 0x66u;
+  buffer[2] = 0x67u;
+  reads.addresses.clear();
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.flattened_srt[3] == 0x66u && snapshot.flattened_srt[4] == 0x67u &&
+            reads.addresses == order,
+        "a later walk kept flat reads of an earlier one");
+  reads.addresses.clear();
+  reads.fail = address(chased, 2);
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads.addresses == std::vector<uint64_t>(order.begin(), order.begin() + 4),
+        "a failed flat read did not stop the walk");
+  reads.addresses.clear();
+  reads.fail = address(table, 5);
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads.addresses == std::vector<uint64_t>(order.begin(), order.begin() + 6),
+        "a failed read of a buffer's fourth DWORD did not stop the walk");
+  reads.fail = 0;
+  // Without a stride, records are bytes: the DWORD at byte 8 needs 12 of them.
+  for (const uint32_t records : {4u, 11u}) {
+    point(address(table, 1), records, 0u);
+    reads.addresses.clear();
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+              reads.addresses == std::vector<uint64_t>(order.begin(), order.begin() + 6),
+          "an out-of-bounds buffer read was accepted");
+  }
+  point(address(table, 1), 12u, 0u);
+  reads.addresses.clear();
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads.addresses == order && snapshot.flattened_srt[4] == 0x67u,
+        "the last DWORD of a buffer was rejected");
+  // A negative immediate below address 0 fails before reading.
+  point(0u, 4u, 4u);
+  reads.addresses.clear();
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && reads.addresses.empty(),
+        "an underflowing scalar address was read");
+}
+
+// A written buffer whose base and size are flat reads of a table, in a block that branches on
+// the size: the plan captures its reads, as the branch depends on memory, and these two reads are
+// clean. A third flat read feeds no descriptor.
+Libs::Graphics::ShaderRecompiler::IR::Program CleanFlatReadProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 2;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const auto user = [&](uint32_t reg) {
+    return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(reg))}));
+  };
+  const auto table = Value(&block.AppendNewInst(ValueOpcode::GetAddressResource, {user(0), user(1)}));
+  const auto read = [&](uint32_t offset) {
+    MemoryInfo info;
+    info.kind = ResourceKind::ScalarAddress;
+    info.offset = offset;
+    program.memory_info.push_back(info);
+    auto &inst = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {table, Value(0u), Value(0u), Value(true)});
+    inst.SetFlags(SrtReadFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
+    const auto slot = static_cast<uint32_t>(program.srt_reads.size());
+    program.srt_reads.push_back({Value(&inst), slot});
+    // The shader reads the flattened slot in this block.
+    auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+    return Value(&block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(slot)}));
+  };
+  const auto base = read(0u);
+  const auto size = read(8u);
+  read(12u);
+  DescriptorSource source;
+  source.dwords = {base, Value(0u), size, Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  auto &condition = block.AppendNewInst(ValueOpcode::IEqual32, {size, Value(64u)});
+  auto &store_block = AddValueBlock(program);
+  AddValueBlock(program);
+  program.blocks[0]->condition = Value(&condition);
+  program.blocks[0]->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                                   .true_block = program.blocks[1],
+                                   .false_block = program.blocks[2]};
+  program.blocks[1]->terminator.kind = CFG::TerminatorKind::Return;
+  program.blocks[2]->terminator.kind = CFG::TerminatorKind::Return;
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  store_block.AppendNewInst(ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+      .SetFlags(MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
+  return program;
+}
+
+struct CountedReads {
+  uint32_t ordinary = 0;
+  uint32_t strict = 0;
+};
+
+// Both readers read host memory directly and count their reads.
+Libs::Graphics::ShaderRecompiler::IR::SrtRuntime CountingRuntime(std::span<const uint32_t> user_data,
+                                                                  CountedReads &reads) {
+  return {.user_data = user_data,
+          .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> values) {
+            ++static_cast<CountedReads *>(data)->ordinary;
+            std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+            return true;
+          },
+          .userdata = &reads,
+          .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> values) {
+            ++static_cast<CountedReads *>(data)->strict;
+            std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+            return true;
+          }};
+}
+
+// Clean flat reads take the direct path in the clean evaluator, through the strict reader, and
+// the other one through the ordinary reader. The walk captures all three; the branch reuses the
+// memo of the size.
+void TestCleanFlatReadsUseTheStrictReader() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = ExtractResourcePlan(CleanFlatReadProgram());
+  const auto clean = [&](size_t slot) {
+    return plan.srt_reads[slot].value.Instruction()->Flags<SrtReadFlags>().clean;
+  };
+  Check(plan.capture_specialization_reads && plan.srt_reads.size() == 3u && clean(0) == 1u &&
+            clean(1) == 1u && clean(2) == 0u,
+        "written buffer reads are not clean in a capturing plan");
+  std::array<uint32_t, 4> words{0x9000u, 0u, 64u, 0x77u};
+  const auto address = reinterpret_cast<uint64_t>(words.data());
+  const std::array<uint32_t, 2> user_data{static_cast<uint32_t>(address),
+                                          static_cast<uint32_t>(address >> 32u)};
+  CountedReads reads;
+  const auto runtime = CountingRuntime(user_data, reads);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            std::ranges::all_of(plan.walker_reads, [](const auto &read) { return read.low != UINT32_MAX; }) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0x9000u, 64u, 0x77u} &&
+            snapshot.buffers[0].dwords[0] == 0x9000u && snapshot.buffers[0].dwords[2] == 64u &&
+            reads.ordinary == 1u && reads.strict == 2u &&
+            snapshot.specialization_reads ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{address, 4u}, {address + 8u, 4u}, {address + 12u, 4u}},
+        "flat reads bypassed their reader or its capture");
+}
+
+// A constant-buffer read below its base (negative immediate) fails after evaluating its handle:
+// it is not prepared for the direct path, which would read it.
+void TestNegativeBufferImmediateIsNotRead() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 4;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const auto user = [&](uint32_t reg) {
+    return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(reg))}));
+  };
+  const auto buffer = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+                                                 {user(0), user(1), user(2), user(3)}));
+  MemoryInfo info;
+  info.kind = ResourceKind::ScalarBuffer;
+  info.offset = 0x80000000u;
+  program.memory_info.push_back(info);
+  auto &inst = block.AppendNewInst(ValueOpcode::ReadConstBuffer, {buffer, Value(0u)});
+  inst.SetFlags(SrtReadFlags{.index = 0});
+  program.srt_reads.push_back({Value(&inst), 0});
+  DescriptorSource source;
+  source.dwords = {user(0), user(1), user(2), user(3)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  auto plan = ExtractResourcePlan(program);
+  // The largest stride and record count: the read would be in bounds.
+  std::array<uint32_t, 4> words{};
+  const auto address = reinterpret_cast<uint64_t>(words.data());
+  const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(address),
+                                          static_cast<uint32_t>(address >> 32u) | (0x3fffu << 16u),
+                                          UINT32_MAX, 0u};
+  uint32_t reads = 0;
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+                             ++*static_cast<uint32_t *>(data);
+                             return false;
+                           },
+                           .userdata = &reads};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            plan.walker_reads.size() == 1u && plan.walker_reads[0].low == UINT32_MAX && reads == 0u,
+        "a constant-buffer read below its base was read");
+}
+
 } // namespace
 
 namespace Common {
@@ -904,6 +1212,9 @@ int main() {
   TestWalkerRecompilesChangedProgram();
   TestWalkerKeepsLazyReads();
   TestBufferReadPastAddressSpaceFails();
+  TestFlatReadsKeepReadSemantics();
+  TestCleanFlatReadsUseTheStrictReader();
+  TestNegativeBufferImmediateIsNotRead();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

@@ -87,20 +87,26 @@ public:
 			return result;
 		}
 
+		const Framing fmt = DetectFraming(static_cast<const uint8_t*>(input), input_size);
 		while (gapless == nullptr || !gapless->IsEnd()) {
 			const auto* data      = static_cast<const uint8_t*>(input) + result.input_consumed;
 			const auto  remaining = input_size - result.input_consumed;
-			if (remaining < 2) {
+			if (result.input_consumed != 0 && remaining == 0) {
+				break;
+			}
+			if (remaining < 2 && fmt != Framing::Raw) {
 				result.result = AJM_RESULT_PARTIAL_INPUT;
 				break;
 			}
-			// Framing: either a 2-byte LE length prefix + packet, or a bare Opus packet filling
-			// the whole input (seen from PS5 titles).
-			uint32_t packet_size = static_cast<uint32_t>(data[0]) | (uint32_t {data[1]} << 8u);
-			uint32_t header      = 2;
-			if (packet_size == 0 || packet_size > remaining - 2) {
-				packet_size = static_cast<uint32_t>(remaining);
+			uint32_t packet_size = 0;
+			uint32_t header      = 0;
+			if (!ParseHeader(fmt, data, remaining, &header, &packet_size)) {
+				if (fmt == Framing::Raw || result.input_consumed != 0) {
+					result.result = AJM_RESULT_PARTIAL_INPUT;
+					break;
+				}
 				header      = 0;
+				packet_size = static_cast<uint32_t>(remaining);
 			}
 			data += header;
 			if (packet_size == 0 || ((data[0] & 3u) == 3 && packet_size < 2)) {
@@ -215,6 +221,64 @@ private:
 	}
 
 	AVCodecContext* m_context = nullptr;
+	enum class Framing { Raw, Be2, Le2, Be4, Hdr8 };
+
+	// Parse the per-packet header for a framing. Hdr8 = {u32 BE size, u32 BE final_range}.
+	static bool ParseHeader(Framing fmt, const uint8_t* p, size_t rem, uint32_t* header,
+	                        uint32_t* size) {
+		auto be32 = [](const uint8_t* q) {
+			return (uint32_t {q[0]} << 24u) | (uint32_t {q[1]} << 16u) | (uint32_t {q[2]} << 8u) |
+			       uint32_t {q[3]};
+		};
+		uint32_t h = 0;
+		uint32_t s = 0;
+		switch (fmt) {
+			case Framing::Raw: h = 0; s = static_cast<uint32_t>(rem); break;
+			case Framing::Be2: if (rem < 2) return false; h = 2; s = (uint32_t {p[0]} << 8u) | p[1]; break;
+			case Framing::Le2: if (rem < 2) return false; h = 2; s = (uint32_t {p[1]} << 8u) | p[0]; break;
+			case Framing::Be4: if (rem < 4) return false; h = 4; s = be32(p); break;
+			case Framing::Hdr8: if (rem < 8) return false; h = 8; s = be32(p); break;
+		}
+		if (s == 0 || s > rem - h) {
+			return false;
+		}
+		*header = h;
+		*size   = s;
+		return true;
+	}
+
+	// A framing is accepted if the packet chain covers the whole input (trailing zeros allowed).
+	static bool ChainFits(Framing fmt, const uint8_t* p, size_t total) {
+		size_t off = 0;
+		while (off < total) {
+			uint32_t h = 0;
+			uint32_t s = 0;
+			if (!ParseHeader(fmt, p + off, total - off, &h, &s)) {
+				for (size_t i = off; i < total; i++) {
+					if (p[i] != 0) return false;
+				}
+				return off != 0;
+			}
+			off += h + s;
+		}
+		return true;
+	}
+
+	Framing DetectFraming(const uint8_t* p, size_t total) {
+		static const Framing order[] = {Framing::Hdr8, Framing::Be4, Framing::Be2, Framing::Le2};
+		if (m_framing != Framing::Raw && ChainFits(m_framing, p, total)) {
+			return m_framing;
+		}
+		for (auto f: order) {
+			if (ChainFits(f, p, total)) {
+				m_framing = f;
+				return f;
+			}
+		}
+		return Framing::Raw;
+	}
+
+	Framing         m_framing = Framing::Raw;
 	const uint32_t  m_max_channels;
 	uint32_t        m_frames_per_packet = 0;
 };

@@ -17,6 +17,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -463,6 +466,42 @@ static void AjmTraceJob(const char* job, uint32_t instance, const AjmDecodeResul
 static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
                                          void* output, size_t output_size, bool multiple_frames) {
 	auto r = AjmDecodeInstanceImpl(instance, input, input_size, output, output_size, multiple_frames);
+	if (GameTrace::Enabled() && (instance >> 14u) == 24u) {
+		static std::atomic_int s_dn {0};
+		const int              k = s_dn.fetch_add(1);
+		if (k < 40) {
+			char hex[64] = "";
+			for (size_t i = 0; input != nullptr && i < 16 && i < input_size; i++) std::snprintf(hex + i * 3, 4, "%02x ", static_cast<const uint8_t*>(input)[i]);
+			GameTrace::Line("AJM OPUS decode#%d in=%p size=%llu head=%s out=%p outsize=%llu mf=%d -> res=0x%x consumed=%llu written=%llu frames=%u ch=%u enc=%u", k, input, static_cast<unsigned long long>(input_size), hex, output, static_cast<unsigned long long>(output_size), multiple_frames ? 1 : 0, static_cast<uint32_t>(r.result), static_cast<unsigned long long>(r.input_consumed), static_cast<unsigned long long>(r.output_written), r.frames, r.format.channel_num, r.format.sample_encoding);
+		}
+	}
+	if ((instance >> 14u) == 24u) {
+		static const bool s_dump = std::getenv("KYTY_DBG_DUMP_OPUS") != nullptr;
+		if (s_dump) {
+			static std::atomic_int s_job {0};
+			const int              k = s_job.fetch_add(1);
+			std::error_code        ec;
+			std::filesystem::create_directories("F:/emuf/tmp-kyty/opus", ec);
+			char base[160];
+			std::snprintf(base, sizeof(base), "F:/emuf/tmp-kyty/opus/inst_%08x", instance);
+			auto append = [](const std::string& path, const void* p, size_t n, size_t cap) {
+				if (n == 0 || p == nullptr) return;
+				std::error_code e2;
+				const auto      sz = std::filesystem::exists(path, e2) ? std::filesystem::file_size(path, e2) : 0;
+				if (sz + n > cap) return;
+				if (FILE* f = std::fopen(path.c_str(), "ab")) { std::fwrite(p, 1, n, f); std::fclose(f); }
+			};
+			const auto fmt = r.format;
+			char pcm[220];
+			std::snprintf(pcm, sizeof(pcm), "%s_%uch_%s_%u.raw", base, fmt.channel_num, fmt.sample_encoding == 2 ? "f32" : (fmt.sample_encoding == 1 ? "s32" : "s16"), fmt.sampling_frequency);
+			constexpr size_t cap = 20u * 1024u * 1024u;
+			append(pcm, output, std::min(r.output_written, output_size), cap);
+			append(std::string(base) + "_input.bin", input, input_size, cap);
+			char line[200];
+			const int ln = std::snprintf(line, sizeof(line), "job=%d in=%llu consumed=%llu written=%llu frames=%u res=0x%x\n", k, static_cast<unsigned long long>(input_size), static_cast<unsigned long long>(r.input_consumed), static_cast<unsigned long long>(r.output_written), r.frames, static_cast<uint32_t>(r.result));
+			append(std::string(base) + "_index.txt", line, static_cast<size_t>(ln), 4u * 1024u * 1024u);
+		}
+	}
 	AjmTraceJob("decode", instance, r);
 	return r;
 }
@@ -524,7 +563,7 @@ static AjmDecodeResult AjmInitializeInstanceImpl(uint32_t instance, const void* 
 
 static AjmDecodeResult AjmInitializeInstance(uint32_t instance, const void* codec_parameters,
                                              size_t codec_parameters_size) {
-	if (GameTrace::Enabled()) {
+	if (GameTrace::Enabled() && (instance >> 14u) == 24u) {
 		static int s_n = 0;
 		if (s_n++ < 24) {
 			char hex[200] = "";

@@ -352,6 +352,7 @@ public:
 		FoldBoundedLoopSelectors();
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
+		m_cyclic_entries.program = &m_program;
 		PlanIndirectDescriptors();
 		PlanIndirectBuffers();
 		for (auto* block: m_program.blocks) {
@@ -362,6 +363,7 @@ public:
 			}
 		}
 		LinkImageAliases();
+		m_cyclic_entries = {};
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -464,6 +466,11 @@ private:
 		Inst*    handle = nullptr;
 		uint32_t source = 0;
 		Value    key;
+	};
+
+	struct MemoryAccessors {
+		uint32_t    count = 0;
+		const Inst* only  = nullptr;
 	};
 
 	// An emulator invariant: the IR reached tracking in a shape this pass must never see.
@@ -698,12 +705,14 @@ private:
 		const auto& info = *branch;
 		const auto& term = info.terminator;
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
-		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
-		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(0)) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(1))) {
+		    !((term.true_block == target_ids[0] && term.false_block == target_ids[1]) ||
+		      (term.false_block == target_ids[0] && term.true_block == target_ids[1])) ||
+		    !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Integer, nullptr,
+		                          &m_cyclic_entries) ||
+		    !ValidateRuntimeValue(m_program, phi->Arg(0), RuntimeValueType::Any, nullptr,
+		                          &m_cyclic_entries) ||
+		    !ValidateRuntimeValue(m_program, phi->Arg(1), RuntimeValueType::Any, nullptr,
+		                          &m_cyclic_entries)) {
 			return value;
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
@@ -884,6 +893,7 @@ private:
 	void PlanScalarReads() {
 		m_program.srt_plan_complete = false;
 		m_program.srt_reads.clear();
+		m_cyclic_entries.program = &m_program;
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				const auto op    = inst.GetOpcode();
@@ -934,10 +944,12 @@ private:
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
 				    ScalarReadMemory(inst, index) != nullptr &&
 				    inst.Arg(1).Resolve().IsImmediate() &&
-				    ValidateRuntimeValue(m_program, Value(&inst)))
+				    ValidateRuntimeValue(m_program, Value(&inst), RuntimeValueType::Any, nullptr,
+				                         &m_cyclic_entries))
 					CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
 			}
 		}
+		m_cyclic_entries = {};
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
 			if (std::ranges::find(m_program.unfoldable_pcs, flags.pc) !=
@@ -1026,7 +1038,7 @@ private:
 				return false;
 			}
 			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i], RuntimeValueType::Any,
-			                          failure)) {
+			                          failure, &m_cyclic_entries)) {
 				return false;
 			}
 		}
@@ -1186,14 +1198,20 @@ private:
 		           : nullptr;
 	}
 
+	static bool IsMemoryAccess(ValueOpcode op) {
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
+		if (!m_memory_accessors.empty()) {
+			const auto& accessors = m_memory_accessors[index];
+			return accessors.count == 0u || (accessors.count == 1u && accessors.only == &owner);
+		}
 		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
+				if (!IsMemoryAccess(inst.GetOpcode()) || &inst == &owner) {
 					continue;
 				}
 				if (inst.Flags<MemoryFlags>().index == index) {
@@ -1202,6 +1220,23 @@ private:
 			}
 		}
 		return true;
+	}
+
+	// Image planning neither adds nor renumbers memory accesses, so this holds while it runs.
+	void IndexMemoryAccessors() {
+		m_memory_accessors.assign(m_program.memory_info.size(), {});
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				if (!IsMemoryAccess(inst.GetOpcode())) {
+					continue;
+				}
+				const auto index = inst.Flags<MemoryFlags>().index;
+				if (index < m_memory_accessors.size()) {
+					m_memory_accessors[index].count++;
+					m_memory_accessors[index].only = &inst;
+				}
+			}
+		}
 	}
 
 	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
@@ -1845,8 +1880,10 @@ private:
 			if (phi->PhiBlock(back) != update_block || !MaskOnlyLosesBits(phi->Arg(back), value))
 				continue;
 			const auto initial = phi->Arg(back ^ 1u).Resolve();
-			return ValidateRuntimeValue(m_program, initial, RuntimeValueType::Integer) ? initial
-			                                                                           : Value {};
+			return ValidateRuntimeValue(m_program, initial, RuntimeValueType::Integer, nullptr,
+			                            &m_cyclic_entries)
+			           ? initial
+			           : Value {};
 		}
 		return {};
 	}
@@ -2107,7 +2144,8 @@ private:
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;
 			if (compare->GetOpcode() != ValueOpcode::SLessThan32 || use_of_key.operand != 0u ||
-			    !ValidateRuntimeValue(m_program, compare->Arg(1)))
+			    !ValidateRuntimeValue(m_program, compare->Arg(1), RuntimeValueType::Any, nullptr,
+			                          &m_cyclic_entries))
 				continue;
 			if (!guarded_on_entry(use, [&](const EdgePredicate& edge) {
 				    return edge.positive && Implies(edge.condition, Value(use_of_key.user));
@@ -2126,7 +2164,8 @@ private:
 
 	const Inst* BoundedLoop(Value key, const Block* use) const {
 		return BoundedLoop(key, use, [&](const Inst& compare, uint32_t) {
-			return ValidateRuntimeValue(m_program, compare.Arg(1), RuntimeValueType::Integer);
+			return ValidateRuntimeValue(m_program, compare.Arg(1), RuntimeValueType::Integer, nullptr,
+			                            &m_cyclic_entries);
 		});
 	}
 
@@ -2552,7 +2591,9 @@ private:
 					const auto* selected = descriptor.dwords[word].TryInstruction();
 					if (selected == nullptr || selected->GetOpcode() != branch->GetOpcode() ||
 					    selected->Parent() != branch->Parent()) {
-						if (!ValidateRuntimeValue(m_program, descriptor.dwords[word]))
+						if (!ValidateRuntimeValue(m_program, descriptor.dwords[word],
+						                          RuntimeValueType::Any, nullptr,
+						                          &m_cyclic_entries))
 							return UINT32_MAX;
 						continue;
 					}
@@ -2639,6 +2680,7 @@ private:
 	}
 
 	void PlanIndirectDescriptors() {
+		IndexMemoryAccessors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
@@ -2658,6 +2700,7 @@ private:
 				}
 			}
 		}
+		m_memory_accessors.clear();
 	}
 
 	// Recognizes a buffer V# assembled from four consecutive scalar reads of one descriptor table
@@ -3244,8 +3287,10 @@ private:
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
-	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
-	std::map<const Inst*, Value>              m_descriptor_values;
+	mutable CyclicPhiEntryCache                m_cyclic_entries;
+	std::vector<MemoryAccessors>               m_memory_accessors;
+	std::vector<IndirectDescriptorPlan>        m_indirect_descriptors;
+	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 	std::vector<IndirectBufferPlan> m_indirect_buffers;
 	std::unordered_set<const Inst*> m_applied_indirect_buffers;

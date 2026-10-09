@@ -1057,6 +1057,46 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+// A cached answer must be the answer: the entry, the web, and on refusal the reason and both
+// disagreeing operands, the first time and on every hit after it.
+void TestCyclicPhiEntryCacheAnswersLikeTheWalk() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  auto &block = AddValueBlock(program);
+  auto &entry = block.AppendNewInst(ValueOpcode::GetUserData,
+                                    {Value(static_cast<ScalarReg>(0))});
+  auto &loop = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto &step = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&loop), Value(1u)});
+  loop.AddPhiOperand(&block, Value(&entry));
+  loop.AddPhiOperand(&block, Value(&step));
+  auto &merge = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  merge.AddPhiOperand(&block, Value(1u));
+  merge.AddPhiOperand(&block, Value(2u));
+  auto &closed = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto &closed_step = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&closed), Value(1u)});
+  closed.AddPhiOperand(&block, Value(&closed_step));
+
+  CyclicPhiEntryCache cache{.program = &program};
+  for (const auto *phi : {&loop, &merge, &closed}) {
+    const Value root(const_cast<Inst *>(phi));
+    std::vector<const Inst *> plain_web{&step};
+    CyclicPhiFailure plain_reject;
+    const auto plain = ResolveCyclicPhiEntry(program, root, &plain_web, &plain_reject);
+    for (int pass = 0; pass < 2; pass++) {
+      std::vector<const Inst *> web{&step};
+      CyclicPhiFailure reject;
+      const auto cached = ResolveCyclicPhiEntry(program, root, &web, &reject, &cache);
+      Check(cached == plain && web == plain_web && reject.reason == plain_reject.reason &&
+                reject.entry == plain_reject.entry && reject.other == plain_reject.other,
+            "a cached loop entry differed from the walk it stands for");
+    }
+  }
+  Check(ResolveCyclicPhiEntry(program, Value(&loop)) == Value(&entry),
+        "the loop entry was not the value the loop is entered with");
+  Check(cache.answers.size() == 3u, "the cache did not hold one answer per phi asked about");
+}
+
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();

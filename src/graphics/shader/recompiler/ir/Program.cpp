@@ -142,15 +142,15 @@ Program& Program::operator=(Program&& other) noexcept {
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
 	CompiledShaderInfo result {
-	    .stage           = stage,
-	    .shader_hash     = shader_hash,
-	    .wave_size       = wave_size,
-	    .user_data_base  = user_data_base,
-	    .user_data_count = user_data_count,
-	    .scratch_dwords  = scratch_dwords,
+	    .stage              = stage,
+	    .shader_hash        = shader_hash,
+	    .wave_size          = wave_size,
+	    .user_data_base     = user_data_base,
+	    .user_data_count    = user_data_count,
+	    .scratch_dwords     = scratch_dwords,
 	    .has_address_writes = has_address_writes,
-	    .info            = std::move(info),
-	    .bindings        = std::move(bindings),
+	    .info               = std::move(info),
+	    .bindings           = std::move(bindings),
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
@@ -235,7 +235,27 @@ bool HasShaderMemoryWrites(const Program& program) {
 }
 
 Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
-                            std::vector<const Inst*>* web_out, CyclicPhiFailure* reject) {
+                            std::vector<const Inst*>* web_out, CyclicPhiFailure* reject,
+                            CyclicPhiEntryCache* cache) {
+	if (cache != nullptr && cache->program == &program) {
+		const auto* root = value.Resolve().TryInstruction();
+		if (root != nullptr && root->GetOpcode() == ValueOpcode::Phi) {
+			auto found = cache->answers.find(root);
+			if (found == cache->answers.end()) {
+				CyclicPhiEntryCache::Answer answer;
+				answer.entry = ResolveCyclicPhiEntry(program, value, &answer.web, &answer.reject);
+				found        = cache->answers.emplace(root, std::move(answer)).first;
+			}
+			const auto& answer = found->second;
+			if (reject != nullptr) {
+				*reject = answer.reject;
+			}
+			if (web_out != nullptr && !answer.entry.IsEmpty()) {
+				*web_out = answer.web;
+			}
+			return answer.entry;
+		}
+	}
 	const auto fail = [&](CyclicPhiReject reason, Value entry = {}, Value other = {}) {
 		if (reject != nullptr) {
 			*reject = {reason, entry, other};
@@ -266,7 +286,7 @@ Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
 	// An operand leading back into the web is the value the loop carries; anything else is a
 	// value the loop was entered with.
 	std::unordered_map<const Inst*, bool> reaches;
-	const auto ReachesWeb = [&](Value operand) {
+	const auto                            ReachesWeb = [&](Value operand) {
 		const auto* start = operand.Resolve().TryInstruction();
 		if (start == nullptr) {
 			return false;
@@ -307,8 +327,8 @@ Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
 	Value entry;
 	for (const auto* inst: web_order) {
 		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
-			const auto operand = inst->Arg(arg).Resolve();
-			const auto* source = operand.TryInstruction();
+			const auto  operand = inst->Arg(arg).Resolve();
+			const auto* source  = operand.TryInstruction();
 			if (source != nullptr && web.contains(source)) {
 				continue;
 			}
@@ -562,7 +582,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					return Fail(fmt::format("{} has an invalid memory-info index",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
-				const auto& memory = program.memory_info[memory_index];
+				const auto& memory        = program.memory_info[memory_index];
 				const bool  vector_buffer = memory.kind == ResourceKind::Buffer ||
 				                            memory.kind == ResourceKind::IndirectBuffer;
 				if (!vector_buffer && memory.kind != ResourceKind::ScalarBuffer) {

@@ -200,18 +200,21 @@ void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
 		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
 	}
 	if (!extra.IsEmpty()) pending.push_back(extra);
-	std::vector<const Inst*> visited;
+	std::unordered_set<const Inst*> visited;
 	while (!pending.empty()) {
 		auto* inst = pending.back().Resolve().TryInstruction();
 		pending.pop_back();
-		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) {
 			continue;
 		}
-		visited.push_back(inst);
-		if (planned_reads.contains(inst)) {
-			auto flags = inst->Flags<SrtReadFlags>();
-			flags.clean = 1u;
-			inst->SetFlags(flags);
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < slots.size()) {
+				slots[slot.U32()] = 1u;
+				pending.push_back(program.srt_reads[slot.U32()].value);
+			}
+			continue;
 		}
 		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
 			pending.push_back(inst->Arg(arg));
@@ -1952,15 +1955,30 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_read_order = OrderSrtReadsAgainstWrites(program);
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
-	Value                       unknown;
-	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
-		value = value.Resolve();
-		if (value.IsEmpty()) return {};
+	CyclicPhiEntryCache                   cyclic_entries {.program = &program};
+	std::unordered_map<const Inst*, bool> validated;
+	// Exec chains reuse each subterm on both sides of an AND, so an unmemoized walk is exponential.
+	std::unordered_map<const Inst*, Value> predicates;
+	Value                                 unknown;
+	std::function<Value(Value)>            ClonePredicate;
+	const auto                             ClonePredicateUncached = [&](Value value) -> Value {
 		const auto* inst = value.TryInstruction();
 		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) {
 			return Value(true);
 		}
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) return Clone(value);
+		const auto runtime = [&] {
+			if (inst == nullptr) {
+				return ValidateRuntimeValue(program, value, RuntimeValueType::Integer);
+			}
+			if (const auto found = validated.find(inst); found != validated.end()) {
+				return found->second;
+			}
+			const bool valid = ValidateRuntimeValue(program, value, RuntimeValueType::Integer,
+			                                        nullptr, &cyclic_entries);
+			validated.emplace(inst, valid);
+			return valid;
+		};
+		if (runtime()) return Clone(value);
 		if (inst == nullptr) return {};
 		const auto op = inst->GetOpcode();
 		if (op == ValueOpcode::ConditionRef || op == ValueOpcode::LogicalNot) {
@@ -1986,6 +2004,18 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		node.SetArg(0, left);
 		node.SetArg(1, right);
 		return result = Value(&node);
+	};
+	ClonePredicate = [&](Value value) -> Value {
+		value = value.Resolve();
+		if (value.IsEmpty()) return {};
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return ClonePredicateUncached(value);
+		if (const auto found = predicates.find(inst); found != predicates.end()) {
+			return found->second;
+		}
+		const auto result = ClonePredicateUncached(value);
+		predicates.emplace(inst, result);
+		return result;
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	plan.uniform_fill = AnalyzeUniformFill(program);

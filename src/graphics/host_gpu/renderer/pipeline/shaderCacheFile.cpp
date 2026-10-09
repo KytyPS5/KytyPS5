@@ -213,6 +213,7 @@ void VisitInput(Info& info, F& field) {
 	} else {
 		static_assert(std::is_same_v<T, ShaderComputeInputInfo>);
 		VisitWorkgroup(info, field);
+		field(info.async_compute);
 		field(info.float_mode);
 		Each(info.dispatch_threads_num, field);
 		Each(info.workgroup_counts, field);

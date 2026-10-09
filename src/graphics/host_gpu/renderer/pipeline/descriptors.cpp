@@ -37,6 +37,8 @@
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -52,6 +54,29 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// Scalar resource reads are folded into the pipeline specialization when it is compiled, so a
+// write to the same guest range by the same dispatch could in principle leave stale constants
+// behind. The ranges compared are conservative (whole descriptors, not the bytes actually
+// touched), and the overlap is often harmless, e.g. a large UAV that merely spans a descriptor
+// table. Aborting the whole process made such titles unplayable, so report each distinct pair
+// once and keep going; a genuine stale-constant problem then shows up as a visual glitch.
+void WarnScalarReadOverlap(const char* kind, uint64_t read_address, uint64_t read_size,
+                           uint64_t write_address, uint64_t write_size) {
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> reported;
+	std::scoped_lock                               lock {mutex};
+	if (reported.size() >= 64 || !reported.emplace(read_address, write_address).second) {
+		return;
+	}
+	std::printf("Warning: scalar resource read [0x%llx, +0x%llx) overlaps %s write "
+	            "[0x%llx, +0x%llx); continuing with the specialization as compiled\n",
+	            static_cast<unsigned long long>(read_address),
+	            static_cast<unsigned long long>(read_size), kind,
+	            static_cast<unsigned long long>(write_address),
+	            static_cast<unsigned long long>(write_size));
+	std::fflush(stdout);
+}
 
 } // namespace
 
@@ -1061,7 +1086,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                          image->info.metadata.range}) {
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+						WarnScalarReadOverlap("an image or attachment", address, size,
+						                      written.address, written.size);
 					}
 				}
 			}
@@ -1072,7 +1098,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						WarnScalarReadOverlap("a shader buffer", address, size, written.address,
+						                      written.size);
 					}
 				}
 			}

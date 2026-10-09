@@ -151,16 +151,23 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		UpdateGcThresholds(m_graphics.GetTotalMemoryBudget());
 	}
+}
+
+void TextureCache::UpdateGcThresholds(uint64_t total_budget) {
+	constexpr int64_t GiB    = 1024ll * 1024 * 1024;
+	const auto        budget = static_cast<int64_t>(std::min<uint64_t>(total_budget, INT64_MAX));
+	const auto        threshold = std::min<int64_t>(budget, 8 * GiB);
+	// The floors keep tiny budgets workable but must never exceed the budget itself, or the
+	// thresholds could not be reached and eviction would never start.
+	const auto pressure_floor = std::min<int64_t>(GiB + GiB / 2, budget / 100 * 60);
+	const auto critical_floor = std::min<int64_t>(3 * GiB, budget / 100 * 85);
+	m_pressure_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), pressure_floor));
+	m_critical_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), critical_floor));
+	m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 }
 
 TextureCache::~TextureCache() {
@@ -1995,14 +2002,51 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+
+	// A device-local allocation failed since the last collection. The allocator already fell back
+	// to slow system memory for that image, so reclaim VRAM now (this is the first safe point) and
+	// size the thresholds below the level at which VRAM actually ran out.
+	constexpr uint64_t EmergencyTicks      = 240;
+	constexpr uint64_t BudgetRelaxInterval = 4096;
+	const auto         oom_events          = m_graphics.device_oom_events.load();
+	if (oom_events != m_seen_oom_events) {
+		m_seen_oom_events = oom_events;
+		m_emergency_ticks = EmergencyTicks;
+		m_ticks_since_oom = 0;
+		if (!m_graphics.CanReportMemoryUsage()) {
+			// No driver usage figures: fall back to this cache's own accounting.
+			m_graphics.LowerMemoryCap(std::max<uint64_t>(m_total_used_memory / 100 * 95,
+			                                             1024ull * 1024 * 1024));
+		}
+		if (const auto cap = m_graphics.GetTotalMemoryBudget(); cap != 0) {
+			UpdateGcThresholds(cap);
+		}
+	} else if (m_emergency_ticks != 0) {
+		--m_emergency_ticks;
+	} else if (++m_ticks_since_oom >= BudgetRelaxInterval && m_graphics.GetMemoryCap() != 0) {
+		// No failures for a long while (another process may have released VRAM): probe upward.
+		m_ticks_since_oom = 0;
+		m_graphics.RelaxMemoryCap();
+		if (const auto budget = m_graphics.GetTotalMemoryBudget(); budget != 0) {
+			UpdateGcThresholds(budget);
+		}
+	}
+	const bool emergency = m_emergency_ticks != 0;
+
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		// While recovering from an allocation failure the usual 80-160 collection-tick age gate
+		// would protect every texture streamed in during the burst that caused the failure, so
+		// nothing could be evicted. Use a short gate and a larger batch instead, but only while
+		// actually above the pressure threshold.
+		const bool     urgent     = emergency && pressured;
+		const uint64_t age        = std::min<uint64_t>(
+            urgent ? 6 : aggressive ? 160 : pressured ? 80 : 16, tick);
+		size_t         deletions  = urgent ? 128 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -2016,12 +2060,19 @@ void TextureCache::RunGarbageCollector() {
 				break;
 			}
 			--deletions;
+			if (urgent && m_total_used_memory < m_pressure_gc_memory) {
+				break;
+			}
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
+				if (urgent && !safe) {
+					// Short-aged eviction must never discard contents that cannot be read back.
+					continue;
+				}
 				if (safe && owner->info.IsTiled()) {
 					continue;
 				}

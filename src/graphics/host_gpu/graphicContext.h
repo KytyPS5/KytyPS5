@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -97,14 +98,30 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// Budget the caches should size themselves against: the driver-reported budget, lowered to the
+	// ceiling learned from device-local allocation failures (see CreateImage).
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	[[nodiscard]] uint64_t GetReportedMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+
+	// Incremented every time a device-local image allocation fails. The caches poll this at safe
+	// points (their garbage collectors) and react by evicting, because evicting from inside the
+	// allocation path would invalidate references held by the caller.
+	std::atomic<uint32_t> device_oom_events {0};
+	// Lowers the learned VRAM ceiling to `bytes` (never raises it). 0 is ignored.
+	void LowerMemoryCap(uint64_t bytes);
+	// Relaxes the learned ceiling by 5% (dropping it once it reaches the reported budget).
+	void RelaxMemoryCap();
+	[[nodiscard]] uint64_t GetMemoryCap() const noexcept {
+		return m_memory_cap.load(std::memory_order_relaxed);
+	}
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	std::atomic<uint64_t>                              m_memory_cap {0};
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;

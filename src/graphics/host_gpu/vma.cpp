@@ -99,6 +99,33 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
+	const auto reported = GetReportedMemoryBudget();
+	const auto cap      = m_memory_cap.load(std::memory_order_relaxed);
+	return cap != 0 && (reported == 0 || cap < reported) ? cap : reported;
+}
+
+void GraphicContext::LowerMemoryCap(uint64_t bytes) {
+	if (bytes == 0) {
+		return;
+	}
+	auto current = m_memory_cap.load(std::memory_order_relaxed);
+	while ((current == 0 || bytes < current) &&
+	       !m_memory_cap.compare_exchange_weak(current, bytes, std::memory_order_relaxed)) {
+	}
+}
+
+void GraphicContext::RelaxMemoryCap() {
+	const auto current = m_memory_cap.load(std::memory_order_relaxed);
+	if (current == 0) {
+		return;
+	}
+	const auto reported = GetReportedMemoryBudget();
+	const auto relaxed  = current + current / 20;
+	m_memory_cap.store(reported != 0 && relaxed >= reported ? 0 : relaxed,
+	                   std::memory_order_relaxed);
+}
+
+uint64_t GraphicContext::GetReportedMemoryBudget() const {
 	if (allocator == nullptr) {
 		return 0;
 	}
@@ -141,14 +168,26 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
         vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
                        &alloc_info, &native_image, &image.allocation, nullptr));
 	if (result != vk::Result::eSuccess) {
-		std::printf("vmaCreateImage failed: %s (%d), extent=%ux%ux%u format=%d levels=%u "
-		            "layers=%u; retrying without requiring device-local memory\n",
-		            vk::to_string(result).c_str(), static_cast<int>(result), image_info.extent.width,
-		            image_info.extent.height, image_info.extent.depth,
-		            static_cast<int>(image_info.format), image_info.mipLevels,
-		            image_info.arrayLayers);
-		std::fflush(stdout);
-		LogMemoryBudget();
+		// A failed device-local allocation means VRAM is effectively full at this usage level,
+		// whatever the driver budget claims (other processes, fragmentation, WDDM limits).
+		// Remember that level so the caches size their eviction thresholds below it, and ask them
+		// (via the event counter) to evict at their next safe point.
+		const auto events = device_oom_events.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (const auto usage = GetDeviceMemoryUsage(); usage != 0) {
+			constexpr uint64_t GiB = 1024ull * 1024 * 1024;
+			LowerMemoryCap(std::max<uint64_t>(usage / 100 * 95, GiB));
+		}
+		if (events <= 16 || events % 128 == 0) {
+			std::printf("vmaCreateImage failed: %s (%d), extent=%ux%ux%u format=%d levels=%u "
+			            "layers=%u (failure #%u); using fallback memory now, caches evict "
+			            "at the next garbage collection\n",
+			            vk::to_string(result).c_str(), static_cast<int>(result),
+			            image_info.extent.width, image_info.extent.height, image_info.extent.depth,
+			            static_cast<int>(image_info.format), image_info.mipLevels,
+			            image_info.arrayLayers, events);
+			std::fflush(stdout);
+			LogMemoryBudget();
+		}
 
 		// Fallback: let VMA pick any memory type (device-local preferred). A hard DEVICE_LOCAL
 		// requirement can fail even when VRAM looks free (driver/OS budget limits, allocation
@@ -168,8 +207,6 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			image.image = nullptr;
 			return false;
 		}
-		std::printf("vmaCreateImage fallback succeeded\n");
-		std::fflush(stdout);
 	}
 	image.image = native_image;
 

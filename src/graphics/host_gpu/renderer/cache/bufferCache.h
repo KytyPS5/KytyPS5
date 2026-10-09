@@ -86,6 +86,8 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
+	void UpdateGcThresholds(uint64_t total_budget);
+
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;
@@ -141,6 +143,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	uint32_t m_seen_oom_events    = 0;
 };
 
 } // namespace Libs::Graphics

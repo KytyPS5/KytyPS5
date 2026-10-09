@@ -240,15 +240,19 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
+	UpdateGcThresholds(m_graphics.GetTotalMemoryBudget());
+}
+
+void BufferCache::UpdateGcThresholds(uint64_t total_budget) {
 	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
 	constexpr int64_t target_threshold = 8 * GiB;
-	const auto        budget =
-	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+	const auto        budget = static_cast<int64_t>(std::min<uint64_t>(total_budget, INT64_MAX));
 	const auto threshold = std::min(budget, target_threshold);
 	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
 	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
-	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
-	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	// Floors must stay reachable when the (possibly learned) budget is small.
+	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, std::min(GiB, budget / 100 * 50)));
+	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, std::min(2 * GiB, budget / 100 * 80)));
 }
 
 BufferCache::~BufferCache() {
@@ -619,6 +623,13 @@ void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	if (const auto oom_events = m_graphics.device_oom_events.load(); oom_events != m_seen_oom_events) {
+		// Images ran out of VRAM; shrink our thresholds to the ceiling that was learned.
+		m_seen_oom_events = oom_events;
+		if (const auto cap = m_graphics.GetTotalMemoryBudget(); cap != 0) {
+			UpdateGcThresholds(cap);
+		}
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

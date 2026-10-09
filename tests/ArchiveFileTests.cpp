@@ -136,6 +136,8 @@ void CheckMalformedArchives(const std::filesystem::path &source,
   Check(read > 0 && read < 64 * 1024 && damaged.Tell() == read &&
             std::equal(bytes.begin(), bytes.begin() + read, payload.begin()),
         "report the valid prefix before a corrupt compressed block");
+  Check(damaged.Seek(0), "reset damaged archive offset");
+  Check(!damaged.ReadIntoGuest(bytes.data(), static_cast<uint32_t>(bytes.size()), &read) && read > 0 && read < 64 * 1024 && damaged.Tell() == read && std::equal(bytes.begin(), bytes.begin() + read, payload.begin()), "guest read reports partial archive corruption without retry");
   Check(damaged.Seek(2 * 64 * 1024), "seek past corrupt compressed block");
   damaged.Read(bytes.data(), 97, &read);
   Check(read == 97 && std::equal(bytes.begin(), bytes.begin() + read,
@@ -186,6 +188,31 @@ void CheckCancellation(const std::filesystem::path &path,
         "preserve a caller's disabled cancellation state");
 }
 #endif
+
+void CheckGuestReads(const std::filesystem::path &directory, const std::filesystem::path &archive_member, const std::vector<uint8_t> &payload) {
+  const auto native_path = directory / "guest-read.bin";
+  Common::File output;
+  Check(output.Create(native_path), "create native guest-read fixture");
+  uint32_t written = 0;
+  output.Write(payload.data(), static_cast<uint32_t>(payload.size()), &written);
+  Check(written == payload.size(), "write native guest-read fixture");
+  output.Close();
+  for (const auto &path : {native_path, archive_member}) {
+    Common::File input(path, Common::File::Mode::Read);
+    std::vector<uint8_t> data(payload.size() + 29, 0xcd);
+    uint32_t got = 99;
+    Check(input.ReadIntoGuest(nullptr, 0, &got) && got == 0 && input.Tell() == 0, "zero read preserves offset");
+    Check(input.Seek(17) && input.ReadIntoGuest(data.data(), static_cast<uint32_t>(data.size()), &got) && got == payload.size() - 17 && input.Tell() == payload.size() && std::equal(data.begin(), data.begin() + got, payload.begin() + 17) && data[got] == 0xcd, "multi-chunk guest read preserves prefix and EOF");
+    Check(input.ReadIntoGuest(data.data(), 29, &got) && got == 0, "EOF is not an I/O error");
+    Check(input.Seek(31) && input.ReadIntoGuest(data.data(), 97, &got) && got == 97 && input.Tell() == 128 && std::equal(data.begin(), data.begin() + got, payload.begin() + 31), "guest read resumes at the requested offset");
+  }
+#if !defined(_WIN32)
+  Common::File non_file(directory, Common::File::Mode::Read);
+  std::array<uint8_t, 97> data{};
+  uint32_t got = 99;
+  Check(!non_file.IsInvalid() && !non_file.ReadIntoGuest(data.data(), data.size(), &got) && got == 0 && non_file.Tell() == 0, "permanent host error must fail without retry or offset advance");
+#endif
+}
 
 } // namespace
 
@@ -377,6 +404,7 @@ int main() {
             !Common::File::RenameFile(copied, data_path),
         "reject unsupported copy and rename operations involving archives");
 
+  CheckGuestReads(temporary.Path(), data_path, payload);
   CheckMalformedArchives(archive_path, payload);
 
   file.Close();

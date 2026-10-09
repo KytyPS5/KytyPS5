@@ -1,9 +1,12 @@
+#include "common/file.h"
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
 #include <atomic>
+#include <cerrno>
+#include <filesystem>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -575,6 +578,51 @@ void TestGpuReacquisitionAfterInvalidation() {
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size);
+  Release(memory);
+}
+
+// An unowned GPU-dirty page must be released before host I/O.
+void TestHostReadIntoUnownedGpuPage() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  constexpr uint64_t pages = 64;
+  const auto size = page_size * pages;
+  auto *memory = Allocate(harness.page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto orphan = address + page_size * 16;
+
+  tracker.ForEachUploadRange(
+      orphan, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(!IsWritable(memory + page_size * 16),
+        "unowned page setup did not protect the page");
+  tracker.InvalidateRegion(address, size, [&] {
+    tracker.ReleaseUnownedRegion(address, size);
+  });
+
+  std::vector<uint8_t> data(size);
+  for (uint64_t i = 0; i < size; i++) {
+    data[i] = static_cast<uint8_t>(i * 7 + 3);
+  }
+  std::FILE *file = std::tmpfile();
+  Check(file != nullptr &&
+            std::fwrite(data.data(), 1, size, file) == size &&
+            std::fseek(file, 0, SEEK_SET) == 0,
+        "temporary file setup failed");
+  errno = 0;
+  const auto got = std::fread(memory, 1, size, file);
+  const int error = errno;
+  std::printf("MemoryTrackerTests: host read into unowned GPU page: want=%llu "
+              "got=%zu errno=%d\n",
+              static_cast<unsigned long long>(size), got, error);
+  Check(got == size && std::memcmp(memory, data.data(), size) == 0,
+        "host read into an unowned GPU page was truncated");
+  Check(!tracker.IsRegionGpuModified(address, size) &&
+            tracker.IsRegionCpuModified(address, size),
+        "unowned GPU page was not handed back to the CPU");
+  std::fclose(file);
+  tracker.UntrackMemory(address, size);
   Release(memory);
 }
 
@@ -1178,6 +1226,83 @@ void TestFaultOnProtectedStack() {
 }
 #endif
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+MemoryTracker *g_fault_tracker = nullptr;
+uint64_t g_fault_begin = 0;
+uint64_t g_fault_end = 0;
+std::atomic<uint32_t> g_tracked_write_faults{0};
+
+// Mirrors RenderContext::HandleFault for a write: invalidate the faulting byte and retry.
+bool HandleTrackedWriteFault(const Common::HostException::ExceptionInfo &info) {
+  using namespace Common::HostException;
+  const auto vaddr = info.access_violation_vaddr;
+  if (info.type != ExceptionType::AccessViolation ||
+      info.access_violation_type != AccessViolationType::Write ||
+      vaddr < g_fault_begin || vaddr >= g_fault_end) {
+    return false;
+  }
+  g_tracked_write_faults.fetch_add(1, std::memory_order_relaxed);
+  g_fault_tracker->InvalidateRegion(vaddr, 1, [] {});
+  return true;
+}
+
+// Ordinary stores must recover writes to a clean tracked destination.
+void TestHostReadIntoCleanTrackedPage() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  constexpr uint64_t pages = 800;
+  const auto size = page_size * pages;
+  constexpr uint64_t offset = 17;
+  auto *memory = Allocate(harness.page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  tracker.ForEachUploadRange(
+      address, size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(!tracker.IsRegionCpuModified(address, size) &&
+            !tracker.IsRegionGpuModified(address, size) &&
+            Protection(memory) == PAGE_READONLY &&
+            Protection(memory + size - 1) == PAGE_READONLY,
+        "clean tracked page setup did not write-protect the range");
+  g_fault_tracker = &tracker;
+  g_fault_begin = address;
+  g_fault_end = address + size;
+  Check(Common::HostException::InstallHandler(HandleTrackedWriteFault),
+        "install tracked write fault handler failed");
+
+  std::vector<uint8_t> data(size + offset);
+  for (uint64_t i = 0; i < data.size(); i++) {
+    data[i] = static_cast<uint8_t>(i * 13 + 5);
+  }
+  auto path = (std::filesystem::temp_directory_path() / "kyty-protected-read-XXXXXX").string();
+  const int fd = ::mkstemp(path.data());
+  Check(fd >= 0 && ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size()) &&
+            ::close(fd) == 0,
+        "temporary file setup failed");
+  Common::File file;
+  Check(file.Open(path, Common::File::Mode::Read), "temporary file open failed");
+
+  // Leave a writable prefix so the direct operation can report partial progress.
+  tracker.InvalidateRegion(address, page_size * 2, [] {});
+  Check(file.Seek(offset), "temporary file seek failed");
+  uint32_t got = 0;
+  int error = 0;
+  file.Read(memory, static_cast<uint32_t>(size), &got, &error);
+  std::printf("MemoryTrackerTests: direct protected read: want=%llu got=%u error=%d faults=%u\n", static_cast<unsigned long long>(size), got, error, g_tracked_write_faults.load());
+  Check(got < size && error == EFAULT && g_tracked_write_faults.load() == 0, "direct protected host read did not fail without a signal");
+  Check(file.Seek(offset), "reset read offset failed");
+  const bool ok = file.ReadIntoGuest(memory, static_cast<uint32_t>(size), &got);
+  std::printf("MemoryTrackerTests: recovered protected read: want=%llu got=%u ok=%d faults=%u offset=%llu\n", static_cast<unsigned long long>(size), got, ok, g_tracked_write_faults.load(), static_cast<unsigned long long>(file.Tell()));
+  Check(ok && got == size && file.Tell() == offset + size && std::memcmp(memory, data.data() + offset, size) == 0, "protected host read was truncated or resumed at the wrong offset");
+  Check(g_tracked_write_faults.load() > 0 && tracker.IsRegionCpuModified(address, size) && IsWritable(memory), "recovered read bypassed the write fault handler");
+  file.Close();
+  std::filesystem::remove(path);
+  g_fault_end = 0;
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+#endif
 } // namespace
 
 namespace Libs::LibKernel::Memory {
@@ -1197,6 +1322,16 @@ int main(int argc, char **argv) {
     BenchmarkCleanUploads();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--unowned-read-only") == 0) {
+    TestHostReadIntoUnownedGpuPage();
+    return 0;
+  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--protected-read-only") == 0) {
+    TestHostReadIntoCleanTrackedPage();
+    return 0;
+  }
+#endif
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
@@ -1205,6 +1340,7 @@ int main(int argc, char **argv) {
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
+  TestHostReadIntoUnownedGpuPage();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
@@ -1217,6 +1353,10 @@ int main(int argc, char **argv) {
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
+#endif
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // Installs the process-wide write-fault handler, so run last.
+  TestHostReadIntoCleanTrackedPage();
 #endif
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;

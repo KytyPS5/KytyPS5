@@ -281,6 +281,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
+			// Cache buffers cover whole tracker pages, so this range has nothing to download.
+			const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+			m_gpu_modified_ranges.Subtract(begin, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - begin);
+			m_memory_tracker.ReleaseUnownedRegion(vaddr, size);
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];

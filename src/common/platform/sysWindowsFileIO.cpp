@@ -15,6 +15,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <vector>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -63,10 +64,17 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	return FILE_ATTRIBUTE_NORMAL;
 }
 
-void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
+void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read, int* error) {
+	if (error != nullptr) {
+		*error = 0;
+	}
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		const bool ok = ReadFile(f.handle, data, size, &w, nullptr) != 0;
+		if (!ok && error != nullptr) {
+			const auto native_error = GetLastError();
+			*error = native_error == ERROR_NOACCESS ? EFAULT : EIO;
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
@@ -81,9 +82,19 @@ static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
 #endif
 }
 
-void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
+void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read, int* error) {
+	if (error != nullptr) {
+		*error = 0;
+	}
 	if (f.type == SYS_FILE_FILE) {
+		if (error != nullptr) {
+			errno = 0;
+		}
 		size_t w = fread(data, 1, size, f.f);
+		if (error != nullptr && std::ferror(f.f)) {
+			*error = errno != 0 ? errno : EIO;
+			std::clearerr(f.f);
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

@@ -69,7 +69,9 @@ public:
 
 	void GetLastAccessAndWriteTimeUTC(DateTime* access, DateTime* write);
 
-	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
+	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr, int* error = nullptr);
+	// Retries a protected guest destination through bounded host storage; reports other I/O failures.
+	bool ReadIntoGuest(void* data, uint32_t size, uint32_t* bytes_read);
 	void Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
 
 	void Printf(const char* format, ...) KYTY_FORMAT_PRINTF(2, 3);

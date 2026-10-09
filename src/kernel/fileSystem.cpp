@@ -661,12 +661,12 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const bool read_ok = file->f.ReadIntoGuest(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 
 	file->mutex.Unlock();
 
-	if (is_invalid) {
-		LOGF("\tfile is invalid\n");
+	if (is_invalid || (!read_ok && bytes_read == 0)) {
+		LOGF("\tfile read failed\n");
 		return KERNEL_ERROR_EIO;
 	}
 
@@ -786,14 +786,13 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
-	file->f.Seek(pos);
+	const bool read_ok = file->f.Seek(offset) && file->f.ReadIntoGuest(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const bool restored = file->f.Seek(pos);
 
 	file->mutex.Unlock();
 
-	if (is_invalid) {
-		LOGF("\tfile is invalid\n");
+	if (is_invalid || !restored || (!read_ok && bytes_read == 0)) {
+		LOGF("\tfile read failed\n");
 		return KERNEL_ERROR_EIO;
 	}
 
@@ -878,6 +877,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	}
 	auto    remaining  = static_cast<uint64_t>(offset) < file_size ? file_size - offset : 0;
 	int64_t bytes_read = 0;
+	bool read_ok = true;
 	for (const auto& buffer: buffers) {
 		if (remaining == 0) {
 			break;
@@ -888,14 +888,14 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
+		read_ok = file->f.ReadIntoGuest(buffer.iov_base, count, &bytes);
 		bytes_read += bytes;
 		remaining -= bytes;
-		if (bytes < count) {
+		if (bytes < count || !read_ok) {
 			break;
 		}
 	}
-	if (!file->f.Seek(position)) {
+	if (!file->f.Seek(position) || (!read_ok && bytes_read == 0)) {
 		return KERNEL_ERROR_EIO;
 	}
 	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,

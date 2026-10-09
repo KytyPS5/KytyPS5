@@ -7,6 +7,9 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <cstdarg>
 #include <cstdio>
 #include <utility>
@@ -248,17 +251,56 @@ uint64_t File::Tell() const {
 	return SysFileTell(*m_p->f);
 }
 
-void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
+void File::Read(void* data, uint32_t size, uint32_t* bytes_read, int* error) {
 	EXIT_IF(IsInvalid());
-
+	if (error != nullptr) {
+		*error = 0;
+	}
 	if (m_p->archive != nullptr) {
-		m_p->archive->Read(data, size, bytes_read);
+		const auto expected = std::min<uint64_t>(size, Remaining());
+		uint32_t got = 0;
+		m_p->archive->Read(data, size, &got);
+		if (bytes_read != nullptr) {
+			*bytes_read = got;
+		}
+		if (error != nullptr && got < expected) {
+			*error = EIO;
+		}
 		return;
 	}
-
 	if (m_p->f != nullptr) {
-		SysFileRead(data, size, *m_p->f, bytes_read);
+		SysFileRead(data, size, *m_p->f, bytes_read, error);
 	}
+}
+
+bool File::ReadIntoGuest(void* data, uint32_t size, uint32_t* bytes_read) {
+	*bytes_read = 0;
+	if (size == 0) {
+		return true;
+	}
+	const auto start = Tell();
+	uint32_t total = 0;
+	int error = 0;
+	Read(data, size, &total, &error);
+	if (error == EFAULT && total < size && Seek(start + total)) {
+		// Host I/O cannot invoke the guest write-fault handler; ordinary stores can.
+		constexpr uint32_t ChunkSize = 1024u * 1024u;
+		std::vector<uint8_t> chunk(std::min(size - total, ChunkSize));
+		while (total < size) {
+			const auto want = std::min(size - total, ChunkSize);
+			uint32_t got = 0;
+			Read(chunk.data(), want, &got, &error);
+			if (got != 0) {
+				std::memcpy(static_cast<uint8_t*>(data) + total, chunk.data(), got);
+			}
+			total += got;
+			if (got < want || error != 0) {
+				break;
+			}
+		}
+	}
+	*bytes_read = total;
+	return error == 0;
 }
 
 void File::Write(const void* data, uint32_t size, uint32_t* bytes_written) {

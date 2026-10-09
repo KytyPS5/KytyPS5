@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -539,8 +540,21 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::BvhIntersect: info.bvh = info.uses_dma = true; break;
 		case ValueOpcode::Bvh8Intersect: info.bvh8 = info.uses_dma = true; break;
 		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
-		case ValueOpcode::RayQueryInitialize: info.ray_query = true; break;
+		case ValueOpcode::RayQueryInitialize: info.ray_query = info.ray_query_mirror = true; break;
 		case ValueOpcode::LoadDeviceAddressU32: info.uses_device_address = true; break;
+		case ValueOpcode::RayQueryInit:
+			// The native ray tracing context, by device address.
+			info.uses_dma = true;
+			[[fallthrough]];
+		case ValueOpcode::RayQueryNext:
+		case ValueOpcode::RayQueryMatch:
+		case ValueOpcode::RayQuerySelectedLeaf:
+		case ValueOpcode::RayQueryResult:
+		case ValueOpcode::RayQueryMark:
+		case ValueOpcode::RayQueryAlpha:
+			info.ray_query = true;
+			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
+			break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_vote |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
@@ -606,7 +620,10 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = info.uses_dma = info.uses_device_address =
 	        false;
-	info.bvh = info.ray_query = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
+	info.ray_query       = false;
+	info.ray_query_sites = 0;
+	info.ray_query_mirror = false;
+	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =

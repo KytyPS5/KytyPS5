@@ -125,7 +125,46 @@ struct EmitterState {
 	uint32_t                                         bvh8_result_type       = 0;
 	uint32_t                                         bvh8_intersect_function = 0;
 	uint32_t                                         bvh_stack_function      = 0;
-	std::array<uint32_t, 2>                          ray_query_variables {};
+	// Native ray tracing: per site and emulated lane half (see spirvEmitterRayQuery.cpp).
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_variables {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_states {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_nodes {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_slots {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_lists {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_counts {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_currents {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_bases {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_inline_records {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_t {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_word {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_instance {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_u {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_v {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_node {};
+	// Wave-uniform: the selected key.
+	std::array<uint32_t, 4>                          ray_query_selected_instance {};
+	std::array<uint32_t, 4>                          ray_query_selected_leaf {};
+	// The per-lane alpha test (RayQueryAlpha): per site and half, its arguments; the guest leaf
+	// code's sample of the bindless table it samples (nullptr: the sites run the leaf code).
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha_cache {};
+	std::array<bool, 4>                              ray_query_alpha_sites {};
+	// Sites whose alpha test reads its data as a closest hit leaf code does (RayQueryAlphaLane),
+	// those of them whose reference is threshold * factor (RayQueryAlphaFactor), and sites whose
+	// opacity comes from the geometry only (RayQueryInitGeometryOpacity).
+	std::array<bool, 4>                              ray_query_alpha_lane {};
+	std::array<bool, 4>                              ray_query_alpha_factor {};
+	std::array<bool, 4>                              ray_query_geometry_opacity {};
+	// The format of the guest data each site's alpha test reads (RayQueryAlpha's last argument,
+	// IR::RayTracingAlphaFields::Pack()).
+	std::array<uint32_t, 4>                          ray_query_alpha_format {};
+	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
+	// Sites whose alpha test is Resident Evil Village's (RayQueryAlphaEntry), and the program's two
+	// samples it stands for (the first texture's xy and the second one's x; nullptr: not found).
+	std::array<bool, 4>                              ray_query_alpha_entry {};
+	std::array<const IR::Inst*, 2>                   ray_query_entry_samples {};
+	// Upstream's ray queries over its BVH mirror (RayQueryInitialize...): one per lane half.
+	std::array<uint32_t, 2>                          ray_query_mirror_variables {};
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -558,7 +597,58 @@ uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32
                          std::array<uint32_t, 3> origin, std::array<uint32_t, 3> direction,
                          uint32_t remap, uint32_t triangle_id, uint32_t bary);
 void DefineTrinityFunctions(EmitterState& state);
+void DeclareRayQueryVariables(EmitterState& state);
+// After every function variable is declared.
+void InitializeRayQueryVariables(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+// Guest memory reads of the native ray tracing alpha test (spirvEmitterRayQuery.cpp), with the
+// semantics of the guest instructions it stands for: a dword at a guest address (S_LOAD_DWORD),
+// a dword of a buffer through a V# (S_BUFFER_LOAD_DWORD) and an element through a V#
+// (BUFFER_LOAD_FORMAT_X idxen); zero where the guest would read zero.
+uint32_t EmitGuestDwordLoad(ValueEmitContext& ctx, uint32_t address);
+uint32_t EmitScalarBufferDwordLoad(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                   uint32_t offset);
+uint32_t EmitFormattedBufferLoadX(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                  uint32_t index);
+// A guest object of `size` bytes at a guest address: one translation when it lies in one
+// caching page (`inside`; `host` is then its host address, 0 when the page has no buffer).
+struct GuestObject {
+	uint32_t address = 0;
+	uint32_t host    = 0;
+	uint32_t inside  = 0;
+};
+GuestObject EmitGuestObject(ValueEmitContext& ctx, uint32_t address, uint32_t size);
+// The dword at `offset` (< size) of the object, as EmitGuestDwordLoad() would read it.
+uint32_t EmitGuestObjectDword(ValueEmitContext& ctx, const GuestObject& object, uint32_t offset);
+// The same with the offset an id (a dword multiple below the size).
+uint32_t EmitGuestObjectDwordAt(ValueEmitContext& ctx, const GuestObject& object, uint32_t offset_id);
+// The three elements of a triangle of an index buffer through its V# from element `first`, as
+// EmitFormattedBufferLoadX() reads each.
+std::array<uint32_t, 3> EmitTriangleIndices(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                            uint32_t first);
+// `size` bytes of a buffer from `offset` through a V#, read dword by dword as
+// EmitScalarBufferDwordLoad() would.
+struct ScalarBufferObject {
+	uint32_t    size   = 0;
+	uint32_t    offset = 0;
+	GuestObject object;
+};
+void     EmitScalarBufferObject(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp, uint32_t offset,
+                                uint32_t size, ScalarBufferObject& object);
+uint32_t EmitScalarBufferObjectDword(ValueEmitContext& ctx, const ScalarBufferObject& object, uint32_t offset);
+// Whether `inst` samples a 2D float bindless table image at an explicit level, and that sample
+// at table entry `key`, coordinates (u, v) and level `lod` (F32): the texel as the instruction
+// returns it (U32x4).
+bool     IsImageTableSampleLod(const EmitterState& state, const IR::Inst& inst);
+uint32_t EmitImageTableSampleLod(ValueEmitContext& ctx, const IR::Inst& sample, uint32_t key,
+                                 uint32_t u, uint32_t v, uint32_t lod);
+// Whether `inst` samples a 2D float image of a bindless or indirect T# table at an explicit level
+// (the sample can then be emitted for another key, EmitImageSampleLodAtKey()), and that sample for
+// the T# at key `key` (the value the instruction computes from the T#'s offset in its table),
+// coordinates (u, v) and level `lod` (F32): the texel as the instruction returns it (U32x4).
+bool     IsImageKeySampleLod(const EmitterState& state, const IR::Inst& inst);
+uint32_t EmitImageSampleLodAtKey(ValueEmitContext& ctx, const IR::Inst& sample, uint32_t key,
+                                 uint32_t u, uint32_t v, uint32_t lod);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

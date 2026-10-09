@@ -475,6 +475,14 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	m_context.GetOcclusionQueries().WriteForReaders();
 
 	const auto vk_buffer = buffer.Handle();
+	if (auto& native_rt = m_context.GetNativeRayTracing(); native_rt.Enabled()) {
+		if (NativeRayTracing::TlasSource source; NativeRayTracing::FindTlasSource(program.info, source)) {
+			const auto& user = cs_regs.cs_user_sgpr.value;
+			const auto  pointer =
+			    uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u);
+			native_rt.Prepare(vk_buffer, pointer, source, m_context.GetGpu().GetFrameNum());
+		}
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = HasStorageWrites(input_info, bindings, indirect_writes);

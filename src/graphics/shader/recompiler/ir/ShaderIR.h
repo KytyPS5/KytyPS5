@@ -615,6 +615,9 @@ struct ShaderInfo {
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
 	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
 	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
+	// Upstream's traversal pass (RayQueryTraversal) traced BVH walks with ray queries over its BVH
+	// mirror (RayTracing): the program takes the mirror's context (Bindings::ray_query_dword).
+	bool                             ray_query_mirror = false;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
@@ -659,7 +662,19 @@ struct ShaderInfo {
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;
 	bool                            bvh_stack                     = false;
+	// Native ray tracing: ray query pseudo-instructions and the sites they belong to.
 	bool                            ray_query                     = false;
+	uint32_t                        ray_query_sites               = 0;
+	// Its guest TLAS: the header address is the 64-bit value at user data pointer
+	// `ray_query_user_sgpr` + `ray_query_header_offset`, the root node `ray_query_root`.
+	uint32_t                        ray_query_user_sgpr           = 0;
+	uint32_t                        ray_query_header_offset       = 0;
+	// Not NoRayQuerySlot: the header address is at the base of the V# at the user data pointer +
+	// this offset, + `ray_query_header_offset` (Marvel's Wolverine).
+	uint32_t                        ray_query_header_vsharp       = NoRayQuerySlot;
+	uint32_t                        ray_query_root                = 0;
+	// How its instance records are laid out (IR::RayTracingLayout::Pack()).
+	std::array<uint32_t, 4>         ray_query_layout {};
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;

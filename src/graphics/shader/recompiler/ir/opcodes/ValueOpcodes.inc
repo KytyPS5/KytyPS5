@@ -353,6 +353,16 @@ VALUE_OPCODE(RayQueryCandidate, U32x4, U1)
 VALUE_OPCODE(RayQueryCandidateInstance, U64, U1)
 VALUE_OPCODE(RayQueryCandidateFrontFace, U1, U1)
 VALUE_OPCODE(RayQueryConfirm, Void, U1)
+// Native ray tracing (IR::TraceNativeTraversals, RayQuery.h); the flags hold the site and the variant.
+VALUE_OPCODE(RayQueryInit, U1, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U1, U1, U1, U1)
+VALUE_OPCODE(RayQueryNext, U32x4)
+VALUE_OPCODE(RayQueryMatch, U1)
+VALUE_OPCODE(RayQuerySelectedLeaf, U32)
+VALUE_OPCODE(RayQueryResult, U32)
+VALUE_OPCODE(RayQueryMark, Void)
+// Level of detail term, cone spread, threshold factor, material V#, buffer table V#, threshold, level offset,
+// format of the guest data (immediate).
+VALUE_OPCODE(RayQueryAlpha, Void, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32)
 VALUE_OPCODE(ImageQueryLod, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageRead, U32x4, ImageResource, ImageAddress, U1)
 VALUE_OPCODE(ImageWrite, Void, ImageResource, ImageAddress, U32x4, U1)

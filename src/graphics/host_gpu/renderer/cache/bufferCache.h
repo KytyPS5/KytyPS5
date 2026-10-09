@@ -32,19 +32,43 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+// The workarounds of recompiled shaders that mark the fault buffer when they change what the
+// shader computes (BufferCache::HACK_MARKS_OFFSET).
+enum class HackMark : uint32_t {
+	Count,
+};
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	// The entry after the last page holds the device address of the native ray tracing context
+	// (see NativeRayTracing::ContextAddress()), 0 without one.
+	static constexpr uint64_t NATIVE_RT_CONTEXT_PAGE = CACHING_NUMPAGES;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	    (CACHING_NUMPAGES + 1) * sizeof(vk::DeviceAddress);
 	// The fault buffer holds three bitmaps of CACHING_NUMPAGES bits: pages that device-address
 	// accesses found without a cached buffer, pages that V#-table stores wrote, and pages that
-	// device-address accesses found cached (their buffers are in use).
+	// device-address accesses found cached (their buffers are in use). Then the hack marks.
 	static constexpr uint64_t WRITE_BITMAP_OFFSET = CACHING_NUMPAGES / 8;
 	static constexpr uint64_t USE_BITMAP_OFFSET   = 2 * WRITE_BITMAP_OFFSET;
-	static constexpr uint64_t FAULT_BUFFER_SIZE   = 3 * WRITE_BITMAP_OFFSET;
+	// A shader whose workaround (HackMark) changed what it computed marks the entry of its hash:
+	// it ORs the two dwords of the hash and their complements (a shader alone in its entry leaves
+	// each dword the complement of the next but one) and adds 1 to the count of the workaround.
+	// FaultManager reads them back.
+	static constexpr uint64_t HACK_MARKS_OFFSET   = 3 * WRITE_BITMAP_OFFSET;
+	static constexpr uint32_t HACK_MARK_ENTRIES   = 256;
+	static constexpr uint32_t HACK_MARK_DWORDS    = 8;
+	static constexpr uint32_t HACK_MARK_COUNTS    = 4; // dword of the count of HackMark 0
+	static constexpr uint64_t HACK_MARKS_SIZE     = uint64_t {HACK_MARK_ENTRIES} * HACK_MARK_DWORDS * 4;
+	static constexpr uint64_t FAULT_BUFFER_SIZE   = HACK_MARKS_OFFSET + HACK_MARKS_SIZE;
+	static_assert(HACK_MARK_COUNTS + static_cast<uint32_t>(HackMark::Count) <= HACK_MARK_DWORDS);
+
+	static constexpr uint32_t HackMarkEntry(uint64_t shader_hash) {
+		return (static_cast<uint32_t>(shader_hash) ^ static_cast<uint32_t>(shader_hash >> 32u)) %
+		       HACK_MARK_ENTRIES;
+	}
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE

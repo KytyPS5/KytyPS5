@@ -366,6 +366,13 @@ uint32_t              EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Ins
 uint32_t              EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitRayQueryCandidateFrontFace(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitRayQueryConfirm(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryNext(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryMatch(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQuerySelectedLeaf(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryResult(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryMark(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryAlpha(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;

@@ -298,7 +298,7 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
-	if (info.ray_query) {
+	if (info.ray_query_mirror) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 2u;
 	}
@@ -834,7 +834,7 @@ void DefineModule(EmitterState& state) {
 	}
 	const bool physical_addresses =
 	    state.program.info.uses_dma || state.program.info.uses_image_heap ||
-	    state.program.info.uses_device_address || state.program.info.ray_query;
+	    state.program.info.uses_device_address || state.program.info.ray_query_mirror;
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -872,8 +872,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 	}
 	if (state.program.info.ray_query) {
-		state.builder.RequireCapability(spv::CapabilityRayQueryKHR);
 		state.builder.RequireExtension("SPV_KHR_ray_query");
+		state.builder.RequireCapability(spv::CapabilityRayQueryKHR);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);

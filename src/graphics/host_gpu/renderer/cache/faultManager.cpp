@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -29,6 +30,14 @@ constexpr size_t MaxPageWrites = 16384;
 // Pages device-address accesses found cached between two reads; more stay for the next read.
 constexpr size_t MaxPageUses = 65536;
 
+// What each HackMark changed, for its notice.
+struct HackMarkNotice {
+	const char* hack;
+	const char* site;
+	const char* what;
+};
+constexpr std::array<HackMarkNotice, static_cast<size_t>(HackMark::Count)> HackMarkNotices {};
+
 } // namespace
 
 FaultManager::Reader::Reader(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -43,7 +52,9 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                      BufferCache::FAULT_BUFFER_SIZE),
       m_faults(graphics, scheduler, MaxPageFaults), m_writes(graphics, scheduler, MaxPageWrites),
-      m_uses(graphics, scheduler, MaxPageUses) {
+      m_uses(graphics, scheduler, MaxPageUses),
+      m_marks_download(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
+                       BufferCache::HACK_MARKS_SIZE) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
@@ -103,6 +114,76 @@ void FaultManager::ProcessFaultBuffer() {
 			}
 		});
 	});
+	ProcessHackMarks();
+}
+
+void FaultManager::ProcessHackMarks() {
+	// Never waits: while the last read is pending the marks stay in the buffer and add up.
+	if (m_marks_tick != 0 || ++m_marks_countdown < HackMarksPeriod) {
+		return;
+	}
+	m_marks_countdown     = 0;
+	constexpr auto offset = BufferCache::HACK_MARKS_OFFSET;
+	constexpr auto size   = BufferCache::HACK_MARKS_SIZE;
+
+	std::array<vk::BufferMemoryBarrier2, 2> barriers {};
+	barriers[0].srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barriers[0].srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	barriers[0].dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barriers[0].dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barriers[0].buffer        = m_fault_buffer.Handle();
+	barriers[0].offset        = offset;
+	barriers[0].size          = size;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = barriers.data();
+
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	command.pipelineBarrier2(dependency);
+	const vk::BufferCopy region {offset, 0, size};
+	command.copyBuffer(m_fault_buffer.Handle(), m_marks_download.Handle(), 1, &region);
+	// The clear after the copy's read.
+	barriers[0].srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barriers[0].srcAccessMask = vk::AccessFlagBits2::eNone;
+	barriers[0].dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	command.pipelineBarrier2(dependency);
+	command.fillBuffer(m_fault_buffer.Handle(), offset, size, 0);
+	barriers[0].srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	barriers[0].dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barriers[0].dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	barriers[1]               = barriers[0];
+	barriers[1].dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	barriers[1].dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	barriers[1].buffer        = m_marks_download.Handle();
+	barriers[1].offset        = 0;
+	dependency.bufferMemoryBarrierCount = 2;
+	command.pipelineBarrier2(dependency);
+
+	m_scheduler.DeferHostOperation([this] {
+		m_marks_download.Invalidate(0, BufferCache::HACK_MARKS_SIZE);
+		const auto* words = std::bit_cast<const uint32_t*>(m_marks_download.Mapped().data());
+		// The marks name their shader: not the one of the draw that runs this completion.
+		Common::HackNotice::ScopedShader no_shader(0);
+		for (uint32_t entry = 0; entry < BufferCache::HACK_MARK_ENTRIES; entry++) {
+			const auto* mark = words + uint64_t {entry} * BufferCache::HACK_MARK_DWORDS;
+			// Two shaders that marked the entry leave a bit set in a dword and its complement.
+			const bool alone = (mark[0] ^ mark[2]) == ~0u && (mark[1] ^ mark[3]) == ~0u;
+			const auto hash  = alone ? (uint64_t {mark[1]} << 32u) | mark[0] : 0;
+			for (size_t kind = 0; kind < HackMarkNotices.size(); kind++) {
+				const auto count = mark[BufferCache::HACK_MARK_COUNTS + kind];
+				if (count == 0) {
+					continue;
+				}
+				const auto& notice = HackMarkNotices[kind];
+				Common::HackNotice::Report(notice.hack, notice.site, hash, 0,
+				                           fmt::format("{} {}{}", count, notice.what,
+				                                       alone ? "" : " (several shaders in the entry)"));
+			}
+		}
+		m_marks_tick = 0;
+	});
+	m_marks_tick = m_scheduler.CurrentTick();
 }
 
 void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {

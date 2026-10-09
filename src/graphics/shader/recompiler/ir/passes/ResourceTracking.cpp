@@ -5103,7 +5103,9 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
-		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect) {
+		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect ||
+		    op == ValueOpcode::RayQueryInit) {
+			// Device addresses: the BVH nodes, or the native ray tracing context.
 			m_dma_tracked   = true;
 			m_dma_unbounded = true;
 			return;

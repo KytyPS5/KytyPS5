@@ -1977,6 +1977,11 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 	if (m_manifest == nullptr || m_manifest->record_path.empty()) {
 		return;
 	}
+	// A program the native ray tracing patched is a variant of this host: the manifest builds
+	// every program unpatched, so the record would build a program that was never this one.
+	if (module.info.info.ray_query) {
+		return;
+	}
 	ManifestModule record {.stage            = key.stage,
 	                       .code_hash        = key.hash,
 	                       .user_data_count  = key.user_data_count,

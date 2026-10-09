@@ -46,6 +46,8 @@ struct GraphicContext {
 	bool                               indirect_draws_enabled                = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// VK_KHR_acceleration_structure + VK_KHR_ray_query (see NativeRayTracing).
+	bool                                      native_ray_tracing_enabled            = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;

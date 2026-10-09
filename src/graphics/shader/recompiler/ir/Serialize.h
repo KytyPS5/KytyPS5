@@ -143,7 +143,7 @@ template <class S, class T> void Io(S& io, T& value) {
 
 // Binds every field, so that a field added later fails to compile until it is listed.
 #define KYTY_IO_FIELDS(Struct, ...)                                                                \
-	template <class S, Is<Struct> T> void Io(S& io, T& object) {                                   \
+	template <class Stream, Is<Struct> Object> void Io(Stream& io, Object& object) {               \
 		auto& [__VA_ARGS__] = object;                                                              \
 		IoAll(io, __VA_ARGS__);                                                                    \
 	}
@@ -159,7 +159,7 @@ KYTY_IO_FIELDS(StageOutput, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo::DmaWindow, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::DmaDescriptorTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T)
+               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,

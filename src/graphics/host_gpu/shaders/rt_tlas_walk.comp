@@ -1,0 +1,337 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Native ray tracing: walks the guest's top-level AMD BVH (box nodes from the header, instance
+// leaves whose node index is the instance index; the instance records at the offset a header field
+// holds, laid out as the tracing shader reads them, see GuestInstance in rt_common.inc) and writes
+// one host acceleration structure instance per leaf. BLASes the
+// host has no slot for yet are reported once each (see nativeRayTracing.cpp), and the built ones
+// the TLAS references are listed for verification.
+
+#include "rt_common.inc"
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer TableEntry {
+	uint64_t key;
+	uint     slot;
+	uint     flags;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer InstanceRef {
+	vec4     rows[3];
+	uint     index_mask;
+	uint     sbt_flags;
+	uint64_t reference;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer ContextEntry {
+	uint64_t header_va;
+	uint64_t tlas_address;
+	uint64_t instance_nodes;
+	uint64_t slots;
+	uint     instance_count;
+	uint     valid;
+	uint64_t instance_base;
+};
+
+layout(push_constant, std430) uniform Push {
+	uint64_t user_ptr_va;
+	uint64_t state;
+	uint64_t queue;
+	uint64_t instance_nodes;
+	uint64_t instances;
+	uint64_t table;
+	uint64_t slots;
+	uint64_t missing;
+	uint64_t context;
+	uint64_t tlas_address;
+	uint64_t verify_list;
+	uint     header_offset;
+	uint     root;
+	uint     instance_capacity;
+	uint     table_mask;
+	uint     prepare_id;
+	uint     verify;
+	// The layout of the instance records (IR::RayTracingLayout::Pack()).
+	uvec4    instance_layout;
+} pc;
+
+// QueueCapacity and MissingCapacity in nativeRayTracing.cpp.
+const uint kQueueCapacity   = 1u << 16;
+const uint kMissingCapacity = 256;
+
+shared uint s_head;
+shared uint s_tail;
+shared uint s_next_tail;
+shared uint s_valid;
+shared uint64_t s_header;
+
+const uint kSlotPending = 0xffffffffu;
+// The key of a table entry the host released (an evicted slot, a BLAS to report again): lookups
+// probe past it and new keys reuse it. Real keys are multiples of 8.
+const uint64_t kTombstone = uint64_t(1);
+const uint kNoEntry = 0xffffffffu;
+
+TableEntry TableAt(uint index) {
+	return TableEntry(pc.table + uint64_t(index) * 16);
+}
+
+// The slot of the BLAS an entry with its key holds; pending until the host writes slot + 1.
+uint SlotOf(TableEntry entry) {
+	const uint slot = entry.slot;
+	return slot == 0 ? kSlotPending : slot - 1;
+}
+
+// Reports a BLAS whose entry was just claimed (the key was `previous` before); when the report
+// list is full the entry is given back so the BLAS is reported again next time.
+uint ReportMissing(TableEntry entry, uint index, uint64_t previous, uint64_t blas_va, uint root) {
+	const uint missing = atomicAdd(RtState(pc.state).missing_count, 1u);
+	if (missing < kMissingCapacity) {
+		MissingEntry report = MissingEntry(pc.missing + uint64_t(missing) * kMissingStride);
+		report.blas_va      = blas_va;
+		report.root         = root;
+		report.table_index  = index;
+		report.leaf_count   = 0;
+		report.box_count    = 0;
+		report.node_limit   = 0;
+		report.flags        = 0;
+	} else {
+		atomicExchange(entry.key, previous);
+	}
+	return kSlotPending;
+}
+
+// Finds the slot of a BLAS. A BLAS the table does not have claims the first released entry of
+// its probe chain (or the empty one ending the chain) and is reported in the missing list.
+uint FindSlot(uint64_t blas_va, uint root) {
+	const uint64_t key  = blas_va ^ (uint64_t(root) << 48);
+	uint           hash = uint(key >> 6) * 0x9e3779b1u ^ uint(key >> 32) * 0x85ebca6bu;
+	uint           released = kNoEntry;
+	for (uint probe = 0; probe < 64; probe++) {
+		const uint index = (hash + probe) & pc.table_mask;
+		TableEntry entry = TableAt(index);
+		uint64_t   found = entry.key;
+		if (found == kTombstone) {
+			if (released == kNoEntry) {
+				released = index;
+			}
+			continue;
+		}
+		if (found == 0) {
+			if (released != kNoEntry) {
+				TableEntry reuse = TableAt(released);
+				const uint64_t taken = atomicCompSwap(reuse.key, kTombstone, key);
+				if (taken == kTombstone) {
+					return ReportMissing(reuse, released, kTombstone, blas_va, root);
+				}
+				if (taken == key) {
+					return SlotOf(reuse);
+				}
+				// Claimed for another BLAS meanwhile: the empty entry takes it.
+			}
+			found = atomicCompSwap(entry.key, uint64_t(0), key);
+			if (found == 0) {
+				return ReportMissing(entry, index, uint64_t(0), blas_va, root);
+			}
+		}
+		if (found == key) {
+			// The host writes slot + 1 once it has allocated the slot.
+			return SlotOf(entry);
+		}
+	}
+	if (released != kNoEntry) {
+		// A full chain: reuse a released entry.
+		TableEntry reuse = TableAt(released);
+		const uint64_t taken = atomicCompSwap(reuse.key, kTombstone, key);
+		if (taken == kTombstone) {
+			return ReportMissing(reuse, released, kTombstone, blas_va, root);
+		}
+		if (taken == key) {
+			return SlotOf(reuse);
+		}
+	}
+	return kSlotPending;
+}
+
+void main() {
+	const uint lid   = gl_LocalInvocationID.x;
+	RtState    state = RtState(pc.state);
+	if (lid == 0) {
+		const uint64_t header = LoadGuestU64(pc.user_ptr_va + pc.header_offset);
+		s_header              = header;
+		s_valid               = header != 0 && (header & 255) == 0 && HostAddress(header) != 0 ? 1u : 0u;
+		state.header_va       = header;
+		if (s_valid != 0) {
+			state.instance_base = header + LoadGuestU64(header + LayoutInstanceOffset(pc.instance_layout));
+			state.node_limit    = LayoutNodeCountAt80(pc.instance_layout) ? LoadGuestU32(header + 80) - 1u
+			                                                              : LoadGuestU32(header + 88);
+		}
+		U32Ref(pc.queue).v = pc.root;
+		s_head             = 0;
+		s_tail             = 1;
+	}
+	barrier();
+	if (s_valid == 0) {
+		if (lid == 0 && pc.context != 0) {
+			ContextEntry(pc.context).valid = 0;
+		}
+		return;
+	}
+	const uint64_t header        = s_header;
+	const uint64_t instance_base = state.instance_base;
+	uint           depth         = 0;
+	// Level by level over the box nodes; the queue keeps every box node visited.
+	while (true) {
+		const uint head = s_head;
+		const uint tail = s_tail;
+		if (head == tail || depth > 64) {
+			break;
+		}
+		if (lid == 0) {
+			s_next_tail = tail;
+		}
+		barrier();
+		for (uint i = head + lid; i < tail; i += gl_WorkGroupSize.x) {
+			const uint node = U32Ref(pc.queue + uint64_t(i) * 4).v;
+			const uint64_t address = NodeAddress(header, node);
+			const uvec4 children = LoadGuestU32x4(address);
+			for (uint c = 0; c < 4; c++) {
+				const uint child = children[c];
+				if (child == kInvalidNode) {
+					continue;
+				}
+				const uint type = NodeType(child);
+				if (type == 4u || type == 5u) {
+					const uint slot = atomicAdd(s_next_tail, 1u);
+					if (slot < kQueueCapacity) {
+						U32Ref(pc.queue + uint64_t(slot) * 4).v = child;
+					} else {
+						atomicOr(state.overflow, 1u);
+					}
+				} else if (type < 4u || LayoutInline(pc.instance_layout, child)) {
+					const uint index = atomicAdd(state.instance_count, 1u);
+					if (index < pc.instance_capacity) {
+						U32Ref(pc.instance_nodes + uint64_t(index) * 4).v = child;
+					} else {
+						atomicOr(state.overflow, 2u);
+					}
+				}
+			}
+		}
+		barrier();
+		if (lid == 0) {
+			s_head = tail;
+			s_tail = min(s_next_tail, kQueueCapacity);
+		}
+		depth++;
+		barrier();
+	}
+	if (lid == 0) {
+		state.box_count = s_tail;
+		state.max_depth = depth;
+	}
+	memoryBarrierBuffer();
+	barrier();
+
+	const uint count = min(state.instance_count, pc.instance_capacity);
+	for (uint i = lid; i < count; i += gl_WorkGroupSize.x) {
+		const uint     node   = U32Ref(pc.instance_nodes + uint64_t(i) * 4).v;
+		const uint64_t      record = InstanceRecord(header, instance_base, node, pc.instance_layout);
+		const GuestInstance guest  = LoadGuestInstance(record, pc.instance_layout);
+		const uint64_t      blas   = guest.blas;
+		const uint          root   = LayoutInline(pc.instance_layout, node)
+		                                 ? LayoutInlineRoot(pc.instance_layout)
+		                                 : guest.root;
+		const uint          mask   = guest.mask;
+		// Instance flags: bit 0 opaque, bit 1 alpha tested anyway, bit 2 both faces, bit 3 which
+		// face is culled. Host instance flags: 1 = facing cull disable, 2 = flip facing, 4 = force
+		// opaque, 8 = force no opaque.
+		const uint guest_flags = guest.flags;
+		const uint flip        = LayoutFlipFacing(pc.instance_layout) ? 1u : 0u;
+		uint       host_flags  = (guest_flags & 4u) != 0 ? 1u : ((((guest_flags >> 3) ^ flip) & 1u) != 0 ? 2u : 0u);
+		host_flags |= (guest_flags & 2u) != 0 ? 8u : ((guest_flags & 1u) != 0 ? 4u : 0u);
+		InstanceRef    out_instance = InstanceRef(pc.instances + uint64_t(i) * 64);
+		uint64_t       reference    = 0;
+		uint           slot         = kSlotPending;
+		if (blas != 0 && mask != 0) {
+			slot = FindSlot(blas, root);
+			if (slot == kSlotPending) {
+				atomicAdd(state.unknown_blas, 1u);
+			} else {
+				SlotInfo info = SlotInfo(pc.slots + uint64_t(slot) * kSlotStride);
+				if (info.state == kSlotBuilt) {
+					reference = info.as_address;
+					if (pc.verify != 0 && atomicExchange(info.stamp, pc.prepare_id) != pc.prepare_id) {
+						const uint v = atomicAdd(state.verify_count, 1u);
+						U32Ref(pc.verify_list + uint64_t(v) * 4).v = slot;
+					}
+				}
+			}
+		}
+		// The guest matrix maps world to object space; the host instance needs its inverse.
+		const vec4 r0 = guest.rows[0];
+		const vec4 r1 = guest.rows[1];
+		const vec4 r2 = guest.rows[2];
+		const mat3 a  = mat3(vec3(r0.x, r1.x, r2.x), vec3(r0.y, r1.y, r2.y), vec3(r0.z, r1.z, r2.z));
+		const vec3 t  = vec3(r0.w, r1.w, r2.w);
+		const float d = determinant(a);
+		if (reference == 0 || !(abs(d) > 1e-30) || isnan(d) || isinf(d)) {
+			atomicAdd(state.inactive, 1u);
+			out_instance.rows[0]    = vec4(0);
+			out_instance.rows[1]    = vec4(0);
+			out_instance.rows[2]    = vec4(0);
+			out_instance.index_mask = 0;
+			out_instance.sbt_flags  = 0;
+			out_instance.reference  = 0;
+			continue;
+		}
+		const mat3 inv = inverse(a);
+		const vec3 it  = -(inv * t);
+		// A transform the hardware cannot use (non-finite or absurdly large values, as in a record
+		// the guest is rewriting) leaves the instance inactive instead of undefined traversal.
+		bool usable = true;
+		for (uint c = 0; c < 3; c++) {
+			const vec3 column = vec3(inv[c][0], inv[c][1], inv[c][2]);
+			usable = usable && all(lessThan(abs(column), vec3(1e18))) && !any(isnan(column));
+		}
+		usable = usable && all(lessThan(abs(it), vec3(1e18))) && !any(isnan(it));
+		if (!usable) {
+			atomicAdd(state.inactive, 1u);
+			out_instance.rows[0]    = vec4(0);
+			out_instance.rows[1]    = vec4(0);
+			out_instance.rows[2]    = vec4(0);
+			out_instance.index_mask = 0;
+			out_instance.sbt_flags  = 0;
+			out_instance.reference  = 0;
+			continue;
+		}
+		// Row-major 3x4 (VkTransformMatrixKHR).
+		out_instance.rows[0]    = vec4(inv[0][0], inv[1][0], inv[2][0], it.x);
+		out_instance.rows[1]    = vec4(inv[0][1], inv[1][1], inv[2][1], it.y);
+		out_instance.rows[2]    = vec4(inv[0][2], inv[1][2], inv[2][2], it.z);
+		out_instance.index_mask = (slot & 0xffffffu) | (mask << 24);
+		out_instance.sbt_flags  = host_flags << 24;
+		out_instance.reference  = reference;
+	}
+	memoryBarrierBuffer();
+	barrier();
+	if (lid == 0) {
+		const uint missing = min(state.missing_count, kMissingCapacity);
+		state.dispatch_x   = missing;
+		state.dispatch_y   = 1;
+		state.dispatch_z   = 1;
+		state.verify_x     = state.verify_count;
+		state.verify_y     = 1;
+		state.verify_z     = 1;
+		if (pc.context != 0) {
+			ContextEntry context   = ContextEntry(pc.context);
+			context.header_va      = s_header;
+			context.tlas_address   = pc.tlas_address;
+			context.instance_nodes = pc.instance_nodes;
+			context.slots          = pc.slots;
+			context.instance_count = count;
+			context.instance_base  = instance_base;
+			context.valid          = pc.tlas_address != 0 ? 1u : 0u;
+		}
+	}
+}

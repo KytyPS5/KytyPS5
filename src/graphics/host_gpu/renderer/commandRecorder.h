@@ -463,6 +463,21 @@ public:
 	                       vk::ArrayProxy<const vk::BufferImageCopy> const& regions) const {
 		copyBufferToImage(source, destination, destination_layout, regions.size(), regions.data());
 	}
+	// Any other command: `function(vk::CommandBuffer)` runs now or when the stream is replayed
+	// (it must then be trivially copyable). Arrays it points to must come from CopyArray().
+	template <typename F>
+	void Custom(F&& function) const {
+		if (m_stream == nullptr) {
+			function(m_direct);
+			return;
+		}
+		m_stream->Record(std::forward<F>(function));
+	}
+	// An array that lives until a Custom() command recorded after it runs.
+	template <typename T>
+	[[nodiscard]] const T* CopyArray(const T* source, size_t count) const {
+		return m_stream == nullptr ? source : m_stream->Copy(source, count);
+	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
 		if (m_stream == nullptr) {

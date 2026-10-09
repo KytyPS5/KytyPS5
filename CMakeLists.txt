@@ -431,6 +431,25 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${occlusion_counters_shader_header}")
+# Native ray tracing: walks of the guest BVHs (see nativeRayTracing.h).
+foreach(shader_name IN ITEMS rt_tlas_walk rt_blas_walk)
+	set(shader_source "${gpu_tiler_shader_dir}/${shader_name}.comp")
+	set(shader_spv "${gpu_tiler_generated_dir}/${shader_name}.spv")
+	set(shader_header "${gpu_tiler_generated_dir}/${shader_name}_spv.h")
+	string(TOUPPER "${shader_name}_SPV" shader_symbol)
+	add_custom_command(
+		OUTPUT "${shader_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		        -DCACHING_PAGEBITS=14 "-I${gpu_tiler_shader_dir}"
+		        -o "${shader_spv}" "${shader_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
+		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${shader_source}" "${gpu_tiler_shader_dir}/rt_common.inc"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${shader_header}")
+endforeach()
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

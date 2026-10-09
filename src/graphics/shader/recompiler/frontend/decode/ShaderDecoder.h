@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <array>
 #include <magic_enum.hpp>
 #include <span>
 #include <string_view>
@@ -814,7 +815,7 @@ enum class ImageDimension : uint32_t {
 };
 
 constexpr uint32_t MaxInstructionRawWords       = 5u;
-constexpr uint32_t MaxImageNsaAddressComponents = 12u;
+constexpr uint32_t MaxImageNsaAddressComponents = 16u;
 
 struct Operand {
 	OperandKind kind       = OperandKind::Unknown;
@@ -929,6 +930,22 @@ struct Program {
 	std::vector<InlinedCallBody> call_bodies;
 	std::vector<LongBranch>      long_branches; // ascending pc
 	std::vector<RuntimeLiteral>  runtime_literals; // ascending pc
+	// The guest TLAS of the native ray tracing patch (see RayTracingPatch.h), when applied: the
+	// header address is the 64-bit value at user data pointer `user_sgpr` + `header_offset`.
+	struct RayTracingSource {
+		uint32_t                user_sgpr     = 0;
+		uint32_t                header_offset = 0;
+		// Not 0xffffffff: the header address is at the base of the V# at the pointer + this offset,
+		// + `header_offset` (Marvel's Wolverine).
+		uint32_t                header_vsharp = 0xffffffffu;
+		uint32_t                root          = 0;
+		// How its instance records are laid out (IR::RayTracingLayout::Pack()).
+		std::array<uint32_t, 4> layout {};
+		bool                    valid         = false;
+	} ray_tracing_source;
+	// With native traversals (TranslateProgram()): the instructions (ascending pc) whose
+	// device-address accesses stay within the guest BVH that the program traces and the buffers of
+	// its leaves' alpha test (NativeTraversals::reach); empty when that is not known.
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

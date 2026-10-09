@@ -16,9 +16,11 @@ class BufferCache;
 // The fault buffer holds three page bitmaps (one bit per BufferCache caching page): shaders record
 // device-address accesses that found no cached buffer in the first, pages that V#-table stores
 // wrote in the second, and device-address accesses that found a cached buffer in the third. All
-// are read back asynchronously.
+// are read back asynchronously, as are the hack marks after them (BufferCache::HACK_MARKS_OFFSET).
 class FaultManager {
 	static constexpr size_t MaxPendingFaults = 8;
+	// Fault reads per read of the hack marks.
+	static constexpr uint32_t HackMarksPeriod = 32;
 
 public:
 	using PagesHandler = Common::UniqueFunction<void, std::span<const uint64_t>>;
@@ -48,6 +50,9 @@ private:
 	};
 
 	void Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&& handler);
+	// Copies the hack marks to the host and clears them; once the GPU work recorded so far
+	// completes, reports each marked workaround (HackNotice) with the shader hash and the count.
+	void ProcessHackMarks();
 
 	GraphicContext&         m_graphics;
 	CommandScheduler&       m_scheduler;
@@ -56,6 +61,9 @@ private:
 	Reader                  m_faults;
 	Reader                  m_writes;
 	Reader                  m_uses;
+	Buffer                  m_marks_download;
+	uint64_t                m_marks_tick      = 0;
+	uint32_t                m_marks_countdown = 0;
 	vk::DescriptorSetLayout m_fault_process_desc_layout     = nullptr;
 	vk::Pipeline            m_fault_process_pipeline        = nullptr;
 	vk::PipelineLayout      m_fault_process_pipeline_layout = nullptr;

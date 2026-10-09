@@ -100,7 +100,15 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::RayQueryInitialize:
 		case ValueOpcode::RayQueryProceed:
 		case ValueOpcode::RayQueryConfirm:
-		case ValueOpcode::Barrier: return true;
+		case ValueOpcode::Barrier:
+		// The ray queries keep per-lane state between these operations.
+		case ValueOpcode::RayQueryInit:
+		case ValueOpcode::RayQueryNext:
+		case ValueOpcode::RayQueryMatch:
+		case ValueOpcode::RayQuerySelectedLeaf:
+		case ValueOpcode::RayQueryResult:
+		case ValueOpcode::RayQueryMark:
+		case ValueOpcode::RayQueryAlpha: return true;
 		default: return false;
 	}
 }

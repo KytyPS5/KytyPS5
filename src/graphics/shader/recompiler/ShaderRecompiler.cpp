@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -588,6 +589,14 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
 	for (const auto& body: decoded.call_bodies)
 		ir.inlined_call_entries.push_back(body.begin);
+	// The TLAS of the native ray tracing patch (see NativeRayTracing::FindTlasSource()).
+	if (decoded.ray_tracing_source.valid) {
+		ir.info.ray_query_user_sgpr     = decoded.ray_tracing_source.user_sgpr;
+		ir.info.ray_query_header_offset = decoded.ray_tracing_source.header_offset;
+		ir.info.ray_query_header_vsharp = decoded.ray_tracing_source.header_vsharp;
+		ir.info.ray_query_root          = decoded.ray_tracing_source.root;
+		ir.info.ray_query_layout        = decoded.ray_tracing_source.layout;
+	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,
@@ -626,7 +635,58 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		LOGF("ShaderRecompiler %s native IR before resource tracking:\n%s", stage,
 		     MakeIrDump(cfg_dump, ir).c_str());
 	}
-	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	// The traversals of the native ray tracing forms, recognized on the IR: their TLAS source (also
+	// for the guest's own traversal, see RenderContext::CacheTlasMemory()) and, when they trace
+	// natively, the guest code that stays in the BVH, which resource tracking takes from the decoded
+	// program (Decoder::Program::ray_tracing_reach; only when the walks cover every node test).
+	const auto*      tracked = &decoded;
+	Decoder::Program traced_source;
+	if (options.stage == ShaderType::Compute) {
+		const auto traced = IR::TraceNativeTraversals(
+		    ir, {.wave_size = options.wave_size, .rewrite = options.native_ray_tracing, .decoded = &decoded});
+		const bool bvh = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+			return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+		});
+		if (traced.source_valid) {
+			// (See RayTracing::FindTlasSource().)
+			ir.info.ray_query_user_sgpr      = traced.user_sgpr;
+			ir.info.ray_query_header_offset  = traced.header_offset;
+			ir.info.ray_query_header_vsharp  = traced.header_vsharp;
+			ir.info.ray_query_root           = traced.root;
+			ir.info.ray_query_layout         = traced.layout;
+			traced_source                    = decoded;
+			traced_source.ray_tracing_source = {.user_sgpr     = traced.user_sgpr,
+			                                    .header_offset = traced.header_offset,
+			                                    .header_vsharp = traced.header_vsharp,
+			                                    .root          = traced.root,
+			                                    .layout        = traced.layout,
+			                                    .valid         = true};
+			if (traced.sites != 0 && !traced.reach.empty()) {
+				auto& reach = traced_source.ray_tracing_reach;
+				for (const auto& inst: decoded.instructions) {
+					if (std::ranges::any_of(traced.reach, [&](const auto& range) {
+						    return inst.pc >= range.first && inst.pc < range.second;
+					    })) {
+						reach.push_back(inst.pc);
+					}
+				}
+				std::ranges::sort(reach);
+				reach.erase(std::unique(reach.begin(), reach.end()), reach.end());
+			}
+			tracked = &traced_source;
+		}
+		if (traced.sites != 0) {
+			LOGF("%s native ray tracing traversals: hash=0x%016" PRIx64 " sites=%u\n", stage,
+			     options.shader_hash, traced.sites);
+			NoteRayTracingProgram(RayTracingProgramKind::Native, options.shader_hash);
+		} else if (options.native_ray_tracing && bvh && !decoded.has_swap_pc && decoded.call_bodies.empty()) {
+			// It walks a guest BVH no form recognizes: on the guest side.
+			LOGF("%s native ray tracing: hash=0x%016" PRIx64 " wave%u walks a guest BVH no form recognizes\n",
+			     stage, options.shader_hash, options.wave_size);
+			NoteRayTracingProgram(RayTracingProgramKind::Unrecognized, options.shader_hash);
+		}
+	}
+	IR::TrackResources(ir, *tracked, native_cfg, options.input_info);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

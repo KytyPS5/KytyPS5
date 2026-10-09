@@ -50,6 +50,7 @@ struct Target {
 	bool                 dirty = false;
 	uint32_t             seq = 0;
 	uint32_t             slices = 1; // >1: 3D volume, all z slices are read back
+	bool                 img3d = false; // 3D image bound to a KYTY_DBG_FRAME_DUMP_BUF_PS draw: raw .bin + IMG3D line
 };
 
 struct Pending {
@@ -100,7 +101,7 @@ std::vector<BufReq>      g_bufreq;
 std::vector<VolReq>      g_volreq;
 std::vector<BufPending>  g_bufpending;
 std::string              g_buflog;
-std::set<uint64_t>       g_seen_vol;
+std::set<std::pair<uint64_t, uint32_t>> g_seen_vol; // (address, draw seq)
 std::set<std::string>    g_seen_buf;
 
 // KYTY_DBG_FRAME_DUMP_BUF_PS=<hex ps hash>[,...]|all selects the draws whose buffers/volumes are dumped.
@@ -625,6 +626,37 @@ void ProcessVolume(Pending& p) {
 	const auto&    t   = p.target;
 	const uint32_t bpp = BytesPerPixel(t.format);
 	const size_t   sl  = static_cast<size_t>(t.w) * t.h * bpp;
+	if (t.img3d && p.mapped != nullptr) {
+		// Raw bytes of a 3D image bound to a BUF_PS draw (tightly packed, x fastest, then y, then z).
+		const auto*   d  = static_cast<const uint8_t*>(p.mapped);
+		const uint64_t nd = p.size / 4;
+		uint64_t      nz = 0;
+		for (uint64_t k = 0; k < nd; k++) {
+			uint32_t w;
+			std::memcpy(&w, d + k * 4, 4);
+			nz += w != 0;
+		}
+		char path[640];
+		std::snprintf(path, sizeof(path), "%s/img3d_%u_%u_%s.bin", g_dir.c_str(), p.seq, t.slot, Hex(t.addr).c_str());
+		std::string fname = "(write failed)";
+		if (FILE* f = std::fopen(path, "wb")) {
+			std::fwrite(d, 1, static_cast<size_t>(p.size), f);
+			std::fclose(f);
+			fname = std::filesystem::path(path).filename().string();
+		}
+		char head[256];
+		std::snprintf(head, sizeof(head), "IMG3D %u %u 0x%s %ux%ux%u %s nonzero_dwords=%" PRIu64 "/%" PRIu64 " first8:",
+		              p.seq, t.slot, Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str(), nz, nd);
+		std::string line = head;
+		for (uint64_t k = 0; k < 8 && k < nd; k++) {
+			uint32_t w;
+			std::memcpy(&w, d + k * 4, 4);
+			char wb[16];
+			std::snprintf(wb, sizeof(wb), " %08x", w);
+			line += wb;
+		}
+		g_buflog += line + " -> " + fname + "\n";
+	}
 	char base[512];
 	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%ux%u_%s", g_dir.c_str(), p.seq, p.label.c_str(),
 	              Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str());
@@ -826,7 +858,7 @@ void BarrierImage(vk::CommandBuffer cmd, const Target& t, vk::ImageLayout from, 
 void RecordReadback(GraphicContext& gfx, vk::CommandBuffer cmd, const Target& t, const char* label,
                     uint32_t seq) {
 	char line[256];
-	if (t.w < kMinSize || t.h < kMinSize) return;
+	if (t.w < kMinSize || (t.h < kMinSize && !t.img3d)) return;
 	if (t.samples > 1) {
 		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u SKIPPED (multisampled)\n", seq,
 		              label, Hex(t.addr).c_str(), t.w, t.h);
@@ -1078,14 +1110,26 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	if (draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {
 		CaptureBindings(*draw.ps_bindings, seq, draw.ps_hash);
 		if (draw.ps_images != nullptr) {
-			for (const auto& im : *draw.ps_images) {
+			for (size_t si = 0; si < draw.ps_images->size(); si++) {
+				const auto& im = (*draw.ps_images)[si];
 				if (im.desc.info.type != Prospero::ImageType::kColor3D) continue;
-				if (!g_seen_vol.insert(im.desc.info.data.address).second) continue;
+				if (!g_seen_vol.insert(std::make_pair(im.desc.info.data.address, seq)).second) continue;
 				VolReq v;
 				v.seq = seq;
 				if (MakeTarget(context, im.image_id, im.desc.view_info, im.layout, im.desc.info.data.address,
 				               v.target)) {
-					g_volreq.push_back(std::move(v));
+					v.target.slot  = static_cast<uint32_t>(si);
+					v.target.img3d = v.target.slices > 1;
+					const uint64_t bytes = static_cast<uint64_t>(v.target.w) * v.target.h * v.target.slices *
+					                       BytesPerPixel(v.target.format);
+					if (v.target.img3d && bytes > (64ull << 20)) {
+						char b3[256];
+						std::snprintf(b3, sizeof(b3), "IMG3D %u %zu 0x%s SKIPPED (%" PRIu64 " bytes > 64MB cap)\n",
+						              seq, si, Hex(im.desc.info.data.address).c_str(), bytes);
+						g_buflog += b3;
+					} else {
+						g_volreq.push_back(std::move(v));
+					}
 				}
 			}
 		}

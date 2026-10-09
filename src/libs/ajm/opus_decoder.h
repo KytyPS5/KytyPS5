@@ -26,10 +26,11 @@ public:
 	AjmOpusDecoder(uint32_t max_channels, AjmSampleEncoding encoding)
 	    : AjmDecoder(0, 48000, encoding), m_max_channels(max_channels) {}
 
-	~AjmOpusDecoder() override { avcodec_free_context(&m_context); }
+	~AjmOpusDecoder() override { avcodec_free_context(&m_context); avcodec_free_context(&m_alt); }
 
 	AjmDecodeResult Initialize(const void* parameters, size_t parameters_size) override {
 		avcodec_free_context(&m_context);
+		avcodec_free_context(&m_alt);
 		Reset();
 		auto result = MakeResult();
 		// PS5 AJM Opus init parameter block is not the PS4 layout the original code assumed
@@ -70,6 +71,7 @@ public:
 	void Reset() override {
 		if (m_context != nullptr) {
 			avcodec_flush_buffers(m_context);
+			if (m_alt != nullptr) avcodec_flush_buffers(m_alt);
 		}
 		m_total_decoded_samples = 0;
 		m_frames_per_packet     = 0;
@@ -147,15 +149,38 @@ public:
 				break;
 			}
 			if (frame->nb_samples < static_cast<int>(samples) ||
-			    frame->ch_layout.nb_channels != static_cast<int>(m_channels)) {
+			    frame->ch_layout.nb_channels > 2) {
 				av_frame_free(&frame);
 				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 				result.internal_result = 0x1043;
 				break;
 			}
 			if (output_bytes != 0) {
-				std::memcpy(static_cast<uint8_t*>(output) + result.output_written,
-				            frame->data[0] + skip * sample_bytes, output_bytes);
+				const uint32_t pc  = frame->ch_layout.nb_channels;
+				const size_t   bps = AjmBytesPerSample(m_sample_encoding);
+				auto*          dst = static_cast<uint8_t*>(output) + result.output_written;
+				const uint8_t* src = frame->data[0] + static_cast<size_t>(skip) * pc * bps;
+				for (uint32_t i = 0; i < write; i++) {
+					const uint8_t* s = src + static_cast<size_t>(i) * pc * bps;
+					uint8_t*       d = dst + static_cast<size_t>(i) * m_channels * bps;
+					if (pc == m_channels) {
+						std::memcpy(d, s, m_channels * bps);
+					} else if (pc == 1) {
+						for (uint32_t c = 0; c < m_channels; c++) std::memcpy(d + c * bps, s, bps);
+					} else {
+						// stereo packet into a mono instance: average
+						if (m_sample_encoding == AjmSampleEncoding::Float) {
+							float a, b; std::memcpy(&a, s, 4); std::memcpy(&b, s + 4, 4);
+							a = (a + b) * 0.5f; std::memcpy(d, &a, 4);
+						} else if (m_sample_encoding == AjmSampleEncoding::S32) {
+							int32_t a, b; std::memcpy(&a, s, 4); std::memcpy(&b, s + 4, 4);
+							a = static_cast<int32_t>((static_cast<int64_t>(a) + b) / 2); std::memcpy(d, &a, 4);
+						} else {
+							int16_t a, b; std::memcpy(&a, s, 2); std::memcpy(&b, s + 2, 2);
+							a = static_cast<int16_t>((a + b) / 2); std::memcpy(d, &a, 2);
+						}
+					}
+				}
 			}
 			av_frame_free(&frame);
 			if (gapless != nullptr) {
@@ -204,10 +229,11 @@ private:
 			return nullptr;
 		}
 		std::memcpy(packet->data, data, size);
-		int rc = avcodec_send_packet(m_context, packet);
+		AVCodecContext* ctx = ContextFor((data[0] & 4u) != 0 ? 2u : 1u);
+		int rc = ctx != nullptr ? avcodec_send_packet(ctx, packet) : -1;
 		av_packet_free(&packet);
 		if (rc >= 0) {
-			rc = avcodec_receive_frame(m_context, frame);
+			rc = avcodec_receive_frame(ctx, frame);
 		}
 		if (rc < 0) {
 			av_frame_free(&frame);
@@ -221,6 +247,27 @@ private:
 	}
 
 	AVCodecContext* m_context = nullptr;
+	// ffmpeg's Opus decoder mangles mono-coded packets fed to a stereo context (blocky noise);
+	// libopus upmixes them. Keep one context per packet channel count and remap on output.
+	AVCodecContext* ContextFor(uint32_t channels) {
+		if (channels == m_channels) {
+			return m_context;
+		}
+		if (m_alt == nullptr) {
+			const auto* codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
+			m_alt             = codec != nullptr ? avcodec_alloc_context3(codec) : nullptr;
+			if (m_alt != nullptr) {
+				av_channel_layout_default(&m_alt->ch_layout, static_cast<int>(channels));
+				m_alt->sample_rate = 48000;
+				if (avcodec_open2(m_alt, codec, nullptr) < 0) {
+					avcodec_free_context(&m_alt);
+				}
+			}
+		}
+		return m_alt;
+	}
+
+	AVCodecContext* m_alt = nullptr;
 	enum class Framing { Raw, Be2, Le2, Be4, Hdr8 };
 
 	// Parse the per-packet header for a framing. Hdr8 = {u32 BE size, u32 BE final_range}.

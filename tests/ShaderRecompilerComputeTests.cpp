@@ -3123,6 +3123,7 @@ public:
       alignas(uint64_t) std::array<uint32_t, 2> narrow_label{0, 0x9abcdef0u};
       bool other_width_waits = false;
       bool other_width_deferred = false;
+      uint32_t cond_exec_ran = 0;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
@@ -3213,6 +3214,16 @@ public:
             wait_passes(reinterpret_cast<const uint8_t *>(&wide_label) + 4, 0x11223344u,
                         false) &&
             wait_passes(narrow_label.data(), 0x9abcdef013579bdfull, true);
+        // COND_EXEC runs the packets it guards when the deferred label is not zero.
+        const auto ordered_address = reinterpret_cast<uint64_t>(&ordered_label);
+        const auto ran_address = reinterpret_cast<uint64_t>(&cond_exec_ran);
+        const std::array<uint32_t, 10> cond_exec{
+            KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), static_cast<uint32_t>(ordered_address),
+            static_cast<uint32_t>(ordered_address >> 32u), 0, 5,
+            KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(ran_address),
+            static_cast<uint32_t>(ran_address >> 32u), 1};
+        Pm4Execution cond_exec_execution;
+        (void)processor->Process(cond_exec_execution, cond_exec);
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -3235,6 +3246,8 @@ public:
               other_width_deferred && other_width_waits &&
                   wide_label == 0x1122334455667788ull && narrow_label[0] == 0x13579bdfu,
               "a GPU-side wait missed part of a deferred label it covers");
+      Require("GpuCommandLane", "COND_EXEC on a deferred label", cond_exec_ran == 1,
+              "COND_EXEC skipped its packets on a label deferred to completion");
       // More timestamps than queries in flight, over fewer slots: every slot holds the time of
       // its last write, in recording order.
       constexpr uint32_t batch_slots = 1000;

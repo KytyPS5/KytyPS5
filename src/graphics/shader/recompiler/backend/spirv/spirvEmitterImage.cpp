@@ -141,21 +141,26 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 	return result;
 }
 
+// Reads `components` coordinates, of which the instruction supplies the first `supplied`;
+// the others are zero, never the operands that follow the coordinates.
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  uint32_t first, uint32_t components, bool cube = false) {
+                  uint32_t first, uint32_t components, bool cube = false,
+                  uint32_t supplied = UINT32_MAX) {
+	const auto read = [&](uint32_t index) {
+		return index < supplied && mem.image_address_components > first + index
+		           ? AddressF32(ctx, mem, address, first + index)
+		           : ZeroF32(ctx.state);
+	};
 	auto x = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
-	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
-	                                                   : ZeroF32(ctx.state);
+	auto y = read(1u);
 	if (cube) {
 		x = CubeAxis(ctx.state, x);
 		y = CubeAxis(ctx.state, y);
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	if (components == 3u) {
-		auto z = mem.image_address_components > first + 2u
-		             ? AddressF32(ctx, mem, address, first + 2u)
-		             : ZeroF32(ctx.state);
+		auto z = read(2u);
 		if (cube) z = CubeLayer(ctx.state, z);
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(ctx.state, 3),
 		                              result, x, y, z);
@@ -166,17 +171,21 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 	return result;
 }
 
+// Same rule as CoordF32: coordinates the instruction does not supply are zero.
 uint32_t CoordU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  ImageDimension dimension) {
+                  ImageDimension dimension, uint32_t supplied = UINT32_MAX) {
 	const auto components = ImageDimensionInfoFor(dimension).coordinate_components;
-	const auto x          = AddressU32(ctx, mem, address, 0);
+	const auto read       = [&](uint32_t index) {
+		return index < supplied && mem.image_address_components > index
+		           ? AddressU32(ctx, mem, address, index)
+		           : ConstantU32(ctx.state, 0);
+	};
+	const auto x = AddressU32(ctx, mem, address, 0);
 	if (components == 1u) return x;
-	const auto y      = mem.image_address_components > 1u ? AddressU32(ctx, mem, address, 1)
-	                                                      : ConstantU32(ctx.state, 0);
+	const auto y      = read(1u);
 	const auto result = ctx.state.builder.AllocateId();
 	if (components == 3u) {
-		const auto z = mem.image_address_components > 2u ? AddressU32(ctx, mem, address, 2)
-		                                                 : ConstantU32(ctx.state, 0);
+		const auto z = read(2u);
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 3),
 		                              result, x, y, z);
 	} else {
@@ -769,12 +778,17 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				        const auto& dimension_info = ImageDimensionInfoFor(dimension);
 				        const auto descriptor = LoadImageDescriptor(state, resource, 0u, array_index);
 				        const auto fetched = state.builder.AllocateId();
-				        const auto coord = CoordU32(ctx, mem, *address, dimension);
+				        // Coordinates, LOD and sample index follow the instruction's address
+				        // layout.
+				        const auto supplied =
+				            ImageDimensionInfoFor(mem.image_dimension).coordinate_components;
+				        const auto coord = CoordU32(ctx, mem, *address, dimension, supplied);
 				        if (dimension_info.multisampled != 0u) {
 					        state.builder.AddFunction(
-					            spv::OpImageFetch, ImageVectorType(state, candidate.numeric_class, 4), fetched,
+					            spv::OpImageFetch,
+					            ImageVectorType(state, candidate.numeric_class, 4), fetched,
 					            descriptor, coord, spv::ImageOperandsSampleMask,
-					            AddressU32(ctx, mem, *address, dimension_info.coordinate_components));
+					            AddressU32(ctx, mem, *address, supplied));
 				        } else {
 					        state.builder.AddFunction(
 					            spv::OpImageFetch, ImageVectorType(state, candidate.numeric_class, 4), fetched,
@@ -853,7 +867,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto  coord =
 				    CoordF32(ctx, mem, *address, layout.coord,
 				             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-				             candidate.cube);
+				             candidate.cube,
+				             ImageDimensionInfoFor(mem.image_dimension).coordinate_components);
 				uint32_t operand_mask = 0;
 				uint32_t offset       = 0;
 				if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {

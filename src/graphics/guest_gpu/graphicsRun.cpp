@@ -27,6 +27,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <vector>
@@ -205,7 +206,7 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
-	m_indirect_instances.reset();
+	m_num_instances_on_gpu             = false;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -795,18 +796,14 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
-	m_indirect_instances.reset();
+	m_num_instances        = num_instances;
+	m_num_instances_on_gpu = false;
 }
 
 uint32_t CommandProcessor::NumInstances() {
-	if (m_indirect_instances.has_value()) {
-		const auto latched =
-		    m_renderer.GetRenderExecutor().ReadIndirectState(*m_indirect_instances);
-		if (latched.executed) {
-			m_num_instances = latched.instances;
-		}
-		m_indirect_instances.reset();
+	if (m_num_instances_on_gpu) {
+		m_num_instances        = m_renderer.GetRenderExecutor().ReadIndirectInstances();
+		m_num_instances_on_gpu = false;
 	}
 	return m_num_instances;
 }
@@ -927,7 +924,9 @@ bool CommandProcessor::DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_coun
 	    (count == 0 || !cache.IsRegionGpuModified(count, sizeof(uint32_t)))) {
 		return false;
 	}
-	uint32_t latched = 0;
+	// The GPU keeps NUM_INSTANCES from here on; it starts from the CPU value when known.
+	const auto instances =
+	    m_num_instances_on_gpu ? std::nullopt : std::optional<uint32_t> {m_num_instances};
 	if (!m_renderer.GetRenderExecutor().DrawIndirect(m_submit_id, CurrentBuffer(),
 	                                                 {.arguments           = arguments,
 	                                                  .count_address       = count,
@@ -937,10 +936,10 @@ bool CommandProcessor::DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_coun
 	                                                  .index_base          = m_index_base_addr,
 	                                                  .index_type_and_size = m_index_type_and_size,
 	                                                  .index_buffer_size   = m_index_buffer_size},
-	                                                 latched)) {
+	                                                 instances)) {
 		return false;
 	}
-	m_indirect_instances = latched;
+	m_num_instances_on_gpu = true;
 	return true;
 }
 
@@ -972,7 +971,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	if (draw_count == 0) {
 		return;
 	}
-	m_indirect_instances.reset();
+	m_num_instances_on_gpu = false;
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
@@ -1010,27 +1009,20 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
-
-		const uint32_t index_count =
-		    (m_index_buffer_size != 0
-		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
-		         : args->index_count_per_instance);
-		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-				LOGF("\t DrawIndexIndirectMulti: clamped index_count from %" PRIu32 " to %" PRIu32
-				     " using INDEX_BUFFER_SIZE\n",
-				     args->index_count_per_instance, index_count);
-			}
-		}
+		// Indices past INDEX_BUFFER_SIZE read as zero (an unset size of 0 leaves them unbounded).
+		const auto first       = args->start_index_location;
+		const auto index_limit = m_index_buffer_size == 0      ? UINT32_MAX
+		                         : first < m_index_buffer_size ? m_index_buffer_size - first
+		                                                       : 0u;
 
 		m_num_instances = args->instance_count;
-		DrawIndex({.index_count    = index_count,
+		DrawIndex({.index_count    = args->index_count_per_instance,
 		           .index_addr     = index_addr,
 		           .instance_count = args->instance_count,
 		           .base_vertex    = static_cast<int32_t>(args->base_vertex_location),
 		           .first_instance = args->start_instance_location,
-		           .offset_source  = DrawOffsetSource::IndirectArgs});
+		           .offset_source  = DrawOffsetSource::IndirectArgs,
+		           .index_limit    = index_limit});
 	}
 }
 

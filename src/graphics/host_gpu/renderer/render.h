@@ -65,6 +65,8 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Indices readable from index_addr (INDEX_BUFFER_SIZE); later ones read as zero.
+	uint32_t index_limit = UINT32_MAX;
 };
 
 struct DrawAutoArgs {
@@ -188,9 +190,12 @@ private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 	// Records the draws with their arguments read by the GPU; false leaves them to the CPU.
+	// instances: NUM_INSTANCES when the CPU knows it, kept if no draw runs.
 	[[nodiscard]] bool DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
-	                                const DrawIndirectPacket& args, uint32_t& latched_state);
-	[[nodiscard]] IndirectDrawPrepare::Latched ReadIndirectState(uint32_t state);
+	                                const DrawIndirectPacket& args,
+	                                std::optional<uint32_t>   instances);
+	// NUM_INSTANCES left by the GPU indirect draws; waits for them.
+	[[nodiscard]] uint32_t ReadIndirectInstances();
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;

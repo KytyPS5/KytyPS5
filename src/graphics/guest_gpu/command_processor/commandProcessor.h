@@ -7,7 +7,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -182,7 +181,7 @@ private:
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
 	// Set when the last indirect draw ran on the GPU: NUM_INSTANCES is latched there.
-	std::optional<uint32_t> m_indirect_instances;
+	bool m_num_instances_on_gpu = false;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

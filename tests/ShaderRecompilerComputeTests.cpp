@@ -411,13 +411,13 @@ struct RenderExecutorTestAccess {
   }
 
   static bool DrawIndirect(RenderExecutor &executor, CommandBuffer &command,
-                           const DrawIndirectPacket &packet, uint32_t &latched) {
-    return executor.DrawIndirect(0, command, packet, latched);
+                           const DrawIndirectPacket &packet,
+                           std::optional<uint32_t> instances) {
+    return executor.DrawIndirect(0, command, packet, instances);
   }
 
-  static IndirectDrawPrepare::Latched ReadIndirectState(RenderExecutor &executor,
-                                                        uint32_t state) {
-    return executor.ReadIndirectState(state);
+  static uint32_t ReadIndirectInstances(RenderExecutor &executor) {
+    return executor.ReadIndirectInstances();
   }
 
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
@@ -15782,6 +15782,13 @@ public:
                   sizeof(rect_vertices));
       constexpr std::array<uint32_t, 3> indices{0, 1, 2};
       std::memcpy(reinterpret_cast<void *>(index_address), indices.data(), sizeof(indices));
+      // Past INDEX_BUFFER_SIZE = 3 the hardware reads 0, not the stale 1 that follows.
+      constexpr std::array<uint32_t, 4> overflow_indices{0, 1, 2, 1};
+      std::memcpy(reinterpret_cast<void *>(index_address + 0x100), overflow_indices.data(),
+                  sizeof(overflow_indices));
+      constexpr std::array<uint8_t, 4> overflow_indices8{0, 1, 2, 1};
+      std::memcpy(reinterpret_cast<void *>(index_address + 0x200), overflow_indices8.data(),
+                  sizeof(overflow_indices8));
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -16689,11 +16696,29 @@ public:
       // GPU-written indirect arguments are drawn without a readback, with the parameters of
       // the CPU path: without SGPR destinations a native fetch ignores the base vertex and
       // first instance, and only the counted draws latch NUM_INSTANCES.
-      if (m_draw_indirect_count_supported) {
+      const auto covered = [&](const char *check, const char *message) {
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (size_t component = 0; component < pixels.size(); component++) {
+          Require("GpuIndirectDraw", check,
+                  pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                  message);
+        }
+      };
+      const auto clear_color = [&] {
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      };
+      if (m_draw_indirect_count_supported && m_index_buffer_range_supported) {
         shaders.SetEsShaderBase(vertex_address);
-        constexpr uint64_t arguments_address = depth_address + 0x3e000;
-        constexpr uint64_t count_address = arguments_address + 0x100;
+        constexpr uint64_t arguments_base = depth_address + 0x3e000;
         auto &buffers = context.GetBufferCache();
+        // Guest arguments are only dword aligned: a larger descriptor alignment must still
+        // read them at their exact address.
+        auto &storage_alignment =
+            context.GetGraphics().physical_device_properties.limits.minStorageBufferOffsetAlignment;
+        const auto saved_alignment = storage_alignment;
+        storage_alignment = std::max<vk::DeviceSize>(storage_alignment, 64);
         const auto write_gpu = [&](uint64_t address, std::span<const uint32_t> words) {
           for (uint32_t i = 0; i < words.size(); i++) {
             auto [buffer, offset] = buffers.ObtainBuffer(address + i * 4u, 4, true);
@@ -16701,22 +16726,34 @@ public:
           }
         };
         struct IndirectCase {
+          const char *check;
           bool indexed;
           uint32_t count;
           std::array<uint32_t, 10> arguments;
-          uint32_t latched;
+          uint32_t instances;
+          uint64_t arguments_offset;
+          uint64_t count_offset;
+          uint64_t index_base;
         };
-        for (const auto &test : {IndirectCase{true, 0, {6, 1, 0, 7, 5}, 1},
-                                 IndirectCase{false, 0, {3, 2, 7, 5}, 2},
-                                 IndirectCase{true, 1, {3, 1, 0, 0, 0, 3, 4, 0, 0, 0}, 1},
-                                 IndirectCase{true, 2, {3, 1, 0, 0, 0, 3, 4, 0, 0, 0}, 4}}) {
-          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
-              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        // GPU-written indices, with a stale 1 after INDEX_BUFFER_SIZE = 3 in the same buffer.
+        write_gpu(arguments_base + 0x380, std::array{0u, 1u, 2u, 1u});
+        for (const auto &test : {
+                 IndirectCase{"indexed", true, 0, {6, 1, 0, 7, 5}, 1, 0, 0, index_address},
+                 IndirectCase{"auto", false, 0, {3, 2, 7, 5}, 2, 4, 0, index_address},
+                 IndirectCase{"count 1 of 2", true, 1, {3, 1, 0, 0, 0, 3, 4, 0, 0, 0}, 1, 0,
+                              0x104, index_address},
+                 IndirectCase{"count 2 of 2", true, 2, {3, 1, 0, 0, 0, 3, 4, 0, 0, 0}, 4, 0x24,
+                              0x13c, index_address},
+                 // Start index 1 of INDEX_BUFFER_SIZE 3: indices 1, 2, then 0.
+                 IndirectCase{"indices past INDEX_BUFFER_SIZE", true, 0, {3, 1, 1, 0, 0}, 1, 0x44,
+                              0, arguments_base + 0x380}}) {
+          clear_color();
+          const auto arguments_address = arguments_base + test.arguments_offset;
+          const auto count_address = arguments_base + test.count_offset;
           write_gpu(arguments_address, test.arguments);
           if (test.count != 0) {
             write_gpu(count_address, std::array{test.count});
           }
-          uint32_t latched = 0;
           Require("GpuIndirectDraw", "GPU path",
                   RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
                       {.arguments = arguments_address,
@@ -16724,27 +16761,112 @@ public:
                        .max_count = test.count != 0 ? 2u : 1u,
                        .stride = test.indexed ? 20u : 16u,
                        .indexed = test.indexed,
-                       .index_base = index_address,
+                       .index_base = test.index_base,
                        .index_type_and_size = 1,
                        .index_buffer_size = 3},
-                      latched),
+                      9u),
                   "an eligible indirect draw fell back to reading its arguments");
           Require("GpuIndirectDraw", "no argument readback",
                   buffers.IsRegionGpuModified(arguments_address, sizeof(test.arguments)),
                   "drawing read the GPU-written arguments back to the CPU");
-          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
-                                              {}, {extent, extent, 1});
-          for (size_t component = 0; component < pixels.size(); component++) {
-            Require("GpuIndirectDraw", test.indexed ? "indexed" : "auto",
-                    pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
-                    "the host draw applied offsets the CPU path drops, or lost coverage");
-          }
-          const auto state = RenderExecutorTestAccess::ReadIndirectState(executor, latched);
+          covered(test.check, "the host draw applied offsets the CPU path drops, read indices "
+                              "past INDEX_BUFFER_SIZE, or lost coverage");
           Require("GpuIndirectDraw", "latched instance count",
-                  state.executed && state.instances == test.latched,
+                  RenderExecutorTestAccess::ReadIndirectInstances(executor) == test.instances,
                   "NUM_INSTANCES did not come from the last counted draw");
         }
-        BufferCacheTestAccess::Download(buffers, arguments_address, 0x200);
+
+        // A draw whose GPU count is 0 keeps NUM_INSTANCES: the earlier draw's, or the CPU value
+        // it starts from.
+        const auto zero_count = [&](std::optional<uint32_t> instances) {
+          write_gpu(arguments_base + 0x100, std::array{0u});
+          Require("GpuIndirectDraw", "zero count GPU path",
+                  RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                      {.arguments = arguments_base, .count_address = arguments_base + 0x100,
+                       .max_count = 2, .stride = 20, .indexed = true, .index_base = index_address,
+                       .index_type_and_size = 1, .index_buffer_size = 3},
+                      instances),
+                  "an eligible indirect draw fell back to reading its arguments");
+          return RenderExecutorTestAccess::ReadIndirectInstances(executor);
+        };
+        write_gpu(arguments_base, std::array{3u, 3u, 0u, 0u, 0u});
+        Require("GpuIndirectDraw", "three instances",
+                RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                    {.arguments = arguments_base, .max_count = 1, .stride = 20, .indexed = true,
+                     .index_base = index_address, .index_type_and_size = 1,
+                     .index_buffer_size = 3},
+                    1u),
+                "an eligible indirect draw fell back to reading its arguments");
+        Require("GpuIndirectDraw", "zero count keeps the last draw",
+                zero_count(std::nullopt) == 3,
+                "a draw that did not run replaced the instance count of the previous one");
+        Require("GpuIndirectDraw", "zero count keeps the CPU value", zero_count(5u) == 5,
+                "a draw that did not run lost the NUM_INSTANCES set on the CPU");
+
+        // Rewritten fetches keep the base vertex and first instance; the commands follow the
+        // arguments and the count at their exact, unaligned addresses.
+        {
+          IndirectDrawPrepare prepare(context.GetGraphics(), scheduler);
+          write_gpu(arguments_base + 0x204, std::array{6u, 2u, 1u, 7u, 5u, 4u, 3u, 0u, 8u, 9u});
+          write_gpu(arguments_base + 0x2fc, std::array{2u});
+          Libs::Graphics::Buffer readback(context.GetGraphics(), scheduler, MemoryUsage::Download, 0,
+                          vk::BufferUsageFlagBits::eTransferDst, 64);
+          for (const bool keep : {true, false}) {
+            const auto [arguments, arguments_offset] =
+                buffers.ObtainBuffer(arguments_base + 0x204, 40, false);
+            const auto [count, count_offset] = buffers.ObtainBuffer(arguments_base + 0x2fc, 4, false);
+            scheduler.EndRendering();
+            const auto commands = prepare.Record(
+                scheduler.Current().Handle(),
+                {.arguments = arguments, .arguments_offset = arguments_offset,
+                 .arguments_size = 40, .count = count, .count_offset = count_offset,
+                 .max_count = 3, .stride = 20, .indexed = true, .keep_offsets = keep});
+            const vk::BufferCopy region{commands.count_offset, 0, 11 * sizeof(uint32_t)};
+            scheduler.Current().Handle().copyBuffer(commands.buffer, readback.Handle(), 1,
+                                                    &region);
+            scheduler.FlushAndWait();
+            readback.Invalidate(0, region.size);
+            std::array<uint32_t, 11> words{};
+            std::memcpy(words.data(), readback.Mapped().data(), sizeof(words));
+            const std::array<uint32_t, 11> expected =
+                keep ? std::array<uint32_t, 11>{2, 6, 2, 1, 7, 5, 4, 3, 0, 8, 9}
+                     : std::array<uint32_t, 11>{2, 6, 2, 1, 0, 0, 4, 3, 0, 0, 0};
+            Require("GpuIndirectDraw", keep ? "rewritten fetch offsets" : "native fetch offsets",
+                    words == expected,
+                    "the prepared commands lost or kept the wrong offsets, or misread "
+                    "unaligned arguments");
+          }
+        }
+        storage_alignment = saved_alignment;
+        BufferCacheTestAccess::Download(buffers, arguments_base, 0x400);
+        shaders.SetEsShaderBase(indirect_vs);
+      }
+
+      // The CPU path draws past INDEX_BUFFER_SIZE with zero indices as well, through a sized
+      // binding or a host copy, and for 8-bit indices.
+      if (m_draw_indirect_count_supported && m_index_buffer_range_supported) {
+        shaders.SetEsShaderBase(vertex_address);
+        struct CpuCase {
+          const char *check;
+          uint64_t address;
+          uint32_t type;
+          bool sized;
+        };
+        auto &graphics = context.GetGraphics();
+        constexpr uint64_t gpu_indices = depth_address + 0x3e000 + 0x384;
+        for (const auto &test : {CpuCase{"sized binding", gpu_indices, 1, true},
+                                 CpuCase{"host copy", index_address + 0x104, 1, false},
+                                 CpuCase{"8-bit", index_address + 0x201, 2, true}}) {
+          clear_color();
+          graphics.index_buffer_range_enabled = test.sized;
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+              {.index_count = 3, .index_addr = reinterpret_cast<const void *>(test.address),
+               .instance_count = 1, .index_type_and_size = test.type,
+               .offset_source = DrawOffsetSource::IndirectArgs, .index_limit = 2});
+          graphics.index_buffer_range_enabled = true;
+          covered(test.check, "the CPU path read indices past INDEX_BUFFER_SIZE or dropped "
+                              "the draw");
+        }
         shaders.SetEsShaderBase(indirect_vs);
       }
 
@@ -18176,6 +18298,7 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_draw_indirect_count_supported = false;
+  bool m_index_buffer_range_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -18213,6 +18336,7 @@ private:
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.draw_indirect_count_enabled = m_draw_indirect_count_supported;
+    m_runtime_context.index_buffer_range_enabled = m_index_buffer_range_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -18360,7 +18484,36 @@ private:
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
+    u32 extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                   nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> available_extensions(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, available_extensions.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    const auto has_extension = [&](const char *name) {
+      return std::ranges::any_of(available_extensions, [&](const auto &extension) {
+        return std::strcmp(extension.extensionName.data(), name) == 0;
+      });
+    };
+    // Sized index buffer bindings, as in production (maintenance5 and robustBufferAccess2).
+    const bool index_range_extensions = has_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) &&
+                                        has_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    vk::PhysicalDeviceMaintenance5FeaturesKHR available_maintenance5{};
+    vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
+    if (index_range_extensions) {
+      available_robustness2.pNext = available_features2.pNext;
+      available_maintenance5.pNext = &available_robustness2;
+      available_features2.pNext = &available_maintenance5;
+    }
     m_physical_device.getFeatures2(&available_features2);
+    m_index_buffer_range_supported = index_range_extensions &&
+                                     available_maintenance5.maintenance5 &&
+                                     available_robustness2.robustBufferAccess2 &&
+                                     available_features.robustBufferAccess;
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -18477,7 +18630,17 @@ private:
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
     device_info.pNext = &min_lod;
+    vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5{};
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
+    if (m_index_buffer_range_supported) {
+      maintenance5.maintenance5 = true;
+      maintenance5.pNext = &robustness2;
+      robustness2.robustBufferAccess2 = true;
+      robustness2.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &maintenance5;
+    }
     vk::PhysicalDeviceFeatures device_features{};
+    device_features.robustBufferAccess = m_index_buffer_range_supported;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
@@ -18504,6 +18667,10 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (m_index_buffer_range_supported) {
+      device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());

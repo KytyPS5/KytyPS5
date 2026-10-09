@@ -485,6 +485,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool maintenance5_extension =
+	    HasExtension(device_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+	vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5 {};
+	if (maintenance5_extension) {
+		maintenance5.pNext        = supported_features2.pNext;
+		supported_features2.pNext = &maintenance5;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
@@ -604,6 +611,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
 	robustness2.pNext                              = &fragment_barycentric;
 #endif
+	graphics.index_buffer_range_enabled = maintenance5_extension && maintenance5.maintenance5 &&
+	                                      robustness2_ext_enabled &&
+	                                      supported_robustness2.robustBufferAccess2;
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
@@ -639,6 +649,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	if (graphics.index_buffer_range_enabled) {
+		maintenance5.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext  = &maintenance5;
 	}
 	if (graphics.shader_image_int64_atomics_enabled) {
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
@@ -1017,6 +1031,9 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		if (HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

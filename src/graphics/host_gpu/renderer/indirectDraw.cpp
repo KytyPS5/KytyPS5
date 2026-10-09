@@ -16,18 +16,20 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t CommandRingSize = 4ull * 1024 * 1024;
-constexpr uint32_t StateCount      = 4096;
-constexpr uint32_t StateDwords     = 4;
 
 constexpr uint32_t FlagIndexed       = 1u;
 constexpr uint32_t FlagCountIndirect = 2u;
 constexpr uint32_t FlagKeepOffsets   = 4u;
+constexpr uint32_t FlagInstances     = 8u;
 
 struct PrepareParameters {
 	uint32_t max_count     = 0;
 	uint32_t stride_dwords = 0;
 	uint32_t flags         = 0;
-	uint32_t index_limit   = 0;
+	// Dword offsets of the arguments and the count inside their aligned descriptors.
+	uint32_t arguments_base = 0;
+	uint32_t count_base     = 0;
+	uint32_t instances      = 0;
 };
 
 uint64_t CommandBytes(uint32_t max_count, bool indexed) {
@@ -44,11 +46,13 @@ IndirectDrawPrepare::IndirectDrawPrepare(GraphicContext& graphics, CommandSchedu
                  vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer,
                  CommandRingSize),
       m_states(graphics, scheduler, MemoryUsage::Download, 0,
-               vk::BufferUsageFlagBits::eStorageBuffer,
-               uint64_t {StateCount} * StateDwords * sizeof(uint32_t)),
-      m_state_ticks(StateCount, 0) {
+               vk::BufferUsageFlagBits::eStorageBuffer, sizeof(uint32_t)) {
 	SetVulkanObjectNameF(m_graphics.device, m_commands.Handle(), "Kyty.IndirectDrawCommands");
-	SetVulkanObjectNameF(m_graphics.device, m_states.Handle(), "Kyty.IndirectDrawStates");
+	SetVulkanObjectNameF(m_graphics.device, m_states.Handle(), "Kyty.IndirectDrawInstances");
+	// The only host write, before any GPU access: NUM_INSTANCES resets to 1.
+	const uint32_t instances = 1;
+	std::memcpy(m_states.Mapped().data(), &instances, sizeof(instances));
+	m_states.Flush(0, sizeof(instances));
 	std::array<vk::DescriptorSetLayoutBinding, 4> bindings {};
 	for (uint32_t index = 0; index < bindings.size(); index++) {
 		bindings[index] = {index, vk::DescriptorType::eStorageBuffer, 1,
@@ -99,32 +103,34 @@ bool IndirectDrawPrepare::Fits(const Request& request) const {
 IndirectDrawPrepare::Commands IndirectDrawPrepare::Record(vk::CommandBuffer command,
                                                           const Request&    request) {
 	EXIT_IF(!Fits(request) || request.arguments == nullptr || request.stride % 4 != 0);
-	const auto alignment = std::max<uint64_t>(
-	    m_graphics.GetPhysicalDeviceProperties().limits.minStorageBufferOffsetAlignment, 16);
+	const auto* count = request.count != nullptr ? request.count : request.arguments;
+	const auto  count_offset =
+	    request.count != nullptr ? request.count_offset : request.arguments_offset;
+	EXIT_IF(request.arguments_offset % 4 != 0 || count_offset % 4 != 0);
+	const auto storage_alignment = std::max<uint64_t>(
+	    m_graphics.GetPhysicalDeviceProperties().limits.minStorageBufferOffsetAlignment, 4);
 	const auto bytes = CommandBytes(request.max_count, request.indexed);
-	auto       start = Common::AlignUp(m_cursor, alignment);
+	auto       start = Common::AlignUp(m_cursor, std::max<uint64_t>(storage_alignment, 16));
 	if (start + bytes > m_commands.Size()) {
 		start = 0;
 	}
 	m_cursor = start + bytes;
 
-	const auto state = m_next_state;
-	m_next_state     = (m_next_state + 1) % StateCount;
-	if (const auto tick = m_state_ticks[state]; tick != 0 && !m_scheduler.IsFree(tick)) {
-		m_scheduler.Wait(tick);
-	}
-	m_state_ticks[state]    = m_scheduler.CurrentTick();
-	const auto state_offset = uint64_t {state} * StateDwords * sizeof(uint32_t);
-	const auto state_bytes  = uint64_t {StateDwords} * sizeof(uint32_t);
-	std::memset(m_states.Mapped().data() + state_offset, 0, state_bytes);
-	m_states.Flush(state_offset, state_bytes);
-
+	// Guest addresses are only dword aligned: bind from an aligned offset, index past it.
+	const auto arguments_descriptor =
+	    Common::AlignDown(request.arguments_offset, storage_alignment);
+	const auto        count_descriptor = Common::AlignDown(count_offset, storage_alignment);
+	const auto        arguments_base   = request.arguments_offset - arguments_descriptor;
+	const auto        count_base       = count_offset - count_descriptor;
 	PrepareParameters parameters {.max_count     = request.max_count,
 	                              .stride_dwords = request.stride / 4,
 	                              .flags = (request.indexed ? FlagIndexed : 0u) |
 	                                       (request.count != nullptr ? FlagCountIndirect : 0u) |
-	                                       (request.keep_offsets ? FlagKeepOffsets : 0u),
-	                              .index_limit = request.index_limit};
+	                                       (request.keep_offsets ? FlagKeepOffsets : 0u) |
+	                                       (request.instances.has_value() ? FlagInstances : 0u),
+	                              .arguments_base = static_cast<uint32_t>(arguments_base / 4),
+	                              .count_base     = static_cast<uint32_t>(count_base / 4),
+	                              .instances      = request.instances.value_or(0)};
 
 	// Argument writes become visible; earlier draws stop reading the reused command range.
 	vk::MemoryBarrier2 before {};
@@ -137,14 +143,12 @@ IndirectDrawPrepare::Commands IndirectDrawPrepare::Record(vk::CommandBuffer comm
 	dependency.pMemoryBarriers    = &before;
 	command.pipelineBarrier2(dependency);
 
-	const auto* count = request.count != nullptr ? request.count : request.arguments;
 	const vk::DescriptorBufferInfo infos[] {
-	    {request.arguments->Handle(), request.arguments_offset, request.arguments_size},
-	    {count->Handle(),
-	     request.count != nullptr ? request.count_offset : request.arguments_offset,
-	     sizeof(uint32_t)},
+	    {request.arguments->Handle(), arguments_descriptor,
+	     arguments_base + request.arguments_size},
+	    {count->Handle(), count_descriptor, count_base + sizeof(uint32_t)},
 	    {m_commands.Handle(), start, bytes},
-	    {m_states.Handle(), state_offset, state_bytes},
+	    {m_states.Handle(), 0, sizeof(uint32_t)},
 	};
 	std::array<vk::WriteDescriptorSet, 4> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
@@ -169,30 +173,19 @@ IndirectDrawPrepare::Commands IndirectDrawPrepare::Record(vk::CommandBuffer comm
 	                             vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eHostRead;
 	dependency.pMemoryBarriers = &after;
 	command.pipelineBarrier2(dependency);
+	m_state_tick = m_scheduler.CurrentTick();
 	return {.buffer          = m_commands.Handle(),
 	        .count_offset    = start,
-	        .commands_offset = start + sizeof(uint32_t),
-	        .state           = state};
+	        .commands_offset = start + sizeof(uint32_t)};
 }
 
-IndirectDrawPrepare::Latched IndirectDrawPrepare::Read(uint32_t state) {
-	EXIT_IF(state >= StateCount || m_state_ticks[state] == 0);
-	m_scheduler.Wait(m_state_ticks[state]);
-	Check(state);
-	const auto offset = uint64_t {state} * StateDwords * sizeof(uint32_t);
-	uint32_t   words[StateDwords] {};
-	std::memcpy(words, m_states.Mapped().data() + offset, sizeof(words));
-	return {.executed = words[0] != 0, .instances = words[1]};
-}
-
-void IndirectDrawPrepare::Check(uint32_t state) {
-	const auto offset = uint64_t {state} * StateDwords * sizeof(uint32_t);
-	m_states.Invalidate(offset, uint64_t {StateDwords} * sizeof(uint32_t));
-	uint32_t errors = 0;
-	std::memcpy(&errors, m_states.Mapped().data() + offset + 2 * sizeof(uint32_t), sizeof(errors));
-	if (errors != 0) {
-		EXIT("indirect draw indices exceed INDEX_BUFFER_SIZE (errors=0x%x)\n", errors);
-	}
+uint32_t IndirectDrawPrepare::ReadInstances() {
+	EXIT_IF(m_state_tick == 0);
+	m_scheduler.Wait(m_state_tick);
+	m_states.Invalidate(0, sizeof(uint32_t));
+	uint32_t instances = 0;
+	std::memcpy(&instances, m_states.Mapped().data(), sizeof(instances));
+	return instances;
 }
 
 } // namespace Libs::Graphics

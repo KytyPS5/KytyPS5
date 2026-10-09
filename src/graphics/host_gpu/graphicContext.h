@@ -34,7 +34,9 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	// drawIndirectCount, multiDrawIndirect and drawIndirectFirstInstance.
-	bool                                      draw_indirect_count_enabled            = false;
+	bool draw_indirect_count_enabled = false;
+	// maintenance5 and robustBufferAccess2: index fetches past a sized binding read zero.
+	bool                                      index_buffer_range_enabled             = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

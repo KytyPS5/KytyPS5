@@ -666,6 +666,12 @@ if(BUILD_TESTING)
 	add_test(NAME raw_buffer_stride_module
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --raw-buffer-stride-module-only)
 	set_tests_properties(raw_buffer_stride_module PROPERTIES TIMEOUT 30)
+	add_test(NAME shader_scalar_zero_sign_cpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-zero-sign-cpu-only)
+	add_test(NAME shader_scalar_zero_sign_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-zero-sign-gpu-only)
+	set_tests_properties(shader_scalar_zero_sign_cpu PROPERTIES TIMEOUT 60)
+	set_tests_properties(shader_scalar_zero_sign_gpu PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 	add_test(NAME pipeline_cache_identity
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
 	add_test(NAME pipeline_cache_checkpoint

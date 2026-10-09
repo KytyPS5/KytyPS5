@@ -188,7 +188,7 @@ private:
 	void V_AND_OR_B32(const Decoder::Instruction& inst);
 	void V_OR3_B32(const Decoder::Instruction& inst);
 	void V_XOR3_B32(const Decoder::Instruction& inst);
-	void S_FF1_I32_B64(const Decoder::Instruction& inst);
+	void S_FF1_I32_B64(const Decoder::Instruction& inst, bool find_zero = false);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
 	void S_FLBIT_I32_B64(const Decoder::Instruction& inst);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);

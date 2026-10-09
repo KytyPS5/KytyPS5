@@ -24191,6 +24191,110 @@ TestCase ScalarBitfieldPack() {
            O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+void CheckScalarZeroBitAndSignDecoder() {
+  constexpr std::array<std::pair<u32, const char*>, 7> operations{{
+      {0x0cu, "S_BREV_B64"}, {0x0du, "S_BCNT0_I32_B32"},
+      {0x0eu, "S_BCNT0_I32_B64"}, {0x11u, "S_FF0_I32_B32"},
+      {0x12u, "S_FF0_I32_B64"}, {0x19u, "S_SEXT_I32_I8"},
+      {0x1au, "S_SEXT_I32_I16"}}};
+  for (auto [encoding, name] : operations) {
+    const std::array code{EncodeSop1(encoding, 22u, 20u)};
+    ShaderRecompiler::Decoder::Instruction decoded;
+    ShaderRecompiler::Decoder::DecodeInstruction(code, 0u, decoded);
+    Require("ScalarZeroBitAndSign", "decoder",
+            magic_enum::enum_name(decoded.opcode) == name &&
+                decoded.src0.reg == 20u && decoded.dst.reg == 22u &&
+                decoded.src_count == 1u,
+            "missing scalar SOP1 instruction");
+  }
+  // Unrelated encodings must still fail instead of becoming success stubs.
+  const std::array invalid{EncodeSop1(0x23u, 22u, 20u)};
+  ShaderRecompiler::Decoder::Instruction decoded;
+  ShaderRecompiler::Decoder::DecodeInstruction(invalid, 0u, decoded);
+  Require("ScalarZeroBitAndSign", "unsupported boundary",
+          decoded.opcode == ShaderOpcode::UNSUPPORTED,
+          "unsupported SOP1 encoding was admitted");
+}
+
+TestCase ScalarZeroBitAndSign(u32 wave_size, bool alias) {
+  TestCase test;
+  test.name = alias ? "ScalarZeroBitAndSignAlias" : "ScalarZeroBitAndSign";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  // Independent bit-by-bit ISA oracle; dynamic buffer inputs prevent folding.
+  constexpr std::array<uint64_t, 11> inputs{
+      0ull, UINT64_MAX, 0x55555555aaaaaaaaull, 0x0123456789abcdefull,
+      0xffffffff7fffffffull, 0xfffffffeffffffffull, 0x7fffffffffffffffull,
+      0x13579bdf1234567full, 0x2468ace0abcd0080ull,
+      0xdeadbeef12347fffull, 0xcafebabe12348000ull};
+  for (auto input : inputs) {
+    test.initial.push_back(static_cast<u32>(input));
+    test.initial.push_back(static_cast<u32>(input >> 32u));
+  }
+  const u32 output_begin = static_cast<u32>(test.initial.size()) + 1u;
+  test.expected = test.initial;
+  test.expected.push_back(0xfeedfaceu);
+  auto& code = test.code;
+  code.push_back(EncodeSop1(0x04u, 126u, InlineU32(1u))); // only lane0 writes
+  constexpr std::array encodings{0x0cu, 0x0du, 0x0eu, 0x11u, 0x12u, 0x19u, 0x1au};
+  u32 out = output_begin;
+  for (u32 row = 0u; row < inputs.size(); ++row) {
+    for (auto encoding : encodings) {
+      for (bool scc : {false, true}) {
+        for (u32 part = 0u; part < 2u; ++part) {
+          AppendVMovU32(&code, 29u, (row * 2u + part) * 4u);
+          AppendBufferLoadDword(&code, 2u, 29u);
+          code.push_back(0xbf8c0000u); // waitcnt before readfirstlane
+          code.push_back(EncodeVop1(0x02u, 20u + part, Vgpr(2u)));
+        }
+        code.push_back(EncodeSopc(0x06u, InlineU32(1u), InlineU32(scc ? 1u : 0u)));
+        const u32 dst = alias ? 20u : 22u;
+        code.push_back(EncodeSop1(encoding, dst, 20u));
+        code.push_back(EncodeSop2(0x0au, 24u, InlineU32(1u), InlineU32(0u)));
+        const auto input = inputs[row];
+        const u32 width = encoding == 0x0eu || encoding == 0x12u ? 64u : 32u;
+        uint64_t value = 0u;
+        if (encoding == 0x0cu) {
+          for (u32 bit = 0u; bit < 64u; ++bit)
+            value |= ((input >> bit) & 1ull) << (63u - bit);
+        } else if (encoding == 0x0du || encoding == 0x0eu) {
+          for (u32 bit = 0u; bit < width; ++bit)
+            value += ((input >> bit) & 1ull) == 0u;
+        } else if (encoding == 0x11u || encoding == 0x12u) {
+          value = 0xffffffffu;
+          for (u32 bit = 0u; bit < width; ++bit) {
+            if (((input >> bit) & 1ull) == 0u) { value = bit; break; }
+          }
+        } else {
+          const u32 bits = encoding == 0x19u ? 8u : 16u;
+          const u32 mask = (1u << bits) - 1u;
+          u32 low = static_cast<u32>(input) & mask;
+          if (low & (1u << (bits - 1u))) low |= ~mask;
+          value = low;
+        }
+        AppendStoreSgpr(&code, dst, out++);
+        test.expected.push_back(static_cast<u32>(value));
+        if (encoding == 0x0cu) {
+          AppendStoreSgpr(&code, dst + 1u, out++);
+          test.expected.push_back(static_cast<u32>(value >> 32u));
+        }
+        AppendStoreSgpr(&code, 24u, out++);
+        test.expected.push_back(encoding == 0x0du || encoding == 0x0eu ? value != 0u : scc);
+      }
+    }
+  }
+  test.expected.push_back(0xdecafbad);
+  test.initial.resize(test.expected.size(), 0xa5a5a5a5u);
+  test.initial[output_begin - 1u] = 0xfeedfaceu;
+  test.initial.back() = 0xdecafbadu;
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::BUFFER_LOAD_DWORD, ShaderOpcode::BUFFER_STORE_DWORD};
+  test.required_spirv = {"OpBitReverse", "OpBitCount", "FindILsb", "OpBitFieldSExtract"};
+  return test;
+}
+
 TestCase ScalarBrevB32PreservesScc() {
   using O = ShaderOpcode;
 
@@ -42867,6 +42971,9 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
+  for (u32 wave : {32u, 64u})
+    for (bool alias : {false, true})
+      cases.push_back(ScalarZeroBitAndSign(wave, alias));
   AddCase(ScalarBitcmpB64DynamicOperands);
   AddCase(ScalarBitcmpB64IntegerConstants);
   AddCase(ScalarBrevB32PreservesScc);
@@ -49220,6 +49327,29 @@ int main(int argc, char **argv) {
   // Child workers each need the real guest arena. The supervising process
   // must not reserve another 13.5 GiB before they run sequentially.
   EnsureConfigInitialized(!admission_parent);
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-zero-sign-cpu-only") == 0) {
+    CheckScalarZeroBitAndSignDecoder();
+    for (u32 wave : {32u, 64u}) {
+      for (bool alias : {false, true}) {
+        auto test = ScalarZeroBitAndSign(wave, alias);
+        test.compile_only = true;
+        RunCase(nullptr, test);
+      }
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-zero-sign-gpu-only") == 0) {
+    CheckScalarZeroBitAndSignDecoder();
+    VulkanHarness vulkan;
+    for (u32 wave : {32u, 64u}) {
+      for (bool alias : {false, true})
+        RunCase(&vulkan, ScalarZeroBitAndSign(wave, alias));
+    }
+    RunCase(&vulkan, ScalarBitfieldPack());
+    RunCase(&vulkan, ScalarBrevB32PreservesScc());
+    RunCase(&vulkan, Scalar64BitOps());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--ajm-at9-multistream-only") == 0) {
     CheckAjmAt9Multistream();
     return 0;

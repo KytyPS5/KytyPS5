@@ -646,6 +646,14 @@ enum class Opcode {
 	S_INST_PREFETCH,
 	S_ENDPGM,
 	EXP,
+	// Keep existing opcode ordinals stable when extending scalar support.
+	S_BREV_B64,
+	S_BCNT0_I32_B32,
+	S_BCNT0_I32_B64,
+	S_FF0_I32_B32,
+	S_FF0_I32_B64,
+	S_SEXT_I32_I8,
+	S_SEXT_I32_I16,
 	COUNT
 };
 

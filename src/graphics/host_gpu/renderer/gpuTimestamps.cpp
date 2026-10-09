@@ -356,10 +356,8 @@ void GpuTimestamps::Complete(const Batch& batch) {
 	bool       deferred = false;
 	{
 		std::lock_guard lock(m_mutex);
-		if (!batch.resolved) {
-			m_retired.fetch_add(count, std::memory_order_release);
-			return;
-		}
+		// Submitting the command buffer resolves its batch, before the batch can complete.
+		EXIT_IF(!batch.resolved);
 		previous = batch.previous;
 		current  = batch.current;
 		deferred = m_retrying || !m_retries.empty();

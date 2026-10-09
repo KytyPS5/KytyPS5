@@ -3442,6 +3442,20 @@ void TestDispatcherSignedBufferLoop() {
   }
 }
 
+void CheckIndirectFormattedFallback(const Program& program) {
+  Check(program.resource_tracking_complete && program.info.uses_dma &&
+            program.bounded_srt_reads.empty() && program.info.buffer_tables.empty(),
+        "unproved formatted selector acquired a bounded host snapshot");
+  uint32_t loads = 0u;
+  for (const auto& memory : program.memory_info) {
+    if (!memory.formatted) continue;
+    ++loads;
+    Check(memory.kind == ResourceKind::IndirectBuffer,
+          "unproved formatted descriptor was converted to a host table");
+  }
+  Check(loads == 1u, "unproved formatted selector lost its live GPU read");
+}
+
 void TestFormattedScalarDescriptorTable(bool nested_loop = false, bool exec_count_guard = false,
                                         bool vcc_count_guard = false) {
   constexpr uint32_t stride = 488u;
@@ -3491,9 +3505,8 @@ void TestFormattedScalarDescriptorTable(bool nested_loop = false, bool exec_coun
   auto rejected = MakeDispatcherSignedBufferLoopFixture(
       true, 1u, stride, column, true, nested_loop, exec_count_guard, vcc_count_guard);
   BuildSrtPlan(rejected.fixture->program);
-  CheckFatal([&] { TrackResources(rejected.fixture->program); },
-             "not a valid runtime value",
-             "formatted scalar descriptor table bypassed its count guard");
+  TrackResources(rejected.fixture->program);
+  CheckIndirectFormattedFallback(rejected.fixture->program);
 }
 
 void TestFormattedExecCountGuard(bool vcc = false) {
@@ -3525,8 +3538,8 @@ void TestFormattedExecCountGuard(bool vcc = false) {
     if (invalid == 4) bad.program.block_info[1].condition = bad.Emit(ValueOpcode::IEqual32,
         {bad.Emit(ValueOpcode::LaneId, {}, 0, bad.program.blocks[1]), Value(0u)},
         0, bad.program.blocks[1]);
-    CheckFatal([&] { bad.PlanAndTrack(); }, "not a valid runtime value",
-               "unsafe EXEC count guard formed a descriptor table");
+    bad.PlanAndTrack();
+    CheckIndirectFormattedFallback(bad.program);
   }
 }
 
@@ -3690,8 +3703,8 @@ void TestWaveSelectedTableWitness() {
     Check(!ProveBoundedSrtRead(rejected.fixture->program,
                              *rejected.descriptor_words[0].ResolveInstruction()),
           "unsafe lane witness bounded a scalar descriptor row");
-    CheckFatal([&] { rejected.fixture->PlanAndTrack(); }, "not a valid runtime value",
-               "unsafe lane witness formed a formatted descriptor table");
+    rejected.fixture->PlanAndTrack();
+    CheckIndirectFormattedFallback(rejected.fixture->program);
   }
 }
 
@@ -3716,6 +3729,7 @@ void TestPhiValidation() {
   // Typed descriptor resolution must reject this control-dependent phi. Raw
   // DWORD reads now legitimately retain the per-lane descriptor in the GPU path.
   memory.formatted = true;
+  memory.typed = true;
   fixture.Emit(ValueOpcode::LoadBufferU32,
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
@@ -9014,6 +9028,28 @@ void TestGpuSelectedFormattedBufferReadAdmission() {
         "GPU-selected formatted read acquired a fabricated host descriptor");
 }
 
+void TestGpuSelectedFormattedWideAdmission() {
+  for (uint32_t width : {2u, 3u, 4u}) {
+    Fixture fixture;
+    fixture.program.srt_plan_complete = true;
+    const auto handle = fixture.Buffer({fixture.Emit(ValueOpcode::LaneId), Value(1u),
+        Value(16u), Value(0x30007654u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    memory.data_dwords = memory.component_count = width;
+    memory.data_bits = 32u;
+    memory.formatted = true;
+    const auto flags = fixture.AddMemory(memory, 0x44u);
+    const auto opcode = width == 2u ? ValueOpcode::LoadBufferU32x2 :
+        width == 3u ? ValueOpcode::LoadBufferU32x3 : ValueOpcode::LoadBufferU32x4;
+    fixture.Emit(opcode, {handle, Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+    TrackResources(fixture.program);
+    Check(fixture.program.memory_info[flags.index].kind == ResourceKind::IndirectBuffer &&
+              fixture.program.info.uses_dma && fixture.program.info.buffers.empty(),
+          "GPU-selected wide formatted load acquired a fake host descriptor");
+  }
+}
+
 void TestGpuSelectedRawBufferAdmission() {
   struct Case { ValueOpcode opcode; uint32_t words; bool formatted; bool typed; bool admitted;
                 uint32_t bits = 32; bool signed_data = false; };
@@ -9067,6 +9103,10 @@ void TestGpuSelectedRawBufferAdmission() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-formatted-wide-only") == 0) {
+      TestGpuSelectedFormattedWideAdmission();
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-formatted-buffer-only") == 0) {
       TestGpuSelectedFormattedBufferReadAdmission();
       std::cout << "KYTY_GPU_SELECTED_FORMATTED_BUFFER_PASS\n";
@@ -9345,6 +9385,7 @@ int main(int argc, char** argv) {
     Run("vertex bounded byte loop", TestVertexBoundedByteDescriptorLoop);
     Run("GPU-selected raw buffers", TestGpuSelectedRawBufferAdmission);
     Run("GPU-selected formatted buffer X", TestGpuSelectedFormattedBufferReadAdmission);
+    Run("GPU-selected formatted wide", TestGpuSelectedFormattedWideAdmission);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

@@ -795,6 +795,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-selected-format-x-cpu-only)
 	add_test(NAME shader_gpu_selected_format_x_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-selected-format-x-only)
+	add_test(NAME shader_gpu_selected_format_wide_admission
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --gpu-selected-formatted-wide-only)
+	add_test(NAME shader_gpu_selected_format_wide_spirv
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-selected-format-wide-cpu-only)
+	add_test(NAME shader_gpu_selected_format_wide_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-selected-format-wide-only)
+	set_tests_properties(shader_gpu_selected_format_wide_admission shader_gpu_selected_format_wide_spirv
+		PROPERTIES TIMEOUT 60)
+	set_tests_properties(shader_gpu_selected_format_wide_gpu PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 	add_test(NAME shader_runtime_descriptor_fault_parser
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --runtime-descriptor-fault-parser-only)
 	set_tests_properties(shader_gpu_selected_format_x_admission shader_gpu_selected_format_x_spirv

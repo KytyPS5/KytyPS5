@@ -33096,6 +33096,86 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors(u32 wave = 32u, bool faults = f
   return test;
 }
 
+TestCase BufferLoadFormatWideGpuSelectedDescriptors(u32 width, u32 wave = 32u) {
+  using F = Prospero::BufferFormat;
+  constexpr uint64_t GuestBase = 0x110000000ull;
+  struct Row {
+    F format;
+    std::array<u32, 4> data, selectors, expected;
+    u32 records = 16u, offset = 0u;
+    bool null = false, active = true;
+  };
+  const std::array<u32,4> identity{4u,5u,6u,7u};
+  const std::array<u32,4> uints{0x11223344u,0x55667788u,0x99aabbccu,0xddeeff00u};
+  const std::array rows{
+    Row{F::k32_32_32_32UInt,uints,identity,uints},
+    Row{F::k32_32Float,{0x3f000000u,0xbf800000u,0u,0u},{5u,4u,0u,1u},
+        {0xbf800000u,0x3f000000u,0u,0x3f800000u},8u},
+    Row{F::k32UInt,{0x89abcdefu,0u,0u,0u},identity,
+        {0x89abcdefu,0x89abcdefu,0x89abcdefu,0x89abcdefu},4u},
+    Row{F::k8_8_8_8UNorm,{0x00ff8000u,0u,0u,0u},identity,
+        {0u,std::bit_cast<u32>(128.0f/255.0f),0x3f800000u,0u},4u},
+    Row{F::k16_16_16_16SInt,{0x8001ffffu,0x7fff0001u,0u,0u},identity,
+        {0xffffffffu,0xffff8001u,1u,32767u},8u},
+    Row{F::k10_11_11UNorm,{0xffffffffu,0u,0u,0u},identity,
+        {0x3f800000u,0x3f800000u,0x3f800000u,0x3f800000u},4u},
+    Row{F::k32_32_32_32UInt,uints,identity,{0u,0u,0u,0u},6u},
+    Row{F::k32_32Float,{0x3f000000u,0xbf800000u,0u,0u},{4u,5u,0u,1u},
+        {0u,0u,0u,0x3f800000u},4u},
+    Row{F::k16_16UInt,uints,identity,{0x2233u,0x8811u,0x2233u,0x8811u},5u,1u},
+    Row{F::k32_32_32_32UInt,uints,identity,{0u,0u,0u,0u},16u,0u,true},
+    Row{F::k32_32_32_32UInt,uints,identity,
+        {0u,0u,0x13579bdfu,0x13579bdfu},16u,0u,false,false},
+    Row{F::k32_32_32_32UInt,uints,{4u,5u,2u,7u},
+        {uints[0],uints[1],0u,uints[3]}}
+  };
+  TestCase test;
+  static constexpr const char* names[2][3] = {
+      {"GpuSelectedFormattedXY32","GpuSelectedFormattedXYZ32","GpuSelectedFormattedXYZW32"},
+      {"GpuSelectedFormattedXY64","GpuSelectedFormattedXYZ64","GpuSelectedFormattedXYZW64"}};
+  test.name = names[wave == 64u ? 1u : 0u][width-2u];
+  test.has_compute_info=true; test.compute_info.wave_size=wave;
+  test.compute_info.threads_num[0]=test.compute_info.threads_num[1]=test.compute_info.threads_num[2]=1u;
+  test.initial.resize(4096u,0xa5a5a5a5u);
+  for(u32 i=0;i<rows.size();++i) {
+    const auto& row=rows[i]; const u32 data=8192u+i*128u;
+    const uint64_t address=row.null?0u:GuestBase+data;
+    const std::array<u32,4> descriptor{static_cast<u32>(address),static_cast<u32>(address>>32u),
+        row.records, DstSel(row.selectors[0],row.selectors[1],row.selectors[2],row.selectors[3]) |
+        (static_cast<u32>(row.format)<<12u)|(3u<<28u)};
+    std::copy(descriptor.begin(),descriptor.end(),test.initial.begin()+128u+i*4u);
+    std::copy(row.data.begin(),row.data.end(),test.initial.begin()+data/4u);
+    test.initial[64u+i]=static_cast<u32>(rows.size())-1u-i;
+  }
+  test.expected=test.initial;
+  for(u32 i=0;i<rows.size();++i) {
+    const auto selected=static_cast<u32>(rows.size())-1u-i; const auto& row=rows[selected];
+    AppendVMovU32(&test.code,30u,(64u+i)*4u); AppendBufferLoadDword(&test.code,0u,30u);
+    test.code.push_back(EncodeVop1(0x02u,20u,Vgpr(0u)));
+    test.code.push_back(EncodeSop2(0x26u,20u,20u,InlineU32(16u)));
+    test.code.push_back(EncodeSmem0(0x0au,8u,0u));test.code.push_back(EncodeSmem1(512u,20u));
+    test.code.push_back(0xbf8c0000u);
+    for(u32 c=0;c<4u;++c) AppendVMovLiteral(&test.code,20u+c,0x13579bdfu);
+    AppendVMovU32(&test.code,20u,0u);AppendVMovU32(&test.code,21u,row.offset);
+    if(!row.active){AppendSMovLiteral(&test.code,126u,0u);AppendSMovLiteral(&test.code,127u,0u);}
+    test.code.push_back(EncodeMubuf0(width-1u,0u,true,true));
+    test.code.push_back(EncodeMubuf1(20u,2u,20u));
+    if(!row.active){AppendSMovLiteral(&test.code,126u,1u);AppendSMovLiteral(&test.code,127u,0u);}
+    for(u32 c=0;c<width;++c) {
+      AppendStoreVgpr(&test.code,20u+c,1u+i*4u+c);
+      test.expected[1u+i*4u+c]=row.expected[c];
+    }
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings={{GuestBase,0u}};
+  test.opcodes={ShaderOpcode::BUFFER_LOAD_DWORD, width==2u?ShaderOpcode::BUFFER_LOAD_FORMAT_XY:
+      width==3u?ShaderOpcode::BUFFER_LOAD_FORMAT_XYZ:ShaderOpcode::BUFFER_LOAD_FORMAT_XYZW,
+      ShaderOpcode::BUFFER_STORE_DWORD};
+  test.expected_runtime_descriptor_fault=width>=3u?2u:0u;
+  test.max_spirv_words=180000u;
+  return test;
+}
+
 TestCase BufferLoadUshortGpuSelectedDescriptors() {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
@@ -43721,6 +43801,8 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return BufferLoadFormatXGpuSelectedDescriptors(); });
   AddCase([] { return BufferLoadFormatXGpuSelectedDescriptors(64u); });
   AddCase([] { return BufferLoadFormatXGpuSelectedDescriptors(32u, true); });
+  for (u32 wave : {32u,64u}) for (u32 width : {2u,3u,4u})
+    cases.push_back(BufferLoadFormatWideGpuSelectedDescriptors(width,wave));
   AddCase(BufferLoadFormatXyResource88UintExtractsBytes);
   AddCase(BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents);
   AddCase(BufferStoreFormatXyResource88UintWritesBytes);
@@ -49807,6 +49889,17 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-format-wide-cpu-only") == 0) {
+    for (u32 width : {2u,3u,4u}) { auto test=BufferLoadFormatWideGpuSelectedDescriptors(width);
+      test.compile_only=true; RunCase(nullptr,test); }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-format-wide-only") == 0) {
+    VulkanHarness vulkan;
+    for (u32 wave : {32u,64u}) for(u32 width : {2u,3u,4u})
+      RunCase(&vulkan,BufferLoadFormatWideGpuSelectedDescriptors(width,wave));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-format-x-cpu-only") == 0) {
     auto test = BufferLoadFormatXGpuSelectedDescriptors(); test.compile_only = true;
     RunCase(nullptr, test);
@@ -50673,10 +50766,10 @@ if (argc == 1) {
     M metadata{};
     Require("IndirectDwordAdmission","raw32",metadata.SupportsIndirectBufferLoad(O::LoadBufferU32),
             "raw32 descriptor load admission was lost");
-    metadata.formatted=true; metadata.data_dwords=metadata.component_count=2u;
-    Require("IndirectDwordAdmission","formatted wide rejection",!metadata.SupportsIndirectBufferLoad(O::LoadBufferU32x2),
-            "formatted descriptor loads were admitted without conversion proof");
-    metadata.formatted=false; metadata.data_dwords=metadata.component_count=1u; metadata.typed=true;
+    metadata.formatted=true; metadata.data_dwords=metadata.component_count=2u; metadata.data_bits=16u;
+    Require("IndirectDwordAdmission","formatted D16 rejection",!metadata.SupportsIndirectBufferLoad(O::LoadBufferU32x2),
+            "formatted D16 descriptor loads were admitted without conversion proof");
+    metadata.formatted=false; metadata.data_dwords=metadata.component_count=1u; metadata.data_bits=32u; metadata.typed=true;
     Require("IndirectDwordAdmission","typed rejection",!metadata.SupportsIndirectBufferLoad(O::LoadBufferU32),
             "typed descriptor loads were admitted without conversion proof");
     metadata.typed=false;metadata.data_bits=16;metadata.data_signed=true;

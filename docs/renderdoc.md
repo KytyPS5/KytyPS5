@@ -2,11 +2,11 @@
 
 Baseline: `c8c15bf3` on the `nhl26` branch. The earlier `9dc25732`
 compatibility change reports that device loss still occurs under RenderDoc.
-This branch adds diagnostics and a game-free capture test. Standalone compute
-capture/replay works with RenderDoc 1.46 on the RTX 3070; NHL 27 capture/replay
-still needs the human test below.
+This branch adds diagnostics and a game-free capture test. NHL 27 menu capture
+and replay were verified with RenderDoc 1.46 on the RTX 3070. The dark-player
+lighting bug remains visible in the replay and is not fixed by this branch.
 
-## First test
+## Reproduce the game test
 
 1. Record the exact emulator commit, RenderDoc product version and NVIDIA driver
    version. The in-application API version in the log is **not** the RenderDoc
@@ -34,6 +34,64 @@ failure occurred before menus, before F1, during capture, or during replay, and
 the capture size and replay error. Keep captures and game data outside Git.
 Use separate runs for configuration changes; preserve the exact environment
 used for each run, including any loop-cap or shader experiment flags.
+
+## Verified NHL 27 run
+
+On 2026-10-09, emulator commit `0f8d54cf`, RenderDoc 1.46 (`e4bd23b6`), RTX 3070
+and NVIDIA driver 617.14:
+
+- Vulkan instance and device creation succeeded with RenderDoc injected.
+- The human tester took two F1 captures. Both completed with
+  `EndFrameCapture result=1`, producing 1,299,975,300-byte and 1,225,450,045-byte
+  files. The game was closed after confirming both files were saved.
+- The first capture replayed using `renderdoccmd replay --loops 1` with exit 0
+  and no reported replay error.
+- The first capture opened in the RenderDoc UI with the status
+  `loaded. No problems detected.` Its final event was EID 25212, and the texture
+  viewer displayed the NHL 27 main menu with the dark player.
+- UI inspection confirmed that compute dispatch EID 11 exposes its shader
+  disassembly and bindings. Buffer 95465, bytes 127616-127632, displayed four
+  uint values: 64, 64, 64, 676. Graphics draw EID 947 exposed its graphics pipeline
+  and fragment shader. These event/resource IDs apply only to that capture;
+  they do not identify the light-culling shader.
+
+The second capture's file creation is confirmed; its replay has not been checked.
+Shader single-stepping and the light-culling inputs/outputs have not been verified.
+Captures and logs remain outside Git.
+
+### Portable launch used for this test
+
+The portable package does not need system-wide layer registration when the
+following variables are set in the launching process. Adjust paths, account
+details and game location for your machine:
+
+```powershell
+$rd = 'C:\tools\RenderDoc_1.46_64'
+$install = 'C:\dev\KytyPS5-renderdoc\_Build\windows\install'
+$game = 'C:\path\to\eboot.bin'
+$env:VK_LAYER_PATH = $rd
+$env:VK_INSTANCE_LAYERS = 'VK_LAYER_RENDERDOC_Capture'
+$env:KYTY_RENDERDOC_COMPAT = '1'
+$env:KYTY_RENDERDOC_DIR = Join-Path $env:TEMP 'kyty-renderdoc-captures'
+$gameArgs = @(
+    '--screen-width', '1280', '--screen-height', '720',
+    '--user-name', 'Cryan', '--user-id', '1000',
+    '--present-mode', 'Mailbox', '--readback-linear-images', 'true',
+    '--sync-raw-image-buffers', 'true', '--vblank-frequency', '60',
+    '--vulkan-validation', 'false', '--shader-validation', 'false',
+    '--shader-log-direction', 'Silent', '--printf-direction', 'File',
+    '--printf-output-file', '_kyty-renderdoc.txt', '--redzone', '--rd',
+    '--game', $game
+)
+& "$rd\renderdoccmd.exe" capture -w -d $install `
+    "$install\kyty_emulator.exe" @gameArgs
+```
+
+In RenderDoc, use **File > Open Capture** (`Ctrl+O`) and select the `.rdc` from
+the capture directory. Select an event in the **Event Browser** to inspect its
+pipeline and resources. **Pipeline State > CS** shows a compute dispatch's
+shader and bindings; **View** opens its disassembly, and a buffer's **Go** arrow
+opens its contents. The **Texture Viewer** shows captured render targets.
 
 ## What the diagnostics establish
 
@@ -104,7 +162,8 @@ Local verification on 2026-10-09:
   that the full suites pass.
 
 The standalone capture contains compute work, so its replay preview has no game
-image. NHL menus, F1 capture and inspection of a team-select frame remain unverified.
+image. The separate NHL run above verified a main-menu capture; a team-select
+frame and an in-match frame have not been inspected.
 
 ## Candidate changes from the other local branch
 

@@ -448,7 +448,7 @@ void TestBoundedImageViewEligibility() {
     plan.descriptor_sources.push_back(source);
   }
   plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
-  // A plain sample reads it with its own dimension, as the T# drives the hardware.
+  // A plain sample reads it with its own type, as the T# drives the hardware.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 2u &&
             snapshot.images[1].dwords == descriptor(0x30u, Type::kColor3D) &&
@@ -469,20 +469,6 @@ void TestBoundedImageViewEligibility() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected multisampled descriptor was sampled");
   sources[1] = volume;
-  // A record of another numeric class would need another sampler variant: refused too.
-  auto floating = descriptor(0x32u, Type::kColor2D);
-  floating[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
-                << 20u;
-  DescriptorSource other_class;
-  other_class.dword_count = 8u;
-  for (uint32_t word = 0; word < floating.size(); ++word)
-    other_class.dwords[word] = Value(floating[word]);
-  plan.descriptor_sources.push_back(other_class);
-  plan.descriptor_sources[image_source].indirect_descriptor->sources[1] =
-      static_cast<uint32_t>(plan.descriptor_sources.size() - 1u);
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "explicitly selected descriptor of another numeric class was sampled");
-  plan.descriptor_sources[image_source].indirect_descriptor->sources[1] = volume;
   // Depth comparison has no 3D form: the mixed table is refused.
   for (auto &memory : plan.memory_info) {
     if (memory.kind == ResourceKind::Image && memory.resource == 0u)
@@ -501,6 +487,81 @@ void TestBoundedImageViewEligibility() {
   }
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected incompatible descriptor was silently normalized to null");
+}
+
+void TestMixedCandidateSamplers() {
+  using Format = Libs::Graphics::Prospero::BufferFormat;
+  // Light tables mix float and 8_UINT records under one sample. The S# applies to each
+  // record with the record's own format: every class gets its variant, whatever the root's.
+  // A table also read by image_load keeps one class: a typed fetch has no per-record view type.
+  for (const bool integer_root : {false, true}) {
+   for (const bool load : {false, true}) {
+    auto fixture = MakeIndirectImageFixture(
+        false, 48u, 0u, 16u, false,
+        load ? std::vector{ValueOpcode::ImageSampleRaw, ValueOpcode::ImageRead}
+             : std::vector{ValueOpcode::ImageSampleRaw});
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    const auto float_image = integer_root ? 1u : 0u;
+    const auto uint_image = integer_root ? 0u : 1u;
+    std::vector<uint32_t> selected;
+    for (const auto format : {integer_root ? Format::k8UInt : Format::k32_32_32_32Float,
+                              integer_root ? Format::k32_32_32_32Float : Format::k8UInt,
+                              Format::k16SInt}) {
+      const std::array<uint32_t, 8> value{
+          0x30u + static_cast<uint32_t>(selected.size()), static_cast<uint32_t>(format) << 20u,
+          3u | (3u << 14u),
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u),
+          0u, 0u, 0u, 0u};
+      DescriptorSource source;
+      source.dword_count = 8u;
+      for (uint32_t word = 0; word < value.size(); ++word) source.dwords[word] = Value(value[word]);
+      selected.push_back(static_cast<uint32_t>(plan.descriptor_sources.size()));
+      plan.descriptor_sources.push_back(source);
+    }
+    plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->sources = selected;
+    std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u,
+                                0x2000u, 48u << 16u, 5u, 0u};
+    LinearTestMemory memory;
+    memory.fail_address = 0x3000u;
+    SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    if (load) {
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "a table read by image_load accepted records of another numeric class");
+      continue;
+    }
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 3u,
+          "float and integer records were not kept as candidates of one table");
+    ApplyResourceSpecialization(fixture->program, specialization);
+    const auto &info = fixture->program.info;
+    const auto sample = std::ranges::find_if(fixture->program.memory_info, [](const auto &memory) {
+      return memory.kind == ResourceKind::Image;
+    });
+    Check(sample != fixture->program.memory_info.end() && info.images.size() == 3u &&
+              info.samplers.size() == 3u,
+          "mixed candidates did not get one sampler variant per class");
+    const auto variant = [&](uint32_t image) -> const SamplerResource * {
+      const auto index = SamplerVariantForImage(info, sample->sampler, image);
+      return index < info.samplers.size() ? &info.samplers[index] : nullptr;
+    };
+    const auto *filtered = variant(float_image);
+    const auto *integer = variant(uint_image);
+    const auto *point = variant(2u);
+    Check(filtered != nullptr && integer != nullptr && point != nullptr &&
+              &info.samplers[sample->sampler] == variant(0u) &&
+              !filtered->integer_border && !filtered->force_point_filtering &&
+              integer->integer_border && !integer->force_point_filtering &&
+              point->integer_border && point->force_point_filtering &&
+              filtered->snapshot_index == 0u && integer->snapshot_index == 0u &&
+              point->snapshot_index == 0u,
+          "a candidate was sampled with the border or filtering of another class");
+   }
+  }
 }
 
 void TestWaterfallImageTable() {
@@ -4180,6 +4241,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+    Run("mixed candidate samplers", TestMixedCandidateSamplers);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("indirect image table operations", TestIndirectImageTableOperations);

@@ -912,30 +912,67 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
 		}
-		const auto& samplers = state.program.info.samplers.at(mem.sampler).indirect_resources;
-		uint32_t sampler_index = 0;
-		if (!samplers.empty()) {
-			const auto* handle = inst.Arg(1).ResolveInstruction();
-			if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource)
-				ctx.Fail(inst, "has invalid finite sampler key provenance");
-			sampler_index = EmitIndexSwitch(
-			    state, ctx.Def(handle->Arg(0)), static_cast<uint32_t>(samplers.size()),
-			    TypeU32(state), [&](uint32_t ordinal) { return ConstantU32(state, samplers[ordinal]); });
+		struct SamplerLoad {
+			uint32_t sampler;
+			uint32_t id;
+			bool     dynamic;
+		};
+		const auto LoadSampler = [&](uint32_t sampler) {
+			const auto& samplers      = state.program.info.samplers.at(sampler).indirect_resources;
+			uint32_t    sampler_index = 0;
+			if (!samplers.empty()) {
+				const auto* handle = inst.Arg(1).ResolveInstruction();
+				if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource)
+					ctx.Fail(inst, "has invalid finite sampler key provenance");
+				sampler_index = EmitIndexSwitch(
+				    state, ctx.Def(handle->Arg(0)), static_cast<uint32_t>(samplers.size()),
+				    TypeU32(state),
+				    [&](uint32_t ordinal) { return ConstantU32(state, samplers[ordinal]); });
+			}
+			return SamplerLoad {sampler, LoadSamplerDescriptor(state, sampler, sampler_index),
+			                    sampler_index != 0u};
+		};
+		// Each candidate applies the S# with its own format: its class picks the sampler variant.
+		std::vector<SamplerLoad> sampler_loads {LoadSampler(mem.sampler)};
+		std::vector<uint32_t>    candidate_samplers;
+		for (const auto resource: image.indirect_resources) {
+			const auto sampler =
+			    resource == mem.resource
+			        ? mem.sampler
+			        : IR::SamplerVariantForImage(state.program.info, mem.sampler, resource);
+			if (sampler == UINT32_MAX) {
+				ctx.Fail(inst, "has no sampler variant for an indirect image candidate");
+				return;
+			}
+			if (std::ranges::none_of(sampler_loads,
+			                         [&](const auto& load) { return load.sampler == sampler; }))
+				sampler_loads.push_back(LoadSampler(sampler));
+			candidate_samplers.push_back(sampler);
 		}
-		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
-			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
-			                                      sampler_index != 0u);
+			const auto  ordinal = std::ranges::find(image.indirect_resources, resource) -
+			                      image.indirect_resources.begin();
+			const auto  variant = static_cast<size_t>(ordinal) < candidate_samplers.size()
+			                          ? candidate_samplers[ordinal]
+			                          : mem.sampler;
+			const auto& load    = *std::ranges::find(sampler_loads, variant, &SamplerLoad::sampler);
+			const auto  sampled =
+			    MakeSampledImage(state, resource, load.id, 0u, array_index, load.dynamic);
 			const auto sample = state.builder.AllocateId();
-			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
+			// A record of another numeric class is read as its own type, like the T# on
+			// hardware; its lanes reach the shader as raw bits.
+			const auto sample_type =
+			    dref ? result_type : ImageVectorType(state, candidate.numeric_class, 4);
+			state.builder.AddFunction(opcode, sample_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
 			                          std::span<const uint32_t>(operands).first(operand_count));
-			return sample;
+			return sample_type == result_type ? sample
+			                                  : Unary(state, spv::OpBitcast, result_type, sample);
 		};
 		auto result = EmitImageAccess(ctx, inst, result_type, EmitSample);
 		if (!dref) {

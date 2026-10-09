@@ -618,8 +618,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		// image_sample and image_load read each record through its own view, with the record's
 		// dimension as the T# drives the hardware and the instruction's coordinates; derivatives
 		// and offsets are laid out for one dimension. A load cannot fetch a cube view, nor take a
-		// fragment index the instruction does not supply. Candidates keep one numeric class,
-		// which selects the sampler variant.
+		// fragment index the instruction does not supply. A sample also reads each record with its
+		// own numeric class, through the sampler variant of that class.
 		const auto& base_root    = program.info.images[root_index];
 		uint32_t    sample_flags = 0;
 		for (const auto& memory: program.memory_info) {
@@ -632,6 +632,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (sample_flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagCd |
 		                     Decoder::ImageSampleFlagOffset | Decoder::ImageSampleFlagCompare)) ==
 		        0u;
+		const bool mixed_classes = mixed_dimensions && base_root.sample_only;
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -652,7 +653,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    (base_root.sample_only ||
 			     (!image.cube && is_msaa(image.dimension) == is_msaa(base_root.dimension)));
 			if ((sampled && is_msaa(image.dimension)) ||
-			    image.numeric_class != image_class.numeric_class ||
+			    (image.numeric_class != image_class.numeric_class && !mixed_classes) ||
 			    (!same_coordinates && !own_view &&
 			     !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
@@ -679,6 +680,11 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 			return false;
 		}
 		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image]));
+		// The S# applies to each indirect image candidate with the candidate's own format.
+		for (const auto image: base.images[pair.image].indirect_resources) {
+			if (image >= base.images.size()) return false;
+			usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[image]));
+		}
 		for (const auto candidate: base.samplers[pair.sampler].indirect_resources) {
 			if (candidate >= base.samplers.size()) return false;
 			usage[candidate] |= usage[pair.sampler];
@@ -1498,6 +1504,18 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+}
+
+uint32_t SamplerVariantForImage(const ShaderInfo& info, uint32_t sampler, uint32_t image) {
+	EXIT_IF(sampler >= info.samplers.size() || image >= info.images.size());
+	const auto type  = ClassifySampler(info.images[image]);
+	const auto found = std::ranges::find_if(info.samplers, [&](const SamplerResource& variant) {
+		return variant.snapshot_index == info.samplers[sampler].snapshot_index &&
+		       variant.force_point_filtering == (type == SamplerClass::PointInteger) &&
+		       variant.integer_border == (type != SamplerClass::Float);
+	});
+	return found == info.samplers.end() ? UINT32_MAX
+	                                    : static_cast<uint32_t>(found - info.samplers.begin());
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

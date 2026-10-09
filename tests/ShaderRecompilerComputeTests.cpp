@@ -35683,6 +35683,230 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   for (auto &texture : textures) vulkan.DestroyImage(&texture);
 }
 
+void CheckIndirectImageMixedCandidates(VulkanHarness &vulkan) {
+  constexpr const char *name = "IndirectImageMixedCandidates";
+  using namespace ShaderRecompiler::IR;
+
+  // A float 2D root selected among a uint 2D record and a float 3D record: each
+  // candidate is sampled with its own image type and sampler variant, and the lanes
+  // reach the shader as bits.
+  Program program{};
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.shader_info_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+
+  auto &key = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &image =
+      block->AppendNewInst(ValueOpcode::GetImageResource,
+                           {Value(&key), Value(0u), Value(0u), Value(0u),
+                            Value(0u), Value(0u), Value(0u), Value(0u)});
+  image.SetFlags<uint32_t>(0u);
+  auto &sampler =
+      block->AppendNewInst(ValueOpcode::GetSamplerResource,
+                           {Value(0u), Value(0u), Value(0u), Value(0u)});
+  sampler.SetFlags<uint32_t>(0u);
+  auto &address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)});
+  MemoryInfo memory{};
+  memory.kind = ResourceKind::Image;
+  memory.resource = 0;
+  memory.sampler = 0;
+  memory.dmask = 0xf;
+  memory.image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLevelZero;
+  memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  memory.image_address_components = 2;
+  program.memory_info.push_back(memory);
+  const MemoryFlags memory_flags{0u, 0x10f0u};
+  uint64_t memory_flag_bits = 0;
+  std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
+  auto &sample = block->AppendNewInst(
+      ValueOpcode::ImageSampleRaw,
+      {Value(&image), Value(&sampler), Value(&address)}, memory_flag_bits);
+  auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                        {Value(&sample), Value(0u)});
+  block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
+
+  program.descriptor_sources.resize(2);
+  program.descriptor_sources[0].dword_count = 8;
+  program.descriptor_sources[0].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor{.table_source = 0, .table_stride = 32,
+                                           .key_count = Value(3u)};
+  program.descriptor_sources[1].dword_count = 4;
+
+  ImageResource root{};
+  root.source = 0;
+  root.first_use_pc = 0x10f0u;
+  root.resource_class = ImageResourceClass::Sampled;
+  root.numeric_class = Prospero::TextureNumericClass::Float;
+  root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  root.read = true;
+  root.indirect_root = 0;
+  root.indirect_mapping_offset = 0;
+  root.indirect_search_iterations = 2;
+  root.indirect_resources = {0u, 1u, 2u};
+  auto integer = root;
+  integer.numeric_class = Prospero::TextureNumericClass::Uint;
+  integer.indirect_search_iterations = 0;
+  integer.indirect_resources.clear();
+  auto volume = root;
+  volume.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+  volume.indirect_search_iterations = 0;
+  volume.indirect_resources.clear();
+  program.info.images = {root, integer, volume};
+  program.info.samplers.push_back({1u, 0x10f0u});
+  // The integer variant of the same S#, planned for the uint record.
+  program.info.samplers.push_back(
+      {.source = 1u, .first_use_pc = 0x10f0u, .integer_border = true});
+  program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
+
+  ShaderComputeInputInfo compute{};
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
+  auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble the mixed candidate shader");
+  Require(name, "typed candidate samples",
+          CountText(text, "OpImageSampleExplicitLod") == 3 &&
+              CountText(text, "OpBitcast %v4float") >= 1 &&
+              text.find("OpTypeImage %uint 2D") != std::string::npos &&
+              text.find("OpTypeImage %float 3D") != std::string::npos,
+          "mixed candidates were not sampled with their own image types");
+  // Each candidate reads the sampler variant of its own class: the uint record the integer one.
+  std::vector<std::span<const u32>> definitions(spirv[3]);
+  u32 float_samples = 0;
+  u32 integer_samples = 0;
+  for (size_t offset = 5; offset < spirv.size();) {
+    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+    switch (static_cast<spv::Op>(words[0] & 0xffffu)) {
+    case spv::OpTypeImage:
+    case spv::OpTypeInt:
+    case spv::OpTypeFloat:
+      definitions[words[1]] = words;
+      break;
+    case spv::OpConstant:
+    case spv::OpLoad:
+    case spv::OpAccessChain:
+    case spv::OpSampledImage:
+      definitions[words[2]] = words;
+      break;
+    case spv::OpImageSampleExplicitLod: {
+      const auto sampled = definitions[words[3]];
+      const auto image_type = definitions[definitions[sampled[3]][1]];
+      const auto chain = definitions[definitions[sampled[4]][3]];
+      const auto slot = definitions[chain[4]][3];
+      if ((definitions[image_type[2]][0] & 0xffffu) == spv::OpTypeInt)
+        integer_samples += slot == 1u ? 1u : 0u;
+      else
+        float_samples += slot == 0u ? 1u : 0u;
+      break;
+    }
+    default:
+      break;
+    }
+    offset += words.size();
+  }
+  Require(name, "candidate sampler variants", float_samples == 2u && integer_samples == 1u,
+          "a candidate was sampled with the sampler variant of another class");
+
+  // On the GPU, lanes select the float root, the uint record or another float record through
+  // the mapping: in range each lane reads its record's texel bits, at the border the border of
+  // its own sampler variant. The variants get distinct borders (float opaque white, integer
+  // transparent black) so each lane shows which one its record read.
+  program.info.images[2].dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  program.info.images[0].indirect_search_iterations = 0;
+  program.descriptor_sources[0].indirect_descriptor = DescriptorSource::IndirectDescriptor{
+      .selector = DescriptorSource::IndirectDescriptor::SelectorRead{
+          .source = 0, .stride = 224, .offset = 12},
+      .table_source = 0, .table_stride = 32};
+  auto &byte_offset = *block->PrependNewInst(std::next(block->begin()), ValueOpcode::IMul32,
+                                             {Value(&key), Value(4u)});
+  image.SetArg(0, Value(&byte_offset));
+  auto &output = block->AppendNewInst(ValueOpcode::GetBufferResource,
+                                      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  output.SetFlags<u32>(0u);
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
+  auto &store = block->AppendNewInst(
+      ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(&byte_offset), Value(0u), Value(&sample_x), Value(true)});
+  store.SetFlags(MemoryFlags{1u, 0u});
+  program.info.buffers.push_back({.packed_stride = 1, .written = true});
+
+  TestCase test;
+  test.name = "IndirectImageMixedClassSamples";
+  CompiledShader compiled;
+  compiled.program = std::move(program);
+  compiled.resources.flattened_srt.push_back(64u);
+  for (u32 lane = 0; lane < 64u; ++lane) compiled.resources.flattened_srt.push_back(lane % 3u);
+  constexpr std::array texels{std::bit_cast<u32>(3.0f), 0x01234567u, std::bit_cast<u32>(5.0f)};
+  std::vector<VulkanHarness::Image> textures;
+  for (u32 resource = 0; resource < 3u; ++resource) {
+    std::vector<u32> pixels(16u, texels[resource]);
+    textures.push_back(vulkan.CreateImageMips(
+        test.name, 2, 2,
+        resource == 1u ? vk::Format::eR32G32B32A32Uint : vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, {pixels}, 4u, vk::ImageLayout::eShaderReadOnlyOptimal,
+        vk::ImageType::e2D, vk::ImageViewType::e2D, 1u));
+  }
+  std::array<vk::Sampler, 2> samplers{};
+  for (u32 slot = 0; slot < samplers.size(); ++slot) {
+    vk::SamplerCreateInfo info{};
+    info.magFilter = info.minFilter = vk::Filter::eNearest;
+    info.mipmapMode = vk::SamplerMipmapMode::eNearest;
+    info.addressModeU = info.addressModeV = info.addressModeW =
+        vk::SamplerAddressMode::eClampToBorder;
+    info.borderColor =
+        slot == 0u ? vk::BorderColor::eFloatOpaqueWhite : vk::BorderColor::eIntTransparentBlack;
+    RequireVk(test.name, "sampler", vulkan.Device().createSampler(&info, nullptr, &samplers[slot]),
+              "vkCreateSampler");
+  }
+  for (const bool border : {false, true}) {
+    for (u32 component = 0; component < 2u; ++component)
+      address.SetArg(component, Value(std::bit_cast<u32>(border ? -1.0f : 0.5f)));
+    for (const u32 wave_size : {32u, 64u}) {
+      compute.wave_size = wave_size;
+      compute.host_subgroup_size = vulkan.SubgroupSize();
+      compute.threads_num[0] = wave_size;
+      compute.threads_num[1] = compute.threads_num[2] = 1u;
+      compiled.program.wave_size = wave_size;
+      compiled.program.shader_info_complete = false;
+      CollectShaderInfo(compiled.program, {.compute = &compute});
+      compiled.spirv =
+          ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+      compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      ValidateSpirv(test.name, compiled.spirv);
+      test.initial.assign(wave_size, 0xdeadbeefu);
+      test.expected.resize(wave_size);
+      for (u32 lane = 0; lane < wave_size; ++lane) {
+        const auto resource = lane % 3u;
+        test.expected[lane] =
+            !border ? texels[resource] : resource == 1u ? 0u : std::bit_cast<u32>(1.0f);
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, textures,
+                      samplers);
+      const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+      vulkan.DestroyBuffer(&buffer);
+      CompareWords(test, border ? "border of each candidate's sampler variant"
+                                : "texel bits of each candidate",
+                   test.expected, actual);
+    }
+  }
+  for (const auto sampler : samplers) vulkan.Device().destroySampler(sampler);
+  for (auto &texture : textures) vulkan.DestroyImage(&texture);
+  std::printf("[compute] %-32s ok\n", "IndirectImageMixedCandidates");
+}
+
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   using O = ShaderOpcode;
 
@@ -43602,6 +43826,7 @@ int main(int argc, char **argv) {
     CheckIndirectImageKeySwitch(vulkan);
     CheckIndirectImageLoadCoordinates();
     CheckFiniteInlineSamplerPhi(vulkan);
+    CheckIndirectImageMixedCandidates(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -43767,6 +43992,7 @@ int main(int argc, char **argv) {
   CheckIndirectImageKeySwitch(vulkan);
   CheckIndirectImageLoadCoordinates();
   CheckFiniteInlineSamplerPhi(vulkan);
+  CheckIndirectImageMixedCandidates(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();

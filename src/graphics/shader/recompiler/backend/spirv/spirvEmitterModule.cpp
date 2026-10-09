@@ -581,7 +581,7 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
-	if (state.program.stage == ShaderType::Pixel && state.requirements.subgroup_ballot) {
+	if (state.program.stage == ShaderType::Pixel && state.program.info.subgroup_ballot) {
 		const auto variable = DefineInterfaceVariable(
 		    state, TypeBool(state), spv::StorageClassInput, "gl_HelperInvocation");
 		state.helper_invocation_variable = variable;

@@ -88,10 +88,8 @@ uint64_t GpuTimestamps::ToReference(const Segment& previous, const Segment& curr
 }
 
 bool GpuTimestamps::SampleClocks(uint64_t& ticks, uint64_t& reference) const {
-	const auto get = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsKHR != nullptr
-	                     ? VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsKHR
-	                     : VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsEXT;
-	if (!m_graphics.calibrated_timestamps_enabled || get == nullptr) {
+	const auto get = m_graphics.get_calibrated_timestamps;
+	if (get == nullptr) {
 		return false;
 	}
 	VkCalibratedTimestampInfoKHR info {};
@@ -105,7 +103,7 @@ bool GpuTimestamps::SampleClocks(uint64_t& ticks, uint64_t& reference) const {
 		const auto before    = Sync::ReadReferenceClock();
 		const auto result    = get(m_graphics.device, 1, &info, &device, &deviation);
 		const auto after     = Sync::ReadReferenceClock();
-		RequireVulkanSuccess(static_cast<vk::Result>(result), "vkGetCalibratedTimestampsKHR");
+		RequireVulkanSuccess(static_cast<vk::Result>(result), "vkGetCalibratedTimestamps");
 		if (after - before < best) {
 			best      = after - before;
 			ticks     = device;
@@ -227,7 +225,7 @@ void GpuTimestamps::Write(uint64_t vaddr, uint32_t size, bool end_of_pipe) {
 		return;
 	}
 	StoreRetries();
-	if (m_graphics.calibrated_timestamps_enabled &&
+	if (m_graphics.get_calibrated_timestamps != nullptr &&
 	    (!m_calibrated || Sync::ReadReferenceClock() - m_last_reference >= CalibrationInterval)) {
 		Calibrate();
 	}

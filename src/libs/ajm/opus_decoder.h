@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 
 namespace Libs::Audio::Ajm {
 
@@ -27,7 +28,7 @@ static_assert(sizeof(AjmSidebandDecOpusCodecInfo) == 4);
 class AjmOpusDecoder final: public AjmDecoder {
 public:
 	AjmOpusDecoder(uint32_t max_channels, AjmSampleEncoding encoding)
-	    : AjmDecoder(0, 48000, encoding), m_max_channels(max_channels) {}
+	    : AjmDecoder(0, 48000, encoding), m_max_channels(max_channels) { SelfTest(); }
 
 	~AjmOpusDecoder() override { avcodec_free_context(&m_context); avcodec_free_context(&m_alt);
 		avcodec_free_context(&m_s1); }
@@ -150,9 +151,13 @@ public:
 				break;
 			}
 
-			const uint32_t ms_end = MultistreamSplit(data, packet_size);
-			AVFrame* frame = ms_end != 0 ? DecodeMultistream(data, packet_size, ms_end, &result) : DecodePacket(data, packet_size, &result);
-			TraceJob(ms_end, packet_size);
+			std::vector<uint8_t> p0;
+			uint32_t             ms_end = 0;
+			const bool           split =
+			    m_channels == 2 && SplitStreams(data, packet_size, &p0, &ms_end);
+			AVFrame* frame = split ? DecodeMultistream(data, packet_size, p0, ms_end, &result)
+			                       : DecodePacket(data, packet_size, &result);
+			TraceJob(split, data, packet_size, ms_end);
 			if (frame == nullptr) {
 				break;
 			}
@@ -227,31 +232,67 @@ public:
 
 private:
 	// 2ch instances carry two uncoupled mono Opus streams: stream0 in self-delimited framing
-	// (TOC, length, frame; RFC 6716 App. B) followed by stream1 as a normal packet.
-	// Returns the stream0 end offset, or 0 if the packet does not look like that.
-	[[nodiscard]] uint32_t MultistreamSplit(const uint8_t* d, uint32_t size) const {
-		if (m_channels != 2 || size < 4 || (d[0] & 3u) != 0) {
-			return 0;
-		}
-		uint32_t lb  = 1;
-		uint32_t len = d[1];
-		if (len >= 252) {
-			len = d[1] + 4u * d[2];
-			lb  = 2;
-		}
-		const uint32_t end = 1 + lb + len;
-		if (end >= size || (d[end] >> 3u) != (d[0] >> 3u) || (d[end] & 4u) != 0 ||
-		    (d[end] & 3u) != 0) {
-			return 0;
-		}
-		return end;
+	// (RFC 6716 App. B: one extra length field) followed by stream1 as a normal packet.
+	static uint32_t TocSamples(uint8_t toc, uint32_t frames) {
+		const uint32_t config = toc >> 3u;
+		const uint32_t fs     = config >= 16         ? 120u << (config & 3u)
+		                        : config >= 12       ? 480u << (config & 1u)
+		                        : (config & 3u) == 3 ? 2880u
+		                                             : 480u << (config & 3u);
+		return fs * frames;
 	}
 
-	AVFrame* DecodeMultistream(const uint8_t* d, uint32_t size, uint32_t end,
-	                           AjmDecodeResult* result) {
-		const uint32_t lb = (d[1] >= 252) ? 2 : 1;
-		std::vector<uint8_t> p0(d + 1 + lb, d + end);
-		p0.insert(p0.begin(), d[0]);
+	static bool ReadLen(const uint8_t* d, uint32_t size, uint32_t* off, uint32_t* len) {
+		if (*off >= size) return false;
+		uint32_t l = d[*off];
+		(*off)++;
+		if (l >= 252) {
+			if (*off >= size) return false;
+			l += 4u * d[*off];
+			(*off)++;
+		}
+		*len = l;
+		return true;
+	}
+
+	// Split a 2ch payload. On success fills the normal-framed stream0 packet and the offset of
+	// stream1. Supports codes 0, 1 and 2 for stream0 (stream1 must have the same duration).
+	static bool SplitStreams(const uint8_t* d, uint32_t size, std::vector<uint8_t>* p0,
+	                         uint32_t* end) {
+		if (size < 4) return false;
+		const uint32_t code = d[0] & 3u;
+		uint32_t       off  = 1;
+		uint32_t       frames = 1;
+		p0->assign(1, d[0]);
+		if (code == 0 || code == 1) {
+			uint32_t len = 0;
+			if (!ReadLen(d, size, &off, &len)) return false;
+			frames          = code == 0 ? 1 : 2;
+			const uint32_t n = len * frames;
+			if (off + n >= size) return false;
+			p0->insert(p0->end(), d + off, d + off + n);
+			*end = off + n;
+		} else if (code == 2) {
+			const uint32_t start = off;
+			uint32_t       n1    = 0;
+			uint32_t       n2    = 0;
+			if (!ReadLen(d, size, &off, &n1)) return false;
+			p0->insert(p0->end(), d + start, d + off);
+			if (!ReadLen(d, size, &off, &n2)) return false;
+			frames = 2;
+			if (off + n1 + n2 >= size) return false;
+			p0->insert(p0->end(), d + off, d + off + n1 + n2);
+			*end = off + n1 + n2;
+		} else {
+			return false;
+		}
+		const uint8_t toc1 = d[*end];
+		if ((toc1 & 3u) != 0 || TocSamples(toc1, 1) != TocSamples(d[0], frames)) return false;
+		return true;
+	}
+
+	AVFrame* DecodeMultistream(const uint8_t* d, uint32_t size, const std::vector<uint8_t>& p0,
+	                           uint32_t end, AjmDecodeResult* result) {
 		AVCodecContext* c0 = ContextFor(1);
 		if (m_s1 == nullptr) {
 			const auto* codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
@@ -291,15 +332,32 @@ private:
 		return out;
 	}
 
-	AVCodecContext* m_s1 = nullptr;
+	// Self-check (KYTY_AJM_OPUS_SELFTEST=1) of SplitStreams on the two observed packet shapes.
+	static void SelfTest() {
+		static bool done = false;
+		if (done || std::getenv("KYTY_AJM_OPUS_SELFTEST") == nullptr) return;
+		done = true;
+		std::vector<uint8_t> a = {0xf8, 0x02, 0xff, 0xfe, 0x78};
+		a.resize(79, 0x11);
+		std::vector<uint8_t> b = {0xf8, 0xd1};
+		b.resize(2 + 209, 0x22);
+		b.insert(b.end(), {0xf8, 0xff, 0xfe});
+		std::vector<uint8_t> p;
+		uint32_t             e = 0;
+		const bool           ra = SplitStreams(a.data(), static_cast<uint32_t>(a.size()), &p, &e);
+		const bool           ok_a = ra && e == 4 && p.size() == 3;
+		const bool           rb = SplitStreams(b.data(), static_cast<uint32_t>(b.size()), &p, &e);
+		const bool           ok_b = rb && e == 211 && p.size() == 210;
+		GameTrace::Line("AJM OPUS selftest job1059-shape=%s job275-shape=%s", ok_a ? "PASS" : "FAIL", ok_b ? "PASS" : "FAIL");
+	}
 
-	void TraceJob(uint32_t ms_end, uint32_t packet_size) const {
-		if (!GameTrace::Enabled()) return;
-		static std::atomic_int s_n {0};
-		const int              k = s_n.fetch_add(1);
-		if (k < 60) {
-			GameTrace::Line("AJM OPUS pkt#%d instance_ch=%u packet=%u multistream_end=%u", k, m_channels, packet_size, ms_end);
-		}
+	AVCodecContext* m_s1 = nullptr;
+	int             m_trace_n = 0;
+
+	void TraceJob(bool split, const uint8_t* d, uint32_t packet_size, uint32_t end) {
+		if (!GameTrace::Enabled() || m_channels != 2 || m_trace_n >= 20) return;
+		m_trace_n++;
+		GameTrace::Line("AJM OPUS 2ch dec=%p pkt#%d size=%u toc0=%02x %02x %02x split=%d end=%u toc1=%02x path=%s", static_cast<const void*>(this), m_trace_n, packet_size, d[0], packet_size > 1 ? d[1] : 0, packet_size > 2 ? d[2] : 0, split ? 1 : 0, end, split ? d[end] : 0, split ? "multistream" : "legacy");
 	}
 
 	AVFrame* DecodePacket(const uint8_t* data, uint32_t size, AjmDecodeResult* result,

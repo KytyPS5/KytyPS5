@@ -669,11 +669,14 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
+configure_windows_image_layout(virtual_memory_allocation_tests)
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 # These tests use exceptions.
-if(NOT KYTY_CLANG_CL)
+if(KYTY_CLANG_CL)
+	target_compile_options(virtual_memory_allocation_tests PRIVATE /EHsc)
+else()
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
@@ -727,6 +730,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME guest_fixed_address_layout
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --fixed-address-layout-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline

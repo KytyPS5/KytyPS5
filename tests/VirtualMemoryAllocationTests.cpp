@@ -4416,6 +4416,13 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--fixed-address-layout-only") == 0) {
+		RunTest(TestReserveMapFixedAndNoOverwrite);
+		RunTest(TestFixedNoOverwriteRejectsReservedRange);
+		RunTest(TestExtendedAndUserMappingsDoNotAlias);
+		RunTest(TestLargeHintedReserveHostsSmallDirectMap);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);

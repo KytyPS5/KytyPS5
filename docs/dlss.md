@@ -185,6 +185,14 @@ pinned by the `3rdparty/DLSS` submodule; `KYTY_DLSS_SDK_ROOT` permits an overrid
 Native SR also supports Linux x86_64. Other platforms retain the default build.
 Windows NGX builds enable ASLR for the engine and regression executable because
 NGX device creation fails without it on tested drivers.
+The `guest_fixed_address_layout` regression uses the same Windows link options
+as the engine and checks fixed reservations, direct mappings, and independent
+user/extended mappings. Run it alongside `dlss_window_device` to check guest
+allocation and NGX device creation together:
+
+```powershell
+ctest --test-dir _Build/windows -R '^(guest_fixed_address_layout|dlss_window_device)$' --output-on-failure
+```
 
 Native FG uses an extracted official
 [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.1):

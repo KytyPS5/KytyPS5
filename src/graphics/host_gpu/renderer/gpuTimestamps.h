@@ -81,20 +81,25 @@ public:
 	// End-of-pipe label (immediate data). Behind a GPU clock value not stored yet, it is stored
 	// after that value, at completion. False when none is pending: the caller writes it now.
 	[[nodiscard]] bool WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size);
-	// A label WriteLabel deferred and did not store yet.
+	// A label WriteLabel deferred and did not store yet. Bit i of live is set while byte i is
+	// still to be stored, that is, no later write covered it.
 	struct Label {
 		uint64_t vaddr  = 0;
 		uint64_t value  = 0;
 		uint32_t size   = 0;
 		uint64_t serial = 0;
+		uint8_t  live   = 0;
 	};
 	// The deferred labels overlapping [vaddr, vaddr + size), oldest first. A GPU-side read
 	// recorded after them sees them, as it did when labels were written at parse time; the
 	// guest CPU sees them at completion.
 	[[nodiscard]] std::vector<Label> PendingLabels(uint64_t vaddr, uint32_t size);
-	// value, read at vaddr after PendingLabels, with those labels applied over it.
+	// value, read at vaddr after PendingLabels, with the live bytes of those labels over it.
 	[[nodiscard]] static uint64_t ApplyLabels(const std::vector<Label>& labels, uint64_t vaddr,
 	                                          uint32_t size, uint64_t value);
+	// A write the GPU thread makes now to [vaddr, vaddr + size) comes after every value and
+	// label recorded so far: they no longer store the bytes it covers. Call it before the write.
+	void Overwritten(uint64_t vaddr, uint64_t size);
 	// Stores every value recorded so far, before a write the GPU thread makes itself.
 	void StoreAll();
 	// Runs a guest-visible completion effect, such as an interrupt, from a completion callback
@@ -129,6 +134,11 @@ private:
 		bool                 resolved = false;
 	};
 
+	// A GPU clock value (value unknown until its batch completes) or a label not stored yet.
+	struct Deferred: Label {
+		bool label = false;
+	};
+
 	// A value to store, or an effect to run when it has one.
 	struct Retry {
 		uint64_t                     vaddr = 0;
@@ -145,8 +155,12 @@ private:
 	void               Copy(const Batch& batch);
 	void               Complete(const Batch& batch);
 	void               Stored(uint64_t count);
-	void               LabelStored(uint64_t serial);
-	void               QueueRetries();
+	// The entry of a value or label not stored yet. The caller holds m_mutex.
+	[[nodiscard]] std::deque<Deferred>::iterator FindDeferred(uint64_t serial);
+	// Calls run(offset, size) for each run of live bytes, stopping at the first that fails.
+	template <typename F>
+	[[nodiscard]] static bool ForEachLiveRun(const Label& deferred, F&& run);
+	void                      QueueRetries();
 
 	GraphicContext&        m_graphics;
 	CommandScheduler&      m_scheduler;
@@ -165,9 +179,9 @@ private:
 	bool                  m_retrying     = false;
 	bool                  m_retry_queued = false;
 	Clock                 m_clock;
-	// Deferred labels not stored yet, by serial: they are stored in that order.
-	std::deque<Label> m_pending_labels;
-	uint64_t          m_label_serial = 0;
+	// Values and labels recorded and not stored yet, by serial: they are stored in that order.
+	std::deque<Deferred> m_deferred;
+	uint64_t             m_serial = 0;
 };
 
 } // namespace Libs::Graphics

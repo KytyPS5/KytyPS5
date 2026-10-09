@@ -328,7 +328,22 @@ bool AliasWritebackEnabled() {
 	return enabled;
 }
 
-enum class AliasAction : int { Writeback, ForcedUpload, DepthInitFromGuest };
+enum class AliasAction : int {
+	Writeback,
+	ForcedUpload,
+	DepthInitFromGuest,
+	WritebackSkipUnmapped
+};
+
+// Marks an overlap/alias resolution that frees images; restores the previous state on exit.
+struct AliasFreeScope {
+	bool& flag;
+	bool  previous;
+	explicit AliasFreeScope(bool& f) : flag(f), previous(f) { flag = true; }
+	~AliasFreeScope() { flag = previous; }
+	AliasFreeScope(const AliasFreeScope&)            = delete;
+	AliasFreeScope& operator=(const AliasFreeScope&) = delete;
+};
 
 // One NHL27ALIAS line per (action, address); 5000 lines in total.
 void AliasLogOnce(AliasAction action, uint64_t address, uint64_t size, const char* detail) {
@@ -341,7 +356,8 @@ void AliasLogOnce(AliasAction action, uint64_t address, uint64_t size, const cha
 		return;
 	}
 	lines++;
-	static const char* const names[] = {"writeback", "forced_upload", "depth_init_from_guest"};
+	static const char* const names[] = {"writeback", "forced_upload", "depth_init_from_guest",
+	                                    "writeback_skip_unmapped"};
 	std::printf("NHL27ALIAS: %s addr=0x%llx size=0x%llx %s\n", names[static_cast<int>(action)],
 	            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
 	            detail);
@@ -363,7 +379,10 @@ bool TextureCache::WriteBackAliasedImage(ImageId id) {
 	const auto  address = image.info.data.address;
 	const auto  size    = image.info.data.size;
 	const auto  format  = vk::to_string(image.backing.format);
-	if (!DownloadImageMemory(id)) {
+	// Refused when the guest range is not backed (TryReadBacking fails) or the image cannot download.
+	// The deferred write is tolerant, so an unmap between enqueue and execution is skipped too.
+	if (!DownloadImageMemory(id, true)) {
+		AliasLogOnce(AliasAction::WritebackSkipUnmapped, address, size, format.c_str());
 		return false;
 	}
 	AliasLogOnce(AliasAction::Writeback, address, size, format.c_str());
@@ -373,7 +392,8 @@ bool TextureCache::WriteBackAliasedImage(ImageId id) {
 void TextureCache::FreeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
-		if (AliasWritebackEnabled()) {
+		// Only overlap/alias frees write back. Unmap and GC frees must not enqueue guest writes.
+		if (AliasWritebackEnabled() && m_alias_free_in_progress) {
 			(void)WriteBackAliasedImage(id);
 		}
 		if (DepthAliasLog::Enabled() &&
@@ -748,6 +768,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
+	// Frees here (via ResolveOverlap) are overlap frees; the flag is set by the caller.
 	auto& cached = m_slot_images[cached_id];
 	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
 	    cached.info.tile_mode != requested.tile_mode) {
@@ -915,6 +936,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (owner == nullptr) {
 		return {merged_id};
 	}
+	// Every FreeImage below (and in ResolveDepthOverlap/ExpandImage) is an overlap free.
+	AliasFreeScope alias_free_scope {m_alias_free_in_progress};
 	auto&      cached       = *owner;
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
@@ -1493,6 +1516,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
+				AliasFreeScope alias_free_scope {m_alias_free_in_progress};
 				FreeImage(result);
 				result = {};
 			}
@@ -2038,7 +2062,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -2074,9 +2098,14 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset, tolerant_write] {
 		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		if (tolerant_write) {
+			// The range may have been unmapped after enqueue; skip rather than exit.
+			(void)LibKernel::Memory::TryWriteBacking(range.address, mapped, range.size);
+		} else {
+			LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		}
 	});
 	return true;
 }

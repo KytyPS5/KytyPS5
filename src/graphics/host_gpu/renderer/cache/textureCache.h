@@ -161,7 +161,8 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// tolerant_write: the deferred guest write skips (instead of exiting) if the range was unmapped.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool tolerant_write = false);
 	// KYTY_ALIAS_WRITEBACK experiment: synchronous download to guest memory before a free.
 	[[nodiscard]] bool WriteBackAliasedImage(ImageId id);
 
@@ -185,6 +186,8 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// Set while an overlap/alias resolution frees an image; only those frees write back.
+	bool             m_alias_free_in_progress = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

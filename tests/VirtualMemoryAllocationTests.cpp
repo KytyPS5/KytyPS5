@@ -1591,6 +1591,53 @@ void TestTrackerWriteWatchKeepsView() {
 }
 #endif
 
+#if defined(__linux__)
+// A view that userfaultfd cannot register keeps working with mprotect write watches.
+void TestTrackerWriteWatchRegistrationFallback() {
+	const char* test = "TrackerWriteWatchRegistrationFallback";
+	using Common::VirtualMemory::Mode;
+	using Libs::LibKernel::Memory::ProtectGuestHostMemory;
+	constexpr uint64_t pages       = 4;
+	const bool         page_tables = Libs::LibKernel::Memory::TestGuestWriteProtectsViews();
+	if (page_tables) {
+		Libs::LibKernel::Memory::TestFailNextWriteProtectRegistration();
+	}
+	const auto base = MapNamedFlexible(test, SceKernelPageSize * pages, SceKernelProtCpuRw,
+	                                   "tracker_write_watch_fallback");
+	const auto word = [](uint64_t address) {
+		return reinterpret_cast<volatile uint64_t*>(address + 8);
+	};
+
+	const bool watched =
+	    ProtectGuestHostMemory(base + SceKernelPageSize, SceKernelPageSize, Mode::Read, false);
+	std::string perms;
+	(void)HostMappings(base + SceKernelPageSize, SceKernelPageSize, &perms);
+
+	struct sigaction action {};
+	struct sigaction old_segv {};
+	struct sigaction old_bus {};
+	action.sa_sigaction = WatchFaultHandler;
+	action.sa_flags     = SA_SIGINFO;
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGSEGV, &action, &old_segv);
+	sigaction(SIGBUS, &action, &old_bus);
+	g_watch_fault_signal = 0;
+	*word(base + SceKernelPageSize) = 0x46414c4cull;
+	const bool write_fault          = g_watch_fault_signal == SIGSEGV &&
+	                         g_watch_fault_address == base + SceKernelPageSize + 8 &&
+	                         *word(base + SceKernelPageSize) == 0x46414c4cull;
+	sigaction(SIGSEGV, &old_segv, nullptr);
+	sigaction(SIGBUS, &old_bus, nullptr);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * pages),
+	        "KernelMunmap");
+	Check(test, watched && perms.rfind("r-", 0) == 0,
+	      "the unregistered view was not write-watched with mprotect");
+	Check(test, write_fault, "a write to the watched page did not fault and land");
+	std::printf("[host]    %-48s ok (%s)\n", test, page_tables ? "page tables" : "mprotect");
+}
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void TestWindowsBackingViewPermissions() {
 	const char* test = "WindowsBackingViewPermissions";
@@ -4609,6 +4656,7 @@ int main(int argc, char** argv) {
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
 	RunTest(TestTrackerWriteWatchKeepsView);
+	RunTest(TestTrackerWriteWatchRegistrationFallback);
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestWindowsBackingViewPermissions);

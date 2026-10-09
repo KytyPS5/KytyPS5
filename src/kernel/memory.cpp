@@ -181,6 +181,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 static callback_func_t g_test_before_backing_map                   = nullptr;
 static callback_func_t g_test_backing_read                         = nullptr;
+static bool            g_test_fail_next_write_protect_register     = false;
 #endif
 
 #include "memoryAddressSpace.inc"
@@ -937,8 +938,50 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
-bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+// Whether the host view mode that the guest protection of vaddr maps to allows the access.
+static bool GuestAllowsAccess(uint64_t vaddr, Graphics::PageFaultAccess access) {
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->Query(vaddr, 0, &range) ||
+	    !IsCommittedRangeType(range.type)) {
+		return false;
+	}
+	if (range.type == VirtualRangeType::Code) {
+		// The loader keeps program memory writable whatever its guest protection.
+		return true;
+	}
+	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
+	GpuAccessMode       gpu_mode = GpuAccessMode::NoAccess;
+	if (!DecodeMemoryProtection(range.protection, &mode, &gpu_mode)) {
+		return false;
+	}
+	const auto bits = static_cast<uint32_t>(mode);
+	switch (access) {
+		case Graphics::PageFaultAccess::Read:
+			return (bits & static_cast<uint32_t>(VirtualMemory::Mode::ExecuteRead)) != 0;
+		case Graphics::PageFaultAccess::Write:
+			return (bits & static_cast<uint32_t>(VirtualMemory::Mode::Write)) != 0;
+		case Graphics::PageFaultAccess::Execute:
+			return (bits & static_cast<uint32_t>(VirtualMemory::Mode::Execute)) != 0;
+		default: return false;
+	}
+}
+
+bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
+                    GpuFaultCause cause) noexcept {
+	if (g_gpu_resources == nullptr) {
+		return false;
+	}
+	// Userfaultfd write protection only raises bus errors on writes, and only when enabled.
+	if (cause == GpuFaultCause::WriteProtect &&
+	    (access != Graphics::PageFaultAccess::Write || g_guest_address_space == nullptr ||
+	     !g_guest_address_space->WriteProtectsViews())) {
+		return false;
+	}
+	// A guest access violation is not a tracking fault, even on a watched page.
+	if (!GuestAllowsAccess(fault_vaddr, access)) {
+		return false;
+	}
+	return g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
 struct PrtAperture {
@@ -3600,6 +3643,10 @@ void TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps) {
 
 void TestFailNextFixedReserveRangeRegistration() {
 	g_test_fail_next_fixed_reserve_range_add = true;
+}
+
+void TestFailNextWriteProtectRegistration() {
+	g_test_fail_next_write_protect_register = true;
 }
 
 void TestFailNextVirtualRangeReplacement() {

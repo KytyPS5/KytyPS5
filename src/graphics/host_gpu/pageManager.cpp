@@ -29,7 +29,18 @@
 #undef min
 #undef max
 #else
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+// Values from Linux 5.14, for older kernel headers.
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
 #endif
 
 namespace Libs::Graphics {
@@ -168,6 +179,13 @@ struct PageManager::Impl {
 		}
 #endif
 		regions = std::make_unique<std::atomic<Region*>[]>(REGION_COUNT);
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		void* page = ::mmap(nullptr, PAGE_SIZE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (page != MAP_FAILED) {
+			can_probe_access = ::madvise(page, PAGE_SIZE, MADV_POPULATE_READ) == 0;
+			::munmap(page, PAGE_SIZE);
+		}
+#endif
 	}
 
 	~Impl() {
@@ -281,9 +299,60 @@ struct PageManager::Impl {
 		}
 	}
 
+	// Whether the access to an unwatched page now succeeds, without performing it.
+	[[nodiscard]] bool AccessSucceeds(uint64_t page, PageFaultAccess access) const noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+			return false;
+		}
+		constexpr DWORD writable =
+		    PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+		constexpr DWORD executable =
+		    PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+		switch (access) {
+			case PageFaultAccess::Write: return (info.Protect & writable) != 0;
+			case PageFaultAccess::Execute: return (info.Protect & executable) != 0;
+			default: return (info.Protect & PAGE_EXECUTE) == 0;
+		}
+#elif defined(__APPLE__)
+		// No probe: macOS keeps the earlier behaviour and retries.
+		(void)page;
+		(void)access;
+		return true;
+#else
+		if (!can_probe_access) {
+			return true;
+		}
+		// Faults the page in as the access would, and fails where the access would fault.
+		return ::madvise(reinterpret_cast<void*>(page), PAGE_SIZE,
+		                 access == PageFaultAccess::Write ? MADV_POPULATE_WRITE
+		                                                  : MADV_POPULATE_READ) == 0;
+#endif
+	}
+
+	[[nodiscard]] bool IsTrackingFault(uint64_t vaddr, PageFaultAccess access) const noexcept {
+		const auto page_addr = Common::AlignDown(vaddr, PAGE_SIZE);
+		auto*      region    = FindRegion(vaddr);
+		if (region == nullptr) {
+			return AccessSucceeds(page_addr, access);
+		}
+		SpinGuard   lock(region->lock);
+		const auto& page = region->pages[(vaddr % REGION_SIZE) / PAGE_SIZE];
+		if (page.access_watchers != 0 ||
+		    (access == PageFaultAccess::Write && page.write_watchers != 0)) {
+			return true;
+		}
+		// Watch changes reprotect under this lock: an unwatched page keeps no tracker
+		// protection, so the probe tells whether a retry passes.
+		return AccessSucceeds(page_addr, access);
+	}
+
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	std::mutex                              region_mutex;
+	bool                                    can_probe_access = false;
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);
@@ -294,6 +363,10 @@ PageManager::~PageManager() = default;
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
+}
+
+bool PageManager::IsTrackingFault(uint64_t vaddr, PageFaultAccess access) const noexcept {
+	return m_impl->IsTrackingFault(vaddr, access);
 }
 
 template <bool track>

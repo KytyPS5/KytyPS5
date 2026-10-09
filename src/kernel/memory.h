@@ -120,7 +120,13 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
-[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// Protection: the host page protection forbids the access. WriteProtect: a bus error that
+// userfaultfd write protection may have raised.
+enum class GpuFaultCause { Protection, WriteProtect };
+// Resolves a page-tracking fault. False when the guest's own protection forbids the access
+// or the tracker does not account for the fault.
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
+                                  GpuFaultCause cause) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
@@ -206,6 +212,7 @@ bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
 bool     TestGuestFreeRangeBounds();
 bool     TestGuestWriteProtectsViews();
+void     TestFailNextWriteProtectRegistration();
 #endif
 
 } // namespace Libs::LibKernel::Memory

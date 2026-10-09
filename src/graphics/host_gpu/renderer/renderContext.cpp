@@ -58,7 +58,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	if (!IsMapped(fault_vaddr, fault_size) ||
+	    !m_page_manager.IsTrackingFault(fault_vaddr, access)) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {

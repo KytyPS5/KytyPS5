@@ -678,6 +678,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer64-comparisons-gpu-only)
 	set_tests_properties(shader_integer64_comparisons_cpu PROPERTIES TIMEOUT 60)
 	set_tests_properties(shader_integer64_comparisons_gpu PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+	foreach(case IN ITEMS cache fresh-metadata boundaries gpu)
+		if(case STREQUAL "fresh-metadata")
+			set(stride_mode "--raw-stride-fresh-metadata-only")
+		else()
+			set(stride_mode "--raw-stride-artifact-${case}-only")
+		endif()
+		add_test(NAME shader_raw_stride_artifact_${case}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${stride_mode})
+		set_tests_properties(shader_raw_stride_artifact_${case} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+	endforeach()
 	add_test(NAME pipeline_cache_identity
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
 	add_test(NAME pipeline_cache_checkpoint

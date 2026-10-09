@@ -1315,7 +1315,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[layout.memory_limit_dword + i] = buffer_limit;
 		if (layout.memory_stride_count != 0) {
 			prepared.shader_data[layout.memory_stride_dword + i] =
-			    program.info.buffers[resource].packed_stride & 0x3fffu;
+			    DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]).Stride();
 		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(

@@ -140,6 +140,30 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (raw_dword) {
 		next.memory_stride_dword = next.memory_limit_dword + next.memory_offset_count;
 		next.memory_stride_count = next.memory_offset_count;
+		std::vector<bool> seen(program.info.buffers.size(), false);
+		std::vector<bool> dynamic(program.info.buffers.size(), true);
+		for (const auto* block: program.blocks) for (const auto& inst: *block) {
+			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None) continue;
+			const auto& memory = program.memory_info[inst.Flags<MemoryFlags>().index];
+			if (memory.planning_only || (memory.kind != ResourceKind::Buffer &&
+			    memory.kind != ResourceKind::ScalarBuffer)) continue;
+			const bool eligible = memory.kind == ResourceKind::Buffer && memory.data_bits == 32u &&
+			    !memory.formatted && !memory.typed && memory.buffer_table == UINT32_MAX;
+			const auto mark = [&](uint32_t resource) {
+				if (resource >= dynamic.size()) BindingFail("invalid runtime stride proof resource");
+				seen[resource] = true;
+				dynamic[resource] = dynamic[resource] && eligible;
+			};
+			if (memory.buffer_table == UINT32_MAX) mark(memory.resource);
+			else for (const auto resource: program.info.buffer_tables[memory.buffer_table].resources)
+				mark(resource);
+		}
+		for (const auto resource: buffers) {
+			const auto& info = program.info.buffers[resource];
+			if (seen[resource] && dynamic[resource] && positive_stride(resource) &&
+			    !info.formatted && !info.scalar && info.image_alias == BufferResource::NoImageAlias)
+				next.runtime_stride_resources.push_back(resource);
+		}
 	}
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());

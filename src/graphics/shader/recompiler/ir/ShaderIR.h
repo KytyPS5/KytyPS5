@@ -448,6 +448,9 @@ struct BindingLayout {
 	uint32_t                       memory_limit_dword = 0;
 	uint32_t                       memory_stride_dword = 0;
 	uint32_t                       memory_stride_count = 0;
+	// Logical slots whose every live access consumes dynamic ordinary raw DWORD
+	// stride. Compiler-owned proof for early permutation reuse, never a device flag.
+	std::vector<uint32_t>          runtime_stride_resources;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 

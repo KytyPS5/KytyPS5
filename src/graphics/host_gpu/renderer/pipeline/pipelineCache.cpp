@@ -543,6 +543,34 @@ std::optional<uint64_t> FindReusableShaderProgramIdForTest(
 	return std::nullopt;
 }
 
+static bool CanReuseCompiledSpecialization(
+    const ShaderRecompiler::IR::ResourceSpecialization& prior,
+    const ShaderRecompiler::IR::ResourceSpecialization& current,
+    const ShaderRecompiler::IR::CompiledShaderInfo& compiled) {
+	if (prior == current) return true;
+	if (prior.bounded_srt_reads != current.bounded_srt_reads ||
+	    prior.buffer_tables != current.buffer_tables || prior.buffer_origins != current.buffer_origins ||
+	    prior.images != current.images || prior.sampler_origins != current.sampler_origins ||
+	    prior.sampled_pairs != current.sampled_pairs ||
+	    prior.sampler_depth_compare_funcs != current.sampler_depth_compare_funcs ||
+	    prior.buffers.size() != current.buffers.size() ||
+	    prior.buffers.size() != compiled.info.buffers.size()) return false;
+	for (uint32_t i = 0; i < prior.buffers.size(); ++i) {
+		if (prior.buffers[i] == current.buffers[i]) continue;
+		const auto a = prior.buffers[i].packed_stride;
+		const auto b = current.buffers[i].packed_stride;
+		if ((a & 0x3fffu) == 0u || (b & 0x3fffu) == 0u ||
+		    (a & ~0x3fffu) != (b & ~0x3fffu) ||
+		    compiled.info.buffers[i].packed_stride != a ||
+		    std::ranges::find(compiled.bindings.runtime_stride_resources, i) ==
+		        compiled.bindings.runtime_stride_resources.end()) return false;
+		auto normalized = current.buffers[i];
+		normalized.packed_stride = a;
+		if (normalized != prior.buffers[i]) return false;
+	}
+	return true;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -844,7 +872,8 @@ struct PipelineCache::ProgramCache {
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
 				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
+				               CanReuseCompiledSpecialization(candidate.specialization,
+				                                              entry->second.specialization, candidate.program);
 			        });
 			    permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,

@@ -2338,6 +2338,137 @@ public:
     return Renderer();
   }
 
+  void CheckRawStrideArtifactReuse(bool metadata_only = false, bool execute = false, u32 wave = 32u,
+                                   const char* variant = "raw") {
+    constexpr const char* name = "RawStrideArtifactReuse";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t allocation_size = 0x100000u;
+    const bool byte = std::strcmp(variant, "byte") == 0;
+    const bool typed = std::strcmp(variant, "typed") == 0;
+    const bool atomic = std::strcmp(variant, "atomic") == 0;
+    const bool scalar = std::strcmp(variant, "scalar") == 0;
+    const bool flags = std::strcmp(variant, "swizzle") == 0 || std::strcmp(variant, "add-tid") == 0;
+    const bool exact = byte || typed || atomic || scalar || flags;
+    std::vector<u32> code;
+    AppendVMovU32(&code, 1u, 2u);
+    AppendVMovU32(&code, 2u, 1u);
+    if (scalar) {
+      code.push_back(EncodeSmem0(0x08u, 8u, 0u));
+      code.push_back(EncodeSmem1(0u));
+      code.push_back(0xbf8c0000u);
+      code.push_back(EncodeVop1(0x01u, 2u, 8u));
+    } else {
+      code.push_back(EncodeMubuf0(byte ? 0x08u : typed ? 0x00u : atomic ? 0x32u : 0x0cu,
+                                  0u, true, false));
+      code.push_back(EncodeMubuf1(2u, 0u, 1u));
+    }
+    code.push_back(0xbf8c0000u);
+    code.push_back(EncodeMubuf0(0x1cu, 4u, true, false));
+    code.push_back(EncodeMubuf1(2u, 0u, 1u));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    Require(name, "direct allocation", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+        0x10000u, 0, &direct) == 0, "raw stride backing allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "direct mapping", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, allocation_size, 0x3, 0x10, direct, 0x10000u) == 0 &&
+        mapped == reinterpret_cast<void*>(base),
+        "raw stride backing mapping failed");
+    std::array<u32, 256> expected;
+    for (u32 i = 0; i < expected.size(); ++i) expected[i] = 0x13570000u + i;
+    std::memcpy(mapped, expected.data(), sizeof(expected));
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      auto& shaders = processor.GetShCtx();
+      auto& cache = context.GetPipelineCache();
+      auto& executor = context.GetRenderExecutor();
+      const HW::ShaderRegisters registers{};
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1u, .num_thread_y = 1u, .num_thread_z = 1u,
+                           .float_mode = 0xc0u, .wave_size = static_cast<uint8_t>(wave), .user_sgpr = 4u});
+      const auto set_descriptor = [&](u32 stride) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(base);
+        descriptor.fields[1] |= stride << 16u;
+        descriptor.fields[2] = 16u;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) | (3u << 28u);
+        if (typed) descriptor.fields[3] |= static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u;
+        if (stride == 48u && std::strcmp(variant, "swizzle") == 0)
+          descriptor.fields[1] |= 1u << 31u;
+        if (stride == 48u && std::strcmp(variant, "add-tid") == 0)
+          descriptor.fields[3] |= 1u << 23u;
+        for (u32 i = 0; i < 4u; ++i)
+          shaders.SetCsUserSgpr(i, descriptor.fields[i], HW::UserSgprType::Unknown);
+      };
+      ShaderComputeInputInfo info{};
+      const ShaderRecompiler::IR::CompiledShaderInfo* first = nullptr;
+      uint64_t first_id = 0u;
+      for (u32 stride : {8u, 48u, 8u, 0u, 8u}) {
+        set_descriptor(stride);
+        const auto program = cache.GetComputeProgram(shaders.GetCs(),
+            registers, info);
+        Require(name, "native program", program && info.stage.program &&
+            info.stage.resources && info.stage.resources->buffers.size() == 1u,
+            "real cache did not materialize the synthetic raw buffer");
+        if (!first) { first = info.stage.program; first_id = program.id; }
+        if (!metadata_only) {
+          Require(name, "early compiled-artifact reuse", stride == 0u || (exact && stride == 48u) ?
+              info.stage.program != first : info.stage.program == first && program.id == first_id,
+              "raw stride change created another compiled artifact");
+        }
+        auto runtime = info.stage;
+        auto snapshot = *runtime.resources;
+        if (metadata_only) {
+          // Same valid raw module, fresh runtime descriptor: no synthetic shader bytes.
+          snapshot.buffers[0].dwords[1] =
+              (snapshot.buffers[0].dwords[1] & ~0x3fff0000u) | (48u << 16u);
+          runtime.resources = &snapshot;
+        }
+        PreparedBindings bindings;
+        executor.PrepareBindings(runtime, bindings);
+        executor.FindBuffers(bindings);
+        executor.RebindBuffers(bindings);
+        const auto& layout = runtime.program->bindings;
+        if (layout.memory_stride_count != 0u) {
+          Require(name, "fresh descriptor metadata",
+              bindings.shader_data.at(layout.memory_stride_dword) == (metadata_only ? 48u : stride),
+              "cached shader published stale descriptor stride");
+        }
+        if (metadata_only) break;
+        if (execute) {
+          processor.DispatchDirect(1u, 1u, 1u, wave == 32u ? 0x8041u : 0x41u);
+          context.GetCommandScheduler().Finish();
+          const u32 source = stride * 2u / 4u;
+          expected[source + 1u] = expected[source];
+          std::array<u32, 256> actual{};
+          Require(name, "GPU backing readback", LibKernel::Memory::TryReadGpuCoherentBacking(
+              base, actual.data(), sizeof(actual)) && actual == expected,
+              "reused module read/store used the wrong stride or changed a sentinel");
+        }
+      }
+      context.GetCommandScheduler().Finish();
+      context.UnmapMemory(base, allocation_size);
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "raw stride backing unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(direct, allocation_size) == 0,
+            "raw stride backing release failed");
+    std::printf("[renderer] RawStrideArtifactReuse metadata=%u gpu=%u wave=%u variant=%s ok\n",
+                metadata_only, execute, wave, variant);
+  }
+
   void CheckHostImageAllocation() {
     constexpr const char *name = "HostImageAllocation";
     auto &graphics = RuntimeContext();
@@ -49439,6 +49570,28 @@ int main(int argc, char **argv) {
   // Child workers each need the real guest arena. The supervising process
   // must not reserve another 13.5 GiB before they run sequentially.
   EnsureConfigInitialized(!admission_parent);
+  if (argc == 2 && std::strcmp(argv[1], "--raw-stride-artifact-cache-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRawStrideArtifactReuse();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--raw-stride-artifact-boundaries-only") == 0) {
+    VulkanHarness vulkan;
+    for (const char* variant : {"byte", "typed", "atomic", "scalar", "swizzle", "add-tid"})
+      vulkan.CheckRawStrideArtifactReuse(false, false, 32u, variant);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--raw-stride-fresh-metadata-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRawStrideArtifactReuse(true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--raw-stride-artifact-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRawStrideArtifactReuse(false, true);
+    vulkan.CheckRawStrideArtifactReuse(false, true, 64u);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--integer64-comparisons-cpu-only") == 0) {
     CheckInteger64ComparisonDecoder();
     for (u32 wave : {32u, 64u}) for (bool vop3 : {false, true}) {

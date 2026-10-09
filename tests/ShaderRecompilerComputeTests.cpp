@@ -35398,6 +35398,56 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     Require(name, "mixed sample count", samples == 3u,
             "mixed candidate switch did not retain every image");
   }
+  // A 2D image_sample_l supplies two coordinates then its LOD: a 3D candidate reads z = 0.
+  program.memory_info[0].image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  program.memory_info[0].image_address_components = 3;
+  for (u32 component = 0; component < 3u; component++) {
+    constexpr std::array values{1.375f, 1.625f, 2.0f};
+    address.SetArg(component, Value(std::bit_cast<u32>(values[component])));
+  }
+  for (u32 resource = 0; resource < 3u; resource++) {
+    program.info.images[resource].cube = false;
+    program.info.images[resource].dimension =
+        resource == 2u ? ShaderRecompiler::Decoder::ImageDimension::Dim3D
+                       : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  }
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  {
+    std::vector<std::span<const u32>> definitions(spirv[3]);
+    u32 volume_samples = 0;
+    for (size_t offset = 5; offset < spirv.size();) {
+      const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+      const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (opcode == spv::OpTypeVector) {
+        definitions[words[1]] = words;
+      } else if (opcode == spv::OpCompositeConstruct || opcode == spv::OpBitcast ||
+                 opcode == spv::OpConstant) {
+        definitions[words[2]] = words;
+      } else if (opcode == spv::OpImageSampleExplicitLod) {
+        const auto coord = definitions[words[4]];
+        const auto lod = definitions[words[6]];
+        Require(name, "2D instruction LOD", !coord.empty() && lod.size() == 4u &&
+                    definitions[lod[3]].size() == 4u &&
+                    definitions[lod[3]][3] == std::bit_cast<u32>(2.0f),
+                "a candidate of another dimension lost the instruction's LOD");
+        if (definitions[coord[1]][3] == 3u) {
+          const auto depth = definitions[coord[5]];
+          Require(name, "3D candidate depth",
+                  depth.size() == 4u && (depth[0] & 0xffffu) == spv::OpConstant && depth[3] == 0u,
+                  "a 3D candidate of a 2D sample read the LOD as its depth");
+          volume_samples++;
+        }
+      }
+      offset += words.size();
+    }
+    Require(name, "3D candidate sample", volume_samples == 1u,
+            "the 3D candidate of a 2D sample was not sampled with three coordinates");
+  }
+  program.memory_info[0].image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  program.memory_info[0].image_address_components = 4;
   // Keep an unrelated native root between the null image and appended children,
   // then select both sides of a cube boundary and the unmapped suffix on the GPU.
   root.indirect_resources = {0u, 2u, 3u, 4u, 5u, 6u};

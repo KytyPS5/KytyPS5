@@ -141,21 +141,26 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 	return result;
 }
 
+// Reads `components` coordinates, of which the instruction supplies the first `supplied`;
+// the others are zero, never the operands that follow the coordinates.
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  uint32_t first, uint32_t components, bool cube = false) {
+                  uint32_t first, uint32_t components, bool cube = false,
+                  uint32_t supplied = UINT32_MAX) {
+	const auto read = [&](uint32_t index) {
+		return index < supplied && mem.image_address_components > first + index
+		           ? AddressF32(ctx, mem, address, first + index)
+		           : ZeroF32(ctx.state);
+	};
 	auto x = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
-	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
-	                                                   : ZeroF32(ctx.state);
+	auto y = read(1u);
 	if (cube) {
 		x = CubeAxis(ctx.state, x);
 		y = CubeAxis(ctx.state, y);
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	if (components == 3u) {
-		auto z = mem.image_address_components > first + 2u
-		             ? AddressF32(ctx, mem, address, first + 2u)
-		             : ZeroF32(ctx.state);
+		auto z = read(2u);
 		if (cube) z = CubeLayer(ctx.state, z);
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(ctx.state, 3),
 		                              result, x, y, z);
@@ -911,10 +916,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
+			const auto  coord     = CoordF32(
+			    ctx, mem, *address, layout.coord,
+			    ImageDimensionInfoFor(candidate.dimension).coordinate_components, candidate.cube,
+			    ImageDimensionInfoFor(mem.image_dimension).coordinate_components);
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);
 			const auto sample = state.builder.AllocateId();

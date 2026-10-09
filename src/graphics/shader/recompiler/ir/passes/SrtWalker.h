@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <memory>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -31,6 +32,22 @@ enum class RuntimeValueType { Any, Integer };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+
+// While alive on this thread, ValidateRuntimeValue calls for `program` share one validator per
+// value type, so verdicts for shared subexpressions are computed once. Only for read-only
+// programs: cached verdicts would go stale if the IR changed during the session.
+class RuntimeValidationSession {
+public:
+	explicit RuntimeValidationSession(const ResourcePlan& program);
+	~RuntimeValidationSession();
+	RuntimeValidationSession(const RuntimeValidationSession&)            = delete;
+	RuntimeValidationSession& operator=(const RuntimeValidationSession&) = delete;
+
+	struct Impl;
+
+private:
+	std::unique_ptr<Impl> m_impl;
+};
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 

@@ -930,32 +930,45 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 
+	// The program is read-only here: share validation verdicts across all calls below.
+	RuntimeValidationSession               validation_session(program);
 	std::unordered_map<const Inst*, Inst*> cloned;
+	// ReadConst/ReadFirstLane/Phi redirects are pure functions of the source; memoize them.
+	std::unordered_map<const Inst*, Value> redirected;
 	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
 		value              = value.Resolve();
 		const auto* source = value.TryInstruction();
 		if (source == nullptr) {
 			return value;
 		}
+		if (const auto found = cloned.find(source); found != cloned.end()) {
+			return Value(found->second);
+		}
+		if (const auto found = redirected.find(source); found != redirected.end()) {
+			return found->second;
+		}
 		if (source->GetOpcode() == ValueOpcode::ReadConst) {
 			const auto slot = source->Arg(1).Resolve();
 			EXIT_IF(!slot.IsImmediate() || slot.GetType() != Type::U32 ||
 			        slot.U32() >= program.srt_reads.size());
-			return Clone(program.srt_reads[slot.U32()].value);
+			const auto result = Clone(program.srt_reads[slot.U32()].value);
+			redirected.emplace(source, result);
+			return result;
 		}
 		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
 		    ValidateRuntimeValue(program, source->Arg(0))) {
 			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
-			return Clone(source->Arg(0));
+			const auto result = Clone(source->Arg(0));
+			redirected.emplace(source, result);
+			return result;
 		}
 		if (source->GetOpcode() == ValueOpcode::Phi) {
 			const auto invariant = ResolveInvariantPhi(program, value);
 			if (!invariant.IsEmpty() && invariant != value) {
-				return Clone(invariant);
+				const auto result = Clone(invariant);
+				redirected.emplace(source, result);
+				return result;
 			}
-		}
-		if (const auto found = cloned.find(source); found != cloned.end()) {
-			return Value(found->second);
 		}
 		if (source->GetOpcode() == ValueOpcode::LoadBufferU32) {
 			plan.requires_specialization_memory = true;

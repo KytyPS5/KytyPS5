@@ -7,6 +7,8 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -146,7 +148,12 @@ public:
 	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type)
 	    : m_program(program), m_type(type) {}
 
-	bool Run(Value value) { return Validate(value); }
+	bool Run(Value value) {
+		const bool valid = Validate(value);
+		// The outermost value closes every cycle, so no verdict is left pending.
+		EXIT_IF(!m_pending_dependencies.empty() || !m_visiting.empty());
+		return valid;
+	}
 
 private:
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
@@ -178,13 +185,58 @@ private:
 		}
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
 		// Integer-only dependency checks do not depend on the active EXEC mask.
-		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
-		if (!m_visiting.insert(inst).second) {
+		if (!require_uniform) {
+			if (const auto found = m_validated_dependencies.find(inst);
+			    found != m_validated_dependencies.end()) {
+				m_low = std::min(m_low, found->second);
+				return true;
+			}
+		}
+		// Uniform verdicts depend only on the instruction and the active EXEC mask.
+		const auto mask_key = ActiveMaskKey();
+		const bool memoize  = require_uniform && mask_key != UncacheableMask;
+		if (memoize) {
+			if (const auto found = m_uniform_verdicts.find({inst, mask_key});
+			    found != m_uniform_verdicts.end()) {
+				return found->second;
+			}
+		}
+		// A cycle is cut optimistically for dependency checks and pessimistically for uniform
+		// checks. Track the shallowest stack depth a cut reaches (Tarjan low-link): a verdict is
+		// final once every cut taken while computing it targets this value or a deeper one.
+		if (const auto found = m_visiting.find(inst); found != m_visiting.end()) {
+			m_low = std::min(m_low, found->second);
 			return !require_uniform;
 		}
+		const auto depth = static_cast<uint32_t>(m_visiting.size() + 1);
+		m_visiting.emplace(inst, depth);
+		const auto low_at_entry = m_low;
+		m_low                   = NoCut;
 		const auto finish = [&](bool valid) {
 			m_visiting.erase(inst);
-			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			const auto low   = m_low;
+			const bool final = low >= depth;
+			if (final) {
+				// This value closed its cycles: results that assumed it valid are now decided.
+				while (!m_pending_dependencies.empty() &&
+				       m_pending_dependencies.back().second >= depth) {
+					const auto pending = m_pending_dependencies.back().first;
+					m_pending_dependencies.pop_back();
+					if (valid) {
+						m_validated_dependencies[pending] = NoCut;
+					} else {
+						m_validated_dependencies.erase(pending);
+					}
+				}
+			}
+			if (valid && !require_uniform) {
+				m_validated_dependencies[inst] = final ? NoCut : low;
+				if (!final) m_pending_dependencies.emplace_back(inst, low);
+			}
+			if (memoize && final) {
+				m_uniform_verdicts.emplace(std::pair {inst, mask_key}, valid);
+			}
+			m_low = std::min(low_at_entry, final ? NoCut : low);
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -313,13 +365,44 @@ private:
 		return finish(ValidateArguments(*inst, true));
 	}
 
+	static constexpr uintptr_t UncacheableMask = ~uintptr_t {0};
+
+	// Identifies the active EXEC mask for the verdict cache: 0 for none, the instruction for a
+	// computed mask, 1/2 for an immediate false/true, UncacheableMask for anything else.
+	[[nodiscard]] uintptr_t ActiveMaskKey() const {
+		if (m_active_mask.IsEmpty()) return 0;
+		if (const auto* mask = m_active_mask.TryInstruction()) {
+			return reinterpret_cast<uintptr_t>(mask);
+		}
+		if (m_active_mask.IsImmediate() && m_active_mask.GetType() == Type::U1) {
+			return m_active_mask.U1() ? 2u : 1u;
+		}
+		return UncacheableMask;
+	}
+
+	struct VerdictKeyHash {
+		size_t operator()(const std::pair<const Inst*, uintptr_t>& key) const noexcept {
+			return std::hash<const Inst*> {}(key.first) ^
+			       (std::hash<uintptr_t> {}(key.second) * 31u);
+		}
+	};
+
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
 	Value                           m_active_mask;
-	std::unordered_set<const Inst*> m_visiting;
-	std::unordered_set<const Inst*> m_validated_dependencies;
+	static constexpr uint32_t       NoCut = UINT32_MAX;
+
+	// Values on the current validation path, with their stack depth.
+	std::unordered_map<const Inst*, uint32_t> m_visiting;
+	// Valid dependency verdicts; the value is the shallowest open cycle they rely on (NoCut once
+	// final). Final verdicts are reused by later calls in a RuntimeValidationSession.
+	std::unordered_map<const Inst*, uint32_t>     m_validated_dependencies;
+	std::vector<std::pair<const Inst*, uint32_t>> m_pending_dependencies;
+	uint32_t                                      m_low = NoCut;
+	std::unordered_map<std::pair<const Inst*, uintptr_t>, bool, VerdictKeyHash> m_uniform_verdicts;
 };
 
+thread_local RuntimeValidationSession::Impl* g_validation_session = nullptr;
 
 } // namespace
 
@@ -969,8 +1052,29 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	return true;
 }
 
+struct RuntimeValidationSession::Impl {
+	const ResourcePlan*               program;
+	Impl*                             previous;
+	std::unique_ptr<RuntimeValidator> validators[2];
+};
+
+RuntimeValidationSession::RuntimeValidationSession(const ResourcePlan& program)
+    : m_impl(std::make_unique<Impl>(Impl {&program, g_validation_session, {}})) {
+	g_validation_session = m_impl.get();
+}
+
+RuntimeValidationSession::~RuntimeValidationSession() {
+	g_validation_session = m_impl->previous;
+}
+
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
-	return RuntimeValidator(program, type).Run(value);
+	auto* session = g_validation_session;
+	if (session == nullptr || session->program != &program) {
+		return RuntimeValidator(program, type).Run(value);
+	}
+	auto& validator = session->validators[type == RuntimeValueType::Integer ? 1 : 0];
+	if (!validator) validator = std::make_unique<RuntimeValidator>(program, type);
+	return validator->Run(value);
 }
 
 

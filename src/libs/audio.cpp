@@ -9,6 +9,8 @@
 #include "libs/controller.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
+#include "libs/gameTrace.h"
+#include <atomic>
 #include "libs/libs.h"
 
 #include <SDL3/SDL.h>
@@ -841,14 +843,26 @@ struct AudioOutPortState {
 	uint64_t reserved2[2];
 };
 
+static void AudioTraceOut(int handle, uint32_t num, int r) {
+	static std::atomic_uint64_t calls[64];
+	const auto                  idx = static_cast<uint32_t>(handle) & 63u;
+	const auto                  n   = calls[idx].fetch_add(1, std::memory_order_relaxed) + 1;
+	if (r < 0) {
+		GameTrace::Line("AudioOutOutput(s) handle=%d num=%u -> ERROR 0x%08x", handle, num, static_cast<uint32_t>(r));
+	}
+	if ((n & (n - 1)) == 0) {
+		GameTrace::Line("AudioOut handle=%d output calls=%llu (last r=%d)", handle, static_cast<unsigned long long>(n), r);
+	}
+}
+
 int KYTY_SYSV_ABI AudioOutInit() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
-                               uint32_t param) {
+static int AudioOutOpenImpl(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                            uint32_t param) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n"
@@ -894,6 +908,13 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 	}
 
 	return id.ToInt();
+}
+
+int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                               uint32_t param) {
+	const int r = AudioOutOpenImpl(user_id, type, index, len, freq, param);
+	GameTrace::Line("AudioOutOpen user=%d type=%d idx=%d len=%u freq=%u param=0x%x -> %d", user_id, type, index, len, freq, param, r);
+	return r;
 }
 
 int KYTY_SYSV_ABI AudioOutClose(int handle) {
@@ -990,7 +1011,11 @@ int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
 		}
 	}
 
-	return static_cast<int>(g_audio->AudioOutOutputs(params, num));
+	const int r = static_cast<int>(g_audio->AudioOutOutputs(params, num));
+	if (GameTrace::Enabled()) {
+		AudioTraceOut(param[0].handle, num, r);
+	}
+	return r;
 }
 
 int KYTY_SYSV_ABI AudioOutOutput(int handle, const void* ptr) {
@@ -1007,7 +1032,11 @@ int KYTY_SYSV_ABI AudioOutOutput(int handle, const void* ptr) {
 		return AUDIO_OUT_ERROR_INVALID_PORT;
 	}
 
-	return static_cast<int>(g_audio->AudioOutOutputs(params, 1));
+	const int r = static_cast<int>(g_audio->AudioOutOutputs(params, 1));
+	if (GameTrace::Enabled()) {
+		AudioTraceOut(handle, 1, r);
+	}
+	return r;
 }
 
 } // namespace AudioOut

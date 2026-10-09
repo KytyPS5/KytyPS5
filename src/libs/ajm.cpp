@@ -8,6 +8,7 @@
 #include "libs/ajm/opus_decoder.h"
 #include "libs/audio.h"
 #include "libs/errno.h"
+#include "libs/gameTrace.h"
 #include "libs/libs.h"
 
 #include <algorithm>
@@ -427,8 +428,8 @@ static bool AjmCodecIsValid(uint32_t codec) {
 	}
 }
 
-static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
-                                         void* output, size_t output_size, bool multiple_frames) {
+static AjmDecodeResult AjmDecodeInstanceImpl(uint32_t instance, const void* input, size_t input_size,
+                                             void* output, size_t output_size, bool multiple_frames) {
 	std::scoped_lock lock(g_ajm_instances_mutex);
 	auto*            state = AjmFindInstanceLocked(instance);
 	if (state == nullptr || state->decoder == nullptr) {
@@ -439,6 +440,31 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 
 	return state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
 	                              &state->gapless);
+}
+
+static void AjmTraceJob(const char* job, uint32_t instance, const AjmDecodeResult& r) {
+	if (!GameTrace::Enabled()) {
+		return;
+	}
+	const uint32_t codec = instance >> 14u;
+	static std::atomic_uint64_t jobs[32], errs[32];
+	const auto                  idx = codec < 32 ? codec : 31;
+	const auto                  n   = jobs[idx].fetch_add(1, std::memory_order_relaxed) + 1;
+	const bool                  bad = r.result != 0 || r.internal_result != 0;
+	const auto                  e   = bad ? errs[idx].fetch_add(1, std::memory_order_relaxed) + 1 : errs[idx].load();
+	if (bad) {
+		GameTrace::Line("AJM job=%s codec=%u instance=0x%08x result=0x%08x internal=0x%08x consumed=%llu written=%llu", job, codec, instance, static_cast<uint32_t>(r.result), static_cast<uint32_t>(r.internal_result), static_cast<unsigned long long>(r.input_consumed), static_cast<unsigned long long>(r.output_written));
+	}
+	if ((n & (n - 1)) == 0) {
+		GameTrace::Line("AJM codec=%u jobs=%llu errors=%llu (last job=%s)", codec, static_cast<unsigned long long>(n), static_cast<unsigned long long>(e), job);
+	}
+}
+
+static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
+                                         void* output, size_t output_size, bool multiple_frames) {
+	auto r = AjmDecodeInstanceImpl(instance, input, input_size, output, output_size, multiple_frames);
+	AjmTraceJob("decode", instance, r);
+	return r;
 }
 
 static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,
@@ -482,8 +508,8 @@ static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer
 	return result;
 }
 
-static AjmDecodeResult AjmInitializeInstance(uint32_t instance, const void* codec_parameters,
-                                             size_t codec_parameters_size) {
+static AjmDecodeResult AjmInitializeInstanceImpl(uint32_t instance, const void* codec_parameters,
+                                                 size_t codec_parameters_size) {
 	std::scoped_lock lock(g_ajm_instances_mutex);
 	auto*            state = AjmFindInstanceLocked(instance);
 	if (state == nullptr || state->decoder == nullptr) {
@@ -494,6 +520,13 @@ static AjmDecodeResult AjmInitializeInstance(uint32_t instance, const void* code
 
 	state->gapless.Reset();
 	return state->decoder->Initialize(codec_parameters, codec_parameters_size);
+}
+
+static AjmDecodeResult AjmInitializeInstance(uint32_t instance, const void* codec_parameters,
+                                             size_t codec_parameters_size) {
+	auto r = AjmInitializeInstanceImpl(instance, codec_parameters, codec_parameters_size);
+	AjmTraceJob("init", instance, r);
+	return r;
 }
 
 static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
@@ -650,6 +683,7 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 
 	const auto slot = (g_ajm_next_instance.fetch_add(1, std::memory_order_relaxed) & 0x3fffu);
 	*instance       = (codec << 14u) | slot;
+	GameTrace::Line("AJM InstanceCreate codec=%u (%s) flags=0x%llx supported=%d -> 0x%08x", codec, AjmCodecName(codec), static_cast<unsigned long long>(flags), supported ? 1 : 0, *instance);
 
 	auto state    = AjmInstanceState {};
 	state.context = context;

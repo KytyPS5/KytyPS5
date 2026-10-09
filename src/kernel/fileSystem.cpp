@@ -594,7 +594,7 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	return OK;
 }
 
-int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
+static int64_t KernelReadImpl(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
@@ -726,7 +726,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	return bytes_written;
 }
 
-int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
+static int64_t KernelPreadImpl(int d, void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
@@ -815,7 +815,7 @@ static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
 	return OK;
 }
 
-int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+static int64_t KernelPreadvImpl(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
 	PRINT_NAME();
 
 	std::vector<KernelIovec> buffers;
@@ -887,6 +887,45 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,
 	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
 	return bytes_read;
+}
+
+static std::string TraceFilePath(int d) {
+	auto* file = g_files->GetFile(d);
+	return file != nullptr ? Common::PathToString(file->real_name) : std::string("<bad-fd>");
+}
+
+int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
+	if (!GameTrace::Enabled()) {
+		return KernelReadImpl(d, buf, nbytes);
+	}
+	const auto tok = GameTrace::Io::Begin("read", TraceFilePath(d), 0, nbytes);
+	const auto r   = KernelReadImpl(d, buf, nbytes);
+	GameTrace::Io::End(tok, r);
+	return r;
+}
+
+int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
+	if (!GameTrace::Enabled()) {
+		return KernelPreadImpl(d, buf, nbytes, offset);
+	}
+	const auto tok = GameTrace::Io::Begin("pread", TraceFilePath(d), static_cast<uint64_t>(offset), nbytes);
+	const auto r   = KernelPreadImpl(d, buf, nbytes, offset);
+	GameTrace::Io::End(tok, r);
+	return r;
+}
+
+int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	if (!GameTrace::Enabled()) {
+		return KernelPreadvImpl(d, iov, iovcnt, offset);
+	}
+	uint64_t total = 0;
+	for (int i = 0; iov != nullptr && i < iovcnt && i < 1024; i++) {
+		total += iov[i].iov_len;
+	}
+	const auto tok = GameTrace::Io::Begin("preadv", TraceFilePath(d), static_cast<uint64_t>(offset), total);
+	const auto r   = KernelPreadvImpl(d, iov, iovcnt, offset);
+	GameTrace::Io::End(tok, r);
+	return r;
 }
 
 int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset) {

@@ -7,6 +7,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
+#include "libs/gameTrace.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -242,6 +243,10 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		}
 	} else if (info.result == OK) {
 		AprShared::RegisterHostPath(info.file_id, info.host_path, info.file_size, info.is_dir);
+	}
+	if (GameTrace::Enabled()) {
+		GameTrace::Line("APR resolve %s -> id=0x%08x size=%llu res=%d", guest_path, info.file_id,
+		                static_cast<unsigned long long>(info.file_size), info.result);
 	}
 
 	if (info.result != OK) {
@@ -655,6 +660,7 @@ struct CommandBufferState {
 		uint64_t destination = 0;
 		uint64_t size        = 0;
 		uint64_t file_offset = 0;
+		uint64_t io_token    = 0;
 	};
 	struct KernelEventCommand {
 		uint64_t eq   = 0;
@@ -1310,6 +1316,18 @@ private:
 				}
 			}
 			const bool complete = result != OK || submission.cursor == submission.commands.size();
+			if (GameTrace::Enabled()) {
+				if (const auto* rf = (submission.cursor > 0 ? std::get_if<CommandBufferState::ReadFileCommand>(&submission.commands[submission.cursor - 1].data) : nullptr)) {
+					GameTrace::Io::End(rf->io_token, result == OK ? static_cast<int64_t>(rf->size) : static_cast<int64_t>(result));
+				}
+				if (complete) {
+					for (size_t k = submission.cursor; k < submission.commands.size(); k++) {
+						if (const auto* rf = std::get_if<CommandBufferState::ReadFileCommand>(&submission.commands[k].data)) {
+							GameTrace::Io::End(rf->io_token, -1);
+						}
+					}
+				}
+			}
 			if (complete) {
 				AprShared::WriteResult(submission.result, result, error_offset);
 				AprShared::SetSubmissionComplete(submission.id);
@@ -1354,6 +1372,17 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 		                                      return command.record_offset < offset;
 	                                      }),
 	                     state.commands.end());
+	if (GameTrace::Enabled()) {
+		for (auto& c: state.commands) {
+			if (auto* rf = std::get_if<CommandBufferState::ReadFileCommand>(&c.data)) {
+				std::string hp;
+				if (!AprShared::TryGetHostPath(rf->file_id, &hp)) {
+					hp = "<unknown-id>";
+				}
+				rf->io_token = GameTrace::Io::Begin(amm ? "amm" : "apr", hp, rf->file_offset, rf->size);
+			}
+		}
+	}
 	const uint32_t id = out_submission_id != nullptr ? AprShared::AllocateSubmissionId() : 0;
 	if (out_submission_id != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id);
@@ -1937,6 +1966,7 @@ static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void*              command_b
 static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_t, uint8_t,
                                                     uint64_t, uint8_t, uint8_t, uint64_t, uint8_t) {
 	PRINT_NAME();
+	GameTrace::Line("AMPR counter op: WaitOnCounter (emulated as NOP; ordering NOT enforced)");
 
 	return AppendNoOpCommand(command_buffer, 0x20);
 }
@@ -1973,6 +2003,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*            
 static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t, uint8_t, uint64_t,
                                                    uint8_t, uint32_t) {
 	PRINT_NAME();
+	GameTrace::Line("AMPR counter op: WriteCounter (emulated as NOP)");
 
 	return AppendNoOpCommand(command_buffer, 0x20);
 }
@@ -1980,6 +2011,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t
 static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t,
                                                                uint8_t, uint64_t, uint8_t) {
 	PRINT_NAME();
+	GameTrace::Line("AMPR counter op: WriteCounterOnCompletion (emulated as NOP)");
 
 	return AppendNoOpCommand(command_buffer, 0x20);
 }

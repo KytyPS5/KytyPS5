@@ -515,6 +515,8 @@ struct DescriptorSource {
 		bool     table_scalar = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		Value    key_count;
+		// Static bound applied to key_count, such as the width of a bit scan mask.
+		uint32_t              key_limit = UINT32_MAX;
 		Value                 selector_first;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;

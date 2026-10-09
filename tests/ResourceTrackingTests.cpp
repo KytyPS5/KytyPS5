@@ -863,14 +863,15 @@ void TestIndirectImageTableOperations() {
 
 void TestBitScanKeyRange() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  enum class Bound { None, Direct, Flags };
+  enum class Bound { None, Direct, Flags, Immediate };
   // A bit scan loop (s_ff1 / s_bitset0) selects keys from the set bits of its mask and
   // stops at the table's count: the host must not probe the other records.
   struct Variant { bool runtime_mask; bool lane_wrapped; Bound bound; bool narrow = false; };
   for (const auto variant : {Variant{true, false, Bound::None}, Variant{true, true, Bound::None},
                              Variant{false, false, Bound::Direct}, Variant{false, false, Bound::Flags},
                              Variant{true, true, Bound::Flags},
-                             Variant{false, false, Bound::None, true}}) {
+                             Variant{false, false, Bound::None, true},
+                             Variant{false, false, Bound::Immediate}}) {
     Fixture fixture(ShaderType::Pixel);
     fixture.program.wave_size = 64u;
     auto *entry = fixture.block;
@@ -918,9 +919,10 @@ void TestBitScanKeyRange() {
         CFG::BranchCondition::SccZero);
     const auto key = fixture.Emit(ValueOpcode::FindILsb32, {scanned});
     fixture.block = count_test;
-    const auto over = fixture.Emit(ValueOpcode::UGreaterThanEqual32, {key, fixture.UserData(3)});
+    const auto count = variant.bound == Bound::Immediate ? Value(5u) : fixture.UserData(3);
+    const auto over = fixture.Emit(ValueOpcode::UGreaterThanEqual32, {key, count});
     Value leave;
-    if (variant.bound == Bound::Direct) {
+    if (variant.bound == Bound::Direct || variant.bound == Bound::Immediate) {
       // s_cmp_ge_u32 key, count; s_cbranch_scc1 exit.
       leave = fixture.Emit(ValueOpcode::ConditionRef, {over}, CFG::BranchCondition::SccNonZero);
     } else if (variant.bound == Bound::Flags) {
@@ -973,14 +975,20 @@ void TestBitScanKeyRange() {
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     const auto key_count = indirect ? indirect->key_count.Resolve() : Value{};
-    const auto *clamp = key_count.TryInstruction();
+    const uint32_t width = variant.narrow ? 12u : 32u;
     Check(indirect && !indirect->selector.has_value() && indirect->table_offset == 344u &&
               indirect->selector_mask.IsEmpty() != variant.runtime_mask &&
-              (variant.bound == Bound::None
-                   ? key_count.IsImmediate() && key_count.U32() == (variant.narrow ? 12u : 32u)
-                   : clamp != nullptr && clamp->GetOpcode() == ValueOpcode::UMin32 &&
-                         clamp->Arg(1) == Value(32u)),
+              indirect->key_limit == width &&
+              (variant.bound == Bound::None ? key_count == Value(width)
+                                            : key_count == count.Resolve()),
           "bit scan loop lost its table, its mask or the count that bounds its keys");
+    // Planning bounds stay in the plan: the shader keeps its own instructions.
+    Check(std::ranges::none_of(fixture.program.blocks, [](const Block *block) {
+            return std::ranges::any_of(*block, [](const Inst &inst) {
+              return inst.GetOpcode() == ValueOpcode::UMin32;
+            });
+          }),
+          "bit scan planning inserted its key bound into the shader");
     const auto plan = ExtractResourcePlan(fixture.program);
 
     LinearTestMemory memory_image;
@@ -1051,6 +1059,7 @@ void TestBitScanKeyRange() {
               snapshot.images.size() == 5u && memory_image.descriptor_reads == 5u &&
               snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 5u,
           "bit scan table probed records at or past the loop's count");
+    if (variant.bound == Bound::Immediate) continue;
     user_data[3] = 40u;
     memory_image.fail_address = UINT64_MAX;
     for (uint32_t key = 5; key < 32u; ++key) fill(key);

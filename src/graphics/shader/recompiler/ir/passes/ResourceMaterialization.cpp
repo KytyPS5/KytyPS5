@@ -327,6 +327,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			} else {
 				if (table_value.dword_count != 2u || !clean.Evaluate(indirect.key_count, key_count))
 					return false;
+				key_count = std::min(key_count, indirect.key_limit);
 				if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
 			}
 			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||

@@ -900,15 +900,16 @@ private:
 				const auto& b = *descriptor.indirect_descriptor;
 				if (a.selector != b.selector || a.table_source != b.table_source ||
 				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
-				    a.table_stride != b.table_stride ||
-				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
+				    a.table_stride != b.table_stride || a.workgroup_axis != b.workgroup_axis ||
+				    a.sources != b.sources || a.key_limit != b.key_limit ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
 				     !EquivalentValue(m_program, a.selector_first, b.selector_first)) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
-				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask))) continue;
+				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask)))
+					continue;
 			}
 			bool same = true;
 			for (uint32_t i = 0; i < descriptor.dword_count; i++) {
@@ -1524,20 +1525,6 @@ private:
 		return guarded ? bound : Value {};
 	}
 
-	// min(bound, limit), created once after bound's definition so it dominates the plan.
-	Value ClampedCount(Value bound, uint32_t limit) {
-		const auto* definition = bound.Resolve().TryInstruction();
-		if (definition == nullptr || definition->Parent() == nullptr) return {};
-		auto* block = definition->Parent();
-		auto  where = std::ranges::find_if(block->Instructions(),
-		                                   [&](const Inst& inst) { return &inst == definition; });
-		if (where == block->Instructions().end()) return {};
-		++where;
-		while (where != block->Instructions().end() && where->GetOpcode() == ValueOpcode::Phi)
-			++where;
-		return Value(&*block->PrependNewInst(where, ValueOpcode::UMin32, {bound, Value(limit)}));
-	}
-
 	Value InitialCandidateMask(Value value, const Block* update_block) const {
 		const auto* phi = value.Resolve().TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
@@ -1999,11 +1986,9 @@ private:
 				// The scan stops at the mask's set bits, its width and the loop's count exit.
 				uint32_t width         = 32u;
 				indirect.selector_mask = ScannedMask(selector->Arg(0), width);
-				indirect.key_count     = Value(width);
-				if (const auto bound = ScanBound(key, handle.Parent()); !bound.IsEmpty()) {
-					if (const auto count = ClampedCount(bound, width); !count.IsEmpty())
-						indirect.key_count = count;
-				}
+				const auto bound       = ScanBound(key, handle.Parent());
+				indirect.key_count     = bound.IsEmpty() ? Value(width) : bound;
+				indirect.key_limit     = width;
 			} else if (!m_shader_writes) {
 				if (const auto* bound = BoundedLoop(key, handle.Parent()))
 					indirect.key_count = bound->Arg(1);

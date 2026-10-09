@@ -642,7 +642,8 @@ struct DrawIndexBufferSource {
 	uint32_t      guest_element_size = 0;
 	// Bound with its size: fetches past it read zero (index_buffer_range_enabled).
 	bool sized = false;
-	// Guest indices readable from address; mesh draws, which fetch them in the shader, stop there.
+	// Guest indices readable from address; mesh draws, which fetch them in the shader, read zero
+	// past it.
 	uint32_t limit = UINT32_MAX;
 };
 
@@ -1119,9 +1120,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	const auto mesh_count =
-	    draw.IsIndexed() ? std::min(draw.index_count, index_source.limit) : draw.index_count;
-	uint32_t mesh_groups = 0;
+	// Mesh draws keep their count; their shader reads indices past the limit as zero.
+	const auto mesh_index_limit = draw.IsIndexed() ? index_source.limit : UINT32_MAX;
+	uint32_t   mesh_groups      = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
@@ -1135,7 +1136,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
-		const auto primitives = mesh.InputPrimitiveCount(mesh_count);
+		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
 		if (primitives == 0 || draw.instance_count == 0) {
 			return;
 		}
@@ -1153,9 +1154,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(index_source.address,
-		                                            static_cast<uint64_t>(mesh_count) *
-		                                                index_source.guest_element_size);
+		const auto readable = std::min(draw.index_count, mesh_index_limit);
+		(void)m_context.GetBufferCache().FindBuffer(
+		    index_source.address, uint64_t {readable} * index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
@@ -1204,13 +1205,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
-		const uint32_t draw_data[] {mesh_count,
+		const uint32_t draw_data[] {draw.index_count,
 		                            draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
 		                                             : emit.first_vertex,
 		                            emit.first_instance,
 		                            index_source.guest_element_size,
 		                            static_cast<uint32_t>(index_source.address),
-		                            static_cast<uint32_t>(index_source.address >> 32u)};
+		                            static_cast<uint32_t>(index_source.address >> 32u),
+		                            mesh_index_limit};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |

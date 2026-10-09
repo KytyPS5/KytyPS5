@@ -818,6 +818,59 @@ void TestWalkerKeepsLazyReads() {
         "a failed right operand of a true logical AND was accepted");
 }
 
+// A constant-buffer DWORD past the 48-bit address space fails before reading, as a scalar read
+// does; the last DWORD below it is read.
+void TestBufferReadPastAddressSpaceFails() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 2;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const auto user = [&](uint32_t reg) {
+    return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(reg))}));
+  };
+  // 16 records without a stride: the DWORD at byte 8 is within the buffer.
+  const std::array<Value, 4> words{user(0), user(1), Value(16u), Value(0u)};
+  const auto buffer = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+                                                 {words[0], words[1], words[2], words[3]}));
+  MemoryInfo info;
+  info.kind = ResourceKind::ScalarBuffer;
+  info.offset = 8u;
+  program.memory_info.push_back(info);
+  auto &read = block.AppendNewInst(ValueOpcode::ReadConstBuffer, {buffer, Value(0u)});
+  read.SetFlags(SrtReadFlags{.index = 0});
+  program.srt_reads.push_back({Value(&read), 0});
+  DescriptorSource source;
+  source.dwords = {words[0], words[1], words[2], words[3]};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> user_data{};
+  std::vector<uint64_t> reads;
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> values) {
+                             static_cast<std::vector<uint64_t> *>(data)->push_back(address);
+                             values[0] = 0x5au;
+                             return true;
+                           },
+                           .userdata = &reads};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto walk = [&](uint64_t base) {
+    user_data = {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32u)};
+    reads.clear();
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  Check(walk(0xfffffffffff0ull) && reads == std::vector<uint64_t>{0xfffffffffff8ull} &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0x5au},
+        "the last DWORD of the address space was not read");
+  Check(!walk(0xfffffffffff8ull) && reads.empty(),
+        "a buffer read past the 48-bit address space was read");
+}
+
 } // namespace
 
 namespace Common {
@@ -850,6 +903,7 @@ int main() {
   TestWalkerFollowsInputsAcrossWalks();
   TestWalkerRecompilesChangedProgram();
   TestWalkerKeepsLazyReads();
+  TestBufferReadPastAddressSpaceFails();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

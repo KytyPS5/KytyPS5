@@ -794,10 +794,11 @@ bool SrtWalker::EvaluateRawRead(const ResourcePlan::WalkerNode& node, uint64_t& 
 		const auto size = stride == 0u
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+		// Like a scalar read, the DWORD must stay in the 48-bit address space.
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t) ||
+		    !AddSignedAddress(base & ~uint64_t {3}, static_cast<int64_t>(byte_offset), address)) {
 			return false;
 		}
-		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);

@@ -1484,13 +1484,15 @@ Graph BuildGraph(const Decoder::Program& program) {
 			if (next_pc <= end_pc) {
 				labels.insert(next_pc);
 			}
-		} else if (inst.opcode == Opcode::S_SETPC_B64) {
-			SetpcTargetInfo target_info;
-			if (!ResolveSetpcTargets(program, i, target_info)) {
-				ExitBuildFailure(
-				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
-			}
+		} else if (inst.opcode == Opcode::S_SETPC_B64 || inst.opcode == Opcode::S_SWAPPC_B64) {
+            SetpcTargetInfo target_info;
+            if (!ResolveSetpcTargets(program, i, target_info)) {
+                ExitBuildFailure(
+                    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+                    fmt::format("unsupported dynamic {} at pc 0x{:08x}",
+                        inst.opcode == Opcode::S_SWAPPC_B64 ? "S_SWAPPC_B64" : "S_SETPC_B64",
+                        inst.pc));
+            }
 			const auto target_pcs = target_info.indirect
 			                            ? std::span<const uint32_t>(target_info.target_pcs)
 			                            : std::span<const uint32_t>(&target_info.target, 1);
@@ -1556,9 +1558,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto& last    = program.instructions[block.inst_end - 1u];
 		const auto  next_pc = InstructionEndPc(last);
 		if (last.opcode == Opcode::S_ENDPGM) {
-			block.terminator.kind = TerminatorKind::Return;
-		} else if (last.opcode == Opcode::S_SETPC_B64) {
-			const auto& target_info = setpc_targets.at(last.pc);
+            block.terminator.kind = TerminatorKind::Return;
+        } else if (last.opcode == Opcode::S_SETPC_B64 || last.opcode == Opcode::S_SWAPPC_B64) {
+            const auto& target_info = setpc_targets.at(last.pc);
 			if (target_info.indirect) {
 				block.terminator.kind                   = TerminatorKind::IndirectBranch;
 				block.terminator.condition              = BranchCondition::Always;

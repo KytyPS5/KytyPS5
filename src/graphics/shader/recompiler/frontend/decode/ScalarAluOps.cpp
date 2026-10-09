@@ -61,6 +61,7 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x1eu, Opcode::S_BITSET1_B64},
     {0x1fu, Opcode::S_GETPC_B64},
     {0x20u, Opcode::S_SETPC_B64},
+	{0x21u, Opcode::S_SWAPPC_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
     {0x28u, Opcode::S_ORN2_SAVEEXEC_B64},
     {0x2du, Opcode::S_QUADMASK_B64},

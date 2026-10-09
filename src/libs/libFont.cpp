@@ -78,7 +78,6 @@ constexpr int SCE_FONT_TEXT_PARSER_RESULT_FONT_CODE = 1;
 constexpr int SCE_FONT_TEXT_PARSER_RESULT_TERMINATE = 0;
 constexpr int SCE_FONT_TEXT_PARSER_RESULT_ERROR     = -1;
 constexpr int SCE_FONT_WRITING_FORM_HORIZONTAL      = 0x10;
-constexpr int FONT_BITMAP_MAX_DIM                   = 128;
 constexpr int FONT_ERROR_INVALID_PARAMETER          = static_cast<int>(0x80460002u);
 constexpr int FONT_ERROR_INVALID_FONT_HANDLE        = static_cast<int>(0x80460005u);
 constexpr int FONT_ERROR_NO_SUPPORT_CODE            = static_cast<int>(0x80460041u);
@@ -107,20 +106,7 @@ struct RendererState {
 	uint64_t              edition;
 };
 
-struct FontGlyphMetrics {
-	float width;
-	float height;
-	struct {
-		float bearing_x;
-		float bearing_y;
-		float advance;
-	} horizontal;
-	struct {
-		float bearing_x;
-		float bearing_y;
-		float advance;
-	} vertical;
-};
+using FontGlyphMetrics = detail::GlyphMetrics;
 
 struct FontKerning {
 	float offset_x;
@@ -184,31 +170,31 @@ struct FontRenderResult {
 };
 
 struct FontState {
-	FontLibrary                                                    library;
-	const void*                                                    data;
-	uint32_t                                                       size;
-	uint32_t                                                       font_set_type;
-	uint32_t                                                       open_mode;
-	int                                                            attribute;
-	FontRenderer                                                   renderer;
-	float                                                          scale_w;
-	float                                                          scale_h;
-	float                                                          effect_weight_x;
-	float                                                          effect_weight_y;
-	uint32_t                                                       effect_weight_mode;
-	float                                                          effect_slant;
-	float                                                          render_scale_w;
-	float                                                          render_scale_h;
-	float                                                          render_effect_weight_x;
-	float                                                          render_effect_weight_y;
-	uint32_t                                                       render_effect_weight_mode;
-	float                                                          render_effect_slant;
-	stbtt_fontinfo                                                 font_info;
-	const uint8_t*                                                 ttf_data;
-	uint32_t                                                       ttf_size;
-	bool                                                           has_ttf;
-	std::vector<uint8_t>                                           fallback_image;
-	FontTransImage                                                 trans_image;
+	FontLibrary          library;
+	const void*          data;
+	uint32_t             size;
+	uint32_t             font_set_type;
+	uint32_t             open_mode;
+	int                  attribute;
+	FontRenderer         renderer;
+	float                scale_w;
+	float                scale_h;
+	float                effect_weight_x;
+	float                effect_weight_y;
+	uint32_t             effect_weight_mode;
+	float                effect_slant;
+	float                render_scale_w;
+	float                render_scale_h;
+	float                render_effect_weight_x;
+	float                render_effect_weight_y;
+	uint32_t             render_effect_weight_mode;
+	float                render_effect_slant;
+	stbtt_fontinfo       font_info;
+	const uint8_t*       ttf_data;
+	uint32_t             ttf_size;
+	bool                 has_ttf;
+	std::vector<uint8_t> fallback_image;
+	FontTransImage       trans_image;
 };
 
 struct FontHorizontalLayout {
@@ -224,12 +210,12 @@ struct FontVerticalLayout {
 };
 
 struct GlyphState {
-	FontState*                                                     font;
-	uint32_t                                                       code;
-	int                                                            attribute;
-	FontGlyphMetrics                                               metrics;
-	std::vector<uint8_t>                                           image;
-	FontTransImage                                                 trans_image;
+	FontState*           font;
+	uint32_t             code;
+	int                  attribute;
+	FontGlyphMetrics     metrics;
+	std::vector<uint8_t> image;
+	FontTransImage       trans_image;
 };
 
 union FontTextParseResult {
@@ -823,35 +809,6 @@ static uint32_t stb_supported_codepoint(FontState* font, uint32_t code) {
 	return code;
 }
 
-static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* metrics) {
-	if (metrics == nullptr || !ensure_stb_font(font)) {
-		return false;
-	}
-
-	code                = stb_supported_codepoint(font, code);
-	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
-	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
-
-	int advance = 0;
-	int x0      = 0;
-	int y0      = 0;
-	int x1      = 0;
-	int y1      = 0;
-	stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(code), &advance, nullptr);
-	stbtt_GetCodepointBox(&font->font_info, static_cast<int>(code), &x0, &y0, &x1, &y1);
-
-	metrics->width                = static_cast<float>(x1 - x0) * scale_x;
-	metrics->height               = static_cast<float>(y1 - y0) * scale_y;
-	metrics->horizontal.bearing_x = static_cast<float>(x0) * scale_x;
-	metrics->horizontal.bearing_y = static_cast<float>(y1) * scale_y;
-	metrics->horizontal.advance   = static_cast<float>(advance) * scale_x;
-	metrics->vertical.bearing_x   = 0.0f;
-	metrics->vertical.bearing_y   = 0.0f;
-	metrics->vertical.advance     = font->scale_h;
-
-	return true;
-}
-
 static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_image, uint32_t code,
                            FontState* font) {
 	if (image == nullptr || trans_image == nullptr || !ensure_stb_font(font)) {
@@ -877,12 +834,11 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 }
 
 static int scaled_font_height(const FontState* font) {
-	const float scale = (font != nullptr && font->scale_h > 1.0f ? font->scale_h : 16.0f);
-	return std::clamp(static_cast<int>(scale + 0.5f), 8, FONT_BITMAP_MAX_DIM);
+	return detail::bitmap_glyph_height(font != nullptr ? font->scale_h : 0.0f);
 }
 
 static int scaled_font_width(const FontState* font) {
-	return std::clamp((scaled_font_height(font) + 1) / 2, 4, FONT_BITMAP_MAX_DIM);
+	return detail::bitmap_glyph_width(font != nullptr ? font->scale_h : 0.0f);
 }
 
 static void fill_bitmap_metrics(FontGlyphMetrics* metrics, const FontState* font) {
@@ -890,18 +846,8 @@ static void fill_bitmap_metrics(FontGlyphMetrics* metrics, const FontState* font
 		return;
 	}
 
-	const float width  = static_cast<float>(scaled_font_width(font));
-	const float height = static_cast<float>(scaled_font_height(font));
-	const float ascent = height * 0.75f;
-
-	metrics->width                = width;
-	metrics->height               = height;
-	metrics->horizontal.bearing_x = 0.0f;
-	metrics->horizontal.bearing_y = ascent;
-	metrics->horizontal.advance   = width;
-	metrics->vertical.bearing_x   = 0.0f;
-	metrics->vertical.bearing_y   = 0.0f;
-	metrics->vertical.advance     = height;
+	detail::get_glyph_metrics(nullptr, 0, 0.0f, 0.0f, font != nullptr ? font->scale_h : 0.0f,
+	                          metrics);
 }
 
 static void fill_metrics_for_code(FontGlyphMetrics* metrics, const FontState* font, uint32_t code) {
@@ -909,7 +855,15 @@ static void fill_metrics_for_code(FontGlyphMetrics* metrics, const FontState* fo
 		return;
 	}
 
-	if (get_stb_metrics(const_cast<FontState*>(font), code, metrics)) {
+	auto* mutable_font = const_cast<FontState*>(font);
+	if (ensure_stb_font(mutable_font)) {
+		code = stb_supported_codepoint(mutable_font, code);
+		const float scale_x =
+		    stbtt_ScaleForMappingEmToPixels(&mutable_font->font_info, mutable_font->scale_w);
+		const float scale_y =
+		    stbtt_ScaleForMappingEmToPixels(&mutable_font->font_info, mutable_font->scale_h);
+		detail::get_glyph_metrics(&mutable_font->font_info, static_cast<int>(code), scale_x,
+		                          scale_y, mutable_font->scale_h, metrics);
 		return;
 	}
 
@@ -1411,7 +1365,7 @@ int KYTY_SYSV_ABI FontGetHorizontalLayout(FontHandle font_handle, FontHorizontal
 
 	auto* font = static_cast<FontState*>(font_handle);
 	if (ensure_stb_font(font)) {
-		const float scale = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
+		const float scale    = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
 		int         ascent   = 0;
 		int         descent  = 0;
 		int         line_gap = 0;
@@ -2068,12 +2022,12 @@ int KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t
 }
 
 int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint32_t code,
-                                FontKerning* kerning) {
+                                 FontKerning* kerning) {
 	PRINT_NAME();
 	if (kerning == nullptr) {
 		return FONT_ERROR_INVALID_PARAMETER;
 	}
-	*kerning = {};
+	*kerning   = {};
 	auto* font = static_cast<FontState*>(font_handle);
 	if (font == nullptr) {
 		return FONT_ERROR_INVALID_FONT_HANDLE;
@@ -2089,14 +2043,16 @@ int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint
 	};
 	const int left  = glyph_index(pre_code);
 	const int right = glyph_index(code);
-	if (left <= 0 || left >= font->font_info.numGlyphs ||
-	    right <= 0 || right >= font->font_info.numGlyphs) {
+	if (left <= 0 || left >= font->font_info.numGlyphs || right <= 0 ||
+	    right >= font->font_info.numGlyphs) {
 		return FONT_ERROR_NO_SUPPORT_CODE;
 	}
-	kerning->offset_x = static_cast<float>(stbtt_GetGlyphKernAdvance(&font->font_info, left, right)) *
-	                    stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
+	kerning->offset_x =
+	    static_cast<float>(stbtt_GetGlyphKernAdvance(&font->font_info, left, right)) *
+	    stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
 	LOGF("\t handle = 0x%016" PRIx64 ", pre_code = 0x%08" PRIx32 ", code = 0x%08" PRIx32
-	     ", offset_x = %f\n", reinterpret_cast<uint64_t>(font_handle), pre_code, code,
+	     ", offset_x = %f\n",
+	     reinterpret_cast<uint64_t>(font_handle), pre_code, code,
 	     static_cast<double>(kerning->offset_x));
 	return OK;
 }

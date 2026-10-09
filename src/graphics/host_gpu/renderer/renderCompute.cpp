@@ -516,6 +516,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (FrameDump::TraceEnabled()) {
+		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
+			if (!program.info.images[i].written) continue;
+			const auto& d = bindings.images[i].desc.info.data;
+			FrameDump::TraceWrite("cs-image", d.address, d.address + d.size, "dispatch", program.shader_hash);
+		}
+	}
 	if (FrameDump::Active()) {
 		std::vector<FrameDump::StorageUse> uses(bindings.images.size());
 		for (size_t i = 0; i < uses.size() && i < program.info.images.size(); i++) {

@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/shader.h"
 
+#include <set>
 #include <algorithm>
 #include <bit>
 #include <cinttypes>
@@ -47,6 +49,7 @@ struct Target {
 	uint64_t             addr = 0;
 	bool                 dirty = false;
 	uint32_t             seq = 0;
+	uint32_t             slices = 1; // >1: 3D volume, all z slices are read back
 };
 
 struct Pending {
@@ -72,6 +75,236 @@ std::string                             g_dir;
 uint32_t                                g_frame = 0;
 bool                                    g_capturing = false;
 std::atomic<bool>                       g_request {false};
+std::atomic<uint64_t>                   g_trace_frame {0};
+
+// ---- buffer / volume content capture (lighting investigation) ----
+struct BufReq {
+	vk::Buffer  buf = nullptr;
+	uint64_t    offset = 0, size = 0;
+	uint32_t    seq = 0;
+	std::string label;
+	uint64_t    addr = 0;
+};
+struct BufPending {
+	vk::Buffer      buffer = nullptr;
+	VmaAllocation   alloc  = nullptr;
+	void*           mapped = nullptr;
+	BufReq          req;
+	GraphicContext* graphics = nullptr;
+};
+struct VolReq {
+	Target   target;
+	uint32_t seq = 0;
+};
+std::vector<BufReq>      g_bufreq;
+std::vector<VolReq>      g_volreq;
+std::vector<BufPending>  g_bufpending;
+std::string              g_buflog;
+std::set<uint64_t>       g_seen_vol;
+std::set<std::string>    g_seen_buf;
+
+// KYTY_DBG_FRAME_DUMP_BUF_PS=<hex ps hash>[,...]|all selects the draws whose buffers/volumes are dumped.
+// Default: the NHL 27 tiled deferred lighting pixel shaders.
+bool WantBuffers(uint64_t ps_hash) {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> v;
+		const char*           e = std::getenv("KYTY_DBG_FRAME_DUMP_BUF_PS");
+		std::string           s = (e != nullptr && *e != '\0') ? e : "1da1fd2871174330,68839c4d8fc9ada5";
+		if (s == "all") {
+			v.push_back(0);
+			return v;
+		}
+		size_t pos = 0;
+		while (pos < s.size()) {
+			size_t n = s.find(',', pos);
+			if (n == std::string::npos) n = s.size();
+			v.push_back(std::strtoull(s.substr(pos, n - pos).c_str(), nullptr, 16));
+			pos = n + 1;
+		}
+		return v;
+	}();
+	for (const auto h : list) {
+		if (h == 0 || h == ps_hash) return true;
+	}
+	return false;
+}
+
+std::string WordsText(const uint8_t* p, size_t bytes, const char* indent = "      ") {
+	std::string s;
+	char        b[512];
+	for (size_t o = 0; o + 4 <= bytes; o += 16) {
+		std::string hex, fl;
+		for (size_t k = 0; k < 4 && o + k * 4 + 4 <= bytes; k++) {
+			uint32_t w;
+			std::memcpy(&w, p + o + k * 4, 4);
+			float f;
+			std::memcpy(&f, &w, 4);
+			char h[16], g[32];
+			std::snprintf(h, sizeof(h), "%08x ", w);
+			if (std::isfinite(f) && (f == 0.0f || (std::fabs(f) > 1e-20f && std::fabs(f) < 1e20f))) {
+				std::snprintf(g, sizeof(g), "%g ", f);
+			} else {
+				std::snprintf(g, sizeof(g), "- ");
+			}
+			hex += h;
+			fl += g;
+		}
+		std::snprintf(b, sizeof(b), "%s+%04zx: %s | %s\n", indent, o, hex.c_str(), fl.c_str());
+		s += b;
+	}
+	return s;
+}
+
+void QueueBuffer(vk::Buffer buf, uint64_t offset, uint64_t range, uint64_t addr, uint64_t guest_size,
+                 uint32_t seq, const std::string& label) {
+	if (!buf || range == 0 || range == VK_WHOLE_SIZE) return;
+	char key[96];
+	std::snprintf(key, sizeof(key), "%" PRIx64 ":%" PRIx64, addr, guest_size);
+	if (!g_seen_buf.insert(key).second) {
+		char b[160];
+		std::snprintf(b, sizeof(b), "    (%s addr=0x%" PRIx64 " size=%" PRIu64 " already dumped for an earlier draw)\n",
+		              label.c_str(), addr, guest_size);
+		g_buflog += b;
+		return;
+	}
+	BufReq r;
+	r.buf    = buf;
+	r.offset = offset;
+	r.size   = std::min<uint64_t>(range, 65536);
+	r.seq    = seq;
+	r.label  = label;
+	r.addr   = addr;
+	g_bufreq.push_back(std::move(r));
+}
+
+// Logs the shader-visible resource tables of one draw and queues GPU copies of the bound buffers.
+void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) {
+	char line[512];
+	std::snprintf(line, sizeof(line), "== #%05u ps=0x%016" PRIx64 " ==\n", seq, ps_hash);
+	g_buflog += line;
+	if (b.runtime != nullptr && b.runtime->resources != nullptr) {
+		const auto& r = *b.runtime->resources;
+		g_buflog += "  user_data (SGPR/user-data dwords, " + std::to_string(r.user_data.size()) + "):\n";
+		g_buflog += WordsText(reinterpret_cast<const uint8_t*>(r.user_data.data()), r.user_data.size() * 4);
+		g_buflog += "  snapshot buffer V# descriptors: " + std::to_string(r.buffers.size()) + "\n";
+		for (size_t i = 0; i < r.buffers.size(); i++) {
+			std::snprintf(line, sizeof(line), "    V#[%zu]:", i);
+			g_buflog += line;
+			for (uint32_t k = 0; k < r.buffers[i].dword_count; k++) {
+				std::snprintf(line, sizeof(line), " %08x", r.buffers[i].dwords[k]);
+				g_buflog += line;
+			}
+			g_buflog += "\n";
+		}
+		g_buflog += "  flattened_srt (" + std::to_string(r.flattened_srt.size()) + " dwords, first 64):\n";
+		g_buflog += WordsText(reinterpret_cast<const uint8_t*>(r.flattened_srt.data()),
+		                      std::min<size_t>(r.flattened_srt.size(), 64) * 4);
+		g_buflog += "  specialization_reads (scalar-read guest ranges, CPU view of guest memory now): " +
+		            std::to_string(r.specialization_reads.size()) + "\n";
+		for (const auto& [addr, size] : r.specialization_reads) {
+			std::snprintf(line, sizeof(line), "    addr=0x%" PRIx64 " size=%" PRIu64 "\n", addr, size);
+			g_buflog += line;
+			if (addr != 0 && size > 0 && size <= 4096) {
+				g_buflog += WordsText(reinterpret_cast<const uint8_t*>(addr),
+				                      static_cast<size_t>(std::min<uint64_t>(size, 256)));
+			}
+		}
+	}
+	g_buflog += "  shader_data (" + std::to_string(b.shader_data.size()) + " dwords):\n";
+	g_buflog += WordsText(reinterpret_cast<const uint8_t*>(b.shader_data.data()),
+	                      std::min<size_t>(b.shader_data.size(), 64) * 4);
+	g_buflog += "  bound storage buffers: " + std::to_string(b.buffers.size()) + "\n";
+	for (size_t i = 0; i < b.buffers.size(); i++) {
+		const auto src = i < b.buffer_sources.size() ? b.buffer_sources[i] : PreparedBindings::BufferSource {};
+		std::snprintf(line, sizeof(line), "    buf[%zu]: guest addr=0x%" PRIx64 " size=%" PRIu64
+		              " host_offset=%" PRIu64 " host_range=%" PRIu64 "\n", i, src.address, src.size,
+		              static_cast<uint64_t>(b.buffers[i].offset), static_cast<uint64_t>(b.buffers[i].range));
+		g_buflog += line;
+		if (src.address == 0) continue;
+		QueueBuffer(b.buffers[i].buffer, b.buffers[i].offset, b.buffers[i].range, src.address, src.size, seq,
+		            "buf" + std::to_string(i));
+	}
+}
+
+void RecordReadback(GraphicContext& gfx, vk::CommandBuffer cmd, const Target& t, const char* label,
+                    uint32_t seq);
+
+// Records the GPU->host copies of the queued buffers and volumes. cmd must be outside a render pass.
+void FlushRequests(GraphicContext& gfx, vk::CommandBuffer cmd) {
+	if (g_bufreq.empty() && g_volreq.empty()) return;
+	using S = vk::PipelineStageFlagBits2;
+	using A = vk::AccessFlagBits2;
+	if (!g_bufreq.empty()) {
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = S::eAllCommands;
+		mb.srcAccessMask = A::eMemoryWrite;
+		mb.dstStageMask  = S::eTransfer;
+		mb.dstAccessMask = A::eTransferRead;
+		vk::DependencyInfo dep {};
+		dep.memoryBarrierCount = 1;
+		dep.pMemoryBarriers    = &mb;
+		cmd.pipelineBarrier2(dep);
+	}
+	for (auto& r : g_bufreq) {
+		vk::BufferCreateInfo bi {};
+		bi.size  = r.size;
+		bi.usage = vk::BufferUsageFlagBits::eTransferDst;
+		VmaAllocationCreateInfo ai {};
+		ai.usage = VMA_MEMORY_USAGE_AUTO;
+		ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VkBuffer          native = VK_NULL_HANDLE;
+		VmaAllocation     alloc  = nullptr;
+		VmaAllocationInfo info {};
+		if (vmaCreateBuffer(gfx.allocator, reinterpret_cast<const VkBufferCreateInfo*>(&bi), &ai, &native,
+		                    &alloc, &info) != VK_SUCCESS) {
+			g_buflog += "  buffer readback allocation failed\n";
+			continue;
+		}
+		vk::BufferCopy region {r.offset, 0, r.size};
+		cmd.copyBuffer(r.buf, vk::Buffer(native), 1, &region);
+		BufPending p;
+		p.buffer   = vk::Buffer(native);
+		p.alloc    = alloc;
+		p.mapped   = info.pMappedData;
+		p.req      = r;
+		p.graphics = &gfx;
+		g_bufpending.push_back(std::move(p));
+	}
+	g_bufreq.clear();
+	for (auto& v : g_volreq) {
+		RecordReadback(gfx, cmd, v.target, "vol", v.seq);
+	}
+	g_volreq.clear();
+}
+
+std::string Hex(uint64_t v);
+
+void ProcessBuffers() {
+	for (auto& p : g_bufpending) {
+		char line[512];
+		std::snprintf(line, sizeof(line), "== buffer %s of #%05u guest addr=0x%" PRIx64 " (dumped %" PRIu64 " bytes) ==\n",
+		              p.req.label.c_str(), p.req.seq, p.req.addr, p.req.size);
+		g_buflog += line;
+		if (p.mapped != nullptr) {
+			vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
+			const auto* d = static_cast<const uint8_t*>(p.mapped);
+			g_buflog += WordsText(d, static_cast<size_t>(std::min<uint64_t>(p.req.size, 256)));
+			if (p.req.size < 65536) {
+				std::snprintf(line, sizeof(line), "%s/buf_%05u_%s_%s.bin", g_dir.c_str(), p.req.seq,
+				              p.req.label.c_str(), Hex(p.req.addr).c_str());
+				if (FILE* f = std::fopen(line, "wb")) {
+					std::fwrite(d, 1, static_cast<size_t>(p.req.size), f);
+					std::fclose(f);
+					g_buflog += std::string("    full dump -> ") + std::filesystem::path(line).filename().string() + "\n";
+				}
+			} else {
+				g_buflog += "    (>=64KB: only the first 64KB copied, first 256 bytes shown)\n";
+			}
+		}
+		vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
+	}
+	g_bufpending.clear();
+}
 
 const char* TypeName(Prospero::ImageType t) {
 	switch (t) {
@@ -377,11 +610,89 @@ std::string Hex(uint64_t v) {
 	return b;
 }
 
+// 3D volume: per-channel min/max/mean/nonzero over all voxels, a few voxel samples, z-slice PNGs.
+void ProcessVolume(Pending& p) {
+	const auto&    t   = p.target;
+	const uint32_t bpp = BytesPerPixel(t.format);
+	const size_t   sl  = static_cast<size_t>(t.w) * t.h * bpp;
+	char base[512];
+	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%ux%u_%s", g_dir.c_str(), p.seq, p.label.c_str(),
+	              Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str());
+	char line[1024];
+	double   sum[4] = {0, 0, 0, 0};
+	float    mn[4] = {3.4e38f, 3.4e38f, 3.4e38f, 3.4e38f}, mx[4] = {-3.4e38f, -3.4e38f, -3.4e38f, -3.4e38f};
+	uint64_t nonzero = 0, total = 0;
+	std::vector<float> lum;
+	std::vector<Decoded> slices(t.slices);
+	for (uint32_t z = 0; z < t.slices; z++) {
+		slices[z] = Decode(t, static_cast<const uint8_t*>(p.mapped) + sl * z);
+		if (!slices[z].ok) {
+			std::snprintf(line, sizeof(line), "VOL seq=%u addr=0x%s %ux%ux%u fmt=%s UNSUPPORTED\n", p.seq,
+			              Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str());
+			g_log += line;
+			return;
+		}
+		const auto& d = slices[z];
+		for (size_t i = 0; i < static_cast<size_t>(t.w) * t.h; i++) {
+			bool nz = false;
+			for (int c = 0; c < 4; c++) {
+				const float v = d.px[i * 4 + c];
+				mn[c] = std::min(mn[c], v);
+				mx[c] = std::max(mx[c], v);
+				sum[c] += v;
+				nz |= v != 0.0f;
+			}
+			nonzero += nz ? 1 : 0;
+			total++;
+			lum.push_back(0.2126f * d.px[i * 4] + 0.7152f * d.px[i * 4 + 1] + 0.0722f * d.px[i * 4 + 2]);
+		}
+	}
+	std::string files;
+	const auto  at = [&](uint32_t x, uint32_t y, uint32_t z, int c) {
+        return slices[z].px[(static_cast<size_t>(y) * t.w + x) * 4 + c];
+	};
+	std::snprintf(line, sizeof(line),
+	              "VOL seq=%u addr=0x%s %ux%ux%u fmt=%s voxels=%llu nonzero=%llu\n"
+	              "    min  = %g %g %g %g\n    max  = %g %g %g %g\n    mean = %g %g %g %g\n",
+	              p.seq, Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str(),
+	              static_cast<unsigned long long>(total), static_cast<unsigned long long>(nonzero), mn[0], mn[1],
+	              mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], sum[0] / static_cast<double>(total),
+	              sum[1] / static_cast<double>(total), sum[2] / static_cast<double>(total),
+	              sum[3] / static_cast<double>(total));
+	g_log += line;
+	const uint32_t cx = t.w / 2, cy = t.h / 2, cz = t.slices / 2;
+	const uint32_t probes[5][3] = {{0, 0, 0}, {cx, cy, cz}, {cx, cy, 0}, {t.w - 1, t.h - 1, t.slices - 1}, {cx / 2, cy / 2, cz / 2}};
+	for (const auto& pr : probes) {
+		std::snprintf(line, sizeof(line), "    voxel(%u,%u,%u) = %g %g %g %g\n", pr[0], pr[1], pr[2],
+		              at(pr[0], pr[1], pr[2], 0), at(pr[0], pr[1], pr[2], 1), at(pr[0], pr[1], pr[2], 2),
+		              at(pr[0], pr[1], pr[2], 3));
+		g_log += line;
+	}
+	float scale = 1.0f;
+	{
+		const size_t k = std::min(lum.size() - 1, static_cast<size_t>(static_cast<double>(lum.size()) * 0.99));
+		std::nth_element(lum.begin(), lum.begin() + static_cast<ptrdiff_t>(k), lum.end());
+		scale = lum[k] > 1e-6f ? 1.0f / lum[k] : (mx[0] > 1e-6f ? 1.0f / mx[0] : 1.0f);
+	}
+	const uint32_t zs[5] = {0, t.slices / 4, t.slices / 2, t.slices * 3 / 4, t.slices - 1};
+	for (const uint32_t z : zs) {
+		const std::string f = std::string(base) + "_z" + std::to_string(z) + "_exp.png";
+		WriteMapped(f, slices[z], [&](const float* px, float& r, float& g, float& bl) {
+			r = Gamma(px[0] * scale); g = Gamma(px[1] * scale); bl = Gamma(px[2] * scale);
+		});
+		files += " " + std::filesystem::path(f).filename().string();
+	}
+	g_log += "    slices (auto-exposed, p99 lum scale " + std::to_string(scale) + "):" + files + "\n";
+}
+
 void ProcessOne(Pending& p) {
 	if (p.mapped == nullptr) return;
 	vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
 	const auto& t = p.target;
-	Decoded d = Decode(t, static_cast<const uint8_t*>(p.mapped));
+	if (t.slices > 1) {
+		ProcessVolume(p);
+		return;
+	}	Decoded d = Decode(t, static_cast<const uint8_t*>(p.mapped));
 	char base[512];
 	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%u_%s", g_dir.c_str(), p.seq, p.label.c_str(),
 	              Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
@@ -526,7 +837,7 @@ void RecordReadback(GraphicContext& gfx, vk::CommandBuffer cmd, const Target& t,
 		g_log += line;
 		return;
 	}
-	const uint64_t size = static_cast<uint64_t>(t.w) * t.h * bpp;
+	const uint64_t size = static_cast<uint64_t>(t.w) * t.h * bpp * t.slices;
 	if (g_pending_bytes + size > kMaxPendingBytes) {
 		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u SKIPPED (readback memory cap)\n", seq,
 		              label, Hex(t.addr).c_str(), t.w, t.h);
@@ -556,7 +867,7 @@ void RecordReadback(GraphicContext& gfx, vk::CommandBuffer cmd, const Target& t,
 	             A::eMemoryWrite, S::eTransfer, A::eTransferRead);
 	vk::BufferImageCopy copy {};
 	copy.imageSubresource = {t.copy_aspect, t.mip, t.layer, 1};
-	copy.imageExtent      = vk::Extent3D {t.w, t.h, 1};
+	copy.imageExtent      = vk::Extent3D {t.w, t.h, t.slices};
 	cmd.copyImageToBuffer(t.image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(native), 1, &copy);
 	BarrierImage(cmd, t, vk::ImageLayout::eTransferSrcOptimal, t.layout, S::eTransfer, A::eTransferRead,
 	             S::eAllCommands, A::eMemoryRead | A::eMemoryWrite);
@@ -590,6 +901,7 @@ bool MakeTarget(RenderContext& ctx, ImageId id, const ImageViewInfo& view, vk::I
 	out.w       = std::max(image.backing.extent.width >> out.mip, 1u);
 	out.h       = std::max(image.backing.extent.height >> out.mip, 1u);
 	out.samples = image.backing.samples;
+	out.slices  = image.info.IsVolume() ? std::max(image.backing.extent.depth >> out.mip, 1u) : 1u;
 	out.layout  = layout;
 	out.addr    = addr;
 	return true;
@@ -634,6 +946,12 @@ void BeginCapture(CommandBuffer& buffer) {
 	g_seq = 0;
 	g_images = 0;
 	g_pending_bytes = 0;
+	g_bufreq.clear();
+	g_volreq.clear();
+	g_bufpending.clear();
+	g_buflog.clear();
+	g_seen_vol.clear();
+	g_seen_buf.clear();
 	g_capturing = true;
 	g_active.store(true, std::memory_order_relaxed);
 	std::printf("NHL27FRAMEDUMP: capturing frame -> %s\n", g_dir.c_str());
@@ -653,6 +971,18 @@ void FinishCapture(CommandBuffer& buffer) {
 	}
 	g_pending.clear();
 	g_targets.clear();
+	ProcessBuffers();
+	if (!g_bufreq.empty()) {
+		g_buflog += "NOTE: " + std::to_string(g_bufreq.size()) + " buffer requests were never flushed\n";
+	}
+	g_bufreq.clear();
+	if (!g_buflog.empty()) {
+		if (FILE* f = std::fopen((g_dir + "/buffers.txt").c_str(), "wb")) {
+			std::fwrite(g_buflog.data(), 1, g_buflog.size(), f);
+			std::fclose(f);
+		}
+		g_buflog.clear();
+	}
 	std::string out = "# KytyPS5 frame dump (KYTY_DBG_FRAME_DUMP). Sequence = draw/dispatch order in the frame.\n"
 	                  "# Image files are named <seq>_<rt<slot>|depth|st<slot>>_<guest addr>_<WxH>_<vk format>.png\n"
 	                  "# HDR formats: <name>.png = clamped 0..1 (linear), <name>_exp.png = auto-exposed (p99 luminance) + sRGB.\n\n";
@@ -686,6 +1016,7 @@ void Request() {
 }
 
 void OnGuestFlip(CommandBuffer& buffer) {
+	g_trace_frame.fetch_add(1, std::memory_order_relaxed);
 	if (!Enabled()) return;
 	std::lock_guard lock(g_mutex);
 	if (g_capturing) {
@@ -734,6 +1065,21 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	for (int i = 0; i < 3; i++) AppendImages(s, ("vs_img" + std::to_string(i)).c_str(), draw.vs_images[i]);
 	AppendImages(s, "ps_img", draw.ps_images);
 	g_log += s;
+	if (draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {
+		CaptureBindings(*draw.ps_bindings, seq, draw.ps_hash);
+		if (draw.ps_images != nullptr) {
+			for (const auto& im : *draw.ps_images) {
+				if (im.desc.info.type != Prospero::ImageType::kColor3D) continue;
+				if (!g_seen_vol.insert(im.desc.info.data.address).second) continue;
+				VolReq v;
+				v.seq = seq;
+				if (MakeTarget(context, im.image_id, im.desc.view_info, im.layout, im.desc.info.data.address,
+				               v.target)) {
+					g_volreq.push_back(std::move(v));
+				}
+			}
+		}
+	}
 }
 
 void OnEndRendering(const CommandBuffer& buffer, const RenderState& pass) {
@@ -741,6 +1087,7 @@ void OnEndRendering(const CommandBuffer& buffer, const RenderState& pass) {
 	if (!g_capturing) return;
 	auto&      gfx = buffer.GetGraphics();
 	const auto cmd = buffer.Handle();
+	FlushRequests(gfx, cmd);
 	const auto dump = [&](vk::ImageView view, const char* label_prefix, bool is_depth) {
 		if (!view) return;
 		const auto it = g_targets.find(reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
@@ -766,6 +1113,7 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 	char b[256];
 	std::snprintf(b, sizeof(b), "#%05u dispatch cs=0x%016" PRIx64 " groups=%ux%ux%u%s\n", seq, cs_hash, gx,
 	              gy, gz, indirect ? " INDIRECT" : "");
+	FlushRequests(buffer.GetGraphics(), buffer.Handle());
 	std::string s = b;
 	for (size_t i = 0; i < images.size(); i++) {
 		const auto& u = images[i];
@@ -785,6 +1133,43 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 		t.slot = static_cast<uint32_t>(i);
 		const std::string label = "st" + std::to_string(i);
 		RecordReadback(buffer.GetGraphics(), buffer.Handle(), t, label.c_str(), seq);
+	}
+}
+
+namespace {
+std::vector<uint64_t>& TraceList() {
+	static std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> v;
+		if (const char* e = std::getenv("KYTY_DBG_TRACE_WRITES"); e != nullptr && *e != '\0') {
+			const std::string s = e;
+			size_t            pos = 0;
+			while (pos < s.size()) {
+				size_t n = s.find(',', pos);
+				if (n == std::string::npos) n = s.size();
+				const auto a = std::strtoull(s.substr(pos, n - pos).c_str(), nullptr, 16);
+				if (a != 0) v.push_back(a);
+				pos = n + 1;
+			}
+		}
+		return v;
+	}();
+	return list;
+}
+} // namespace
+
+bool TraceEnabled() noexcept {
+	static const bool on = !TraceList().empty();
+	return on;
+}
+
+void TraceWrite(const char* what, uint64_t begin, uint64_t end, const char* kind, uint64_t hash) {
+	for (const auto a : TraceList()) {
+		if (a >= begin && a < end) {
+			std::printf("NHL27TRACE: %s [0x%" PRIx64 ",0x%" PRIx64 ") covers 0x%" PRIx64 " writer=%s hash=0x%016" PRIx64
+			            " guest_flip=%" PRIu64 "\n",
+			            what, begin, end, a, kind != nullptr ? kind : "?", hash, g_trace_frame.load());
+			std::fflush(stdout);
+		}
 	}
 }
 

@@ -19,6 +19,7 @@
 namespace Libs::Graphics {
 
 struct TextureBinding;
+struct PreparedBindings;
 
 namespace FrameDump {
 
@@ -64,6 +65,8 @@ struct DrawLog {
 	const TargetRef*                 depth = nullptr;
 	const std::vector<TextureBinding>* vs_images[3] {};
 	const std::vector<TextureBinding>* ps_images = nullptr;
+	// Resource tables of the draw (for the lighting-buffer content dump, see FrameDump::OnDraw).
+	const PreparedBindings*            ps_bindings = nullptr;
 };
 
 // Registers the draw's render targets (so the end of the render pass can read them back) and logs it.
@@ -81,6 +84,12 @@ struct StorageUse {
 // Called after a dispatch was recorded; logs it and reads back the storage images it wrote.
 void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash, uint32_t gx,
                 uint32_t gy, uint32_t gz, bool indirect, std::span<const StorageUse> images);
+
+// KYTY_DBG_TRACE_WRITES=<hexaddr>[,<hexaddr>...]: print a line whenever a GPU write (buffer cache write
+// log, color/depth target of a draw, storage image of a dispatch) overlaps one of the addresses. Works
+// without KYTY_DBG_FRAME_DUMP. One relaxed bool test when unset.
+[[nodiscard]] bool TraceEnabled() noexcept;
+void TraceWrite(const char* what, uint64_t begin, uint64_t end, const char* kind, uint64_t hash);
 
 } // namespace FrameDump
 } // namespace Libs::Graphics

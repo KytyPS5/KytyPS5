@@ -1409,6 +1409,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	}
 
+	if (FrameDump::TraceEnabled()) {
+		for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+			const auto& d = state.color_info[i].desc.info.data;
+			FrameDump::TraceWrite("draw-rt", d.address, d.address + d.size, "draw", crumb_ps);
+		}
+	}
 	if (FrameDump::Active()) {
 		FrameDump::TargetRef color_refs[RENDER_COLOR_ATTACHMENTS_MAX];
 		for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
@@ -1449,6 +1455,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			log.vs_images[i] = &bindings.vertex[i].images;
 		}
 		log.ps_images = state.ps_active && bindings.pixel ? &bindings.pixel->images : nullptr;
+		log.ps_bindings = state.ps_active && bindings.pixel ? &*bindings.pixel : nullptr;
 		FrameDump::OnDraw(m_context, log);
 	}
 

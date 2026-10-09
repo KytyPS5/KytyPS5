@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 
+#include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <span>
@@ -99,6 +100,7 @@ private:
 				result = ref & ~InlineRef;
 				return true;
 			}
+			EXIT_IF(m_layout != m_program.walker_layout);
 			const auto& immediate = m_immediates[ref & ~ImmediateRef];
 			result                = immediate.payload;
 			return immediate.valid;
@@ -127,6 +129,9 @@ private:
 	const Node*                             m_nodes      = nullptr;
 	const ResourcePlan::WalkerImmediate*    m_immediates = nullptr;
 	ResourcePlan::EvaluationContext::Entry* m_values     = nullptr;
+	// The plan's walker_layout when the pointers above were taken. Every public entry
+	// refreshes them, as a nested walker may compile nodes in between.
+	uint32_t m_layout = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -417,6 +417,7 @@ uint32_t WalkerRef(const ResourcePlan& plan, Value value) {
 		EXIT_IF(index >= ImmediateRef);
 		if (index >= plan.walker_nodes.size()) {
 			plan.walker_nodes.resize(plan.evaluation_value_count);
+			++plan.walker_layout;
 		}
 		auto& node = plan.walker_nodes[index];
 		// Evaluation indices belong to the plan that owns the instruction.
@@ -429,6 +430,7 @@ uint32_t WalkerRef(const ResourcePlan& plan, Value value) {
 		return InlineRef | static_cast<uint32_t>(immediate.payload);
 	}
 	plan.walker_immediates.push_back(immediate);
+	++plan.walker_layout;
 	EXIT_IF(plan.walker_immediates.size() > InlineRef - ImmediateRef);
 	return ImmediateRef | static_cast<uint32_t>(plan.walker_immediates.size() - 1u);
 }
@@ -615,6 +617,7 @@ void SrtWalker::Refresh() {
 		walker->m_nodes      = m_program.walker_nodes.data();
 		walker->m_immediates = m_program.walker_immediates.data();
 		walker->m_values     = walker->m_context.values.data();
+		walker->m_layout     = m_program.walker_layout;
 	}
 }
 
@@ -661,6 +664,7 @@ float SrtWalker::Float32(uint64_t bits) {
 }
 
 bool SrtWalker::EvaluateNodeRef(Ref ref, uint64_t& result) {
+	EXIT_IF(m_layout != m_program.walker_layout);
 	if (ref == m_active_mask) {
 		result = 1u;
 		return true;

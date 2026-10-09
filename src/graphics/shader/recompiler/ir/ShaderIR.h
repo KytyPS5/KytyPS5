@@ -639,6 +639,9 @@ struct ResourcePlan {
 	mutable std::vector<WalkerImmediate> walker_immediates;
 	mutable std::vector<WalkerRoot>      walker_srt_reads;
 	mutable std::vector<WalkerRoot>      walker_descriptors;
+	// Counts additions to the arrays above, which may move them: a walker refreshes its
+	// pointers after any compilation before it evaluates again.
+	mutable uint32_t walker_layout = 0;
 };
 
 struct Program: ResourcePlan {

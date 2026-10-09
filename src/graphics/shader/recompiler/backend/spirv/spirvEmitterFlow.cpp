@@ -81,7 +81,8 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
-		if (centroid || sample) {
+		// A covered single-sample fragment has its only sample at the pixel center.
+		if (sample || (centroid && !state.input_info.pixel->ps_single_sample)) {
 			const auto coordinates = state.builder.AllocateId();
 			state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
 			if (sample) {

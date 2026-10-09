@@ -75,6 +75,18 @@ void Shutdown() {
 	g_renderer = nullptr;
 }
 
+void EmergencyShutdown() {
+	if (g_renderer == nullptr) {
+		return;
+	}
+	// A crash on the thread that already holds this mutex would deadlock on Lock(); TryLock()
+	// just skips the save in that case instead of hanging the crash handler.
+	if (g_renderer->GetMutex().TryLock()) {
+		g_renderer->GetPipelineCache().Save();
+		g_renderer->GetMutex().Unlock();
+	}
+}
+
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer) {
 	EXIT_IF(type == nullptr);
 

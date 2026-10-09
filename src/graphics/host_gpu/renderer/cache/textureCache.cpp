@@ -350,8 +350,12 @@ void AliasLogOnce(AliasAction action, uint64_t address, uint64_t size, const cha
 } // namespace
 
 bool TextureCache::WriteBackAliasedImage(ImageId id) {
-	// The guest copy must be current before any later upload reads it, so wait for the download
-	// and for the deferred guest write-back. Not possible outside an active scheduler.
+	// Enqueue only: the download is recorded into the current command buffer and the guest
+	// write-back runs as a priority operation. Do not call Finish()/DrainPriorityOperations() here.
+	// This runs from FreeImage, reached from FindImage/ResolveOverlap, which still hold image ids.
+	// Finish() runs pending deferred erases, which would leave those ids stale (SlotVector
+	// operator[] assert). The image memory is released by a deferred erase that runs only after
+	// the GPU tick, so the queued download still completes first.
 	if (!m_scheduler.Active() || CommandScheduler::InDeferredOperation()) {
 		return false;
 	}
@@ -362,8 +366,6 @@ bool TextureCache::WriteBackAliasedImage(ImageId id) {
 	if (!DownloadImageMemory(id)) {
 		return false;
 	}
-	m_scheduler.Finish();
-	m_scheduler.DrainPriorityOperations();
 	AliasLogOnce(AliasAction::Writeback, address, size, format.c_str());
 	return true;
 }

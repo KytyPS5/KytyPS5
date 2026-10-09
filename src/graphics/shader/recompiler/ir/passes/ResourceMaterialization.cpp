@@ -589,6 +589,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (resource_count < 2u || exemplar == ImageResource::NoIndirectImage) {
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
+		if (program.info.images[root_index].resource_class != ImageResourceClass::Sampled) {
+			// Candidates are dispatched per access only for sampled-class operations.
+			return SpecializationFail(
+			    fmt::format("indirect storage image table at pc 0x{:08x} is unsupported",
+			                program.info.images[root_index].first_use_pc));
+		}
 		const auto& image_class = specialization.images[exemplar];
 		const auto is_2d = [](Decoder::ImageDimension dimension) {
 			return dimension == Decoder::ImageDimension::Dim2D ||
@@ -1428,8 +1434,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
-			        inst.GetOpcode() != ValueOpcode::ImageRead);
+			        image_opcode.resource_class != ImageResourceClass::Sampled);
 		}
 	}
 	for (auto& memory: memory_info) {

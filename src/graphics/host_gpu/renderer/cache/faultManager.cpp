@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -20,13 +21,19 @@ namespace {
 constexpr size_t MaxPageFaults    = 1024;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 
+struct ProcessParameters {
+	uint32_t bitmap_words;
+	uint32_t summary_words;
+	uint32_t summary_span;
+};
+
 } // namespace
 
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     BufferCache::FAULT_BUFFER_SIZE),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -46,9 +53,13 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 
 	const auto module = CompileSPV(FAULT_BUFFER_PROCESS_SPV, m_graphics.device);
 
+	const vk::PushConstantRange  push_constants {vk::ShaderStageFlagBits::eCompute, 0,
+	                                             sizeof(ProcessParameters)};
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount = 1;
-	pipeline_layout_info.pSetLayouts    = &m_fault_process_desc_layout;
+	pipeline_layout_info.setLayoutCount         = 1;
+	pipeline_layout_info.pSetLayouts            = &m_fault_process_desc_layout;
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 	RequireVulkanSuccess(
 	    m_graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                           &m_fault_process_pipeline_layout),
@@ -121,8 +132,14 @@ void FaultManager::ProcessFaultBuffer() {
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
-	const auto num_workgroups = (num_threads + 63) / 64;
+	// One invocation per summary word; only summarized bitmap words are read.
+	const ProcessParameters parameters {
+	    .bitmap_words  = static_cast<uint32_t>(BufferCache::FAULT_BITMAP_WORDS),
+	    .summary_words = static_cast<uint32_t>(BufferCache::FAULT_SUMMARY_WORDS),
+	    .summary_span  = BufferCache::FAULT_SUMMARY_SPAN};
+	command.pushConstants(m_fault_process_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                      sizeof(parameters), &parameters);
+	const auto num_workgroups = (BufferCache::FAULT_SUMMARY_WORDS + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
@@ -132,7 +149,9 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// The counter keeps counting faults that did not fit in the area.
+		const auto count =
+		    std::min(static_cast<uint32_t>(faults[0]), static_cast<uint32_t>(MaxPageFaults - 1));
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);

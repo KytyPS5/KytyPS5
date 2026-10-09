@@ -62,6 +62,18 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		// Games rewrite large heaps every frame, a few pages per 64 KiB block at a time. Release
+		// the whole aligned block on the first write fault so its neighbours do not fault (and
+		// mprotect, with a TLB shootdown on every core) one by one. Only plain CPU memory: no
+		// GPU-modified data (that would need a readback) and no cached image (re-upload).
+		constexpr uint64_t FaultBlock = 64 * 1024;
+		const uint64_t     block      = fault_vaddr & ~(FaultBlock - 1);
+		if (IsMapped(block, FaultBlock) && !m_buffer_cache.IsRegionGpuModified(block, FaultBlock) &&
+		    !m_texture_cache.IsRegionRegistered(block, FaultBlock)) {
+			m_buffer_cache.InvalidateMemory(block, FaultBlock);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+			return true;
+		}
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {

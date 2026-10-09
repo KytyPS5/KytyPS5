@@ -3124,6 +3124,9 @@ public:
       bool other_width_waits = false;
       bool other_width_deferred = false;
       uint32_t cond_exec_ran = 0;
+      alignas(16) uint64_t predicate_label = 0;
+      uint32_t predicated_ran = 0;
+      uint32_t branch_ran = 0;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
@@ -3224,6 +3227,35 @@ public:
             static_cast<uint32_t>(ran_address >> 32u), 1};
         Pm4Execution cond_exec_execution;
         (void)processor->Process(cond_exec_execution, cond_exec);
+        // Boolean predication and COND_INDIRECT_BUFFER read deferred labels too.
+        auto predicate = make_release_mem(2, 0, &predicate_label, 1);
+        Pm4Execution predicate_label_execution;
+        (void)processor->Process(predicate_label_execution, predicate);
+        const auto predicate_address = reinterpret_cast<uint64_t>(&predicate_label);
+        const auto predicated_address = reinterpret_cast<uint64_t>(&predicated_ran);
+        const std::array<uint32_t, 13> predicated{
+            KYTY_PM4(4, Pm4::IT_SET_PREDICATION, 0), (3u << 16u) | (1u << 8u),
+            static_cast<uint32_t>(predicate_address),
+            static_cast<uint32_t>(predicate_address >> 32u),
+            KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | 1u, 0,
+            static_cast<uint32_t>(predicated_address),
+            static_cast<uint32_t>(predicated_address >> 32u), 1,
+            KYTY_PM4(4, Pm4::IT_SET_PREDICATION, 0), 0, 0, 0};
+        Pm4Execution predicated_execution;
+        (void)processor->Process(predicated_execution, predicated);
+        const auto branch_address = reinterpret_cast<uint64_t>(&branch_ran);
+        const std::array<uint32_t, 5> then_commands{
+            KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(branch_address),
+            static_cast<uint32_t>(branch_address >> 32u), 1};
+        const auto then_address = reinterpret_cast<uint64_t>(then_commands.data());
+        const auto narrow_address = reinterpret_cast<uint64_t>(narrow_label.data());
+        const std::array<uint32_t, 14> branch{
+            KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0), 1u | (3u << 8u),
+            static_cast<uint32_t>(narrow_address), static_cast<uint32_t>(narrow_address >> 32u),
+            UINT32_MAX, 0, 0x13579bdfu, 0, static_cast<uint32_t>(then_address),
+            static_cast<uint32_t>(then_address >> 32u), 5, 0, 0, 0};
+        Pm4Execution branch_execution;
+        (void)processor->Process(branch_execution, branch);
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -3248,6 +3280,9 @@ public:
               "a GPU-side wait missed part of a deferred label it covers");
       Require("GpuCommandLane", "COND_EXEC on a deferred label", cond_exec_ran == 1,
               "COND_EXEC skipped its packets on a label deferred to completion");
+      Require("GpuCommandLane", "predication and branch on deferred labels",
+              predicated_ran == 1 && branch_ran == 1,
+              "predication or COND_INDIRECT_BUFFER missed a label deferred to completion");
       // More timestamps than queries in flight, over fewer slots: every slot holds the time of
       // its last write, in recording order.
       constexpr uint32_t batch_slots = 1000;

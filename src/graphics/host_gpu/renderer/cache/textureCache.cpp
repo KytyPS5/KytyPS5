@@ -1837,6 +1837,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+/// Schedule image writeback only when a safe download and readable backing are available.
+/// Seed staging from guest backing to preserve bytes not overwritten by the transfer.
+/// The declared hazard covers the full backing range written by the completion callback.
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -1873,10 +1876,12 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	m_scheduler.DeferPriorityOperation(
+	    [&download, range, mapped, offset] {
+		    download.Invalidate(offset, range.size);
+		    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+	    },
+	    range);
 	return true;
 }
 

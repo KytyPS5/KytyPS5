@@ -137,6 +137,10 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+/// Download tracked GPU-dirty spans; return false when no copies are needed.
+/// Async publication retains temporary staging storage and declares the whole source
+/// buffer as a conservative hazard covering all packed copies. Synchronous publication
+/// waits for the GPU and earlier priority callbacks before writing guest backing.
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
@@ -207,7 +211,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(std::move(publish),
+		                                   GuestRange {buffer_address, buffer.Size()});
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);

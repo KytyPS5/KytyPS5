@@ -92,6 +92,9 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	m_mapped_ranges.Add(vaddr, size);
 }
 
+/// Retire GPU ownership and overlapping guest writebacks before removing a mapping.
+/// Cache checks run on the GPU command lane, or directly during teardown. Deferred
+/// completion callbacks cannot call this method because they would wait on themselves.
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
@@ -104,7 +107,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		if (m_command_scheduler.Active() &&
 		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
 		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		     m_command_scheduler.HasPendingPriorityOperations({vaddr, size}))) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

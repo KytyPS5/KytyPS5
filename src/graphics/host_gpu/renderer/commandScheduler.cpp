@@ -207,6 +207,8 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
+/// Release completed normal callbacks only after priority callbacks through the same tick.
+/// Callbacks run outside the queue lock so resource destruction can enqueue further work.
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
 	for (;;) {
@@ -218,7 +220,7 @@ void CommandScheduler::PopPendingOperations() {
 				return;
 			}
 			operation = std::move(m_pending_operations.front());
-			m_pending_operations.pop();
+			m_pending_operations.pop_front();
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -229,17 +231,25 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	QueueOperation(std::move(operation), false);
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), true);
+/// Schedule a completion at the current GPU tick; captured resources must survive its execution.
+/// The range must cover every guest access, including writes performed after the GPU wait.
+/// An omitted range aliases all guest memory; an empty range promises no guest access.
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              std::optional<GuestRange>      range) {
+	EXIT_IF(range && !range->ValidOrEmpty());
+	QueueOperation(std::move(operation), true, range);
 }
 
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+/// Queue work while open, or execute it inline after an external shutdown completes.
+/// A callback already running in this scheduler must not wait on its own shutdown.
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+                                      std::optional<GuestRange> range) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
+		queue.push_back({std::move(operation), CurrentTick(), range});
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -254,11 +264,31 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	operation();
 }
 
+/// Include the callback already removed from the queue but still waiting or executing.
+/// This is a snapshot, not a completion wait or a barrier against subsequent enqueues.
 bool CommandScheduler::HasPendingPriorityOperations() {
 	std::lock_guard lock(m_operation_mutex);
 	return !m_priority_operations.empty() || m_priority_active;
 }
 
+/// Query guest-memory hazards for a valid, nonempty half-open range.
+/// Unknown ranges always overlap; host-only callbacks never do. The active callback
+/// remains a hazard until it returns, even after its GPU tick has completed.
+bool CommandScheduler::HasPendingPriorityOperations(GuestRange range) {
+	EXIT_IF(!range.Valid());
+	const auto overlaps = [range](const std::optional<GuestRange>& pending) {
+		return !pending || (!pending->Empty() && range.address < pending->End() &&
+		                    pending->address < range.End());
+	};
+	std::lock_guard lock(m_operation_mutex);
+	return (m_priority_active && overlaps(m_priority_active_range)) ||
+	       std::any_of(m_priority_operations.begin(), m_priority_operations.end(),
+	                   [&](const auto& operation) { return overlaps(operation.range); });
+}
+
+/// Run priority callbacks in FIFO order after their GPU ticks complete.
+/// Publish the active range under the queue lock before popping becomes observable,
+/// and retain it through the callback so concurrent unmap queries cannot miss writeback.
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
@@ -271,9 +301,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
+			m_priority_operations.pop_front();
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
+			m_priority_active_range = operation.range;
 		}
 		m_master.Wait(operation.tick);
 		if (!stop.stop_requested()) {
@@ -283,6 +314,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			std::lock_guard lock(m_operation_mutex);
 			m_priority_active      = false;
 			m_priority_active_tick = 0;
+			m_priority_active_range.reset();
 		}
 		m_operation_available.notify_all();
 	}

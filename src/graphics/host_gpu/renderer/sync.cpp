@@ -176,6 +176,9 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 	}
 }
 
+/// Complete a prepared flip and then signal its interrupt after the current GPU tick.
+/// Requires the active current command buffer. The deferred work accesses host state;
+/// the destination argument is validated here but is not dereferenced by the callback.
 void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuffer& buffer,
                                                   uint32_t* dst_gpu_addr, uint32_t value,
                                                   int handle, int index, int flip_mode,
@@ -190,12 +193,16 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
-		renderer.GetVideoOut().CompleteFlip(request_id);
-		renderer.TriggerInterrupt(event_id, 0);
-	});
+	scheduler.DeferPriorityOperation(
+	    [&renderer, event_id, request_id] {
+		    renderer.GetVideoOut().CompleteFlip(request_id);
+		    renderer.TriggerInterrupt(event_id, 0);
+	    },
+	    GuestRange {});
 }
 
+/// Complete a prepared flip after the active current command buffer finishes on the GPU.
+/// The destination argument is validated, but this completion performs no guest writeback.
 void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
                                 uint32_t value, int handle, int index, int flip_mode,
                                 int64_t flip_arg, uint64_t request_id) {
@@ -209,9 +216,12 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
 	scheduler.DeferPriorityOperation(
-	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); },
+	    GuestRange {});
 }
 
+/// Complete a prepared flip after the active current command buffer reaches its GPU tick.
+/// Only host flip state is retained, so unrelated guest unmaps need not wait for it.
 void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int handle, int index,
                               int flip_mode, int64_t flip_arg, uint64_t request_id) {
 	(void)buffer.Handle();
@@ -223,16 +233,20 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
 	scheduler.DeferPriorityOperation(
-	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); },
+	    GuestRange {});
 }
 
+/// Signal a host event queue after the active current command buffer completes.
+/// The context ID is event data, not a guest pointer; the callback has no guest-memory hazard.
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id) {
 	(void)buffer.Handle();
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
 	scheduler.DeferPriorityOperation(
-	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
+	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); },
+	    GuestRange {});
 }
 
 static void InterruptEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {

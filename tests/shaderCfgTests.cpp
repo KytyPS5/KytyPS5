@@ -14995,15 +14995,47 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+void TestLegacyMadRoundingPolicy() {
+  using namespace ShaderRecompiler;
+  const auto emit = [](IR::ValueOpcode opcode) {
+    const uint32_t shader[] = {EncodeSopp(0x01)};
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    auto result = RecompileForTest(shader, options);
+    IR::IREmitter ir(result.program.blocks.front());
+    ir.Emit(opcode, {IR::Value::F32(1.000244140625f), IR::Value::F32(1.000244140625f), IR::Value::F32(-1.00048828125f)});
+    auto binary = Spirv::EmitProgram(result.program, options.input_info);
+    CheckSpirvBinaryValidates(binary);
+    return binary;
+  };
+#if defined(__APPLE__)
+  bool separate = false;
+#else
+  bool separate = true;
+#endif
+  const char *value = std::getenv("KYTY_MAD_SEPARATE_ROUNDING");
+  if (value != nullptr && std::strcmp(value, "0") == 0) separate = false;
+  if (value != nullptr && std::strcmp(value, "1") == 0) separate = true;
+  const auto mad = emit(IR::ValueOpcode::FPMad32);
+  const auto source = DisassembleSpirvBinary(mad);
+  Check(SpirvInstructionOpcodeCount(mad, spv::OpFMul) == (separate ? 1u : 0u) && SpirvInstructionOpcodeCount(mad, spv::OpFAdd) == (separate ? 1u : 0u), "MAD policy emitted the wrong FMul/FAdd count");
+  Check(SpirvInstructionOpcodeCount(mad, spv::OpExtInst) == (separate ? 0u : 1u) && SpirvContainsExtInst(mad, 50u) == !separate, "MAD policy must emit exactly one GLSL.std.450 Fma when fused");
+  Check(CountSourceOccurrences(source, "NoContraction") == (separate ? 2u : 0u), "MAD policy emitted the wrong NoContraction decorations");
+  const auto fma = emit(IR::ValueOpcode::FPFma32);
+  Check(SpirvInstructionOpcodeCount(fma, spv::OpExtInst) == 1u && SpirvContainsExtInst(fma, 50u) && CountSourceOccurrences(DisassembleSpirvBinary(fma), "NoContraction") == 1u, "explicit Fma must retain its upstream NoContraction behavior");
+  std::printf("MAD rounding CPU: env=%s separate=%d FMul=%u FAdd=%u Fma=%u NoContraction=%u; explicit Fma intact\n", value == nullptr ? "unset" : value, separate, SpirvInstructionOpcodeCount(mad, spv::OpFMul), SpirvInstructionOpcodeCount(mad, spv::OpFAdd), SpirvInstructionOpcodeCount(mad, spv::OpExtInst), CountSourceOccurrences(source, "NoContraction"));
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestLegacyMadRoundingPolicy();
+  if (argc == 2 && std::strcmp(argv[1], "--mad-rounding-only") == 0) return 0;
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

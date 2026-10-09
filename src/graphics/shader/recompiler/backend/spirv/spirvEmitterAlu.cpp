@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -99,6 +100,22 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	return Select(state, TypeU32(state), zero, ConstantU32(state, 0), high);
 }
 
+// On Apple, fuse legacy MAD to avoid SPIRV-Cross NoContraction helpers; this changes rounding (KhronosGroup/SPIRV-Cross#1999, #2156).
+bool MadSeparateRounding() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MAD_SEPARATE_ROUNDING");
+		if (value != nullptr && (value[0] == '0' || value[0] == '1') && value[1] == '\0') {
+			return value[0] == '1';
+		}
+#if defined(__APPLE__)
+		return false;
+#else
+		return true;
+#endif
+	}();
+	return enabled;
+}
+
 } // namespace
 
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -108,6 +125,9 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (!MadSeparateRounding()) {
+		return EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
+	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
 	// a = EmitFlushF32DenormToSignedZero(state, a);

@@ -12,9 +12,9 @@
 
 class ConfigurationItem;
 class CompatibilityDatabase;
+class ControllerPreview;
 class QEvent;
 class QTreeWidgetItem;
-class QPoint;
 
 namespace Ui {
 class ConfigurationListWidget;
@@ -29,6 +29,7 @@ public:
 
 	void SetRunEnabled(bool flag) { m_run_enabled = flag; }
 	void SetRuntimeDirectory(const QString& directory) { m_runtime_directory = directory; }
+	void SetControllerPreview(ControllerPreview* preview) { m_controller_preview = preview; }
 
 	[[nodiscard]] const ConfigurationItem* GetSelectedItem() const { return m_selected_item; }
 	ConfigurationItem*                     GetSelectedItem() { return m_selected_item; }
@@ -65,13 +66,13 @@ protected slots:
 	void edit_global_settings();
 	void edit_input_mapping();
 	void list_itemDoubleClicked(QTreeWidgetItem* witem, int column);
-	void show_context_menu(const QPoint& pos);
 	void open_game_folder();
 	void remove_save_data();
 	void filter_configurations(const QString& text);
 
 private:
 	void               SelectItem(QTreeWidgetItem* witem);
+	void               ShowContextMenu(QTreeWidgetItem* witem);
 	void               ApplyCompatibility();
 	void               UpdateToolbarIcons();
 	void               ImportGameSettings(QWidget* parent);
@@ -87,6 +88,7 @@ private:
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
 	CompatibilityDatabase*        m_compatibility = nullptr;
+	ControllerPreview*            m_controller_preview = nullptr;
 };
 
 #endif // CONFIGURATION_LIST_WIDGET_H

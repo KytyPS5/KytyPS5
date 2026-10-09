@@ -161,6 +161,7 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	// Native filtering/border variants share the original sampler's runtime descriptor.
 	uint32_t snapshot_index        = 0;
+	std::vector<uint32_t> indirect_resources;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
@@ -590,6 +591,7 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
 	bool                                requires_specialization_memory = false;
+	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;

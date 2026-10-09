@@ -574,10 +574,12 @@ static void ShaderGetStaticInputInfoPS(
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
+	const bool async_compute             = info.async_compute;
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
 	const auto host_subgroup_size         = info.host_subgroup_size;
 	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
 	info                                  = {};
+	info.async_compute                    = async_compute;
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
 	info.host_subgroup_size               = host_subgroup_size;
 	std::ranges::copy(workgroup_counts, info.workgroup_counts);
@@ -693,7 +695,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
+	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
+	              (static_cast<uint32_t>(info.async_compute) << 1u));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));

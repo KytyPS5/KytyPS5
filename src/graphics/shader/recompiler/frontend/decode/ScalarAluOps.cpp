@@ -61,6 +61,7 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x1eu, Opcode::S_BITSET1_B64},
     {0x1fu, Opcode::S_GETPC_B64},
     {0x20u, Opcode::S_SETPC_B64},
+    {0x21u, Opcode::S_SWAPPC_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
     {0x28u, Opcode::S_ORN2_SAVEEXEC_B64},
     {0x2du, Opcode::S_QUADMASK_B64},
@@ -88,7 +89,7 @@ constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
     {0x08u, Opcode::S_CMP_LE_I32}, {0x09u, Opcode::S_CMP_EQ_U32}, {0x0au, Opcode::S_CMP_LG_U32},
     {0x0bu, Opcode::S_CMP_GT_U32}, {0x0cu, Opcode::S_CMP_GE_U32}, {0x0du, Opcode::S_CMP_LT_U32},
     {0x0eu, Opcode::S_CMP_LE_U32}, {0x0fu, Opcode::S_ADD_I32},    {0x10u, Opcode::S_MULK_I32},
-    {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT_VSCNT}, {0x18u, Opcode::S_WAITCNT},
+    {0x12u, Opcode::S_GETREG_B32}, {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT_VSCNT}, {0x18u, Opcode::S_WAITCNT},
     {0x19u, Opcode::S_WAITCNT},    {0x1au, Opcode::S_WAITCNT},
     {0x1bu, Opcode::S_SUBVECTOR_LOOP_BEGIN}, {0x1cu, Opcode::S_SUBVECTOR_LOOP_END},
 };
@@ -155,6 +156,10 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	switch (inst.opcode) {
+		case Opcode::S_SWAPPC_B64:
+			inst.branch_target = UINT32_MAX;
+			inst.data_dwords = 2;
+			break;
 		case Opcode::S_GETPC_B64:
 			inst.src_count = 0;
 			DecodeScalarDestination(sdst, pc, inst.dst);
@@ -202,7 +207,7 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 23u) & 0x1fu;
 	const uint32_t sdst   = (word >> 16u) & 0x7fu;
-	const auto     imm    = opcode >= 0x09u && opcode <= 0x0eu
+	const auto     imm    = (opcode >= 0x09u && opcode <= 0x0eu) || opcode == 0x12u
 	                           ? static_cast<int32_t>(word & 0xffffu)
 	                           : static_cast<int32_t>(static_cast<int16_t>(word & 0xffffu));
 
@@ -222,6 +227,7 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	switch (inst.opcode) {
+		case Opcode::S_GETREG_B32:
 		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:

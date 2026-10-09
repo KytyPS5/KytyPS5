@@ -1,61 +1,69 @@
 #include "inputMappingDialog.h"
 
-#include <QAbstractItemView>
+#include "controllerPreview.h"
+#include "dualsenseWidget.h"
+
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QGridLayout>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHash>
-#include <QHeaderView>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPushButton>
+#include <QScreen>
+#include <QScrollArea>
 #include <QStringList>
-#include <QTreeWidget>
 #include <QVBoxLayout>
 
 namespace {
 
-constexpr int  BINDING_COLUMN            = 1;
 constexpr auto DEFAULT_MOUSE_SENSITIVITY = 1.0;
 constexpr char MOUSE_SENSITIVITY[]       = "MouseSensitivity=";
+
+enum Group { Dpad, LeftStick, RightStick, Face, Shoulders, Center, Shortcuts, GroupCount };
 
 struct PadControl {
 	const char* id;
 	const char* label;
 	const char* default_binding;
+	Group       group;
+	int         row;
+	int         column;
 };
 
 constexpr PadControl PAD_CONTROLS[] = {
-    {"Up", "D-pad Up", "Up"},
-    {"Down", "D-pad Down", "Down"},
-    {"Left", "D-pad Left", "Left"},
-    {"Right", "D-pad Right", "Right"},
-    {"LeftStickUp", "Left stick Up", "W"},
-    {"LeftStickDown", "Left stick Down", "S"},
-    {"LeftStickLeft", "Left stick Left", "A"},
-    {"LeftStickRight", "Left stick Right", "D"},
-    {"RightStickUp", "Right stick Up", "T"},
-    {"RightStickDown", "Right stick Down", "G"},
-    {"RightStickLeft", "Right stick Left", "F"},
-    {"RightStickRight", "Right stick Right", "H"},
-    {"Triangle", "Triangle", "I"},
-    {"Circle", "Circle", "L"},
-    {"Cross", "Cross", "J"},
-    {"Square", "Square", "K"},
-    {"L1", "L1", "Q"},
-    {"R1", "R1", "E"},
-    {"L2", "L2", "Z"},
-    {"R2", "R2", "C"},
-    {"L3", "L3", "Left Shift"},
-    {"R3", "R3", "Left Ctrl"},
-    {"Options", "Options", "Return"},
-    {"TouchPad", "Touch pad left (SELECT)", "Backspace"},
-    {"TouchPadRight", "Touch pad right (START)", "Tab"},
-    {"SpeakerVolume", "Speaker volume (cycle)", "1"},
-    {"VibrationIntensity", "Vibration intensity (cycle)", "2"},
-    {"TriggerEffectIntensity", "Trigger effect intensity (cycle)", "3"},
+    {"Up", "Up", "Up", Dpad, 0, 1},
+    {"Down", "Down", "Down", Dpad, 2, 1},
+    {"Left", "Left", "Left", Dpad, 1, 0},
+    {"Right", "Right", "Right", Dpad, 1, 2},
+    {"LeftStickUp", "Up", "W", LeftStick, 0, 1},
+    {"LeftStickDown", "Down", "S", LeftStick, 2, 1},
+    {"LeftStickLeft", "Left", "A", LeftStick, 1, 0},
+    {"LeftStickRight", "Right", "D", LeftStick, 1, 2},
+    {"RightStickUp", "Up", "T", RightStick, 0, 1},
+    {"RightStickDown", "Down", "G", RightStick, 2, 1},
+    {"RightStickLeft", "Left", "F", RightStick, 1, 0},
+    {"RightStickRight", "Right", "H", RightStick, 1, 2},
+    {"Triangle", "Triangle", "I", Face, 0, 1},
+    {"Circle", "Circle", "L", Face, 1, 2},
+    {"Cross", "Cross", "J", Face, 2, 1},
+    {"Square", "Square", "K", Face, 1, 0},
+    {"L1", "L1", "Q", Shoulders, 0, 1},
+    {"R1", "R1", "E", Shoulders, 0, 2},
+    {"L2", "L2", "Z", Shoulders, 0, 0},
+    {"R2", "R2", "C", Shoulders, 0, 3},
+    {"L3", "Press / L3", "Left Shift", LeftStick, 1, 1},
+    {"R3", "Press / R3", "Left Ctrl", RightStick, 1, 1},
+    {"Options", "Options", "Return", Center, 0, 1},
+    {"TouchPad", "Touch pad left", "Backspace", Center, 0, 0},
+    {"TouchPadRight", "Touch pad right", "Tab", Center, 0, 2},
+    {"SpeakerVolume", "Speaker volume", "1", Shortcuts, 0, 0},
+    {"VibrationIntensity", "Vibration intensity", "2", Shortcuts, 0, 1},
+    {"TriggerEffectIntensity", "Trigger intensity", "3", Shortcuts, 0, 2},
 };
 
 QString KeypadName(int key) {
@@ -183,6 +191,17 @@ private:
 	QString m_binding;
 };
 
+void AssignBinding(QHash<QString, QString>& bindings, const QString& id, const QString& binding) {
+	for (auto item = bindings.begin(); item != bindings.end();) {
+		if (item.value().compare(binding, Qt::CaseInsensitive) == 0) {
+			item = bindings.erase(item);
+		} else {
+			++item;
+		}
+	}
+	bindings.insert(id, binding);
+}
+
 QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 	QHash<QString, QString> result;
 	for (const auto& entry: mapping) {
@@ -191,15 +210,7 @@ QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 		}
 		const auto separator = entry.indexOf(QLatin1Char('='));
 		if (separator > 0 && separator + 1 < entry.size()) {
-			const auto binding = entry.mid(separator + 1);
-			for (auto item = result.begin(); item != result.end();) {
-				if (item.value().compare(binding, Qt::CaseInsensitive) == 0) {
-					item = result.erase(item);
-				} else {
-					++item;
-				}
-			}
-			result.insert(entry.left(separator), binding);
+			AssignBinding(result, entry.left(separator), entry.mid(separator + 1));
 		}
 	}
 	return result;
@@ -216,82 +227,146 @@ double ParseMouseSensitivity(const QStringList& mapping) {
 
 } // namespace
 
-InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* parent)
-    : QDialog(parent) {
-	setWindowTitle(tr("Input Mapping"));
-	resize(460, 650);
+InputMappingDialog::InputMappingDialog(const QStringList& mapping, ControllerPreview* preview,
+                                       QWidget* parent)
+    : QDialog(parent), m_preview(preview) {
+	setWindowTitle(tr("Controls"));
+	resize(QSize(1100, 820).boundedTo(screen()->availableGeometry().size()));
 
 	auto* layout = new QVBoxLayout(this);
-	layout->addWidget(
-	    new QLabel(tr("Map keyboard or mouse buttons to DualSense controls.\n"
-	                  "Press F7 in-game to toggle mouse movement on the right stick."),
-	               this));
+	layout->setSpacing(10);
+	auto* title = new QLabel(tr("Controller setup"), this);
+	auto  font  = title->font();
+	font.setPointSize(font.pointSize() + 7);
+	font.setBold(true);
+	title->setFont(font);
+	layout->addWidget(title);
+	auto* hint = new QLabel(
+	    tr("Select a button to remap. Press controller buttons to test."), this);
+	hint->setWordWrap(true);
+	layout->addWidget(hint);
+	m_status = new QLabel(this);
+	m_status->setObjectName(QStringLiteral("controllerStatus"));
+	m_status->setWordWrap(true);
+	layout->addWidget(m_status);
 
-	const auto parsed = ParseMapping(mapping);
-	m_custom_bindings = !parsed.isEmpty();
+	auto* scroll = new QScrollArea(this);
+	scroll->setWidgetResizable(true);
+	scroll->setFrameShape(QFrame::NoFrame);
+	auto* content = new QWidget(scroll);
+	auto* grid    = new QGridLayout(content);
+	grid->setContentsMargins(0, 0, 0, 0);
+	grid->setSpacing(12);
+	QGroupBox*   groups[GroupCount];
+	QGridLayout* cells[GroupCount];
+	const char*  titles[] = {"D-Pad",
+	                         "Left stick",
+	                         "Right stick",
+	                         "Face buttons",
+	                         "Shoulders and triggers",
+	                         "Touch pad and options",
+	                         "In-game shortcuts (cycle)"};
+	for (int index = 0; index < GroupCount; ++index) {
+		groups[index] = new QGroupBox(tr(titles[index]), content);
+		cells[index]  = new QGridLayout(groups[index]);
+		cells[index]->setSpacing(5);
+	}
+
+	m_bindings        = ParseMapping(mapping);
+	m_custom_bindings = !m_bindings.isEmpty();
+	for (const auto& control: PAD_CONTROLS) {
+		const auto id          = QString::fromLatin1(control.id);
+		auto*      cell        = new QGroupBox(tr(control.label), groups[control.group]);
+		auto*      cell_layout = new QVBoxLayout(cell);
+		cell_layout->setContentsMargins(3, 5, 3, 3);
+		auto* button = new QPushButton(cell);
+		button->setObjectName(QStringLiteral("binding_") + id);
+		button->setAutoDefault(false);
+		button->setMinimumWidth(64);
+		button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+		button->setAccessibleName(tr(titles[control.group]) + QStringLiteral(" / ") +
+		                          tr(control.label));
+		cell_layout->addWidget(button);
+		cells[control.group]->addWidget(cell, control.row, control.column);
+		m_buttons.insert(id, button);
+		if (!m_custom_bindings) {
+			m_bindings.insert(id, QString::fromLatin1(control.default_binding));
+		}
+		connect(button, &QPushButton::clicked, this, [this, id] { ChangeBinding(id); });
+	}
+
+	auto* left = new QVBoxLayout;
+	left->addWidget(groups[Dpad]);
+	left->addWidget(groups[LeftStick]);
+	left->addStretch();
+	grid->addLayout(left, 0, 0);
+	auto* center = new QVBoxLayout;
+	center->addWidget(groups[Shoulders]);
+	m_controller = new DualSenseWidget(content);
+	m_controller->setObjectName(QStringLiteral("controllerDiagram"));
+	center->addWidget(m_controller, 1);
+	center->addWidget(groups[Center]);
+	grid->addLayout(center, 0, 1);
+	auto* right = new QVBoxLayout;
+	right->addWidget(groups[Face]);
+	right->addWidget(groups[RightStick]);
+	right->addStretch();
+	grid->addLayout(right, 0, 2);
+	grid->setColumnStretch(1, 1);
+	grid->addWidget(groups[Shortcuts], 1, 0, 1, 3);
+	scroll->setWidget(content);
+	layout->addWidget(scroll, 1);
 
 	auto* sensitivity_layout = new QHBoxLayout;
 	sensitivity_layout->addWidget(new QLabel(tr("Mouse sensitivity"), this));
 	m_sensitivity = new QDoubleSpinBox(this);
+	m_sensitivity->setObjectName(QStringLiteral("mouseSensitivity"));
 	m_sensitivity->setRange(0.1, 5.0);
 	m_sensitivity->setSingleStep(0.1);
 	m_sensitivity->setDecimals(1);
-	m_sensitivity->setSuffix(QStringLiteral("x"));
+	m_sensitivity->setSuffix(QStringLiteral("×"));
 	m_sensitivity->setValue(ParseMouseSensitivity(mapping));
 	sensitivity_layout->addWidget(m_sensitivity);
+	sensitivity_layout->addWidget(
+	    new QLabel(tr("F7 in-game toggles mouse movement on the right stick."), this));
 	sensitivity_layout->addStretch();
 	layout->addLayout(sensitivity_layout);
 
-	m_bindings = new QTreeWidget(this);
-	m_bindings->setColumnCount(2);
-	m_bindings->setHeaderLabels({tr("DualSense control"), tr("Host input")});
-	m_bindings->setRootIsDecorated(false);
-	m_bindings->setSelectionMode(QAbstractItemView::SingleSelection);
-	m_bindings->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-	m_bindings->header()->setSectionResizeMode(1, QHeaderView::Stretch);
-	layout->addWidget(m_bindings);
-
-	for (const auto& control: PAD_CONTROLS) {
-		auto* item = new QTreeWidgetItem(m_bindings);
-		item->setText(0, tr(control.label));
-		item->setData(0, Qt::UserRole, QString::fromLatin1(control.id));
-		SetBinding(item, m_custom_bindings ? parsed.value(QString::fromLatin1(control.id))
-		                                   : QString::fromLatin1(control.default_binding));
-	}
-	m_bindings->setCurrentItem(m_bindings->topLevelItem(0));
-
-	auto* controls  = new QHBoxLayout;
-	m_change_button = new QPushButton(tr("Change..."), this);
-	m_clear_button  = new QPushButton(tr("Clear"), this);
-	auto* defaults  = new QPushButton(tr("Defaults"), this);
-	controls->addWidget(m_change_button);
-	controls->addWidget(m_clear_button);
-	controls->addWidget(defaults);
-	controls->addStretch();
-	layout->addLayout(controls);
-
-	auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+	auto* buttons  = new QDialogButtonBox(QDialogButtonBox::RestoreDefaults |
+	                                          QDialogButtonBox::Save | QDialogButtonBox::Cancel,
+	                                      this);
+	auto* defaults = buttons->button(QDialogButtonBox::RestoreDefaults);
+	defaults->setObjectName(QStringLiteral("defaults"));
+	defaults->setAutoDefault(false);
 	layout->addWidget(buttons);
-
-	connect(m_bindings, &QTreeWidget::itemDoubleClicked, this,
-	        [this](QTreeWidgetItem*, int) { ChangeBinding(); });
-	connect(m_bindings, &QTreeWidget::itemSelectionChanged, this, [this]() { UpdateButtons(); });
-	connect(m_change_button, &QPushButton::clicked, this, [this]() { ChangeBinding(); });
-	connect(m_clear_button, &QPushButton::clicked, this, [this]() { ClearBinding(); });
-	connect(defaults, &QPushButton::clicked, this, [this]() { RestoreDefaults(); });
+	connect(m_controller, &DualSenseWidget::ControlClicked, this,
+	        &InputMappingDialog::ChangeBinding);
+	connect(defaults, &QPushButton::clicked, this, &InputMappingDialog::RestoreDefaults);
 	connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
 	connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+	if (m_preview != nullptr) {
+		connect(m_preview, &ControllerPreview::StateChanged, this,
+		        &InputMappingDialog::UpdatePreview);
+		m_preview->SetPreviewEnabled(true);
+	}
 	UpdateButtons();
+	UpdatePreview();
+}
+
+InputMappingDialog::~InputMappingDialog() {
+	if (m_preview != nullptr) {
+		m_preview->SetPreviewEnabled(false);
+	}
 }
 
 QStringList InputMappingDialog::Mapping() const {
 	QStringList result;
 	if (m_custom_bindings) {
-		for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
-			const auto* item    = m_bindings->topLevelItem(index);
-			const auto  binding = item->data(BINDING_COLUMN, Qt::UserRole).toString();
+		for (const auto& control: PAD_CONTROLS) {
+			const auto id      = QString::fromLatin1(control.id);
+			const auto binding = m_bindings.value(id);
 			if (!binding.isEmpty()) {
-				result.append(item->data(0, Qt::UserRole).toString() + QLatin1Char('=') + binding);
+				result.append(id + QLatin1Char('=') + binding);
 			}
 		}
 	}
@@ -302,58 +377,73 @@ QStringList InputMappingDialog::Mapping() const {
 	return result;
 }
 
-void InputMappingDialog::ChangeBinding() {
-	auto* item = m_bindings->currentItem();
-	if (item == nullptr) {
+void InputMappingDialog::ChangeBinding(const QString& id) {
+	if (!m_buttons.contains(id)) {
 		return;
 	}
-
+	m_selected = id;
+	UpdateHighlights();
 	InputCaptureDialog dialog(this);
-	if (dialog.exec() != QDialog::Accepted) {
-		return;
+	dialog.setWindowTitle(tr("Set binding — %1").arg(m_buttons.value(id)->accessibleName()));
+	if (dialog.exec() == QDialog::Accepted) {
+		AssignBinding(m_bindings, id, dialog.Binding());
+		m_custom_bindings = true;
 	}
-
-	for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
-		auto* other = m_bindings->topLevelItem(index);
-		if (other != item && other->data(BINDING_COLUMN, Qt::UserRole)
-		                             .toString()
-		                             .compare(dialog.Binding(), Qt::CaseInsensitive) == 0) {
-			SetBinding(other, {});
-		}
-	}
-	SetBinding(item, dialog.Binding());
-	m_custom_bindings = true;
-}
-
-void InputMappingDialog::ClearBinding() {
-	SetBinding(m_bindings->currentItem(), {});
-	m_custom_bindings = true;
+	m_selected.clear();
+	UpdateButtons();
 }
 
 void InputMappingDialog::RestoreDefaults() {
-	for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
-		SetBinding(m_bindings->topLevelItem(index),
-		           QString::fromLatin1(PAD_CONTROLS[index].default_binding));
+	m_bindings.clear();
+	for (const auto& control: PAD_CONTROLS) {
+		m_bindings.insert(QString::fromLatin1(control.id),
+		                  QString::fromLatin1(control.default_binding));
 	}
 	m_sensitivity->setValue(DEFAULT_MOUSE_SENSITIVITY);
 	m_custom_bindings = false;
-}
-
-void InputMappingDialog::SetBinding(QTreeWidgetItem* item, const QString& binding) {
-	if (item == nullptr) {
-		return;
-	}
-	item->setData(BINDING_COLUMN, Qt::UserRole, binding);
-	item->setText(BINDING_COLUMN, binding.isEmpty() ? tr("None") : binding);
 	UpdateButtons();
 }
 
 void InputMappingDialog::UpdateButtons() {
-	if (m_change_button == nullptr) {
-		return;
+	for (auto item = m_buttons.begin(); item != m_buttons.end(); ++item) {
+		auto*      button  = item.value();
+		const auto binding = m_bindings.value(item.key());
+		const auto label   = binding.isEmpty() ? tr("None") : binding;
+		button->setText(QString(label).replace(QLatin1Char('&'), QLatin1String("&&")));
+		button->setToolTip(tr("%1: %2. Click to change.").arg(button->accessibleName(), label));
 	}
-	const auto* item = m_bindings->currentItem();
-	m_change_button->setEnabled(item != nullptr);
-	m_clear_button->setEnabled(item != nullptr &&
-	                           !item->data(BINDING_COLUMN, Qt::UserRole).toString().isEmpty());
+	UpdateHighlights();
+}
+
+void InputMappingDialog::UpdatePreview() {
+	const auto pressed = m_preview != nullptr ? m_preview->Pressed() : QSet<QString>();
+	m_controller->SetPressed(pressed);
+	m_controller->SetSticks(m_preview != nullptr ? m_preview->LeftStick() : QPointF(),
+	                        m_preview != nullptr ? m_preview->RightStick() : QPointF());
+	UpdateHighlights();
+	if (m_preview != nullptr && !m_preview->Error().isEmpty()) {
+		m_status->setText(tr("Controller preview unavailable: %1").arg(m_preview->Error()));
+	} else if (m_preview != nullptr && !m_preview->DeviceName().isEmpty()) {
+		m_status->setText(tr("Connected: %1").arg(m_preview->DeviceName()));
+	} else {
+		m_status->setText(tr("No controller connected"));
+	}
+}
+
+void InputMappingDialog::UpdateHighlights() {
+	m_controller->SetSelected(m_selected);
+	for (auto item = m_buttons.begin(); item != m_buttons.end(); ++item) {
+		const bool down   = m_preview != nullptr && m_preview->Pressed().contains(item.key());
+		auto       colors = palette();
+		if (down) {
+			colors.setColor(QPalette::Button, colors.color(QPalette::Highlight));
+			colors.setColor(QPalette::ButtonText, colors.color(QPalette::HighlightedText));
+		} else if (item.key() == m_selected) {
+			colors.setColor(QPalette::ButtonText, colors.color(QPalette::Highlight));
+		}
+		auto label_font = font();
+		label_font.setBold(down);
+		item.value()->setPalette(colors);
+		item.value()->setFont(label_font);
+	}
 }

@@ -322,10 +322,11 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                              uint32_t array_index = 0);
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t array_index = 0);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
-                          uint32_t mip = 0, uint32_t array_index = 0);
+                          uint32_t mip = 0, uint32_t array_index = 0,
+                          bool sampler_dynamic = false);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);

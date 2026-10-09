@@ -52,8 +52,8 @@ or graphical glitches, so please include the version you tested when reporting a
       <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
     </td>
     <td align="center">
-      <strong>Dreaming Sarah</strong><br>
-      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5">
+      <strong>Saros</strong><br>
+      <img src="docs/screenshots/ps5-03.png" width="300" alt="Saros running in KytyPS5">
     </td>
   </tr>
   <tr>

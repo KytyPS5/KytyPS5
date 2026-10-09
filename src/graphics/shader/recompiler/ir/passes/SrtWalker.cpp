@@ -11,6 +11,35 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+SrtRuntime SrtReadCapture::ObservedRuntime() {
+	auto runtime = m_source;
+	runtime.userdata = this;
+	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
+	                                         ? ReadStrict : nullptr;
+	runtime.read_memory = ReadOrdinary;
+	return runtime;
+}
+
+bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address, values)) {
+		return false;
+	}
+	capture.m_ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
+bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	if (capture.m_source.read_memory != nullptr) {
+		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+	} else {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	capture.m_ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
@@ -159,7 +188,7 @@ private:
 	bool Validate(Value value, bool require_uniform = true) {
 		value = value.Resolve();
 		// Host floating-point evaluation does not model shader rounding/denormal modes.
-		if (m_type == RuntimeValueType::Integer &&
+		if (m_type != RuntimeValueType::Any &&
 		    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
 			return false;
 		}
@@ -188,6 +217,13 @@ private:
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
+		if (m_type == RuntimeValueType::ImmutableInteger &&
+		    (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
+		     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
+		     SharedAccessOf(op) != SharedAccess::None)) {
+			return finish(false);
+		}
 		if (op == ValueOpcode::ReadConst) {
 			const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (inst->NumArgs() != 2 || inst->Arg(0).Resolve().TryInstruction() == nullptr ||
@@ -197,7 +233,7 @@ private:
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return finish(false);
 			}
-			if (m_type == RuntimeValueType::Integer) {
+			if (m_type != RuntimeValueType::Any) {
 				const auto active_mask = m_active_mask;
 				m_active_mask          = {};
 				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
@@ -209,7 +245,7 @@ private:
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
 		    inst->Arg(0).Resolve() == m_active_mask) {
 			// Empty EXEC reads lane zero, so ignored operands still require integer types.
-			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(2), false)) {
+			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(2), false)) {
 				return finish(false);
 			}
 			return finish(Validate(inst->Arg(1)));
@@ -237,7 +273,7 @@ private:
 			return finish(true);
 		}
 		if (op == ValueOpcode::Phi) {
-			if (m_type == RuntimeValueType::Integer && !ValidateArguments(*inst, false)) {
+			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
 				return finish(false);
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
@@ -251,7 +287,7 @@ private:
 			    inst->Arg(1).GetType() != Type::U1) {
 				return finish(false);
 			}
-			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(1), false)) {
+			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(1), false)) {
 				return finish(false);
 			}
 			const auto active_mask = m_active_mask;
@@ -959,7 +995,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
+		if (!block.condition.IsEmpty() &&
+		    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
 		    predicate.Evaluate(block.condition, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {

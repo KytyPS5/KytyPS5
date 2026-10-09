@@ -10,13 +10,21 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_MOV_B64: S_MOV_B64(inst); return;
 		case O::S_WQM_B32: S_WQM(inst, false); return;
 		case O::S_WQM_B64: S_WQM(inst, true); return;
-		case O::S_GETPC_B64: S_GETPC_B64(inst); return;
+		case O::S_GETPC_B64:
+		case O::S_SWAPPC_B64: S_GETPC_B64(inst); return;
 		case O::S_SETPC_B64: return;
 		case O::S_SUBVECTOR_LOOP_BEGIN: S_SUBVECTOR_LOOP(inst, true); return;
 		case O::S_SUBVECTOR_LOOP_END: S_SUBVECTOR_LOOP(inst, false); return;
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return;
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
+		case O::S_GETREG_B32:
+			if (!graphics_compute || (inst.src0.value != 0x1818u && inst.src0.value != 0x0a18u))
+				EXIT("unsupported S_GETREG_B32 at pc 0x%08x: selector=0x%04x graphics_compute=%u",
+				     inst.pc, inst.src0.value, static_cast<unsigned>(graphics_compute));
+			// HW_ID2 identifies graphics compute as QUEUE=6, ME=0.
+			WriteOperand(inst.dst, IR::Value(inst.src0.value == 0x1818u ? 6u : 0u));
+			return;
 		case O::S_SETREG_B32: EmitControlNop(); return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
 		case O::S_WAITCNT: return;

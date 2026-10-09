@@ -146,6 +146,15 @@ inline constexpr auto EmitFPOrdEqual32 = EmitFloatCompare32<spv::OpFOrdEqual>;
 EMIT_NATIVE(FPOrdEqual64, OpFOrdEqual, U1, uint32_t, uint32_t)
 EMIT_NATIVE(FPOrdLessThanEqual64, OpFOrdLessThanEqual, U1, uint32_t, uint32_t)
 EMIT_NATIVE(FPOrdGreaterThanEqual64, OpFOrdGreaterThanEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdNotEqual64, OpFOrdNotEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdLessThan64, OpFOrdLessThan, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdGreaterThan64, OpFOrdGreaterThan, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPUnordEqual64, OpFUnordEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPUnordNotEqual64, OpFUnordNotEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPUnordLessThan64, OpFUnordLessThan, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPUnordGreaterThan64, OpFUnordGreaterThan, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPUnordLessThanEqual64, OpFUnordLessThanEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPUnordGreaterThanEqual64, OpFUnordGreaterThanEqual, U1, uint32_t, uint32_t)
 inline constexpr auto EmitFPUnordEqual32 = EmitFloatCompare32<spv::OpFUnordEqual>;
 inline constexpr auto EmitFPOrdNotEqual32 = EmitFloatCompare32<spv::OpFOrdNotEqual>;
 inline constexpr auto EmitFPUnordNotEqual32 = EmitFloatCompare32<spv::OpFUnordNotEqual>;
@@ -158,6 +167,7 @@ inline constexpr auto EmitFPUnordLessThanEqual32 = EmitFloatCompare32<spv::OpFUn
 inline constexpr auto EmitFPOrdGreaterThanEqual32 = EmitFloatCompare32<spv::OpFOrdGreaterThanEqual>;
 inline constexpr auto EmitFPUnordGreaterThanEqual32 = EmitFloatCompare32<spv::OpFUnordGreaterThanEqual>;
 EMIT_NATIVE(FPIsNan32, OpIsNan, U1, uint32_t)
+EMIT_NATIVE(FPIsNan64, OpIsNan, U1, uint32_t)
 inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 inline constexpr auto EmitFPCmpClass16 = EmitClassMaskF16;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)

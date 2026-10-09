@@ -20,6 +20,20 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 };
 
+class SrtReadCapture {
+public:
+	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
+	    m_source(source), m_ranges(ranges) {}
+	SrtRuntime ObservedRuntime();
+
+private:
+	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
+
+	SrtRuntime                                  m_source;
+	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+};
+
 // Retained reads no longer need the guest instruction PC. A clean read evaluates
 // its address and bounds through the strict reader as well as the final DWORD.
 struct SrtReadFlags {
@@ -27,7 +41,7 @@ struct SrtReadFlags {
 	uint32_t clean = 0;
 };
 
-enum class RuntimeValueType { Any, Integer };
+enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);

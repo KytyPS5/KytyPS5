@@ -38572,6 +38572,28 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
            0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
+// The renderer binds 32-bit atomics on a 32_SINT descriptor through its R32_UINT view;
+// 64-bit atomics still need 32_32_UINT.
+void CheckAtomicSintStorageTexture() {
+  auto descriptor = AtomicStorageTextureDescriptor();
+  descriptor.fields[1] =
+      (descriptor.fields[1] & ~0x1ff00000u) |
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) << 20u);
+  Require("AtomicSintStorageTexture", "descriptor",
+          descriptor.Format() == Prospero::BufferFormat::k32SInt,
+          "32_SINT image-atomic descriptor fixture is malformed");
+  const auto resource = AtomicStorageTextureResource();
+  ValidateStorageTexture(resource, descriptor, 0x10000);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal("AtomicSintStorageTexture64", [&] {
+    auto atomic64 = resource;
+    atomic64.atomic64 = true;
+    ValidateStorageTexture(atomic64, descriptor, 0x10000);
+  });
+#endif
+  std::printf("[host]    %-32s ok\n", "AtomicSintStorageTexture");
+}
+
 [[noreturn]] void RunStorageTextureDescriptorDeathCase(const char *kind) {
   auto resource = BasicStorageTextureResource();
   auto descriptor = BasicStorageTextureDescriptor();
@@ -42901,6 +42923,7 @@ int main(int argc, char **argv) {
   CheckImageSamplerSpecialization();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();
+  CheckAtomicSintStorageTexture();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
   CheckErrorDialogLifecycle();

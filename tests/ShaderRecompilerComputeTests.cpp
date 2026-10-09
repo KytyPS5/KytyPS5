@@ -18380,10 +18380,27 @@ private:
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
     available_provoking_vertex.pNext = &available_feedback_dynamic;
+    uint32_t extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> available_extensions(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, available_extensions.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    const bool conditional_rendering_extension = std::any_of(
+        available_extensions.begin(), available_extensions.end(), [](const auto &extension) {
+          return std::strcmp(extension.extensionName,
+                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) == 0;
+        });
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional{};
     available_conditional.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
-    available_min_lod.pNext = &available_conditional;
+    available_min_lod.pNext = conditional_rendering_extension
+                                  ? static_cast<void *>(&available_conditional)
+                                  : static_cast<void *>(&available_provoking_vertex);
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
@@ -18423,7 +18440,8 @@ private:
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
-    m_conditional_rendering_supported = available_conditional.conditionalRendering;
+    m_conditional_rendering_supported =
+        conditional_rendering_extension && available_conditional.conditionalRendering;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.depthBounds &&

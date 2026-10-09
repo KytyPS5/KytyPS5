@@ -808,7 +808,7 @@ void TestIndirectImageTableOperations() {
     auto words = std::array<uint32_t, 8>{identity, 75u << 20u, 3u | (3u << 14u),
         Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u),
         0u, 0u, 0u, 0u};
-    if (type == Type::kColor2DMsaa) {
+    if (type == Type::kColor2DMsaa || type == Type::kColor2DMsaaArray) {
       words[3] |= 1u << 16u; // two fragments
       words[5] |= 1u << 4u;
     }
@@ -843,20 +843,38 @@ void TestIndirectImageTableOperations() {
   constexpr auto sample = ValueOpcode::ImageSampleRaw;
   Check(materializes({sample}, Dim2D, {Type::kColor2D, Type::kColor3D}),
         "a plain sample refused a table of mixed dimensions");
-  // Loads, gathers and queries read through the root's view only.
+  // A load fetches each record through its own view with the instruction's coordinates.
   for (const auto &ops : std::initializer_list<std::vector<ValueOpcode>>{
-           {ValueOpcode::ImageRead}, {ValueOpcode::ImageGatherRaw},
-           {ValueOpcode::ImageQueryDimensions}, {sample, ValueOpcode::ImageRead},
-           {sample, ValueOpcode::ImageGatherRaw}}) {
+           {ValueOpcode::ImageRead}, {sample, ValueOpcode::ImageRead}}) {
+    Check(materializes(ops, Dim2D, {Type::kColor2D, Type::kColor3D}),
+          "a load refused a table of mixed dimensions");
+    Check(!materializes(ops, Decoder::ImageDimension::Dim3D, {Type::kColor3D, Type::kCube}),
+          "a load accepted a cube record of another dimension");
+  }
+  Check(materializes({sample}, Decoder::ImageDimension::Dim3D, {Type::kColor3D, Type::kCube}),
+        "a plain sample refused a cube record of another dimension");
+  // Gathers and queries read through the root's view only.
+  for (const auto &ops : std::initializer_list<std::vector<ValueOpcode>>{
+           {ValueOpcode::ImageGatherRaw}, {ValueOpcode::ImageQueryDimensions},
+           {sample, ValueOpcode::ImageGatherRaw}, {ValueOpcode::ImageRead, ValueOpcode::ImageGatherRaw}}) {
     Check(materializes(ops, Dim2D, {Type::kColor2D, Type::kColor2D}),
           "an image operation refused a table of one dimension");
     Check(!materializes(ops, Dim2D, {Type::kColor2D, Type::kColor3D}),
           "an image operation without per-candidate views accepted mixed dimensions");
   }
-  // A sampler cannot read a multisampled record; image_load fetches its samples.
+  // A sampler cannot read a multisampled record; image_load fetches its samples, with the
+  // fragment index of a multisampled instruction.
   Check(materializes({ValueOpcode::ImageRead}, Decoder::ImageDimension::Dim2DMsaa,
                      {Type::kColor2DMsaa, Type::kColor2DMsaa}),
         "image_load refused a multisampled table");
+  Check(materializes({ValueOpcode::ImageRead}, Decoder::ImageDimension::Dim2DMsaaArray,
+                     {Type::kColor2DMsaaArray, Type::kColor2DMsaa}),
+        "a multisampled load refused multisampled records of mixed dimensions");
+  Check(!materializes({ValueOpcode::ImageRead}, Dim2D, {Type::kColor2D, Type::kColor2DMsaa}),
+        "a single-sampled load accepted a multisampled record");
+  Check(!materializes({ValueOpcode::ImageRead}, Decoder::ImageDimension::Dim2DMsaa,
+                      {Type::kColor2DMsaa, Type::kColor2D}),
+        "a multisampled load accepted a single-sampled record of another dimension");
   Check(!materializes({sample}, Dim2D, {Type::kColor2DMsaa, Type::kColor2DMsaa}),
         "a sample accepted a multisampled table");
 }

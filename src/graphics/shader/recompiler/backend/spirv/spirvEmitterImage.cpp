@@ -141,15 +141,19 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 	return result;
 }
 
-// Reads `components` coordinates, of which the instruction supplies the first `supplied`;
-// the others are zero, never the operands that follow the coordinates.
+// The instruction's dimension supplies the coordinates; a candidate of another dimension reads
+// the missing ones as zero, never the operands that follow the coordinates.
+uint32_t SuppliedCoordinates(const IR::MemoryInfo& mem, uint32_t first) {
+	const auto supplied = ImageDimensionInfoFor(mem.image_dimension).coordinate_components;
+	return std::min(
+	    supplied, mem.image_address_components > first ? mem.image_address_components - first : 0u);
+}
+
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  uint32_t first, uint32_t components, bool cube = false,
-                  uint32_t supplied = UINT32_MAX) {
-	const auto read = [&](uint32_t index) {
-		return index < supplied && mem.image_address_components > first + index
-		           ? AddressF32(ctx, mem, address, first + index)
-		           : ZeroF32(ctx.state);
+                  uint32_t first, uint32_t components, bool cube = false) {
+	const auto supplied = SuppliedCoordinates(mem, first);
+	const auto read     = [&](uint32_t index) {
+		return index < supplied ? AddressF32(ctx, mem, address, first + index) : ZeroF32(ctx.state);
 	};
 	auto x = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
@@ -174,14 +178,16 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 uint32_t CoordU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                   ImageDimension dimension) {
 	const auto components = ImageDimensionInfoFor(dimension).coordinate_components;
-	const auto x          = AddressU32(ctx, mem, address, 0);
+	const auto supplied   = SuppliedCoordinates(mem, 0u);
+	const auto read       = [&](uint32_t index) {
+		return index < supplied ? AddressU32(ctx, mem, address, index) : ConstantU32(ctx.state, 0);
+	};
+	const auto x = AddressU32(ctx, mem, address, 0);
 	if (components == 1u) return x;
-	const auto y      = mem.image_address_components > 1u ? AddressU32(ctx, mem, address, 1)
-	                                                      : ConstantU32(ctx.state, 0);
+	const auto y      = read(1u);
 	const auto result = ctx.state.builder.AllocateId();
 	if (components == 3u) {
-		const auto z = mem.image_address_components > 2u ? AddressU32(ctx, mem, address, 2)
-		                                                 : ConstantU32(ctx.state, 0);
+		const auto z = read(2u);
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 3),
 		                              result, x, y, z);
 	} else {
@@ -763,9 +769,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				        const auto coord = CoordU32(ctx, mem, *address, dimension);
 				        if (dimension_info.multisampled != 0u) {
 					        state.builder.AddFunction(
-					            spv::OpImageFetch, ImageVectorType(state, candidate.numeric_class, 4), fetched,
+					            spv::OpImageFetch,
+					            ImageVectorType(state, candidate.numeric_class, 4), fetched,
 					            descriptor, coord, spv::ImageOperandsSampleMask,
-					            AddressU32(ctx, mem, *address, dimension_info.coordinate_components));
+					            AddressU32(ctx, mem, *address,
+					                       ImageDimensionInfoFor(mem.image_dimension)
+					                           .coordinate_components));
 				        } else {
 					        state.builder.AddFunction(
 					            spv::OpImageFetch, ImageVectorType(state, candidate.numeric_class, 4), fetched,
@@ -916,10 +925,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
-			const auto  coord     = CoordF32(
-			    ctx, mem, *address, layout.coord,
-			    ImageDimensionInfoFor(candidate.dimension).coordinate_components, candidate.cube,
-			    ImageDimensionInfoFor(mem.image_dimension).coordinate_components);
+			const auto coord =
+			    CoordF32(ctx, mem, *address, layout.coord,
+			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
+			             candidate.cube);
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);
 			const auto sample = state.builder.AllocateId();

@@ -615,9 +615,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2DMsaa ||
 			       dimension == Decoder::ImageDimension::Dim2DMsaaArray;
 		};
-		// Only image_sample selects each record's own view, sampled with the record's dimension
-		// as the T# drives the hardware; derivatives and offsets are laid out for one dimension.
-		// Candidates keep one numeric class, which selects the sampler variant.
+		// image_sample and image_load read each record through its own view, with the record's
+		// dimension as the T# drives the hardware and the instruction's coordinates; derivatives
+		// and offsets are laid out for one dimension. A load cannot fetch a cube view, nor take a
+		// fragment index the instruction does not supply. Candidates keep one numeric class,
+		// which selects the sampler variant.
 		const auto& base_root    = program.info.images[root_index];
 		uint32_t    sample_flags = 0;
 		for (const auto& memory: program.memory_info) {
@@ -626,7 +628,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 		const bool mixed_dimensions =
-		    base_root.sample_only &&
+		    base_root.sample_or_load_only &&
 		    (sample_flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagCd |
 		                     Decoder::ImageSampleFlagOffset | Decoder::ImageSampleFlagCompare)) ==
 		        0u;
@@ -645,9 +647,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
+			const bool own_view =
+			    mixed_dimensions &&
+			    (base_root.sample_only ||
+			     (!image.cube && is_msaa(image.dimension) == is_msaa(base_root.dimension)));
 			if ((sampled && is_msaa(image.dimension)) ||
 			    image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !mixed_dimensions &&
+			    (!same_coordinates && !own_view &&
 			     !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||

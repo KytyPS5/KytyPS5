@@ -35193,6 +35193,118 @@ void CheckFiniteInlineSamplerPhi(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+// An indirect image_load fetches each candidate with its own dimension but the instruction's
+// address layout: missing coordinates are zero, and the LOD and fragment index stay where the
+// instruction puts them.
+void CheckIndirectImageLoadCoordinates() {
+  constexpr const char *name = "IndirectImageLoadCoordinates";
+  using namespace ShaderRecompiler::IR;
+  using Dim = ShaderRecompiler::Decoder::ImageDimension;
+  struct Variant {
+    Dim instruction;
+    Dim root;
+    Dim child;
+    std::array<u32, 4> address;
+  };
+  // 2D load: x, y, LOD. 2D MSAA array load: x, y, layer, fragment.
+  for (const auto &variant : {Variant{Dim::Dim2D, Dim::Dim2D, Dim::Dim3D, {1u, 2u, 5u, 0u}},
+                              Variant{Dim::Dim2DMsaaArray, Dim::Dim2DMsaaArray, Dim::Dim2DMsaa,
+                                      {1u, 2u, 3u, 7u}}}) {
+    const bool msaa = variant.instruction == Dim::Dim2DMsaaArray;
+    Program program{};
+    program.stage = ShaderType::Compute;
+    program.wave_size = 32;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    program.shader_info_complete = true;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    auto &key = block->AppendNewInst(ValueOpcode::LaneId);
+    auto &image = block->AppendNewInst(ValueOpcode::GetImageResource,
+                                       {Value(&key), Value(0u), Value(0u), Value(0u), Value(0u),
+                                        Value(0u), Value(0u), Value(0u)});
+    image.SetFlags<uint32_t>(0u);
+    auto &address = block->AppendNewInst(
+        ValueOpcode::MakeImageAddress,
+        {Value(variant.address[0]), Value(variant.address[1]), Value(variant.address[2]),
+         Value(variant.address[3]), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory{};
+    memory.kind = ResourceKind::Image;
+    memory.resource = 0;
+    memory.dmask = 0xf;
+    memory.image_dimension = variant.instruction;
+    memory.image_address_components = msaa ? 4u : 3u;
+    memory.image_has_mip = !msaa;
+    program.memory_info.push_back(memory);
+    const MemoryFlags memory_flags{0u, 0x10f0u};
+    uint64_t memory_flag_bits = 0;
+    std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
+    auto &read = block->AppendNewInst(ValueOpcode::ImageRead,
+                                      {Value(&image), Value(&address), Value(true)},
+                                      memory_flag_bits);
+    auto &read_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                        {Value(&read), Value(0u)});
+    block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&read_x)});
+    program.descriptor_sources.resize(1);
+    program.descriptor_sources[0].dword_count = 8;
+    program.descriptor_sources[0].indirect_descriptor =
+        DescriptorSource::IndirectDescriptor{.table_source = 0, .table_stride = 32,
+                                             .key_count = Value(2u)};
+    ImageResource root{};
+    root.source = 0;
+    root.first_use_pc = 0x10f0u;
+    root.resource_class = ImageResourceClass::Sampled;
+    root.numeric_class = Prospero::TextureNumericClass::Float;
+    root.dimension = variant.root;
+    root.read = true;
+    root.indirect_root = 0;
+    root.indirect_search_iterations = 1;
+    root.indirect_resources = {0u, 1u};
+    auto child = root;
+    child.dimension = variant.child;
+    child.indirect_search_iterations = 0;
+    child.indirect_resources.clear();
+    program.info.images = {root, child};
+    ShaderComputeInputInfo compute{};
+    program.shader_info_complete = false;
+    CollectShaderInfo(program, {.compute = &compute});
+    const auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv(name, spirv);
+    std::vector<std::span<const u32>> definitions(spirv[3]);
+    u32 fetches = 0;
+    for (size_t offset = 5; offset < spirv.size();) {
+      const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+      const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (opcode == spv::OpCompositeConstruct || opcode == spv::OpConstant) {
+        definitions[words[2]] = words;
+      } else if (opcode == spv::OpImageFetch) {
+        // OpImageFetch type result image coord operands value
+        const auto coord = definitions[words[4]];
+        const auto operand = definitions[words[6]];
+        Require(name, "operand", words.size() == 7u && operand.size() == 4u &&
+                    (operand[0] & 0xffffu) == spv::OpConstant,
+                "a fetch lost its constant LOD or fragment operand");
+        Require(name, msaa ? "fragment" : "LOD",
+                words[5] == (msaa ? spv::ImageOperandsSampleMask : spv::ImageOperandsLodMask) &&
+                    operand[3] == variant.address[msaa ? 3 : 2],
+                "a candidate of another dimension read its LOD or fragment from a coordinate");
+        if (coord.size() == 6u) {
+          const auto z = definitions[coord[5]];
+          Require(name, "third coordinate",
+                  z.size() == 4u && z[3] == (msaa ? variant.address[2] : 0u),
+                  "a 3D candidate of a 2D load read the LOD as its depth");
+        }
+        fetches++;
+      }
+      offset += words.size();
+    }
+    Require(name, "fetches", fetches == 2u, "each candidate was not fetched once");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
@@ -43488,6 +43600,7 @@ int main(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     CheckIndirectImageKeySwitch(vulkan);
+    CheckIndirectImageLoadCoordinates();
     CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
@@ -43652,6 +43765,7 @@ int main(int argc, char **argv) {
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
+  CheckIndirectImageLoadCoordinates();
   CheckFiniteInlineSamplerPhi(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();

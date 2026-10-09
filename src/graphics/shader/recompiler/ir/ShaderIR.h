@@ -148,9 +148,10 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
-	// Every use is ImageSampleRaw, the only operation that reads each indirect candidate
-	// through its own view.
+	// Every use is ImageSampleRaw, or ImageSampleRaw and ImageRead: the operations that read each
+	// indirect candidate through its own view with the instruction's coordinates.
 	bool                          sample_only                = false;
+	bool                          sample_or_load_only        = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;

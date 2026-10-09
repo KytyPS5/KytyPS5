@@ -2437,7 +2437,8 @@ private:
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
 		image.atomic64       = atomic64;
-		image.sample_only    = true;
+		image.sample_only         = true;
+		image.sample_or_load_only = true;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -2452,6 +2453,9 @@ private:
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
 		image.sample_only  = image.sample_only && op == ValueOpcode::ImageSampleRaw;
+		image.sample_or_load_only =
+		    image.sample_or_load_only &&
+		    (op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageRead);
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

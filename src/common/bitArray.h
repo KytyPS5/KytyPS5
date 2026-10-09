@@ -21,6 +21,8 @@ class BitArray final {
 public:
 	using Range = std::pair<size_t, size_t>;
 
+	static constexpr size_t kWordCount = WORD_COUNT;
+
 	class Iterator final {
 	public:
 		using iterator_category = std::forward_iterator_tag;
@@ -79,6 +81,8 @@ public:
 		}
 		m_data[last_word] = other.m_data[last_word] & end_mask;
 	}
+
+	[[nodiscard]] constexpr uint64_t Word(size_t index) const { return m_data[index]; }
 
 	[[nodiscard]] constexpr bool Get(size_t index) const {
 		return (m_data[index / BITS_PER_WORD] & (uint64_t {1} << (index % BITS_PER_WORD))) != 0;

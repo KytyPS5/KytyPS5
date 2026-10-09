@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -87,6 +88,7 @@ public:
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
+		PublishDirtyBits();
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -96,6 +98,29 @@ public:
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
 		return GetBits<source>().FirstRangeFrom(start).first < end;
+	}
+
+	// IsModified without the lock, for the thread that owns GPU-dirty bits and clears CPU-dirty
+	// bits. Other threads only set CPU-dirty bits, under the lock and before their write.
+	template <DirtySource source>
+	[[nodiscard]] bool IsModifiedUnlocked(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto& words       = source == DirtySource::Cpu ? m_cpu_words : m_gpu_words;
+		const auto  first       = start / 64;
+		const auto  last        = (end - 1) / 64;
+		for (auto word = first; word <= last; word++) {
+			auto bits = words[word].load(std::memory_order_acquire);
+			if (word == first) {
+				bits &= ~uint64_t {0} << (start % 64);
+			}
+			if (word == last && end % 64 != 0) {
+				bits &= (uint64_t {1} << (end % 64)) - 1;
+			}
+			if (bits != 0) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	template <DirtySource source, bool enable>
@@ -117,6 +142,7 @@ public:
 		} else {
 			bits.UnsetRange(start, end);
 		}
+		PublishDirtyBits();
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
 		} else {
@@ -134,6 +160,7 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			PublishDirtyBits();
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
 			} else {
@@ -148,6 +175,13 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	void PublishDirtyBits() {
+		for (size_t word = 0; word < RegionBits::kWordCount; word++) {
+			m_cpu_words[word].store(m_cpu_dirty.Word(word), std::memory_order_release);
+			m_gpu_words[word].store(m_gpu_dirty.Word(word), std::memory_order_release);
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -194,6 +228,9 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// Copies of the dirty bits for IsModifiedUnlocked, stored under the lock.
+	std::array<std::atomic<uint64_t>, RegionBits::kWordCount> m_cpu_words {};
+	std::array<std::atomic<uint64_t>, RegionBits::kWordCount> m_gpu_words {};
 };
 
 } // namespace Libs::Graphics

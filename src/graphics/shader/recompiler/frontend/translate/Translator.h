@@ -124,6 +124,8 @@ private:
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
 	                        bool scalar, bool cmpx);
+	void EmitInteger64Compare(const Decoder::Instruction& inst, bool signed_value,
+	                          uint32_t predicate, bool cmpx);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,

@@ -29828,6 +29828,116 @@ TestCase VectorVop3CompareEqU64OnGpu() {
   return test;
 }
 
+void CheckInteger64ComparisonDecoder() {
+  constexpr std::array predicates{"F", "LT", "EQ", "LE", "GT", "NE", "GE", "T"};
+  for (bool sign : {true, false}) for (bool cmpx : {false, true}) {
+    for (u32 pred = 0; pred < 8u; ++pred) for (bool vop3 : {false, true}) {
+      const u32 encoding = (sign ? 0xa0u : 0xe0u) + (cmpx ? 0x10u : 0u) + pred;
+      std::vector<u32> code;
+      if (vop3) AppendVop3(&code, encoding, cmpx ? 126u : 106u, Vgpr(2u), Vgpr(4u));
+      else code.push_back(EncodeVopc(encoding, Vgpr(2u), 4u));
+      ShaderRecompiler::Decoder::Instruction decoded;
+      ShaderRecompiler::Decoder::DecodeInstruction(code, 0u, decoded);
+      const auto expected = std::string(cmpx ? "V_CMPX_" : "V_CMP_") +
+          predicates[pred] + (sign ? "_I64" : "_U64");
+      Require("Integer64Comparisons", "decoder",
+          magic_enum::enum_name(decoded.opcode) == expected && decoded.src_count == 2u &&
+          decoded.src0.reg == 2u && decoded.src1.reg == 4u &&
+          decoded.dst.kind == (cmpx ? ShaderRecompiler::Decoder::OperandKind::ExecLo :
+                                     ShaderRecompiler::Decoder::OperandKind::VccLo),
+          "missing integer64 comparison predicate " + expected +
+          (vop3 ? " VOP3: " : " VOPC: ") +
+          ShaderRecompiler::Decoder::InstructionToString(decoded) +
+          " sources=" + std::to_string(decoded.src_count));
+      if (!vop3) for (u32 marker : {233u, 234u, 250u}) {
+        const std::array decorated{EncodeVopc(encoding, marker, 4u), 0xff00e402u};
+        ShaderRecompiler::Decoder::DecodeInstruction(decorated, 0u, decoded);
+        Require("Integer64Comparisons", "unsupported DPP/DPP8",
+                decoded.opcode == ShaderOpcode::UNSUPPORTED,
+                "64-bit compare admitted unsupported lane-routing modifiers");
+      }
+    }
+  }
+}
+
+TestCase Integer64Comparisons(u32 wave, bool vop3) {
+  TestCase test;
+  test.name = wave == 64u ? (vop3 ? "Integer64CompareWave64Vop3" : "Integer64CompareWave64Vopc")
+                          : (vop3 ? "Integer64CompareWave32Vop3" : "Integer64CompareWave32Vopc");
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.threads_num[0] = wave;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  constexpr std::array<std::pair<uint64_t, uint64_t>, 8> pairs{{
+      {0u, 0u}, {0u, 1u}, {UINT64_MAX, 0u},
+      {0x8000000000000000ull, 0x7fffffffffffffffull},
+      {0x0000000100000000ull, 0x00000000ffffffffull},
+      {0xfffffffffffffffeull, UINT64_MAX},
+      {0x0123456789abcdefull, 0x0123456789abcdefull},
+      {0x0000000080000000ull, 0xffffffff80000000ull}}};
+  for (u32 lane = 0; lane < wave; ++lane) {
+    for (auto bits : {pairs[lane % pairs.size()].first, pairs[lane % pairs.size()].second}) {
+      test.initial.push_back(static_cast<u32>(bits));
+      test.initial.push_back(static_cast<u32>(bits >> 32u));
+    }
+  }
+  test.expected = test.initial;
+  test.expected.push_back(0xfeedfaceu);
+  u32 out = static_cast<u32>(test.expected.size());
+  auto& code = test.code;
+  code.push_back(EncodeVop2(0x1au, 1u, InlineU32(4u), 0u)); // lane * 16 bytes
+  AppendBufferLoadOpcode(&code, 0x0eu, 2u, 1u); // v2:v5, dynamic 64-bit pairs
+  code.push_back(0xbf8c0000u);
+  const auto full = wave == 64u ? UINT64_MAX : 0xffffffffull;
+  for (bool sign : {true, false}) for (bool cmpx : {false, true}) {
+    for (u32 pred = 0; pred < 8u; ++pred) {
+      const uint64_t active = pred == 0u ? 0u : pred == 7u ? full :
+          full & 0xccccccccaaaaaaaauLL;
+      AppendSMovLiteral(&code, 126u, static_cast<u32>(active));
+      AppendSMovLiteral(&code, 127u, static_cast<u32>(active >> 32u));
+      AppendSMovLiteral(&code, 106u, 0x13579bdfu);
+      AppendSMovLiteral(&code, 107u, wave == 64u ? 0x2468ace0u : 0u);
+      code.push_back(EncodeSopc(0x06u, InlineU32(1u), InlineU32((pred & 1u) ? 1u : 0u)));
+      const u32 encoding = (sign ? 0xa0u : 0xe0u) + (cmpx ? 0x10u : 0u) + pred;
+      if (vop3) AppendVop3(&code, encoding, cmpx ? 126u : 106u, Vgpr(2u), Vgpr(4u));
+      else code.push_back(EncodeVopc(encoding, Vgpr(2u), 4u));
+      for (u32 i = 0; i < 4u; ++i) {
+        const u32 source = i < 2u ? (cmpx ? 126u : 106u) + i : 106u + i - 2u;
+        code.push_back(EncodeSMovB32(20u + i, source));
+      }
+      code.push_back(EncodeSop2(0x0au, 24u, InlineU32(1u), InlineU32(0u)));
+      code.push_back(EncodeSop1(0x04u, 126u, InlineU32(1u))); // single writer
+      uint64_t mask = 0u;
+      for (u32 lane = 0; lane < wave; ++lane) {
+        const auto [a, b] = pairs[lane % pairs.size()];
+        // Independent oracle compares biased unsigned values for signed ordering.
+        const uint64_t lhs = sign ? a ^ (1ull << 63u) : a;
+        const uint64_t rhs = sign ? b ^ (1ull << 63u) : b;
+        const std::array conditions{false, lhs < rhs, a == b, lhs <= rhs,
+                                    lhs > rhs, a != b, lhs >= rhs, true};
+        if (conditions[pred] && ((active >> lane) & 1ull)) mask |= 1ull << lane;
+      }
+      const uint64_t vcc = cmpx ? (wave == 64u ? 0x2468ace013579bdfull : 0x13579bdfull) : mask;
+      const std::array values{static_cast<u32>(mask), static_cast<u32>(mask >> 32u),
+                              static_cast<u32>(vcc), static_cast<u32>(vcc >> 32u), pred & 1u};
+      for (u32 i = 0; i < values.size(); ++i) {
+        AppendStoreSgpr(&code, 20u + i, out++);
+        test.expected.push_back(values[i]);
+      }
+      AppendSMovLiteral(&code, 126u, static_cast<u32>(full));
+      AppendSMovLiteral(&code, 127u, static_cast<u32>(full >> 32u));
+    }
+  }
+  test.expected.push_back(0xdecafbadu);
+  test.initial.resize(test.expected.size(), 0xa5a5a5a5u);
+  test.initial[wave * 4u] = 0xfeedfaceu;
+  test.initial.back() = 0xdecafbadu;
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::BUFFER_LOAD_DWORDX4, ShaderOpcode::BUFFER_STORE_DWORD};
+  return test;
+}
+
 TestCase VectorVop3CompareNeU64OnGpu() {
   using O = ShaderOpcode;
 
@@ -43152,6 +43262,8 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(VectorCompareF32DenormalModes(mode));
   }
   AddCase(VectorCompareOps);
+  for (u32 wave : {32u, 64u})
+    for (bool vop3 : {false, true}) cases.push_back(Integer64Comparisons(wave, vop3));
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);
   AddCase(VectorVop3CompareGtU64OnGpu);
@@ -49327,6 +49439,25 @@ int main(int argc, char **argv) {
   // Child workers each need the real guest arena. The supervising process
   // must not reserve another 13.5 GiB before they run sequentially.
   EnsureConfigInitialized(!admission_parent);
+  if (argc == 2 && std::strcmp(argv[1], "--integer64-comparisons-cpu-only") == 0) {
+    CheckInteger64ComparisonDecoder();
+    for (u32 wave : {32u, 64u}) for (bool vop3 : {false, true}) {
+      auto test = Integer64Comparisons(wave, vop3);
+      test.compile_only = true;
+      RunCase(nullptr, test);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--integer64-comparisons-gpu-only") == 0) {
+    CheckInteger64ComparisonDecoder();
+    VulkanHarness vulkan;
+    for (u32 wave : {32u, 64u}) for (bool vop3 : {false, true})
+      RunCase(&vulkan, Integer64Comparisons(wave, vop3));
+    RunCase(&vulkan, VectorVop3CompareNeU64OnGpu());
+    RunCase(&vulkan, VectorVopcCmpxNeU64CapturedExecMask());
+    RunCase(&vulkan, VectorVop3CmpxNeI64CapturedExecMask());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-zero-sign-cpu-only") == 0) {
     CheckScalarZeroBitAndSignDecoder();
     for (u32 wave : {32u, 64u}) {

@@ -31,6 +31,30 @@ void Translator::EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueO
 	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs})), scalar, cmpx);
 }
 
+void Translator::EmitInteger64Compare(const Decoder::Instruction& inst, bool signed_value,
+                                     uint32_t predicate, bool cmpx) {
+	// RDNA2 predicate order: false, <, ==, <=, >, !=, >=, true.
+	// Signed/unsigned strict ordering plus equality implements all predicates
+	// without adding another backend path. CMPX changes EXEC and preserves VCC.
+	if (predicate == 0u || predicate == 7u) {
+		return EmitCompareConstant(inst, predicate == 7u, false, cmpx);
+	}
+	const auto lhs = ReadU64(inst.src0);
+	const auto rhs = ReadU64(inst.src1);
+	const auto less = signed_value ? IR::ValueOpcode::SLessThan64 : IR::ValueOpcode::ULessThan64;
+	IR::U1 result;
+	switch (predicate) {
+		case 1u: result = IR::U1(ir.Emit(less, {lhs, rhs})); break;
+		case 2u: result = IR::U1(ir.Emit(IR::ValueOpcode::IEqual64, {lhs, rhs})); break;
+		case 3u: result = ir.LogicalNot(IR::U1(ir.Emit(less, {rhs, lhs}))); break;
+		case 4u: result = IR::U1(ir.Emit(less, {rhs, lhs})); break;
+		case 5u: result = IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {lhs, rhs})); break;
+		case 6u: result = ir.LogicalNot(IR::U1(ir.Emit(less, {lhs, rhs}))); break;
+		default: EXIT("invalid integer64 comparison predicate");
+	}
+	EmitCompareResult(inst, result, false, cmpx);
+}
+
 void Translator::EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                       bool signed_value, bool cmpx) {
 	const auto lhs = ReadU16AsU32(inst.src0, signed_value);

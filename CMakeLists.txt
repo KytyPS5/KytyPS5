@@ -672,6 +672,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-zero-sign-gpu-only)
 	set_tests_properties(shader_scalar_zero_sign_cpu PROPERTIES TIMEOUT 60)
 	set_tests_properties(shader_scalar_zero_sign_gpu PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+	add_test(NAME shader_integer64_comparisons_cpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer64-comparisons-cpu-only)
+	add_test(NAME shader_integer64_comparisons_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer64-comparisons-gpu-only)
+	set_tests_properties(shader_integer64_comparisons_cpu PROPERTIES TIMEOUT 60)
+	set_tests_properties(shader_integer64_comparisons_gpu PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 	add_test(NAME pipeline_cache_identity
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
 	add_test(NAME pipeline_cache_checkpoint

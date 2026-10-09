@@ -96,6 +96,33 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMPX_LE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, false, true);
 			return;
+		// AnyPS5 completes this RDNA2 family; reuse the shared masked comparison path.
+		case O::V_CMP_F_I64: EmitInteger64Compare(inst, true, 0u, false); return;
+		case O::V_CMP_LT_I64: EmitInteger64Compare(inst, true, 1u, false); return;
+		case O::V_CMP_LE_I64: EmitInteger64Compare(inst, true, 3u, false); return;
+		case O::V_CMP_GT_I64: EmitInteger64Compare(inst, true, 4u, false); return;
+		case O::V_CMP_NE_I64: EmitInteger64Compare(inst, true, 5u, false); return;
+		case O::V_CMP_GE_I64: EmitInteger64Compare(inst, true, 6u, false); return;
+		case O::V_CMP_T_I64: EmitInteger64Compare(inst, true, 7u, false); return;
+		case O::V_CMPX_F_I64: EmitInteger64Compare(inst, true, 0u, true); return;
+		case O::V_CMPX_LT_I64: EmitInteger64Compare(inst, true, 1u, true); return;
+		case O::V_CMPX_EQ_I64: EmitInteger64Compare(inst, true, 2u, true); return;
+		case O::V_CMPX_LE_I64: EmitInteger64Compare(inst, true, 3u, true); return;
+		case O::V_CMPX_GT_I64: EmitInteger64Compare(inst, true, 4u, true); return;
+		case O::V_CMPX_GE_I64: EmitInteger64Compare(inst, true, 6u, true); return;
+		case O::V_CMPX_T_I64: EmitInteger64Compare(inst, true, 7u, true); return;
+		case O::V_CMP_F_U64: EmitInteger64Compare(inst, false, 0u, false); return;
+		case O::V_CMP_LE_U64: EmitInteger64Compare(inst, false, 3u, false); return;
+		case O::V_CMP_GE_U64: EmitInteger64Compare(inst, false, 6u, false); return;
+		case O::V_CMP_T_U64: EmitInteger64Compare(inst, false, 7u, false); return;
+		case O::V_CMPX_F_U64: EmitInteger64Compare(inst, false, 0u, true); return;
+		case O::V_CMPX_LT_U64: EmitInteger64Compare(inst, false, 1u, true); return;
+		case O::V_CMPX_EQ_U64: EmitInteger64Compare(inst, false, 2u, true); return;
+		case O::V_CMPX_LE_U64: EmitInteger64Compare(inst, false, 3u, true); return;
+		case O::V_CMPX_GT_U64: EmitInteger64Compare(inst, false, 4u, true); return;
+		case O::V_CMPX_GE_U64: EmitInteger64Compare(inst, false, 6u, true); return;
+		case O::V_CMPX_T_U64: EmitInteger64Compare(inst, false, 7u, true); return;
+
 		case O::V_CMP_EQ_I64:
 		case O::V_CMP_EQ_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, false, false);

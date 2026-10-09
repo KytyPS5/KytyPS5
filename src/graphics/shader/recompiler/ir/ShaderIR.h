@@ -593,7 +593,8 @@ struct ResourcePlan {
 		bool     comparable = false;
 		uint64_t payload    = 0;
 	};
-	// Reference of a root value (SRT read, descriptor DWORD), redone when the value changes.
+	// Reference of a root value (SRT read, descriptor DWORD, block condition), redone when the
+	// value changes.
 	struct WalkerRoot {
 		Value    value;
 		uint32_t ref   = UINT32_MAX;
@@ -650,6 +651,7 @@ struct ResourcePlan {
 	mutable std::vector<WalkerRoot>      walker_srt_reads;
 	mutable std::vector<WalkerRead>      walker_reads; // per SRT read root
 	mutable std::vector<WalkerRoot>      walker_descriptors;
+	mutable std::vector<WalkerRoot>      walker_conditions;
 	// Counts additions to the arrays above, which may move them: a walker refreshes its
 	// pointers after any compilation before it evaluates again.
 	mutable uint32_t walker_layout = 0;

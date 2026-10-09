@@ -1179,6 +1179,33 @@ void TestNegativeBufferImmediateIsNotRead() {
         "a constant-buffer read below its base was read");
 }
 
+// A replaced SRT read recompiles every node of the plan: the block condition is compiled again
+// and follows the memory read by the next walk.
+void TestRecompiledWalkerFollowsBlockConditions() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = ExtractResourcePlan(CleanFlatReadProgram());
+  std::array<uint32_t, 4> words{0x9000u, 0u, 64u, 0u};
+  const auto address = reinterpret_cast<uint64_t>(words.data());
+  const std::array<uint32_t, 2> user_data{static_cast<uint32_t>(address),
+                                          static_cast<uint32_t>(address >> 32u)};
+  CountedReads reads;
+  const auto runtime = CountingRuntime(user_data, reads);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[2] == 64u,
+        "the taken branch did not activate its buffer");
+  const auto *read = plan.srt_reads[0].value.ResolveInstruction();
+  auto &clone = plan.value_storage.emplace_back(read->GetOpcode());
+  for (size_t arg = 0; arg < read->NumArgs(); ++arg) clone.SetArg(arg, read->Arg(arg));
+  clone.SetFlags(read->Flags<SrtReadFlags>());
+  plan.srt_reads[0].value = Value(&clone);
+  words[2] = 65u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[2] == 0u,
+        "a recompiled walker kept a stale block condition");
+}
+
 } // namespace
 
 namespace Common {
@@ -1215,6 +1242,7 @@ int main() {
   TestFlatReadsKeepReadSemantics();
   TestCleanFlatReadsUseTheStrictReader();
   TestNegativeBufferImmediateIsNotRead();
+  TestRecompiledWalkerFollowsBlockConditions();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

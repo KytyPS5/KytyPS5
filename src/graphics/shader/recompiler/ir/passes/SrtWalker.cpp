@@ -616,6 +616,7 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 			m_program.walker_nodes.clear();
 			m_program.walker_immediates.clear();
 			m_program.walker_descriptors.clear();
+			m_program.walker_conditions.clear();
 			roots.assign(reads.size(), {});
 			m_program.walker_reads.assign(reads.size(), {});
 			for (size_t slot = 0; slot < reads.size(); ++slot) {
@@ -649,6 +650,7 @@ SrtWalker::~SrtWalker() {
 		m_program.walker_srt_reads.clear();
 		m_program.walker_reads.clear();
 		m_program.walker_descriptors.clear();
+		m_program.walker_conditions.clear();
 	}
 }
 
@@ -1383,6 +1385,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	for (const auto& block: m_program.control_flow) {
 		for (const auto source: block.sources) active.at(source) = 0u;
 	}
+	auto& conditions = m_program.walker_conditions;
+	if (conditions.size() < m_program.control_flow.size()) {
+		conditions.resize(m_program.control_flow.size());
+	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
 	visited.assign(m_program.control_flow.size(), 0u);
@@ -1398,16 +1404,17 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		for (const auto slot: block.srt_reads) {
 			if (!refresh(slot)) return false;
 		}
-		uint32_t condition = 0;
+		uint64_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+		// A condition is a root like the SRT reads: compiled once, refreshed in CompileRoot.
 		if (!block.condition.IsEmpty() &&
-		    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
-		    predicate.Evaluate(block.condition, condition)) {
-			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+		    (m_runtime.read_specialization_memory != nullptr ||
+		     !m_program.capture_specialization_reads) &&
+		    predicate.EvaluateRef(RootRef(conditions, index, block.condition), condition)) {
+			pending.push_back(block.successors[static_cast<uint32_t>(condition) != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
-		Refresh();
 	}
 	return true;
 }

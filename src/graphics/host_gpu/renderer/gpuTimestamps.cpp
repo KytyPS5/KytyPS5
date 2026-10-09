@@ -36,6 +36,10 @@ uint64_t FixedRate(double rate) {
 	return static_cast<uint64_t>(rate * FixedPointOne);
 }
 
+uint8_t AllBytes(uint32_t size) {
+	return static_cast<uint8_t>((1u << size) - 1u);
+}
+
 uint64_t ValidMask(GraphicContext& graphics) {
 	uint32_t count = 0;
 	graphics.physical_device.getQueueFamilyProperties(&count, nullptr);
@@ -300,7 +304,13 @@ void GpuTimestamps::Write(uint64_t vaddr, uint32_t size, bool end_of_pipe) {
 	}
 	m_issued++;
 	batch.queries++;
-	batch.writes.push_back({vaddr, 0, query, size, false});
+	uint64_t serial = 0;
+	{
+		std::lock_guard lock(m_mutex);
+		serial = ++m_serial;
+		m_deferred.push_back({{vaddr, 0, size, serial, AllBytes(size)}, false});
+	}
+	batch.writes.push_back({vaddr, 0, query, size, false, serial});
 	m_unstored.fetch_add(1, std::memory_order_relaxed);
 	// Timestamps may be written inside a render pass; their readback waits for the batch end.
 	m_scheduler.Current().Handle().writeTimestamp2(end_of_pipe
@@ -317,8 +327,8 @@ bool GpuTimestamps::WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size) {
 	uint64_t serial = 0;
 	{
 		std::lock_guard lock(m_mutex);
-		serial = ++m_label_serial;
-		m_pending_labels.push_back({vaddr, value, size, serial});
+		serial = ++m_serial;
+		m_deferred.push_back({{vaddr, value, size, serial, AllBytes(size)}, true});
 	}
 	CurrentBatch().writes.push_back({vaddr, value, 0, size, true, serial});
 	m_unstored.fetch_add(1, std::memory_order_relaxed);
@@ -328,9 +338,10 @@ bool GpuTimestamps::WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size) {
 std::vector<GpuTimestamps::Label> GpuTimestamps::PendingLabels(uint64_t vaddr, uint32_t size) {
 	std::vector<Label> labels;
 	std::lock_guard    lock(m_mutex);
-	for (const auto& label: m_pending_labels) {
-		if (label.vaddr < vaddr + size && vaddr < label.vaddr + label.size) {
-			labels.push_back(label);
+	for (const auto& deferred: m_deferred) {
+		if (deferred.label && deferred.live != 0 && deferred.vaddr < vaddr + size &&
+		    vaddr < deferred.vaddr + deferred.size) {
+			labels.push_back(deferred);
 		}
 	}
 	return labels;
@@ -342,24 +353,56 @@ uint64_t GpuTimestamps::ApplyLabels(const std::vector<Label>& labels, uint64_t v
 	for (const auto& label: labels) {
 		const auto begin = std::max(vaddr, label.vaddr);
 		const auto end   = std::min(vaddr + size, label.vaddr + label.size);
-		std::memcpy(reinterpret_cast<uint8_t*>(&value) + (begin - vaddr),
-		            reinterpret_cast<const uint8_t*>(&label.value) + (begin - label.vaddr),
-		            end - begin);
+		for (auto address = begin; address < end; ++address) {
+			if (((label.live >> (address - label.vaddr)) & 1u) != 0) {
+				reinterpret_cast<uint8_t*>(&value)[address - vaddr] =
+				    reinterpret_cast<const uint8_t*>(&label.value)[address - label.vaddr];
+			}
+		}
 	}
 	return value;
 }
 
-void GpuTimestamps::LabelStored(uint64_t serial) {
-	if (serial == 0) {
+void GpuTimestamps::Overwritten(uint64_t vaddr, uint64_t size) {
+	// Entries are added on this thread: none counted means none to update.
+	if (m_unstored.load(std::memory_order_acquire) == 0) {
 		return;
 	}
 	std::lock_guard lock(m_mutex);
-	const auto      label = std::lower_bound(
-	    m_pending_labels.begin(), m_pending_labels.end(), serial,
-	    [](const Label& pending, uint64_t value) { return pending.serial < value; });
-	if (label != m_pending_labels.end() && label->serial == serial) {
-		m_pending_labels.erase(label);
+	for (auto& deferred: m_deferred) {
+		const auto begin = std::max(vaddr, deferred.vaddr);
+		const auto end   = std::min(vaddr + size, deferred.vaddr + deferred.size);
+		for (auto address = begin; address < end; ++address) {
+			deferred.live &= static_cast<uint8_t>(~(1u << (address - deferred.vaddr)));
+		}
 	}
+}
+
+std::deque<GpuTimestamps::Deferred>::iterator GpuTimestamps::FindDeferred(uint64_t serial) {
+	const auto deferred = std::lower_bound(
+	    m_deferred.begin(), m_deferred.end(), serial,
+	    [](const Deferred& pending, uint64_t value) { return pending.serial < value; });
+	EXIT_IF(deferred == m_deferred.end() || deferred->serial != serial);
+	return deferred;
+}
+
+template <typename F>
+bool GpuTimestamps::ForEachLiveRun(const Label& deferred, F&& run) {
+	for (uint32_t begin = 0; begin < deferred.size;) {
+		if (((deferred.live >> begin) & 1u) == 0) {
+			begin++;
+			continue;
+		}
+		auto end = begin + 1;
+		while (end < deferred.size && ((deferred.live >> end) & 1u) != 0) {
+			end++;
+		}
+		if (!run(begin, end - begin)) {
+			return false;
+		}
+		begin = end;
+	}
+	return true;
 }
 
 void GpuTimestamps::StoreAll() {
@@ -452,10 +495,19 @@ void GpuTimestamps::Complete(const Batch& batch) {
 			            sizeof(ticks));
 			value = Clock::Convert(previous, current, ticks & m_mask, m_mask);
 		}
-		if (!deferred && m_context.StoreAtCompletion(write.vaddr, &value, write.size)) {
-			LabelStored(write.serial);
-			stored++;
-			continue;
+		if (!deferred) {
+			// Stored under the lock: a later write of the GPU thread either finds this entry
+			// gone and lands after it, or clears the bytes it covers first.
+			std::lock_guard lock(m_mutex);
+			const auto      entry = FindDeferred(write.serial);
+			const auto*     bytes = reinterpret_cast<const uint8_t*>(&value);
+			if (ForEachLiveRun(*entry, [&](uint32_t offset, uint32_t size) {
+				    return m_context.StoreAtCompletion(write.vaddr + offset, bytes + offset, size);
+			    })) {
+				m_deferred.erase(entry);
+				stored++;
+				continue;
+			}
 		}
 		// Later values must not land before this one.
 		deferred = true;
@@ -539,8 +591,20 @@ void GpuTimestamps::StoreRetries() {
 			if (retry.effect) {
 				retry.effect();
 			} else {
-				std::memcpy(reinterpret_cast<void*>(retry.vaddr), &retry.value, retry.size);
-				LabelStored(retry.serial);
+				Label entry;
+				{
+					std::lock_guard lock(m_mutex);
+					const auto      deferred = FindDeferred(retry.serial);
+					entry                    = *deferred;
+					m_deferred.erase(deferred);
+				}
+				// Retries run on the GPU thread (or once it stopped), which makes the writes that
+				// overwrite them: the live bytes stay as read.
+				(void)ForEachLiveRun(entry, [&](uint32_t offset, uint32_t size) {
+					std::memcpy(reinterpret_cast<uint8_t*>(retry.vaddr) + offset,
+					            reinterpret_cast<const uint8_t*>(&retry.value) + offset, size);
+					return true;
+				});
 				stored++;
 			}
 		}

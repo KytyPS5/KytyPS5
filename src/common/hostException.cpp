@@ -101,7 +101,8 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.native_context    = exception->ContextRecord;
 
 	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-		info.type = ExceptionType::AccessViolation;
+		info.type                   = ExceptionType::AccessViolation;
+		info.access_violation_cause = AccessViolationCause::Protection;
 		switch (exception_record->ExceptionInformation[0]) {
 			case 0: info.access_violation_type = AccessViolationType::Read; break;
 			case 1: info.access_violation_type = AccessViolationType::Write; break;
@@ -177,6 +178,7 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
 		info.type                   = ExceptionType::AccessViolation;
+		info.access_violation_cause = AccessViolationCause::Protection;
 		info.access_violation_type  = DecodeAccess(mc->__es.__err);
 		info.access_violation_vaddr = reinterpret_cast<uint64_t>(si->si_addr);
 	}
@@ -235,7 +237,12 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	info.native_context    = context;
 
 	if (signal_number == SIGSEGV || signal_number == SIGBUS) {
-		info.type             = ExceptionType::AccessViolation;
+		info.type = ExceptionType::AccessViolation;
+		if (signal_number == SIGSEGV && signal_info->si_code == SEGV_ACCERR) {
+			info.access_violation_cause = AccessViolationCause::Protection;
+		} else if (signal_number == SIGBUS && signal_info->si_code == BUS_ADRERR) {
+			info.access_violation_cause = AccessViolationCause::WriteProtect;
+		}
 		const auto error_code = static_cast<uint64_t>(gregs[REG_ERR]);
 		if ((error_code & PAGE_FAULT_ERROR_INSTRUCTION) != 0) {
 			info.access_violation_type = AccessViolationType::Execute;

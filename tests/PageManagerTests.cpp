@@ -483,6 +483,46 @@ void TestWriteWatchesKeepAccess() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestTrackingFaults() {
+  using Libs::Graphics::PageFaultAccess;
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  const auto page = region_base + page_size;
+  const auto *page_ptr = reinterpret_cast<const void *>(page);
+
+  Check(manager.IsTrackingFault(page, PageFaultAccess::Write),
+        "a write fault on a never-tracked writable page was not claimed");
+  manager.UpdatePageWatchers<true>(page, page_size);
+  Check(manager.IsTrackingFault(page, PageFaultAccess::Write),
+        "a write fault on a write-watched page was not claimed");
+  manager.UpdatePageWatchers<false>(page, page_size);
+  // Released since the fault: the retry passes.
+  Check(IsWritable(page_ptr) &&
+            manager.IsTrackingFault(page, PageFaultAccess::Write),
+        "a write fault on a released writable page was not claimed");
+#if !defined(__APPLE__)
+  // The page's own protection forbids the access: the retry would fault again.
+  Check(VirtualProtect(const_cast<void *>(page_ptr), page_size, PAGE_READONLY,
+                       nullptr) != 0,
+        "VirtualProtect failed");
+  Check(!manager.IsTrackingFault(page, PageFaultAccess::Write),
+        "a write fault on an unwatched read-only page was claimed");
+  Check(manager.IsTrackingFault(page, PageFaultAccess::Read),
+        "a read fault on a released readable page was not claimed");
+  Check(VirtualProtect(const_cast<void *>(page_ptr), page_size, PAGE_NOACCESS,
+                       nullptr) != 0,
+        "VirtualProtect failed");
+  Check(!manager.IsTrackingFault(page, PageFaultAccess::Read),
+        "a read fault on an unwatched inaccessible page was claimed");
+#endif
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestRegionEndpointBatching() {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -753,6 +793,7 @@ int main(int argc, char **argv) {
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestWriteWatchesKeepAccess();
+  TestTrackingFaults();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();

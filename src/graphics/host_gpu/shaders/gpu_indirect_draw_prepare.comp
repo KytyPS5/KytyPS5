@@ -1,6 +1,6 @@
 #version 450
 // Rewrites guest indirect draw arguments into host draw commands with the parameters the CPU
-// path would emit, and records the instance count the command processor latches.
+// path would emit, and keeps the NUM_INSTANCES the command processor latches.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer Arguments {
@@ -16,61 +16,57 @@ layout(std430, binding = 2) writeonly buffer Commands {
 	uint commands[];
 };
 
-// [0] last draw executed, [1] its instance count, [2] error bits.
-layout(std430, binding = 3) buffer State {
-	uint state[];
+// NUM_INSTANCES after the draws recorded so far.
+layout(std430, binding = 3) buffer Instances {
+	uint instances_state;
 };
 
 layout(push_constant) uniform Parameters {
 	uint max_count;
 	uint stride_dwords;
 	uint flags;
-	uint index_limit;
+	uint arguments_base;
+	uint count_base;
+	uint instances;
 } parameters;
 
 const uint FlagIndexed       = 1u;
 const uint FlagCountIndirect = 2u;
 const uint FlagKeepOffsets   = 4u;
-const uint ErrorIndexRange   = 1u;
+const uint FlagInstances     = 8u;
 
 void main() {
 	const uint index = gl_GlobalInvocationID.x;
 	const uint count = (parameters.flags & FlagCountIndirect) != 0u
-	                       ? min(guest_count[0], parameters.max_count)
+	                       ? min(guest_count[parameters.count_base], parameters.max_count)
 	                       : parameters.max_count;
 	if (index == 0u) {
 		commands[0] = count;
-		state[0]    = count != 0u ? 1u : 0u;
+		// The last executed draw latches its instance count; without one the value stays.
 		if (count != 0u) {
-			state[1] = arguments[(count - 1u) * parameters.stride_dwords + 1u];
+			instances_state = arguments[parameters.arguments_base +
+			                            (count - 1u) * parameters.stride_dwords + 1u];
+		} else if ((parameters.flags & FlagInstances) != 0u) {
+			instances_state = parameters.instances;
 		}
 	}
 	if (index >= count) {
 		return;
 	}
-	const uint base      = index * parameters.stride_dwords;
-	uint       elements  = arguments[base];
-	const uint instances = arguments[base + 1u];
-	const bool keep      = (parameters.flags & FlagKeepOffsets) != 0u;
+	const uint base = parameters.arguments_base + index * parameters.stride_dwords;
+	const bool keep = (parameters.flags & FlagKeepOffsets) != 0u;
 	if ((parameters.flags & FlagIndexed) != 0u) {
-		const uint first = arguments[base + 2u];
-		elements         = min(elements, parameters.index_limit);
-		// Only INDEX_BUFFER_SIZE indices are bound; a draw past them is refused, not truncated.
-		if (elements != 0u && instances != 0u &&
-		    (first > parameters.index_limit || elements > parameters.index_limit - first)) {
-			atomicOr(state[2], ErrorIndexRange);
-			elements = 0u;
-		}
+		// Indices past the bound INDEX_BUFFER_SIZE read as zero, as on the hardware.
 		const uint command = 1u + index * 5u;
-		commands[command]      = elements;
-		commands[command + 1u] = instances;
-		commands[command + 2u] = first;
+		commands[command]      = arguments[base];
+		commands[command + 1u] = arguments[base + 1u];
+		commands[command + 2u] = arguments[base + 2u];
 		commands[command + 3u] = keep ? arguments[base + 3u] : 0u;
 		commands[command + 4u] = keep ? arguments[base + 4u] : 0u;
 	} else {
 		const uint command = 1u + index * 4u;
-		commands[command]      = elements;
-		commands[command + 1u] = instances;
+		commands[command]      = arguments[base];
+		commands[command + 1u] = arguments[base + 1u];
 		commands[command + 2u] = keep ? arguments[base + 2u] : 0u;
 		commands[command + 3u] = keep ? arguments[base + 3u] : 0u;
 	}

@@ -80,6 +80,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 
 	// Device memory starts undefined, and the parser reports every set bit. The renderer is
 	// created before guest commands bind the scheduler, so the clear has its own submission.
+	// The barrier that ends Fill also orders the clear before later submissions on the queue.
 	m_fault_buffer.Fill(m_scheduler.BeginCommand(), 0, m_fault_buffer.Size(), 0);
 	m_scheduler.Submit();
 }

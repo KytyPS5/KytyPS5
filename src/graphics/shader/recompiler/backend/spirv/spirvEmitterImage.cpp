@@ -312,7 +312,23 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 			                              result[index], size, index);
 		}
 	}
-	if (info.multisampled == 0u) {
+	// T# MinLod folded into the view base level: the view answers for the shifted base, RESINFO must not.
+	const auto& resinfo = ctx.state.program.info.images.at(mem.resource).min_lod_resinfo;
+	if (info.multisampled == 0u && resinfo.Active()) {
+		const auto lod = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpExtInst, TypeU32(ctx.state), lod, GlslStd450(ctx.state),
+		                              GLSLstd450UMin, AddressU32(ctx, mem, address, 0),
+		                              ConstantU32(ctx.state, 31));
+		for (uint32_t index = 0; index < info.spatial_components; index++) {
+			const auto shifted = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state),
+			                            ConstantU32(ctx.state, resinfo.extent[index]), lod);
+			result[index]      = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpExtInst, TypeU32(ctx.state), result[index],
+			                              GlslStd450(ctx.state), GLSLstd450UMax, shifted,
+			                              ConstantU32(ctx.state, 1));
+		}
+		result[3] = ConstantU32(ctx.state, resinfo.levels);
+	} else if (info.multisampled == 0u) {
 		result[3] = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(ctx.state), result[3],
 		                              image);

@@ -3118,6 +3118,7 @@ public:
       uint64_t clock_before = 0;
       alignas(uint64_t) uint64_t ordered_label = 0;
       uint64_t ordered_label_at_parse = UINT64_MAX;
+      uint32_t ordered_label_for_gpu = 0;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
@@ -3175,6 +3176,9 @@ public:
         Pm4Execution ordered_execution;
         (void)processor->Process(ordered_execution, ordered);
         ordered_label_at_parse = ordered_label;
+        // Later commands run after it on the host queue: a GPU-side wait sees it already.
+        ordered_label_for_gpu = processor->ReadLabel(
+            reinterpret_cast<const volatile uint32_t *>(&ordered_label));
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -3187,8 +3191,12 @@ public:
                   interrupt_clock <= clock_after + clock_tolerance,
               "clock write with writeback and interrupt lost its data");
       Require("GpuCommandLane", "label behind a timestamp",
-              ordered_label_at_parse == 0 && ordered_label == 0x55667788u,
-              "a label was written before the GPU clock value recorded before it");
+              ordered_label_at_parse == 0 && ordered_label_for_gpu == 0x55667788u &&
+                  ordered_label == 0x55667788u &&
+                  processor->ReadLabel(reinterpret_cast<const volatile uint32_t *>(
+                      &ordered_label)) == 0x55667788u,
+              "a label was written before the GPU clock value recorded before it, or a "
+              "GPU-side read after it missed it");
       // More timestamps than queries in flight, over fewer slots: every slot holds the time of
       // its last write, in recording order.
       constexpr uint32_t batch_slots = 1000;

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -80,6 +81,10 @@ public:
 	// End-of-pipe label (immediate data). Behind a GPU clock value not stored yet, it is stored
 	// after that value, at completion. False when none is pending: the caller writes it now.
 	[[nodiscard]] bool WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size);
+	// The last label WriteLabel deferred to vaddr with this size, while it is not stored. The
+	// host queue runs commands in recording order, so a GPU-side wait recorded after the label
+	// can use it; the guest CPU sees it at completion.
+	[[nodiscard]] bool PendingLabel(uint64_t vaddr, uint32_t size, uint64_t& value);
 	// Stores every value recorded so far, before a write the GPU thread makes itself.
 	void StoreAll();
 	// Runs a guest-visible completion effect, such as an interrupt, from a completion callback
@@ -97,11 +102,12 @@ public:
 private:
 	// A GPU clock value read from query, or a label with its value.
 	struct Pending {
-		uint64_t vaddr = 0;
-		uint64_t value = 0;
-		uint32_t query = 0;
-		uint32_t size  = 0;
-		bool     label = false;
+		uint64_t vaddr  = 0;
+		uint64_t value  = 0;
+		uint32_t query  = 0;
+		uint32_t size   = 0;
+		bool     label  = false;
+		uint64_t serial = 0;
 	};
 
 	struct Batch {
@@ -119,6 +125,7 @@ private:
 		uint64_t                     value = 0;
 		uint32_t                     size  = 0;
 		Common::UniqueFunction<void> effect;
+		uint64_t                     serial = 0;
 	};
 
 	[[nodiscard]] bool SampleClocks(uint64_t& ticks, uint64_t& reference) const;
@@ -128,6 +135,7 @@ private:
 	void               Copy(const Batch& batch);
 	void               Complete(const Batch& batch);
 	void               Stored(uint64_t count);
+	void               LabelStored(uint64_t vaddr, uint64_t serial);
 	void               QueueRetries();
 
 	GraphicContext&        m_graphics;
@@ -147,6 +155,14 @@ private:
 	bool                  m_retrying     = false;
 	bool                  m_retry_queued = false;
 	Clock                 m_clock;
+	// Deferred labels by address, with the serial of the last one: value, size, serial.
+	struct PendingValue {
+		uint64_t value  = 0;
+		uint32_t size   = 0;
+		uint64_t serial = 0;
+	};
+	std::unordered_map<uint64_t, PendingValue> m_pending_labels;
+	uint64_t                                   m_label_serial = 0;
 };
 
 } // namespace Libs::Graphics

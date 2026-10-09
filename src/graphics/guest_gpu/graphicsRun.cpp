@@ -335,7 +335,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -849,7 +849,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			value = ReadLabel(static_cast<const volatile uint64_t*>(address));
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -1277,6 +1277,21 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
 	                 interrupt_context_id);
 }
+
+template <typename T>
+T CommandProcessor::ReadLabel(const volatile T* addr) {
+	// A label deferred to completion counts for the commands after it: the host queue runs them
+	// after the work before the label.
+	uint64_t pending = 0;
+	if (m_renderer.GetGpuTimestamps().PendingLabel(reinterpret_cast<uint64_t>(addr), sizeof(T),
+	                                               pending)) {
+		return static_cast<T>(pending);
+	}
+	return *addr;
+}
+
+template uint32_t CommandProcessor::ReadLabel(const volatile uint32_t*);
+template uint64_t CommandProcessor::ReadLabel(const volatile uint64_t*);
 
 template <typename T>
 void CommandProcessor::WriteLabel(T* dst, T value) {

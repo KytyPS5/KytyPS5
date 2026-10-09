@@ -314,9 +314,36 @@ bool GpuTimestamps::WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size) {
 	if (m_unstored.load(std::memory_order_acquire) == 0) {
 		return false;
 	}
-	CurrentBatch().writes.push_back({vaddr, value, 0, size, true});
+	uint64_t serial = 0;
+	{
+		std::lock_guard lock(m_mutex);
+		serial                  = ++m_label_serial;
+		m_pending_labels[vaddr] = {value, size, serial};
+	}
+	CurrentBatch().writes.push_back({vaddr, value, 0, size, true, serial});
 	m_unstored.fetch_add(1, std::memory_order_relaxed);
 	return true;
+}
+
+bool GpuTimestamps::PendingLabel(uint64_t vaddr, uint32_t size, uint64_t& value) {
+	std::lock_guard lock(m_mutex);
+	const auto      label = m_pending_labels.find(vaddr);
+	if (label == m_pending_labels.end() || label->second.size != size) {
+		return false;
+	}
+	value = label->second.value;
+	return true;
+}
+
+void GpuTimestamps::LabelStored(uint64_t vaddr, uint64_t serial) {
+	if (serial == 0) {
+		return;
+	}
+	std::lock_guard lock(m_mutex);
+	const auto      label = m_pending_labels.find(vaddr);
+	if (label != m_pending_labels.end() && label->second.serial == serial) {
+		m_pending_labels.erase(label);
+	}
 }
 
 void GpuTimestamps::StoreAll() {
@@ -410,13 +437,14 @@ void GpuTimestamps::Complete(const Batch& batch) {
 			value = Clock::Convert(previous, current, ticks & m_mask, m_mask);
 		}
 		if (!deferred && m_context.StoreAtCompletion(write.vaddr, &value, write.size)) {
+			LabelStored(write.vaddr, write.serial);
 			stored++;
 			continue;
 		}
 		// Later values must not land before this one.
 		deferred = true;
 		std::lock_guard lock(m_mutex);
-		m_retries.push_back({write.vaddr, value, write.size, {}});
+		m_retries.push_back({write.vaddr, value, write.size, {}, write.serial});
 	}
 	m_retired.fetch_add(count, std::memory_order_release);
 	Stored(stored);
@@ -496,6 +524,7 @@ void GpuTimestamps::StoreRetries() {
 				retry.effect();
 			} else {
 				std::memcpy(reinterpret_cast<void*>(retry.vaddr), &retry.value, retry.size);
+				LabelStored(retry.vaddr, retry.serial);
 				stored++;
 			}
 		}

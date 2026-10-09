@@ -22544,6 +22544,51 @@ TestCase Vop2SdwaMaxI32CapturedHighWord(u32 wave_size) {
   return test;
 }
 
+TestCase Vop2SdwaMinI32CapturedByte0(u32 wave_size) {
+  using O = ShaderOpcode;
+  struct MinCase { u32 lhs, packed_rhs, expected, exec = 1; };
+  constexpr std::array<MinCase, 9> cases{{
+      {0xfffffffbu, 0x12345678u, 0xfffffffbu},
+      {0x00000064u, 0xffffff80u, 0x00000064u},
+      {0x000000c8u, 0xffffff80u, 0x00000080u},
+      {0x7fffffffu, 0x000000ffu, 0x000000ffu},
+      {0x80000000u, 0x7fffffffu, 0x80000000u},
+      {0x00000100u, 0x00000105u, 0x00000005u},
+      {0xffffffffu, 0x00000000u, 0xffffffffu},
+      {0x00000010u, 0xdeadbe0fu, 0x0000000fu},
+      {0x80000001u, 0x7fff0123u, 0x7fff0123u, 0},
+  }};
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaMinI32Byte0Wave64"
+                             : "Vop2SdwaMinI32Byte0Wave32";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.packed_rhs});
+  }
+  test.initial.resize(cases.size() * 3u, 0xdeadbeefu);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    AppendVMovU32(&code, 30, i * 8u);
+    AppendBufferLoadDword(&code, 5, 30);
+    AppendVMovU32(&code, 30, i * 8u + 4u);
+    AppendBufferLoadDword(&code, 2, 30);
+    code.push_back(EncodeSMovB32(126, InlineU32(cases[i].exec)));
+    code.insert(code.end(), {0x220404f9u, 0x00060605u});
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = cases.size() * 2u + i;
+    AppendStoreVgpr(&code, 2, out);
+    test.expected[out] = cases[i].expected;
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_MIN_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MIN_I32 v2, v5, v2.sdwa(sel=0,sext=0)", cases.size()}};
+  test.required_spirv = {"OpBitFieldUExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop2SdwaMulI24Destinations(u32 wave_size) {
   using O = ShaderOpcode;
   constexpr std::array<u32, 5> sources{
@@ -36886,6 +36931,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(32));
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(64));
+  cases.push_back(Vop2SdwaMinI32CapturedByte0(32));
+  cases.push_back(Vop2SdwaMinI32CapturedByte0(64));
   cases.push_back(Vop2SdwaMulI24Destinations(32));
   cases.push_back(Vop2SdwaMulI24Destinations(64));
   cases.push_back(Vop2SdwaMulU24Destinations(32));

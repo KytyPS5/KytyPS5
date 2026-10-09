@@ -3746,22 +3746,31 @@ void TestPackedReciprocalSquareRoot() {
 
 // PS5 executables keep switch tables in read-only data, outside the code segment. A dispatch
 // whose table, index bound and base the patcher can prove, or a tail call, must not leave a
-// four-byte VRSQRTPS on the SIGILL path, and must expose the VRSQRTPS in its cases.
+// four-byte VRSQRTPS on the SIGILL path, and must expose the VRSQRTPS in its cases. Any
+// dispatch it cannot prove keeps the function on direct control flow and the site trapped.
 void TestReciprocalSquareRootBesideJumpTables() {
 	const char* test = "ReciprocalSquareRootBesideJumpTables";
 	constexpr uint64_t module_size = 0x4000;
-	constexpr uint64_t table_offset = 0x3000;
+	constexpr uint64_t data_offset = 0x3000;
 	constexpr uint64_t allocation_size = module_size * 2;
 	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
-	    0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_table_test");
+			0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_table_test");
 	Check(test, mapping != 0, "failed to allocate jump-table test code");
 	InstructionTestScope restore {mapping, allocation_size};
 	restore.InstallHandler(test);
 	using GuestFunction = void(KYTY_SYSV_ABI*)(uint32_t, const uint32_t*, uint32_t*);
 	const auto function = reinterpret_cast<GuestFunction>(mapping);
 	const std::array<uintptr_t, 1> function_starts {mapping};
-	auto* table = reinterpret_cast<int32_t*>(mapping + table_offset);
+	// Read-only data: the main table, a copy of it, a one-entry table and an absolute table.
+	auto* table = reinterpret_cast<int32_t*>(mapping + data_offset);
+	auto* table_copy = reinterpret_cast<int32_t*>(mapping + data_offset + 0x40);
+	auto* inner_table = reinterpret_cast<int32_t*>(mapping + data_offset + 0x80);
+	auto* absolute_table = reinterpret_cast<uint64_t*>(mapping + data_offset + 0xc0);
+	constexpr uint64_t read_only_size = 0x100;
+	// A pointer to a pointer slot, as a vtable is reached from an object.
+	auto* slot = reinterpret_cast<uint64_t*>(mapping + data_offset + 0x100);
 	const auto tail_target = mapping + 0x800;
+	const auto helper = mapping + 0x810;
 	enum class Dispatch {
 		Bounded,
 		ByteIndex,
@@ -3770,19 +3779,69 @@ void TestReciprocalSquareRootBesideJumpTables() {
 		Redispatch,
 		ConstantIndex,
 		TailCall,
-		Unbounded
+		TailCallThroughSlot,
+		Unbounded,
+		IndexRewritten,
+		TwoBases,
+		EnteredPath,
+		CallClobbersIndex,
+		CallClobbersBase,
+		EntryOutsideFunction,
+		TargetIsTable,
+		WritableTable,
+		DispatchAfterEpilogue,
+		AbsoluteTableAfterEpilogue,
+		JumpWithFrame,
+		ReenteredDispatch,
+		MisalignedEntry
 	};
-	for (const auto dispatch: {Dispatch::Bounded, Dispatch::ByteIndex, Dispatch::Masked,
-	                           Dispatch::HoistedBase, Dispatch::Redispatch, Dispatch::ConstantIndex,
-	                           Dispatch::TailCall, Dispatch::Unbounded}) {
+	struct Variant {
+		Dispatch dispatch;
+		const char* name;
+		bool proven;
+		// Selectors that are safe to run; case `selector + shift` is expected, 9 takes the fallback.
+		std::vector<uint32_t> selectors;
+		uint32_t shift = 0;
+	};
+	const std::vector<Variant> variants {
+			{Dispatch::Bounded, "bounded", true, {0, 1, 2, 3, 9}},
+			{Dispatch::ByteIndex, "byte index", true, {0, 1, 2, 3, 9}},
+			{Dispatch::Masked, "masked", true, {0, 1, 2, 3}},
+			{Dispatch::HoistedBase, "hoisted base", true, {0, 1, 2, 3}},
+			{Dispatch::Redispatch, "redispatch", true, {0, 1, 2, 3}},
+			{Dispatch::ConstantIndex, "constant index", true, {0, 1, 2, 3}},
+			{Dispatch::TailCall, "tail call", true, {0, 1, 2, 3, 9}},
+			{Dispatch::TailCallThroughSlot, "tail call through a slot", true, {0, 1, 2, 3, 9}},
+			{Dispatch::Unbounded, "unbounded", false, {1, 2, 3}},
+			{Dispatch::IndexRewritten, "index rewritten after the guard", false, {0, 1, 2, 9}, 1},
+			{Dispatch::TwoBases, "two table bases", false, {1, 2, 3, 9}},
+			{Dispatch::EnteredPath, "branch into the dispatch path", false, {1, 2, 3, 9}},
+			{Dispatch::CallClobbersIndex, "call clobbers the index", false, {1, 2, 3, 9}},
+			{Dispatch::CallClobbersBase, "call clobbers the base", false, {1, 2, 3, 9}},
+			{Dispatch::EntryOutsideFunction, "entry outside the function", false, {1, 2, 9}},
+			{Dispatch::TargetIsTable, "target register is the base", false, {9}},
+			{Dispatch::WritableTable, "writable table", false, {1, 2, 3, 9}},
+			{Dispatch::DispatchAfterEpilogue, "dispatch after the epilogue", false, {}},
+			{Dispatch::AbsoluteTableAfterEpilogue, "absolute table after the epilogue", false, {}},
+			{Dispatch::JumpWithFrame, "indirect jump inside the frame", false, {}},
+			{Dispatch::ReenteredDispatch, "case entering an earlier dispatch", false, {2, 3, 9}},
+			{Dispatch::MisalignedEntry, "entry inside an instruction", false, {1, 2, 9}},
+	};
+	for (const auto& variant: variants) {
+		const auto dispatch = variant.dispatch;
+		const std::string context = std::string(" (") + variant.name + ")";
 		std::memset(reinterpret_cast<void*>(mapping), 0xcc, module_size);
 		*reinterpret_cast<uint8_t*>(tail_target) = 0xc3; // ret
+		*reinterpret_cast<uint8_t*>(helper) = 0xc3;      // ret
+		slot[0] = reinterpret_cast<uint64_t>(&slot[1]);
+		slot[1] = tail_target;
 		Xbyak::CodeGenerator code(0x800, reinterpret_cast<void*>(mapping));
 		Xbyak::Label cases[4];
 		Xbyak::Label fallback;
 		Xbyak::Label done;
 		Xbyak::Label dispatch_jump;
 		Xbyak::Label redispatch;
+		Xbyak::Label path_entry;
 		const auto table_address = reinterpret_cast<const void*>(table);
 		const bool hoisted = dispatch == Dispatch::HoistedBase || dispatch == Dispatch::Redispatch;
 		const Xbyak::Reg64 base = hoisted ? code.r12 : code.rcx;
@@ -3795,12 +3854,19 @@ void TestReciprocalSquareRootBesideJumpTables() {
 		code.vmovups(code.xmm1, code.ptr[code.rsi]);
 		code.vrsqrtps(code.xmm2, code.xmm1);
 		code.vmovups(code.ptr[code.rdx + 32], code.xmm2);
+		bool sum_dispatch = true;
 		switch (dispatch) {
 			case Dispatch::Bounded:
 			case Dispatch::TailCall:
+			case Dispatch::TailCallThroughSlot:
+			case Dispatch::EntryOutsideFunction:
+			case Dispatch::WritableTable:
+			case Dispatch::ReenteredDispatch:
+			case Dispatch::MisalignedEntry:
 				code.cmp(code.edi, 3);
 				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
 				code.mov(code.eax, code.edi);
+				code.L(path_entry);
 				code.lea(code.rcx, code.ptr[code.rip + table_address]);
 				break;
 			case Dispatch::ByteIndex:
@@ -3846,11 +3912,105 @@ void TestReciprocalSquareRootBesideJumpTables() {
 				code.mov(code.eax, code.edi);
 				code.lea(code.rcx, code.ptr[code.rip + table_address]);
 				break;
+			case Dispatch::IndexRewritten:
+				code.cmp(code.edi, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				code.mov(code.eax, code.edi);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				code.add(code.eax, 1);
+				break;
+			case Dispatch::TwoBases: {
+				// Selector 0 reads the copy of the table: same cases, another base.
+				Xbyak::Label join;
+				code.mov(code.eax, code.edi);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				code.test(code.edi, code.edi);
+				code.jnz(join, Xbyak::CodeGenerator::T_NEAR);
+				code.lea(code.rcx, code.ptr[code.rip + reinterpret_cast<const void*>(table_copy)]);
+				code.L(join);
+				code.cmp(code.eax, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				break;
+			}
+			case Dispatch::EnteredPath: {
+				// Selector 7 enters below the guard with an index the guard never checked.
+				Xbyak::Label entered;
+				code.mov(code.eax, code.edi);
+				code.cmp(code.edi, 7);
+				code.je(entered, Xbyak::CodeGenerator::T_NEAR);
+				code.cmp(code.edi, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				code.L(entered);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				break;
+			}
+			case Dispatch::CallClobbersIndex:
+				code.mov(code.eax, code.edi);
+				code.cmp(code.eax, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				code.call(reinterpret_cast<const void*>(helper));
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				break;
+			case Dispatch::CallClobbersBase:
+				// The index lives in a callee-saved register, so only the base is lost by the call.
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				code.mov(code.ebx, code.edi);
+				code.cmp(code.ebx, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				code.call(reinterpret_cast<const void*>(helper));
+				code.movsxd(code.rax, code.dword[code.rcx + code.rbx * 4]);
+				code.add(code.rax, code.rcx);
+				code.jmp(code.rax);
+				sum_dispatch = false;
+				break;
+			case Dispatch::TargetIsTable:
+				// add rax, rax doubles the entry instead of adding the base.
+				code.cmp(code.edi, 3);
+				code.ja(fallback, Xbyak::CodeGenerator::T_NEAR);
+				code.mov(code.ecx, code.edi);
+				code.lea(code.rax, code.ptr[code.rip + table_address]);
+				code.movsxd(code.rax, code.dword[code.rax + code.rcx * 4]);
+				code.add(code.rax, code.rax);
+				code.jmp(code.rax);
+				sum_dispatch = false;
+				break;
+			case Dispatch::DispatchAfterEpilogue:
+				// An unproven dispatch after the frame is gone still targets this function.
+				code.mov(code.eax, code.edi);
+				code.lea(code.rcx, code.ptr[code.rip + table_address]);
+				code.movsxd(code.rax, code.dword[code.rcx + code.rax * 4]);
+				code.add(code.rax, code.rcx);
+				code.pop(code.rbx);
+				code.pop(code.r12);
+				code.pop(code.rbp);
+				code.jmp(code.rax);
+				sum_dispatch = false;
+				break;
+			case Dispatch::AbsoluteTableAfterEpilogue:
+				code.mov(code.eax, code.edi);
+				code.lea(code.rcx, code.ptr[code.rip + reinterpret_cast<const void*>(absolute_table)]);
+				code.mov(code.rax, code.qword[code.rcx + code.rax * 8]);
+				code.pop(code.rbx);
+				code.pop(code.r12);
+				code.pop(code.rbp);
+				code.jmp(code.rax);
+				sum_dispatch = false;
+				break;
+			case Dispatch::JumpWithFrame:
+				// A loaded pointer, but the frame is still there: not a tail call.
+				code.mov(code.rax, code.qword[code.rip + reinterpret_cast<const void*>(&slot[1])]);
+				code.pop(code.rbx);
+				code.pop(code.r12);
+				code.jmp(code.rax);
+				sum_dispatch = false;
+				break;
 		}
-		code.movsxd(code.rax, code.dword[base + code.rax * 4]);
-		code.add(code.rax, base);
-		code.L(redispatch);
-		code.jmp(code.rax);
+		if (sum_dispatch) {
+			code.movsxd(code.rax, code.dword[base + code.rax * 4]);
+			code.add(code.rax, base);
+			code.L(redispatch);
+			code.jmp(code.rax);
+		}
 		code.L(cases[0]);
 		code.vmovups(code.xmm1, code.ptr[code.rsi]);
 		code.vrsqrtps(code.xmm0, code.xmm1);
@@ -3864,6 +4024,16 @@ void TestReciprocalSquareRootBesideJumpTables() {
 		code.jmp(done, Xbyak::CodeGenerator::T_NEAR);
 		for (uint32_t index = 1; index < 4; ++index) {
 			code.L(cases[index]);
+			if (dispatch == Dispatch::ReenteredDispatch && index == 1) {
+				// A second dispatch, only decoded once the first is resolved, enters the first one's
+				// path below its guard.
+				code.xor_(code.eax, code.eax);
+				code.lea(code.rcx, code.ptr[code.rip + reinterpret_cast<const void*>(inner_table)]);
+				code.movsxd(code.rax, code.dword[code.rcx + code.rax * 4]);
+				code.add(code.rax, code.rcx);
+				code.jmp(code.rax);
+				continue;
+			}
 			code.mov(code.dword[code.rdx], index);
 			code.jmp(done, Xbyak::CodeGenerator::T_NEAR);
 		}
@@ -3876,49 +4046,120 @@ void TestReciprocalSquareRootBesideJumpTables() {
 			code.mov(code.rax, tail_target);
 			code.pop(code.rbp);
 			code.jmp(code.rax);
+		} else if (dispatch == Dispatch::TailCallThroughSlot) {
+			code.mov(code.rax, code.qword[code.rip + reinterpret_cast<const void*>(&slot[0])]);
+			code.pop(code.rbp);
+			code.jmp(code.ptr[code.rax]);
 		} else {
 			code.pop(code.rbp);
 			code.ret();
 		}
-		Check(test, Xbyak::GetError() == 0 && code.getSize() < 0x800, "failed to generate jump-table fixture");
+		Check(test, Xbyak::GetError() == 0 && code.getSize() < 0x800, "failed to generate jump-table fixture" + context);
 		for (uint32_t index = 0; index < 4; ++index) {
-			table[index] = static_cast<int32_t>(reinterpret_cast<intptr_t>(cases[index].getAddress()) -
-			                                    reinterpret_cast<intptr_t>(table));
+			const auto target = reinterpret_cast<intptr_t>(cases[index].getAddress());
+			table[index] = static_cast<int32_t>(target - reinterpret_cast<intptr_t>(table));
+			table_copy[index] = static_cast<int32_t>(target - reinterpret_cast<intptr_t>(table_copy));
+			absolute_table[index] = static_cast<uint64_t>(target);
 		}
+		if (dispatch == Dispatch::EntryOutsideFunction) {
+			table[3] = static_cast<int32_t>(static_cast<intptr_t>(tail_target) - reinterpret_cast<intptr_t>(table));
+		} else if (dispatch == Dispatch::MisalignedEntry) {
+			table[3] = table[2] + 1;
+		}
+		inner_table[0] = static_cast<int32_t>(reinterpret_cast<intptr_t>(path_entry.getAddress()) -
+																					reinterpret_cast<intptr_t>(inner_table));
 		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), module_size,
-		                                            reinterpret_cast<void*>(mapping + module_size), module_size);
+																								reinterpret_cast<void*>(mapping + module_size), module_size);
+		if (dispatch != Dispatch::WritableTable) {
+			Loader::RegisterGuestInstructionPatchReadOnlyData(reinterpret_cast<void*>(mapping), mapping + data_offset,
+																												read_only_size);
+		}
 		const auto result = Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, true);
 		// Unproven dispatches keep the trap for the straight-line site and hide their cases.
-		const bool proven = dispatch != Dispatch::Unbounded;
+		const bool proven = variant.proven;
 		Check(test, Xbyak::GetError() == 0 && result.reciprocal_sqrt.found == (proven ? 2u : 1u) &&
-		                result.reciprocal_sqrt.native == (proven ? 2u : 0u) &&
-		                result.reciprocal_sqrt.trapped == (proven ? 0u : 1u),
-		      "a provable dispatch or tail call kept VRSQRTPS on the trap path");
+										result.reciprocal_sqrt.native == (proven ? 2u : 0u) &&
+										result.reciprocal_sqrt.trapped == (proven ? 0u : 1u),
+					(proven ? "a provable dispatch or tail call kept VRSQRTPS on the trap path"
+									: "an unproven dispatch let the patcher borrow bytes or decode its cases") +
+							context);
 		const std::array<uint32_t, 4> input {0x40800000, 0x3f800000, 0x41800000, 0x3e800000};
 		const std::array<uint32_t, 4> roots {0x3f000000, 0x3f800000, 0x3e800000, 0x40000000};
-		const bool bounded = dispatch == Dispatch::Bounded || dispatch == Dispatch::ByteIndex ||
-		                     dispatch == Dispatch::TailCall;
-		for (const uint32_t selector: {0u, 1u, 2u, 3u, 9u}) {
-			if ((selector == 9 && !bounded) || (selector == 0 && !proven)) {
-				continue;
-			}
+		for (const uint32_t selector: variant.selectors) {
+			const uint32_t target_case = selector == 9 ? 9 : selector + variant.shift;
 			std::array<uint32_t, 12> output {};
 			const auto traps_before = g_instruction_traps;
 			function(selector, input.data(), output.data());
 			const auto traps = static_cast<uint64_t>(g_instruction_traps - traps_before);
 			Check(test, std::equal(roots.begin(), roots.end(), output.begin() + 8) &&
-			                traps == (proven ? 0u : 1u),
-			      "straight-line reciprocal root lost exact results or its patch");
-			if (selector == 0) {
+											traps == (proven ? 0u : 1u),
+						"straight-line reciprocal root lost exact results or its patch" + context);
+			if (target_case == 0) {
 				Check(test, std::equal(roots.begin(), roots.end(), output.begin()) &&
-				                (dispatch != Dispatch::Redispatch ||
-				                 std::equal(roots.begin(), roots.end(), output.begin() + 4)),
-				      "dispatched reciprocal root lost exact results");
+												(dispatch != Dispatch::Redispatch ||
+												 std::equal(roots.begin(), roots.end(), output.begin() + 4)),
+							"dispatched reciprocal root lost exact results" + context);
 			} else {
-				Check(test, output[0] == (selector == 9 ? 0xffffffffu : selector),
-				      "patched dispatch reached the wrong case");
+				Check(test, output[0] == (target_case == 9 ? 0xffffffffu : target_case),
+							"patched dispatch reached the wrong case" + context);
 			}
 		}
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// The red-zone liveness analysis must follow resolved jump-table edges: here the red zone is
+// read only in a case, so it is live across the table load before the dispatch.
+void TestRedZoneLivenessAcrossJumpTables() {
+	const char* test = "RedZoneLivenessAcrossJumpTables";
+	constexpr uint64_t module_size = 0x4000;
+	constexpr uint64_t table_offset = 0x3000;
+	constexpr uint64_t allocation_size = module_size * 2;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+			0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_table_test");
+	Check(test, mapping != 0, "failed to allocate jump-table test code");
+	InstructionTestScope restore {mapping, allocation_size};
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(uint32_t, uint64_t);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const std::array<uintptr_t, 1> function_starts {mapping};
+	auto* table = reinterpret_cast<int32_t*>(mapping + table_offset);
+	std::memset(reinterpret_cast<void*>(mapping), 0xcc, module_size);
+	Xbyak::CodeGenerator code(0x800, reinterpret_cast<void*>(mapping));
+	Xbyak::Label cases[4];
+	code.mov(code.qword[code.rsp - 8], code.rsi);
+	code.mov(code.eax, code.edi);
+	code.and_(code.eax, 3);
+	code.lea(code.rcx, code.ptr[code.rip + reinterpret_cast<const void*>(table)]);
+	code.movsxd(code.rax, code.dword[code.rcx + code.rax * 4]);
+	code.add(code.rax, code.rcx);
+	code.jmp(code.rax);
+	code.L(cases[0]);
+	code.mov(code.rax, code.qword[code.rsp - 8]);
+	code.ret();
+	for (uint32_t index = 1; index < 4; ++index) {
+		code.L(cases[index]);
+		code.mov(code.eax, index);
+		code.ret();
+	}
+	Check(test, Xbyak::GetError() == 0, "failed to generate red-zone jump-table fixture");
+	for (uint32_t index = 0; index < 4; ++index) {
+		table[index] = static_cast<int32_t>(reinterpret_cast<intptr_t>(cases[index].getAddress()) -
+																				reinterpret_cast<intptr_t>(table));
+	}
+	Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), module_size,
+																							reinterpret_cast<void*>(mapping + module_size), module_size);
+	Loader::RegisterGuestInstructionPatchReadOnlyData(reinterpret_cast<void*>(mapping), mapping + table_offset,
+																										4 * sizeof(int32_t));
+	const auto result = Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, true, false);
+	Check(test, result.red_zone_function_count == 1 && result.indirect_red_zone_function_count == 0,
+				"the dispatch was not resolved");
+	Check(test, result.memory_instruction_count == 1 && result.patched_memory_instruction_count == 1 &&
+									result.unrelocatable_memory_instruction_count == 0,
+				"the table load was not protected although a case reads the red zone");
+	constexpr uint64_t value = 0x1122334455667788ull;
+	for (uint32_t selector = 0; selector < 4; ++selector) {
+		Check(test, function(selector, value) == (selector == 0 ? value : selector),
+					"patched dispatch returned the wrong value");
 	}
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -4631,6 +4872,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
 		RunTest(TestReciprocalSquareRootBesideJumpTables);
+		RunTest(TestRedZoneLivenessAcrossJumpTables);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
@@ -4645,6 +4887,7 @@ int main(int argc, char** argv) {
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
 	RunTest(TestReciprocalSquareRootBesideJumpTables);
+	RunTest(TestRedZoneLivenessAcrossJumpTables);
 	RunTest(TestPackedBitFieldExtract);
 	RunTest(TestCpuExtensionContexts);
 	RunTest(TestPackedBitFieldInsert);

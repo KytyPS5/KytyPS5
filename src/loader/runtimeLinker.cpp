@@ -1744,6 +1744,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				PatchProgram(program, segment_addr, segment_memory_size);
 				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}
+			// Relocations may still write a RELRO segment, so only plain read-only loads qualify.
+			if (patch_guest_instructions && phdr[i].p_type == PT_LOAD &&
+			    (phdr[i].p_flags & (PF_R | PF_W)) == PF_R) {
+				RegisterGuestInstructionPatchReadOnlyData(
+				    reinterpret_cast<void*>(program->base_vaddr), segment_addr, phdr[i].p_memsz);
+			}
 
 			if (!skip_protect) {
 				Libs::LibKernel::Memory::SetProgramMemoryProtection(segment_addr,

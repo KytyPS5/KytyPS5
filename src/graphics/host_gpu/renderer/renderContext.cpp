@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -121,6 +122,29 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+void RenderContext::FindBdaBuffers(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	if (ranges.empty()) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	for (const auto& [address, size]: ranges) {
+		if (size == 0 || size > UINT64_MAX - address) {
+			continue;
+		}
+		// Page by page, like the fault buffer: a page that a buffer already holds is not joined
+		// with a neighbouring page that has none.
+		m_mapped_ranges.ForEachInRange(address, size, [this](uint64_t start, uint64_t end) {
+			while (start < end) {
+				const auto next =
+				    std::min(end, Common::AlignDown(start, BufferCache::CACHING_PAGESIZE) +
+				                      BufferCache::CACHING_PAGESIZE);
+				(void)m_buffer_cache.FindBuffer(start, next - start);
+				start = next;
+			}
+		});
+	}
 }
 
 void RenderContext::PrepareBda() {

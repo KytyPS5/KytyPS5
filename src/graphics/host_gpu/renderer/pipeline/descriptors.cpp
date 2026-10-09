@@ -812,6 +812,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		const auto& program  = *prepared.runtime->program;
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout = program.bindings;
+		// A BDA miss reads zero and is only mapped after the dispatch; map the known reads now.
+		m_context.FindBdaBuffers(snapshot.gpu_scalar_reads);
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;

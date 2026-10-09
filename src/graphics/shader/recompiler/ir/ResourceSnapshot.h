@@ -36,6 +36,8 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// Byte ranges of GPU-side scalar loads; the renderer makes them resident before the shader.
+	std::vector<std::pair<uint64_t, uint64_t>> gpu_scalar_reads;
 	UniformFill                 uniform_fill;
 };
 

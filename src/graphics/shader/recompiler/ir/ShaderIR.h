@@ -533,6 +533,13 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+// A scalar load the shader issues through BDA from an address the host plan can evaluate.
+struct GpuScalarRead {
+	std::array<Value, 3> address;    // base low, base high, SGPR offset
+	uint32_t             offset = 0; // instruction offset
+	uint32_t             block  = 0; // index in the resource control flow
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -590,6 +597,7 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<GpuScalarRead>                 gpu_scalar_reads;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

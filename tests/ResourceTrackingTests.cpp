@@ -559,7 +559,8 @@ void TestWaterfallImageTable() {
 
 void TestGuardedDirectImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  enum class Guard { Nonzero, SccNonZero, Plain, Zero, Unrelated, Bypass, ExecZero, VccZero };
+  enum class Guard { Nonzero, SccNonZero, Plain, Zero, Unrelated, Bypass, ExecZero, VccZero,
+                     LaneExit, LaneUnobserved, LaneUnrelated, LaneAny, LaneMask };
   const auto make_plan = [](Guard guard) {
     Fixture fixture(ShaderType::Pixel);
     fixture.program.wave_size = 64u;
@@ -582,20 +583,53 @@ void TestGuardedDirectImageTable() {
     const auto kind = guard == Guard::ExecZero ? CFG::BranchCondition::ExecZero
                     : guard == Guard::VccZero ? CFG::BranchCondition::VccZero
                                              : CFG::BranchCondition::SccZero;
+    const bool lane_guard = guard == Guard::LaneExit || guard == Guard::LaneUnobserved ||
+                            guard == Guard::LaneUnrelated || guard == Guard::LaneAny ||
+                            guard == Guard::LaneMask;
+    Value scan_valid;
+    // Per-lane EXEC and an unrelated lane predicate.
+    const auto exec = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(1u), Value(0u)}), Value(0u)});
+    const auto other = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(2u), Value(0u)}), Value(0u)});
     auto condition = nonzero;
-    if (guard == Guard::SccNonZero) {
+    if (lane_guard) {
+      // s_cselect_b64 vcc, exec, 0 exit: VCC = (ff1 >= count || ff1 == -1) && EXEC.
+      const auto scan = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+      // s_cmp_lg_u32 -1, ff1; s_cselect_b64 exec, exec, 0.
+      scan_valid = fixture.Emit(ValueOpcode::LogicalAnd,
+          {fixture.Emit(ValueOpcode::INotEqual32, {Value(0xffffffffu), scan}), exec});
+      const auto past = fixture.Emit(ValueOpcode::LogicalAnd,
+          {fixture.Emit(ValueOpcode::UGreaterThanEqual32, {scan, fixture.UserData(3)}), exec});
+      const auto empty = fixture.Emit(ValueOpcode::LogicalAnd,
+          {fixture.Emit(ValueOpcode::IEqual32, {Value(0xffffffffu), scan}), exec});
+      condition = fixture.Emit(ValueOpcode::LogicalOr, {past, empty});
+      // LaneAny enters on "some lane has VCC clear", which says nothing of the sampling lanes.
+      if (guard == Guard::LaneAny || guard == Guard::LaneMask)
+        condition = fixture.Emit(ValueOpcode::LogicalNot, {condition});
       condition = fixture.Emit(ValueOpcode::ConditionRef, {condition},
-                               CFG::BranchCondition::SccNonZero);
-    }
-    condition = fixture.Emit(ValueOpcode::LogicalNot, {condition});
-    if (guard != Guard::Plain && guard != Guard::SccNonZero) {
-      condition = fixture.Emit(ValueOpcode::ConditionRef, {condition}, kind);
+                               CFG::BranchCondition::VccNonZero);
+    } else {
+      if (guard == Guard::SccNonZero) {
+        condition = fixture.Emit(ValueOpcode::ConditionRef, {condition},
+                                 CFG::BranchCondition::SccNonZero);
+      }
+      condition = fixture.Emit(ValueOpcode::LogicalNot, {condition});
+      if (guard != Guard::Plain && guard != Guard::SccNonZero) {
+        condition = fixture.Emit(ValueOpcode::ConditionRef, {condition}, kind);
+      }
     }
     fixture.program.blocks[0]->condition = condition;
     fixture.program.blocks[0]->terminator = {
         .kind = CFG::TerminatorKind::ConditionalBranch,
-        .true_block = fixture.program.blocks[guard == Guard::Zero ? 1u : 4u],
-        .false_block = fixture.program.blocks[guard == Guard::Zero ? 4u : 1u]};
+        .true_block = fixture.program.blocks[guard == Guard::Zero || guard == Guard::LaneAny ||
+                                                     guard == Guard::LaneMask
+                                                 ? 1u
+                                                 : 4u],
+        .false_block = fixture.program.blocks[guard == Guard::Zero || guard == Guard::LaneAny ||
+                                                      guard == Guard::LaneMask
+                                                  ? 4u
+                                                  : 1u]};
     for (uint32_t block = 1; block < 4; ++block) {
       fixture.program.blocks[block]->terminator = {
           .kind = CFG::TerminatorKind::Branch,
@@ -641,8 +675,20 @@ void TestGuardedDirectImageTable() {
     MemoryInfo memory;
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
-                 fixture.AddMemory(memory, 0x128));
+    const auto texel = fixture.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture.ImageAddress()}, fixture.AddMemory(memory, 0x128));
+    if (lane_guard) {
+      // The texel reaches registers only through a VALU write masked by the sampling lanes.
+      const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(0u)});
+      // LaneMask: no guarding edge, but the sampling lanes are a subset of the valid scan.
+      const auto lanes = guard == Guard::LaneUnrelated ? other
+                         : fixture.Emit(ValueOpcode::LogicalAnd,
+                                        {guard == Guard::LaneMask ? scan_valid : exec, other});
+      fixture.Emit(ValueOpcode::ReferenceU32,
+                   {guard == Guard::LaneUnobserved
+                        ? component
+                        : fixture.Emit(ValueOpcode::SelectU32, {lanes, component, Value(0u)})});
+    }
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
@@ -658,8 +704,11 @@ void TestGuardedDirectImageTable() {
   auto plan = make_plan(Guard::Nonzero);
   make_plan(Guard::SccNonZero);
   make_plan(Guard::Plain);
+  make_plan(Guard::LaneExit);
+  make_plan(Guard::LaneMask);
   for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass,
-                           Guard::ExecZero, Guard::VccZero}) {
+                           Guard::ExecZero, Guard::VccZero, Guard::LaneUnobserved,
+                           Guard::LaneUnrelated, Guard::LaneAny}) {
     CheckFatal([&] { make_plan(guard); }, "not a valid runtime value",
                "direct table accepted a selector without a dominating nonzero guard");
   }

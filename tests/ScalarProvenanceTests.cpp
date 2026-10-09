@@ -640,7 +640,7 @@ ReductionIr BuildReduction(Fixture &fixture, ValueOpcode op, uint32_t neutral,
   PermlaneFlags perm;
   perm.x16 = true;
   const auto swapped = fixture.Emit(ValueOpcode::Permlane16U32,
-                                    {current, Value(perm_select), Value(perm_select), whole},
+                                    {current, Value(perm_select), Value(perm_select), whole, Value(0u)},
                                     FlagBits(perm));
   const auto fetched = fixture.Emit(ValueOpcode::SelectU32, {whole, swapped, data});
   const auto combined = fixture.Emit(op, {current, fetched});
@@ -725,8 +725,11 @@ void TestPartialWaveReductionRejectsUnprovenPatterns() {
     Fixture fixture;
     fixture.program.stage = ShaderType::Pixel;
     BuildReduction(fixture, ValueOpcode::UMin32, 0xffffffffu, true, 0x76543210u);
-    Check(LowerPartialWaveReductions(fixture.program).rewritten_reads == 0,
+    const auto stats = LowerPartialWaveReductions(fixture.program);
+    Check(stats.rewritten_reads == 0,
           "non-lane-15 permlane selector was accepted");
+    Check(stats.rejections.size() == 2 && stats.rejections[0].find("permlane mismatch") != std::string::npos,
+          "rejection diagnostic missing or wrong");
   }
   {
     Fixture fixture;  // compute waves are launched whole

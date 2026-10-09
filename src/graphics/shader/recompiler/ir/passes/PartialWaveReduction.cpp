@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/PartialWaveReduction.h"
 
 #include <cstdlib>
+#include <string>
 #include <optional>
 #include <unordered_set>
 #include <vector>
@@ -21,6 +22,27 @@ struct Reduction {
 	WaveReduceOp op;
 	Value        input; // value fed to the first DPP step (neutral already applied)
 };
+
+// Rejection diagnostic (KYTY_DBG_LANE_AUDIT): the deepest matcher stage that failed wins.
+struct RejectDiag {
+	int         stage = -1;
+	std::string text;
+	void        Note(int s, std::string t) {
+		if (s >= stage) {
+			stage = s;
+			text  = std::move(t);
+		}
+	}
+};
+thread_local RejectDiag g_diag;
+
+std::string OpName(Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) return "imm";
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) return "none";
+	return std::string(ValueOpcodeName(inst->GetOpcode()));
+}
 
 Inst* InstOf(Value value) {
 	return value.Resolve().TryInstruction();
@@ -106,15 +128,31 @@ uint32_t NeutralOf(WaveReduceOp op) {
 // DppUpdate(Op(DppMove(Y, E), Y), Y, E) with the given row_shr amount; returns Y.
 std::optional<Value> MatchRowShrStep(Value value, ValueOpcode opcode, uint32_t shift) {
 	const auto* update = InstOf(value);
-	if (update == nullptr || update->GetOpcode() != ValueOpcode::DppUpdateU32) return std::nullopt;
+	const auto  tag    = "row_shr:" + std::to_string(shift) + " step: ";
+	if (update == nullptr || update->GetOpcode() != ValueOpcode::DppUpdateU32) {
+		g_diag.Note(5, tag + "chain value is " + OpName(value) + ", not DppUpdateU32");
+		return std::nullopt;
+	}
 	const auto flags = update->Flags<DppMoveFlags>();
 	if (flags.control != 0x110u + shift || flags.row_mask != 0xfu || flags.bank_mask != 0xfu ||
 	    flags.fetch_inactive || flags.bound_control || flags.dpp8 || !IsAllTrue(update->Arg(2))) {
+		g_diag.Note(5, tag + "DppUpdate mismatch ctrl=" + std::to_string(flags.control) +
+		                   " row_mask=" + std::to_string(flags.row_mask) +
+		                   " bank_mask=" + std::to_string(flags.bank_mask) +
+		                   " fi=" + std::to_string(flags.fetch_inactive) +
+		                   " bc=" + std::to_string(flags.bound_control) +
+		                   " dpp8=" + std::to_string(flags.dpp8) +
+		                   " exec_all_true=" + std::to_string(IsAllTrue(update->Arg(2))) +
+		                   " exec_op=" + OpName(update->Arg(2)));
 		return std::nullopt;
 	}
 	const auto  y  = update->Arg(1).Resolve();
 	const auto* op = InstOf(update->Arg(0));
-	if (op == nullptr || op->GetOpcode() != opcode) return std::nullopt;
+	if (op == nullptr || op->GetOpcode() != opcode) {
+		g_diag.Note(5, tag + "combine op is " + OpName(update->Arg(0)) + ", expected " +
+		                   std::string(ValueOpcodeName(opcode)));
+		return std::nullopt;
+	}
 	for (size_t i = 0; i < 2; i++) {
 		const auto* move = InstOf(op->Arg(i));
 		if (move == nullptr || move->GetOpcode() != ValueOpcode::DppMoveU32) continue;
@@ -126,29 +164,53 @@ std::optional<Value> MatchRowShrStep(Value value, ValueOpcode opcode, uint32_t s
 			return y;
 		}
 	}
+	g_diag.Note(5, tag + "no matching DppMove(y) operand: ops " + OpName(op->Arg(0)) + "," +
+	                   OpName(op->Arg(1)));
 	return std::nullopt;
 }
 
 std::optional<Reduction> MatchReduction(Value source) {
 	// Final combine: Select(E, Op(P, Q), P) (or just Op(P, Q)).
 	const auto* combine = StripAllTrueSelect(source).TryInstruction();
-	if (combine == nullptr) return std::nullopt;
+	if (combine == nullptr) {
+		g_diag.Note(0, "readlane source is not an instruction (" + OpName(source) + ")");
+		return std::nullopt;
+	}
 	const auto op = ReduceOpOf(combine->GetOpcode());
-	if (!op) return std::nullopt;
+	if (!op) {
+		g_diag.Note(0, "readlane source opcode " + std::string(ValueOpcodeName(combine->GetOpcode())) +
+		                   " is not a reduction combine");
+		return std::nullopt;
+	}
 
 	// Q = V_PERMLANEX16(P, -1, -1): every lane reads lane 15 of the opposite row of its pair.
 	for (size_t i = 0; i < 2; i++) {
 		const auto* permlane = StripAllTrueSelect(combine->Arg(i)).TryInstruction();
-		if (permlane == nullptr || permlane->GetOpcode() != ValueOpcode::Permlane16U32) continue;
+		if (permlane == nullptr || permlane->GetOpcode() != ValueOpcode::Permlane16U32) {
+			g_diag.Note(1, "combine(" + std::string(ValueOpcodeName(combine->GetOpcode())) +
+			                   ") operand " + std::to_string(i) + " is " + OpName(combine->Arg(i)) +
+			                   ", not Permlane16");
+			continue;
+		}
 		const auto flags = permlane->Flags<PermlaneFlags>();
 		const auto sel0  = permlane->Arg(1).Resolve();
 		const auto sel1  = permlane->Arg(2).Resolve();
 		if (!flags.x16 || flags.fetch_inactive || !sel0.IsImmediate() || sel0.U32() != ~0u ||
 		    !sel1.IsImmediate() || sel1.U32() != ~0u || !IsAllTrue(permlane->Arg(3))) {
+			g_diag.Note(2, "permlane mismatch x16=" + std::to_string(flags.x16) +
+			                   " fi=" + std::to_string(flags.fetch_inactive) +
+			                   " sel0=" + (sel0.IsImmediate() ? std::to_string(sel0.U32()) : OpName(sel0)) +
+			                   " sel1=" + (sel1.IsImmediate() ? std::to_string(sel1.U32()) : OpName(sel1)) +
+			                   " exec_all_true=" + std::to_string(IsAllTrue(permlane->Arg(3))) +
+			                   " exec_op=" + OpName(permlane->Arg(3)));
 			continue;
 		}
 		const auto p = combine->Arg(1 - i).Resolve();
-		if (!(permlane->Arg(0).Resolve() == p)) continue;
+		if (!(permlane->Arg(0).Resolve() == p)) {
+			g_diag.Note(3, "permlane input (" + OpName(permlane->Arg(0)) +
+			                   ") differs from the other combine operand (" + OpName(p) + ")");
+			continue;
+		}
 
 		// P = four row_shr steps 1, 2, 4, 8 (innermost first) over the neutral-filled input.
 		const auto opcode = combine->GetOpcode();
@@ -173,6 +235,13 @@ std::optional<Reduction> MatchReduction(Value source) {
 			std::unordered_set<const Inst*> visiting;
 			if (!neutral.IsImmediate() || neutral.GetType() != Type::U32 ||
 			    neutral.U32() != NeutralOf(*op) || !IsExecBounded(fill->Arg(0), visiting)) {
+				g_diag.Note(6, "neutral fill rejected: neutral=" +
+				                   (neutral.IsImmediate() ? std::to_string(neutral.U32())
+				                                          : OpName(neutral)) +
+				                   " expected=" + std::to_string(NeutralOf(*op)) +
+				                   " cond=" + OpName(fill->Arg(0)) +
+				                   " cond_exec_bounded=" +
+				                   std::to_string(IsExecBounded(fill->Arg(0), visiting)));
 				continue;
 			}
 		}
@@ -207,8 +276,13 @@ PartialWaveReductionStats LowerPartialWaveReductions(Program& program) {
 	}
 	for (auto* read: reads) {
 		const auto lane      = read->Arg(1).Resolve().U32();
+		g_diag = {};
 		const auto reduction = MatchReduction(read->Arg(0));
-		if (!reduction) continue;
+		if (!reduction) {
+			stats.rejections.push_back("readlane=" + std::to_string(lane) + " reason=" +
+			                           (g_diag.text.empty() ? std::string("unknown") : g_diag.text));
+			continue;
+		}
 
 		auto* block = read->Parent();
 		auto  where = block->begin();

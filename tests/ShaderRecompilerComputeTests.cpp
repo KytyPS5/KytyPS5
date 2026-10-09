@@ -24177,6 +24177,42 @@ TestCase VectorPermlane16FetchInactiveFi() {
   return test;
 }
 
+// KYTY_DPP_PRESERVE_INACTIVE=1 (set by main for this test binary). RDNA2 V_PERMLANE16 with FI=0:
+// a disabled source lane keeps the old destination (BC=0) or reads 0 (BC=1).
+TestCase VectorPermlane16InactivePreserve(bool bound_control) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 2, 77);
+  const std::vector<u32> rest = {
+      EncodeVop1(0x01, 1, 0),
+      EncodeVop2(0x25, 1, InlineU32(10), 1),
+      EncodeVopc(0xc2, InlineU32(0), 0),
+      EncodeSop1(0x04, 126, 106),
+      EncodeSMovB32(0, InlineU32(1)),
+      EncodeSMovB32(1, InlineU32(0)),
+  };
+  code.insert(code.end(), rest.begin(), rest.end());
+  AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1, 0, bound_control ? 2u : 0u);
+  AppendStoreVgpr(&code, 2, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = bound_control ? "VectorPermlane16InactiveBoundCtrlZero"
+                            : "VectorPermlane16InactivePreservesDestination";
+  test.code = code;
+  test.expected = {bound_control ? 0u : 77u};
+  test.opcodes = {O::V_MOV_B32,          O::V_ADD_NC_U32, O::V_CMP_EQ_U32,
+                  O::S_MOV_B64,          O::S_MOV_B32,    O::V_PERMLANE16_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorDpp8Captured(bool masked_exec) {
   using O = ShaderOpcode;
   constexpr u32 sentinel = 0xaaaaaaaau;
@@ -36008,6 +36044,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(VectorDppInactiveSourcePreservesDestination);
+  AddCase([]() { return VectorPermlane16InactivePreserve(false); });
+  AddCase([]() { return VectorPermlane16InactivePreserve(true); });
   AddCase(VectorDppRowShare);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
@@ -41658,6 +41696,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
     RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination());
+    RunCase(&vulkan, VectorPermlane16InactivePreserve(false));
+    RunCase(&vulkan, VectorPermlane16InactivePreserve(true));
     RunCase(&vulkan, VectorDppRowShare());
     return 0;
   }

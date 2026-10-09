@@ -473,7 +473,9 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	};
 	const auto result =
 	    ir.Emit(IR::ValueOpcode::Permlane16U32,
-	            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec()}, flags);
+	            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec(),
+             ir.GetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg))},
+            flags);
 	auto dst      = DestinationOperand(inst);
 	dst.op_sel    = false;
 	dst.op_sel_hi = false;

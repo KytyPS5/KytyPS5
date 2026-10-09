@@ -857,8 +857,18 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (!flags.fetch_inactive) {
 		const auto source_exec = ctx.Shuffle(inst, 3, target);
 		result                 = state.builder.AllocateId();
+		// RDNA2 ISA (V_PERMLANE16/X16): FI=0 and the source lane is disabled -> BC=1 reads 0,
+		// BC=0 leaves the destination lane unchanged (old value). Same rule as DPP bound_ctrl.
+		static const bool preserve_inactive = [] {
+			const char* v = std::getenv("KYTY_DPP_PRESERVE_INACTIVE");
+			return v != nullptr && v[0] == '1';
+		}();
+		const uint32_t inactive_value =
+		    (preserve_inactive && !flags.bound_control && inst.NumArgs() > 4)
+		        ? ctx.Arg(inst, 4)
+		        : ConstantU32(state, 0);
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,
-		                          ConstantU32(state, 0));
+		                          inactive_value);
 	}
 	return result;
 }

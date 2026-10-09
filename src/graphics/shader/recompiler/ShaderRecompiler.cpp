@@ -745,6 +745,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (IR::PartialWaveReductionEnabled()) {
 		const auto reduction_stats = IR::LowerPartialWaveReductions(ir);
 		lane_audit_reductions      = reduction_stats.rewritten_reads;
+		if (LaneAuditEnabled()) {
+			for (const auto& why: reduction_stats.rejections) {
+				std::printf("NHL27REDUCEREJ: hash=0x%016" PRIx64 " stage=%s %s\n",
+				            options.shader_hash, StageName(options.stage), why.c_str());
+			}
+			std::fflush(stdout);
+		}
 		if (reduction_stats.rewritten_reads != 0) {
 			LOGF("%s partial-wave reductions: reads=%" PRIu32 "\n", GetDumpLabel(options),
 			     reduction_stats.rewritten_reads);

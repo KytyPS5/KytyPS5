@@ -2,10 +2,14 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <string>
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 struct PartialWaveReductionStats {
-	uint32_t rewritten_reads = 0;
+	uint32_t                 rewritten_reads = 0;
+	std::vector<std::string> rejections; // one line per rejected readlane 31/63 (why)
 };
 
 // KYTY_PARTIAL_WAVE_REDUCTION=1 (cached getenv).

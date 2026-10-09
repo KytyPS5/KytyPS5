@@ -109,6 +109,9 @@ public:
 	// Memory a later command reads, with the end-of-pipe labels recorded before it.
 	template <typename T>
 	[[nodiscard]] T ReadLabel(const volatile T* addr);
+	// Before a write made at parse time: the labels and GPU clock values recorded before it
+	// must not store over it at completion.
+	void BeforeImmediateWrite(const volatile void* dst, uint64_t size);
 	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,

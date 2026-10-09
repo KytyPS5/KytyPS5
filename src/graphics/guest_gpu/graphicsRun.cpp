@@ -308,6 +308,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
+	BeforeImmediateWrite(dst, static_cast<uint64_t>(dw_num) * 4);
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
@@ -362,6 +363,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	BeforeImmediateWrite(dst, (write_one_address ? 1 : uint64_t {dw_num}) * sizeof(uint32_t));
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
@@ -421,6 +423,10 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	bool dst_gds = false;
 	if (!decode_gds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+	}
+	if (!dst_gds) {
+		// A GPU fill or copy lands at execution, also after the labels recorded before it.
+		BeforeImmediateWrite(reinterpret_cast<const void*>(dst_address_or_offset), num_bytes);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	if (src_sel == 2) {
@@ -1293,6 +1299,10 @@ T CommandProcessor::ReadLabel(const volatile T* addr) {
 template uint32_t CommandProcessor::ReadLabel(const volatile uint32_t*);
 template uint64_t CommandProcessor::ReadLabel(const volatile uint64_t*);
 
+void CommandProcessor::BeforeImmediateWrite(const volatile void* dst, uint64_t size) {
+	m_renderer.GetGpuTimestamps().Overwritten(reinterpret_cast<uint64_t>(dst), size);
+}
+
 template <typename T>
 void CommandProcessor::WriteLabel(T* dst, T value) {
 	// End-of-pipe labels land in packet order with the GPU clock values before them.
@@ -1391,6 +1401,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
 			for (uint32_t db = 0; db < 16u; db++) {
+				BeforeImmediateWrite(&results[db * 2u], sizeof(uint64_t));
 				results[db * 2u] = value;
 			}
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;

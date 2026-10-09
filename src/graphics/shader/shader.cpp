@@ -49,6 +49,9 @@ static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_ma
 static std::mutex                                                      g_shader_map_mutex;
 static std::unordered_map<uint64_t, ShaderTessellationInputInfo>       g_tess_layouts;
 static std::mutex                                                      g_tess_layouts_mutex;
+static std::mutex                                                      g_shader_map_observer_mutex;
+static ShaderMapObserver g_shader_map_observer      = nullptr;
+static void*             g_shader_map_observer_user = nullptr;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -64,8 +67,20 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		     addr, data.code_size_bytes);
 	}
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
-	std::scoped_lock lock(g_shader_map_mutex);
-	(*g_shader_map)[addr] = {data, hash};
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		(*g_shader_map)[addr] = {data, hash};
+	}
+	std::scoped_lock lock(g_shader_map_observer_mutex);
+	if (g_shader_map_observer != nullptr) {
+		g_shader_map_observer(g_shader_map_observer_user, hash);
+	}
+}
+
+void ShaderSetMapObserver(ShaderMapObserver observer, void* user) {
+	std::scoped_lock lock(g_shader_map_observer_mutex);
+	g_shader_map_observer      = observer;
+	g_shader_map_observer_user = user;
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {

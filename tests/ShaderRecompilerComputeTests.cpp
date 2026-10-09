@@ -1285,6 +1285,50 @@ void ExpectFatal(const char *name, Function function) {
 }
 #endif
 
+// The draws of a long zero tail read the indices of the draw in order, from the copy only, and
+// keep list primitives whole.
+void CheckZeroTailDraws() {
+  struct Case {
+    uint32_t count, head, period;
+    uint64_t capacity;
+  };
+  for (const auto &c : {Case{10, 2, 3, 100}, Case{1000, 2, 3, 100}, Case{1000, 0, 1, 7},
+                        Case{1001, 98, 1, 100}, Case{100000, 31, 32, 97}, Case{20, 20, 3, 20},
+                        Case{4000, 3, 4, 64}}) {
+    ZeroTailDraws draws;
+    const bool planned = PlanZeroTailDraws(c.count, c.head, c.period, c.capacity, draws);
+    // The copy: indices 1..head, then zeros; the draw reads the head, then zeros.
+    std::vector<uint32_t> copy(draws.copy_count, 0);
+    for (uint32_t i = 0; i < c.head && i < copy.size(); i++) {
+      copy[i] = i + 1;
+    }
+    std::vector<uint32_t> drawn;
+    bool whole = true;
+    bool inside = true;
+    draws.ForEachDraw(c.count, [&](uint32_t first, uint32_t count) {
+      whole = whole && (count % c.period == 0 || drawn.size() + count == c.count);
+      inside = inside && uint64_t{first} + count <= copy.size();
+      for (uint32_t i = 0; inside && i < count; i++) {
+        drawn.push_back(copy[first + i]);
+      }
+    });
+    bool same = drawn.size() == c.count;
+    for (uint32_t i = 0; same && i < c.count; i++) {
+      same = drawn[i] == (i < c.head ? i + 1 : 0u);
+    }
+    Require("ZeroTailDraws", "draws",
+            planned && draws.copy_count <= c.capacity && whole && inside && same,
+            "the zero tail draws missed or reordered indices, split a primitive or read past "
+            "the copy");
+  }
+  ZeroTailDraws draws;
+  Require("ZeroTailDraws", "capacity",
+          !PlanZeroTailDraws(1000, 95, 3, 100, draws) &&
+              !PlanZeroTailDraws(1000, 101, 1, 100, draws),
+          "a head without room for whole zero primitives was accepted");
+  std::printf("[host]    %-32s ok\n", "ZeroTailDraws");
+}
+
 void CheckLeastRecentlyUsedCacheOrdering() {
   Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
   const auto first = cache.Insert(1, 1);
@@ -16880,6 +16924,20 @@ public:
           graphics.index_buffer_range_enabled = true;
           covered(test.check, "the CPU path read indices past INDEX_BUFFER_SIZE or dropped "
                               "the draw");
+        }
+        // A zero tail longer than the stream buffer holds: copied in part, drawn in chunks.
+        for (const auto &test : {CpuCase{"long host copy", index_address + 0x104, 1, false},
+                                 CpuCase{"long 8-bit", index_address + 0x201, 2, true}}) {
+          clear_color();
+          graphics.index_buffer_range_enabled = test.sized;
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+              {.index_count = 0x1200000u,
+               .index_addr = reinterpret_cast<const void *>(test.address),
+               .instance_count = 1, .index_type_and_size = test.type,
+               .offset_source = DrawOffsetSource::IndirectArgs, .index_limit = 2});
+          graphics.index_buffer_range_enabled = true;
+          covered(test.check, "a long zero tail on the CPU path overflowed the stream buffer "
+                              "or lost the draw");
         }
         shaders.SetEsShaderBase(indirect_vs);
       }
@@ -42415,6 +42473,7 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckZeroTailDraws();
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);

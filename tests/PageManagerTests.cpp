@@ -1,6 +1,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
+#include <algorithm>
 #include <barrier>
 #include <cstdint>
 #include <cstdio>
@@ -168,12 +169,14 @@ uint64_t g_protection_calls = 0;
 struct ProtectionCall {
   uint64_t address;
   uint64_t size;
+  bool access_changed = true;
 };
 std::vector<ProtectionCall> g_protection_ranges;
 std::mutex g_protection_log_mutex;
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
-                         Common::VirtualMemory::Mode mode) {
+                         Common::VirtualMemory::Mode mode,
+                         bool access_changed = true) {
   uint32_t protection = PAGE_NOACCESS;
   if (mode == Common::VirtualMemory::Mode::Read) {
     protection = PAGE_READONLY;
@@ -184,7 +187,7 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
   {
     std::lock_guard lock(g_protection_log_mutex);
     g_protection_calls++;
-    g_protection_ranges.push_back({vaddr, size});
+    g_protection_ranges.push_back({vaddr, size, access_changed});
   }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
@@ -431,6 +434,52 @@ void TestRegionMaskWatcherRanges() {
             g_protection_ranges[0].size == page_size * 3,
         "sparse read unmask did not bridge a compatible gap");
 
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestWriteWatchesKeepAccess() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  RegionBits mask;
+  mask.Set(1);
+  const auto only_access = [](bool changed) {
+    std::lock_guard lock(g_protection_log_mutex);
+    return !g_protection_ranges.empty() &&
+           std::all_of(g_protection_ranges.begin(), g_protection_ranges.end(),
+                       [changed](const ProtectionCall &call) {
+                         return call.access_changed == changed;
+                       });
+  };
+
+  // Write watches move pages between read-only and read-write only.
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true>(region_base, mask);
+  const bool write_watch = only_access(false);
+  // Access watches add or remove read access.
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  const bool access_watch = only_access(true) &&
+                            Protection(reinterpret_cast<void *>(
+                                region_base + page_size)) == PAGE_NOACCESS;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  const bool access_unwatch = only_access(true) &&
+                              Protection(reinterpret_cast<void *>(
+                                  region_base + page_size)) == PAGE_READONLY;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false>(region_base, mask);
+  const bool write_unwatch =
+      only_access(false) &&
+      IsWritable(reinterpret_cast<void *>(region_base + page_size));
+  Check(write_watch && write_unwatch,
+        "write watch changes reported an access change");
+  Check(access_watch && access_unwatch,
+        "access watch changes did not report an access change");
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -686,8 +735,9 @@ void TestFatalPaths() {
 namespace Libs::LibKernel::Memory {
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
-                            Common::VirtualMemory::Mode mode) {
-  return ProtectAddressSpace(vaddr, size, mode);
+                            Common::VirtualMemory::Mode mode,
+                            bool access_changed) {
+  return ProtectAddressSpace(vaddr, size, mode, access_changed);
 }
 
 } // namespace Libs::LibKernel::Memory
@@ -702,6 +752,7 @@ int main(int argc, char **argv) {
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
+  TestWriteWatchesKeepAccess();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();

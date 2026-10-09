@@ -375,8 +375,8 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		                     mem.resource == state.dynamic_buffer_resource;
 		const auto prefix =
 		    dynamic ? state.dynamic_buffer_byte_offset
-		            : state.memory_byte_offsets[ResourceForDescriptor(
-		                  state, IR::DescriptorBindingKind::Buffers, mem.resource)];
+		            : state.memory_byte_offsets[state.program.info.buffers.at(mem.resource)
+		                                            .descriptor_index];
 		const auto address = Binary(state, spv::OpIAdd, TypeU32(state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -907,6 +907,18 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 					                              value, data, component);
 				}
 			}
+			// D16 stores carry the low half of each VGPR.
+			if (mem.data_bits == 16u) {
+				if (info.type == Format::ComponentType::Uint) {
+					value = EmitBitFieldUExtract(ctx.state, value, ConstantU32(ctx.state, 0),
+					                             ConstantU32(ctx.state, 16));
+				} else if (info.type == Format::ComponentType::Sint) {
+					value = EmitBitFieldSExtract(ctx.state, value, ConstantU32(ctx.state, 0),
+					                             ConstantU32(ctx.state, 16));
+				} else {
+					value = EmitBitCastU32F32(ctx.state, EmitF16BitsToF32(ctx.state, value));
+				}
+			}
 			value = EncodeFormatComponent(ctx.state, info, component, value);
 			const auto bits = info.component_bits[component];
 			if (info.packed_bitfield) {
@@ -1157,6 +1169,42 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 			    values[component] =
 			        LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource);
 		    }
+		    // A glc DWORDX2 is one 64-bit access: look-back scans poll a SWAP_X2 pair.
+		    if (components == 2 && mem.glc && mem.kind == IR::ResourceKind::Buffer &&
+		        state.storage_buffers[3].variable != 0) {
+			    const auto u32          = TypeU32(state);
+			    const auto byte_address = ByteAddress(ctx, inst, mem);
+			    const auto aligned      = Binary(
+			        state, spv::OpIEqual, TypeBool(state),
+			        Binary(state, spv::OpBitwiseAnd, u32, byte_address, ConstantU32(state, 7u)),
+			        ConstantU32(state, 0u));
+			    const auto wide_resource =
+			        PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3]);
+			    const auto index = Binary(state, spv::OpShiftRightLogical, u32, byte_address,
+			                              ConstantU32(state, 3u));
+			    const auto wide  = EmitValueOrDefaultIfCondition(
+			        state,
+			        Binary(state, spv::OpLogicalAnd, TypeBool(state), aligned,
+			               EmitMemoryElementInBounds(state, wide_resource, index)),
+			        TypeU64(state), ConstantU64(state, 0), [&]() {
+				        const auto pointer = EmitStorageBufferElementPointer(
+				            state, wide_resource, index,
+				            TypeStorageBufferElementPointer(state, 64));
+				        const auto loaded = state.builder.AllocateId();
+				        state.builder.AddFunction(
+				            spv::OpAtomicLoad, TypeU64(state), loaded, pointer,
+				            ConstantU32(state, spv::ScopeDevice),
+				            ConstantU32(state, spv::MemorySemanticsAcquireMask |
+				                                   spv::MemorySemanticsUniformMemoryMask));
+				        return loaded;
+			        });
+			    const auto low  = Unary(state, spv::OpUConvert, u32, wide);
+			    const auto high = Unary(state, spv::OpUConvert, u32,
+			                            Binary(state, spv::OpShiftRightLogical, TypeU64(state),
+			                                   wide, ConstantU32(state, 32u)));
+			    values[0]       = Select(state, u32, aligned, low, values[0]);
+			    values[1]       = Select(state, u32, aligned, high, values[1]);
+		    }
 		    return ConstructU32Composite(state, components, values);
 	    });
 }
@@ -1179,6 +1227,7 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			                          component);
 			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
 		}
+		store_words();
 	});
 }
 

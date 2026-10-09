@@ -3745,6 +3745,20 @@ int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication
 	return OK;
 }
 
+int KYTY_SYSV_ABI AgcSetNop(uint32_t* packet) {
+	PRINT_NAME();
+
+	LOGF("\t packet  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(packet));
+
+	LOGF("\t packet0 = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32 ", len = %" PRIu32
+	     "\n",
+	     packet[0], (packet[0] >> 8u) & 0xffu, KYTY_PM4_R(packet[0]), AgcGetPacketSize(packet));
+
+	packet[0] = (packet[0] & 0xffff0003u) | (Pm4::IT_NOP << 8u);
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
                                          uint32_t predication) {
 	PRINT_NAME();

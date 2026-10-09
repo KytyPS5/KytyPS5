@@ -236,8 +236,23 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0x19u, Opcode::V_CMPX_NGE_F32},       {0x1au, Opcode::V_CMPX_NLG_F32},
     {0x1bu, Opcode::V_CMPX_NGT_F32},       {0x1cu, Opcode::V_CMPX_NLE_F32},
     {0x1du, Opcode::V_CMPX_NEQ_F32},       {0x1eu, Opcode::V_CMPX_NLT_F32},
-    {0x22u, Opcode::V_CMP_EQ_F64, false},  {0x23u, Opcode::V_CMP_LE_F64, false},
-    {0x33u, Opcode::V_CMPX_LE_F64, false}, {0x36u, Opcode::V_CMPX_GE_F64, false},
+    {0x20u, Opcode::V_CMP_F_F64, false},    {0x21u, Opcode::V_CMP_LT_F64, false},
+    {0x22u, Opcode::V_CMP_EQ_F64, false},   {0x23u, Opcode::V_CMP_LE_F64, false},
+    {0x24u, Opcode::V_CMP_GT_F64, false},   {0x25u, Opcode::V_CMP_LG_F64, false},
+    {0x26u, Opcode::V_CMP_GE_F64, false},   {0x27u, Opcode::V_CMP_O_F64, false},
+    {0x28u, Opcode::V_CMP_U_F64, false},    {0x29u, Opcode::V_CMP_NGE_F64, false},
+    {0x2au, Opcode::V_CMP_NLG_F64, false},  {0x2bu, Opcode::V_CMP_NGT_F64, false},
+    {0x2cu, Opcode::V_CMP_NLE_F64, false},  {0x2du, Opcode::V_CMP_NEQ_F64, false},
+    {0x2eu, Opcode::V_CMP_NLT_F64, false},  {0x2fu, Opcode::V_CMP_TRU_F64, false},
+    {0x30u, Opcode::V_CMPX_F_F64, false},
+    {0x31u, Opcode::V_CMPX_LT_F64, false},  {0x32u, Opcode::V_CMPX_EQ_F64, false},
+    {0x33u, Opcode::V_CMPX_LE_F64, false},  {0x34u, Opcode::V_CMPX_GT_F64, false},
+    {0x35u, Opcode::V_CMPX_LG_F64, false},  {0x36u, Opcode::V_CMPX_GE_F64, false},
+    {0x37u, Opcode::V_CMPX_O_F64, false},   {0x38u, Opcode::V_CMPX_U_F64, false},
+    {0x39u, Opcode::V_CMPX_NGE_F64, false}, {0x3au, Opcode::V_CMPX_NLG_F64, false},
+    {0x3bu, Opcode::V_CMPX_NGT_F64, false}, {0x3cu, Opcode::V_CMPX_NLE_F64, false},
+    {0x3du, Opcode::V_CMPX_NEQ_F64, false}, {0x3eu, Opcode::V_CMPX_NLT_F64, false},
+    {0x3fu, Opcode::V_CMPX_TRU_F64, false},
     {0x80u, Opcode::V_CMP_F_I32},          {0x81u, Opcode::V_CMP_LT_I32},
     {0x82u, Opcode::V_CMP_EQ_I32},         {0x83u, Opcode::V_CMP_LE_I32},
     {0x84u, Opcode::V_CMP_GT_I32},         {0x85u, Opcode::V_CMP_NE_I32},
@@ -879,10 +894,38 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMP_F_F32:
 		case Opcode::V_CMP_LT_F32:
 		case Opcode::V_CMP_EQ_F32:
+		case Opcode::V_CMP_F_F64:
+		case Opcode::V_CMP_LT_F64:
 		case Opcode::V_CMP_EQ_F64:
 		case Opcode::V_CMP_LE_F64:
+		case Opcode::V_CMP_GT_F64:
+		case Opcode::V_CMP_LG_F64:
+		case Opcode::V_CMP_GE_F64:
+		case Opcode::V_CMP_O_F64:
+		case Opcode::V_CMP_U_F64:
+		case Opcode::V_CMP_NGE_F64:
+		case Opcode::V_CMP_NLG_F64:
+		case Opcode::V_CMP_NGT_F64:
+		case Opcode::V_CMP_NLE_F64:
+		case Opcode::V_CMP_NEQ_F64:
+		case Opcode::V_CMP_NLT_F64:
+		case Opcode::V_CMP_TRU_F64:
+		case Opcode::V_CMPX_F_F64:
+		case Opcode::V_CMPX_LT_F64:
+		case Opcode::V_CMPX_EQ_F64:
 		case Opcode::V_CMPX_LE_F64:
+		case Opcode::V_CMPX_GT_F64:
+		case Opcode::V_CMPX_LG_F64:
 		case Opcode::V_CMPX_GE_F64:
+		case Opcode::V_CMPX_O_F64:
+		case Opcode::V_CMPX_U_F64:
+		case Opcode::V_CMPX_NGE_F64:
+		case Opcode::V_CMPX_NLG_F64:
+		case Opcode::V_CMPX_NGT_F64:
+		case Opcode::V_CMPX_NLE_F64:
+		case Opcode::V_CMPX_NEQ_F64:
+		case Opcode::V_CMPX_NLT_F64:
+		case Opcode::V_CMPX_TRU_F64:
 		case Opcode::V_CMP_LE_F32:
 		case Opcode::V_CMP_GT_F32:
 		case Opcode::V_CMP_LG_F32:
@@ -1202,10 +1245,9 @@ VopcSdwaFields DecodeVopcSdwaFields(uint32_t modifier) {
 }
 
 bool SupportsVopcSdwa(Opcode opcode) {
+	// F64 SDWA operand handling is not implemented.
 	return opcode != Opcode::UNSUPPORTED && opcode != Opcode::V_CMP_NE_I64 &&
-	       opcode != Opcode::V_CMP_EQ_F64 &&
-	       opcode != Opcode::V_CMP_LE_F64 && opcode != Opcode::V_CMPX_LE_F64 &&
-	       opcode != Opcode::V_CMPX_GE_F64;
+	       (opcode < Opcode::V_CMP_F_F64 || opcode > Opcode::V_CMPX_TRU_F64);
 }
 
 void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
@@ -1538,8 +1580,22 @@ void ApplyNativeVop3SourceModifiers(Instruction& inst, uint32_t abs, uint32_t ne
 
 bool IsVopcCompareExec(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::V_CMPX_F_F64:
+		case Opcode::V_CMPX_LT_F64:
+		case Opcode::V_CMPX_EQ_F64:
 		case Opcode::V_CMPX_LE_F64:
+		case Opcode::V_CMPX_GT_F64:
+		case Opcode::V_CMPX_LG_F64:
 		case Opcode::V_CMPX_GE_F64:
+		case Opcode::V_CMPX_O_F64:
+		case Opcode::V_CMPX_U_F64:
+		case Opcode::V_CMPX_NGE_F64:
+		case Opcode::V_CMPX_NLG_F64:
+		case Opcode::V_CMPX_NGT_F64:
+		case Opcode::V_CMPX_NLE_F64:
+		case Opcode::V_CMPX_NEQ_F64:
+		case Opcode::V_CMPX_NLT_F64:
+		case Opcode::V_CMPX_TRU_F64:
 		case Opcode::V_CMPX_LT_F32:
 		case Opcode::V_CMPX_EQ_F32:
 		case Opcode::V_CMPX_LE_F32:

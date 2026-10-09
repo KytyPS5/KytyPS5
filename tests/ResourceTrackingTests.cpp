@@ -742,7 +742,9 @@ void TestBoundedComputeImageLoop() {
   enum class Variant {
     Bounded, Plain, Nonzero, TrueEdge, WrongGuard, EntryBypass, ExitBypass, GuardBlock,
     WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity,
-    IncrementBypass, PreviousBound, Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite,
+    IncrementBypass, PreviousBound, Forwarded, ForwardedChain, ForwardedJoin,
+    ForwardedBranch, ForwardedIncrementBypass,
+    Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite,
     GuardedDiamond, GuardedDiamondBypass
   };
   const auto make_plan = [](Variant variant) {
@@ -759,16 +761,21 @@ void TestBoundedComputeImageLoop() {
     auto *guard = masked ? fixture.AddBlock() : header;
     auto *increment = masked ? fixture.AddBlock() : latch;
     auto *final_exit = variant == Variant::PreviousBound ? fixture.AddBlock() : exit;
+    const bool forwarded = variant >= Variant::Forwarded && variant <= Variant::ForwardedIncrementBypass;
+    auto *forward = forwarded ? fixture.AddBlock() : increment;
+    auto *incoming = variant == Variant::ForwardedChain ? fixture.AddBlock() : forward;
+    auto *detour = variant == Variant::ForwardedJoin ? fixture.AddBlock() : nullptr;
     entry->AddBranch(header);
     if (!masked) {
       header->AddBranch(exit);
       header->AddBranch(body);
       body->AddBranch(latch);
-      latch->AddBranch(header);
+      latch->AddBranch(forwarded ? forward : header);
       if (variant == Variant::PreviousBound) latch->AddBranch(final_exit);
       if (variant == Variant::EntryBypass) entry->AddBranch(body);
       if (variant == Variant::ExitBypass) exit->AddBranch(body);
-      if (variant == Variant::IncrementBypass || variant == Variant::PreviousBound)
+      if (variant == Variant::IncrementBypass || variant == Variant::PreviousBound ||
+          variant == Variant::ForwardedIncrementBypass)
         exit->AddBranch(latch);
       fixture.program.blocks[0]->terminator = {
           .kind = variant == Variant::EntryBypass
@@ -789,16 +796,16 @@ void TestBoundedComputeImageLoop() {
           .kind = variant == Variant::PreviousBound
                       ? CFG::TerminatorKind::ConditionalBranch
                       : CFG::TerminatorKind::Branch,
-          .true_block = fixture.program.blocks[1u],
+          .true_block = forwarded ? forward : fixture.program.blocks[1u],
           .false_block = final_exit};
       fixture.program.blocks[4]->terminator = {
           .kind = final_exit != exit || variant == Variant::ExitBypass ||
-                          variant == Variant::IncrementBypass
+                          variant == Variant::IncrementBypass || variant == Variant::ForwardedIncrementBypass
                       ? CFG::TerminatorKind::Branch
                       : CFG::TerminatorKind::Return,
           .true_block =
               fixture.program.blocks[final_exit != exit ||
-                                             variant == Variant::IncrementBypass
+                                             variant == Variant::IncrementBypass || variant == Variant::ForwardedIncrementBypass
                                          ? 3u
                                          : 2u]};
       if (final_exit != exit)
@@ -822,6 +829,29 @@ void TestBoundedComputeImageLoop() {
                                         count}, 0, compare);
     const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
                                              {local, Value(0u)}, 0, entry);
+    if (forwarded) {
+      forward->AddBranch(incoming == forward ? header : incoming);
+      forward->terminator = {.kind = CFG::TerminatorKind::Branch,
+                            .true_block = incoming == forward ? header : incoming};
+      if (incoming != forward) {
+        incoming->AddBranch(header);
+        incoming->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+      }
+      if (variant == Variant::ForwardedBranch) {
+        forward->AddBranch(exit);
+        forward->condition = initial_active;
+        forward->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                              .true_block = header, .false_block = exit};
+      }
+      if (detour != nullptr) {
+        latch->AddBranch(detour);
+        latch->condition = initial_active;
+        latch->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                            .true_block = forward, .false_block = detour};
+        detour->AddBranch(forward);
+        detour->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = forward};
+      }
+    }
     if (masked) {
       auto *active_phi = diamond ? nullptr : &header->AppendNewInst(
           ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
@@ -934,7 +964,9 @@ void TestBoundedComputeImageLoop() {
                                    {key, Value(variant == Variant::WrongStep ? 2u : 1u)},
                                    0, increment);
     phi.AddPhiOperand(entry, variant == Variant::DivergentKey ? local : Value(0u));
-    phi.AddPhiOperand(increment, step);
+    phi.AddPhiOperand(forwarded ? incoming : increment, step);
+    Check(!forwarded || step.ResolveInstruction()->Parent() != phi.PhiBlock(1),
+          "forwarded loop fixture did not separate the increment from its Phi incoming edge");
 
     fixture.block = variant == Variant::GuardBlock ? header : body;
     const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
@@ -975,7 +1007,11 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::TrueEdge);
   make_plan(Variant::Masked);
   make_plan(Variant::GuardedDiamond);
+  make_plan(Variant::Forwarded);
+  make_plan(Variant::ForwardedChain);
   for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
+                             Variant::ForwardedJoin, Variant::ForwardedBranch,
+                             Variant::ForwardedIncrementBypass,
                              Variant::MaskedWrongGuard,
                              Variant::MaskResurrection, Variant::StatusOverwrite,
                              Variant::GuardedDiamondBypass}) {
@@ -2612,6 +2648,129 @@ void TestFiniteImagePhiCycle() {
   }
 }
 
+void TestFiniteInlineSampler() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto* entry = fixture.block;
+  auto* defined = fixture.AddBlock();
+  auto* merge = fixture.AddBlock();
+  entry->AddBranch(defined);
+  entry->AddBranch(merge);
+  defined->AddBranch(merge);
+  const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  entry->condition = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                      .true_block = defined, .false_block = merge};
+  defined->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+  merge->terminator.kind = CFG::TerminatorKind::Return;
+  fixture.block = merge;
+  auto& lod = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  auto& filter = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  lod.AddPhiOperand(entry, Value(0u));
+  lod.AddPhiOperand(defined, Value(0x00fff000u));
+  filter.AddPhiOperand(defined, Value(0x0a500000u));
+  filter.AddPhiOperand(entry, Value(0u));
+  const auto sampler = fixture.Sampler({Value(0u), Value(&lod), Value(&filter), Value(0u)});
+  const auto direct = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  const auto previous = fixture.Sampler(
+      {Value(0u), Value(0x00fff000u), Value(0x0a500000u), Value(0u)});
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  for (const auto format : {F::k32Float, F::k32SInt}) {
+    const auto image = fixture.Image({Value(0x1000u), Value(uint32_t(format) << 20u),
+        Value(0u), Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+            (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u)),
+        Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    if (format == F::k32Float)
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, previous, fixture.ImageAddress()},
+                   fixture.AddMemory(memory, 0x440u));
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x1dd0u));
+    if (format == F::k32Float)
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, direct, fixture.ImageAddress()},
+                   fixture.AddMemory(memory, 0x1dd8u));
+  }
+  fixture.PlanAndTrack();
+  const auto root = fixture.program.memory_info[1].sampler;
+  const auto source = fixture.program.info.samplers[root].source;
+  const auto& finite = fixture.program.descriptor_sources[source].indirect_descriptor;
+  Check(finite && finite->sources.size() == 2 && fixture.program.info.samplers.size() == 3,
+        "finite inline sampler lost either state or aliased the direct sampler");
+  const auto* key = sampler.Instruction()->Arg(0).Instruction();
+  Check(key->GetOpcode() == ValueOpcode::Phi && key->Parent() == merge &&
+            key->PhiBlock(0) == entry && key->PhiBlock(1) == defined &&
+            key->Arg(0).U32() == 0 && key->Arg(1).U32() == 1,
+        "inline sampler DWORD correlation did not preserve its GPU selector");
+  const auto plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{.read_specialization_memory = ReadTestMemory};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite inline sampler could not materialize literal choices");
+  const auto candidates = fixture.program.info.samplers[root].indirect_resources;
+  Check(candidates.size() == 2 && snapshot.samplers[candidates[0]].dwords[1] == 0 &&
+            snapshot.samplers[candidates[0]].dwords[2] == 0 &&
+            snapshot.samplers[candidates[1]].dwords[1] == 0x00fff000u &&
+            snapshot.samplers[candidates[1]].dwords[2] == 0x0a500000u,
+        "finite sampler materialization mixed the two correlated DWORD states");
+  Check(candidates[1] == fixture.program.memory_info[0].sampler && candidates[1] < root,
+        "finite sampler did not reuse the earlier constant candidate");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  for (const uint32_t operation : {1u, 3u}) {
+    const auto selected = fixture.program.memory_info[operation].sampler;
+    const auto& choices = fixture.program.info.samplers[selected].indirect_resources;
+    Check(choices.size() == 2, "sampler class specialization lost a finite candidate");
+    for (uint32_t ordinal = 0; ordinal < choices.size(); ++ordinal) {
+      const auto& choice = fixture.program.info.samplers[choices[ordinal]];
+      Check(choice.snapshot_index == candidates[ordinal] &&
+                choice.force_point_filtering == (operation == 3u) &&
+                choice.integer_border == (operation == 3u),
+            "finite sampler class remapping changed candidate identity or filtering");
+    }
+  }
+  Check(fixture.program.info.samplers[fixture.program.memory_info[2].sampler]
+            .indirect_resources.empty(),
+        "direct sampler was changed into a dynamic selection");
+  auto invalid = ExtractResourcePlan(fixture.program);
+  invalid.info.samplers[0].source = static_cast<uint32_t>(invalid.descriptor_sources.size());
+  Check(!MaterializeResources(invalid, runtime, snapshot, specialization),
+        "invalid sampler source bypassed materialization validation");
+
+  Fixture adjusted;
+  auto* initial = adjusted.block;
+  auto* alternate = adjusted.AddBlock();
+  auto* join = adjusted.AddBlock();
+  initial->AddBranch(alternate);
+  initial->AddBranch(join);
+  alternate->AddBranch(join);
+  initial->condition = adjusted.Emit(ValueOpcode::IEqual32,
+      {adjusted.Emit(ValueOpcode::LaneId), Value(0u)});
+  initial->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = alternate, .false_block = join};
+  alternate->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = join};
+  join->terminator.kind = CFG::TerminatorKind::Return;
+  auto& selected = join->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  selected.AddPhiOperand(initial, Value(0u));
+  selected.AddPhiOperand(alternate, Value(0x00fff000u));
+  adjusted.block = join;
+  const auto shared = adjusted.Sampler({Value(0u), Value(&selected), Value(0u), Value(0u)});
+  const auto image = adjusted.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                    Value(0u), Value(0u), Value(0u), Value(0u)});
+  for (const uint32_t flags : {0u, uint32_t(Decoder::ImageSampleFlagAdjust)}) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    memory.image_sample_flags = flags;
+    adjusted.Emit(ValueOpcode::ImageSampleRaw, {image, shared, adjusted.ImageAddress()},
+                  adjusted.AddMemory(memory, 0x1dd0u));
+  }
+  CheckFatal([&] { adjusted.PlanAndTrack(); }, "not a valid runtime value",
+             "finite sampler planning accepted a shared SampleAdjust handle");
+}
+
 void TestFiniteImageBitScanSentinel() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   for (const bool nonzero : {false, true}) {
@@ -3572,6 +3731,7 @@ int main() {
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
+    Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);

@@ -10,9 +10,9 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs)
+	           bool flush_f32_inputs, bool graphics_compute)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      flush_f32_inputs(flush_f32_inputs) {}
+	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -127,7 +127,8 @@ private:
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);
+	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx,
+	                             bool is64 = false);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx, bool half = false);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
@@ -264,6 +265,7 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
+	bool            graphics_compute;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

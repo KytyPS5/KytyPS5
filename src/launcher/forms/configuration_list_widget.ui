@@ -205,6 +205,72 @@
           </spacer>
          </item>
          <item>
+          <widget class="QSlider" name="grid_size_slider">
+           <property name="maximumSize">
+            <size><width>120</width><height>16777215</height></size>
+           </property>
+           <property name="toolTip">
+            <string>Game image size</string>
+           </property>
+           <property name="accessibleName">
+            <string>Game image size</string>
+           </property>
+           <property name="minimum">
+            <number>128</number>
+           </property>
+           <property name="maximum">
+            <number>320</number>
+           </property>
+           <property name="singleStep">
+            <number>16</number>
+           </property>
+           <property name="pageStep">
+            <number>32</number>
+           </property>
+           <property name="value">
+            <number>224</number>
+           </property>
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="gridSizeSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeType">
+            <enum>QSizePolicy::Fixed</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size><width>8</width><height>0</height></size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QToolButton" name="grid_view_button">
+           <property name="minimumSize">
+            <size><width>36</width><height>36</height></size>
+           </property>
+           <property name="text">
+            <string>Grid view</string>
+           </property>
+           <property name="toolTip">
+            <string>Toggle grid view</string>
+           </property>
+           <property name="iconSize">
+            <size><width>32</width><height>32</height></size>
+           </property>
+           <property name="checkable">
+            <bool>true</bool>
+           </property>
+           <property name="autoRaise">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
           <widget class="QLineEdit" name="search_line_edit">
            <property name="sizePolicy">
             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
@@ -238,50 +304,53 @@
         </layout>
        </item>
        <item>
-        <widget class="GameListTreeWidget" name="cfgs_list">
-         <property name="rootIsDecorated">
-          <bool>false</bool>
-         </property>
-         <column>
-          <property name="text">
-           <string>Game</string>
+        <widget class="QStackedWidget" name="game_views">
+         <widget class="GameListTreeWidget" name="cfgs_list">
+          <property name="rootIsDecorated">
+           <bool>false</bool>
           </property>
-         </column>
-         <column>
-          <property name="text">
-           <string>Serial</string>
-          </property>
-         </column>
-         <column>
-          <property name="text">
-           <string>Game Version</string>
-          </property>
-         </column>
-         <column>
-          <property name="text">
-           <string>Firmware Version</string>
-          </property>
-         </column>
-         <column>
-          <property name="text">
-           <string>Size</string>
-          </property>
-         </column>
-         <column>
-          <property name="text">
-           <string>Path</string>
-          </property>
-         </column>
-         <column>
-          <property name="text">
-           <string>Status</string>
-          </property>
-         </column>
-         <column>
-          <property name="text">
-           <string>Comments</string>
-          </property>
-         </column>
+          <column>
+           <property name="text">
+            <string>Game</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>Serial</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>Game Version</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>Firmware Version</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>Size</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>Path</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>Status</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>Comments</string>
+           </property>
+          </column>
+         </widget>
+         <widget class="QListView" name="cfgs_grid"/>
         </widget>
        </item>
       </layout>

@@ -4,8 +4,11 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -36,6 +39,32 @@ struct CompileResult {
 	std::string            ir_dump;
 	IR::Program            program;
 };
+
+// Decoded source and typed scalar call queries are retained once per cache source.
+struct ShaderSource {
+	struct Call {
+		uint32_t instruction;
+		std::array<IR::Value, 2> target;
+	};
+	struct Linked {
+		std::vector<uint32_t> code;
+		Decoder::Program decoded;
+		std::vector<uint32_t> observed_function;
+	};
+	std::vector<uint32_t> code;
+	Decoder::Program decoded;
+	IR::ResourcePlan call_targets;
+	std::optional<Call> call;
+	std::optional<Linked> linked;
+	uint64_t revision = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> reads;
+};
+
+[[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
+	                                           const CompileOptions& options);
+const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
+[[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
+	                                           const CompileOptions& options);
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);

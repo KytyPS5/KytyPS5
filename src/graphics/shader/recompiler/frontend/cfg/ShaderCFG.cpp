@@ -1468,7 +1468,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst    = program.instructions[i];
 		const auto  next_pc = InstructionEndPc(inst);
-		if (Decoder::IsDirectBranch(inst.opcode)) {
+		if (Decoder::IsDirectBranch(inst.opcode) ||
+		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX)) {
 			if (!IsValidTarget(inst.branch_target, program.instructions, end_pc)) {
 				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
@@ -1501,7 +1502,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 			if (next_pc <= end_pc) {
 				labels.push_back(next_pc);
 			}
-		} else if (inst.opcode == Opcode::S_ENDPGM) {
+		} else if (inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::S_SWAPPC_B64) {
 			labels.push_back(next_pc);
 		}
 	}
@@ -1550,6 +1551,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto  next_pc = InstructionEndPc(last);
 		if (last.opcode == Opcode::S_ENDPGM) {
 			block.terminator.kind = TerminatorKind::Return;
+		} else if (last.opcode == Opcode::S_SWAPPC_B64 && last.branch_target != UINT32_MAX) {
+			block.terminator.kind = TerminatorKind::Branch;
+			block.terminator.true_block = block_at_pc(last.branch_target);
 		} else if (last.opcode == Opcode::S_SETPC_B64) {
 			const auto& target_info = setpc_targets.at(last.pc);
 			if (target_info.indirect) {
@@ -1674,6 +1678,36 @@ Graph Structurize(const Graph& graph) {
 		return failed;
 	}
 	return GotoStructurizer(graph).Run();
+}
+
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
+	uint32_t destination = UINT32_MAX;
+	// Scalar ALU pair widths are not all decoded. The typed producer must confirm this word.
+	return InstructionWritesScalarCode(inst, code) ||
+	       (ScalarOperandCode(inst.dst, destination) && code == destination + 1u);
+}
+
+uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                              uint32_t before, uint32_t code) {
+	EXIT_IF(before >= program.instructions.size());
+	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
+		return block.inst_begin <= before && before < block.inst_end;
+	});
+	EXIT_IF(found == graph.blocks.end());
+	const auto* block = &*found;
+	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
+		for (uint32_t i = before; i > block->inst_begin;) {
+			const auto& inst = program.instructions[--i];
+			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
+			if (MayWriteScalarRegister(inst, code)) return i;
+		}
+		if (block->id == graph.entry_block) return UINT32_MAX;
+		EXIT_IF(block->predecessors.size() != 1u);
+		block = graph.FindBlock(block->predecessors[0]);
+		EXIT_IF(block == nullptr);
+		before = block->inst_end;
+	}
+	EXIT("scalar shader call source has cyclic reaching definitions");
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

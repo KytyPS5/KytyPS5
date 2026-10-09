@@ -1,3 +1,13 @@
+QListView#cfgs_grid {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    color: palette(text);
+}
+
+QListView#cfgs_grid::item {
+    padding: 8px;
+}
+
 GameListTreeWidget#cfgs_list {
     background: transparent;
     border: 1px solid palette(mid);
@@ -39,6 +49,7 @@ QLineEdit#search_line_edit:focus {
     border-color: palette(highlight);
 }
 
+QToolButton#grid_view_button,
 QToolButton#refresh_button,
 QToolButton#global_settings_button,
 QToolButton#input_mapping_button,
@@ -51,6 +62,7 @@ QToolButton#delete_button {
     padding: 3px;
 }
 
+QToolButton#grid_view_button:hover,
 QToolButton#refresh_button:hover,
 QToolButton#global_settings_button:hover,
 QToolButton#input_mapping_button:hover,
@@ -61,6 +73,8 @@ QToolButton#delete_button:hover {
     border-color: palette(mid);
 }
 
+QToolButton#grid_view_button:checked,
+QToolButton#grid_view_button:pressed,
 QToolButton#refresh_button:pressed,
 QToolButton#global_settings_button:pressed,
 QToolButton#input_mapping_button:pressed,

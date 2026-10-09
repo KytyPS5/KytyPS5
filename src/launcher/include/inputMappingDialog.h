@@ -2,32 +2,38 @@
 #define LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
 
 #include <QDialog>
+#include <QHash>
 #include <QStringList>
 
+class ControllerPreview;
+class DualSenseWidget;
+class QLabel;
 class QPushButton;
 class QDoubleSpinBox;
-class QTreeWidget;
-class QTreeWidgetItem;
-class QWidget;
 
 class InputMappingDialog final: public QDialog {
 public:
-	explicit InputMappingDialog(const QStringList& mapping, QWidget* parent = nullptr);
+	explicit InputMappingDialog(const QStringList& mapping, ControllerPreview* preview,
+	                            QWidget* parent = nullptr);
+	~InputMappingDialog() override;
 
 	[[nodiscard]] QStringList Mapping() const;
 
 private:
-	void ChangeBinding();
-	void ClearBinding();
+	void ChangeBinding(const QString& id);
 	void RestoreDefaults();
-	void SetBinding(QTreeWidgetItem* item, const QString& binding);
 	void UpdateButtons();
+	void UpdatePreview();
+	void UpdateHighlights();
 
-	QTreeWidget*    m_bindings        = nullptr;
-	QPushButton*    m_change_button   = nullptr;
-	QPushButton*    m_clear_button    = nullptr;
-	QDoubleSpinBox* m_sensitivity     = nullptr;
-	bool            m_custom_bindings = false;
+	ControllerPreview*           m_preview;
+	DualSenseWidget*             m_controller = nullptr;
+	QHash<QString, QString>      m_bindings;
+	QHash<QString, QPushButton*> m_buttons;
+	QString                      m_selected;
+	QLabel*                      m_status          = nullptr;
+	QDoubleSpinBox*              m_sensitivity     = nullptr;
+	bool                         m_custom_bindings = false;
 };
 
 #endif /* LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_ */

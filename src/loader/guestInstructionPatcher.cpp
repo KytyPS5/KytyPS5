@@ -57,6 +57,7 @@ struct PatchModule {
 	u8*                        end   = nullptr;
 	std::set<u8*>              patched;
 	std::vector<ReadOnlyRange> read_only_data;
+	std::vector<uintptr_t>     code_addresses;
 	Xbyak::CodeGenerator patch_gen;
 	Xbyak::CodeGenerator trampoline_gen;
 	bool                 trampoline_exhaustion_reported = false;
@@ -949,7 +950,8 @@ std::map<uintptr_t, std::optional<s64>> StackDepths(const DecodedFunction& funct
 }
 
 // A pointer read from memory without an index (a vtable or import slot) whose base is RIP, an
-// argument or such a pointer itself. Stack slots and indexed tables can hold computed targets.
+// argument or a register loaded from such a slot, whose own base is not the stack. Stack slots
+// and indexed tables can hold computed targets.
 bool IsPointerSlot(const DecodedFunction& function, LazyControlFlowGraph& graph,
                    uintptr_t function_start, uintptr_t address, const ZydisDecodedOperand& operand,
                    bool check_base) {
@@ -983,7 +985,7 @@ bool IsPointerSlot(const DecodedFunction& function, LazyControlFlowGraph& graph,
 }
 
 // Every value `reg` can hold before `address` comes from the caller, a pointer slot, a constant
-// outside the function, or a copy of such a value. A caller cannot hold an address inside it.
+// outside the function, or a copy of such a value.
 bool HoldsExternalAddress(const DecodedFunction& function, LazyControlFlowGraph& graph,
                           uintptr_t function_start, uintptr_t function_end, uintptr_t address,
                           ZydisRegister reg, int depth) {
@@ -1016,7 +1018,8 @@ bool HoldsExternalAddress(const DecodedFunction& function, LazyControlFlowGraph&
 }
 
 // An indirect jump leaves the function (tail call) when the stack is back at its entry depth and
-// the target is an address from outside the function, never a value computed in it.
+// the target is an address from outside the function, never a value computed in it. Such a value
+// can still be a label of the function if its address is taken; DecodeFunction checks that.
 bool IsIndirectTailJump(const DecodedFunction& function, LazyControlFlowGraph& graph,
                         const std::map<uintptr_t, std::optional<s64>>& stack_depths,
                         uintptr_t function_start, uintptr_t function_end,
@@ -1035,9 +1038,11 @@ bool IsIndirectTailJump(const DecodedFunction& function, LazyControlFlowGraph& g
 	                            target.reg.value, MaxCopyDepth);
 }
 
+// `label_address_taken`: the module holds the address of an instruction strictly inside the
+// function, so a value from outside it may still target one of its labels.
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
                                std::span<const ReadOnlyRange> read_only_data,
-                               bool                           resolve_jump_tables = true) {
+                               bool label_address_taken, bool resolve_jump_tables = true) {
 	DecodedFunction               function;
 	std::vector<uintptr_t>        blocks {function_start};
 	std::unordered_set<uintptr_t> visited;
@@ -1127,12 +1132,32 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 		    return lhs.first + lhs.second.instruction.length > rhs.first;
 	    }) == function.instructions.end();
 	if (!consistent && resolve_jump_tables) {
-		return DecodeFunction(function_start, function_end, read_only_data, false);
+		return DecodeFunction(function_start, function_end, read_only_data, label_address_taken,
+		                      false);
 	}
+	// Labels as values: the function may also take its own addresses, its entry included as the
+	// base of label offsets.
+	const auto takes_own_address = [&] {
+		return std::ranges::any_of(function.instructions, [&](const auto& entry) {
+			const auto& destination = entry.second.operands[0];
+			if (destination.type != ZYDIS_OPERAND_TYPE_REGISTER) {
+				return false;
+			}
+			const auto target = DecodeRipRelativeLea(entry.second, destination.reg.value);
+			return target && *target >= function_start && *target < function_end;
+		});
+	};
 	std::optional<std::map<uintptr_t, std::optional<s64>>> stack_depths;
+	std::optional<bool>                                    address_taken;
 	function.has_indirect_branch = std::ranges::any_of(indirect_branches, [&](uintptr_t branch) {
 		if (function.jump_table_targets.contains(branch)) {
 			return false;
+		}
+		if (!address_taken) {
+			address_taken = label_address_taken || takes_own_address();
+		}
+		if (*address_taken) {
+			return true;
 		}
 		if (!stack_depths) {
 			stack_depths = StackDepths(function, function_start);
@@ -2041,6 +2066,30 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
 	}
 }
+
+// Targets of RIP-relative LEA in the segment, decoded linearly from each function start.
+void CollectRipRelativeAddresses(uintptr_t segment_start, uintptr_t segment_end,
+                                 std::span<const uintptr_t> function_starts,
+                                 std::vector<uintptr_t>*    addresses) {
+	for (size_t index = 0; index <= function_starts.size(); ++index) {
+		uintptr_t       address = index == 0 ? segment_start : function_starts[index - 1];
+		const uintptr_t end = index < function_starts.size() ? function_starts[index] : segment_end;
+		while (address < end) {
+			ZydisDecodedInstruction instruction {};
+			if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&GetDecoder(), nullptr,
+			                                                reinterpret_cast<void*>(address),
+			                                                end - address, &instruction))) {
+				++address;
+				continue;
+			}
+			address += instruction.length;
+			if (instruction.mnemonic == ZYDIS_MNEMONIC_LEA && instruction.raw.modrm.mod == 0 &&
+			    instruction.raw.modrm.rm == 5) {
+				addresses->push_back(address + instruction.raw.disp.value);
+			}
+		}
+	}
+}
 } // namespace
 
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
@@ -2086,6 +2135,17 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 
 	std::unique_lock lock {module->mutex};
 	const size_t     trampoline_begin = module->trampoline_gen.getSize();
+
+	// Addresses the module takes strictly inside a function: relocated pointers and RIP-relative
+	// LEA. A value from outside a function can only target one of its labels through these.
+	std::vector<uintptr_t> taken_addresses = module->code_addresses;
+	CollectRipRelativeAddresses(segment_addr, segment_end, starts, &taken_addresses);
+	std::erase_if(taken_addresses, [&](uintptr_t address) {
+		return address < segment_addr || address >= segment_end ||
+		       std::ranges::binary_search(starts, address);
+	});
+	std::ranges::sort(taken_addresses);
+
 	bool analyze_red_zone = protect_memory;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	analyze_red_zone |= emulate_amd;
@@ -2099,7 +2159,9 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		}
 
 		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, module->read_only_data);
+		const auto taken = std::ranges::upper_bound(taken_addresses, function_start);
+		auto function    = DecodeFunction(function_start, function_end, module->read_only_data,
+		                                  taken != taken_addresses.end() && *taken < function_end);
 		if (analyze_red_zone) {
 			AnalyzeRedZoneLiveness(function);
 		}
@@ -2327,6 +2389,20 @@ void RegisterGuestInstructionPatchReadOnlyData(void* module_ptr, uint64_t addr, 
 	EXIT_IF(size == 0 || addr < start || addr >= end || size > end - addr);
 	std::unique_lock lock {module->second.mutex};
 	module->second.read_only_data.emplace_back(addr, addr + size);
+}
+
+void RegisterGuestInstructionPatchCodeAddresses(void*                     module_ptr,
+                                                std::span<const uint64_t> addresses) {
+	auto module = g_patch_modules.find(reinterpret_cast<u64>(module_ptr));
+	EXIT_IF(module == g_patch_modules.end());
+	const auto       start = reinterpret_cast<u64>(module->second.start);
+	const auto       end   = reinterpret_cast<u64>(module->second.end);
+	std::unique_lock lock {module->second.mutex};
+	for (const u64 address: addresses) {
+		if (address >= start && address < end) {
+			module->second.code_addresses.push_back(address);
+		}
+	}
 }
 
 void UnregisterGuestInstructionPatchModule(void* module_ptr) {

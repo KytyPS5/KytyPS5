@@ -323,6 +323,33 @@ void GpuTimestamps::Complete(const Batch& batch) {
 		m_retries.push_back({write.vaddr, value, write.size});
 	}
 	m_retired.fetch_add(count, std::memory_order_release);
+	if (deferred) {
+		QueueRetries();
+	}
+}
+
+void GpuTimestamps::QueueRetries() {
+	// A guest may wait for a deferred value without another GPU clock write: the GPU thread
+	// stores it as soon as it is between packets. One queued store covers all retries so far.
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_retries.empty() || m_retry_queued) {
+			return;
+		}
+		m_retry_queued = true;
+	}
+	const bool queued = m_context.PostGpuCommand([this] {
+		{
+			std::lock_guard lock(m_mutex);
+			m_retry_queued = false;
+		}
+		StoreRetries();
+	});
+	if (!queued) {
+		// The GPU is shutting down: the unmaps of the teardown store what is left.
+		std::lock_guard lock(m_mutex);
+		m_retry_queued = false;
+	}
 }
 
 void GpuTimestamps::StoreRetries() {

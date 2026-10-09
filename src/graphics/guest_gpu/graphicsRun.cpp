@@ -98,11 +98,20 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	const bool sent = TrySendCommand(std::move(command));
+	EXIT_IF(!sent);
+}
+
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
 	Common::LockGuard lock(m_queue_mutex);
-	EXIT_IF(!m_accepting);
+	if (!m_accepting) {
+		return false;
+	}
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
+	return true;
 }
 
 void GuestGpu::ProcessCommands() {

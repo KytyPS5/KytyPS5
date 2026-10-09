@@ -2,11 +2,13 @@
 
 #include "common/file.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <random>
 #include <system_error>
+#include <type_traits>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -75,6 +77,245 @@ private:
 	size_t                   m_pos = 0;
 };
 
+// Fields are stored one by one in a fixed width (bools as one byte, enums as their underlying type)
+// so that padding bytes and runtime pointers never reach the file.
+template <typename T>
+void PutField(std::vector<uint8_t>& out, const T& value) {
+	if constexpr (std::is_same_v<T, bool>) {
+		Put(out, static_cast<uint8_t>(value ? 1u : 0u));
+	} else if constexpr (std::is_enum_v<T>) {
+		Put(out, static_cast<std::underlying_type_t<T>>(value));
+	} else {
+		static_assert(std::is_arithmetic_v<T>);
+		Put(out, value);
+	}
+}
+
+template <typename T>
+bool GetField(Reader& reader, T& value) {
+	if constexpr (std::is_same_v<T, bool>) {
+		uint8_t byte = 0;
+		if (!reader.Get(byte) || byte > 1u) {
+			return false;
+		}
+		value = byte != 0;
+		return true;
+	} else if constexpr (std::is_enum_v<T>) {
+		std::underlying_type_t<T> raw {};
+		if (!reader.Get(raw)) {
+			return false;
+		}
+		value = static_cast<T>(raw);
+		return true;
+	} else {
+		static_assert(std::is_arithmetic_v<T>);
+		return reader.Get(value);
+	}
+}
+
+template <typename Array, typename F>
+void Each(Array& values, F& field) {
+	for (auto& value: values) {
+		field(value);
+	}
+}
+
+template <typename Info, typename F>
+void VisitWorkgroup(Info& info, F& field) {
+	Each(info.threads_num, field);
+	field(info.lds_size_dwords);
+	field(info.scratch_size_dwords);
+	field(info.host_subgroup_size);
+	field(info.wave_size);
+}
+
+// Every field except the runtime `stage` pointers.
+template <typename Info, typename F>
+void VisitInput(Info& info, F& field) {
+	using T = std::remove_const_t<Info>;
+	if constexpr (std::is_same_v<T, ShaderVertexInputInfo>) {
+		for (auto& resource: info.resources) {
+			Each(resource.fields, field);
+		}
+		for (auto& destination: info.resources_dst) {
+			field(destination.register_start);
+			field(destination.registers_num);
+			field(destination.attr_id);
+			field(destination.fetch_index);
+			field(destination.buffer_index);
+		}
+		for (auto& buffer: info.buffers) {
+			field(buffer.addr);
+			field(buffer.stride);
+			field(buffer.num_records);
+			field(buffer.fetch_index);
+		}
+		field(info.logical_stage);
+		field(info.resources_num);
+		field(info.fetch_attrib_reg);
+		field(info.fetch_buffer_reg);
+		field(info.buffers_num);
+		field(info.wave_size);
+		field(info.scratch_size_dwords);
+		field(info.pa_cl_vs_out_cntl);
+		Each(info.clip_space.scale, field);
+		Each(info.clip_space.offset, field);
+		Each(info.clip_space.half_extent, field);
+		field(info.clip_space.enabled);
+		VisitWorkgroup(info.mesh, field);
+		field(info.mesh.input_primitive);
+		field(info.mesh.primitives_per_group);
+		field(info.mesh.vertices_per_group);
+		field(info.mesh.max_vertices);
+		field(info.mesh.max_primitives);
+		field(info.mesh.provoking_vertex);
+		field(info.mesh.fast_launch);
+		field(info.tess.input_control_points);
+		field(info.tess.output_control_points);
+		field(info.tess.ls_stride);
+		field(info.tess.hs_stride);
+		field(info.tess.domain);
+		field(info.tess.partitioning);
+		field(info.tess.output_topology);
+		field(info.fetch_external);
+		field(info.fetch_embedded);
+	} else if constexpr (std::is_same_v<T, ShaderPixelInputInfo>) {
+		Each(info.interpolator_settings, field);
+		field(info.input_num);
+		field(info.wave_size);
+		field(info.ps_system_input_base);
+		field(info.custom_interpolation_mask);
+		field(info.ps_perspective_center_vgpr);
+		field(info.ps_perspective_sample_vgpr);
+		field(info.ps_perspective_centroid_vgpr);
+		Each(info.target_output_mode, field);
+		field(info.target_shader_mask);
+		for (auto& mapping: info.target_export_mapping) {
+			field(mapping.packed);
+		}
+		field(info.scratch_size_dwords);
+		field(info.ps_pos_x);
+		field(info.ps_pos_y);
+		field(info.ps_pos_z);
+		field(info.ps_pos_w);
+		field(info.ps_front_face);
+		field(info.ps_ancillary);
+		field(info.ps_no_perspective);
+		field(info.parameter_mode);
+		field(info.ps_pixel_kill_enable);
+		field(info.ps_depth_export_enable);
+		field(info.ps_sample_mask_export_enable);
+		field(info.ps_sample_shading);
+		field(info.dual_source_blending);
+		field(info.alpha_blend_source);
+		field(info.ps_early_z);
+		field(info.ps_execute_on_noop);
+	} else {
+		static_assert(std::is_same_v<T, ShaderComputeInputInfo>);
+		VisitWorkgroup(info, field);
+		field(info.float_mode);
+		Each(info.dispatch_threads_num, field);
+		Each(info.workgroup_counts, field);
+		Each(info.group_id, field);
+		field(info.dispatch_thread_dimensions);
+		field(info.lds_storage);
+		field(info.thread_ids_num);
+		field(info.workgroup_register);
+		field(info.tg_size_en);
+	}
+}
+
+template <typename Info, typename F>
+void VisitBuffer(Info& buffer, F& field) {
+	field(buffer.packed_stride);
+	field(buffer.descriptor_format);
+	field(buffer.descriptor_swizzle);
+	field(buffer.zero_stride_oob);
+	field(buffer.indirect_root);
+	field(buffer.indirect_mapping_offset);
+	field(buffer.indirect_search_iterations);
+}
+
+template <typename Info, typename F>
+void VisitImage(Info& image, F& field) {
+	field(image.numeric_class);
+	field(image.dimension);
+	field(image.mip_count);
+	field(image.conversion_format);
+	field(image.shader_swizzle);
+	field(image.indirect_root);
+	field(image.indirect_mapping_offset);
+	field(image.indirect_search_iterations);
+	field(image.cube);
+	field(image.fmask);
+}
+
+template <typename T>
+void PutFields(std::vector<uint8_t>& out, const T& value) {
+	auto put = [&out](const auto& field) { PutField(out, field); };
+	if constexpr (std::is_same_v<T, Buffer>) {
+		VisitBuffer(value, put);
+	} else if constexpr (std::is_same_v<T, Image>) {
+		VisitImage(value, put);
+	} else {
+		VisitInput(value, put);
+	}
+}
+
+template <typename T>
+bool GetFields(Reader& reader, T& value) {
+	bool ok  = true;
+	auto get = [&reader, &ok](auto& field) { ok = ok && GetField(reader, field); };
+	if constexpr (std::is_same_v<T, Buffer>) {
+		VisitBuffer(value, get);
+	} else if constexpr (std::is_same_v<T, Image>) {
+		VisitImage(value, get);
+	} else {
+		VisitInput(value, get);
+	}
+	return ok;
+}
+
+template <typename T>
+size_t FieldsSize() {
+	static const size_t size = [] {
+		std::vector<uint8_t> out;
+		PutFields(out, T {});
+		return out.size();
+	}();
+	return size;
+}
+
+template <typename T>
+void PutFieldsArray(std::vector<uint8_t>& out, const std::vector<T>& values) {
+	for (const auto& value: values) {
+		PutFields(out, value);
+	}
+}
+
+template <typename T>
+bool GetFieldsArray(Reader& reader, std::vector<T>& values, uint32_t count) {
+	if (reader.Remaining() / FieldsSize<T>() < count) {
+		return false;
+	}
+	values.resize(count);
+	return std::ranges::all_of(values, [&reader](T& value) { return GetFields(reader, value); });
+}
+
+template <typename Info>
+std::vector<uint8_t> EncodeInput(const Info& info) {
+	std::vector<uint8_t> out;
+	out.reserve(FieldsSize<Info>());
+	PutFields(out, info);
+	return out;
+}
+
+template <typename Info>
+bool DecodeInput(std::span<const uint8_t> data, Info& info) {
+	Reader reader(data);
+	return GetFields(reader, info) && reader.Remaining() == 0;
+}
+
 std::vector<uint8_t> EncodeRecipe(const ShaderCacheRecipe& recipe) {
 	std::vector<uint8_t> out;
 	Put(out, static_cast<uint32_t>(recipe.stage));
@@ -89,8 +330,8 @@ std::vector<uint8_t> EncodeRecipe(const ShaderCacheRecipe& recipe) {
 	PutArray(out, recipe.code);
 	PutArray(out, recipe.back_code);
 	PutArray(out, recipe.input);
-	PutArray(out, recipe.specialization.buffers);
-	PutArray(out, recipe.specialization.images);
+	PutFieldsArray(out, recipe.specialization.buffers);
+	PutFieldsArray(out, recipe.specialization.images);
 	return out;
 }
 
@@ -115,8 +356,8 @@ bool DecodeRecipe(std::span<const uint8_t> payload, ShaderCacheRecipe& recipe) {
 	return reader.GetArray(recipe.code, code_words) &&
 	       reader.GetArray(recipe.back_code, back_words) &&
 	       reader.GetArray(recipe.input, input_bytes) &&
-	       reader.GetArray(recipe.specialization.buffers, buffers) &&
-	       reader.GetArray(recipe.specialization.images, images) && reader.Remaining() == 0;
+	       GetFieldsArray(reader, recipe.specialization.buffers, buffers) &&
+	       GetFieldsArray(reader, recipe.specialization.images, images) && reader.Remaining() == 0;
 }
 
 } // namespace
@@ -127,11 +368,30 @@ size_t ShaderCacheInputSize(ShaderType stage) {
 		case ShaderType::Mesh:
 		case ShaderType::Local:
 		case ShaderType::TessellationControl:
-		case ShaderType::TessellationEvaluation: return sizeof(ShaderVertexInputInfo);
-		case ShaderType::Pixel: return sizeof(ShaderPixelInputInfo);
-		case ShaderType::Compute: return sizeof(ShaderComputeInputInfo);
+		case ShaderType::TessellationEvaluation: return FieldsSize<ShaderVertexInputInfo>();
+		case ShaderType::Pixel: return FieldsSize<ShaderPixelInputInfo>();
+		case ShaderType::Compute: return FieldsSize<ShaderComputeInputInfo>();
 		default: return 0;
 	}
+}
+
+std::vector<uint8_t> EncodeShaderCacheInput(const ShaderVertexInputInfo& info) {
+	return EncodeInput(info);
+}
+std::vector<uint8_t> EncodeShaderCacheInput(const ShaderPixelInputInfo& info) {
+	return EncodeInput(info);
+}
+std::vector<uint8_t> EncodeShaderCacheInput(const ShaderComputeInputInfo& info) {
+	return EncodeInput(info);
+}
+bool DecodeShaderCacheInput(std::span<const uint8_t> data, ShaderVertexInputInfo& info) {
+	return DecodeInput(data, info);
+}
+bool DecodeShaderCacheInput(std::span<const uint8_t> data, ShaderPixelInputInfo& info) {
+	return DecodeInput(data, info);
+}
+bool DecodeShaderCacheInput(std::span<const uint8_t> data, ShaderComputeInputInfo& info) {
+	return DecodeInput(data, info);
 }
 
 std::vector<uint8_t> SerializeShaderCache(std::string_view          signature,

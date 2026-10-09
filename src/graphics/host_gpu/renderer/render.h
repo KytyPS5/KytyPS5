@@ -205,6 +205,7 @@ private:
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	void                         ResolvePendingMetaClears(CommandBuffer& buffer);
+	void TrackMetaFills(const ShaderComputeInputInfo& input, CommandBuffer& buffer);
 	std::unordered_set<uint64_t> m_pending_meta_fills;
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);

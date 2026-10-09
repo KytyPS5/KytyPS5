@@ -401,18 +401,27 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+	} else {
+		// The pipeline's dynamic depth bias must be set before every draw of this command buffer.
+		vk_buffer.setDepthBias(0.0f, 0.0f, 0.0f);
 	}
 
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	// Every dynamic state of the pipeline must be set in this command buffer before the draw,
+	// even while the stencil test is disabled (VUID-vkCmdDraw-None-07848 and its siblings).
+	const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+		vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
+		vk_buffer.setStencilCompareMask(face, state.compareMask);
+		vk_buffer.setStencilWriteMask(face, state.writeMask);
+		vk_buffer.setStencilReference(face, state.reference);
+	};
 	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
-		};
 		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
 		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+	} else {
+		const vk::StencilOpState unused {vk::StencilOp::eKeep, vk::StencilOp::eKeep,
+		                                 vk::StencilOp::eKeep, vk::CompareOp::eAlways, 0, 0, 0};
+		set_stencil(vk::StencilFaceFlagBits::eFrontAndBack, unused);
 	}
 
 #if defined(__APPLE__)

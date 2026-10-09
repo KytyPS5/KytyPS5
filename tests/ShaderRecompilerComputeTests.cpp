@@ -35393,6 +35393,181 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   for (auto &texture : textures) vulkan.DestroyImage(&texture);
 }
 
+// Array loads, gathers and size queries select the indirect table candidate per lane, through
+// both a native descriptor-array run of 2D T#s and a separate 2D-array candidate. Loads keep
+// the instruction's address layout: slice 1, then LOD 0.
+void CheckIndirectImageOperations(VulkanHarness &vulkan) {
+  constexpr const char *name = "IndirectImageOperations";
+  using namespace ShaderRecompiler::IR;
+  using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+
+  Program program{};
+  program.stage = ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.shader_info_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+
+  auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+  // A dense table maps DWORD offsets of the descriptor key.
+  auto &key = block->AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(4u)});
+  auto &image = block->AppendNewInst(
+      ValueOpcode::GetImageResource,
+      {Value(&key), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  image.SetFlags<uint32_t>(0u);
+  auto &sampler = block->AppendNewInst(ValueOpcode::GetSamplerResource,
+                                       {Value(0u), Value(0u), Value(0u), Value(0u)});
+  sampler.SetFlags<uint32_t>(0u);
+  const auto make_address = [&](u32 x, u32 y, u32 slice) -> Inst & {
+    return block->AppendNewInst(
+        ValueOpcode::MakeImageAddress,
+        {Value(x), Value(y), Value(slice), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  };
+  const auto add_memory = [&](u32 components, bool mip = false) {
+    MemoryInfo memory{};
+    memory.kind = ResourceKind::Image;
+    memory.dmask = 0x1;
+    memory.image_dimension = Dimension::Dim2DArray;
+    memory.image_address_components = components;
+    memory.image_has_mip = mip;
+    program.memory_info.push_back(memory);
+    MemoryFlags flags{static_cast<u32>(program.memory_info.size() - 1u), 0x10f0u};
+    uint64_t bits = 0;
+    std::memcpy(&bits, &flags, sizeof(flags));
+    return bits;
+  };
+  auto &read = block->AppendNewInst(ValueOpcode::ImageRead,
+                                    {Value(&image), Value(&make_address(0u, 0u, 1u)), Value(true)},
+                                    add_memory(4, true));
+  const auto half = std::bit_cast<u32>(0.5f);
+  auto &gather = block->AppendNewInst(
+      ValueOpcode::ImageGatherRaw,
+      {Value(&image), Value(&sampler), Value(&make_address(half, half, std::bit_cast<u32>(1.0f))),
+       Value(0u), Value(0u), Value(0u), Value(0u)},
+      add_memory(3));
+  auto &query = block->AppendNewInst(ValueOpcode::ImageQueryDimensions,
+                                     {Value(&image), Value(&make_address(0u, 0u, 0u))},
+                                     add_memory(1));
+
+  auto &output = block->AppendNewInst(ValueOpcode::GetBufferResource,
+                                      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  output.SetFlags<u32>(0u);
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
+  const MemoryFlags store_flags{static_cast<u32>(program.memory_info.size() - 1u), 0u};
+  auto &lane_offset = block->AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(12u)});
+  u32 field = 0;
+  for (auto *result : {&read, &gather, &query}) {
+    auto &x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4, {Value(result), Value(0u)});
+    auto &offset =
+        block->AppendNewInst(ValueOpcode::IAdd32, {Value(&lane_offset), Value(field++ * 4u)});
+    auto &store = block->AppendNewInst(
+        ValueOpcode::StoreBufferU32,
+        {Value(&output), Value(0u), Value(&offset), Value(0u), Value(&x), Value(true)});
+    store.SetFlags(store_flags);
+  }
+  program.info.buffers.push_back({.packed_stride = 1, .written = true});
+
+  program.descriptor_sources.resize(2);
+  program.descriptor_sources[0].dword_count = 8;
+  program.descriptor_sources[0].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor{.table_source = 0, .table_stride = 32};
+  program.descriptor_sources[1].dword_count = 4;
+
+  ImageResource root{};
+  root.source = 0;
+  root.first_use_pc = 0x10f0u;
+  root.resource_class = ImageResourceClass::Sampled;
+  root.numeric_class = Prospero::TextureNumericClass::Float;
+  root.dimension = Dimension::Dim2D;
+  root.read = true;
+  root.indirect_root = 0;
+  root.indirect_resources = {0u, 1u, 2u, 3u};
+  auto candidate = root;
+  candidate.indirect_resources.clear();
+  program.info.images.assign(4, candidate);
+  program.info.images[0] = root;
+  program.info.images[3].dimension = Dimension::Dim2DArray;
+  program.info.samplers.push_back({1u, 0x10f0u});
+  program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
+
+  ShaderComputeInputInfo compute{};
+  CompiledShader compiled;
+  compiled.program = std::move(program);
+  constexpr std::array ordinals{0u, 1u, 2u, 3u, 3u, 2u, 1u, 0u};
+  compiled.resources.flattened_srt.push_back(ordinals.size());
+  compiled.resources.flattened_srt.insert(compiled.resources.flattened_srt.end(),
+                                          ordinals.begin(), ordinals.end());
+  std::vector<VulkanHarness::Image> textures;
+  for (u32 resource = 0; resource < 4u; ++resource) {
+    const auto width = resource + 1u;
+    const auto layers = resource == 3u ? 2u : 1u;
+    std::vector<u32> pixels(width * layers * 4u, std::bit_cast<u32>(float(resource)));
+    // Slice 1 of the array candidate holds a value no other layer or candidate has.
+    if (layers == 2u)
+      std::fill(pixels.begin() + width * 4u, pixels.end(), std::bit_cast<u32>(30.0f));
+    textures.push_back(vulkan.CreateImageMips(
+        name, width, 1, vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eSampled,
+        {pixels}, 4u, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+        resource == 3u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
+  }
+  const auto native_sampler = vulkan.CreateSampler(name);
+  TestCase test;
+  test.name = name;
+  for (const u32 wave_size : {32u, 64u}) {
+    compute.wave_size = wave_size;
+    compute.host_subgroup_size = vulkan.SubgroupSize();
+    compute.threads_num[0] = wave_size;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compiled.program.wave_size = wave_size;
+    compiled.program.shader_info_complete = false;
+    CollectShaderInfo(compiled.program, {.compute = &compute});
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+    compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+    ValidateSpirv(name, compiled.spirv);
+    std::string text;
+    Require(name, "candidate dispatch",
+            spvtools::SpirvTools(SPV_ENV_VULKAN_1_2).Disassemble(compiled.spirv, &text) &&
+                text.find("OpSwitch") != std::string::npos &&
+                text.find("SampledImageArrayNonUniformIndexing") != std::string::npos,
+            "the table did not use both a native array run and a candidate switch");
+    std::vector<u32> nonuniform;
+    bool nonuniform_fetch = false;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto words =
+          std::span<const u32>(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+      const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+        nonuniform.push_back(words[1]);
+      if (opcode == spv::OpImageFetch && std::ranges::find(nonuniform, words[3]) != nonuniform.end())
+        nonuniform_fetch = true;
+      offset += words.size();
+    }
+    Require(name, "nonuniform fetched image", nonuniform_fetch,
+            "the arrayed load lacks its nonuniform image decoration");
+    test.initial.assign(wave_size * 3u, 0xdeadbeefu);
+    test.expected.assign(wave_size * 3u, 0u);
+    for (u32 lane = 0; lane < wave_size; ++lane) {
+      const auto resource = lane < ordinals.size() ? ordinals[lane] : 0u;
+      const auto texel = std::bit_cast<u32>(resource == 3u ? 30.0f : float(resource));
+      test.expected[lane * 3u] = texel;
+      test.expected[lane * 3u + 1u] = texel;
+      test.expected[lane * 3u + 2u] = resource + 1u;
+    }
+    auto buffer = vulkan.CreateStorageBuffer(name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, native_sampler,
+                    textures);
+    const auto actual = vulkan.ReadBuffer(name, buffer, test.expected.size());
+    vulkan.DestroyBuffer(&buffer);
+    CompareWords(test, "per-lane load, gather and size query", test.expected, actual);
+  }
+  vulkan.Device().destroySampler(native_sampler);
+  for (auto &texture : textures) vulkan.DestroyImage(&texture);
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   using O = ShaderOpcode;
 
@@ -43310,6 +43485,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckIndirectImageKeySwitch(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
+    CheckIndirectImageOperations(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -43474,6 +43650,7 @@ int main(int argc, char **argv) {
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   CheckFiniteInlineSamplerPhi(vulkan);
+  CheckIndirectImageOperations(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();

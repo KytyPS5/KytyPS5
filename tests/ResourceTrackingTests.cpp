@@ -206,7 +206,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t table_offset = 0,
-                         uint32_t table_shader_offset = 0, bool nested = false) {
+                         uint32_t table_shader_offset = 0, bool nested = false,
+                         ValueOpcode op = ValueOpcode::ImageSampleRaw) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -264,14 +265,34 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
     fixture->Emit(ValueOpcode::ReferenceU32, {field});
   }
   const auto image = fixture->Image(image_words, 0x10f0);
-  const auto sampler =
-      fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
   MemoryInfo sample;
   sample.kind = ResourceKind::Image;
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress()},
-                                     fixture->AddMemory(sample, 0x10f0));
+  if (op == ValueOpcode::ImageWrite) {
+    const auto texel = fixture->Emit(ValueOpcode::CompositeConstructU32x4,
+                                     {Value(0u), Value(0u), Value(0u), Value(0u)});
+    fixture->Emit(op, {image, fixture->ImageAddress(), texel, Value(true)},
+                  fixture->AddMemory(sample, 0x10f0));
+    return fixture;
+  }
+  Value sampled;
+  if (op == ValueOpcode::ImageRead) {
+    sampled = fixture->Emit(op, {image, fixture->ImageAddress(), Value(true)},
+                            fixture->AddMemory(sample, 0x10f0));
+  } else if (op == ValueOpcode::ImageQueryDimensions) {
+    sampled = fixture->Emit(op, {image, fixture->ImageAddress()},
+                            fixture->AddMemory(sample, 0x10f0));
+  } else {
+    const auto sampler =
+        fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
+    const auto address = fixture->ImageAddress();
+    const auto memory = fixture->AddMemory(sample, 0x10f0);
+    sampled = op == ValueOpcode::ImageGatherRaw
+                  ? fixture->Emit(op, {image, sampler, address, Value(0u), Value(0u), Value(0u),
+                                       Value(0u)},
+                                  memory)
+                  : fixture->Emit(op, {image, sampler, address}, memory);
+  }
   const auto sampled_x =
       fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
   fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
@@ -436,6 +457,45 @@ void TestBoundedImageViewEligibility() {
   plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected incompatible descriptor was silently normalized to null");
+}
+
+// Sampled-class accesses select their table candidate on the GPU; storage tables are rejected
+// before compilation.
+void TestIndirectImageTableOperations() {
+  for (const auto op : {ValueOpcode::ImageRead, ValueOpcode::ImageGatherRaw,
+                        ValueOpcode::ImageQueryDimensions, ValueOpcode::ImageWrite}) {
+    auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, false, op);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u, 0x2000u, 48u << 16u, 3u, 0u};
+    LinearTestMemory memory;
+    memory.fail_address = 0x3000u;
+    for (uint32_t row = 0; row < 3u; ++row) {
+      const std::array<uint32_t, 8> descriptor{
+          0x20u + row, static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32UInt) << 20u,
+          3u | (3u << 14u),
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u),
+          0u, 0u, 0u, 0u};
+      std::copy(descriptor.begin(), descriptor.end(),
+                memory.words.begin() + (0x1010u + row * 48u) / 4u);
+    }
+    SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+    if (op == ValueOpcode::ImageWrite) {
+      Check(!materialized, "indirect storage image table was accepted");
+      continue;
+    }
+    Check(materialized && snapshot.images.size() == 4u &&
+              specialization.images[0].indirect_root == 0u,
+          "indirect sampled image access did not materialize its table candidates");
+    ApplyResourceSpecialization(fixture->program, specialization);
+    Check(fixture->program.info.images[0].indirect_resources.size() == 4u,
+          "indirect sampled image access lost its table candidates");
+  }
 }
 
 void TestWaterfallImageTable() {
@@ -3720,6 +3780,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+    Run("indirect image table operations", TestIndirectImageTableOperations);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -125,6 +126,35 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+// A uniform fill of plain buffer memory (e.g. DCC/CMASK metadata cleared by a compute shader)
+// is applied to guest memory in command order instead of on the GPU. The range then stays
+// CPU-owned, so later metadata inspection (MaterializeColorClear) needs no synchronous GPU
+// readback. GPU work recorded earlier still sees the old data: the buffer cache uploads the
+// CPU copy at the next GPU use, in stream order.
+static bool TryCpuBufferFill(CommandBuffer& command, uint64_t address, uint64_t size,
+                             uint32_t value) {
+	constexpr uint64_t MaxCpuFillSize = 4ull << 20u;
+	if (size == 0 || size > MaxCpuFillSize || (address & 3u) != 0 || (size & 3u) != 0 ||
+	    !GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	auto& context = command.GetContext();
+	if (!context.IsMapped(address, size) ||
+	    context.GetTextureCache().IsRegionRegistered(address, size)) {
+		return false;
+	}
+	context.GetBufferCache().InvalidateMemory(address, size);
+	const std::vector<uint32_t> words(size / sizeof(uint32_t), value);
+	LibKernel::Memory::WriteBacking(address, words.data(), size);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("GraphicsRenderDispatchDirect: CPU buffer fill addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
+		     address, size, value);
+	}
+	return true;
+}
+
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
                                                 CommandBuffer& command, uint32_t group_x,
                                                 uint32_t group_y, uint32_t group_z, uint32_t mode) {
@@ -184,7 +214,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		return false;
+		return TryCpuBufferFill(command, descriptor.Base48(), size, packed_clear);
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {

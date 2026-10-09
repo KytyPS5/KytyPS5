@@ -163,7 +163,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	    (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type()))) {
 		return false;
 	}
-	const auto metadata_control = descriptor.fields[6] & 0x00ffffffu;
+	// MaxUncompBlkSize/MaxCompBlkSize (bits 15-18) size DCC blocks; HTILE depth ignores them.
+	constexpr uint32_t dcc_block_size_mask = 0x00078000u;
+	const auto         metadata_control = descriptor.fields[6] & 0x00ffffffu & ~dcc_block_size_mask;
 	if (metadata_control == 0) {
 		return true;
 	}
@@ -172,7 +174,8 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
 	return metadata_control == expected_control && GuestRange {metadata_addr, 1}.Valid() &&
 	       (metadata_addr & 0x7fffu) == 0 &&
-	       descriptor.TileMode() == Prospero::TileMode::kDepth;
+	       (descriptor.TileMode() == Prospero::TileMode::kDepth ||
+	        descriptor.TileMode() == Prospero::TileMode::kRenderTarget);
 }
 
 static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,

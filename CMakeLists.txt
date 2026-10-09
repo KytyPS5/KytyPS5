@@ -433,6 +433,17 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(min_lod_view_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/MinLodViewTests.cpp")
+target_include_directories(min_lod_view_tests PRIVATE ${inc_headers})
+# Mutants (each must be caught, WILL_FAIL): MinLod floors instead of rounding up; the shift is not capped at the
+# last level; RESINFO reports the shifted view.
+foreach(mutant IN ITEMS FLOOR NO_CAP RESINFO)
+	string(TOLOWER ${mutant} mutant_lower)
+	add_executable(min_lod_view_mutant_${mutant_lower}_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/MinLodViewTests.cpp")
+	target_include_directories(min_lod_view_mutant_${mutant_lower}_tests PRIVATE ${inc_headers})
+	target_compile_definitions(min_lod_view_mutant_${mutant_lower}_tests PRIVATE KYTY_MINLOD_MUTANT_${mutant}=1)
+endforeach()
+
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
@@ -611,6 +622,11 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME min_lod_view COMMAND $<TARGET_FILE:min_lod_view_tests>)
+	foreach(mutant IN ITEMS floor no_cap resinfo)
+		add_test(NAME min_lod_view_mutant_${mutant} COMMAND $<TARGET_FILE:min_lod_view_mutant_${mutant}_tests>)
+		set_tests_properties(min_lod_view_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
+	endforeach()
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -687,6 +703,10 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
+		min_lod_view_tests
+		min_lod_view_mutant_floor_tests
+		min_lod_view_mutant_no_cap_tests
+		min_lod_view_mutant_resinfo_tests
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests

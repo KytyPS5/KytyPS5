@@ -250,7 +250,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #else
 		check_feature(color_write_ext.colorWriteEnable, "colorWriteEnable");
 #endif
-		check_feature(image_view_min_lod.minLod, "image view minLod");
+		// VK_EXT_image_view_min_lod is optional: without it the T# MinLod is folded into the view base level.
 
 		check_feature(depth_clip_control.depthClipControl, "depthClipControl");
 #if defined(__APPLE__)
@@ -429,13 +429,23 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
 	vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
 	image_view_min_lod.minLod = VK_TRUE;
-	depth_clip_control.pNext  = &image_view_min_lod;
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
 	// feature structs from the chain on macOS (the renderer falls back to default depth
 	// clipping and static color-write masks).
 #if !defined(__APPLE__)
-	image_view_min_lod.pNext = &depth_clip_enable;
+	void* const depth_clip_tail = &depth_clip_enable;
+#else
+	void* const depth_clip_tail = nullptr;
 #endif
+	const bool min_lod_extension =
+	    HasExtension(device_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+	vk::PhysicalDeviceImageViewMinLodFeaturesEXT supported_min_lod {};
+	if (min_lod_extension) {
+		image_view_min_lod.pNext = depth_clip_tail;
+		depth_clip_control.pNext = &image_view_min_lod;
+	} else {
+		depth_clip_control.pNext = depth_clip_tail;
+	}
 	depth_clip_control.depthClipControl = VK_TRUE;
 
 	const bool workgroup_layout_extension =
@@ -485,8 +495,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	if (min_lod_extension) {
+		supported_min_lod.pNext   = supported_features2.pNext;
+		supported_features2.pNext = &supported_min_lod;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.has_view_min_lod                   = min_lod_extension && supported_min_lod.minLod == VK_TRUE;
+	if (min_lod_extension && !graphics.has_view_min_lod) {
+		// Enabled without the feature: leave it out of the chain.
+		depth_clip_control.pNext = depth_clip_tail;
+	}
+	graphics.min_lod_remap = !graphics.has_view_min_lod;
+	LOGF("T# MinLod: view min lod feature=%d remap_to_base_level=%d\n", graphics.has_view_min_lod ? 1 : 0,
+	     graphics.min_lod_remap ? 1 : 0);
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -937,8 +959,7 @@ void WindowContext::CreateVulkan() {
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    "VK_KHR_maintenance1"};
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -1001,7 +1022,8 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
-		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		for (const auto* extension: {VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
+		                             VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,

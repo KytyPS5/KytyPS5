@@ -4,7 +4,6 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
-#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -87,12 +86,9 @@ bool RenderContext::StoreAtCompletion(uint64_t vaddr, const void* data, uint64_t
 		std::memcpy(reinterpret_cast<void*>(vaddr), data, size);
 		return true;
 	}
-	// Cached copies cannot be invalidated here; unwatched pages have none that a write can stale.
-	if (m_page_manager.IsWatched(vaddr, 1) || m_page_manager.IsWatched(vaddr + size - 1, 1)) {
-		return false;
-	}
-	LibKernel::Memory::WriteBacking(vaddr, data, size);
-	return true;
+	// Cached copies cannot be invalidated here. Unwatched pages have none that a write can
+	// stale, and the store excludes a cache registering a watcher meanwhile.
+	return m_page_manager.StoreUnwatched(vaddr, size, data);
 }
 
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {

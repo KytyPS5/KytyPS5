@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -279,20 +280,30 @@ struct PageManager::Impl {
 		}
 	}
 
-	bool IsWatched(uint64_t vaddr, uint64_t size) const {
+	bool StoreUnwatched(uint64_t vaddr, uint64_t size, const void* data) {
 		ValidateRange(vaddr, size);
-		const auto end = Common::AlignUp(vaddr + size, PAGE_SIZE);
-		for (auto page = Common::AlignDown(vaddr, PAGE_SIZE); page < end; page += PAGE_SIZE) {
-			auto* region = FindRegion(page);
-			if (region == nullptr) {
-				return false;
-			}
-			SpinGuard  lock(region->lock);
-			const auto state = region->pages[(page % REGION_SIZE) / PAGE_SIZE];
-			if (state.write_watchers == 0 && state.access_watchers == 0) {
+		const auto first_page = Common::AlignDown(vaddr, PAGE_SIZE);
+		const auto last_page  = Common::AlignDown(vaddr + size - 1, PAGE_SIZE);
+		if (last_page - first_page > PAGE_SIZE) {
+			Fatal("store spans more than two pages at 0x%016" PRIx64, vaddr);
+		}
+		// The regions exist and stay locked across the store, in address order, so no watcher
+		// registers between the check and the write.
+		auto*                    first_region = GetOrCreateRegion(first_page);
+		auto*                    last_region  = GetOrCreateRegion(last_page);
+		SpinGuard                first_lock(first_region->lock);
+		std::optional<SpinGuard> last_lock;
+		if (last_region != first_region) {
+			last_lock.emplace(last_region->lock);
+		}
+		for (auto page = first_page; page <= last_page; page += PAGE_SIZE) {
+			const auto* region = page == first_page ? first_region : last_region;
+			const auto  state  = region->pages[(page % REGION_SIZE) / PAGE_SIZE];
+			if (state.write_watchers != 0 || state.access_watchers != 0) {
 				return false;
 			}
 		}
+		Libs::LibKernel::Memory::WriteBacking(vaddr, data, size);
 		return true;
 	}
 
@@ -316,8 +327,8 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
 }
 
-bool PageManager::IsWatched(uint64_t vaddr, uint64_t size) const {
-	return m_impl->IsWatched(vaddr, size);
+bool PageManager::StoreUnwatched(uint64_t vaddr, uint64_t size, const void* data) {
+	return m_impl->StoreUnwatched(vaddr, size, data);
 }
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);

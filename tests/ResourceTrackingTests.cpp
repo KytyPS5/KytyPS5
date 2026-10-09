@@ -786,6 +786,158 @@ void TestGuardedDirectImageTable() {
         "batched descriptor read crossed the 48-bit endpoint");
 }
 
+void TestLoopSelectedSignedKey() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // for (i = 0; i < count; ++i) { key = sel[i]; if (key >= 0) sample(table[key]); }
+  enum class Guard { NonNegative, None, Unrelated, Inverted, SecondUnguarded };
+  const auto make_plan = [](Guard guard) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *use = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(exit);
+    header->AddBranch(body);
+    body->AddBranch(use);
+    if (guard != Guard::None) body->AddBranch(latch);
+    use->AddBranch(latch);
+    latch->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    use->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+    latch->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto index = Value(&phi);
+    const auto count = fixture.UserData(2);
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto active = fixture.Emit(ValueOpcode::INotEqual32, {local, Value(0u)}, 0, entry);
+    const auto in_range = fixture.Emit(ValueOpcode::SLessThan32, {index, count}, 0, header);
+    const auto allowed = fixture.Emit(ValueOpcode::LogicalAnd, {in_range, active}, 0, header);
+    header->condition = fixture.Emit(
+        ValueOpcode::ConditionRef,
+        {fixture.Emit(ValueOpcode::LogicalNot, {allowed}, 0, header)},
+        CFG::BranchCondition::ExecZero, header);
+    header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = exit, .false_block = body};
+    const auto step = fixture.Emit(ValueOpcode::IAdd32, {index, Value(1u)}, 0, latch);
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, step);
+
+    // s_load_dword key, s[0:1], i * 16 offset:0x40
+    fixture.block = body;
+    const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    MemoryInfo selector;
+    selector.kind = ResourceKind::ScalarAddress;
+    selector.offset = 0x40u;
+    const auto key = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {base, fixture.Emit(ValueOpcode::IMul32, {index, Value(16u)}), Value(0u), Value(true)},
+        fixture.AddMemory(selector, 0x100));
+    if (guard == Guard::None) {
+      body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = use};
+    } else {
+      // s_cmp_ge_i32 value, 0; s_cbranch_scc0 latch
+      const auto tested = guard == Guard::Unrelated ? fixture.UserData(5) : key;
+      const auto nonnegative = fixture.Emit(ValueOpcode::SGreaterThanEqual32, {tested, Value(0u)});
+      body->condition = fixture.Emit(
+          ValueOpcode::ConditionRef,
+          {guard == Guard::Inverted ? nonnegative
+                                    : fixture.Emit(ValueOpcode::LogicalNot, {nonnegative})},
+          CFG::BranchCondition::SccZero);
+      body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = latch, .false_block = use};
+    }
+
+    // s_load_dwordx8 image, s[0:1], (key << 5) + 0x400
+    const auto sample_table = [&](Block *destination, uint32_t pc) {
+      fixture.block = destination;
+      const auto offset = fixture.Emit(
+          ValueOpcode::IAdd32,
+          {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(0x400u)});
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < words.size(); ++word) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        memory.offset = word * sizeof(uint32_t);
+        words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                   {base, offset, Value(0u), Value(true)},
+                                   fixture.AddMemory(memory, pc));
+      }
+      const auto image = fixture.Image(words, pc);
+      const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+      MemoryInfo sample;
+      sample.kind = ResourceKind::Image;
+      sample.image_dimension = Decoder::ImageDimension::Dim2D;
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                   fixture.AddMemory(sample, pc));
+    };
+    sample_table(use, 0x110);
+    // The same table sampled again after the guarded block joins the skip edge.
+    if (guard == Guard::SecondUnguarded) sample_table(latch, 0x120);
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect && indirect->selector.has_value() && indirect->selector->stride == 16u &&
+              indirect->selector->offset == 0x40u && indirect->table_offset == 0x400u,
+          "loop-selected key was not planned as a pointer-backed selector");
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  // Selector words 1, -1, 0; records for keys -1, 0 and 1.
+  LinearTestMemory memory;
+  const auto word_at = [&](uint64_t address) { return (address - memory.base) / 4u; };
+  const uint32_t selectors[] = {1u, UINT32_MAX, 0u};
+  for (uint32_t i = 0; i < 3u; ++i) memory.words[word_at(0x1800u + 0x40u + i * 16u)] = selectors[i];
+  for (const uint32_t key : {UINT32_MAX, 0u, 1u}) {
+    const auto word = word_at(0x1800u + ((key * 32u + 0x400u) & 0xffffffffu));
+    memory.words[word] = 0x200u + (key + 1u);
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 6> user_data{0x1800u, 0u, 3u, 0u, 0u, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  const auto materialize = [&](Guard guard, std::vector<uint32_t> &keys,
+                               std::vector<uint32_t> &descriptors) {
+    const auto plan = make_plan(guard);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "loop-selected image table did not materialize");
+    const auto mapping = specialization.images[0].indirect_mapping_offset;
+    keys.clear();
+    for (uint32_t entry = 0; entry < snapshot.flattened_srt[mapping]; ++entry)
+      keys.push_back(snapshot.flattened_srt[mapping + 1u + entry * 2u]);
+    descriptors.clear();
+    for (const auto &image : snapshot.images) descriptors.push_back(image.dwords[0]);
+  };
+  std::vector<uint32_t> keys, descriptors;
+  // The key >= 0 test keeps the record of key -1 away from the image.
+  materialize(Guard::NonNegative, keys, descriptors);
+  Check(keys == std::vector<uint32_t>{0u, 1u} &&
+            std::ranges::find(descriptors, 0x200u) == descriptors.end(),
+        "guarded negative selector produced an image candidate");
+  // Without that proof, key -1 addresses the record before the table like the SMEM read.
+  for (const auto guard : {Guard::None, Guard::Unrelated, Guard::Inverted,
+                           Guard::SecondUnguarded}) {
+    materialize(guard, keys, descriptors);
+    Check(keys == std::vector<uint32_t>{0u, 1u, UINT32_MAX} &&
+              std::ranges::find(descriptors, 0x200u) != descriptors.end(),
+          "negative selector did not read the record at its computed address");
+  }
+}
+
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
@@ -3772,6 +3924,7 @@ int main() {
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
+    Run("loop-selected signed key", TestLoopSelectedSignedKey);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);

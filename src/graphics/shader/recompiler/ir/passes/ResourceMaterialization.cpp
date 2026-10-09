@@ -401,6 +401,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else
 			return false;
 		if (selector != nullptr) {
+			if (indirect.selector_nonnegative)
+				std::erase_if(keys, [](uint32_t key) { return key >= 0x80000000u; });
 			std::ranges::sort(keys);
 			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		}
@@ -414,9 +416,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		const auto key = sources.empty() ? keys[entry] : entry;
 		DescriptorValue candidate;
 		candidate.dword_count = dword_count;
-		if (sources.empty() && selector != nullptr && key >= 0x80000000u) {
-			// A negative selector value means "no resource": bind a null descriptor.
-		} else if (sources.empty()) {
+		if (sources.empty()) {
 			const uint64_t table_offset =
 			    uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
 			    (indirect.table_immediate & ~3u);

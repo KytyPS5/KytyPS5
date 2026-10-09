@@ -937,6 +937,8 @@ private:
 			if (same) {
 				if (current.indirect_descriptor) {
 					current.indirect_descriptor->table_scalar |= descriptor.indirect_descriptor->table_scalar;
+					current.indirect_descriptor->selector_nonnegative &=
+					    descriptor.indirect_descriptor->selector_nonnegative;
 					current.indirect_descriptor->table_record_bytes = std::max(
 					    current.indirect_descriptor->table_record_bytes,
 					    descriptor.indirect_descriptor->table_record_bytes);
@@ -1646,7 +1648,60 @@ private:
 		    .offset = static_cast<uint32_t>(offset + memory->offset)});
 		indirect.selector_first = Value(0u);
 		indirect.key_count      = bound->Arg(1);
+		// A negative key that never reaches the image has no table record candidate.
+		indirect.selector_nonnegative = NonnegativeOnEntry(key, image.Parent());
 		return true;
+	}
+
+	// True when every path from the definition of key to block tests key >= 0.
+	bool NonnegativeOnEntry(Value key, const Block* block) const {
+		const auto* definition = key.Resolve().TryInstruction();
+		if (definition == nullptr || block == nullptr) return false;
+		return GuardedOnEntry(
+		    block, [&](const Block* at) { return at == definition->Parent(); },
+		    [&](const EdgePredicate& edge) {
+			    return edge.lanes == LaneQuantifier::All &&
+			           ConditionProvesNonnegative(edge.condition, edge.positive, key);
+		    });
+	}
+
+	// True when condition (or its negation when !positive) implies value >= 0 as a signed
+	// integer.
+	bool ConditionProvesNonnegative(Value condition, bool positive, Value value,
+	                                uint32_t depth = 0) const {
+		if (depth > 12u) return false;
+		const auto* test = SimplifyGuard(condition).TryInstruction();
+		if (test == nullptr) return false;
+		const auto op = test->GetOpcode();
+		if (op == ValueOpcode::LogicalNot && test->NumArgs() == 1u)
+			return ConditionProvesNonnegative(test->Arg(0), !positive, value, depth + 1u);
+		if (test->NumArgs() != 2u) return false;
+		if ((op == ValueOpcode::LogicalAnd && positive) ||
+		    (op == ValueOpcode::LogicalOr && !positive)) {
+			return ConditionProvesNonnegative(test->Arg(0), positive, value, depth + 1u) ||
+			       ConditionProvesNonnegative(test->Arg(1), positive, value, depth + 1u);
+		}
+		for (uint32_t arg = 0; arg < 2u; ++arg) {
+			uint32_t immediate = 0;
+			if (!ImmediateU32(test->Arg(arg ^ 1u), immediate) ||
+			    !EquivalentValue(m_program, test->Arg(arg), value))
+				continue;
+			// Lower bound the outcome implies on value; `left`: value is the left operand.
+			const bool             left = arg == 0u;
+			const auto             c    = static_cast<int64_t>(std::bit_cast<int32_t>(immediate));
+			std::optional<int64_t> bound;
+			if (op == ValueOpcode::SGreaterThanEqual32) {
+				if (left == positive) bound = left ? c : c + 1; // v >= c, or c >= v false
+			} else if (op == ValueOpcode::SGreaterThan32) {
+				if (left == positive) bound = left ? c + 1 : c; // v > c, or c > v false
+			} else if (op == ValueOpcode::SLessThan32) {
+				if (left != positive) bound = left ? c : c + 1; // v < c false, or c < v
+			} else if (op == ValueOpcode::SLessThanEqual32) {
+				if (left != positive) bound = left ? c + 1 : c; // v <= c false, or c <= v
+			}
+			if (bound && *bound >= 0) return true;
+		}
+		return false;
 	}
 
 	const Inst* BoundedLoop(Value key, const Block* use, const auto& accepts_bound) const {
@@ -2333,6 +2388,11 @@ private:
 					// A handle built from the same descriptor words as a planned one (the same
 					// scalar reads used again in a dominated block) shares that plan.
 					if (const auto* twin = FindTwinPlan(*handle)) {
+						// The shared source keeps negative keys out only if both uses test them.
+						auto& shared = m_sources[twin->source].indirect_descriptor;
+						if (shared && shared->selector_nonnegative &&
+						    !NonnegativeOnEntry(twin->key, handle->Parent()))
+							shared->selector_nonnegative = false;
 						auto copy   = *twin;
 						copy.handle = handle;
 						m_indirect_descriptors.push_back(std::move(copy));

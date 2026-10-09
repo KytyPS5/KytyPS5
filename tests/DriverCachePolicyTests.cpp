@@ -64,6 +64,7 @@ void TestReplaceKeepsOldFileOnFailure() {
 	Check(std::filesystem::is_regular_file(dst) && ReadAll(dst) == "old cache", "old cache lost when source is missing");
 	std::filesystem::create_directories(temp / "child");
 	Check(!ReplaceCacheFile(temp, dst), "directory unexpectedly replaced cache file");
+	Check(std::filesystem::is_directory(temp / "child"), "rejected directory source was removed");
 	Check(std::filesystem::is_regular_file(dst) && ReadAll(dst) == "old cache", "old cache lost when rename fails");
 	std::puts("DriverCachePolicyTests: missing source and rename failure preserve old cache");
 }

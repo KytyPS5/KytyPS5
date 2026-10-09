@@ -9,6 +9,9 @@ namespace Libs::Graphics::DriverCachePolicy {
 // Keep the old cache visible until rename succeeds; never delete the destination first.
 inline bool ReplaceCacheFile(const std::filesystem::path& temp, const std::filesystem::path& dst) {
 	std::error_code error;
+	if (!std::filesystem::is_regular_file(temp, error)) {
+		return false;
+	}
 	std::filesystem::rename(temp, dst, error);
 	if (error) {
 		std::filesystem::remove(temp, error);

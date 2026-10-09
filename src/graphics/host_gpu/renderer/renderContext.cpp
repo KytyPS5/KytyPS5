@@ -90,6 +90,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	++m_map_epoch;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -129,9 +130,22 @@ void RenderContext::PrepareBda() {
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// Synchronizing walks every cached buffer, which is expensive when done per draw/dispatch.
+	// Uploads only exist after a CPU write (which bumps g_cpu_dirty_generation), a newly
+	// registered buffer or newly mapped memory, so skip the walk when none of those happened since
+	// the last one. The counters are read before the walk: a write racing with it just causes
+	// another walk on the next call.
+	const auto cpu_generation = g_cpu_dirty_generation.load(std::memory_order_acquire);
+	const auto buffer_epoch   = m_buffer_cache.RegistrationEpoch();
+	if (cpu_generation != m_bda_synced_cpu_generation || buffer_epoch != m_bda_synced_buffer_epoch ||
+	    m_map_epoch != m_bda_synced_map_epoch) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		m_bda_synced_cpu_generation = cpu_generation;
+		m_bda_synced_buffer_epoch   = buffer_epoch;
+		m_bda_synced_map_epoch      = m_map_epoch;
+	}
 	m_fault_process_pending = true;
 }
 

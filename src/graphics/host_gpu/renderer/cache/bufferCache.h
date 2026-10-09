@@ -79,6 +79,8 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Incremented every time a buffer is registered; see RenderContext::PrepareBda.
+	[[nodiscard]] uint64_t RegistrationEpoch() const noexcept { return m_registration_epoch; }
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -144,6 +146,7 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	uint32_t m_seen_oom_events    = 0;
+	uint64_t m_registration_epoch = 0;
 };
 
 } // namespace Libs::Graphics

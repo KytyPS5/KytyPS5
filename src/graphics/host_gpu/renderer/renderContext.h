@@ -82,6 +82,11 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	// State of the last full BDA buffer synchronization (see PrepareBda).
+	uint64_t                  m_bda_synced_cpu_generation = ~uint64_t {0};
+	uint64_t                  m_bda_synced_buffer_epoch   = ~uint64_t {0};
+	uint64_t                  m_bda_synced_map_epoch      = ~uint64_t {0};
+	uint64_t                  m_map_epoch                 = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

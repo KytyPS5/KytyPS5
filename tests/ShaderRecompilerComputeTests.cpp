@@ -33817,6 +33817,44 @@ TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   return test;
 }
 
+TestCase ImageLoadPackedUnormConvertsToFloat() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 component = 0; component < 4; component++) {
+    AppendStoreVgpr(&code, component, component);
+  }
+  AppendEnd(&code);
+
+  // Fields 1023/2047 (11 bits), 2047/2047 (11 bits), 512/1023 (10 bits).
+  const auto unorm = [](u32 field, u32 bits) {
+    return std::bit_cast<u32>(static_cast<float>(field) *
+                              (1.0f / static_cast<float>((1u << bits) - 1u)));
+  };
+  TestCase test;
+  test.name = "ImageLoadPackedUnormConvertsToFloat";
+  test.code = std::move(code);
+  test.expected = {unorm(1023u, 11), unorm(2047u, 11), unorm(512u, 10),
+                   0x3f800000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[6] = 1023u | (2047u << 11) | (512u << 22);
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data =
+      MakeSampledTextureData(Prospero::BufferFormat::k11_11_10UNorm);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(4, 5, 6, 1);
+  test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract",
+                         "OpConvertUToF"};
+  return test;
+}
+
 TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   using O = ShaderOpcode;
 
@@ -35757,6 +35795,41 @@ TestCase ImageStorePackedUintHonorsSparseDmask() {
   return test;
 }
 
+TestCase ImageStorePackedUnormClampsAndRounds() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovLiteral(&code, 0, std::bit_cast<u32>(2.0f));
+  AppendVMovLiteral(&code, 1, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 2, std::bit_cast<u32>(0.25f));
+  AppendVMovLiteral(&code, 3, std::bit_cast<u32>(-1.0f));
+  code.push_back(EncodeMimg0(0x08, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendEnd(&code);
+
+  // 2.0 clamps to 2047, 0.5 * 2047 rounds to even 1024, 0.25 * 1023 rounds to 256.
+  std::vector<u32> expected_image(16, 0);
+  expected_image[1 * 4 + 2] = 2047u | (1024u << 11) | (256u << 22);
+
+  TestCase test;
+  test.name = "ImageStorePackedUnormClampsAndRounds";
+  test.code = std::move(code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
+  test.user_data =
+      MakeStorageTextureData(Prospero::BufferFormat::k11_11_10UNorm);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(4, 5, 6, 0);
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui = std::move(expected_image);
+  test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
+                         StorageUint2DImageBindingName(false)};
+  test.forbidden_spirv = {"R32ui"};
+  return test;
+}
+
 TestCase ComputeTgSizeSgprUsesWaveMetadata() {
   using O = ShaderOpcode;
 
@@ -37240,6 +37313,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
+  AddCase(ImageLoadPackedUnormConvertsToFloat);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageSampleUScaled8<false>);
   AddCase(ImageSampleUScaled8<true>);
@@ -37286,6 +37360,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreR32UintUsesFormatlessStorageImage);
   AddCase(ImageStorePackedUintSaturatesChannels);
   AddCase(ImageStorePackedUintHonorsSparseDmask);
+  AddCase(ImageStorePackedUnormClampsAndRounds);
   AddCase(ComputeTgSizeSgprUsesWaveMetadata);
   AddCase(ImageStoreAndAtomicShareTypedBinding);
   AddCase(ImageAtomicCompareSwapGlcAndExec);

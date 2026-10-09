@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -1406,6 +1407,49 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 		BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
+	}
+
+	if (FrameDump::Active()) {
+		FrameDump::TargetRef color_refs[RENDER_COLOR_ATTACHMENTS_MAX];
+		for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+			const auto& c = state.color_info[i];
+			auto&       r = color_refs[i];
+			r.view      = rendering.color_attachments[c.target_slot].image_view;
+			r.layout    = rendering.color_attachments[c.target_slot].image_layout;
+			r.image_id  = c.image_id;
+			r.slot      = c.target_slot;
+			r.desc      = &c.desc;
+			r.mip       = c.guest_mip_level;
+			r.layer     = c.guest_array_layer;
+			r.extent    = c.Extent();
+		}
+		FrameDump::TargetRef depth_ref;
+		if (state.depth_info.image_id) {
+			depth_ref.view     = rendering.depth_stencil_attachment.image_view;
+			depth_ref.layout   = rendering.depth_stencil_attachment.image_layout;
+			depth_ref.image_id = state.depth_info.image_id;
+			depth_ref.desc     = &state.depth_info.desc;
+		}
+		FrameDump::DrawLog log;
+		log.vs_hash       = crumb_vs;
+		log.ps_hash       = crumb_ps;
+		log.count         = draw.index_count;
+		log.instances     = draw.instance_count;
+		log.indexed       = draw.IsIndexed();
+		log.mesh          = mesh_active;
+		log.indirect      = emit.indirect != nullptr;
+		log.ps_active     = state.ps_active;
+		log.depth_test    = state.depth_info.depth_test_enable;
+		log.depth_write   = state.depth_info.depth_write_enable;
+		log.depth_compare = state.depth_info.depth_compare_op;
+		log.colors        = std::span<const FrameDump::TargetRef>(
+            color_refs, std::min<uint32_t>(state.color_count, RENDER_COLOR_ATTACHMENTS_MAX));
+		log.depth         = state.depth_info.image_id ? &depth_ref : nullptr;
+		for (uint32_t i = 0; i < vertex_stages.size() && i < 3; i++) {
+			log.vs_images[i] = &bindings.vertex[i].images;
+		}
+		log.ps_images = state.ps_active && bindings.pixel ? &bindings.pixel->images : nullptr;
+		FrameDump::OnDraw(m_context, log);
 	}
 
 	if (!draw.IsIndexed()) {

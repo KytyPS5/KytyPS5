@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -113,6 +114,9 @@ void CommandBuffer::EndRendering() const {
 		return;
 	}
 	Handle().endRendering();
+	if (FrameDump::Active()) {
+		FrameDump::OnEndRendering(*this, m_render_state);
+	}
 	m_rendering    = false;
 	m_render_state = {};
 }

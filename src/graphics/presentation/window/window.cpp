@@ -13,6 +13,7 @@
 #include "common/timer.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -203,6 +204,11 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
+				}
+				break;
+			case SDLK_F2:
+				if (!key.repeat) {
+					Libs::Graphics::FrameDump::Request();
 				}
 				break;
 			case SDLK_F11:

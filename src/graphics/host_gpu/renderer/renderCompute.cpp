@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -515,6 +516,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (FrameDump::Active()) {
+		std::vector<FrameDump::StorageUse> uses(bindings.images.size());
+		for (size_t i = 0; i < uses.size() && i < program.info.images.size(); i++) {
+			uses[i].binding = &bindings.images[i];
+			uses[i].written = program.info.images[i].written;
+			uses[i].storage = program.info.images[i].resource_class ==
+			                  ShaderRecompiler::IR::ImageResourceClass::Storage;
+		}
+		FrameDump::OnDispatch(m_context, buffer, program.shader_hash, thread_group_x, thread_group_y,
+		                      thread_group_z, false, uses);
+	}
 	if (known_fill_size != 0) {
 		// Recorded after the bindings marked the range GPU-written, which clears older records.
 		m_context.GetBufferCache().RecordGpuFill(known_fill_address, known_fill_size,

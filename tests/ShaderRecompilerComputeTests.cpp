@@ -41593,14 +41593,15 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized(renderdoc_smoke);
   if (renderdoc_smoke) {
 #if defined(_WIN32)
-    // renderdoccmd injects the DLL before this process starts. Bind before any
-    // Vulkan call.
+    // Exercise production loading before any Vulkan call, with either an
+    // installed/portable copy or injection through RenderDoc.
     RenderDocInit();
     const auto module = GetModuleHandleA("renderdoc.dll");
     if (module == nullptr) {
       std::fprintf(
           stderr,
-          "RenderDoc smoke: launch this test through renderdoccmd capture\n");
+          "RenderDoc smoke: install RenderDoc, place its DLL and manifest beside "
+          "this executable, or launch through renderdoccmd capture\n");
       return 2;
     }
     const auto get_api = reinterpret_cast<pRENDERDOC_GetAPI>(

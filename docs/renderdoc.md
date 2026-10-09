@@ -2,9 +2,42 @@
 
 Baseline: `c8c15bf3` on the `nhl26` branch. The earlier `9dc25732`
 compatibility change reports that device loss still occurs under RenderDoc.
-This branch adds diagnostics and a game-free capture test. NHL 27 menu capture
-and replay were verified with RenderDoc 1.46 on the RTX 3070. The dark-player
-lighting bug remains visible in the replay and is not fixed by this branch.
+This branch adds diagnostics, portable RenderDoc loading and a game-free capture
+test. NHL 27 menu capture and replay were verified with RenderDoc 1.46 on the
+RTX 3070. The dark-player lighting bug remains visible in the replay and is not
+fixed by this branch.
+
+## Direct launch with `--rd` on Windows
+
+For a portable x64 RenderDoc package, copy **both** `renderdoc.dll` and
+`renderdoc.json` from the same package into the directory containing
+`kyty_emulator.exe`. Launch the emulator normally with your game arguments,
+`--redzone` and `--rd`, then focus its window and press F1. No `renderdoccmd`
+wrapper or manually configured Vulkan environment is required for this path.
+Run the emulator without administrator privileges; the
+[Vulkan loader ignores custom layer search paths in elevated applications](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md#exception-for-elevated-privileges).
+
+The loader first uses an injected DLL or the installed copy found in the Windows
+registry. If neither is available, it checks the **executable directory**, not
+the working directory, for the portable DLL and manifest. For this fallback it
+adds that directory to the active Vulkan layer search path and enables
+`VK_LAYER_RENDERDOC_Capture` in this process. Existing layer/path entries are
+preserved; saved environment settings and registry keys are not changed.
+Automatic compatibility detection sees the selected layer.
+
+Before this fallback was added, a direct launch using only `--rd` failed on the
+test machine because portable RenderDoc had no installation registry entry.
+The DLL was not loaded, and F1 logged `capture requested, but RenderDoc is
+unavailable`. The earlier successful NHL captures used the injected launch
+described below; they did not prove that direct `--rd` worked.
+
+The fixed direct launch was verified on 2026-10-09 with RenderDoc 1.46, RTX 3070
+and driver 617.14. With injected/launcher layer settings cleared, the emulator
+loaded its adjacent DLL, enabled compatibility automatically and created the
+Vulkan device successfully. The human tester pressed F1; the capture completed
+with result 1 and saved a 330,902,923-byte `.rdc`. That file replayed with
+`renderdoccmd replay --loops 1`, exit 0. This verifies the captured frame, not
+every NHL scene or shader-debugging feature.
 
 ## Reproduce the game test
 
@@ -95,7 +128,7 @@ opens its contents. The **Texture Viewer** shows captured render targets.
 
 ## What the diagnostics establish
 
-- Whether `renderdoc.dll` was already loaded or the registry load path was used,
+- Whether `renderdoc.dll` was already loaded, installed or loaded as a portable copy,
   the DLL path, loader errors, and the bound API version.
 - Vulkan instance/device creation results, GPU/driver identifiers, available
   extensions, required feature checks and enabled device extensions.
@@ -111,8 +144,11 @@ the failing stage.
 ## Standalone capture test
 
 Build `shader_recompiler_compute_tests`, then run its `--renderdoc-only` selector
-through RenderDoc. This uses the production request/guest-flip capture flow and
-checks GPU results for buffer load/store, buffer atomics and wave32 64-bit LDS
+with RenderDoc available. For a direct portable test, copy `renderdoc.dll` and
+`renderdoc.json` beside the test executable and run
+`shader_recompiler_compute_tests.exe --renderdoc-only` normally. Alternatively,
+use the injected launch below. This uses the production request/guest-flip capture
+flow and checks GPU results for buffer load/store, buffer atomics and wave32 64-bit LDS
 atomics. It uses the test harness's Vulkan initialization, so it does not test
 the emulator's window/device creation, presentation or game workload.
 
@@ -152,6 +188,12 @@ Local verification on 2026-10-09:
 - RenderDoc 1.46 (`e4bd23b6`), RTX 3070, NVIDIA driver 617.14: three smoke GPU
   checks passed; capture ended with result 1, produced one 312,147-byte file,
   and CLI replay returned 0. A rebuilt repeat also passed (311,780-byte capture).
+- Direct portable loading was reproduced failing with exit 2 before the fix,
+  even with the DLL and manifest beside the test executable. After the fix,
+  the same direct selector passed all three GPU checks and saved a 311,887-byte
+  capture, which replayed with exit 0. This run used no injection, installation
+  registry entry, manually selected Vulkan layer or compatibility override;
+  its working directory differed from the executable directory.
 - `--thread-dimensions-only`, `--buffer-cache-range-only` and `--scheduler-only`
   passed on the GPU without RenderDoc.
 - The full `shader_cfg` and `shader_recompiler_compute` CTest suites fail on both

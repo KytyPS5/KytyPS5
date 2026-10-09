@@ -32,6 +32,44 @@ public:
 		uint64_t rate           = 0;
 	};
 
+	// Host GPU ticks to the guest clock, for a counter with the valid bits of mask.
+	class Clock {
+	public:
+		Clock(uint64_t mask, double nominal_rate): m_mask(mask), m_nominal_rate(nominal_rate) {}
+
+		// Calibrated pair of device ticks and reference time. The first one starts measuring
+		// the rate, the second anchors the clock, later ones correct it.
+		void Sample(uint64_t ticks, uint64_t reference);
+		// Without calibrated pairs: one anchor with the nominal rate, then Advance keeps the
+		// segment base recent so that masked ticks stay within half a counter period of it.
+		void Anchor(uint64_t ticks, uint64_t reference);
+		void Advance(uint64_t reference);
+
+		[[nodiscard]] bool            Anchored() const { return m_anchored; }
+		[[nodiscard]] uint64_t        LastReference() const { return m_last_reference; }
+		[[nodiscard]] const Segment&  Previous() const { return m_previous; }
+		[[nodiscard]] const Segment&  Current() const { return m_current; }
+		[[nodiscard]] uint64_t        Convert(uint64_t ticks) const;
+		[[nodiscard]] static uint64_t Convert(const Segment& previous, const Segment& current,
+		                                      uint64_t ticks, uint64_t mask);
+
+	private:
+		void Restart(uint64_t ticks, uint64_t reference);
+
+		uint64_t m_mask         = 0;
+		double   m_nominal_rate = 0.0;
+		bool     m_sampled      = false;
+		bool     m_anchored     = false;
+		// Rate measurement: reference time since its start over the masked intervals summed.
+		uint64_t m_measure_reference = 0;
+		uint64_t m_measure_ticks     = 0;
+		uint64_t m_last_ticks        = 0;
+		uint64_t m_last_reference    = 0;
+		Segment  m_anchor;
+		Segment  m_previous;
+		Segment  m_current;
+	};
+
 	GpuTimestamps(GraphicContext& graphics, CommandScheduler& scheduler, RenderContext& context);
 	~GpuTimestamps();
 	KYTY_CLASS_NO_COPY(GpuTimestamps);
@@ -69,7 +107,6 @@ private:
 
 	[[nodiscard]] bool SampleClocks(uint64_t& ticks, uint64_t& reference) const;
 	void               InitializeWithSubmission(bool anchor);
-	void               Calibrate();
 	void               Resolve();
 	void               Complete(const Batch& batch);
 	void               QueueRetries();
@@ -85,15 +122,9 @@ private:
 	std::atomic<uint64_t>  m_retired {0};
 	std::mutex             m_mutex;
 	std::vector<Retry>     m_retries;
-	bool                   m_retrying        = false;
-	bool                   m_retry_queued    = false;
-	bool                   m_calibrated      = false;
-	uint64_t               m_first_ticks     = 0;
-	uint64_t               m_first_reference = 0;
-	uint64_t               m_last_ticks      = 0;
-	uint64_t               m_last_reference  = 0;
-	Segment                m_previous;
-	Segment                m_current;
+	bool                   m_retrying     = false;
+	bool                   m_retry_queued = false;
+	Clock                  m_clock;
 };
 
 } // namespace Libs::Graphics

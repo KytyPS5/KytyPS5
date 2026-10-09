@@ -18,8 +18,8 @@ namespace {
 constexpr double   FixedPointOne       = 4294967296.0;
 constexpr uint64_t ReferenceFrequency  = 100000000;
 constexpr uint64_t CalibrationInterval = 2 * ReferenceFrequency;
-// A new segment starts this long after its sample, past the GPU work recorded before it, so
-// every command converts with one continuous function.
+// A new segment starts this long after its sample: a batch submitted before the sample and run
+// within this delay converts with the segment the previous batches used.
 constexpr uint64_t SegmentDelay = ReferenceFrequency;
 
 uint64_t Scale(uint64_t delta, uint64_t rate) {
@@ -28,14 +28,12 @@ uint64_t Scale(uint64_t delta, uint64_t rate) {
 	       ((delta_lo * (rate & 0xffffffffu)) >> 32u);
 }
 
-uint64_t ConvertTicks(const GpuTimestamps::Segment& previous, const GpuTimestamps::Segment& current,
-                      uint64_t ticks, uint64_t mask) {
-	const bool  after_current = ((ticks - current.device_base) & mask) <= (mask >> 1u);
-	const auto& segment       = after_current ? current : previous;
-	const auto  forward       = (ticks - segment.device_base) & mask;
-	return forward <= (mask >> 1u)
-	           ? segment.reference_base + Scale(forward, segment.rate)
-	           : segment.reference_base - Scale((segment.device_base - ticks) & mask, segment.rate);
+double RateOf(const GpuTimestamps::Segment& segment) {
+	return static_cast<double>(segment.rate) / FixedPointOne;
+}
+
+uint64_t FixedRate(double rate) {
+	return static_cast<uint64_t>(rate * FixedPointOne);
 }
 
 uint64_t ValidMask(GraphicContext& graphics) {
@@ -60,7 +58,8 @@ GpuTimestamps::GpuTimestamps(GraphicContext& graphics, CommandScheduler& schedul
                              RenderContext& context)
     : m_graphics(graphics), m_scheduler(scheduler), m_context(context), m_mask(ValidMask(graphics)),
       m_readback(graphics, scheduler, MemoryUsage::Download, 0,
-                 vk::BufferUsageFlagBits::eTransferDst, QueryCount * sizeof(uint64_t)) {
+                 vk::BufferUsageFlagBits::eTransferDst, QueryCount * sizeof(uint64_t)),
+      m_clock(m_mask, NominalRate(graphics)) {
 	SetVulkanObjectNameF(m_graphics.device, m_readback.Handle(), "GPU Timestamp Readback");
 	if (m_mask == 0) {
 		return;
@@ -71,7 +70,13 @@ GpuTimestamps::GpuTimestamps(GraphicContext& graphics, CommandScheduler& schedul
 	RequireVulkanSuccess(m_graphics.device.createQueryPool(&pool_info, nullptr, &m_pool),
 	                     "create GPU timestamp query pool");
 	// A first sample here gives the first segment a measured rate.
-	InitializeWithSubmission(!SampleClocks(m_first_ticks, m_first_reference));
+	uint64_t   ticks     = 0;
+	uint64_t   reference = 0;
+	const bool sampled   = SampleClocks(ticks, reference);
+	if (sampled) {
+		m_clock.Sample(ticks, reference);
+	}
+	InitializeWithSubmission(!sampled);
 	m_scheduler.SetBeforeSubmit([this] { Resolve(); });
 }
 
@@ -84,7 +89,97 @@ GpuTimestamps::~GpuTimestamps() {
 
 uint64_t GpuTimestamps::ToReference(const Segment& previous, const Segment& current,
                                     uint64_t ticks) {
-	return ConvertTicks(previous, current, ticks, UINT64_MAX);
+	return Clock::Convert(previous, current, ticks, UINT64_MAX);
+}
+
+uint64_t GpuTimestamps::Clock::Convert(const Segment& previous, const Segment& current,
+                                       uint64_t ticks, uint64_t mask) {
+	const bool  after_current = ((ticks - current.device_base) & mask) <= (mask >> 1u);
+	const auto& segment       = after_current ? current : previous;
+	const auto  forward       = (ticks - segment.device_base) & mask;
+	return forward <= (mask >> 1u)
+	           ? segment.reference_base + Scale(forward, segment.rate)
+	           : segment.reference_base - Scale((segment.device_base - ticks) & mask, segment.rate);
+}
+
+uint64_t GpuTimestamps::Clock::Convert(uint64_t ticks) const {
+	return Convert(m_previous, m_current, ticks & m_mask, m_mask);
+}
+
+void GpuTimestamps::Clock::Restart(uint64_t ticks, uint64_t reference) {
+	m_measure_reference = reference;
+	m_measure_ticks     = 0;
+	m_last_ticks        = ticks;
+	m_last_reference    = reference;
+}
+
+void GpuTimestamps::Clock::Sample(uint64_t ticks, uint64_t reference) {
+	ticks &= m_mask;
+	if (!m_sampled) {
+		m_sampled = true;
+		Restart(ticks, reference);
+		return;
+	}
+	// A masked interval is only known while it is shorter than half a counter period: past a
+	// quarter, by the current rate, measure again from this sample.
+	const double rate_before = m_anchored ? RateOf(m_current) : m_nominal_rate;
+	const auto   interval    = (ticks - m_last_ticks) & m_mask;
+	if (static_cast<double>(reference - m_last_reference) / rate_before >=
+	    static_cast<double>(m_mask >> 2u)) {
+		Restart(ticks, reference);
+		if (m_anchored) {
+			m_current  = {ticks, reference, m_current.rate};
+			m_previous = m_current;
+		}
+		return;
+	}
+	if (interval == 0) {
+		return;
+	}
+	m_measure_ticks += interval;
+	// Host periods can be off: RADV reports 10.019 ns for a 10 ns counter on Strix Halo.
+	const auto   measured_reference = reference - m_measure_reference;
+	const double rate =
+	    measured_reference >= ReferenceFrequency / 20
+	        ? static_cast<double>(measured_reference) / static_cast<double>(m_measure_ticks)
+	        : rate_before;
+	if (!m_anchored) {
+		m_current  = {ticks, reference, FixedRate(rate)};
+		m_previous = m_current;
+		m_anchored = true;
+	} else {
+		// Remove the offset error over the next interval.
+		const double error = static_cast<double>(static_cast<int64_t>(reference - Convert(ticks)));
+		const double correction =
+		    std::clamp(error / static_cast<double>(interval), -rate / 1000.0, rate / 1000.0);
+		const auto knot =
+		    (ticks + static_cast<uint64_t>(static_cast<double>(SegmentDelay) / rate)) & m_mask;
+		const auto knot_reference = Convert(knot);
+		m_previous                = m_current;
+		m_current                 = {knot, knot_reference, FixedRate(rate + correction)};
+	}
+	m_last_ticks     = ticks;
+	m_last_reference = reference;
+}
+
+void GpuTimestamps::Clock::Anchor(uint64_t ticks, uint64_t reference) {
+	m_anchor   = {ticks & m_mask, reference, FixedRate(m_nominal_rate)};
+	m_current  = m_anchor;
+	m_previous = m_current;
+	m_anchored = true;
+	Restart(ticks & m_mask, reference);
+}
+
+void GpuTimestamps::Clock::Advance(uint64_t reference) {
+	// The anchor line from a base at this reference time, counted from the anchor so that
+	// rounding does not accumulate.
+	const auto elapsed =
+	    reference > m_anchor.reference_base ? reference - m_anchor.reference_base : uint64_t {0};
+	const auto ticks = static_cast<uint64_t>(static_cast<double>(elapsed) / RateOf(m_anchor));
+	m_current        = {(m_anchor.device_base + ticks) & m_mask,
+	                    m_anchor.reference_base + Scale(ticks, m_anchor.rate), m_anchor.rate};
+	m_previous       = m_current;
+	m_last_reference = reference;
 }
 
 bool GpuTimestamps::SampleClocks(uint64_t& ticks, uint64_t& reference) const {
@@ -165,52 +260,10 @@ void GpuTimestamps::InitializeWithSubmission(bool anchor) {
 		                                                           vk::QueryResultFlagBits::e64),
 		                     "read GPU clock anchor");
 		m_graphics.device.destroyQueryPool(anchor_pool, nullptr);
-		m_current    = {ticks, reference,
-		                static_cast<uint64_t>(NominalRate(m_graphics) * FixedPointOne)};
-		m_previous   = m_current;
-		m_calibrated = true;
+		m_clock.Anchor(ticks, reference);
 	}
 	m_graphics.device.destroyFence(fence, nullptr);
 	m_graphics.device.destroyCommandPool(pool, nullptr);
-}
-
-void GpuTimestamps::Calibrate() {
-	uint64_t ticks     = 0;
-	uint64_t reference = 0;
-	if (!SampleClocks(ticks, reference)) {
-		return;
-	}
-	if (!m_calibrated) {
-		// Host periods can be off: RADV reports 10.019 ns for a 10 ns counter on Strix Halo.
-		const bool   measured = reference - m_first_reference >= ReferenceFrequency / 20;
-		const double rate     = measured ? static_cast<double>(reference - m_first_reference) /
-		                                       static_cast<double>((ticks - m_first_ticks) & m_mask)
-		                                 : NominalRate(m_graphics);
-		if (!measured) {
-			m_first_ticks     = ticks;
-			m_first_reference = reference;
-		}
-		m_current        = {ticks, reference, static_cast<uint64_t>(rate * FixedPointOne)};
-		m_previous       = m_current;
-		m_last_ticks     = ticks;
-		m_last_reference = reference;
-		m_calibrated     = true;
-		return;
-	}
-	// Measure the rate over the whole run, and remove the offset error over the next interval.
-	const double rate     = static_cast<double>(reference - m_first_reference) /
-	                        static_cast<double>((ticks - m_first_ticks) & m_mask);
-	const double interval = static_cast<double>((ticks - m_last_ticks) & m_mask);
-	const double error    = static_cast<double>(
-	    static_cast<int64_t>(reference - ConvertTicks(m_previous, m_current, ticks, m_mask)));
-	const double correction = std::clamp(error / interval, -rate / 1000.0, rate / 1000.0);
-	const auto   knot =
-	    (ticks + static_cast<uint64_t>(static_cast<double>(SegmentDelay) / rate)) & m_mask;
-	const auto knot_reference = ConvertTicks(m_previous, m_current, knot, m_mask);
-	m_previous                = m_current;
-	m_current = {knot, knot_reference, static_cast<uint64_t>((rate + correction) * FixedPointOne)};
-	m_last_ticks     = ticks;
-	m_last_reference = reference;
 }
 
 void GpuTimestamps::Write(uint64_t vaddr, uint32_t size, bool end_of_pipe) {
@@ -225,9 +278,16 @@ void GpuTimestamps::Write(uint64_t vaddr, uint32_t size, bool end_of_pipe) {
 		return;
 	}
 	StoreRetries();
-	if (m_graphics.get_calibrated_timestamps != nullptr &&
-	    (!m_calibrated || Sync::ReadReferenceClock() - m_last_reference >= CalibrationInterval)) {
-		Calibrate();
+	const auto now = Sync::ReadReferenceClock();
+	if (m_graphics.get_calibrated_timestamps != nullptr) {
+		if (!m_clock.Anchored() || now - m_clock.LastReference() >= CalibrationInterval) {
+			uint64_t ticks     = 0;
+			uint64_t reference = 0;
+			EXIT_IF(!SampleClocks(ticks, reference));
+			m_clock.Sample(ticks, reference);
+		}
+	} else if (now - m_clock.LastReference() >= CalibrationInterval) {
+		m_clock.Advance(now);
 	}
 	if (m_issued - m_retired.load(std::memory_order_acquire) >= QueryCount) {
 		// Every query waits for its batch to complete.
@@ -284,8 +344,8 @@ void GpuTimestamps::Resolve() {
 	command.pipelineBarrier2(dependency);
 
 	std::lock_guard lock(m_mutex);
-	batch->previous = m_previous;
-	batch->current  = m_current;
+	batch->previous = m_clock.Previous();
+	batch->current  = m_clock.Current();
 	batch->resolved = true;
 }
 
@@ -311,7 +371,7 @@ void GpuTimestamps::Complete(const Batch& batch) {
 		uint64_t ticks = 0;
 		std::memcpy(&ticks, m_readback.Mapped().data() + write.query * sizeof(uint64_t),
 		            sizeof(ticks));
-		const auto value = ConvertTicks(previous, current, ticks & m_mask, m_mask);
+		const auto value = Clock::Convert(previous, current, ticks & m_mask, m_mask);
 		if (!deferred && m_context.StoreAtCompletion(write.vaddr, &value, write.size)) {
 			continue;
 		}

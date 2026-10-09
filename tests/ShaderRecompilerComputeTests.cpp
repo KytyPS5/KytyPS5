@@ -1332,6 +1332,91 @@ void CheckGpuClockSegments() {
   std::printf("[host]    %-32s ok\n", "GpuClockSegments");
 }
 
+// A narrow counter (36 bits at 19.2 MHz wraps every hour) converts correctly across wraps,
+// calibrated or not, and a correction keeps the function monotonic.
+void CheckGpuClockCalibration() {
+  constexpr uint64_t mask = (uint64_t{1} << 36u) - 1u;
+  constexpr uint64_t second = 100000000;
+  constexpr uint64_t start_reference = 1000000000000ull;
+  constexpr uint64_t start_ticks = mask - 192000000; // 10 s before the counter wraps
+  constexpr uint64_t tolerance = 100;                // 1 us of the 100 MHz clock
+  const auto device_ticks = [&](double ticks_per_reference, uint64_t reference) {
+    return (start_ticks + static_cast<uint64_t>(
+                              static_cast<double>(reference - start_reference) *
+                              ticks_per_reference)) &
+           mask;
+  };
+  const auto near = [&](uint64_t value, uint64_t reference) {
+    return (value > reference ? value - reference : reference - value) <= tolerance;
+  };
+  const auto rate_of = [](const GpuTimestamps::Segment &segment) {
+    return static_cast<double>(segment.rate) / 4294967296.0;
+  };
+
+  // Calibrated: the counter runs 50 ppm faster than its reported period, wraps three times.
+  const double nominal = 100.0 / 19.2;
+  const double actual = 0.192 * (1.0 + 50e-6);
+  GpuTimestamps::Clock clock(mask, nominal);
+  clock.Sample(device_ticks(actual, start_reference), start_reference);
+  bool accurate = true;
+  bool monotonic = true;
+  bool corrected = true;
+  bool rate_measured = true;
+  uint64_t reference = start_reference + second / 5;
+  for (int sample = 0; sample < 5400; ++sample, reference += 2 * second) {
+    // One sample reads the reference 20 us late; the next samples remove the error.
+    const bool skewed = sample == 2000;
+    clock.Sample(device_ticks(actual, reference), reference + (skewed ? 2000 : 0));
+    corrected &= std::abs(rate_of(clock.Current()) - rate_of(clock.Previous())) <=
+                 rate_of(clock.Previous()) / 500.0;
+    uint64_t last = 0;
+    for (uint64_t offset = 0; offset < 2 * second; offset += second / 1000) {
+      const auto value = clock.Convert(device_ticks(actual, reference + offset));
+      monotonic &= value >= last;
+      last = value;
+    }
+    const bool settled = sample < 2000 || sample > 2020;
+    if (settled) {
+      for (const uint64_t offset : {second / 2, 3 * second / 2}) {
+        accurate &= near(clock.Convert(device_ticks(actual, reference + offset)),
+                         reference + offset);
+      }
+    }
+    if (sample > 100 && settled) {
+      rate_measured &=
+          std::abs(rate_of(clock.Current()) * actual - 1.0) <= 1e-5;
+    }
+  }
+  // Longer than a quarter period without a sample: the clock measures again from there.
+  reference += 40 * 60 * second;
+  clock.Sample(device_ticks(actual, reference), reference);
+  bool resumed = true;
+  for (int sample = 0; sample < 4; ++sample, reference += 2 * second) {
+    clock.Sample(device_ticks(actual, reference), reference);
+    resumed &= near(clock.Convert(device_ticks(actual, reference + second / 2)),
+                    reference + second / 2);
+  }
+  Require("GpuClockCalibration", "calibrated narrow counter",
+          accurate && monotonic && corrected && rate_measured && resumed,
+          "a calibrated narrow GPU counter lost the guest clock across a wrap");
+
+  // Uncalibrated: one anchor, then the segment follows the counter across its wraps.
+  GpuTimestamps::Clock nominal_clock(mask, 1.0 / 0.192);
+  nominal_clock.Anchor(device_ticks(0.192, start_reference), start_reference);
+  bool followed = true;
+  for (uint64_t step = 1; step <= 3600; ++step) {
+    const auto now = start_reference + step * 2 * second;
+    nominal_clock.Advance(now);
+    for (const uint64_t offset : {uint64_t{0}, second / 2, 19 * second / 10}) {
+      followed &= near(nominal_clock.Convert(device_ticks(0.192, now + offset)),
+                       now + offset);
+    }
+  }
+  Require("GpuClockCalibration", "uncalibrated narrow counter", followed,
+          "an uncalibrated narrow GPU counter went backwards after a wrap");
+  std::printf("[host]    %-32s ok\n", "GpuClockCalibration");
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -42445,6 +42530,7 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckGpuClockSegments();
+  CheckGpuClockCalibration();
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);

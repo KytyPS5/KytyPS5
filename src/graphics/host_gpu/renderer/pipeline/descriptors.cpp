@@ -30,6 +30,8 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 
+#include <cinttypes>
+#include <cstdio>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -536,6 +538,26 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
+// Members of an indirect (GPU-indexed) image table share one shader slot, so the shader is
+// specialised for a single numeric class / dimensionality. A candidate whose descriptor does not
+// fit that slot cannot legally be bound there (e.g. sampling a UINT image through a float
+// sampler is invalid Vulkan). Such candidates are replaced by a neutral null image instead of
+// aborting the whole emulator.
+static bool IndirectCandidateFitsSlot(const ShaderRecompiler::IR::ImageResource& resource,
+                                      const ShaderTextureResource&               descriptor) {
+	using Dim = ShaderRecompiler::Decoder::ImageDimension;
+	if (resource.numeric_class != Prospero::SampledTextureNumericClass(descriptor.Format())) {
+		return false;
+	}
+	const auto type    = descriptor.Type();
+	const bool is_3d   = type == Prospero::ImageType::kColor3D;
+	const bool is_1d   = type == Prospero::ImageType::kColor1D || type == Prospero::ImageType::kColor1DArray;
+	const bool is_cube = type == Prospero::ImageType::kCube;
+	const bool slot_3d = resource.dimension == Dim::Dim3D;
+	const bool slot_1d = resource.dimension == Dim::Dim1D || resource.dimension == Dim::Dim1DArray;
+	return is_3d == slot_3d && is_1d == slot_1d && is_cube == resource.cube;
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -551,6 +573,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (descriptor.IsNull()) {
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+
+	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+	    resource.indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage &&
+	    !IndirectCandidateFitsSlot(resource, descriptor)) {
+		static std::atomic<uint32_t> warned {0};
+		if (warned.fetch_add(1, std::memory_order_relaxed) < 16u) {
+			std::printf("Warning: indirect image table candidate does not fit its shader slot "
+			            "(slot numeric=%u dimension=%u cube=%d, descriptor format=%u type=%u "
+			            "addr=0x%016" PRIx64 "); binding a null image instead\n",
+			            static_cast<uint32_t>(resource.numeric_class),
+			            static_cast<uint32_t>(resource.dimension), resource.cube,
+			            static_cast<uint32_t>(descriptor.Format()),
+			            static_cast<uint32_t>(descriptor.Type()), descriptor.Base40());
+			std::fflush(stdout);
+		}
+		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
 	}

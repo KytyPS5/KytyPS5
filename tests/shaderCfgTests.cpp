@@ -2461,6 +2461,14 @@ void TestNewShaderRecompilerSMovB32() {
   };
 
   auto options = MakeCompileOptions(ShaderType::Compute);
+  // The stores use s[48:51], not the default s[0:3] fixture descriptor.
+  // A zero-stride mode-0 descriptor discards stores by the guest contract.
+  std::array<uint32_t, 64> user_data{};
+  user_data[48] = 0x4000u;
+  user_data[49] = 4u << 16u;
+  user_data[50] = 4u;
+  user_data[51] = 3u << 28u;
+  options.user_data = user_data;
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);

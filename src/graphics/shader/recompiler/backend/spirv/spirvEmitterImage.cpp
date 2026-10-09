@@ -712,6 +712,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
 			                            dimension_info.coordinate_components, image.cube);
+			const bool indirect = image.indirect_root == mem.resource;
+			if (indirect &&
+			    (dimension == ImageDimension::Dim1D || dimension == ImageDimension::Dim1DArray)) {
+				ctx.Fail(inst, "has an unsupported indirect 1D gather");
+				return;
+			}
 			if (dimension == ImageDimension::Dim1D) {
 				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
@@ -749,22 +755,60 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				offset = PackedOffset(ctx, mem, *address, layout, dimension);
 			}
 			const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
-			const auto EmitGather = [&](uint32_t mip) {
-				const auto sampled = MakeSampledImage(state, mem.resource, sampler_id, mip);
+			const auto EmitGather = [&](uint32_t resource, uint32_t gather_coord, uint32_t mip) {
+				const auto       sampled = MakeSampledImage(state, resource, sampler_id, mip);
 				const auto sample = state.builder.AllocateId();
 				const std::array operands {operand_mask, offset};
-				state.builder.AddFunction(
-				    dref ? spv::OpImageDrefGather : spv::OpImageGather, result_type,
-				    sample, sampled, coord, component_or_dref,
-				    std::span(operands).first(operand_mask != 0u ? 2u : 0u));
+				state.builder.AddFunction(dref ? spv::OpImageDrefGather : spv::OpImageGather,
+				                          result_type, sample, sampled, gather_coord,
+				                          component_or_dref,
+				                          std::span(operands).first(operand_mask != 0u ? 2u : 0u));
 				return sample;
 			};
-			const auto sample = image.mip_mode == IR::ImageMipMode::Dynamic && image.mip_count > 1u
-			                        ? EmitIndexSwitch(
-			                              state, GatherMip(ctx, inst, mem, *address, layout,
-			                                               image.mip_count),
-			                              image.mip_count, result_type, EmitGather)
-			                        : EmitGather(0);
+			const auto EmitGatherMips = [&](uint32_t resource, uint32_t gather_coord) {
+				const auto& candidate = state.program.info.images[resource];
+				if (candidate.mip_mode != IR::ImageMipMode::Dynamic || candidate.mip_count <= 1u) {
+					return EmitGather(resource, gather_coord, 0u);
+				}
+				return EmitIndexSwitch(
+				    state, GatherMip(ctx, inst, mem, *address, layout, candidate.mip_count),
+				    candidate.mip_count, result_type,
+				    [&](uint32_t mip) { return EmitGather(resource, gather_coord, mip); });
+			};
+			uint32_t sample = 0;
+			if (!indirect) {
+				sample = EmitGatherMips(mem.resource, coord);
+			} else {
+				// Same GPU-selected descriptor lookup as indirect samples: one switch arm per
+				// candidate, each gathering from its own binding slot.
+				const auto* handle = image_arg.ResolveInstruction();
+				const auto* source = image.source < state.program.descriptor_sources.size()
+				                         ? &state.program.descriptor_sources[image.source]
+				                         : nullptr;
+				if (handle == nullptr || source == nullptr ||
+				    !source->indirect_descriptor.has_value() || handle->NumArgs() == 0u) {
+					ctx.Fail(inst, "has invalid indirect image key provenance");
+					return;
+				}
+				if (state.flattened_srt_variable == 0 || image.indirect_resources.size() < 2u) {
+					ctx.Fail(inst, "has no indirect image runtime mapping");
+					return;
+				}
+				const auto selected = EmitIndirectResourceIndex(
+				    state, ctx.Def(handle->Arg(0)), image.indirect_mapping_offset,
+				    image.indirect_search_iterations, 0u);
+				sample = EmitIndexSwitch(
+				    state, selected, static_cast<uint32_t>(image.indirect_resources.size()),
+				    result_type, [&](uint32_t ordinal) {
+					    const auto  resource        = image.indirect_resources[ordinal];
+					    const auto& candidate       = state.program.info.images[resource];
+					    const auto  candidate_coord = CoordF32(
+					        ctx, mem, *address, layout.coord,
+					        ImageDimensionInfoFor(candidate.dimension).coordinate_components,
+					        candidate.cube);
+					    return EmitGatherMips(resource, candidate_coord);
+				    });
+			}
 			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
 			                              result_numeric_class, false, mem, true));
 			return;

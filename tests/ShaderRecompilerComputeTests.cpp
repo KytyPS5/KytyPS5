@@ -3108,13 +3108,10 @@ public:
       alignas(uint64_t) uint64_t gds_label = UINT64_MAX;
       bool release_mem_submission_counts = false;
       uint64_t clock_before = 0;
+      alignas(uint64_t) uint64_t ordered_label = 0;
+      uint64_t ordered_label_at_parse = UINT64_MAX;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
-
-        clock_before = Sync::ReadReferenceClock();
-        processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
-                                     reinterpret_cast<void *>(clock_base + 16),
-                                     UINT64_MAX, 2);
 
         for (const auto interrupt : {0u, 3u, 1u, 2u}) {
           release_label = 0;
@@ -3160,6 +3157,16 @@ public:
             interrupt_split_once &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
+
+        clock_before = Sync::ReadReferenceClock();
+        processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
+                                     reinterpret_cast<void *>(clock_base + 16),
+                                     UINT64_MAX, 2);
+        // A label behind a GPU clock value not stored yet lands after it, at completion.
+        auto ordered = make_release_mem(1, 0, &ordered_label, 0x55667788u);
+        Pm4Execution ordered_execution;
+        (void)processor->Process(ordered_execution, ordered);
+        ordered_label_at_parse = ordered_label;
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -3171,6 +3178,9 @@ public:
               interrupt_clock + clock_tolerance >= clock_before &&
                   interrupt_clock <= clock_after + clock_tolerance,
               "clock write with writeback and interrupt lost its data");
+      Require("GpuCommandLane", "label behind a timestamp",
+              ordered_label_at_parse == 0 && ordered_label == 0x55667788u,
+              "a label was written before the GPU clock value recorded before it");
       // More timestamps than queries in flight, over fewer slots: every slot holds the time of
       // its last write, in recording order.
       constexpr uint32_t batch_slots = 1000;
@@ -3604,9 +3614,11 @@ public:
                 compute_done_label == compute_done_value,
             "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
 
-    // The interrupt of a GPU clock write whose value is left to the GPU thread waits for that
-    // value: a game woken by it reads the new time, not the old one.
+    // The interrupt of a GPU clock write whose value is left to the GPU thread, and a label
+    // after it, wait for that value: a game woken by either reads the new time.
     constexpr uint64_t held_clock = clock_base + 0x3100;
+    constexpr uint64_t held_label = clock_base + 0x2f00;
+    constexpr uint64_t held_label_value = 0x0123456789abcdefull;
     auto held_processor = std::make_unique<CommandProcessor>(context, 0);
     std::binary_semaphore held_recorded{0};
     std::binary_semaphore held_release{0};
@@ -3622,6 +3634,9 @@ public:
       held_processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
                                          reinterpret_cast<void *>(held_clock), 0, 2,
                                          0x99u);
+      held_processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 2,
+                                         reinterpret_cast<void *>(held_label),
+                                         held_label_value, 0);
       scheduler.Finish();
       scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
       // The GPU thread stays busy: the value and its interrupt wait for it. The page is
@@ -3633,6 +3648,7 @@ public:
     interrupt_count = 0;
     const auto held_early_wait = wait_for_interrupt(interrupt_event, interrupt_count);
     const auto held_early_count = interrupt_count;
+    const auto held_label_early = read_clock(held_label);
     held_release.release();
     gpu.WaitForIdle();
     interrupt_count = 0;
@@ -3641,12 +3657,13 @@ public:
     LibKernel::Memory::InstallGpuResources(nullptr);
     Require("GpuCommandLane", "interrupt behind a deferred timestamp",
             held_watched && held_early_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
-                held_early_count == 0 && held_wait == 0 &&
+                held_early_count == 0 && held_label_early == 0 &&
+                read_clock(held_label) == held_label_value && held_wait == 0 &&
                 interrupt_count == 1 && interrupt_event.ident == 0 &&
                 interrupt_event.data == 0x99u &&
                 held_value + clock_tolerance >= held_before &&
                 held_value <= Sync::ReadReferenceClock() + clock_tolerance,
-            "an interrupt ran before the GPU clock value written before it");
+            "an interrupt or a label landed before the GPU clock value written before it");
 
     interrupt_count = 0;
     const auto extra_interrupt_wait =

@@ -41,7 +41,9 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	// Queues work on the GPU thread from any thread, including completion callbacks that can
 	// outlive the guest GPU. False when no GPU accepts work.
-	[[nodiscard]] bool                      PostGpuCommand(Common::UniqueFunction<void>&& command);
+	[[nodiscard]] bool PostGpuCommand(Common::UniqueFunction<void>&& command);
+	// A completion stored guest memory: queues waiting on memory poll again.
+	void                                    NotifyGuestWrite();
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }

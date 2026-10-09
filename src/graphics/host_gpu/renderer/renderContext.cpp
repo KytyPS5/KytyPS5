@@ -62,6 +62,13 @@ bool RenderContext::PostGpuCommand(Common::UniqueFunction<void>&& command) {
 	return m_gpu != nullptr && m_gpu->TrySendCommand(std::move(command));
 }
 
+void RenderContext::NotifyGuestWrite() {
+	std::lock_guard lock(m_gpu_mutex);
+	if (m_gpu != nullptr) {
+		m_gpu->NotifyGuestWrite();
+	}
+}
+
 VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	EXIT_IF(m_video_out == nullptr);
 	return *m_video_out;

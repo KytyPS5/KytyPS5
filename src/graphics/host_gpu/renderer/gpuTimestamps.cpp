@@ -294,20 +294,49 @@ void GpuTimestamps::Write(uint64_t vaddr, uint32_t size, bool end_of_pipe) {
 		m_scheduler.Finish();
 		m_scheduler.WaitPriorityOperations(m_scheduler.CurrentTick() - 1);
 	}
-	if (m_batch == nullptr) {
-		m_batch              = std::make_shared<Batch>();
-		m_batch->first_query = static_cast<uint32_t>(m_issued % QueryCount);
-		// Queued before the interrupts recorded after this write, so it runs first.
-		m_scheduler.DeferPriorityOperation([this, batch = m_batch] { Complete(*batch); });
-	}
+	auto&      batch = CurrentBatch();
 	const auto query = static_cast<uint32_t>(m_issued % QueryCount);
+	if (batch.queries == 0) {
+		batch.first_query = query;
+	}
 	m_issued++;
-	m_batch->writes.push_back({vaddr, query, size});
+	batch.queries++;
+	batch.writes.push_back({vaddr, 0, query, size, false});
+	m_unstored.fetch_add(1, std::memory_order_relaxed);
 	// Timestamps may be written inside a render pass; their readback waits for the batch end.
 	m_scheduler.Current().Handle().writeTimestamp2(end_of_pipe
 	                                                   ? vk::PipelineStageFlagBits2::eAllCommands
 	                                                   : vk::PipelineStageFlagBits2::eTopOfPipe,
 	                                               m_pool, query);
+}
+
+bool GpuTimestamps::WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size) {
+	StoreRetries();
+	if (m_unstored.load(std::memory_order_acquire) == 0) {
+		return false;
+	}
+	CurrentBatch().writes.push_back({vaddr, value, 0, size, true});
+	m_unstored.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+void GpuTimestamps::StoreAll() {
+	if (m_unstored.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	m_scheduler.Finish();
+	m_scheduler.WaitPriorityOperations(m_scheduler.CurrentTick() - 1);
+	StoreRetries();
+	EXIT_IF(m_unstored.load(std::memory_order_acquire) != 0);
+}
+
+GpuTimestamps::Batch& GpuTimestamps::CurrentBatch() {
+	if (m_batch == nullptr) {
+		m_batch = std::make_shared<Batch>();
+		// Queued before the interrupts recorded after this write, so it runs first.
+		m_scheduler.DeferPriorityOperation([this, batch = m_batch] { Complete(*batch); });
+	}
+	return *m_batch;
 }
 
 void GpuTimestamps::Resolve() {
@@ -316,12 +345,22 @@ void GpuTimestamps::Resolve() {
 	}
 	const auto batch = std::move(m_batch);
 	m_batch          = nullptr;
+	if (batch->queries != 0) {
+		Copy(*batch);
+	}
 
+	std::lock_guard lock(m_mutex);
+	batch->previous = m_clock.Previous();
+	batch->current  = m_clock.Current();
+	batch->resolved = true;
+}
+
+void GpuTimestamps::Copy(const Batch& batch) {
 	auto& command_buffer = m_scheduler.Current();
 	command_buffer.EndRendering();
 	auto       command = command_buffer.Handle();
-	const auto count   = static_cast<uint32_t>(batch->writes.size());
-	const auto first   = std::min(count, QueryCount - batch->first_query);
+	const auto count   = batch.queries;
+	const auto first   = std::min(count, QueryCount - batch.first_query);
 	const auto copy    = [&](uint32_t query, uint32_t queries) {
 		command.copyQueryPoolResults(m_pool, query, queries, m_readback.Handle(),
 		                             query * sizeof(uint64_t), sizeof(uint64_t),
@@ -329,7 +368,7 @@ void GpuTimestamps::Resolve() {
 		// Query commands execute in submission order: the reset follows the copy.
 		command.resetQueryPool(m_pool, query, queries);
 	};
-	copy(batch->first_query, first);
+	copy(batch.first_query, first);
 	if (count > first) {
 		copy(0, count - first);
 	}
@@ -342,15 +381,10 @@ void GpuTimestamps::Resolve() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &copied;
 	command.pipelineBarrier2(dependency);
-
-	std::lock_guard lock(m_mutex);
-	batch->previous = m_clock.Previous();
-	batch->current  = m_clock.Current();
-	batch->resolved = true;
 }
 
 void GpuTimestamps::Complete(const Batch& batch) {
-	const auto count = static_cast<uint32_t>(batch.writes.size());
+	const auto count = batch.queries;
 	Segment    previous;
 	Segment    current;
 	bool       deferred = false;
@@ -362,15 +396,22 @@ void GpuTimestamps::Complete(const Batch& batch) {
 		current  = batch.current;
 		deferred = m_retrying || !m_retries.empty();
 	}
-	const auto first = std::min(count, QueryCount - batch.first_query);
-	m_readback.Invalidate(batch.first_query * sizeof(uint64_t), first * sizeof(uint64_t));
-	m_readback.Invalidate(0, (count - first) * sizeof(uint64_t));
+	if (count != 0) {
+		const auto first = std::min(count, QueryCount - batch.first_query);
+		m_readback.Invalidate(batch.first_query * sizeof(uint64_t), first * sizeof(uint64_t));
+		m_readback.Invalidate(0, (count - first) * sizeof(uint64_t));
+	}
+	uint64_t stored = 0;
 	for (const auto& write: batch.writes) {
-		uint64_t ticks = 0;
-		std::memcpy(&ticks, m_readback.Mapped().data() + write.query * sizeof(uint64_t),
-		            sizeof(ticks));
-		const auto value = Clock::Convert(previous, current, ticks & m_mask, m_mask);
+		auto value = write.value;
+		if (!write.label) {
+			uint64_t ticks = 0;
+			std::memcpy(&ticks, m_readback.Mapped().data() + write.query * sizeof(uint64_t),
+			            sizeof(ticks));
+			value = Clock::Convert(previous, current, ticks & m_mask, m_mask);
+		}
 		if (!deferred && m_context.StoreAtCompletion(write.vaddr, &value, write.size)) {
+			stored++;
 			continue;
 		}
 		// Later values must not land before this one.
@@ -379,9 +420,19 @@ void GpuTimestamps::Complete(const Batch& batch) {
 		m_retries.push_back({write.vaddr, value, write.size, {}});
 	}
 	m_retired.fetch_add(count, std::memory_order_release);
+	Stored(stored);
 	if (deferred) {
 		QueueRetries();
 	}
+}
+
+void GpuTimestamps::Stored(uint64_t count) {
+	if (count == 0) {
+		return;
+	}
+	m_unstored.fetch_sub(count, std::memory_order_release);
+	// A queue waiting for one of these values polls again.
+	m_context.NotifyGuestWrite();
 }
 
 void GpuTimestamps::QueueRetries() {
@@ -440,13 +491,16 @@ void GpuTimestamps::StoreRetries() {
 		}
 		// Plain stores fault here like other GPU-thread writes, so the watching caches see them.
 		// Unmapping a range stores its retries first, so every destination is still mapped.
+		uint64_t stored = 0;
 		for (const auto& retry: retries) {
 			if (retry.effect) {
 				retry.effect();
 			} else {
 				std::memcpy(reinterpret_cast<void*>(retry.vaddr), &retry.value, retry.size);
+				stored++;
 			}
 		}
+		Stored(stored);
 	}
 }
 

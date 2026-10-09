@@ -77,6 +77,11 @@ public:
 
 	// End of pipe: after all earlier commands complete. Otherwise when the command is reached.
 	void Write(uint64_t vaddr, uint32_t size, bool end_of_pipe);
+	// End-of-pipe label (immediate data). Behind a GPU clock value not stored yet, it is stored
+	// after that value, at completion. False when none is pending: the caller writes it now.
+	[[nodiscard]] bool WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size);
+	// Stores every value recorded so far, before a write the GPU thread makes itself.
+	void StoreAll();
 	// Runs a guest-visible completion effect, such as an interrupt, from a completion callback
 	// after the values before it: now, or on the GPU thread right after the ones left to it.
 	void Signal(Common::UniqueFunction<void>&& effect);
@@ -90,15 +95,19 @@ public:
 	                                          uint64_t ticks);
 
 private:
+	// A GPU clock value read from query, or a label with its value.
 	struct Pending {
 		uint64_t vaddr = 0;
+		uint64_t value = 0;
 		uint32_t query = 0;
 		uint32_t size  = 0;
+		bool     label = false;
 	};
 
 	struct Batch {
 		std::vector<Pending> writes;
 		uint32_t             first_query = 0;
+		uint32_t             queries     = 0;
 		Segment              previous;
 		Segment              current;
 		bool                 resolved = false;
@@ -114,8 +123,11 @@ private:
 
 	[[nodiscard]] bool SampleClocks(uint64_t& ticks, uint64_t& reference) const;
 	void               InitializeWithSubmission(bool anchor);
+	Batch&             CurrentBatch();
 	void               Resolve();
+	void               Copy(const Batch& batch);
 	void               Complete(const Batch& batch);
+	void               Stored(uint64_t count);
 	void               QueueRetries();
 
 	GraphicContext&        m_graphics;
@@ -127,12 +139,14 @@ private:
 	std::shared_ptr<Batch> m_batch;
 	uint64_t               m_issued = 0;
 	std::atomic<uint64_t>  m_retired {0};
-	std::mutex             m_mutex;
-	std::mutex             m_store_mutex;
-	std::vector<Retry>     m_retries;
-	bool                   m_retrying     = false;
-	bool                   m_retry_queued = false;
-	Clock                  m_clock;
+	// Values recorded and not stored yet: a label behind one waits for it.
+	std::atomic<uint64_t> m_unstored {0};
+	std::mutex            m_mutex;
+	std::mutex            m_store_mutex;
+	std::vector<Retry>    m_retries;
+	bool                  m_retrying     = false;
+	bool                  m_retry_queued = false;
+	Clock                 m_clock;
 };
 
 } // namespace Libs::Graphics

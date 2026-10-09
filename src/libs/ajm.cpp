@@ -524,6 +524,15 @@ static AjmDecodeResult AjmInitializeInstanceImpl(uint32_t instance, const void* 
 
 static AjmDecodeResult AjmInitializeInstance(uint32_t instance, const void* codec_parameters,
                                              size_t codec_parameters_size) {
+	if (GameTrace::Enabled()) {
+		static int s_n = 0;
+		if (s_n++ < 24) {
+			char hex[200] = "";
+			const auto n = codec_parameters_size < 48 ? codec_parameters_size : 48;
+			for (size_t i = 0; codec_parameters != nullptr && i < n; i++) std::snprintf(hex + i * 3, 4, "%02x ", static_cast<const uint8_t*>(codec_parameters)[i]);
+			GameTrace::Line("AJM init-params instance=0x%08x size=%llu bytes=%s", instance, static_cast<unsigned long long>(codec_parameters_size), hex);
+		}
+	}
 	auto r = AjmInitializeInstanceImpl(instance, codec_parameters, codec_parameters_size);
 	AjmTraceJob("init", instance, r);
 	return r;

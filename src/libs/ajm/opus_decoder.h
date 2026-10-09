@@ -32,26 +32,29 @@ public:
 		avcodec_free_context(&m_context);
 		Reset();
 		auto result = MakeResult();
-		if (parameters == nullptr || parameters_size < sizeof(AjmDecOpusInitializeParameters)) {
-			result.result = AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL;
-			return result;
+		// PS5 AJM Opus init parameter block is not the PS4 layout the original code assumed
+		// (every init returned INVALID_PARAMETER|FATAL). Channels come from the instance flags;
+		// accept any block and only honour plausible values from it.
+		uint32_t channels = m_max_channels != 0 ? m_max_channels : 2;
+		if (parameters != nullptr && parameters_size >= 4) {
+			uint32_t first = 0;
+			std::memcpy(&first, parameters, 4);
+			if (first >= 1 && first <= 2) {
+				channels = first;
+			}
 		}
-		const auto& params = *static_cast<const AjmDecOpusInitializeParameters*>(parameters);
-		if (params.channel_num == 0 || params.channel_num > 2 || params.sample_rate != 48000 ||
-		    params.mapping_family != 0) {
-			result.result = AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL;
-			return result;
+		if (channels > 2) {
+			channels = 2;
 		}
-		if (params.channel_num > m_max_channels) {
-			result.result = AJM_RESULT_TOO_MANY_CHANNELS | AJM_RESULT_FATAL;
-			return result;
-		}
+		struct {
+			uint32_t channel_num;
+		} params {channels};
 
 		const auto* codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
 		m_context         = codec != nullptr ? avcodec_alloc_context3(codec) : nullptr;
 		if (m_context != nullptr) {
 			av_channel_layout_default(&m_context->ch_layout, static_cast<int>(params.channel_num));
-			m_context->sample_rate = static_cast<int>(params.sample_rate);
+			m_context->sample_rate = 48000;
 			if (avcodec_open2(m_context, codec, nullptr) < 0) {
 				avcodec_free_context(&m_context);
 			}
@@ -60,7 +63,7 @@ public:
 			result.result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 			return result;
 		}
-		SetFormat(params.channel_num, params.sample_rate, m_sample_encoding);
+		SetFormat(params.channel_num, 48000, m_sample_encoding);
 		return MakeResult();
 	}
 
@@ -91,12 +94,15 @@ public:
 				result.result = AJM_RESULT_PARTIAL_INPUT;
 				break;
 			}
-			const auto packet_size = static_cast<uint32_t>(data[0]) | (uint32_t {data[1]} << 8u);
-			if (packet_size > remaining - 2) {
-				result.result = AJM_RESULT_PARTIAL_INPUT;
-				break;
+			// Framing: either a 2-byte LE length prefix + packet, or a bare Opus packet filling
+			// the whole input (seen from PS5 titles).
+			uint32_t packet_size = static_cast<uint32_t>(data[0]) | (uint32_t {data[1]} << 8u);
+			uint32_t header      = 2;
+			if (packet_size == 0 || packet_size > remaining - 2) {
+				packet_size = static_cast<uint32_t>(remaining);
+				header      = 0;
 			}
-			data += 2;
+			data += header;
 			if (packet_size == 0 || ((data[0] & 3u) == 3 && packet_size < 2)) {
 				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 				result.internal_result = 0x1043;
@@ -134,7 +140,7 @@ public:
 			if (frame == nullptr) {
 				break;
 			}
-			if (frame->nb_samples != static_cast<int>(samples) ||
+			if (frame->nb_samples < static_cast<int>(samples) ||
 			    frame->ch_layout.nb_channels != static_cast<int>(m_channels)) {
 				av_frame_free(&frame);
 				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
@@ -155,7 +161,7 @@ public:
 					gapless->current.total_samples -= write;
 				}
 			}
-			result.input_consumed += packet_size + 2;
+			result.input_consumed += packet_size + header;
 			result.output_written += output_bytes;
 			result.frames += frames;
 			m_frames_per_packet = frames;

@@ -33638,14 +33638,17 @@ TestCase DsOrderedCountAddressAndExec(u32 wave_size, bool pixel_counter) {
   return test;
 }
 
-TestCase DsOrderedCountFollowsWaveLaunchOrder() {
+template <bool two_d> TestCase DsOrderedCountFollowsWaveLaunchOrder() {
   using O = ShaderOpcode;
   TestCase test;
-  test.name = "DsOrderedCountFollowsWaveLaunchOrder";
+  // The 2D variant ranks waves by y * 4 + x, which needs NumWorkgroups.
+  test.name = two_d ? "DsOrderedCountFollowsWaveLaunchOrder2D"
+                    : "DsOrderedCountFollowsWaveLaunchOrder";
   auto &code = test.code;
   constexpr u32 waves = 16;
-  // s0 = group id, s1 = TG_SIZE whose bits [16:6] hold the ordered-append term.
-  code.push_back(EncodeSop2(0x27, 2, 1, 255));
+  // s0 (and s1 in 2D) = group id, then TG_SIZE whose bits [16:6] hold the
+  // ordered-append term.
+  code.push_back(EncodeSop2(0x27, 2, two_d ? 2 : 1, 255));
   code.push_back(0x000b0006u);
   // Earlier waves spin longer, so an unordered counter would serve them last.
   // v5 counts the iterations and is stored, so the delay cannot be optimized
@@ -33681,13 +33684,15 @@ TestCase DsOrderedCountFollowsWaveLaunchOrder() {
   test.expected_gds = test.gds_initial;
   test.expected_gds[0] = waves;
   test.expected_gds[ShaderRecompiler::IR::OrderedAppendReleaseCounter] = waves;
-  test.dispatch_x = waves;
+  test.dispatch_x = two_d ? 4 : waves;
+  test.dispatch_y = two_d ? waves / 4 : 1;
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = 64;
   test.compute_info.group_id[0] = true;
+  test.compute_info.group_id[1] = two_d;
   test.compute_info.workgroup_register = 0;
   test.compute_info.tg_size_en = true;
   test.has_compute_info = true;
@@ -37303,7 +37308,8 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(DsOrderedCountAddressAndExec(wave_size, true));
   }
   AddCase(DsAppendConsumeGdsRegionBounds);
-  AddCase(DsOrderedCountFollowsWaveLaunchOrder);
+  AddCase(DsOrderedCountFollowsWaveLaunchOrder<false>);
+  AddCase(DsOrderedCountFollowsWaveLaunchOrder<true>);
   AddCase(DsOrderedCountRanksPastElevenBits);
   AddCase(DsGdsSubdwordAndAtomicWrites);
   AddCase(DsReadWrite2Variants);
@@ -43159,7 +43165,8 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, false));
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, true));
     }
-    RunCase(&vulkan, DsOrderedCountFollowsWaveLaunchOrder());
+    RunCase(&vulkan, DsOrderedCountFollowsWaveLaunchOrder<false>());
+    RunCase(&vulkan, DsOrderedCountFollowsWaveLaunchOrder<true>());
     RunCase(&vulkan, DsOrderedCountRanksPastElevenBits());
     return 0;
   }

@@ -175,6 +175,7 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::WorkgroupId:
 			AddInput(info, kind, 0, 3, "gl_WorkGroupID");
 			break;
+		case StageInputKind::NumWorkgroups: AddInput(info, kind, 0, 3, "gl_NumWorkGroups"); break;
 		case StageInputKind::LocalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_LocalInvocationID");
 			break;

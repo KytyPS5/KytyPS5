@@ -713,14 +713,16 @@ private:
 		return operands(true);
 	}
 
-	const ResourcePlan&             m_program;
-	RuntimeValueType                m_type;
-	bool                            m_wave_uniform;
-	Value                           m_active_mask;
-	std::unordered_set<const Inst*> m_visiting;
-	std::unordered_set<const Inst*> m_validated_dependencies;
+	const ResourcePlan&                                 m_program;
+	RuntimeValueType                                    m_type;
+	bool                                                m_wave_uniform;
+	Value                                               m_active_mask;
+	bool                                                m_lane_bound = false;
+	std::vector<Frame>                                  m_stack;
+	std::unordered_set<const Inst*>                     m_visiting;
+	std::unordered_set<const Inst*>                     m_validated_dependencies;
+	std::unordered_map<const Inst*, std::vector<Scope>> m_validated_uniform;
 };
-
 
 } // namespace
 
@@ -930,8 +932,18 @@ SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean, SrtWalker
       m_context(AcquireContext()) {
 	// A walker that takes phis on trust or binds a lane keeps its own memo, as do its children.
 	if (!isolated && parent.m_isolated) {
+		m_assumed        = parent.m_assumed;
+		m_barred         = parent.m_barred;
+		m_lane           = parent.m_lane;
+		m_suspended_lane = parent.m_suspended_lane;
+	}
+}
 
 SrtWalker::~SrtWalker() {
+	if (m_isolated) {
+		m_context.session = nullptr;
+		return;
+	}
 	if (m_session != this) return;
 	for (auto& context: m_program.evaluation_contexts)
 		if (context.session == this) context.session = nullptr;
@@ -940,6 +952,7 @@ SrtWalker::~SrtWalker() {
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
 	if (!EvaluateWide(value, wide)) {
+		m_refusal = m_state->last;
 		return false;
 	}
 	result = static_cast<uint32_t>(wide);
@@ -949,14 +962,15 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 	ResourcePlan::EvaluationContext* unused = nullptr;
 	for (auto& context: m_program.evaluation_contexts) {
-		if (context.session == m_session && context.active_mask == m_active_mask &&
-		    context.read_policy == m_read_policy) return context;
+		if (!m_isolated && context.session == m_session && context.active_mask == m_active_mask &&
+		    context.read_policy == m_read_policy)
+			return context;
 		if (context.session == nullptr && unused == nullptr) unused = &context;
 	}
 	auto& context = unused != nullptr ? *unused : m_program.evaluation_contexts.emplace_back();
-	context.session = m_session;
+	context.session     = m_isolated ? this : m_session;
 	context.active_mask = m_active_mask;
-	context.read_policy = m_read_policy;
+	context.read_policy = static_cast<uint8_t>(m_read_policy | (m_isolated ? 4u : 0u));
 	context.generation += 4;
 	return context;
 }
@@ -973,6 +987,26 @@ float SrtWalker::Float32(uint64_t bits) {
 	return std::bit_cast<float>(static_cast<uint32_t>(bits));
 }
 
+bool SrtWalker::Refuse(SrtRefusal reason) {
+	m_state->last = reason;
+	++m_state->refusals;
+	return false;
+}
+
+bool SrtWalker::RefuseVolatile(SrtRefusal reason) {
+	++m_state->volatile_refusals;
+	return Refuse(reason);
+}
+
+uint64_t SrtWalker::VolatileRefusals() const {
+	return m_state->volatile_refusals +
+	       (m_clean_evaluator != nullptr ? m_clean_evaluator->m_state->volatile_refusals : 0u);
+}
+
+bool SrtWalker::Delegate(SrtWalker& walker, Value value, uint64_t& result) {
+	if (walker.EvaluateWide(value, result)) return true;
+	if (walker.m_state != m_state) Refuse(walker.m_state->last);
+	return false;
 }
 
 SrtWalker::Visit SrtWalker::BeginVisit(ResourcePlan::EvaluationContext::Entry& entry) {
@@ -1156,6 +1190,27 @@ bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 	return EvaluateWide(inst.Arg(index), result);
 }
 
+const ResourcePlan::PhiPlan* SrtWalker::FrozenPhiPlan(const Inst& inst) {
+	if (!m_program.frozen_values) {
+		return nullptr;
+	}
+	const auto index = inst.EvaluationIndex(m_program.evaluation_value_count);
+	if (index < m_program.phi_plan_index.size() && m_program.phi_plan_index[index] != UINT32_MAX) {
+		return &m_program.phi_plans[m_program.phi_plan_index[index]];
+	}
+	const Value phi(const_cast<Inst*>(&inst));
+	auto&       plan = m_program.phi_plans.emplace_back();
+	plan.invariant   = ResolveInvariantPhi(m_program, phi);
+	if (plan.invariant.IsEmpty()) {
+		plan.entry = ResolveCyclicPhiEntry(m_program, phi, &plan.web);
+	}
+	if (index >= m_program.phi_plan_index.size()) {
+		m_program.phi_plan_index.resize(index + 1u, UINT32_MAX);
+	}
+	m_program.phi_plan_index[index] = static_cast<uint32_t>(m_program.phi_plans.size() - 1u);
+	return &plan;
+}
+
 bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	if (const auto control = m_program.control_phi_predecessors.find(&inst);
 	    control != m_program.control_phi_predecessors.end()) {
@@ -1171,8 +1226,9 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 		}
 		return found || Refuse(SrtRefusal::UndefinedValue);
 	}
-	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
 	const Value phi(const_cast<Inst*>(&inst));
+	const auto* frozen = FrozenPhiPlan(inst);
+	const auto  value = frozen != nullptr ? frozen->invariant : ResolveInvariantPhi(m_program, phi);
 	if (!value.IsEmpty()) {
 		return EvaluateWide(value, result);
 	}
@@ -1181,6 +1237,18 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	}
 	// Loop-carried: assume the entry value and require every operand of the phi web to reproduce
 	// it.
+	std::vector<const Inst*> resolved_web;
+	CyclicPhiFailure         failure;
+	const auto entry = frozen != nullptr
+	                       ? frozen->entry
+	                       : ResolveCyclicPhiEntry(m_program, phi, &resolved_web, &failure);
+	if (entry.IsEmpty()) {
+		if (frozen != nullptr) ResolveCyclicPhiEntry(m_program, phi, nullptr, &failure);
+		return Refuse(failure.reason == CyclicPhiReject::Merge ? SrtRefusal::PhiMerge
+		                                                       : SrtRefusal::PhiNoEntry);
+	}
+	const auto& web       = frozen != nullptr ? frozen->web : resolved_web;
+	uint64_t    candidate = 0;
 	if (!EvaluateWide(entry, candidate)) {
 		return false;
 	}
@@ -1240,8 +1308,10 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		}
 		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
 	}
+	return Refuse(SrtRefusal::UnsupportedOperand);
 }
 
+bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result) {
 	const auto* source = inst.Arg(0).ResolveInstruction();
 	if (source == nullptr || component >= 4u) {
 		return Refuse(SrtRefusal::UnsupportedOperand);
@@ -1264,6 +1334,7 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
 	}
 	return Refuse(SrtRefusal::UnsupportedOperand);
+bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes) {
 	RawReadShape shape;
 	if (!RawReadShapeOf(m_program, inst, component_bytes, shape)) {
 		return Refuse(SrtRefusal::UnsupportedOperand);
@@ -1283,6 +1354,7 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	if (handle == nullptr) {
 		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
+	RawReadEvent event {.inst = &inst, .component_bytes = component_bytes};
 	auto&        operands = event.operands;
 	if (!Arg(*handle, 0, operands[0]) || !Arg(*handle, 1, operands[1]) ||
 	    !Arg(inst, RawReadOffsetArgument(inst.GetOpcode()), operands[2])) {
@@ -1301,8 +1373,6 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 			result = 0u;
 			return true;
 	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
 		}
 	}
@@ -1407,6 +1477,7 @@ bool SrtWalker::EvaluateRule(const Inst& inst, uint64_t& result) {
 	const auto ternary = [&]() {
 		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 	};
+	const auto s32 = [](uint64_t value) {
 		return std::bit_cast<int32_t>(static_cast<uint32_t>(value));
 	};
 	const auto f32 = [](float value) {
@@ -1435,6 +1506,7 @@ bool SrtWalker::EvaluateRule(const Inst& inst, uint64_t& result) {
 			if (!m_active_mask.IsEmpty() && inst.Arg(1).Resolve() == m_active_mask) {
 				evaluated = EvaluateWide(inst.Arg(0), result);
 			} else {
+				SrtWalker clean_active(*this, inst.Arg(1), true);
 				SrtWalker active(*this, inst.Arg(1), false, &clean_active);
 				evaluated = active.EvaluateWide(inst.Arg(0), result);
 			}
@@ -1689,6 +1761,19 @@ bool SrtWalker::EvaluateRule(const Inst& inst, uint64_t& result) {
 			switch (inst.GetOpcode()) {
 				case ValueOpcode::FPAdd32: result = f32(x + y); break;
 				case ValueOpcode::FPSub32: result = f32(x - y); break;
+				case ValueOpcode::FPMin32: result = f32(std::fmin(x, y)); break;
+				case ValueOpcode::FPMax32: result = f32(std::fmax(x, y)); break;
+				case ValueOpcode::FPOrdEqual32: result = x == y; break;
+				case ValueOpcode::FPOrdNotEqual32: result = !nan2() && x != y; break;
+				case ValueOpcode::FPOrdLessThan32: result = x < y; break;
+				case ValueOpcode::FPOrdGreaterThan32: result = x > y; break;
+				case ValueOpcode::FPUnordEqual32: result = nan2() || x == y; break;
+				case ValueOpcode::FPUnordNotEqual32: result = x != y; break;
+				case ValueOpcode::FPUnordLessThan32: result = nan2() || x < y; break;
+				case ValueOpcode::FPUnordGreaterThan32: result = nan2() || x > y; break;
+				case ValueOpcode::FPUnordLessThanEqual32: result = nan2() || x <= y; break;
+				default: result = nan2() || x >= y; break;
+			}
 			return true;
 		}
 		case ValueOpcode::BitwiseAnd32:

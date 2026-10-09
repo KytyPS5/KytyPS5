@@ -219,6 +219,27 @@ Value ResolveActiveU32(Value value, Value active) {
 }
 
 Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+                            std::vector<const Inst*>* web_out, CyclicPhiFailure* reject,
+                            CyclicPhiEntryCache* cache) {
+	if (cache != nullptr && cache->program == &program) {
+		const auto* root = value.Resolve().TryInstruction();
+		if (root != nullptr && root->GetOpcode() == ValueOpcode::Phi) {
+			auto found = cache->answers.find(root);
+			if (found == cache->answers.end()) {
+				CyclicPhiEntryCache::Answer answer;
+				answer.entry = ResolveCyclicPhiEntry(program, value, &answer.web, &answer.reject);
+				found        = cache->answers.emplace(root, std::move(answer)).first;
+			}
+			const auto& answer = found->second;
+			if (reject != nullptr) {
+				*reject = answer.reject;
+			}
+			if (web_out != nullptr && !answer.entry.IsEmpty()) {
+				*web_out = answer.web;
+			}
+			return answer.entry;
+		}
+	}
 	const auto fail = [&](CyclicPhiReject reason, Value entry = {}, Value other = {}) {
 		if (reject != nullptr) {
 			*reject = {reason, entry, other};

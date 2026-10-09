@@ -217,19 +217,41 @@ public:
 	                       SrtWalker*             conditions      = nullptr,
 
 private:
+		uint64_t   order;
+		uint64_t   volatile_refusals;
+		uint64_t   outer_cycle_root;
+		LaneScope* lane;
+		bool       outer_dependent;
+	};
+
 	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
-	          SrtWalker* clean_evaluator = nullptr);
+	          SrtWalker* clean_evaluator = nullptr, bool isolated = false);
 	ResourcePlan::EvaluationContext& AcquireContext();
 	void ResetUnknowns();
 	static float Float32(uint64_t bits);
-	bool EvaluateWide(Value value, uint64_t& result);
-	bool Arg(const Inst& inst, size_t index, uint64_t& result);
-	bool EvaluatePhi(const Inst& inst, uint64_t& result);
-	bool EvaluateExtract(const Inst& inst, uint64_t& result);
-	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	bool                             Refuse(SrtRefusal reason);
+	bool                             RefuseVolatile(SrtRefusal reason);
+	[[nodiscard]] uint64_t           VolatileRefusals() const;
+	[[nodiscard]] LaneScope*         DependenceScope() const {
+		return m_lane != nullptr ? m_lane : m_suspended_lane;
+	}
+	Visit       BeginVisit(ResourcePlan::EvaluationContext::Entry& entry);
+	void        EndVisit(const Visit& visit, uint32_t index, bool evaluated, uint64_t value);
+	bool        Delegate(SrtWalker& walker, Value value, uint64_t& result);
+	bool        EvaluateWide(Value value, uint64_t& result);
+	bool        EvaluateChain(const Inst& root, uint64_t& result);
+	const Inst* ColdPlainOperand(Value value, uint32_t& index);
+	bool        Arg(const Inst& inst, size_t index, uint64_t& result);
+	bool        EvaluatePhi(const Inst& inst, uint64_t& result);
+	const ResourcePlan::PhiPlan* FrozenPhiPlan(const Inst& inst);
+	bool                         EvaluateExtract(const Inst& inst, uint64_t& result);
+	bool     EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result);
+	bool     EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes = 0u);
+	bool     EvaluateBallot(const Inst& inst, uint64_t& result);
 	void     BarAssumptions(SrtWalker& walker) const;
 	uint32_t ClosedBallotIndex(const Inst& ballot);
 	void     ForgetLaneValues();
+	bool     EvaluateInst(const Inst& inst, uint64_t& result);
 	bool     EvaluateRule(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
@@ -248,6 +270,11 @@ private:
 	InstValueMap m_assumed;
 	InstSet      m_barred;
 	// Set only inside a ballot's per-lane sweep; a flat-slot read or a readfirstlane suspends it.
+	LaneScope* m_lane           = nullptr;
+	LaneScope* m_suspended_lane = nullptr;
+	// A walker reused across the lanes of one sweep forgets its lane-dependent values per lane.
+	bool                  m_shares_lanes = false;
+	std::vector<uint32_t> m_lane_entries;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -657,6 +657,11 @@ private:
 		Value planning_handle;
 	};
 
+	struct MemoryAccessors {
+		uint32_t    count = 0;
+		const Inst* only  = nullptr;
+	};
+
 	struct IndirectDescriptorPlan {
 		Inst*                      handle = nullptr;
 		uint32_t                   source = 0;
@@ -678,6 +683,16 @@ private:
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		EXIT("%s", message.c_str());
 		std::abort();
+	}
+
+	// A guest shader this pass cannot model: records the first reason and unwinds.
+	bool Reject(uint32_t pc, const std::string& reason) const {
+		if (m_status.ok) {
+			m_status.ok     = false;
+			m_status.pc     = pc;
+			m_status.reason = reason;
+		}
+		return false;
 	}
 
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
@@ -1287,7 +1302,33 @@ private:
 		           : nullptr;
 	}
 
+	static bool IsMemoryAccess(ValueOpcode op) {
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
+	// Descriptor planning neither adds nor renumbers memory accesses, so this holds while it runs.
+	void IndexMemoryAccessors() {
+		m_memory_accessors.assign(m_program.memory_info.size(), {});
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				if (!IsMemoryAccess(inst.GetOpcode())) continue;
+				const auto index = inst.Flags<MemoryFlags>().index;
+				if (index < m_memory_accessors.size()) {
+					m_memory_accessors[index].count++;
+					m_memory_accessors[index].only = &inst;
+				}
+			}
+		}
+	}
+
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
+		if (!m_memory_accessors.empty()) {
+			if (index >= m_memory_accessors.size()) return true;
+			const auto& accessors = m_memory_accessors[index];
+			return accessors.count == 0u || (accessors.count == 1u && accessors.only == &owner);
+		}
 		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
 				const auto op = inst.GetOpcode();
@@ -3407,6 +3448,21 @@ private:
 		return true;
 	}
 
+	// A GPU-written, host-unevaluable or unfoldable table is decoded in the shader instead.
+	bool DemoteBufferTable(const Inst& handle, const DescriptorSource& table) const {
+		if (std::ranges::any_of(handle.Uses(), [&](const Use& use) {
+			    return std::ranges::find(m_program.unfoldable_pcs,
+			                             use.user->Flags<MemoryFlags>().pc) !=
+			           m_program.unfoldable_pcs.end();
+		    }))
+			return true;
+		if (!m_program.refuse_indirect_buffer_table) return false;
+		auto sources = m_sources;
+		sources.push_back(table);
+		return m_program.refuse_indirect_buffer_table(m_program, sources,
+		                                              static_cast<uint32_t>(sources.size() - 1u));
+	}
+
 	bool TryMakeIndirectBuffer(Inst& handle, const DescriptorSource& descriptor,
 	                           IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
@@ -3452,6 +3508,7 @@ private:
 			source.dword_count = 4u;
 			source.dwords.fill(Value(0u));
 			source.indirect_descriptor = std::move(indirect);
+			if (DemoteBufferTable(handle, source)) return false;
 			plan.handle = &handle;
 			plan.source = InternSource(source);
 			plan.key = key;
@@ -3868,6 +3925,7 @@ private:
 	}
 
 	void PlanIndirectDescriptors() {
+		IndexMemoryAccessors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
@@ -3919,6 +3977,7 @@ private:
 				            memory.resource * 4u, false);
 			}
 		}
+		m_memory_accessors.clear();
 	}
 
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
@@ -4332,6 +4391,7 @@ private:
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
+	std::vector<MemoryAccessors>                    m_memory_accessors;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;

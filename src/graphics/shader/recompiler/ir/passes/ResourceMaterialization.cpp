@@ -326,14 +326,13 @@ void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
 		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
 	}
 	if (!extra.IsEmpty()) pending.push_back(extra);
-	std::vector<const Inst*> visited;
+	std::unordered_set<const Inst*> visited;
 	while (!pending.empty()) {
 		auto* inst = pending.back().Resolve().TryInstruction();
 		pending.pop_back();
-		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+		if (inst == nullptr || !visited.insert(inst).second) {
 			continue;
 		}
-		visited.push_back(inst);
 		if (planned_reads.contains(inst)) {
 			auto flags = inst->Flags<SrtReadFlags>();
 			flags.clean = 1u;

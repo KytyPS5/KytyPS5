@@ -409,6 +409,8 @@ void GpuTimestamps::QueueRetries() {
 }
 
 void GpuTimestamps::StoreRetries() {
+	// The GPU thread and a teardown unmap can both store: one at a time keeps the order.
+	std::lock_guard store_lock(m_store_mutex);
 	for (;;) {
 		std::vector<Retry> retries;
 		{

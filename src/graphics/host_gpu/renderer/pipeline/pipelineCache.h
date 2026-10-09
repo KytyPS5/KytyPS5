@@ -125,6 +125,9 @@ public:
 	void WaitForBackgroundCompilation();
 	// Runs on the compiling thread before recorded programs are compiled (tests).
 	void SetRecordedCompileHook(std::function<void()> hook);
+	// Runs in WaitForBackgroundCompilation before it waits, under the job lock; `blocking` tells
+	// whether compilations are still pending (tests).
+	void SetBackgroundWaitHook(std::function<void(bool blocking)> hook);
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;

@@ -826,7 +826,12 @@ struct PipelineCache::ProgramCache {
 
 	void WaitForBackgroundCompilation() {
 		std::unique_lock lock(job_mutex);
-		job_done.wait(lock, [this] { return queue.empty() && running == 0; });
+		const auto       finished = [this] { return queue.empty() && running == 0; };
+		// Under job_mutex: no job can end between the hook and the wait.
+		if (wait_hook) {
+			wait_hook(!finished());
+		}
+		job_done.wait(lock, finished);
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
@@ -884,6 +889,7 @@ struct PipelineCache::ProgramCache {
 	std::deque<Job*>                                    queue;
 	uint32_t                                            running = 0;
 	std::function<void()>                               compile_hook;
+	std::function<void(bool)>                           wait_hook;
 	ShaderCacheRecipes                                  recipes;
 	bool                                                dirty          = false;
 	bool                                                save_requested = false;
@@ -1091,6 +1097,11 @@ void PipelineCache::WaitForBackgroundCompilation() {
 void PipelineCache::SetRecordedCompileHook(std::function<void()> hook) {
 	std::lock_guard lock(m_program_cache->job_mutex);
 	m_program_cache->compile_hook = std::move(hook);
+}
+
+void PipelineCache::SetBackgroundWaitHook(std::function<void(bool blocking)> hook) {
+	std::lock_guard lock(m_program_cache->job_mutex);
+	m_program_cache->wait_hook = std::move(hook);
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(

@@ -37647,17 +37647,29 @@ void CheckShaderCacheConcurrentWaiters(VulkanHarness &vulkan) {
     });
     started.acquire();
     const auto during = cache.GetProgramStats();
+    // The hook runs under the job lock right before the wait, so the compilation released after
+    // it can only end once the waiter is blocked.
+    std::binary_semaphore waiting{0};
+    bool waiter_blocked = false;
+    cache.SetBackgroundWaitHook([&](bool blocking) {
+      waiter_blocked = blocking;
+      waiting.release();
+    });
     uint64_t seen_by_waiter = 0;
     std::thread waiter([&] {
       cache.WaitForBackgroundCompilation();
       seen_by_waiter = cache.GetProgramStats().compiled;
     });
+    waiting.acquire();
     release.release();
     lookup.join();
     waiter.join();
+    cache.SetBackgroundWaitHook(nullptr);
     const auto after = cache.GetProgramStats();
     Require(name, "in flight", during.in_flight == 1,
             "a recorded program compiled by the lookup thread was not in flight");
+    Require(name, "waiter blocked", waiter_blocked,
+            "a waiter did not wait for the recorded program compiled by the lookup thread");
     Require(name, "waiter", seen_by_waiter == 1,
             "a waiter woke before the recorded program compiled by the lookup thread ended");
     Require(name, "finished", after.in_flight == 0 && after.compiled == 1 &&

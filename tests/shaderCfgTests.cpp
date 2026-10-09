@@ -11052,6 +11052,128 @@ void TestMeshInputAssembly() {
   }
 }
 
+void TestMeshWave32PackedSubgroupIsolation(bool forward_permute) {
+  using namespace ShaderRecompiler;
+  const uint32_t readfirst_shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeVop1(0x02, 24, 5 + 256),
+      EncodeVop1(0x01, 4, 24),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(4, 4, 4, 4),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  const uint32_t permute_shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeDs0(0xb2), EncodeDs1(4, 5, 5),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(4, 4, 4, 4),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  const auto shader = forward_permute ? std::span<const uint32_t>(permute_shader)
+                                      : std::span<const uint32_t>(readfirst_shader);
+  ShaderVertexInputInfo input{};
+  input.logical_stage = ShaderType::Mesh;
+  input.mesh.wave_size = 32;
+  input.mesh.host_subgroup_size = 64;
+  input.mesh.threads_num[0] = 64;
+  input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
+  input.mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kTriList);
+  input.mesh.primitives_per_group = 1;
+  input.mesh.vertices_per_group = 3;
+  input.mesh.max_primitives = 1;
+  input.mesh.max_vertices = 3;
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.wave_size = 32;
+  options.input_info.vertex = &input;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+
+  std::unordered_map<uint32_t, std::span<const uint32_t>> definitions;
+  std::vector<std::span<const uint32_t>> shuffles;
+  for (size_t index = 5; index < result.spirv.size();) {
+    const auto length = result.spirv[index] >> 16u;
+    Check(length != 0 && index + length <= result.spirv.size(), "invalid packed-wave SPIR-V");
+    const auto instruction = std::span<const uint32_t>(result.spirv.data() + index, length);
+    const auto opcode = static_cast<spv::Op>(instruction[0] & 0xffffu);
+    if (opcode == spv::OpGroupNonUniformShuffle) {
+      shuffles.push_back(instruction);
+    }
+    if (opcode == spv::OpConstant || opcode == spv::OpLoad || opcode == spv::OpCompositeExtract ||
+        opcode == spv::OpCompositeConstruct || opcode == spv::OpSelect ||
+        opcode == spv::OpVectorExtractDynamic ||
+        opcode == spv::OpUGreaterThanEqual || opcode == spv::OpBitwiseAnd ||
+        opcode == spv::OpBitwiseOr || opcode == spv::OpGroupNonUniformBallot ||
+        opcode == spv::OpGroupNonUniformBallotFindLSB) {
+      definitions.emplace(instruction[2], instruction);
+    }
+    index += length;
+  }
+  const auto find = [&](uint32_t id, spv::Op opcode) -> std::span<const uint32_t> {
+    const auto it = definitions.find(id);
+    return it != definitions.end() && (it->second[0] & 0xffffu) == static_cast<uint32_t>(opcode)
+               ? it->second : std::span<const uint32_t>{};
+  };
+  const auto is_constant = [&](uint32_t id, uint32_t value) {
+    const auto constant = find(id, spv::OpConstant);
+    return constant.size() == 4 && constant[3] == value;
+  };
+  const auto is_guest_ballot = [&](uint32_t id) {
+    const auto ballot = find(id, spv::OpCompositeConstruct);
+    if (ballot.size() != 7) {
+      return false;
+    }
+    const auto selected = find(ballot[3], spv::OpSelect);
+    if (selected.size() != 6) {
+      return false;
+    }
+    const auto upper = find(selected[4], spv::OpCompositeExtract);
+    const auto lower = find(selected[5], spv::OpCompositeExtract);
+    const auto condition = find(selected[3], spv::OpUGreaterThanEqual);
+    return upper.size() == 5 && lower.size() == 5 && upper[3] == lower[3] &&
+               upper[4] == 1 && lower[4] == 0 && condition.size() == 5 &&
+               is_constant(condition[4], 32);
+  };
+  bool isolated = false;
+  for (const auto shuffle : shuffles) {
+    const auto lane = find(shuffle[5], spv::OpBitwiseOr);
+    if (lane.size() != 5) {
+      continue;
+    }
+    const auto local = find(lane[3], spv::OpBitwiseAnd);
+    const auto half = find(lane[4], spv::OpBitwiseAnd);
+    if (local.size() != 5 || half.size() != 5 || !is_constant(local[4], 31) ||
+        !is_constant(half[4], 32)) {
+      continue;
+    }
+    if (forward_permute) {
+      isolated = true;
+      break;
+    }
+    const auto first = find(local[3], spv::OpGroupNonUniformBallotFindLSB);
+    if (first.size() != 5) {
+      continue;
+    }
+    isolated = is_guest_ballot(first[4]);
+    if (isolated) {
+      break;
+    }
+  }
+  Check(isolated, "wave32 shuffle can read the other guest wave in subgroup64");
+  if (forward_permute) {
+    size_t ballots = 0;
+    for (const auto& [id, instruction] : definitions) {
+      if ((instruction[0] & 0xffffu) == spv::OpVectorExtractDynamic) {
+        Check(is_guest_ballot(instruction[3]), "wave32 DS_PERMUTE used the other guest wave ballot");
+        ++ballots;
+      }
+    }
+    Check(ballots != 0, "wave32 DS_PERMUTE did not exercise ballot word selection");
+  }
+}
+
 void TestNewShaderRecompilerSetpcJumpTable() {
   const uint32_t shader[] = {
       EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
@@ -15000,10 +15122,18 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char** argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--wave32-readfirst-only") == 0) {
+    TestMeshWave32PackedSubgroupIsolation(false);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave32-permute-only") == 0) {
+    TestMeshWave32PackedSubgroupIsolation(true);
+    return 0;
+  }
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -15124,6 +15254,8 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
+  TestMeshWave32PackedSubgroupIsolation(false);
+  TestMeshWave32PackedSubgroupIsolation(true);
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();

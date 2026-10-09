@@ -38,4 +38,26 @@ if(GIT_EXECUTABLE)
 		endif()
 	endif()
 endif()
+# Hash of everything that can change what the shader recompiler produces. It keys the on-disk
+# recompiler cache, so editing the recompiler invalidates it while a new commit elsewhere does not.
+file(GLOB_RECURSE RECOMPILER_SOURCES
+	"${GIT_WORKING_DIRECTORY}/src/graphics/shader/*.h"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/shader/*.cpp"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/shader/*.inc"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/guest_gpu/gpu_format.h"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/guest_gpu/gpu_format.cpp"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/guest_gpu/gpu_defs.h"
+)
+list(SORT RECOMPILER_SOURCES)
+set(RECOMPILER_COMBINED_HASH "")
+foreach(src ${RECOMPILER_SOURCES})
+	file(SHA256 "${src}" SRC_HASH)
+	string(APPEND RECOMPILER_COMBINED_HASH "${SRC_HASH}")
+endforeach()
+if(RECOMPILER_COMBINED_HASH STREQUAL "")
+	set(KYTY_RECOMPILER_SIGNATURE "none")
+else()
+	string(SHA256 KYTY_RECOMPILER_SIGNATURE "${RECOMPILER_COMBINED_HASH}")
+endif()
+
 configure_file("${INPUT_FILE}" "${OUTPUT_FILE}")

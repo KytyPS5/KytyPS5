@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -252,6 +253,10 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		ResourceMemo                               resource_memo;
+		size_t                                     last_permutation = std::numeric_limits<size_t>::max();
+		bool                                       native_plan_checked = false;
+		bool                                       native_plan_allowed = false;
 	};
 
 	struct ProgramKeyHash {
@@ -330,7 +335,20 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
+		static const bool reuse_enabled = [] {
+			const char* value = std::getenv("KYTY_PROGRAM_RESOURCE_CACHE");
+			return value != nullptr && value[0] == '1' && value[1] == 0;
+		}();
+		++lookups;
+		auto& last = last_sources[static_cast<size_t>(stage)];
+		SourceEntry* entry = nullptr;
+		if (reuse_enabled && last.key != nullptr && *last.key == lookup_key) {
+			entry = last.source;
+			++source_hits;
+		} else if (auto found = programs.find(lookup_key); found != programs.end()) {
+			entry = &found->second;
+			last = {&found->first, entry};
+		}
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -351,23 +369,50 @@ struct PipelineCache::ProgramCache {
 			}
 			return true;
 		};
-		if (entry != programs.end()) {
-			if (!native_plan_safe(entry->second.resource_plan)) return {};
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+		const auto check_native_plan = [&](SourceEntry& source) {
+			if (reuse_enabled && source.native_plan_checked) return source.native_plan_allowed;
+			const bool allowed = native_plan_safe(source.resource_plan);
+			if (reuse_enabled) {
+				// Native SGPR mappings belong to ProgramKey; the plan graph is immutable.
+				source.native_plan_checked = true;
+				source.native_plan_allowed = allowed;
+			}
+			return allowed;
+		};
+		if (entry != nullptr) {
+			if (!check_native_plan(*entry)) return {};
+			bool reused = false;
+			EXIT_IF(!entry->resource_memo.Refresh(entry->resource_plan, runtime,
+			    entry->resources, entry->specialization, reuse_enabled, reused));
+			resource_hits += reused;
+			materializations += !reused;
+			if (reuse_enabled && entry->last_permutation < entry->permutations.size()) {
+				const auto& candidate = entry->permutations[entry->last_permutation];
+				const auto& layout = candidate.program.bindings;
+				if (layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
+				        push_data_cursor, layout.ShaderDataDwords()) &&
+				    candidate.specialization == entry->specialization) {
+					++permutation_hits;
+					input_info.stage = {.program = &candidate.program, .resources = &entry->resources};
+					layout.AdvancePushData(push_data_cursor);
+					PrintStats(reuse_enabled);
+					return candidate.handle;
+				}
+			}
 			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
+			        entry->permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
 				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
+				               candidate.specialization == entry->specialization;
 			        });
-			    permutation != entry->second.permutations.end()) {
+			    permutation != entry->permutations.end()) {
+				entry->last_permutation = static_cast<size_t>(permutation - entry->permutations.begin());
 				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &entry->second.resources};
+				                    .resources = &entry->resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				PrintStats(reuse_enabled);
 				return permutation->handle;
 			}
 		}
@@ -419,18 +464,22 @@ struct PipelineCache::ProgramCache {
 			failed_shaders.emplace(params.hash, 0u);
 			return {};
 		}
-		if (entry == programs.end()) {
-			entry = programs.try_emplace(lookup_key,
+		if (entry == nullptr) {
+			const auto found = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			if (!native_plan_safe(entry->second.resource_plan)) return {};
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			entry = &found->second;
+			last = {&found->first, entry};
+			if (!check_native_plan(*entry)) return {};
+			bool reused = false;
+			EXIT_IF(!entry->resource_memo.Refresh(entry->resource_plan, runtime,
+			    entry->resources, entry->specialization, reuse_enabled, reused));
+			++materializations;
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
-		const auto& permutation = entry->second.permutations.back();
-		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+		entry->permutations.push_back(CompilePermutation(
+		    stage_name, options, std::move(translated), entry->specialization, push_data_cursor));
+		entry->last_permutation = entry->permutations.size() - 1;
+		const auto& permutation = entry->permutations.back();
+		input_info.stage = {.program = &permutation.program, .resources = &entry->resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
@@ -448,6 +497,20 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
 	}
+	void PrintStats(bool enabled) {
+		static const bool stats = [] {
+			const char* value = std::getenv("KYTY_PERF_STATS");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (!stats || (lookups & 16383u) != 0) return;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last_stats < std::chrono::seconds(5)) return;
+		std::printf("NHL27PROGRAM: cache=%d lookups=%llu source_hits=%llu resource_hits=%llu materialize=%llu perm_hits=%llu\n",
+		    enabled, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(source_hits),
+		    static_cast<unsigned long long>(resource_hits), static_cast<unsigned long long>(materializations),
+		    static_cast<unsigned long long>(permutation_hits));
+		last_stats = now;
+	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
@@ -463,6 +526,10 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	struct LastSource { const ProgramKey* key = nullptr; SourceEntry* source = nullptr; };
+	std::array<LastSource, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> last_sources {};
+	uint64_t lookups = 0, source_hits = 0, resource_hits = 0, materializations = 0, permutation_hits = 0;
+	std::chrono::steady_clock::time_point last_stats = std::chrono::steady_clock::now();
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 	// NHL debugging: shader hash -> number of skip warnings printed.

@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
 
 #include <bit>
 #include <cstdio>
@@ -147,6 +148,54 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
   return program;
+}
+
+void TestResourceMemoTracksMemoryAndRuntime() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  uint32_t word = 0x12345678u;
+  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&word));
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Libs::Graphics::ResourceMemo memo;
+  SrtRuntime runtime{};
+  bool reused = true;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "memo first refresh reused an absent snapshot");
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && reused,
+        "unchanged memory-backed SRT was not reused");
+  word = 0xabcdef01u;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused &&
+            snapshot.flattened_srt[0] == word,
+        "same-pointer SRT update reused stale values");
+  runtime.shader_base = 0x1000;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "shader-base change reused an old snapshot");
+  std::array<uint32_t, 3> groups{1, 2, 3};
+  runtime.workgroup_counts = groups;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "new workgroup counts reused an old snapshot");
+  groups[0] = 4;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "same-pointer workgroup update reused stale values");
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, false, reused) && !reused,
+        "disabled memo reused cached state");
+  auto user_plan = UserDataBufferPlan();
+  std::array<uint32_t, 1> user{0x8000};
+  runtime.user_data = user;
+  Check(memo.Refresh(user_plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "different resource plan reused an old snapshot");
+  user[0] = 0x9000;
+  Check(memo.Refresh(user_plan, runtime, snapshot, specialization, true, reused) && !reused &&
+            snapshot.buffers[0].dwords[0] == user[0] && snapshot.user_data[0] == user[0],
+        "same-pointer register update reused stale descriptor or push payload");
+  std::array<uint32_t, 2> payload{user[0], 7};
+  runtime.user_data = payload;
+  Check(memo.Refresh(user_plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "changed user-data length reused an old snapshot");
+  payload[1] = 9;
+  Check(memo.Refresh(user_plan, runtime, snapshot, specialization, true, reused) && reused &&
+            snapshot.user_data[1] == 9 && snapshot.buffers[0].dwords[0] == payload[0],
+        "non-resource register update failed to reuse resources or update push data");
 }
 
 void TestMappedSrtUsesDirectReaderByDefault() {
@@ -462,6 +511,18 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
             snapshot.specialization_reads ==
                 std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}},
         "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
+  Libs::Graphics::ResourceMemo memo;
+  bool reused = true;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "strict memo did not establish an initial snapshot");
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && reused,
+        "unchanged strict descriptor did not reuse its snapshot");
+  reads.clean = false;
+  Check(!memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "failed strict read reused a stale writable descriptor");
+  reads.clean = true;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "failed strict refresh left a reusable snapshot");
 }
 
 void TestFailedMaterializationRejectsStage() {
@@ -616,6 +677,7 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestResourceMemoTracksMemoryAndRuntime();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestFailedRuntimeReadIsMemoizedPerRefresh();

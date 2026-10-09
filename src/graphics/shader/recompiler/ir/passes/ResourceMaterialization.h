@@ -28,6 +28,9 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
 		uint32_t                      indirect_sampler           = UINT32_MAX;
+		uint32_t                      independent_sampler_mapping_offset = 0;
+		uint32_t                      independent_sampler_search_iterations = 0;
+		uint32_t                      independent_sampler_candidates = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          needs_manual_depth_compare = false;

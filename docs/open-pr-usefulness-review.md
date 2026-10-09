@@ -1,3 +1,42 @@
+# Дополнение 10 октября 2026 года: текущий ресурсный блокер
+
+Снимок API сохранён в `_Build/analysis/pr-review-20261010/`: 234 открытых PR
+KytyPS5 и 77 SharpEmu. Это полный список на момент получения, но целевой
+разбор изменений, а не новый полный аудит каждого PR.
+
+- [Kyty #1338](https://github.com/KytyPS5/KytyPS5/pull/1338),
+  `0b022120dde4e5dde752e60e671183b5d9100635`: полезен. `const Inst*`
+  выбирает конструктор `IR::Value(bool)` при передаче ConditionRef другой
+  половине wave64. Native RED220232 проверяет сохранение ID предиката;
+  тот же GREEN/GPUAV220352 и bounded forward-branch/full-backing проверка
+  прошли. Первая обычная ветка220023 проходила до исправления и не считается RED.
+- [Kyty #1320](https://github.com/KytyPS5/KytyPS5/pull/1320), `6b28b3fd`:
+  кандидат для per-candidate gather/query и координат смешанных измерений.
+  Не исправляет текущую корреляцию material roots; не перенесён.
+- [Kyty #1257](https://github.com/KytyPS5/KytyPS5/pull/1257), `4d0b7f2a`:
+  bindless массивы T# могут сократить специализации больших таблиц. Это
+  отдельный контракт renderer/descriptor heap; не заменяет независимые
+  селекторы изображения и сэмплера. Не перенесён без своего RED.
+- [Kyty #1226](https://github.com/KytyPS5/KytyPS5/pull/1226), `e52056b7`:
+  отклонён для этой работы: отбрасывает непрослеживаемые биты border word
+  сэмплера. Такое приближение не доказывает правильный sampling.
+- [SharpEmu #926](https://github.com/sharpemu/sharpemu/pull/926), полный head
+  `848fceefbd409444e2236d7438571641d603dafb`, не изменился с прежнего разбора.
+  Раздельные runtime image/sampler ресурсы и waterfall служат ориентиром.
+  Заявленные автором menu/gameplay на RTX5070 не являются результатом Kyty.
+- [SharpEmu #1057](https://github.com/sharpemu/sharpemu/pull/1057),
+  `e86d3a748e323b3728234162a1a7321f15ce9643`: просмотрена карта всех124 файлов
+  и релевантные patches. ResourceMaterializer добавляет RuntimeSamplerCandidate
+  и отдельные mappings сэмплеров; полезный следующий ориентир для больших
+  независимых таблиц. Ветка целиком не переносилась и на Kyty не запускалась.
+
+Текущий локальный механизм проверен отдельно: direct compact/full inline image
+и независимый inline sampler, разные roots/keys, заполненные wave32/64,
+native численные значения и GPUAV, строгие quotas и unreadable-memory отказ.
+Независимый sampler с nested image table пока явно неподдержан: OOB image key
+там может выбирать действительный table[0], что требует отдельного оракула.
+Меню и вход в игру ещё не подтверждены; следующий шаг — native build/retry.
+
 # Обновление 7 октября 2026 года: интеграция в текущую ветку
 
 По уточнению пользователя полезные изменения перенесены в `yotei-windows-bringup`,

@@ -5120,7 +5120,8 @@ void TestHeterogeneousIndirectImageViewSwizzles() {
 std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = false,
                                                     bool image_table = false,
                                                     bool full_width_images = false,
-                                                    bool guarded_selector = false) {
+                                                    bool guarded_selector = false,
+                                                    uint32_t independent_sampler = 0u) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> index_words;
@@ -5178,6 +5179,22 @@ std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = fa
   const auto byte_offset =
       fixture->Emit(ValueOpcode::IMul32,
                     {index, Value(full_width_images ? 440u : 872u)});
+  auto sampler_material = material;
+  auto sampler_offset = byte_offset;
+  if ((independent_sampler & 1u) != 0u) {
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word) words[word] = fixture->UserData(8u + word);
+    sampler_material = fixture->Buffer(words, 0x250);
+  }
+  if ((independent_sampler & 2u) != 0u) {
+    std::array<Value, 4> selector_words;
+    for (uint32_t word = 0; word < 4u; ++word) selector_words[word] = fixture->UserData(12u + word);
+    const auto sampler_indices = fixture->Buffer(selector_words, 0x254);
+    const auto sampler_index = fixture->Emit(
+        ValueOpcode::ReadConstBuffer, {sampler_indices, index_offset},
+        fixture->AddMemory(scalar, 0x264));
+    sampler_offset = fixture->Emit(ValueOpcode::IMul32, {sampler_index, Value(872u)});
+  }
   if (full_width_images) {
     const auto sampler = fixture->Sampler(
         {Value(146u), Value(0x00fff000u), Value(0x05000000u), Value(0u)}, 0x1c30);
@@ -5218,7 +5235,9 @@ std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = fa
     component.component_count = ordinary_samplers || image_table ? 4u : 8u;
     component.component_index = ordinary_samplers ? dword - 4u : dword;
     const auto word = fixture->Emit(
-        ValueOpcode::ReadConstBuffer, {material, byte_offset},
+        ValueOpcode::ReadConstBuffer,
+        {dword < 4u ? sampler_material : material,
+         dword < 4u ? sampler_offset : byte_offset},
         fixture->AddMemory(component, 0x5bc));
     if (dword < 4u) {
       sampler_words[dword] = word;
@@ -5565,6 +5584,102 @@ void TestInlineSampledSccConditionRefGuard() {
   }
   Check(InlineCandidateForKey(snapshot, specialization, 3u * 872u) == 0u,
         "bounded sampled table admitted an unreachable selector");
+}
+
+void TestIndependentInlineSampledSources() {
+  {
+    auto nested = MakeInlineDescriptorFixture(false, true, false, false, 3u);
+    nested->PlanAndTrack();
+    const auto plan = ExtractResourcePlan(nested->program);
+    std::array<uint32_t, 16> user_data{};
+    LinearTestMemory memory;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(!MaterializeResources(plan, {.user_data = user_data, .userdata = &memory,
+              .read_specialization_memory = ReadLinearTestMemory}, snapshot, specialization) &&
+              LastResourceSpecializationError().find("nested image table are unsupported") != std::string_view::npos,
+          "independent nested image table silently correlated an out-of-bounds default image");
+  }
+  for (uint32_t independent : {1u, 2u, 3u}) {
+    auto fixture = MakeInlineDescriptorFixture(false, false, false, false, independent);
+    fixture->PlanAndTrack();
+    EliminateDeadCode(fixture->program.blocks);
+    ValidateProgram(fixture->program, true);
+    const auto plan = ExtractResourcePlan(fixture->program);
+    Check(fixture->program.info.images.size() == 1u &&
+              fixture->program.info.samplers.size() == 1u,
+          "independent inline sampled sources lost their logical resources");
+    const auto& image = fixture->program.descriptor_sources.at(
+        fixture->program.info.images[0].source);
+    const auto& sampler = fixture->program.descriptor_sources.at(
+        fixture->program.info.samplers[0].source);
+    Check(image.inline_descriptor && sampler.inline_descriptor,
+          "independent inline sampled sources lost descriptor provenance");
+    Check((image.inline_descriptor->buffer_source != sampler.inline_descriptor->buffer_source) ==
+              ((independent & 1u) != 0u),
+          "independent sampler material root was correlated with the image");
+    std::array<uint32_t, 16> user_data{0x1000u, 872u << 16u, 2u, 0u,
+        0x2800u, 0u, 16u, 0u, (independent & 1u) != 0u ? 0x3000u : 0x1000u,
+        872u << 16u, 2u, 0u, 0x2900u, 0u, 16u, 0u};
+    LinearTestMemory memory;
+    memory.words.resize(0x5000u / 4u);
+    memory.words[(0x2800u - memory.base) / 4u + 1u] = 1u;
+    memory.words[(0x2900u - memory.base) / 4u] = 1u;
+    for (uint32_t record = 0; record < 2u; ++record) {
+      const std::array<uint32_t, 4> image_words{
+          0x20u + record * 0x20u,
+          static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u,
+          3u | (3u << 14u), Libs::Graphics::DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u)};
+      std::copy(image_words.begin(), image_words.end(),
+          memory.words.begin() + (record * 872u + 152u) / 4u);
+      memory.words[(user_data[8] - memory.base + record * 872u + 136u) / 4u] =
+          record == 0u ? 0u : 146u;
+    }
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {.user_data = user_data, .userdata = &memory,
+        .read_specialization_memory = ReadLinearTestMemory}, snapshot, specialization),
+        "independent inline descriptors did not materialize");
+    const auto& root = specialization.images[0];
+    Check(root.independent_sampler_candidates != 0u,
+          "independent inline selectors were collapsed into one mapping");
+    const auto lookup = [&](uint32_t offset, uint32_t key) {
+      for (uint32_t row = 0; row < snapshot.flattened_srt.at(offset); ++row) {
+        const auto position = offset + 1u + row * 2u;
+        if (snapshot.flattened_srt.at(position) == key)
+          return snapshot.flattened_srt.at(position + 1u);
+      }
+      return 0u;
+    };
+    for (uint32_t image_record = 0; image_record < 2u; ++image_record) {
+      for (uint32_t sampler_record = 0; sampler_record < 2u; ++sampler_record) {
+        if (independent == 1u && image_record != sampler_record) continue;
+        const auto selected_image = lookup(root.indirect_mapping_offset, image_record * 872u);
+        const auto selected_sampler = lookup(root.independent_sampler_mapping_offset, sampler_record * 872u);
+        Check(selected_image != 0u, "valid independent image selected the null descriptor");
+        const auto ordinal = 1u + (selected_image - 1u) * root.independent_sampler_candidates + selected_sampler;
+        const auto resource = root.indirect_resources.at(ordinal);
+        const auto native_sampler = specialization.images.at(resource).indirect_sampler;
+        Check(snapshot.images.at(resource).dwords[0] == 0x20u + image_record * 0x20u &&
+                  snapshot.samplers.at(native_sampler).dwords[0] == (sampler_record == 0u ? 0u : 146u),
+              "independent descriptor mapping selected the wrong image/sampler combination");
+      }
+    }
+    auto runtime = SrtRuntime{.user_data = user_data, .userdata = &memory,
+        .read_specialization_memory = ReadLinearTestMemory};
+    runtime.max_dense_images = 2u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "independent sampled combinations ignored the image budget");
+    runtime.max_dense_images = ShaderInfo::MaxImages;
+    runtime.max_native_samplers = 1u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "independent sampled combinations ignored the sampler budget");
+    runtime.max_native_samplers = ShaderInfo::MaxSamplers;
+    memory.fail_address = user_data[8] + 136u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "independent sampler accepted unavailable descriptor bytes");
+  }
 }
 
 void TestInlineDescriptorPairs() {
@@ -9139,6 +9254,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ADDRESS_BACKED_INDIRECT_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--independent-inline-sampled-sources-only") == 0) {
+      TestIndependentInlineSampledSources();
+      std::cout << "KYTY_INDEPENDENT_INLINE_SAMPLED_SOURCES_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--sampled-pair-materialization-only") == 0) {
       TestSharedInlineImageCandidates(true);
       std::cout << "KYTY_SAMPLED_PAIR_MATERIALIZATION_PASS\n";
@@ -9395,6 +9515,7 @@ int main(int argc, char** argv) {
     Run("shared inline images", [] { TestSharedInlineImageCandidates(); });
     Run("sampled pair materialization", [] { TestSharedInlineImageCandidates(true); });
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
+    Run("independent inline sampled sources", TestIndependentInlineSampledSources);
     Run("inline native sampler capacity", TestInlineNativeSamplerCapacity);
     Run("coherent inline selector values", TestCoherentInlineSelectorValues);
     Run("combined native image capacity", TestCombinedNativeImageCapacity);

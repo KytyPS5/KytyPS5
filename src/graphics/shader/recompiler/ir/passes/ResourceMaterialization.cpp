@@ -46,6 +46,9 @@ struct IndirectImage {
 	std::vector<uint32_t>        candidates;
 	std::vector<DescriptorValue> descriptors;
 	std::vector<DescriptorValue> samplers;
+	std::vector<uint32_t> sampler_keys;
+	std::vector<uint32_t> sampler_candidates;
+	uint32_t sampler_count = 0;
 };
 
 struct MaterializedSnapshot {
@@ -709,6 +712,76 @@ bool MaterializeInlineImage(const DescriptorSource::InlineDescriptor& image,
 		next.samplers.clear();
 	}
 	result = std::move(next);
+	return true;
+}
+
+bool MaterializeIndependentInlineSampler(const DescriptorSource::InlineDescriptor& sampler,
+                                        const DescriptorValue& buffer_value, uint32_t pc,
+                                        const SrtRuntime& runtime, IndirectImage& image,
+                                        const std::vector<uint32_t>* selector_values) {
+	ShaderBufferResource buffer;
+	if (!DecodeBufferDescriptor(buffer_value, buffer) || sampler.selector_stride == 0u ||
+	    sampler.descriptor_dwords != 4u || sampler.image_table ||
+	    sampler.descriptor_offset > UINT32_MAX - 12u) {
+		return SpecializationFail("independent inline sampler has invalid metadata");
+	}
+	const auto size = ScalarBufferSize(buffer);
+	const auto step = sampler.selector_limit != 0u ? uint64_t{sampler.selector_stride}
+	    : std::gcd<uint64_t>(sampler.selector_stride, uint64_t{1} << 32u);
+	const auto last_byte = size >= 4u ? ((size - 4u) & ~uint64_t{3}) + 3u : 0u;
+	std::vector<uint32_t> keys;
+	if (selector_values != nullptr) {
+		for (const auto value : *selector_values)
+			keys.push_back(static_cast<uint32_t>(uint64_t{value} * sampler.selector_stride));
+		std::ranges::sort(keys);
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+	} else {
+		const auto probes = sampler.selector_limit != 0u ? uint64_t{sampler.selector_limit}
+		    : size >= 4u && last_byte >= sampler.descriptor_offset
+		        ? std::min<uint64_t>(UINT32_MAX, last_byte - sampler.descriptor_offset) / step + 1u : 0u;
+		if (probes > MaxIndirectImageProbes)
+			return SpecializationFail("independent inline sampler probe limit exceeded");
+		for (uint64_t probe = 0; probe < probes; ++probe)
+			keys.push_back(static_cast<uint32_t>(probe * step));
+	}
+	if (keys.size() > MaxIndirectImageProbes)
+		return SpecializationFail("independent inline sampler probe limit exceeded");
+	DescriptorValue zero;
+	zero.dword_count = 4u;
+	std::vector<DescriptorValue> samplers{zero};
+	for (const auto key : keys) {
+		auto value = zero;
+		for (uint32_t word = 0; word < 4u; ++word) {
+			if (!ReadScalarBufferWord(buffer, key, sampler.descriptor_offset + word * 4u,
+			                          runtime, value.dwords[word]))
+				return SpecializationFail(fmt::format(
+				    "independent inline sampler at pc 0x{:08x}: descriptor memory is unavailable or GPU-dirty", pc));
+		}
+		const auto found = std::ranges::find(samplers, value);
+		const auto candidate = static_cast<uint32_t>(found - samplers.begin());
+		if (found == samplers.end()) {
+			if (samplers.size() >= runtime.max_native_samplers)
+				return SpecializationFail("independent inline sampler exceeds the native sampler limit");
+			samplers.push_back(value);
+		}
+		if (candidate != 0u) {
+			image.sampler_keys.push_back(key);
+			image.sampler_candidates.push_back(candidate);
+		}
+	}
+	const uint64_t product = 1u + uint64_t{image.descriptors.size() - 1u} * samplers.size();
+	if (product > ShaderInfo::MaxImages || product > runtime.max_dense_images)
+		return SpecializationFail("independent sampled candidates exceed the dense image resource limit");
+	const auto descriptors = std::move(image.descriptors);
+	image.descriptors = {descriptors[0]};
+	image.samplers = {zero};
+	for (size_t candidate = 1; candidate < descriptors.size(); ++candidate) {
+		for (const auto& value : samplers) {
+			image.descriptors.push_back(descriptors[candidate]);
+			image.samplers.push_back(value);
+		}
+	}
+	image.sampler_count = static_cast<uint32_t>(samplers.size());
 	return true;
 }
 
@@ -1934,21 +2007,32 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 			if (source->inline_descriptor->image_table.has_value()) {
 				requests.push_back(source->inline_descriptor->image_table->address_source);
 			}
+			const bool independent = inline_sampler != nullptr && source->inline_descriptor->independent_sampler;
+			if (independent && source->inline_descriptor->image_table)
+				return SpecializationFail("independent inline samplers with a nested image table are unsupported");
+			if (independent) requests.push_back(inline_sampler->buffer_source);
 			SrtRuntime clean_runtime = runtime;
 			clean_runtime.read_memory = runtime.read_specialization_memory;
 			std::vector<DescriptorValue> tables;
-			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
-				return SpecializationFail(fmt::format(
-				    "inline sampled pair at pc 0x{:08x}: buffer or table address descriptor is unavailable or GPU-dirty",
-				    image.first_use_pc));
+			SrtWalker table_walker(program, clean_runtime);
+			for (const auto request : requests) {
+				DescriptorValue value;
+				if (!table_walker.EvaluateDescriptor(request, value)) {
+					return SpecializationFail(fmt::format(
+					    "inline sampled pair at pc 0x{:08x}: buffer or table address descriptor is unavailable or GPU-dirty: {}",
+					    image.first_use_pc, table_walker.LastFlatError()));
+				}
+				tables.push_back(value);
 			}
 			IndirectImage table;
-			if (!MaterializeInlineImage(*source->inline_descriptor, inline_sampler,
-			                            tables[0], tables.size() > 1u ? &tables[1] : nullptr,
+			if (!MaterializeInlineImage(*source->inline_descriptor, independent ? nullptr : inline_sampler,
+			                            tables[0], source->inline_descriptor->image_table ? &tables[1] : nullptr,
 			                            image.first_use_pc, runtime, table,
 			                            selector_values(*source->inline_descriptor))) {
 				return false;
 			}
+			if (independent && !MaterializeIndependentInlineSampler(*inline_sampler, tables.back(),
+			        image.first_use_pc, runtime, table, selector_values(*inline_sampler))) return false;
 			next.images[image_index] = table.descriptors[0];
 			if (table.descriptors.size() > 1u) {
 				table.resource = image_index;
@@ -2148,6 +2232,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .indirect_mapping_offset    = image.indirect_mapping_offset,
 		    .indirect_search_iterations = image.indirect_search_iterations,
 		    .indirect_sampler           = image.indirect_sampler,
+		    .independent_sampler_mapping_offset = image.independent_sampler_mapping_offset,
+		    .independent_sampler_search_iterations = image.independent_sampler_search_iterations,
+		    .independent_sampler_candidates = image.independent_sampler_candidates,
 		    .cube                       = image.cube,
 		    .needs_manual_depth_compare = false,
 		    .indirect_resources = image.indirect_resources,
@@ -2241,6 +2328,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		root.indirect_sampler           = candidate_samplers[0];
 		root.indirect_mapping_offset    = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
 		root.indirect_search_iterations = std::bit_width(table.keys.size());
+		root.independent_sampler_candidates = table.sampler_count;
 		next_snapshot.flattened_srt.resize(next_snapshot.flattened_srt.size() + 1u +
 		                                   table.keys.size() * 2u);
 		std::vector<uint32_t> order(table.keys.size());
@@ -2253,6 +2341,20 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			const auto offset                   = root.indirect_mapping_offset + 1u + entry * 2u;
 			next_snapshot.flattened_srt[offset] = table.keys[source];
 			next_snapshot.flattened_srt[offset + 1] = table.candidates[source];
+		}
+		if (table.sampler_count != 0u) {
+			root.independent_sampler_mapping_offset = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
+			root.independent_sampler_search_iterations = std::bit_width(table.sampler_keys.size());
+			next_snapshot.flattened_srt.push_back(static_cast<uint32_t>(table.sampler_keys.size()));
+			for (size_t index = 0; index < table.sampler_keys.size(); ++index) {
+				next_snapshot.flattened_srt.push_back(table.sampler_keys[index]);
+				next_snapshot.flattened_srt.push_back(table.sampler_candidates[index]);
+			}
+			// Even an empty mapping has a readable inactive probe for bounded lookup.
+			if (table.sampler_keys.empty()) {
+				next_snapshot.flattened_srt.push_back(0u);
+				next_snapshot.flattened_srt.push_back(0u);
+			}
 		}
 		next_snapshot.images[table.resource] = table.descriptors[0];
 	}
@@ -3127,6 +3229,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.indirect_sampler           = source.indirect_sampler;
+		image.independent_sampler_mapping_offset = source.independent_sampler_mapping_offset;
+		image.independent_sampler_search_iterations = source.independent_sampler_search_iterations;
+		image.independent_sampler_candidates = source.independent_sampler_candidates;
 		image.cube                       = source.cube;
 		image.indirect_resources = source.indirect_resources;
 		for (const auto resource: image.indirect_resources) EXIT_IF(resource >= specialization.images.size());

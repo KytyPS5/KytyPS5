@@ -1706,6 +1706,17 @@ private:
 				retain(sampler.source);
 			}
 		}
+		// An inline sampler handle carries a key and only three root operands.
+		// Its complete material descriptor and selector source belong to host
+		// planning, and must survive DCE even when no image shares these roots.
+		for (const auto& source : m_sources) {
+			if (!source.inline_descriptor) continue;
+			retain(source.inline_descriptor->buffer_source);
+			if (source.inline_descriptor->selector_buffer_source != UINT32_MAX)
+				retain(source.inline_descriptor->selector_buffer_source);
+			if (source.inline_descriptor->image_table)
+				retain(source.inline_descriptor->image_table->address_source);
+		}
 	}
 
 	uint32_t InternSource(const DescriptorSource& descriptor) {
@@ -2993,7 +3004,7 @@ private:
 					if (image_source.buffer_source != sampler_source.buffer_source ||
 					    image_source.selector_stride != sampler_source.selector_stride ||
 					    !EquivalentValue(m_program, image_plan.key, sampler_plan.key)) {
-						Fail(flags.pc, "inline image and sampler require the same material buffer and selector");
+						m_sources[image_plan.source].inline_descriptor->independent_sampler = true;
 					}
 				} else {
 					if (sampler == nullptr || sampler->GetOpcode() != ValueOpcode::GetSamplerResource) {

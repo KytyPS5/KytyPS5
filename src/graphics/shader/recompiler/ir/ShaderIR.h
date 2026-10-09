@@ -169,6 +169,9 @@ struct ImageResource {
 	uint32_t                      indirect_mapping_offset    = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	uint32_t                      indirect_sampler = UINT32_MAX;
+	uint32_t                      independent_sampler_mapping_offset = 0;
+	uint32_t                      independent_sampler_search_iterations = 0;
+	uint32_t                      independent_sampler_candidates = 0;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -623,6 +626,7 @@ struct DescriptorSource {
 		// Optional raw DWORD selector fetched from a scalar buffer at a U32
 		// byte offset divisible by four, with zero immediate offset.
 		uint32_t selector_buffer_source = UINT32_MAX;
+		bool independent_sampler = false;
 
 		bool operator==(const InlineDescriptor& other) const = default;
 	};

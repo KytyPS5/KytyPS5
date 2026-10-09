@@ -1,6 +1,55 @@
 # Emulator regression test debt
 
+## Split-wave64 scalar ConditionRef provenance (PR1338 candidate, 2026-10-09)
+
+Current `spirvEmitterFlow.cpp::EmitConditionRef` passes a `const Inst*` to
+`IR::Value`, selecting the bool constructor. PR1338 head
+`0b022120dde4e5dde752e60e671183b5d9100635` fixes this reference conversion.
+Before adaptation, require a bounded native regression: scalar buffer read
+sets a false SCC branch, both wave64 halves write the same independently
+computed value, and full backing remains unchanged outside those stores.
+Use a forward branch only, with no guest loop or barrier that could hang.
+Then same GREEN plus true-branch/mask and neighboring wave64 cases. Do not
+run new wave64 sampled loops until this candidate is resolved.
+
+Completed as local `c01d2892`: direct production-emitter ID-handoff
+RED220232 -> unchanged GREEN/GPUAV220352. Forward false-SCC branch checks
+64 lane results/full backing. Ordinary branch220023 passed on the old code
+and is not reproduction evidence. Registered neighbor batch220925 PASS5/5.
+
 ## Independent inline image and sampler sources (2026-10-09, current native frontier)
+
+Direct compact/full image support is now numerically proved in the working
+patch on top of `c01d2892`. Native admission RED214439, native shader
+RED215357 (scoped restoration of only the original correlation rejection),
+root-lifetime RED215806 -> same GREEN215856. Native GPUAV215909 passes
+separate roots/keys/both; GPUAV220509 adds full wave32/64 occupancy and whole
+backing; GPUAV221416 additionally passes full eight-word image descriptors.
+Resource tracking + registered admission221612 PASS2/2; shared-image and
+ordinary-sampler GPUAV221724 PASS. Quotas/unavailable memory remain failures.
+Nested image-table + independent sampler is explicitly rejected and has a
+negative regression: OOB image keys can select valid table[0], requiring a
+separate numerical regression before extending the mapping. Other-game
+runtime coverage and the original Yotei retry remain pending.
+
+Related lifetime regression (2026-10-09 21:56 UTC): native numeric fixture
+passes resource tracking but fails materialization after production DCE;
+independent sampler buffer source dword3 has become `Void`. A sampler handle
+has only four operands and cannot retain its live key plus all four root words.
+Required RED: extract the synthetic plan after DCE, then materialize independent
+sources with the unchanged descriptor oracle. Retain complete planning roots
+through the existing resource-source lifetime mechanism, never replace the
+lost word with zero. GPU diagnostic artifacts:
+`_Build/checks/20261009-215626-0671273-shader_recompiler_compute_tests/`.
+
+Native Windows continuation 2026-10-09 21:44 UTC: source `959cce06` with
+test-only additions to `ResourceTrackingTests.cpp`; unchanged production
+`--independent-inline-sampled-sources-only` reproduces the exact same-material
+rejection. Verified RED artifacts:
+`_Build/checks/20261009-214439-9671471-resource_tracking_tests/`.
+Fixture separates material roots and/or live loop selectors using synthetic IR.
+This is resource admission proof only; numeric materialization, native GPU
+wave32/64 results, strict boundary cases and original-game retry remain pending.
 
 Nativecheckpointbc4/EXEf268/original5178 warmrun200619 naturally exits321 at
 20:28:24UTC,1237 complete pipelines, no deadline/memoryguard. Both formatted

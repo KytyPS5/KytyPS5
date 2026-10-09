@@ -40304,10 +40304,12 @@ enum class MaterialImageSampleMode {
 
 TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
                                          bool expanded_samplers = false,
-                                         u32 selector_limit = 0u) {
+                                         u32 selector_limit = 0u,
+                                         u32 independent_sampler = 0u,
+                                         bool full_wave = false) {
   using O = ShaderOpcode;
-  constexpr u32 material_base = 128u;
-  constexpr u32 index_base = 64u;
+  const u32 material_base = full_wave ? 2048u : 128u;
+  const u32 index_base = full_wave ? 1024u : 64u;
   const bool full_inline = mode == MaterialImageSampleMode::FullStaticSampler;
   const u32 material_stride = full_inline ? 440u : 872u;
   const u32 material_count = expanded_samplers ? 32u : 4u;
@@ -40317,7 +40319,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   constexpr u32 raw_table_offset = 544u;
   constexpr u32 packed_index_offset = 564u;
   const bool image_table = mode == MaterialImageSampleMode::ImageTableDynamicSampler;
-  const bool dynamic_sampler = mode == MaterialImageSampleMode::CompactDynamicSampler || image_table;
+  const bool dynamic_sampler = mode == MaterialImageSampleMode::CompactDynamicSampler || image_table || independent_sampler != 0u;
   const u32 image_offset = full_inline ? 0u : dynamic_sampler ? 152u : 588u;
   const u32 iteration_count = expanded_samplers ? 4u : image_table ? 5u : material_count;
 
@@ -40332,17 +40334,43 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = 32;
+  if (full_wave) {
+    test.compute_info.wave_size = 64u;
+    test.compute_info.threads_num[0] = 64u;
+    test.compute_info.thread_ids_num = 1u;
+  }
   test.use_runtime_samplers = true;
   test.buffer_addresses_are_backing_offsets = true;
-  const u32 backing_size = image_table ? raw_table_base + raw_table_offset + 2u * 32u
-                                      : material_base + material_count * material_stride;
+  const u32 sampler_material_base = (independent_sampler & 1u) != 0u
+      ? full_wave ? 8192u : 4096u : material_base;
+  const u32 sampler_index_base = full_wave ? 1056u : 96u;
+  const u32 backing_size = independent_sampler != 0u ? sampler_material_base + material_count * material_stride
+                          : image_table ? raw_table_base + raw_table_offset + 2u * 32u
+                                        : material_base + material_count * material_stride;
   test.initial.resize(backing_size / 4u);
   const auto keys = expanded_samplers ? std::array{0u, 30u, 31u, 33u, 5u}
                                       : std::array{2u, 0u, 3u, 1u, 5u};
   std::copy_n(keys.begin(), iteration_count, test.initial.begin() + index_base / 4u);
+  if ((independent_sampler & 2u) != 0u) {
+    const std::array sampler_keys{1u, 3u, 0u, 2u};
+    std::copy(sampler_keys.begin(), sampler_keys.end(), test.initial.begin() + sampler_index_base / 4u);
+  }
   test.expected = {std::bit_cast<u32>(80.0f), std::bit_cast<u32>(8.0f),
                    std::bit_cast<u32>(dynamic_sampler ? 20.0f : 80.0f),
                    std::bit_cast<u32>(dynamic_sampler ? 2.0f : 8.0f)};
+  if (independent_sampler != 0u) {
+    test.name = independent_sampler == 1u ? "IndependentInlineSamplerRoot"
+        : independent_sampler == 2u ? "IndependentInlineSamplerKey"
+                                    : "IndependentInlineSamplerRootAndKey";
+    if ((independent_sampler & 2u) != 0u)
+      test.expected = {std::bit_cast<u32>(20.0f), std::bit_cast<u32>(2.0f),
+                       std::bit_cast<u32>(80.0f), std::bit_cast<u32>(8.0f)};
+  }
+  if (full_wave) {
+    const auto values = std::move(test.expected);
+    test.expected.clear();
+    for (const auto value : values) test.expected.insert(test.expected.end(), 64u, value);
+  }
   if (expanded_samplers) {
     test.name = "Inline33NativeSamplers";
     test.expected = {std::bit_cast<u32>(8.0f), std::bit_cast<u32>(80.0f),
@@ -40354,7 +40382,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
     // Out-of-bounds material reads yield index zero and a zero (repeat) sampler.
     test.expected.push_back(std::bit_cast<u32>(2.0f));
   }
-  if (full_inline) {
+  if (full_inline && independent_sampler == 0u) {
     // The second full descriptor in the same x16 load selects the other image.
     for (const float value : {8.0f, 80.0f, 8.0f, 80.0f}) {
       test.expected.push_back(std::bit_cast<u32>(value));
@@ -40369,6 +40397,12 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
             test.user_data.begin() + 4u);
   std::copy(index_descriptor.begin(), index_descriptor.end(),
             test.user_data.begin() + 8u);
+  if (independent_sampler != 0u) {
+    const std::array sampler_descriptor{sampler_material_base, material_stride << 16u, material_count, 0u};
+    const std::array sampler_index_descriptor{sampler_index_base, 4u << 16u, iteration_count, 0u};
+    std::copy(sampler_descriptor.begin(), sampler_descriptor.end(), test.user_data.begin() + 24u);
+    std::copy(sampler_index_descriptor.begin(), sampler_index_descriptor.end(), test.user_data.begin() + 28u);
+  }
   test.user_data[50] = static_cast<u32>(test.expected.size() * sizeof(u32));
   if (image_table) {
     test.user_data[24] = raw_table_base;
@@ -40393,7 +40427,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
     const auto record_base = material_base + record * material_stride;
     if (dynamic_sampler) {
       std::copy(sampler.begin(), sampler.end(),
-                test.initial.begin() + (record_base + 136u) / 4u);
+                test.initial.begin() + (sampler_material_base + record * material_stride + 136u) / 4u);
     }
     if (image_table) {
       const auto table_index = record / 2u;
@@ -40428,6 +40462,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
                                 {image_b_address, std::move(image_b)}};
 
   auto &code = test.code;
+  if (full_wave) code.push_back(EncodeVop1(0x01u, 31u, Vgpr(0u)));
   if (dynamic_sampler) {
     // IMAGE_SAMPLE_D address order is dUV/dX, dUV/dY, then UV.
     AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.25f));
@@ -40469,9 +40504,24 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
     code.push_back(EncodeSmem0(0x03, 16, 12));
     code.push_back(EncodeSmem1(raw_table_offset, 63));
   } else if (dynamic_sampler) {
-    // One dynamic x8 read loads sampler s[12:15] and compact image s[16:19].
-    code.push_back(EncodeSmem0(0x0b, 12, 2));
-    code.push_back(EncodeSmem1(136, 61));
+    if (independent_sampler != 0u) {
+      u32 sampler_key = 61u;
+      if ((independent_sampler & 2u) != 0u) {
+        code.push_back(EncodeSmem0(0x08, 64, 14));
+        code.push_back(EncodeSmem1(0, 33));
+        code.push_back(EncodeSop2(0x26, 65, 64, 255u));
+        code.push_back(material_stride);
+        sampler_key = 65u;
+      }
+      code.push_back(EncodeSmem0(0x0a, 12, 12));
+      code.push_back(EncodeSmem1(136, sampler_key));
+      code.push_back(EncodeSmem0(full_inline ? 0x0bu : 0x0au, 16, 2));
+      code.push_back(EncodeSmem1(full_inline ? 0u : 152u, 61));
+    } else {
+      // One dynamic x8 read loads sampler s[12:15] and compact image s[16:19].
+      code.push_back(EncodeSmem0(0x0b, 12, 2));
+      code.push_back(EncodeSmem1(136, 61));
+    }
   } else if (full_inline) {
     // One x16 read supplies two adjacent full image descriptors s[16:31].
     code.push_back(EncodeSmem0(0x0c, 16, 2));
@@ -40490,9 +40540,16 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
                              0x1, 0, false, 1, !image_table && !full_inline));
   code.push_back(EncodeMimg1(0, dynamic_sampler ? 20u : 24u, 4,
                              dynamic_sampler ? 3u : 19u));
-  code.push_back(EncodeVop1(0x01, 30, 33));
+  if (full_wave) {
+    code.push_back(EncodeSop2(0x1eu, 34u, 33u, InlineU32(6u)));
+    code.push_back(EncodeVop1(0x01u, 30u, 34u));
+    code.push_back(EncodeVop2(0x1au, 29u, InlineU32(2u), 31u));
+    code.push_back(EncodeVop2(0x25u, 30u, Vgpr(29u), 30u));
+  } else {
+    code.push_back(EncodeVop1(0x01, 30, 33));
+  }
   AppendBufferStoreDword(&code, 0, 30);
-  if (full_inline) {
+  if (full_inline && independent_sampler == 0u) {
     code.push_back(EncodeMimg0(0x27, 0x1, 0, false, 1, false));
     code.push_back(EncodeMimg1(1, 24, 6, 19));
     code.push_back(EncodeSop2(0x00, 34, 33, InlineU32(material_count * 4u)));
@@ -40512,8 +40569,8 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
 
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_LSHL_B32,
                   O::S_BUFFER_LOAD_DWORD, O::S_MUL_I32,
-                  full_inline ? O::S_BUFFER_LOAD_DWORDX16
-                  : dynamic_sampler && !image_table ? O::S_BUFFER_LOAD_DWORDX8
+                  full_inline ? independent_sampler != 0u ? O::S_BUFFER_LOAD_DWORDX8 : O::S_BUFFER_LOAD_DWORDX16
+                  : dynamic_sampler && !image_table && independent_sampler == 0u ? O::S_BUFFER_LOAD_DWORDX8
                                                   : O::S_BUFFER_LOAD_DWORDX4,
                   O::IMAGE_SAMPLE,
                   O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
@@ -40526,6 +40583,13 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   }
   test.required_spirv = {"OpLoopMerge", "OpSwitch", "OpImageSampleExplicitLod",
                          dynamic_sampler ? "Grad" : "Lod"};
+  if (full_wave) {
+    test.opcodes.push_back(O::V_LSHLREV_B32);
+    test.opcodes.push_back(O::V_ADD_NC_U32);
+    const auto output = std::move(test.expected);
+    test.expected = test.initial;
+    std::copy(output.begin(), output.end(), test.expected.begin());
+  }
   if (!dynamic_sampler) {
     test.decoded_counts.push_back({"image_sample_lz ", full_inline ? 2u : 1u});
     test.forbidden_spirv = {"Grad"};
@@ -51312,6 +51376,26 @@ if (argc == 1) {
     std::printf("native combined image descriptor ceiling=%u\n", vulkan.DenseImageCapacity());
     RunCase(&vulkan, CombinedNativeImageCapacity());
     std::puts("KYTY_COMBINED_NATIVE_IMAGE_CAPACITY_GPU_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--independent-inline-sampled-sources-only") == 0) {
+    VulkanHarness vulkan;
+    for (u32 independent : {1u, 2u, 3u})
+      RunCase(&vulkan, MakeImageSampleDynamicMaterials(
+          MaterialImageSampleMode::CompactDynamicSampler, false, 0u, independent));
+    auto full_descriptor = MakeImageSampleDynamicMaterials(
+        MaterialImageSampleMode::FullStaticSampler, false, 0u, 3u);
+    full_descriptor.name = "IndependentInlineSamplerFullImageDescriptor";
+    RunCase(&vulkan, full_descriptor);
+    for (u32 wave : {32u, 64u}) {
+      auto full = MakeImageSampleDynamicMaterials(
+          MaterialImageSampleMode::CompactDynamicSampler, false, 0u, 3u, true);
+      full.name = wave == 32u ? "IndependentInlineSamplerFullWave32"
+                             : "IndependentInlineSamplerFullWave64";
+      full.compute_info.wave_size = wave;
+      RunCase(&vulkan, full);
+    }
+    std::puts("KYTY_INDEPENDENT_INLINE_SAMPLED_SOURCES_GPU_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--inline-native-sampler-capacity-only") == 0) {

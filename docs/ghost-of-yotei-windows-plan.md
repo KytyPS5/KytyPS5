@@ -1,5 +1,32 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-09 22:19 UTC** (native independent sources proved; emulator build/retry next):
+
+- Native Windows only; WSL remains stopped. Branch `yotei-windows-bringup`,
+  local `c01d2892` fixes split-wave64 ConditionRef pointer conversion from
+  PR1338, independent emitter RED220232 -> GREEN/GPUAV220352. Ordinary
+  branch220023 was already passing and is not claimed as RED.
+- Working independent inline-image/sampler correction on this commit:
+  distinct material roots and GPU keys, bounded mappings/products, complete
+  planning-root lifetime. Admission RED214439/shader RED215357, lifetime
+  RED215806 -> GREEN215856; numeric GPUAV215909, full wave32/64 + whole backing
+  220509, full eight-word images221416 PASS. Registered GPU neighbors220925
+  PASS5/5, final resource tracking/admission221612 PASS2/2, shared/ordinary
+  sampler images221724 PASS. Proof artifacts are under `_Build/checks/`.
+- Direct compact/full images supported. Nested image tables with independent
+  samplers remain explicitly unsupported, with a negative CPU regression;
+  valid OOB table[0] requires a separate oracle. Quotas/ownership/unavailable
+  memory checks retained. Only Yotei is available in `G:\games\Kyty`; other-game
+  runtime compatibility is not established.
+- PR inventory and targeted review refreshed in
+  `_Build/analysis/pr-review-20261010/` and `docs/open-pr-usefulness-review.md`.
+  SharpEmu926 pinned head unchanged;1057 runtime samplers are an additional
+  reference. No broad branch port, push or issue108 publication.
+- Installed EXE still `f2683c3d99e97cffab8d536ebbbb5abd4d0c485d533f02bc6f5d8003d4b857b9`
+  / compiledbc4; original eboot5178 unchanged. Last actual runtime is still
+  warmrun200619 fatal at independent inline image/sampler PS07b3 PC6d0.
+  New emulator build/install/original retry, menu and game entry are pending.
+
 Checkpoint **2026-10-09 20:34 UTC** (warm original retry reaches independent image/sampler frontier; Windows handoff):
 
 - Tested compiledbc4b4d4d / installedEXEf2683c3d99e97cffab8d536ebbbb5abd4d0c485d533f02bc6f5d8003d4b857b9,

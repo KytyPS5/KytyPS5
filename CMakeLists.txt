@@ -794,6 +794,12 @@ if(BUILD_TESTING)
 	set_tests_properties(shader_indirect_dword_load PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 	add_test(NAME shader_gpu_selected_format_x_admission
 		COMMAND $<TARGET_FILE:resource_tracking_tests> --gpu-selected-formatted-buffer-only)
+	add_test(NAME shader_independent_inline_sampled_sources_admission
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --independent-inline-sampled-sources-only)
+	add_test(NAME shader_independent_inline_sampled_sources_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --independent-inline-sampled-sources-only)
+	set_tests_properties(shader_independent_inline_sampled_sources_admission PROPERTIES TIMEOUT 60)
+	set_tests_properties(shader_independent_inline_sampled_sources_gpu PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	add_test(NAME shader_gpu_selected_format_x_spirv
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-selected-format-x-cpu-only)
 	add_test(NAME shader_gpu_selected_format_x_gpu

@@ -202,8 +202,9 @@ struct PageManager::Impl {
 		return ptr;
 	}
 
-	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
-		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
+	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
+	             bool access_changed) noexcept {
+		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode, access_changed)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
 		}
@@ -220,7 +221,8 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				// Write-watch changes keep every page of the range readable.
+				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms, is_read);
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}

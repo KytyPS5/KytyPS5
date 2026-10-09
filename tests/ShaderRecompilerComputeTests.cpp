@@ -3604,6 +3604,50 @@ public:
                 compute_done_label == compute_done_value,
             "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
 
+    // The interrupt of a GPU clock write whose value is left to the GPU thread waits for that
+    // value: a game woken by it reads the new time, not the old one.
+    constexpr uint64_t held_clock = clock_base + 0x3100;
+    auto held_processor = std::make_unique<CommandProcessor>(context, 0);
+    std::binary_semaphore held_recorded{0};
+    std::binary_semaphore held_release{0};
+    bool held_watched = false;
+    const auto held_before = Sync::ReadReferenceClock();
+    LibKernel::Memory::InstallGpuResources(&context);
+    gpu.SendCommand([&] {
+      auto &scheduler = context.GetCommandScheduler();
+      held_processor->BufferInit();
+      (void)context.GetBufferCache().ObtainBuffer(held_clock, sizeof(uint64_t), true);
+      held_watched =
+          context.GetBufferCache().IsRegionGpuModified(held_clock, sizeof(uint64_t));
+      held_processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
+                                         reinterpret_cast<void *>(held_clock), 0, 2,
+                                         0x99u);
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      // The GPU thread stays busy: the value and its interrupt wait for it. The page is
+      // not read here, as the read would need the GPU thread too.
+      held_recorded.release();
+      held_release.acquire();
+    });
+    held_recorded.acquire();
+    interrupt_count = 0;
+    const auto held_early_wait = wait_for_interrupt(interrupt_event, interrupt_count);
+    const auto held_early_count = interrupt_count;
+    held_release.release();
+    gpu.WaitForIdle();
+    interrupt_count = 0;
+    const auto held_wait = wait_for_interrupt(interrupt_event, interrupt_count);
+    const auto held_value = read_clock(held_clock);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require("GpuCommandLane", "interrupt behind a deferred timestamp",
+            held_watched && held_early_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
+                held_early_count == 0 && held_wait == 0 &&
+                interrupt_count == 1 && interrupt_event.ident == 0 &&
+                interrupt_event.data == 0x99u &&
+                held_value + clock_tolerance >= held_before &&
+                held_value <= Sync::ReadReferenceClock() + clock_tolerance,
+            "an interrupt ran before the GPU clock value written before it");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);

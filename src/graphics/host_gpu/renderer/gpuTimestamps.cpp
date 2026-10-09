@@ -376,7 +376,7 @@ void GpuTimestamps::Complete(const Batch& batch) {
 		// Later values must not land before this one.
 		deferred = true;
 		std::lock_guard lock(m_mutex);
-		m_retries.push_back({write.vaddr, value, write.size});
+		m_retries.push_back({write.vaddr, value, write.size, {}});
 	}
 	m_retired.fetch_add(count, std::memory_order_release);
 	if (deferred) {
@@ -408,6 +408,22 @@ void GpuTimestamps::QueueRetries() {
 	}
 }
 
+void GpuTimestamps::Signal(Common::UniqueFunction<void>&& effect) {
+	bool queued = false;
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_retrying || !m_retries.empty()) {
+			m_retries.push_back({0, 0, 0, std::move(effect)});
+			queued = true;
+		}
+	}
+	if (queued) {
+		QueueRetries();
+	} else {
+		effect();
+	}
+}
+
 void GpuTimestamps::StoreRetries() {
 	// The GPU thread and a teardown unmap can both store: one at a time keeps the order.
 	std::lock_guard store_lock(m_store_mutex);
@@ -425,7 +441,11 @@ void GpuTimestamps::StoreRetries() {
 		// Plain stores fault here like other GPU-thread writes, so the watching caches see them.
 		// Unmapping a range stores its retries first, so every destination is still mapped.
 		for (const auto& retry: retries) {
-			std::memcpy(reinterpret_cast<void*>(retry.vaddr), &retry.value, retry.size);
+			if (retry.effect) {
+				retry.effect();
+			} else {
+				std::memcpy(reinterpret_cast<void*>(retry.vaddr), &retry.value, retry.size);
+			}
 		}
 	}
 }

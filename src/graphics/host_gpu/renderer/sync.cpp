@@ -192,7 +192,8 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
 	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
 		renderer.GetVideoOut().CompleteFlip(request_id);
-		renderer.TriggerInterrupt(event_id, 0);
+		renderer.GetGpuTimestamps().Signal(
+		    [&renderer, event_id] { renderer.TriggerInterrupt(event_id, 0); });
 	});
 }
 
@@ -231,8 +232,11 @@ void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t co
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation(
-	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
+	// A game woken by the interrupt reads the GPU clock values written before it.
+	scheduler.DeferPriorityOperation([&renderer, event_id, context_id] {
+		renderer.GetGpuTimestamps().Signal(
+		    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
+	});
 }
 
 static void InterruptEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {

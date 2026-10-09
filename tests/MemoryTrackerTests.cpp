@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <semaphore>
 #include <string>
@@ -212,6 +213,8 @@ struct ProtectionCall {
 
 std::vector<ProtectionCall> g_protection_log;
 std::mutex g_protection_log_mutex;
+// Called once by the next protection change, before it is applied.
+std::function<void()> g_before_next_protection;
 
 void ResetProtectionLog() {
   g_protection_calls = 0;
@@ -227,10 +230,15 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     protection = PAGE_READWRITE;
   }
   DWORD old_protection = 0;
+  std::function<void()> before;
   {
     std::lock_guard lock(g_protection_log_mutex);
     g_protection_calls++;
     g_protection_log.push_back({vaddr, size, mode});
+    before = std::exchange(g_before_next_protection, nullptr);
+  }
+  if (before) {
+    before();
   }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
@@ -924,6 +932,63 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
         "download callback serialized an unrelated tracker region");
 }
 
+void TestQueriesDoNotWaitForWriteFault() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  // A clean page before the faulted one keeps the fault to its own page.
+  const auto faulted = base + page_size;
+  const auto queried = base + page_size * 3;
+  Check(faulted / Libs::Graphics::TRACKER_REGION_SIZE ==
+            (queried + page_size - 1) / Libs::Graphics::TRACKER_REGION_SIZE,
+        "query test pages do not share a tracker region");
+  tracker.ForEachUploadRange(
+      base, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+
+  // A guest write fault holds the region while its pages change protection.
+  std::binary_semaphore fault_entered{0};
+  std::binary_semaphore finish_fault{0};
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_before_next_protection = [&] {
+      fault_entered.release();
+      finish_fault.acquire();
+    };
+  }
+  std::jthread fault([&] {
+    tracker.InvalidateRegion(faulted, 1, [] { Check(false, "clean page needed a flush"); });
+  });
+  fault_entered.acquire();
+  std::binary_semaphore queries_finished{0};
+  std::atomic_bool clean{false};
+  std::jthread queries([&] {
+    bool uploaded = false;
+    tracker.ForEachUploadRange(
+        queried, page_size, false,
+        [&](uint64_t, uint64_t) noexcept { uploaded = true; }, []() noexcept {});
+    clean.store(!tracker.IsRegionCpuModified(queried, page_size) &&
+                    !tracker.IsRegionGpuModified(queried, page_size) && !uploaded,
+                std::memory_order_relaxed);
+    queries_finished.release();
+  });
+  const bool completed_during_fault =
+      queries_finished.try_acquire_for(std::chrono::seconds(5));
+  finish_fault.release();
+  fault.join();
+  queries.join();
+
+  const bool fault_dirtied = tracker.IsRegionCpuModified(faulted, page_size) &&
+                             IsWritable(memory + page_size);
+  tracker.UntrackMemory(base, page_size * 4);
+  Release(memory);
+  Check(completed_during_fault && clean.load(std::memory_order_relaxed),
+        "dirty queries waited for a write fault in the same region");
+  Check(fault_dirtied, "write fault did not dirty its page");
+}
+
 void TestGpuUnmarkUsesRegionMask() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1212,6 +1277,7 @@ int main(int argc, char **argv) {
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
+  TestQueriesDoNotWaitForWriteFault();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();

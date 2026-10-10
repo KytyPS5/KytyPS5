@@ -329,6 +329,76 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
+static void MarkStorageImagesFlushed(TextureCache& cache, const PreparedBindings& bindings) {
+	for (const auto& binding: bindings.images) {
+		if (binding.desc.type != TextureCache::BindingType::Storage || !binding.image_id) {
+			continue;
+		}
+		auto*      image = &cache.GetImage(binding.image_id);
+		const bool whole =
+		    image->binding.force_general && !image->info.IsDepth() && !image->info.data.Empty();
+		const auto&                          view = binding.desc.view_info;
+		std::optional<ImageSubresourceRange> range;
+		if (!whole) {
+			range = ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                               view.layer_count};
+		}
+		image->MarkShaderWritesFlushed(range);
+	}
+}
+
+template <typename Handle>
+static uint64_t HandleKey(Handle handle) {
+	return (uint64_t)(handle); // NOLINT: a non-dispatchable handle is a pointer or an integer
+}
+
+// What the dispatch about to be recorded reads and writes, for JoinDeferredBarrier.
+static void CollectDispatchAccess(TextureCache& textures, const ShaderStageRuntime& stage,
+                                  const PreparedBindings& bindings, DispatchAccess& access) {
+	using Space = DispatchAccess::Space;
+	access.Clear();
+	const auto& program = *stage.program;
+	const auto& layout  = program.bindings;
+	if (program.info.uses_dma) {
+		access.reads_all  = true;
+		access.writes_all = program.has_address_writes;
+	}
+	// Heap slots select images no binding names.
+	access.reads_all = access.reads_all || program.info.uses_image_heap;
+	if (bindings.gds.buffer != nullptr) {
+		access.reads_all  = true;
+		access.writes_all = true;
+	}
+			access.reads_all  = true;
+			access.writes_all = true;
+		} else {
+			}
+		}
+	}
+	EXIT_IF(bindings.images.size() < program.info.images.size());
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto& resource = program.info.images[i];
+		if (resource.heap || !bindings.images[i].image_id) {
+			continue;
+		}
+		const bool write =
+		    resource.written &&
+		    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+		const auto& image = textures.GetImage(bindings.images[i].image_id);
+		access.Add(Space::HostImage, HandleKey(static_cast<VkImage>(image.backing.image)), 0, 1,
+		           write);
+		// An alias of the same guest memory is another host image; its guest range names it.
+		for (const auto range: {image.info.data, image.info.stencil, image.info.metadata.range}) {
+			access.Add(Space::Guest, 0, range.address, range.size, write);
+		}
+	}
+	if (bindings.shared_memory.buffer != nullptr) {
+		const auto& memory = bindings.shared_memory;
+		access.Add(Space::HostBuffer, HandleKey(static_cast<VkBuffer>(memory.buffer)),
+		           memory.offset, memory.range, true);
+	}
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.program->bindings.descriptor_counts[
@@ -563,6 +633,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	StreamHold stream_hold(m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream));
 	auto&      bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		std::copy(std::begin(input_info.dispatch_threads_num),
+		          std::end(input_info.dispatch_threads_num),
+		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
+	}
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
@@ -575,12 +650,37 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	const PreciseWriteScope precise_writes(m_context.GetBufferCache());
 	RebindBuffers(bindings);
+	bool has_storage_writes =
+	    bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage);
+	has_storage_writes =
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& image) {
+		                return image.written &&
+		                       image.resource_class ==
+		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
+	                }) ||
+	    has_storage_writes;
+	CollectDispatchAccess(m_context.GetTextureCache(), input_info.stage, bindings,
+	                      m_dispatch_access);
+	// The heap's commit may upload slot words, and a transfer cannot record inside a group.
+	const auto join = program.info.uses_image_heap
+	                      ? CommandBuffer::DeferredJoin {}
+	                      : buffer.JoinDeferredBarrier(m_dispatch_access, has_storage_writes);
+	if (!join.joined) {
+		buffer.FlushDeferredBarrier();
+	}
+	const bool ordered_before = join.joined ? join.ordered_before : buffer.FullBarrierIsLast();
 
 	auto vk_buffer = buffer.Handle();
 	if (!CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	                    std::span {&descriptor_stage, 1u})) {
+		if (join.joined) {
+			buffer.CancelDeferredJoin();
+		}
 		return;
 	}
+	const bool hazard_barrier = has_storage_writes && !ordered_before;
+	if (hazard_barrier) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -610,7 +710,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	buffer.DeferBarrier(m_dispatch_access, hazard_barrier || ordered_before);
+	MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
 	ResetBindings();
 }
 
@@ -665,6 +766,16 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	const PreciseWriteScope precise_writes(m_context.GetBufferCache());
 	RebindBuffers(bindings);
+	// An indirect dispatch never joins a group: its argument barrier waits for compute anyway.
+	const bool overlap = !thread_dimensions;
+	if (overlap) {
+		CollectDispatchAccess(m_context.GetTextureCache(), input_info.stage, bindings,
+		                      m_dispatch_access);
+		m_dispatch_access.Add(DispatchAccess::Space::Guest, 0, args_addr,
+		                      sizeof(vk::DispatchIndirectCommand), false);
+	}
+	buffer.FlushDeferredBarrier();
+	const bool               ordered_before = buffer.FullBarrierIsLast();
 	ThreadDispatcher::Record dispatch_record {args_buffer->Handle(), args_offset, 0};
 	if (thread_dimensions) {
 		const auto& limits = m_context.GetGraphics().physical_device_properties.limits;
@@ -688,7 +799,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
-	if (has_storage_writes) {
+	const bool hazard_barrier = has_storage_writes && !ordered_before;
+	if (hazard_barrier) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk::MemoryBarrier barrier {};
@@ -705,7 +817,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.dispatchIndirect(dispatch_record.buffer, dispatch_record.groups_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (overlap) {
+		buffer.DeferBarrier(m_dispatch_access, hazard_barrier || ordered_before);
+	} else {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (hazard_barrier || ordered_before) {
+			buffer.MarkFullBarrier();
+		}
+	}
+	MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
 	ResetBindings();
 }
 

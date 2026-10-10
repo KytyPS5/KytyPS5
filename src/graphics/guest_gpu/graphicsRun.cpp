@@ -1048,11 +1048,11 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 0: break;
 		case 1: {
 			const auto value = static_cast<uint32_t>(data);
-			std::memcpy(address, &value, sizeof(value));
+			WriteMemory(address, &value, sizeof(value));
 			break;
 		}
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
-		case 2: std::memcpy(address, &data, sizeof(data)); break;
+		case 2: WriteMemory(address, &data, sizeof(data)); break;
 		case 5: {
 			GetScheduler().Finish();
 			const auto gds = static_cast<uint32_t>(data);

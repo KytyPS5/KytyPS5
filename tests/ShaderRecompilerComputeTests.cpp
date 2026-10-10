@@ -32,6 +32,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -16068,6 +16069,138 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "indirect argument allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckDispatchOverlap() {
+    constexpr const char *name = "DispatchOverlap";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t stride = 0x10000;
+    constexpr u32 groups = 64;
+    constexpr u32 words = groups * 64;
+    const std::array<uint64_t, 4> buffers{base, base + stride, base + 2 * stride, base + 3 * stride};
+    enum : u32 { A, B, C, D };
+
+    std::vector<u32> inc;
+    AppendVop3(&inc, 0x346u, 1, 8, InlineU32(6), Vgpr(0));
+    inc.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+    inc.push_back(EncodeMubuf1(2, 1, 1));
+    inc.push_back(EncodeSopp(0x0c, 0));
+    inc.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 2));
+    inc.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+    inc.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&inc);
+    std::vector<u32> fill;
+    AppendVop3(&fill, 0x346u, 1, 4, InlineU32(6), Vgpr(0));
+    fill.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 1));
+    fill.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+    fill.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&fill);
+    for (const auto *code : {&fill, &inc}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "overlap fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "overlap fixture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      const auto set_buffer = [&](u32 sgpr, uint64_t address) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[1] |= static_cast<u32>(sizeof(u32)) << 16u;
+        descriptor.fields[2] = words;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i]);
+        }
+      };
+      const auto run_fill = [&](u32 out) {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(fill.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        set_buffer(0, buffers[out]);
+        processor.DispatchDirect(groups, 1, 1, 0x41u);
+      };
+      const auto run_inc = [&](u32 in, u32 out) {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(inc.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 8, .tgid_x_en = true});
+        set_buffer(0, buffers[out]);
+        set_buffer(4, buffers[in]);
+        processor.DispatchDirect(groups, 1, 1, 0x41u);
+      };
+      const auto check = [&](const char *what, u32 index, u32 offset) {
+        cache.ReadMemory(buffers[index], words * sizeof(u32));
+        std::vector<u32> actual(words);
+        Require(name, "readback",
+                LibKernel::Memory::TryReadBacking(buffers[index], actual.data(),
+                                                  words * sizeof(u32)),
+                "overlap output could not be read back");
+        for (u32 i = 0; i < words; i++) {
+          Require(name, what, actual[i] == i + offset,
+                  "word " + std::to_string(i) + " expected " + Hex(i + offset) + ", got " +
+                      Hex(actual[i]));
+        }
+      };
+      const auto sequence = [&] {
+        run_fill(A);      // starts a group
+        run_fill(B);      // disjoint: joins
+        run_inc(A, C);    // reads A, which the group wrote: flushes
+        run_inc(B, D);    // B was flushed with the first group, C/A are only read by D: joins
+        run_inc(C, B);    // reads C and overwrites B that D just read: flushes
+      };
+      // The first pass creates the programs and cache buffers, which records uploads in between.
+      sequence();
+      check("warm-up results", B, 3);
+      sequence();
+      Require(name, "pending barrier after a dispatch",
+              scheduler.Current().HasDeferredBarrier(),
+              "the last dispatch did not leave its barrier pending");
+      check("fill A", A, 1);
+      Require(name, "readback flushes the pending barrier",
+              !scheduler.Current().HasDeferredBarrier(),
+              "a download was recorded while a dispatch barrier was still pending");
+      check("RAW A -> C", C, 2);
+      check("RAW B -> D before the WAR overwrite", D, 2);
+      check("WAR C -> B", B, 3);
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "overlap fixture unmap failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "overlap fixture release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -52978,6 +53111,68 @@ void CheckImageTransitionState(RenderContext &renderer) {
                      "repeat transfer write");
   CheckRepeatedWrite(vk::AccessFlagBits2::eShaderWrite, "repeat shader write");
   CheckRepeatedWrite(vk::AccessFlagBits2::eMemoryWrite, "repeat memory write");
+
+  const auto storage_access =
+      vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+  image.backing.state = {};
+  image.backing.subresource_states.clear();
+  (void)image.GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                          graphics_stage, {});
+  image.MarkShaderWritesFlushed({});
+  Require(name, "flushed storage re-entry",
+          image.backing.state.flushed &&
+              image
+                  .GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                               graphics_stage, {})
+                  .empty() &&
+              !image.backing.state.flushed,
+          "a write already published by a full barrier was fenced again");
+  Require(name, "re-entry write is fenced",
+          image
+                  .GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                               graphics_stage, {})
+                  .size() == 1,
+          "the write after a flushed re-entry lost its dependency");
+  image.MarkShaderWritesFlushed({});
+  barriers = image.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::AccessFlagBits2::eShaderRead, graphics_stage,
+                               {});
+  Require(name, "flushed layout change",
+          barriers.size() == 1 &&
+              barriers[0].oldLayout == vk::ImageLayout::eGeneral &&
+              !image.backing.state.flushed,
+          "a flushed state skipped a layout transition");
+  image.backing.state = {};
+  image.backing.subresource_states.clear();
+  (void)image.GetBarriers(vk::ImageLayout::eGeneral,
+                          vk::AccessFlagBits2::eTransferWrite,
+                          vk::PipelineStageFlagBits2::eTransfer, {});
+  image.MarkShaderWritesFlushed({});
+  Require(name, "flush ignores transfer writes", !image.backing.state.flushed,
+          "a transfer write was treated as published by a shader barrier");
+  image.backing.state = {};
+  image.backing.subresource_states.clear();
+  (void)image.GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                          graphics_stage, {});
+  image.MarkShaderWritesFlushed(ImageSubresourceRange{1, 1, 0, 1});
+  Require(name, "partial flush of an unsplit image", !image.backing.state.flushed,
+          "a partial flush marked the whole image");
+  (void)image.GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                          graphics_stage, ImageSubresourceRange{1, 1, 0, 1});
+  image.MarkShaderWritesFlushed(ImageSubresourceRange{1, 1, 0, 1});
+  Require(name, "partial flush",
+          image.backing.subresource_states.size() == 6 &&
+              image.backing.subresource_states[3].flushed &&
+              !image.backing.subresource_states[0].flushed &&
+              image
+                  .GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                               graphics_stage, ImageSubresourceRange{1, 1, 0, 1})
+                  .empty() &&
+              image
+                      .GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                                   graphics_stage, ImageSubresourceRange{0, 1, 0, 1})
+                      .size() == 1,
+          "subresource flush state diverged from its range");
   image.backing.state = {};
   image.backing.subresource_states.clear();
   const auto attachment_access = vk::AccessFlagBits2::eColorAttachmentRead |
@@ -53084,6 +53279,17 @@ void CheckImageTransitionState(RenderContext &renderer) {
   HW::UserConfig user_config{};
   HW::Shader shaders{};
   scheduler.Begin(registers, user_config, shaders);
+  {
+    auto &command = scheduler.Current();
+    Require(name, "full barrier unmarked", !command.FullBarrierIsLast(),
+            "a fresh command buffer claimed a full barrier");
+    (void)command.Handle();
+    command.MarkFullBarrier();
+    const bool marked = command.FullBarrierIsLast();
+    (void)command.Handle();
+    Require(name, "full barrier mark", marked && !command.FullBarrierIsLast(),
+            "a handle request after the full barrier did not invalidate its mark");
+  }
   image.backing.state = {};
   image.backing.subresource_states.clear();
   image.Transit(vk::ImageLayout::eGeneral,
@@ -58833,6 +59039,7 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
+  vulkan.CheckDispatchOverlap();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckRefusedShaderSkipsDispatch();
   vulkan.CheckOrderedDispatch();

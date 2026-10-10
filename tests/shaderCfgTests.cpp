@@ -8207,6 +8207,12 @@ void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
         "DS append/consume loop unexpectedly selected dispatcher fallback");
   Check(SpirvContainsOpcode(result.spirv, 246),
         "DS structured SPIR-V lacks OpLoopMerge");
+  // DS_APPEND picks its counter lane with FirstLane: FindILsb on the ballot words, not
+  // OpGroupNonUniformBallotFindLSB, which Metal rejects in vertex functions.
+  Check(!SpirvContainsOpcode(result.spirv, 343),
+        "DS append SPIR-V contains OpGroupNonUniformBallotFindLSB");
+  Check(SpirvExtInstCount(result.spirv, 73) >= 1,
+        "DS append SPIR-V does not find the first lane with GLSL.std.450 FindILsb");
   CheckSpirvBinaryValidates(result.spirv);
 }
 

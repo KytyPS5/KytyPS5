@@ -1,5 +1,19 @@
 # Emulator regression test debt
 
+## Real wave-address graph recognition extension (2026-10-10)
+
+Original5178/source1ee315aa/EXE6b8e6 run060729 naturally exits321 at
+06:48:02.696UTC,1265 complete pipelines, no guards, min RAM16.99GiB.
+The bounded synthetic address-table case is numerically proved, but real
+PS617c still rejects pc8b4 during tracking. Do not claim that full shader or
+game works. Saved ps617c-early.txt contains all scalar-address/pointer/row
+ancestors. Next identify the exact failed proof (row dominance, active-mask
+phi/Select ancestry, paired pointer/load provenance), reproduce that extension
+synthetically, then preserve the original mask/address/ownership constraints
+while extending shared recognition. No rejection suppression or empty-lane
+assumptions. A new game diagnostic is justified only if existing IR cannot
+identify the failed proof; keep diagnostics separate from semantic fixes.
+
 ## Wave-selected scalar-address image table (2026-10-10)
 
 Original5178/sourceed3f2e74/EXEd2bd run042530 naturally exits321 at

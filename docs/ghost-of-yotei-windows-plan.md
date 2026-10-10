@@ -1,5 +1,24 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 06:49 UTC** (synthetic wave table passes; real recognition still pending):
+
+- Local source1ee315aa / EXE6b8e6 / original5178 run
+  `_Build/runs/game-20261010-060729-wave-address-image-tables-native`
+  naturally exits321 at06:48:02.696UTC,1265 complete pipelines, timeout and
+  memory guards=false, minimum available RAM16.99GiB. Real PS617c remains
+  rejected atpc8b4 LoadAddressU32 image provenance. Do not treat the bounded
+  synthetic pass as a completed real-shader fix. Native slot now idle.
+- Last window-progress.png shows loading arc only. No menu/entry/post.
+  Driver cache file1197626877 bytes retained. The shared bounded mechanism
+  and strict negative/neighbor tests remain valid; missing real graph proof
+  is still required. No installed/source changes during this run.
+- Next: use saved full IR to isolate the exact row/mask/pointer recognition
+  rejection, native synthetic RED for that shape, verified extension, then
+  original retry. Keep canonical address bits, finite source bounds, original
+  wave scope and stage write protection. Diagnostic-only tracing is allowed;
+  no guessing or widened acceptance from a game log. PS07b3 driver completion,
+  menu and gameplay remain pending. No push or issue108 publication.
+
 Checkpoint **2026-10-10 06:05 UTC** (bounded wave-address table regression proved):
 
 - Working shared correction supports paired indexed vector-buffer pointers,

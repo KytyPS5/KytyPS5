@@ -545,6 +545,7 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_pos_z                     = (active_inputs & 0x00000400u) != 0;
 	ps_info.ps_pos_w                     = (active_inputs & 0x00000800u) != 0;
 	ps_info.ps_front_face                = (active_inputs & 0x00001000u) != 0;
+	ps_info.ps_front_face_all_bits       = (sh.baryc_cntl & 0x01000000u) != 0;
 	ps_info.ps_ancillary                 = (active_inputs & 0x00002000u) != 0;
 	ps_info.ps_sample_shading            = (active_inputs & 0x00000011u) != 0;
 	ps_info.ps_no_perspective            = (sh.ps_input_ena & sh.ps_input_addr & 0x00000020u) != 0;
@@ -663,6 +664,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_w));
 	key.push_back(static_cast<uint32_t>(info.ps_front_face));
+	key.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
 	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
 	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
 	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));

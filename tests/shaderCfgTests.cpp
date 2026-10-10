@@ -14388,6 +14388,65 @@ void TestNewShaderRecompilerStageInputInfo() {
   CheckSpirvBinaryValidates(ps_pos_y_result.spirv);
 }
 
+void TestPixelFrontFaceEncoding() {
+  // RDNA SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS (bit 24) selects integer
+  // 1/0. In float mode the same guest VGPR contains +1.0/-1.0 bits.
+  const uint32_t shader[] = {
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  std::vector<uint32_t> float_key;
+  for (const bool integer_encoding : {false, true}) {
+    HW::ShaderRegisters sh{};
+    sh.ps_input_ena = sh.ps_input_addr = 0x1000u;
+    sh.baryc_cntl = integer_encoding ? 0x01000000u : 0u;
+    ShaderPixelInputInfo pixel{};
+    (void)PrepareProgram(regs, sh, mappings, pixel);
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &pixel;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    std::unordered_map<uint32_t, uint32_t> constants;
+    for (size_t i = 5; i < result.spirv.size();) {
+      const auto size = result.spirv[i] >> 16u;
+      if ((result.spirv[i] & 0xffffu) == 43u && size == 4u) {
+        constants[result.spirv[i + 2]] = result.spirv[i + 3];
+      }
+      i += size;
+    }
+    bool found_face_select = false;
+    for (size_t i = 5; i < result.spirv.size();) {
+      const auto size = result.spirv[i] >> 16u;
+      if ((result.spirv[i] & 0xffffu) == 169u && size == 6u &&
+          constants.contains(result.spirv[i + 4]) &&
+          constants.contains(result.spirv[i + 5])) {
+        const auto front = constants.at(result.spirv[i + 4]);
+        const auto back = constants.at(result.spirv[i + 5]);
+        if (front != back) {
+          Check(front == (integer_encoding ? 1u : 0x3f800000u) &&
+                    back == (integer_encoding ? 0u : 0xbf800000u),
+                "front/back face VGPR values ignore SPI_BARYC_CNTL encoding");
+          found_face_select = true;
+        }
+      }
+      i += size;
+    }
+    Check(found_face_select, "front-face export lost the face input");
+    const auto key = MakeStageStaticKey(pixel);
+    if (!integer_encoding) {
+      float_key.assign(key.begin(), key.end());
+    } else {
+      Check(float_key != key,
+            "pixel cache aliases integer and float front-face encodings");
+    }
+  }
+}
+
 void TestNewShaderRecompilerPixelPipelineEntry() {
   const uint32_t shader[] = {0xbf810000u};
 
@@ -15127,6 +15186,10 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--front-face-only") == 0) {
+    TestPixelFrontFaceEncoding();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--setpc-dword-only") == 0) {
     TestNewShaderRecompilerSetpcDwordJumpTable();
     TestSetpcDwordJumpTableAliasedLoadSelector();
@@ -15298,6 +15361,7 @@ int main(int argc, char **argv) {
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
+  TestPixelFrontFaceEncoding();
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();

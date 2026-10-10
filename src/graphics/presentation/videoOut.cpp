@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -214,6 +216,10 @@ public:
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
+	bool               PresentEarly();
+	[[nodiscard]] bool EarlyPresentPending() const noexcept {
+		return m_early_pending.load(std::memory_order_acquire);
+	}
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
 
@@ -233,6 +239,7 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
+		bool                        presented_early;
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -245,6 +252,7 @@ private:
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
 	uint64_t             m_next_request_id = 1;
+	std::atomic<bool>    m_early_pending {false};
 };
 
 struct VideoOutDriver::Impl {
@@ -847,7 +855,23 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
+		static const bool early_present = [] {
+			const char* text = std::getenv("KYTY_EARLY_PRESENT");
+			return text != nullptr && std::strcmp(text, "0") != 0;
+		}();
+		if (total_wait > 0 && early_present) {
+			const auto deadline = sleep_begin + static_cast<uint64_t>(total_wait);
+			for (auto now = sleep_begin; now < deadline && !token.stop_requested();
+			     now      = Common::Timer::QueryPerformanceCounter()) {
+				if (m_flip_queue.EarlyPresentPending()) {
+					(void)m_flip_queue.PresentEarly();
+					continue;
+				}
+				const auto remaining_us = ((deadline - now) * 1000000u + frequency - 1) / frequency;
+				Common::Thread::SleepMicro(
+				    static_cast<uint32_t>(std::clamp<uint64_t>(remaining_us, 1, 500)));
+			}
+		} else if (total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
@@ -1147,6 +1171,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		m_early_pending.store(true, std::memory_order_release);
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1230,7 +1255,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	// Lock each port in bus order, then present and complete the whole group at one Vblank.
 	std::sort(requests.begin(), requests.begin() + count,
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
-	bool due = true;
+	bool due           = true;
+	bool shown_already = true;
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
 	for (size_t i = 0; i < count; i++) {
 		auto& r = requests[i];
@@ -1239,9 +1265,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
 		}
+		shown_already &= r.presented_early;
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
 	}
-	if (due) {
+	if (due && !shown_already) {
 		m_presenter.Present(std::span(layers.data(), count));
 	}
 
@@ -1280,6 +1307,69 @@ bool FlipQueue::Flip(uint32_t micros) {
 		    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
 			LOGF("Flip done: %d\n", requests[0].index);
 		}
+	}
+	return due;
+}
+
+bool FlipQueue::PresentEarly() {
+	m_mutex.Lock();
+	m_early_pending.store(false, std::memory_order_relaxed);
+	const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
+	                                [](const auto& r) { return r.group == r.id; });
+	if (m_processing || owner == m_requests.end()) {
+		m_mutex.Unlock();
+		return false;
+	}
+	const uint64_t group = owner->id;
+	if (std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(),
+	                [group](const auto& r) { return r.group == group; }) ||
+	    std::any_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
+		    return r.group == group && (r.state != RequestState::Ready || r.presented_early);
+	    })) {
+		m_mutex.Unlock();
+		return false;
+	}
+	std::array<Request, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> requests {};
+	size_t                                                            count = 0;
+	for (auto& request: m_requests) {
+		if (request.group == group) {
+			EXIT_IF(count == requests.size());
+			request.state     = RequestState::Presenting;
+			requests[count++] = request;
+		}
+	}
+	m_processing = true;
+	m_mutex.Unlock();
+
+	std::sort(requests.begin(), requests.begin() + count,
+	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
+	bool                                                                                 due = true;
+	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
+	for (size_t i = 0; i < count; i++) {
+		auto& r = requests[i];
+		r.cfg->mutex.Lock();
+		due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
+		if (r.id == group) {
+			due &= IsFlipDueLocked(*r.cfg, r.generation);
+		}
+		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
+	}
+	if (due) {
+		m_presenter.Present(std::span(layers.data(), count));
+	}
+
+	m_mutex.Lock();
+	for (auto& request: m_requests) {
+		if (request.group == group) {
+			request.state           = RequestState::Ready;
+			request.presented_early = due;
+		}
+	}
+	m_processing = false;
+	m_done_cond_var.SignalAll();
+	m_mutex.Unlock();
+	for (size_t i = count; i != 0; i--) {
+		requests[i - 1].cfg->mutex.Unlock();
 	}
 	return due;
 }

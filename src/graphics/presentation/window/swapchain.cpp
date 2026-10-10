@@ -18,8 +18,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -923,7 +926,7 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
 	// One presented frame has passed; image staleness is judged in frames.
 	m_impl->renderer.GetTextureCache().AdvanceFrame();
 	KYTY_PROFILER_FUNCTION();
@@ -1047,7 +1050,14 @@ void Presenter::Impl::Present() {
 			continue;
 		}
 		{
-			Common::LockGuard render_lock(renderer.GetMutex());
+			static const bool render_locked = [] {
+				const char* text = std::getenv("KYTY_PRESENT_RENDER_LOCK");
+				return text != nullptr && std::strcmp(text, "0") != 0;
+			}();
+			std::optional<Common::LockGuard> render_lock;
+			if (render_locked) {
+				render_lock.emplace(renderer.GetMutex());
+			}
 			auto&             command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();

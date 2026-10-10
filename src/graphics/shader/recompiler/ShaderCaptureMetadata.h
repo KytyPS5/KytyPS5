@@ -19,4 +19,11 @@ nlohmann::ordered_json BuildResourceReadMetadata(const IR::SrtRuntime& runtime,
 std::vector<ReadEvent> ReadResourceReadMetadata(const nlohmann::ordered_json& input,
                                               IR::SrtRuntime& runtime);
 std::vector<uint32_t> ReadCapturedUserData(const nlohmann::ordered_json& manifest);
+nlohmann::ordered_json CaptureTextureInputs(const IR::ResourcePlan& plan,
+                                           const IR::SrtRuntime& runtime, uint32_t logical);
+// Diagnostic analysis of captured logical texels. No draw-time ownership or
+// selector-provenance proof is implied; padding is deliberately excluded.
+bool CollectCapturedTextureBytes(const ShaderTextureResource& texture,
+                                 std::span<const uint32_t> words, uint32_t channels,
+                                 std::vector<uint32_t>& values);
 } // namespace Libs::Graphics::ShaderRecompiler::Capture

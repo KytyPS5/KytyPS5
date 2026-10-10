@@ -28,7 +28,77 @@ int main(int argc, char **argv) {
     options.shader_hash = params.hash;
     options.user_data = std::span(params.user_data).first(3u);
     options.wave_size = 64u;
-    if (argc == 2 && std::string_view(argv[1]) == "--read-capture-only") {
+    if (argc == 2 && std::string_view(argv[1]) == "--texture-capture-only") {
+      ShaderTextureResource texture;
+      texture.fields[1] = (60u << 20u) | (1u << 30u);
+      texture.fields[2] = 1u << 14u;
+      texture.fields[3] = (9u << 28u) | (5u << 20u) | 0xfacu;
+      std::vector<uint32_t> pixels(1024u, 0x40404040u);
+      // Independent Standard4KB 2x2 offsets: (0,0)=0, (1,0)=4,
+      // (0,1)=16, (1,1)=20. Padding contains an unrelated value64.
+      pixels[0] = 0x40070401u; pixels[1] = 0x41ff0401u;
+      pixels[4] = 0x42ff0407u; pixels[5] = 0x43070401u;
+      std::vector<uint32_t> values;
+      Check(Capture::CollectCapturedTextureBytes(texture, pixels, 7u, values) &&
+                values == std::vector<uint32_t>{1u,4u,7u,255u},
+            "logical RGB domain includes padding/alpha or loses a texel");
+      Check(Capture::CollectCapturedTextureBytes(texture, pixels, 8u, values) &&
+                values == std::vector<uint32_t>{64u,65u,66u,67u},
+            "alpha domain does not follow selected channel");
+      texture.fields[3] = (texture.fields[3] & ~0xfffu) | 7u | (1u << 6u) | (4u << 9u);
+      Check(Capture::CollectCapturedTextureBytes(texture, pixels, 7u, values) &&
+                values == std::vector<uint32_t>{0u,1u,64u,65u,66u,67u},
+            "byte domain ignores swizzle or constant components");
+      pixels.pop_back();
+      Check(!Capture::CollectCapturedTextureBytes(texture, pixels, 7u, values) && values.empty(),
+            "truncated texture accepted as complete byte domain");
+      IR::ResourcePlan plan;
+      IR::DescriptorSource buffer;
+      buffer.dword_count = 4;
+      buffer.dwords[0] = IR::Value(0x1000u);
+      buffer.dwords[1] = IR::Value(16u << 16u);
+      buffer.dwords[2] = IR::Value(1u);
+      buffer.dwords[3] = IR::Value(0x5204u);
+      plan.descriptor_sources.push_back(buffer);
+      IR::DescriptorSource image;
+      image.inline_descriptor = IR::DescriptorSource::InlineDescriptor{0u, 16u, 0u, 0u};
+      image.inline_descriptor->selector_limit = 1u;
+      plan.descriptor_sources.push_back(image);
+      IR::ImageResource metadata;
+      metadata.source = 1u; metadata.read = true;
+      plan.info.images.push_back(metadata);
+      struct State { uint32_t reads = 0; bool dirty = false; } state;
+      IR::SrtRuntime runtime;
+      runtime.userdata = &state;
+      runtime.read_specialization_memory = +[](void* data, uint64_t address, std::span<uint32_t> words) {
+        auto& state = *static_cast<State*>(data); ++state.reads;
+        if (address == 0x1000u && words.size() == 4u) {
+          words[0] = 0x20u; words[1] = 60u << 20u; words[2] = 0u;
+          words[3] = (9u << 28u) | (5u << 20u) | 0xfacu;
+          return true;
+        }
+        if (address == 0x2000u && words.size() == 1024u && !state.dirty) {
+          std::fill(words.begin(), words.end(), 0x03020104u); return true;
+        }
+        return false;
+      };
+      const auto captured = Capture::CaptureTextureInputs(plan, runtime, 0u);
+      Check(captured.at("entries").size() == 1u, "texture capture missed bounded candidate");
+      const auto& entry = captured.at("entries").at(0);
+      Check(entry.at("payload_captured") == true && entry.at("descriptor_stable") == true &&
+                entry.at("words").size() == 1024u && entry.at("words").at(0) == 0x03020104u,
+            "texture capture altered raw payload or descriptor");
+      Check(state.reads == 3u && captured.at("specialization_proof") == false,
+            "diagnostic reads/count or proof scope incorrect");
+      state.dirty = true;
+      const auto dirty = Capture::CaptureTextureInputs(plan, runtime, 0u);
+      Check(dirty.at("entries").at(0).at("payload_captured") == false &&
+                !dirty.at("entries").at(0).contains("words"), "dirty texture fabricated payload");
+      plan.info.images[0].written = true;
+      const auto reads = state.reads;
+      Check(Capture::CaptureTextureInputs(plan, runtime, 0u).contains("error") && state.reads == reads,
+            "written image admitted for diagnostic snapshot");
+    } else if (argc == 2 && std::string_view(argv[1]) == "--read-capture-only") {
       struct State {
         uint32_t normal = 0, strict = 0, clamp = 0;
       } state;

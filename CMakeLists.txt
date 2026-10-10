@@ -631,7 +631,7 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
-	foreach(capture_mode IN ITEMS pixel-metadata compute-metadata vertex-metadata read-capture)
+	foreach(capture_mode IN ITEMS pixel-metadata compute-metadata vertex-metadata read-capture texture-capture)
 		add_test(NAME shader_capture_${capture_mode}
 			COMMAND $<TARGET_FILE:shader_capture_tests> --${capture_mode}-only)
 		set_tests_properties(shader_capture_${capture_mode} PROPERTIES TIMEOUT 30)

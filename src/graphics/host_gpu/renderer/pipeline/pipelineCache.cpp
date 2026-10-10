@@ -854,8 +854,15 @@ struct PipelineCache::ProgramCache {
 					} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 						captured.input_info.pixel = &input_info;
 					} else captured.input_info.compute = &input_info;
-					const auto reads = ShaderRecompiler::Capture::BuildResourceReadMetadata(
+					auto reads = ShaderRecompiler::Capture::BuildResourceReadMetadata(
 					    runtime, capture, ok, ok ? std::string_view{} : ShaderRecompiler::IR::LastResourceSpecializationError());
+					if (const auto* index = std::getenv("KYTY_RESOURCE_CAPTURE_TEXTURE_IMAGE")) {
+						char* parsed_end = nullptr;
+						const auto logical = std::strtoul(index, &parsed_end, 10);
+						if (*index && parsed_end && !*parsed_end && logical <= UINT32_MAX)
+							reads["additional_texture_inputs"] = ShaderRecompiler::Capture::CaptureTextureInputs(
+							    plan, runtime, static_cast<uint32_t>(logical));
+					}
 					CaptureDispatchedShader(params, captured, lookup_key.static_state, runtime.compute_workgroups,
 					                        &reads, std::filesystem::u8path(directory));
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)

@@ -33928,6 +33928,132 @@ TestCase DsOrderedCountAddressAndExec(u32 wave_size, bool pixel_counter) {
   return test;
 }
 
+template <bool two_d> TestCase DsOrderedCountFollowsWaveLaunchOrder() {
+  using O = ShaderOpcode;
+  TestCase test;
+  // The 2D variant ranks waves by y * 4 + x, which needs NumWorkgroups.
+  test.name = two_d ? "DsOrderedCountFollowsWaveLaunchOrder2D"
+                    : "DsOrderedCountFollowsWaveLaunchOrder";
+  auto &code = test.code;
+  constexpr u32 waves = 16;
+  // s0 (and s1 in 2D) = group id, then TG_SIZE whose bits [16:6] hold the
+  // ordered-append term.
+  code.push_back(EncodeSop2(0x27, 2, two_d ? 2 : 1, 255));
+  code.push_back(0x000b0006u);
+  // Earlier waves spin longer, so an unordered counter would serve them last.
+  // v5 counts the iterations and is stored, so the delay cannot be optimized
+  // away.
+  AppendVMovU32(&code, 5, 0);
+  code.push_back(EncodeSop2(0x03, 3, InlineU32(waves), 2));
+  code.push_back(EncodeSop2(0x1e, 3, 3, InlineU32(10)));
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(1), 5));
+  code.push_back(EncodeSop2(0x03, 3, 3, InlineU32(1)));
+  code.push_back(EncodeSopc(0x07, 3, InlineU32(0)));
+  code.push_back(EncodeSopp(0x05, 0xfffcu));
+  // M0 = term; the counter sits at GDS address 0. Every wave adds one and
+  // releases.
+  code.push_back(EncodeSMovB32(124, 2));
+  AppendVMovU32(&code, 2, 1);
+  code.push_back(EncodeDs0(0x3f, 3u << 8u, true));
+  code.push_back(EncodeDs1(3, 0, 2));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop1(0x01, 4, 2));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 4, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, waves);
+  AppendEnd(&code);
+  for (u32 wave = 0; wave < waves; ++wave) {
+    test.expected.push_back(wave);
+  }
+  for (u32 wave = 0; wave < waves; ++wave) {
+    test.expected.push_back((waves - wave) << 10u);
+  }
+  test.initial.assign(waves * 2u, 0xdeadbeefu);
+  test.gds_initial.assign(
+      ShaderRecompiler::IR::OrderedAppendReleaseCounter + 1u, 0);
+  // Every wave adds one at address 0 and releases its slot once.
+  test.expected_gds = test.gds_initial;
+  test.expected_gds[0] = waves;
+  test.expected_gds[ShaderRecompiler::IR::OrderedAppendReleaseCounter] = waves;
+  test.dispatch_x = two_d ? 4 : waves;
+  test.dispatch_y = two_d ? waves / 4 : 1;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.group_id[1] = two_d;
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.tg_size_en = true;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpLoopMerge"};
+  test.opcodes = {O::S_BFE_U32,     O::S_SUB_I32,          O::S_LSHL_B32,
+                  O::S_CMP_LG_U32,  O::S_CBRANCH_SCC1,     O::S_MOV_B32,
+                  O::V_MOV_B32,     O::DS_ORDERED_COUNT,   O::S_WAITCNT,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM,
+                  O::V_ADD_NC_U32};
+  return test;
+}
+
+TestCase DsOrderedCountRanksPastElevenBits() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "DsOrderedCountRanksPastElevenBits";
+  auto &code = test.code;
+  // Wave 2048 shares the 11-bit term of wave 0; only wave 0 is delayed, so a
+  // wait on the term alone would serve wave 2048 first.
+  constexpr u32 waves = 2049;
+  code.push_back(EncodeSop2(0x27, 2, 1, 255));
+  code.push_back(0x000b0006u);
+  AppendVMovU32(&code, 5, 0);
+  code.push_back(EncodeSopc(0x06, 0, InlineU32(0)));
+  code.push_back(EncodeSop2(0x0a, 3, 255, InlineU32(1)));
+  code.push_back(0x40000u);
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(1), 5));
+  code.push_back(EncodeSop2(0x03, 3, 3, InlineU32(1)));
+  code.push_back(EncodeSopc(0x07, 3, InlineU32(0)));
+  code.push_back(EncodeSopp(0x05, 0xfffcu));
+  code.push_back(EncodeSMovB32(124, 2));
+  AppendVMovU32(&code, 2, 1);
+  code.push_back(EncodeDs0(0x3f, 3u << 8u, true));
+  code.push_back(EncodeDs1(3, 0, 2));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop1(0x01, 4, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 4, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, waves);
+  AppendEnd(&code);
+  for (u32 wave = 0; wave < waves; ++wave) {
+    test.expected.push_back(wave);
+  }
+  for (u32 wave = 0; wave < waves; ++wave) {
+    test.expected.push_back(wave == 0 ? 0x40000u : 1u);
+  }
+  test.initial.assign(waves * 2u, 0xdeadbeefu);
+  test.gds_initial.assign(
+      ShaderRecompiler::IR::OrderedAppendReleaseCounter + 1u, 0);
+  // Every wave adds one at address 0 and releases its slot once.
+  test.expected_gds = test.gds_initial;
+  test.expected_gds[0] = waves;
+  test.expected_gds[ShaderRecompiler::IR::OrderedAppendReleaseCounter] = waves;
+  test.dispatch_x = waves;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.tg_size_en = true;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpLoopMerge"};
+  test.opcodes = {O::S_BFE_U32, O::S_CMP_EQ_U32,  O::S_CSELECT_B32,
+                  O::S_SUB_I32, O::S_CMP_LG_U32,  O::S_CBRANCH_SCC1,
+                  O::S_MOV_B32, O::V_MOV_B32,     O::DS_ORDERED_COUNT,
+                  O::S_WAITCNT, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM,  O::V_ADD_NC_U32};
+  return test;
+}
+
 TestCase DsAppendConsumeGdsRegionBounds() {
   using O = ShaderOpcode;
   struct Access {
@@ -37478,6 +37604,9 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(DsOrderedCountAddressAndExec(wave_size, true));
   }
   AddCase(DsAppendConsumeGdsRegionBounds);
+  AddCase(DsOrderedCountFollowsWaveLaunchOrder<false>);
+  AddCase(DsOrderedCountFollowsWaveLaunchOrder<true>);
+  AddCase(DsOrderedCountRanksPastElevenBits);
   AddCase(DsGdsSubdwordAndAtomicWrites);
   AddCase(DsReadWrite2Variants);
   AddCase(DsWideReadSnapshotsOverlappingAddress);
@@ -43347,6 +43476,9 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, false));
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, true));
     }
+    RunCase(&vulkan, DsOrderedCountFollowsWaveLaunchOrder<false>());
+    RunCase(&vulkan, DsOrderedCountFollowsWaveLaunchOrder<true>());
+    RunCase(&vulkan, DsOrderedCountRanksPastElevenBits());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {

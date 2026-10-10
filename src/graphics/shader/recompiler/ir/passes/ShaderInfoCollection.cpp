@@ -175,6 +175,7 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::WorkgroupId:
 			AddInput(info, kind, 0, 3, "gl_WorkGroupID");
 			break;
+		case StageInputKind::NumWorkgroups: AddInput(info, kind, 0, 3, "gl_NumWorkGroups"); break;
 		case StageInputKind::LocalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_LocalInvocationID");
 			break;
@@ -455,6 +456,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					break;
 				case StageInputKind::TessCoord:
 				case StageInputKind::WorkgroupId:
+				case StageInputKind::NumWorkgroups:
 				case StageInputKind::LocalInvocationId:
 				case StageInputKind::GlobalInvocationId:
 					if (component >= 3u) {

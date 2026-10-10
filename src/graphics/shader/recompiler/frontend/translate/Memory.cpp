@@ -885,8 +885,9 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
-	// Approximate ordered counting with one GDS atomic per wave. Wave-launch ordering and
-	// release/done synchronization are not emulated.
+	// One GDS atomic per wave. With the ordered-append term in the TG_SIZE SGPR (see
+	// TranslateProgram) the wave first waits for every earlier wave to release, as the hardware
+	// does.
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto m0 = ir.GetM0();
 	auto address = ir.BitwiseAnd(ir.ShiftRightLogical(m0, IR::U32(IR::Value(16u))),
@@ -912,6 +913,26 @@ void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 	                                   {ReadU32(inst.src0), is_first}));
 	const auto value = ir.Select(active, source, IR::U32(IR::Value(0u)));
 	const auto flags = AddMemoryInfo(memory, inst.pc);
+	const bool ordered  = program.info.uses_ordered_append;
+	if (ordered) {
+		// Wait on the full dispatch-order rank: M0 only keeps its low 11 bits, which repeat
+		// every 2048 waves while Vulkan may run such waves concurrently.
+		const auto builtin = [&](IR::StageInputKind kind, uint32_t component) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::GetBuiltin,
+			                       {IR::Value(static_cast<uint32_t>(kind)), IR::Value(component)}));
+		};
+		auto group      = builtin(IR::StageInputKind::WorkgroupId, 2);
+		group           = ir.IAdd(ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 1)),
+		                          builtin(IR::StageInputKind::WorkgroupId, 1));
+		group           = ir.IAdd(ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 0)),
+		                          builtin(IR::StageInputKind::WorkgroupId, 0));
+		const auto wave = IR::U32(
+		    ir.Emit(IR::ValueOpcode::UDiv32, {builtin(IR::StageInputKind::LocalInvocationIndex, 0),
+		                                      IR::Value(program.info.ordered_append_wave_size)}));
+		const auto rank =
+		    ir.IAdd(ir.IMul(group, IR::U32(IR::Value(program.info.ordered_append_waves))), wave);
+		ir.Emit(IR::ValueOpcode::OrderedAppendWait, {rank, is_first}, flags);
+	}
 	IR::U32 result;
 	if (((inst.secondary_offset >> 4u) & 3u) == 1u) {
 		const auto swapped = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicSwap32,
@@ -922,6 +943,10 @@ void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 	} else {
 		result = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
 		                        {address, value, is_first}, flags));
+	}
+	if (ordered && (inst.secondary_offset & 1u) != 0u) {
+		// wave_release: hand the ordered-append slot to the next wave.
+		ir.Emit(IR::ValueOpcode::OrderedAppendRelease, {is_first}, flags);
 	}
 	// DS_ORDERED_COUNT writes every destination lane, regardless of EXEC.
 	ir.SetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg),

@@ -1192,10 +1192,34 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				const auto first_bit =
 				    entry_ir.Select(entry_ir.IEqual(wave_id, IR::U32(IR::Value(0u))),
 				                    IR::U32(IR::Value(0x80000000u)), IR::U32(IR::Value(0u)));
+				auto tg_size = entry_ir.BitwiseOr(
+				    entry_ir.BitwiseOr(wave_bits, IR::U32(IR::Value(waves))), first_bit);
+				const bool ordered_append =
+				    std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+					    return inst.opcode == Decoder::Opcode::DS_ORDERED_COUNT;
+				    });
+				if (ordered_append) {
+					// Ordered append term [16:6]: the wave's position in dispatch order, which the
+					// hardware dispatcher assigns and DS_ORDERED_COUNT serves in sequence.
+					result.info.uses_ordered_append      = true;
+					result.info.ordered_append_waves     = waves;
+					result.info.ordered_append_wave_size = wave_size;
+					const auto u32   = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+					auto       group = builtin(IR::StageInputKind::WorkgroupId, 2);
+					group            = entry_ir.IAdd(
+					    entry_ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 1)),
+					    builtin(IR::StageInputKind::WorkgroupId, 1));
+					group = entry_ir.IAdd(
+					    entry_ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 0)),
+					    builtin(IR::StageInputKind::WorkgroupId, 0));
+					const auto term = entry_ir.BitwiseAnd(
+					    entry_ir.IAdd(entry_ir.IMul(group, u32(waves)), wave_id),
+					    u32(IR::OrderedAppendWaveIdMask));
+					tg_size = entry_ir.BitwiseOr(
+					    tg_size, entry_ir.ShiftLeftLogical(term, IR::U32(IR::Value(6u))));
+				}
 				entry_ir.SetScalarReg(
-				    static_cast<IR::ScalarReg>(cs->workgroup_register + reg_offset),
-				    entry_ir.BitwiseOr(entry_ir.BitwiseOr(wave_bits, IR::U32(IR::Value(waves))),
-				                       first_bit));
+				    static_cast<IR::ScalarReg>(cs->workgroup_register + reg_offset), tg_size);
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;

@@ -1196,6 +1196,72 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+namespace {
+
+// Atomic add on one of the ordered-append counters, which sit past the guest GDS range.
+uint32_t OrderedAppendCounterAdd(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t dword,
+                                 uint32_t value, uint32_t semantics) {
+	auto&       state    = ctx.state;
+	const auto& mem      = ctx.Memory(inst);
+	const auto  resource = PrepareMemoryResourceAccess(state, mem);
+	const auto  index    = ConstantU32(state, dword);
+	return EmitValueOrZeroIfCondition(
+	    state, EmitMemoryElementInBounds(state, resource, index), [&]() {
+		    const auto pointer = EmitMemoryElementPointer(state, resource, index);
+		    const auto old     = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), old, pointer,
+		                              ConstantU32(state, spv::ScopeDevice),
+		                              ConstantU32(state, semantics), ConstantU32(state, value));
+		    return old;
+	    });
+}
+
+} // namespace
+
+void EmitOrderedAppendRelease(ValueEmitContext& ctx, const IR::Inst& inst) {
+	EmitIfCondition(ctx.state, ctx.Arg(inst, 0), [&]() {
+		OrderedAppendCounterAdd(ctx, inst, IR::OrderedAppendReleaseCounter, 1u,
+		                        spv::MemorySemanticsAcquireReleaseMask |
+		                            spv::MemorySemanticsUniformMemoryMask);
+	});
+}
+
+void EmitOrderedAppendWait(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto rank  = ctx.Arg(inst, 0);
+	EmitIfCondition(state, ctx.Arg(inst, 1), [&]() {
+		// Spin until the release counter reaches this wave's rank. Known limitation: the bound
+		// breaks a deadlock when an earlier wave never releases, at the cost of the order.
+		const auto preheader = state.current_label;
+		const auto header    = state.builder.AllocateId();
+		const auto body      = state.builder.AllocateId();
+		const auto cont      = state.builder.AllocateId();
+		const auto merge     = state.builder.AllocateId();
+		const auto iteration = state.builder.AllocateId();
+		const auto next      = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBranch, header);
+		EmitLabel(state, header);
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0u),
+		                          preheader, next, cont);
+		state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+		state.builder.AddFunction(spv::OpBranch, body);
+		EmitLabel(state, body);
+		const auto current = OrderedAppendCounterAdd(ctx, inst, IR::OrderedAppendReleaseCounter, 0u,
+		                                             spv::MemorySemanticsAcquireReleaseMask |
+		                                                 spv::MemorySemanticsUniformMemoryMask);
+		const auto ready   = Binary(state, spv::OpIEqual, TypeBool(state), current, rank);
+		const auto expired = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), iteration,
+		                            ConstantU32(state, 1u << 22u));
+		const auto done    = Binary(state, spv::OpLogicalOr, TypeBool(state), ready, expired);
+		state.builder.AddFunction(spv::OpBranchConditional, done, merge, cont);
+		EmitLabel(state, cont);
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next, iteration,
+		                          ConstantU32(state, 1u));
+		state.builder.AddFunction(spv::OpBranch, header);
+		EmitLabel(state, merge);
+	});
+}
+
 uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem   = ctx.Memory(inst);
 	auto&       state = ctx.state;

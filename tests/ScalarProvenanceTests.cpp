@@ -154,6 +154,23 @@ void TestRawScalarComponentAlignment() {
       "raw scalar base, immediate, and offset were not aligned independently");
 }
 
+void TestNullScalarAddressWithoutReaderReadsZero() {
+  // A title can issue scalar loads through an SRT pointer it has not populated yet. Without a
+  // memory reader the walker dereferences the address directly, so a null pointer must read
+  // as zero (the null resource) instead of faulting on the host.
+  Fixture fixture;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x20);
+  const auto read = RawRead(
+      fixture, Address(fixture, Value(0u), Value(0u)), Value(0u), memory);
+  LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+  fixture.Plan();
+
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), SrtRuntime{}).RefreshFlatBuffer(flat),
+        "null scalar SRT address without a reader failed to evaluate");
+  Check(flat == std::vector<uint32_t>{0u}, "null scalar SRT address did not read as zero");
+}
+
 void TestScalarMemoryDomainMismatchFails() {
   Fixture raw;
   const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
@@ -720,6 +737,7 @@ int main() {
   try {
     TestImmediateFlatteningAndGvn();
     TestRawScalarComponentAlignment();
+    TestNullScalarAddressWithoutReaderReadsZero();
     TestScalarMemoryDomainMismatchFails();
     TestDynamicReadRemainsTyped();
     TestNestedSrtWalk();

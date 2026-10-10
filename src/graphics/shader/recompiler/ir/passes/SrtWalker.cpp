@@ -50,6 +50,9 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+// Lowest address any host or guest mapping can occupy (matches the default Linux mmap_min_addr
+// and the Windows null-pointer reservation), so direct reads below it always fault.
+constexpr uint64_t NullPageLimit = 0x10000ull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
@@ -561,6 +564,14 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
+		// Without a reader the address is dereferenced directly. A null or near-null SRT pointer
+		// (e.g. user data the title has not populated yet) can never be mapped, so read it as
+		// zero instead of faulting on the host. A zero descriptor resolves to the null resource,
+		// matching how empty vector buffers are evaluated above.
+		if (address < NullPageLimit) {
+			result = 0u;
+			return true;
+		}
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;

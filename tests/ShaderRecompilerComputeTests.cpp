@@ -40359,6 +40359,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
                    std::bit_cast<u32>(dynamic_sampler ? 20.0f : 80.0f),
                    std::bit_cast<u32>(dynamic_sampler ? 2.0f : 8.0f)};
   if (independent_sampler != 0u) {
+    test.expected_dense_images = 3u;
     test.name = independent_sampler == 1u ? "IndependentInlineSamplerRoot"
         : independent_sampler == 2u ? "IndependentInlineSamplerKey"
                                     : "IndependentInlineSamplerRootAndKey";

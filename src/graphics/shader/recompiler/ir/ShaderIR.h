@@ -172,6 +172,7 @@ struct ImageResource {
 	uint32_t                      independent_sampler_mapping_offset = 0;
 	uint32_t                      independent_sampler_search_iterations = 0;
 	uint32_t                      independent_sampler_candidates = 0;
+	std::vector<uint32_t>         independent_sampler_resources;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;

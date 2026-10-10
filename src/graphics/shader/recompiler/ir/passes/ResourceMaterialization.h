@@ -31,6 +31,7 @@ struct ResourceSpecialization {
 		uint32_t                      independent_sampler_mapping_offset = 0;
 		uint32_t                      independent_sampler_search_iterations = 0;
 		uint32_t                      independent_sampler_candidates = 0;
+		std::vector<uint32_t>         independent_sampler_resources;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          needs_manual_depth_compare = false;

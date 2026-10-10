@@ -5639,11 +5639,15 @@ void TestIndependentInlineSampledSources() {
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     Check(MaterializeResources(plan, {.user_data = user_data, .userdata = &memory,
-        .read_specialization_memory = ReadLinearTestMemory}, snapshot, specialization),
+        .read_specialization_memory = ReadLinearTestMemory, .max_dense_images = 3u}, snapshot, specialization),
         "independent inline descriptors did not materialize");
     const auto& root = specialization.images[0];
     Check(root.independent_sampler_candidates != 0u,
           "independent inline selectors were collapsed into one mapping");
+    Check(snapshot.images.size() == 3u,
+          "independent samplers duplicated image bindings");
+    Check(root.independent_sampler_resources.size() >= 2u,
+          "independent samplers lost sampler state");
     const auto lookup = [&](uint32_t offset, uint32_t key) {
       for (uint32_t row = 0; row < snapshot.flattened_srt.at(offset); ++row) {
         const auto position = offset + 1u + row * 2u;
@@ -5658,9 +5662,8 @@ void TestIndependentInlineSampledSources() {
         const auto selected_image = lookup(root.indirect_mapping_offset, image_record * 872u);
         const auto selected_sampler = lookup(root.independent_sampler_mapping_offset, sampler_record * 872u);
         Check(selected_image != 0u, "valid independent image selected the null descriptor");
-        const auto ordinal = 1u + (selected_image - 1u) * root.independent_sampler_candidates + selected_sampler;
-        const auto resource = root.indirect_resources.at(ordinal);
-        const auto native_sampler = specialization.images.at(resource).indirect_sampler;
+        const auto resource = root.indirect_resources.at(selected_image);
+        const auto native_sampler = root.independent_sampler_resources.at(selected_sampler);
         Check(snapshot.images.at(resource).dwords[0] == 0x20u + image_record * 0x20u &&
                   snapshot.samplers.at(native_sampler).dwords[0] == (sampler_record == 0u ? 0u : 146u),
               "independent descriptor mapping selected the wrong image/sampler combination");

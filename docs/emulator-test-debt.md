@@ -1,5 +1,29 @@
 # Emulator regression test debt
 
+## Independent image/sampler bindings without Cartesian image duplication (2026-10-10)
+
+Nativef8b8e2f8 / EXE9b191 / original5178 run010007 naturally exits321 at
+01:36:13.035UTC,1270 complete pipelines, no timeout/process/system memory
+guard. PS07b3 passes resource tracking, then independent candidate products
+exceed the dense image resource limit during materialization. No menu/entry.
+Required RED: two direct inline images plus null and independently selected
+samplers must materialize within a three-image budget, without raising quotas
+or dropping sampler state; same numeric outputs for all root/key variants,
+compact/full descriptors, wave32/64/full backing. Use separate sampler slots
+and key mappings, preserve per-origin classes/ownership/bounds and strict
+aggregate native sampler/image/pair budgets. Same-source driver cache warmed
+through six bounded runs; do not discard it for speculative changes.
+
+Completed locally: intended native RED
+`_Build/checks/20261010-014057-9245537-resource_tracking_tests`; unchanged
+three-image-budget GREEN015807 and full resource suite020913 PASS2/2.
+Separate image/sampler bindings pass all six unchanged numeric GPUAV cases
+in022433, including full T#, wave32/64 and complete backing. Registered
+neighbors021106 PASS5/5; shared/ordinary image GPUAV022037 PASS. Image,
+native sampler and sampled-pair quotas remain enforced. Independently
+selected manual depth compare and nested image tables remain explicit
+unsupported cases. Native emulator rebuild and original-game retry pending.
+
 ## Split-wave64 scalar ConditionRef provenance (PR1338 candidate, 2026-10-09)
 
 Current `spirvEmitterFlow.cpp::EmitConditionRef` passes a `const Inst*` to

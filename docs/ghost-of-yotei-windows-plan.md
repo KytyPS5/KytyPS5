@@ -1,5 +1,131 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 02:27 UTC** (independent bindings regression proved):
+
+- Original5178 / sourcef8b8e2f8 / EXE9b191 run
+  `_Build/runs/game-20261010-010007-independent-inline-samplers-native`
+  naturally exits321 at01:36:13.035UTC after1270 complete pipelines. Timeout
+  and both memory guards=false, minimum available RAM17.67GiB. PS07b3 passes
+  tracking but Cartesian candidate duplication exceeds the dense image limit.
+  No visually confirmed menu or game entry; no issue108 publication.
+- Working fix preserves independent image and sampler slots, separate key
+  mappings and class-aware sampled pairs, without multiplying image views or
+  raising quotas. Native three-image-budget RED014057 -> GREEN015807;
+  resource suite020913 PASS2/2; six unchanged numeric GPUAV cases022433 PASS,
+  full T#/wave32/wave64/full backing. Registered neighbors021106 PASS5/5 and
+  shared/ordinary image GPUAV022037 PASS. Artifact roots are `_Build/checks/`.
+- Next: commit this verified shared fix separately, build native Windows,
+  preserve installed EXE and warmed cache, then retry original eboot with
+  bounded3600s/32GiB process cap/8GiB Windows reserve/240s close grace.
+  Manual independent depth compare and nested image tables remain unsupported;
+  other-game runtime coverage, menu and gameplay remain pending.
+
+Checkpoint **2026-10-10 00:46 UTC** (fifth deadline exit; workload-duration adjustment):
+
+- Samef8b8e2f8 / EXE9b191 / original5178 run001242 ends exit0 at
+ 00:42:50.729UTC,938 pipelines, timedOut=true, memoryGuard=false,
+  systemMemoryGuard=false, closeRequested=true/no forced cleanup. Windows
+  available RAM minimum18.16GiB. Game28288/tools93739 ended. No menu/post.
+- Driver cache payload1101179817/file1101180002 bytes saved unchanged at exit.
+  No new semantic fatal, PS07b3 independent-source frontier still pending.
+- Repeated1800s runs make cache progress but stop before the real frontier.
+  Measured fc6 variants take~128s each; fresh54904/1158 variants also dominate
+  creation. Next launcher lifetime3600s, still explicitly bounded, with the
+  same32GiB process ceiling/8GiB Windows reserve/240s close grace. This adjusts
+  a real-workload supervisor duration, not GPU TDR or a regression-test timeout.
+  Source/EXE/resource limits remain unchanged; no emulator fix claimed here.
+
+Checkpoint **2026-10-10 00:09 UTC** (capacity-guard retry ends safely at deadline):
+
+- Sourcef8b8e2f8 / EXE9b191 / original5178 run233618 ends exit0 at
+ 00:07:25.245UTC,927 complete pipelines, timedOut=true, memoryGuard=false,
+  systemMemoryGuard=false, closeRequested=true/no forced cleanup. Game9616
+  and tools38250 ended; native slot idle. System available RAM minimum18.09GiB
+  with process cap32GiB/system floor8GiB. No production resource limits changed.
+- Driver cache payload1086698267/file1086698452 bytes saved unchanged at exit.
+  Large54904/da4ff variants still consume the bounded run. No new semantic fatal;
+  original PS07b3 independent-source frontier, menu and entry remain pending.
+- Next: same-source bounded warm retry; preserve all prior artifacts/caches.
+  Continuing cache preparation is not a successful game or cross-game result.
+
+Checkpoint **2026-10-09 23:36 UTC** (third guard exit; capacity-based launcher budget):
+
+- Same sourcef8b8e2f8 / EXE9b191 / original5178 run231847 ends exit0 at
+ 23:32:42.335UTC,919 pipelines, memoryGuard=true28GiB, timedOut=false,
+  closeRequested=true. Game42528 and tools91922 ended; no new semantic fatal.
+  Driver cache payload1072063393 bytes/file1072063578 saved. Old PS07b3 pending.
+- Live host check after closure:63.93GiB physical/38.93GiB available. Earlier
+  process sample showed substantial shared working-set pages. This does not
+  establish absence of a leak. No production memory/resource quota was changed.
+- ACTIVE fourth same-source retry
+  `_Build/runs/game-20261009-233618-independent-inline-samplers-native`,
+  PID9616/tools38250. Launcher process ceiling32GiB (about half physical RAM),
+  plus new explicit system-free-memory floor8GiB sampled every5s. The runner
+  records systemMemoryGuard/minimumObservedAvailableMemoryGiB at completion.
+  This is a measured launcher configuration, not a claimed emulator fix.
+  Timeout1800s/close grace240s/Performance1280x720 remain unchanged. Source
+  inputs fixed; no simultaneous native build/GPU test. Menu/entry/post pending.
+
+Checkpoint **2026-10-09 23:18 UTC** (second retry safely ends at deadline; further warm retry next):
+
+- Sourcef8b8e2f8 / EXE9b191 / original5178 run224616 ends exit0 at
+ 23:17:17.997UTC,915 complete pipelines, timedOut=true, memoryGuard=false,
+  closeRequested=true, no forced cleanup. Game44780 and tools48134 ended.
+  Visible loading arc only (`window-warm-progress.png`); no menu/entry/post.
+- Five CSfc6f8c56eb7e168f variants1053..1057 create in135880/128713/127649/
+ 127897/129067ms, consuming about11 minutes of this bounded run. Last driver
+  cache payload1069048073 bytes, file1069048258 bytes, saved unchanged at exit.
+  New semantic PS07b3 frontier remains pending. No unsupported errors suppressed.
+- Next: unchanged source/EXE/1800s/28GiB/240s grace warm retry with this cache;
+  do not increase guards or interpret deadline exit0 as successful startup.
+
+Checkpoint **2026-10-09 23:05 UTC** (warm same-source retry has visible loading UI):
+
+- ACTIVE original5178 / sourcef8b8e2f8 / EXE9b191 second run
+  `_Build/runs/game-20261009-224616-independent-inline-samplers-native`,
+  PID44780, tools exec48134, unchanged1800s/28GiB/240s grace/Performance1280x720.
+  Passed first run's794-pipeline memory-guard point; at23:04:57872 pipelines,
+  24.77GiB working set. No new semantic fatal. Source inputs remain fixed.
+- Owned foreground capture `window-warm-progress.png` visually shows the white
+  loading arc on black. This proves pixels/loading UI only, not menu or entry.
+  No issue108 publication. Original PS07b3 independent-source frontier still pending.
+- Read-only memory sample22:52:19:64GiB host,22.55GiB available; process
+  PrivateBytes12.88GB/WorkingSet25.19GB/WorkingSetPrivate2.90GB;
+  GPU dedicated9.30GB/shared0.70GB. No guard or emulator limit was increased.
+
+Checkpoint **2026-10-09 22:45 UTC** (new native run ends at memory guard; warm retry next):
+
+- Source `f8b8e2f8` / installed9b191 / original5178 run222335 ends exit0 at
+ 22:44:13.764UTC,794 complete pipelines, timedOut=false, memoryGuard=true,
+  closeRequested=true. This is bounded supervisor shutdown at28GiB, not a
+  successful game exit. Native slot is now idle; exec session20142 finished.
+- Last snapshots `window-early.png`, `window-progress.png`, `window-778.png`
+  are black. No menu/entry or issue108 milestone. Old PS07b3 independent-source
+  frontier has not been retried yet. No new semantic fatal was captured.
+- Driver cache1037290978 bytes saved. Prior1015211758-byte cache and f268
+  EXE preserved. New modules compiled more slowly despite loading the previous
+  cache; causal split between ConditionRef and planning-root changes is unproved.
+  Next: same source/EXE and unchanged1800s/28GiB limits with the newly warmed
+  cache before changing production or relaxing any guard.
+
+Checkpoint **2026-10-09 22:24 UTC** (new native original-game retry active):
+
+- Separate local commits `c01d2892` (ConditionRef) and
+  `f8b8e2f893a8169d3dbba6cee679a4fa36cdac7b` (independent direct sources).
+  Native emulator build221946 PASS; installed SHA-256
+  `9b19143c512a0f05e2e8044f159e04215a5628be92ae3adebed522e87694b9cd`.
+  Previous f268 EXE and complete1015211758-byte driver cache preserved in
+  `_Build/analysis/independent-inline-samplers-20261010/runtime-20261009T222211Z-62d01351/`.
+- ACTIVE original eboot5178 run
+  `_Build/runs/game-20261009-222335-independent-inline-samplers-native`,
+  PID46160, bounded1800s/28GiB/240s close grace, normal async Performance,
+ 1280x720, timing only. Foreground controlled runner exec session20142;
+  the older detached-background attempt created no game/run evidence and
+  is not a runtime result. Source inputs fixed; no native build/GPU test.
+- Early owned-window `window-early.png` is black despite shown-frame counters.
+  No new visible-menu/game-entry proof. Observe full outcome and old PS07b3
+  frontier before another production edit. WSL remains stopped. No push/post.
+
 Checkpoint **2026-10-09 22:19 UTC** (native independent sources proved; emulator build/retry next):
 
 - Native Windows only; WSL remains stopped. Branch `yotei-windows-bringup`,

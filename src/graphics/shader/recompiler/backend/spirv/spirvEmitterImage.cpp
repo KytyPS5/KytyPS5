@@ -713,8 +713,7 @@ uint32_t EmitDescriptorKeySelection(ValueEmitContext& ctx, uint32_t key,
 }
 
 uint32_t EmitIndirectImageSelection(ValueEmitContext& ctx, const IR::Inst& inst,
-                                    IR::Value image_arg, const IR::ImageResource& image,
-                                    IR::Value sampler_arg = {}, uint32_t sampler_resource = UINT32_MAX) {
+                                    IR::Value image_arg, const IR::ImageResource& image) {
 	auto& state = ctx.state;
 	const auto* handle = image_arg.ResolveInstruction();
 	const auto* source = image.source < ctx.program.descriptor_sources.size()
@@ -738,33 +737,6 @@ uint32_t EmitIndirectImageSelection(ValueEmitContext& ctx, const IR::Inst& inst,
 	}
 	auto selected = EmitDescriptorKeySelection(ctx, key, image.indirect_mapping_offset,
 	                                           image.indirect_search_iterations);
-	if (image.independent_sampler_candidates != 0u) {
-		uint32_t sampler = ConstantU32(state, 0u);
-		if (!sampler_arg.IsEmpty() && sampler_resource < state.program.info.samplers.size()) {
-			const auto source_index = state.program.info.samplers[sampler_resource].source;
-			const auto* sampler_source = source_index < ctx.program.descriptor_sources.size()
-			    ? &ctx.program.descriptor_sources[source_index] : nullptr;
-			const auto* sampler_handle = sampler_arg.ResolveInstruction();
-			if (sampler_source != nullptr && sampler_source->inline_descriptor) {
-				const auto sampler_key_arg = sampler_source->inline_descriptor->key_arg;
-				if (sampler_handle == nullptr || sampler_key_arg >= sampler_handle->NumArgs()) {
-					ctx.Fail(inst, "has invalid independent sampler key provenance");
-					return 0u;
-				}
-				sampler = EmitDescriptorKeySelection(ctx, ctx.Def(sampler_handle->Arg(sampler_key_arg)),
-				    image.independent_sampler_mapping_offset, image.independent_sampler_search_iterations);
-			}
-		}
-		const auto nonnull = Binary(state, OpINotEqual, TypeBool(state), selected, ConstantU32(state, 0u));
-		const auto combined = Binary(state, OpIAdd, TypeU32(state),
-		    Binary(state, OpIMul, TypeU32(state),
-		        Binary(state, OpISub, TypeU32(state), selected, ConstantU32(state, 1u)),
-		        ConstantU32(state, image.independent_sampler_candidates)),
-		    Binary(state, OpIAdd, TypeU32(state), sampler, ConstantU32(state, 1u)));
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction({OpSelect, TypeU32(state), result, nonnull, combined, ConstantU32(state, 0u)});
-		selected = result;
-	}
 	return selected;
 }
 
@@ -1108,7 +1080,28 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		const auto EmitSample = [&](uint32_t resource) {
+		uint32_t independent_sampler = ConstantU32(state, 0u);
+		const auto* sampler_handle = inst.Arg(1).ResolveInstruction();
+		const auto sampler_source_index = state.program.info.samplers.at(mem.sampler).source;
+		const auto* sampler_source = sampler_source_index < ctx.program.descriptor_sources.size()
+		    ? &ctx.program.descriptor_sources[sampler_source_index] : nullptr;
+		const bool independent = !image.independent_sampler_resources.empty() &&
+		    sampler_source != nullptr && sampler_source->inline_descriptor.has_value();
+		if (independent) {
+			if (use_manual_compare) {
+				ctx.Fail(inst, "does not support independently selected manual depth-compare samplers");
+				return;
+			}
+			const auto key_arg = sampler_source->inline_descriptor->key_arg;
+			if (sampler_handle == nullptr || key_arg >= sampler_handle->NumArgs()) {
+				ctx.Fail(inst, "has invalid independent sampler key provenance");
+				return;
+			}
+			independent_sampler = EmitDescriptorKeySelection(ctx, ctx.Def(sampler_handle->Arg(key_arg)),
+			    image.independent_sampler_mapping_offset, image.independent_sampler_search_iterations);
+		}
+		uint32_t sample_exit_label = 0u;
+		const auto EmitOneSample = [&](uint32_t resource, uint32_t forced_sampler = UINT32_MAX) {
 			const auto& selected_image = state.program.info.images[resource];
 			const auto candidate_dimension = selected_image.dimension;
 			const auto& candidate_dimension_info = ImageDimensionInfoFor(candidate_dimension);
@@ -1145,7 +1138,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			const auto candidate_sampler = state.program.info.images[resource].indirect_sampler;
 			const auto sampled = MakeSampledImage(state, resource,
-			    candidate_sampler != UINT32_MAX ? candidate_sampler : mem.sampler);
+			    forced_sampler != UINT32_MAX ? forced_sampler
+			        : candidate_sampler != UINT32_MAX ? candidate_sampler : mem.sampler);
 			const auto candidate_result_type =
 			    dref && !use_manual_compare
 			        ? TypeF32(state)
@@ -1171,6 +1165,47 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			return sample;
 		};
+		const auto EmitSample = [&](uint32_t resource) {
+			sample_exit_label = 0u;
+			if (!independent) return EmitOneSample(resource);
+			const auto& samplers = state.program.info.images.at(resource).independent_sampler_resources;
+			if (samplers.empty()) {
+				ctx.Fail(inst, "has no independent sampler resources for its image class");
+				return uint32_t{0};
+			}
+			// A direct inline root's default T# is null. Canonicalize its unused sampler
+			// as before; valid images retain each independently selected sampler state.
+			if (resource == mem.resource || samplers.size() == 1u)
+				return EmitOneSample(resource, samplers[0]);
+			const auto default_sampler_label = state.builder.AllocateId();
+			const auto sampler_merge = state.builder.AllocateId();
+			std::vector<uint32_t> sampler_labels(samplers.size() - 1u);
+			std::vector<uint32_t> words{OpSwitch, independent_sampler, default_sampler_label};
+			for (uint32_t ordinal = 1; ordinal < samplers.size(); ++ordinal) {
+				sampler_labels[ordinal - 1u] = state.builder.AllocateId();
+				words.push_back(ordinal);
+				words.push_back(sampler_labels[ordinal - 1u]);
+			}
+			state.builder.AddFunction({OpSelectionMerge, sampler_merge, SelectionControlNone});
+			state.builder.AddFunction(words);
+			const auto type = heterogeneous_numeric ? TypeU32Vector(state, 4) : result_type;
+			std::vector<uint32_t> sampler_phi{OpPhi, type, state.builder.AllocateId()};
+			EmitLabel(state, default_sampler_label);
+			sampler_phi.push_back(EmitOneSample(resource, samplers[0]));
+			sampler_phi.push_back(default_sampler_label);
+			state.builder.AddFunction({OpBranch, sampler_merge});
+			for (uint32_t ordinal = 1; ordinal < samplers.size(); ++ordinal) {
+				EmitLabel(state, sampler_labels[ordinal - 1u]);
+				sampler_phi.push_back(EmitOneSample(resource, samplers[ordinal]));
+				sampler_phi.push_back(sampler_labels[ordinal - 1u]);
+				state.builder.AddFunction({OpBranch, sampler_merge});
+			}
+			EmitLabel(state, sampler_merge);
+			state.builder.AddFunction(sampler_phi);
+			sample_exit_label = sampler_merge;
+			return sampler_phi[2];
+		};
+
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
 			auto       result = sample;
@@ -1199,7 +1234,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 			return;
 		}
-		const auto selected = EmitIndirectImageSelection(ctx, inst, image_arg, image, inst.Arg(1), mem.sampler);
+		const auto selected = EmitIndirectImageSelection(ctx, inst, image_arg, image);
 		if (selected == 0u) return;
 		const auto            default_label = state.builder.AllocateId();
 		const auto            merge_label   = state.builder.AllocateId();
@@ -1217,12 +1252,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		std::vector<uint32_t> phi_words {OpPhi, phi_type, state.builder.AllocateId()};
 		EmitLabel(state, default_label);
 		phi_words.push_back(EmitSample(image.indirect_resources[0]));
-		phi_words.push_back(default_label);
+		phi_words.push_back(sample_exit_label != 0u ? sample_exit_label : default_label);
 		state.builder.AddFunction({OpBranch, merge_label});
 		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
 			EmitLabel(state, labels[candidate - 1u]);
 			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
-			phi_words.push_back(labels[candidate - 1u]);
+			phi_words.push_back(sample_exit_label != 0u ? sample_exit_label : labels[candidate - 1u]);
 			state.builder.AddFunction({OpBranch, merge_label});
 		}
 		EmitLabel(state, merge_label);

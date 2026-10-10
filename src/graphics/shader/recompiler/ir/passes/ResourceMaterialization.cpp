@@ -769,19 +769,10 @@ bool MaterializeIndependentInlineSampler(const DescriptorSource::InlineDescripto
 			image.sampler_candidates.push_back(candidate);
 		}
 	}
-	const uint64_t product = 1u + uint64_t{image.descriptors.size() - 1u} * samplers.size();
-	if (product > ShaderInfo::MaxImages || product > runtime.max_dense_images)
-		return SpecializationFail("independent sampled candidates exceed the dense image resource limit");
-	const auto descriptors = std::move(image.descriptors);
-	image.descriptors = {descriptors[0]};
-	image.samplers = {zero};
-	for (size_t candidate = 1; candidate < descriptors.size(); ++candidate) {
-		for (const auto& value : samplers) {
-			image.descriptors.push_back(descriptors[candidate]);
-			image.samplers.push_back(value);
-		}
-	}
-	image.sampler_count = static_cast<uint32_t>(samplers.size());
+	// Image views and sampler objects have independent descriptor budgets.
+	// Retain each image once; sampled-pair topology is derived separately.
+	image.samplers = std::move(samplers);
+	image.sampler_count = static_cast<uint32_t>(image.samplers.size());
 	return true;
 }
 
@@ -2235,6 +2226,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .independent_sampler_mapping_offset = image.independent_sampler_mapping_offset,
 		    .independent_sampler_search_iterations = image.independent_sampler_search_iterations,
 		    .independent_sampler_candidates = image.independent_sampler_candidates,
+		    .independent_sampler_resources = image.independent_sampler_resources,
 		    .cube                       = image.cube,
 		    .needs_manual_depth_compare = false,
 		    .indirect_resources = image.indirect_resources,
@@ -2259,10 +2251,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	};
 	for (const auto& table: snapshot.indirect_images) {
 		const auto root_image = next_specialization.images[table.resource];
-		std::vector<uint32_t> candidate_samplers(table.descriptors.size(), UINT32_MAX);
+		std::vector<uint32_t> candidate_samplers(
+		    table.sampler_count != 0u ? table.samplers.size() : table.descriptors.size(), UINT32_MAX);
 		if (table.sampler_resource != UINT32_MAX) {
 			if (table.sampler_resource >= program.info.samplers.size() ||
-			    table.samplers.size() != table.descriptors.size()) {
+			    (table.sampler_count == 0u && table.samplers.size() != table.descriptors.size())) {
 				return SpecializationFail("inline sampled pair has an invalid sampler table");
 			}
 			for (uint32_t candidate = 0; candidate < table.samplers.size(); candidate++) {
@@ -2315,7 +2308,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				}
 				auto image = root_image;
 				image.indirect_root = table.resource;
-				image.indirect_sampler = candidate_samplers[candidate];
+				image.indirect_sampler = table.sampler_count == 0u ? candidate_samplers[candidate] : UINT32_MAX;
+				if (table.sampler_count != 0u) image.independent_sampler_resources = candidate_samplers;
 				image.indirect_resources.clear();
 				next_specialization.images.push_back(std::move(image));
 				next_snapshot.images.push_back(table.descriptors[candidate]);
@@ -2325,7 +2319,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		auto& root                      = next_specialization.images[table.resource];
 		root.indirect_resources         = std::move(resources);
 		root.indirect_root              = table.resource;
-		root.indirect_sampler           = candidate_samplers[0];
+		root.indirect_sampler           = table.sampler_count == 0u ? candidate_samplers[0] : UINT32_MAX;
+		if (table.sampler_count != 0u) root.independent_sampler_resources = candidate_samplers;
 		root.indirect_mapping_offset    = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
 		root.indirect_search_iterations = std::bit_width(table.keys.size());
 		root.independent_sampler_candidates = table.sampler_count;
@@ -2685,22 +2680,31 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		                             : direct;
 		for (const auto index: candidates) {
 			const auto& image = next_specialization.images[index];
-			const bool dynamic_pair = image.indirect_sampler != UINT32_MAX &&
-			                          image.indirect_sampler < next_specialization.sampler_origins.size() &&
-			                          next_specialization.sampler_origins[image.indirect_sampler] == pair.sampler;
-			const auto sampler = dynamic_pair ? image.indirect_sampler : pair.sampler;
-			if (sampler >= sampler_info.samplers.size()) {
-				return SpecializationFail("sampled pair has an invalid sampler resource");
+			for (const auto sampler: image.independent_sampler_resources) {
+				if (sampler >= next_specialization.sampler_origins.size())
+					return SpecializationFail("independent sampled pair references an absent sampler");
 			}
-			if (std::ranges::any_of(sampler_info.sampled_pairs, [&](const SampledResourcePair& p) {
-				    return p.image == index && p.sampler == sampler;
-				})) {
-				continue;
+			const bool independent = !image.independent_sampler_resources.empty() &&
+			    next_specialization.sampler_origins[image.independent_sampler_resources[0]] == pair.sampler;
+			std::vector<uint32_t> selected_samplers;
+			if (independent) {
+				selected_samplers = image.independent_sampler_resources;
+			} else {
+				const bool dynamic_pair = image.indirect_sampler != UINT32_MAX &&
+				    image.indirect_sampler < next_specialization.sampler_origins.size() &&
+				    next_specialization.sampler_origins[image.indirect_sampler] == pair.sampler;
+				selected_samplers.push_back(dynamic_pair ? image.indirect_sampler : pair.sampler);
 			}
-			if (sampler_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs) {
-				return SpecializationFail("specialized sampled pairs exceed the resource limit");
+			for (const auto sampler: selected_samplers) {
+				if (sampler >= sampler_info.samplers.size())
+					return SpecializationFail("sampled pair has an invalid sampler resource");
+				if (std::ranges::any_of(sampler_info.sampled_pairs, [&](const SampledResourcePair& p) {
+					return p.image == index && p.sampler == sampler;
+				})) continue;
+				if (sampler_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs)
+					return SpecializationFail("specialized sampled pairs exceed the resource limit");
+				sampler_info.sampled_pairs.push_back({index, sampler, pair.first_use_pc});
 			}
-			sampler_info.sampled_pairs.push_back({index, sampler, pair.first_use_pc});
 		}
 	}
 	next_specialization.sampled_pairs = sampler_info.sampled_pairs;
@@ -3232,6 +3236,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.independent_sampler_mapping_offset = source.independent_sampler_mapping_offset;
 		image.independent_sampler_search_iterations = source.independent_sampler_search_iterations;
 		image.independent_sampler_candidates = source.independent_sampler_candidates;
+		image.independent_sampler_resources = source.independent_sampler_resources;
 		image.cube                       = source.cube;
 		image.indirect_resources = source.indirect_resources;
 		for (const auto resource: image.indirect_resources) EXIT_IF(resource >= specialization.images.size());
@@ -3289,6 +3294,12 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			const auto type = static_cast<uint32_t>(ClassifySampler(image));
 			image.indirect_sampler = sampler_plan.mapping[image.indirect_sampler][type];
 			EXIT_IF(image.indirect_sampler == UINT32_MAX);
+		}
+		for (auto& sampler : image.independent_sampler_resources) {
+			EXIT_IF(sampler >= sampler_info.samplers.size());
+			const auto type = static_cast<uint32_t>(ClassifySampler(image));
+			sampler = sampler_plan.mapping[sampler][type];
+			EXIT_IF(sampler == UINT32_MAX);
 		}
 	}
 

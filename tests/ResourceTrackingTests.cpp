@@ -6597,7 +6597,7 @@ void TestSharedInlineImageCandidates(bool pair_domain_regression = false) {
 
 }
 
-void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = false, bool grow_mask = false, bool preceding_cycle = false) {
+void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = false, bool grow_mask = false, bool preceding_cycle = false, bool uniform_row = false, bool invalid_row = false, bool wrapping_row = false) {
   Fixture fixture;
   auto* entry = fixture.block;
   auto* gate = fixture.AddBlock();
@@ -6605,8 +6605,8 @@ void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = 
   auto* body = fixture.AddBlock();
   auto* exit = fixture.AddBlock();
   const auto active = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(8u), Value(0u)});
-  const auto row = fixture.UserData(9u);
-  const auto bounded = fixture.Emit(ValueOpcode::ULessThan32, {row, Value(2u)});
+  const auto row = wrapping_row ? fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(9u), Value(2u)}) : fixture.UserData(9u);
+  const auto bounded = fixture.Emit(ValueOpcode::ULessThan32, {row, Value(uniform_row ? 255u : 2u)});
   std::array<Value, 4> words;
   for (uint32_t word = 0; word < 4u; ++word) words[word] = fixture.UserData(word);
   const auto buffer = fixture.Buffer(words);
@@ -6717,6 +6717,36 @@ void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = 
   Check(fixture.program.info.images.size() == 1u &&
       fixture.program.descriptor_sources.at(fixture.program.info.images[0].source).inline_descriptor->address_table.has_value(),
       "shrinking mask lost paired pointer ancestry");
+  if (uniform_row) {
+    std::array<uint32_t, 12> user_data{};
+    user_data[0] = 0x100000u; user_data[1] = 136u << 16u;
+    user_data[2] = 2u; user_data[3] = 0x5204u;
+    user_data[8] = 1u; user_data[9] = wrapping_row ? UINT32_MAX : invalid_row ? 64u : 1u;
+    SrtRuntime runtime;
+    runtime.user_data = user_data;
+    runtime.neighboring_stages_read_only = true;
+    runtime.read_memory = runtime.read_specialization_memory = +[](void*, uint64_t address, std::span<uint32_t> words) {
+      if (words.size() != 1u) return false;
+      if (address == 0x100078u || address == 0x100100u) { words[0] = 0x200000u; return true; }
+      if (address == 0x10007cu || address == 0x100104u) { words[0] = 0u; return true; }
+      for (const auto row : {1u,64u}) {
+        const uint64_t base = 0x200000u + uint64_t{row} * 368u + 64u;
+        if (address < base || address >= base + 32u || (address - base) % 4u) continue;
+        const uint32_t descriptor[8]{0x3000u, 60u << 20u, 0u,
+            ((row == 64u ? 4u : 9u) << 28u) | (5u << 20u) | 0xfacu, 0u,0u,0u,0u};
+        words[0] = descriptor[(address - base) / 4u]; return true;
+      }
+      return false; // Unselected rows are deliberately unavailable.
+    };
+    auto plan = ExtractResourcePlan(fixture.program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool ok = MaterializeResources(plan, runtime, snapshot, specialization);
+    if (invalid_row) {
+      Check(!ok && LastResourceSpecializationError().find("unsupported image descriptor") != std::string_view::npos,
+            "selected invalid uniform row was accepted");
+    } else Check(ok, "uniform wave row probes unselected descriptor rows");
+  }
 }
 
 void TestInlineFullWidthImageLoads() {
@@ -9480,6 +9510,13 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ADDRESS_BACKED_INDIRECT_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--wave-address-uniform-row-only") == 0) {
+      TestWaveAddressShrinkingMask(false, false, false, false, true);
+      TestWaveAddressShrinkingMask(false, false, false, false, true, true);
+      TestWaveAddressShrinkingMask(false, false, false, false, true, false, true);
+      std::cout << "KYTY_WAVE_ADDRESS_UNIFORM_ROW_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--wave-address-mask-cycle-only") == 0) {
       TestWaveAddressShrinkingMask(true, false, false, true);
       TestWaveAddressShrinkingMask(true, true, false, true);
@@ -9766,6 +9803,9 @@ int main(int argc, char** argv) {
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
     Run("independent inline sampled sources", TestIndependentInlineSampledSources);
     Run("shrinking wave mask", [] { TestWaveAddressShrinkingMask(); });
+    Run("uniform wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, true); });
+    Run("invalid uniform wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, true, true); });
+    Run("wrapping uniform wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, true, false, true); });
     Run("merged wave mask", [] { TestWaveAddressShrinkingMask(true); });
     Run("empty wave mask bypass", [] { TestWaveAddressShrinkingMask(true, true); });
     Run("original wave mask through cycle", [] { TestWaveAddressShrinkingMask(true, false, false, true); });

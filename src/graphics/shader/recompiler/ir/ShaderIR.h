@@ -611,6 +611,9 @@ struct DescriptorSource {
 			uint32_t row_stride = 0;
 			uint32_t row_limit = 0;
 			uint32_t row_key_arg = 1;
+			// Retained expression permits independent CPU-uniform proofs. An
+			// unknown/vector/memory-dependent row keeps the guarded full domain.
+			Value row_value;
 			bool operator==(const AddressTable&) const = default;
 		};
 		struct ImageTable {

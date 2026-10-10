@@ -2920,6 +2920,7 @@ private:
 		source.inline_descriptor->descriptor_dwords = 8u;
 		source.inline_descriptor->address_table = DescriptorSource::InlineDescriptor::AddressTable{
 		    memory.offset, row_stride, row_limit, 1u};
+		source.inline_descriptor->address_table->row_value = row;
 		plan.handle = &handle; plan.source = InternSource(source); plan.read_count = 8u; plan.root_count = 5u;
 		plan.roots[0] = row;
 		std::copy_n(buffer_source.dwords.begin(), 4u, plan.roots.begin() + 1u);

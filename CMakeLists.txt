@@ -738,6 +738,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME resource_tracking_uniform_wave_row
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --wave-address-uniform-row-only)
+	set_tests_properties(resource_tracking_uniform_wave_row PROPERTIES TIMEOUT 60)
 	add_test(NAME shader_performance_optimization_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --performance-optimization-readback-only)
 	add_test(NAME raw_buffer_runtime_stride

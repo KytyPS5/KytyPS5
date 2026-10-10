@@ -9,9 +9,15 @@ enum class ExceptionType { Unknown, AccessViolation, IllegalInstruction };
 
 enum class AccessViolationType { Unknown, Read, Write, Execute };
 
+// Protection: the page protection forbids the access. WriteProtect: a Linux SIGBUS with
+// BUS_ADRERR, raised for userfaultfd write-protected pages (and for some other bus errors).
+// Other: any other fault, which page protection changes cannot resolve.
+enum class AccessViolationCause { Other, Protection, WriteProtect };
+
 struct ExceptionInfo {
 	ExceptionType       type                   = ExceptionType::Unknown;
 	AccessViolationType access_violation_type  = AccessViolationType::Unknown;
+	AccessViolationCause access_violation_cause = AccessViolationCause::Other;
 	uint64_t            access_violation_vaddr = 0;
 	uint64_t            exception_address      = 0;
 	uint64_t            rax                    = 0;

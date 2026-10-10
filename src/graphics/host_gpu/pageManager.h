@@ -25,6 +25,10 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	// Whether a fault at vaddr is resolved by page tracking: the page is watched against the
+	// access, or it is not (a watch released since the fault) and the access now succeeds.
+	[[nodiscard]] bool IsTrackingFault(uint64_t vaddr, PageFaultAccess access) const noexcept;
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

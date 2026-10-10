@@ -93,8 +93,12 @@
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
+#include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -5214,6 +5218,102 @@ public:
     DestroyBuffer(&readback);
     std::printf("[gpu]     %-32s ok\n", name);
   }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // Guest writes to pages of a GPU-tracked range, through the production fault route.
+  void CheckTrackedGuestWriteFaults() {
+    constexpr const char *name = "TrackedGuestWriteFaults";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t page = 0x4000;
+    constexpr uint64_t allocation_size = page * 8;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x33, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &cache = context.GetBufferCache();
+    context.MapMemory(base, allocation_size);
+    (void)cache.ObtainBuffer(base, allocation_size, false);
+    scheduler.Finish();
+    Require(name, "tracked upload", !cache.IsRegionCpuModified(base, allocation_size),
+            "the uploaded range is not CPU-clean");
+
+    // A tracked guest-writable page: the write faults, is released and lands.
+    auto *writable = reinterpret_cast<volatile uint32_t *>(base + page);
+    *writable = 0x57524954u;
+    Require(name, "tracked write",
+            *writable == 0x57524954u && cache.IsRegionCpuModified(base + page, 4) &&
+                !cache.IsRegionCpuModified(base + 2 * page, 4),
+            "a write to a tracked page was not seen by the cache");
+
+    // The guest made the page read-only: its write is an access violation, not a
+    // tracking fault to retry. Page 0 is still watched; page 1 no longer is.
+    const auto expect_violation = [&](const char *stage, uint64_t address) {
+      std::fflush(nullptr);
+      const pid_t pid = ::fork();
+      Require(name, stage, pid >= 0, "fork failed");
+      if (pid == 0) {
+#if defined(__linux__)
+        // A core dump of this process can outlast the timeout.
+        ::prctl(PR_SET_DUMPABLE, 0);
+#endif
+        if (Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void *>(address), page,
+                                                    0x11) != 0) {
+          ::_exit(2);
+        }
+        *reinterpret_cast<volatile uint32_t *>(address) = 1;
+        ::_exit(0);
+      }
+      int status = 0;
+      pid_t waited = 0;
+      for (int i = 0; i < 1000 && waited == 0; i++) {
+        waited = ::waitpid(pid, &status, WNOHANG);
+        if (waited == 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      }
+      if (waited == 0) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+        Fail(name, stage, "the write to a guest read-only page was retried forever");
+      }
+      Require(name, stage,
+              waited == pid && WIFSIGNALED(status) &&
+                  (WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS),
+              "the write to a guest read-only page did not raise an access violation");
+    };
+    expect_violation("watched read-only page", base);
+    expect_violation("released read-only page", base + page);
+
+    context.UnmapMemory(base, allocation_size);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "free",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                              allocation_size) == 0,
+            "direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+#endif
 
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
@@ -18354,10 +18454,18 @@ private:
                    info.access_violation_type != Exception::AccessViolationType::Write)) {
                 return false;
               }
+              if (info.access_violation_cause == Exception::AccessViolationCause::Other) {
+                return false;
+              }
               const auto access =
                   info.access_violation_type == Exception::AccessViolationType::Write
                       ? PageFaultAccess::Write : PageFaultAccess::Read;
-              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              const auto cause =
+                  info.access_violation_cause == Exception::AccessViolationCause::WriteProtect
+                      ? LibKernel::Memory::GpuFaultCause::WriteProtect
+                      : LibKernel::Memory::GpuFaultCause::Protection;
+              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr,
+                                                       cause);
             }),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
@@ -43849,6 +43957,9 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUnifiedTextureCacheFlow();
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  vulkan.CheckTrackedGuestWriteFaults();
+#endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

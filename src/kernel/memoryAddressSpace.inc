@@ -28,6 +28,89 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+// Page-tracker write watches as page-table write protection (userfaultfd): watching a page
+// neither changes nor splits its view. A write to a protected page raises SIGBUS, which the
+// host fault handler resolves like a protection fault.
+class GuestWriteProtection {
+public:
+	GuestWriteProtection() {
+		const int fd = static_cast<int>(
+		    syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+		if (fd < 0) {
+			LOGF("\t guest write tracking: mprotect (userfaultfd unavailable: %d)\n", errno);
+			return;
+		}
+		uffdio_api api {};
+		api.api      = UFFD_API;
+		api.features = UFFD_FEATURE_SIGBUS | UFFD_FEATURE_WP_HUGETLBFS_SHMEM;
+		if (ioctl(fd, UFFDIO_API, &api) != 0 ||
+		    (api.features & UFFD_FEATURE_WP_HUGETLBFS_SHMEM) == 0 ||
+		    (api.ioctls & (uint64_t {1} << _UFFDIO_REGISTER)) == 0) {
+			LOGF("\t guest write tracking: mprotect (no shared-memory write protection: %d)\n",
+			     errno);
+			close(fd);
+			return;
+		}
+		m_fd = fd;
+		LOGF("\t guest write tracking: userfaultfd write protection\n");
+	}
+
+	~GuestWriteProtection() {
+		if (m_fd >= 0) {
+			close(m_fd);
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(GuestWriteProtection);
+
+	[[nodiscard]] bool Enabled() const { return m_fd >= 0; }
+
+	// False when the view cannot be write-protected; its watches then use mprotect.
+	[[nodiscard]] bool Register(uint64_t vaddr, uint64_t size) const {
+		uffdio_register range {};
+		range.range.start = vaddr;
+		range.range.len   = size;
+		range.mode        = UFFDIO_REGISTER_MODE_WP;
+		bool registered   = false;
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_fail_next_write_protect_register) {
+			g_test_fail_next_write_protect_register = false;
+			errno                                   = EBUSY;
+		} else
+#endif
+		{
+			registered = ioctl(m_fd, UFFDIO_REGISTER, &range) == 0;
+		}
+		if (registered && (range.ioctls & (uint64_t {1} << _UFFDIO_WRITEPROTECT)) == 0) {
+			uffdio_range unregister {vaddr, size};
+			(void)ioctl(m_fd, UFFDIO_UNREGISTER, &unregister);
+			registered = false;
+			errno      = EINVAL;
+		}
+		if (!registered) {
+			LOGF("\t guest write tracking: mprotect for view 0x%016" PRIx64 " size 0x%016" PRIx64
+			     " (userfaultfd registration failed: %d)\n",
+			     vaddr, size, errno);
+		}
+		return registered;
+	}
+
+	[[nodiscard]] bool Protect(uint64_t vaddr, uint64_t size, bool write_protect) const {
+		const auto          page  = static_cast<uint64_t>(getpagesize());
+		const auto          start = vaddr & ~(page - 1);
+		uffdio_writeprotect range {};
+		range.range.start = start;
+		range.range.len   = ((vaddr + size + page - 1) & ~(page - 1)) - start;
+		range.mode        = write_protect ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
+		return ioctl(m_fd, UFFDIO_WRITEPROTECT, &range) == 0;
+	}
+
+private:
+	int m_fd = -1;
+};
+#endif
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -312,12 +395,15 @@ public:
 		return true;
 #else
 		std::lock_guard lock(m_mutex);
-		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
+		bool            write_protected = false;
+		void* mapped = MapView(vaddr, size, backing_offset, mode, &write_protected, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			return false;
 		}
 		RemoveMappingsUnlocked(vaddr, size);
-		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+		EXIT_IF(
+		    !m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode, write_protected})
+		         .second);
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
@@ -487,6 +573,59 @@ public:
 #endif
 	}
 
+	[[nodiscard]] bool WriteProtectsViews() const {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		return m_write_protection.Enabled();
+#else
+		return false;
+#endif
+	}
+
+	// Applies a page-tracker protection to part of the views. On a write-protected view, the
+	// view protection changes only with access watches; write watches stay in the page tables.
+	bool ProtectTracked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+	                    bool access_changed) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		if (m_write_protection.Enabled() &&
+		    (mode == VirtualMemory::Mode::Read || mode == VirtualMemory::Mode::ReadWrite)) {
+			std::shared_lock lock(m_mutex);
+			const auto       end    = vaddr + size;
+			auto             cursor = vaddr;
+			auto             it     = m_maps.upper_bound(vaddr);
+			if (it != m_maps.begin()) {
+				--it;
+			}
+			const auto protect = [&](uint64_t start, uint64_t bytes, bool write_protected) {
+				if (!write_protected) {
+					return VirtualMemory::Protect(start, bytes, mode);
+				}
+				// Write-protect before the view becomes writable, so no write lands unwatched.
+				return m_write_protection.Protect(start, bytes,
+				                                  mode == VirtualMemory::Mode::Read) &&
+				       (!access_changed ||
+				        VirtualMemory::Protect(start, bytes, VirtualMemory::Mode::ReadWrite));
+			};
+			for (; it != m_maps.end() && it->second.vaddr < end; ++it) {
+				const auto& entry = it->second;
+				const auto  start = std::max(cursor, entry.vaddr);
+				const auto  stop  = std::min(end, entry.vaddr + entry.size);
+				if (stop <= start) {
+					continue;
+				}
+				if ((cursor < start && !protect(cursor, start - cursor, false)) ||
+				    !protect(start, stop - start, entry.write_protected)) {
+					return false;
+				}
+				cursor = stop;
+			}
+			return cursor >= end || protect(cursor, end - cursor, false);
+		}
+#else
+		(void)access_changed;
+#endif
+		return VirtualMemory::Protect(vaddr, size, mode);
+	}
+
 	bool Contains(uint64_t vaddr, uint64_t size) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -517,6 +656,8 @@ private:
 		uint64_t            size           = 0;
 		uint64_t            backing_offset = 0;
 		VirtualMemory::Mode mode           = VirtualMemory::Mode::NoAccess;
+		// Registered for userfaultfd write protection; watches on other views use mprotect.
+		bool write_protected = false;
 	};
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -536,11 +677,13 @@ private:
 			it = m_maps.erase(it);
 			if (old.vaddr < vaddr) {
 				m_maps.emplace(old.vaddr,
-				               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
+				               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode,
+				                         old.write_protected});
 			}
 			if (end < old_end) {
-				m_maps.emplace(end, MapEntry {end, old_end - end,
-				                             old.backing_offset + end - old.vaddr, old.mode});
+				m_maps.emplace(end,
+				               MapEntry {end, old_end - end, old.backing_offset + end - old.vaddr,
+				                         old.mode, old.write_protected});
 			}
 		}
 	}
@@ -650,7 +793,7 @@ private:
 	}
 
 	void* MapView(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode,
-	              FailureReason* failure_reason) {
+	              bool* write_protected, FailureReason* failure_reason) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (const auto callback = g_test_before_backing_map) {
 			g_test_before_backing_map = nullptr;
@@ -663,6 +806,11 @@ private:
 			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
 			return nullptr;
 		}
+#if !defined(__APPLE__)
+		*write_protected = m_write_protection.Enabled() && m_write_protection.Register(vaddr, size);
+#else
+		*write_protected = false;
+#endif
 		return ptr;
 	}
 
@@ -674,6 +822,9 @@ private:
 	}
 
 	int m_fd = -1;
+#if !defined(__APPLE__)
+	GuestWriteProtection m_write_protection;
+#endif
 #endif
 
 	uint8_t*                     m_backing_base = nullptr;
@@ -740,6 +891,7 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+	[[nodiscard]] bool     WriteProtectsViews() const { return m_backing->WriteProtectsViews(); }
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);
@@ -801,13 +953,19 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
-	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+	                      bool access_changed) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
 		std::lock_guard lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		return ForEachMappedPartUnlocked(
+		    vaddr, size, [&](const MappedRegion& region, uint64_t start, uint64_t bytes) {
+			    return region.type == MappingType::Backing
+			               ? m_backing->ProtectTracked(start, bytes, mode, access_changed)
+			               : VirtualMemory::Protect(start, bytes, mode);
+		    });
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -1026,7 +1184,9 @@ private:
 		return (value & (m_granularity - 1u)) == 0;
 	}
 
-	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	// Calls func(region, start, size) on each mapped part of the range until it returns false.
+	template <typename Func>
+	bool ForEachMappedPartUnlocked(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {
@@ -1036,12 +1196,18 @@ private:
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
-			if (range_start < range_end &&
-			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+			if (range_start < range_end && !func(region, range_start, range_end - range_start)) {
 				return false;
 			}
 		}
 		return true;
+	}
+
+	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		return ForEachMappedPartUnlocked(
+		    vaddr, size, [mode](const MappedRegion& /*region*/, uint64_t start, uint64_t bytes) {
+			    return VirtualMemory::Protect(start, bytes, mode);
+		    });
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {

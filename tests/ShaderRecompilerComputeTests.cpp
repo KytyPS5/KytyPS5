@@ -4707,6 +4707,123 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // RESIDENT EVIL 3 writes labels into pages a dispatch just wrote; each store drained the queue.
+  void CheckBufferCacheOrderedWrite() {
+    constexpr const char *name = "BufferCacheOrderedWrite";
+    constexpr uintptr_t base = 0x000000020a400000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t gpu_offset = 0x1000;
+    constexpr uint64_t beside_offset = 0x1100;
+    constexpr uint64_t label_offset = 0x1200;
+    constexpr uint64_t clean_offset = 0x8000;
+    constexpr uint32_t stale = 0x0badf00du;
+    constexpr uint32_t gpu_value = 0x11111111u;
+    constexpr uint32_t cp_value = 0x22222222u;
+    constexpr uint32_t later_gpu_value = 0x33333333u;
+    constexpr uint32_t label_value = 0x44444444u;
+    constexpr std::array<uint32_t, 2> beside_values{0x55555555u, 0x66666666u};
+    constexpr uint32_t clean_value = 0x77777777u;
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "ordered-write direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "ordered-write fixed direct-memory mapping failed");
+    for (uint64_t offset = 0; offset < allocation_size; offset += sizeof(stale)) {
+      std::memcpy(static_cast<uint8_t *>(mapped) + offset, &stale, sizeof(stale));
+    }
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto backing = [&](uint64_t offset) {
+        uint32_t value = 0;
+        Libs::LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value));
+        return value;
+      };
+      const auto write_on_gpu = [&](uint64_t offset, uint32_t value) {
+        Require(name, "dirty allocation",
+                cache.ObtainBuffer(base + offset, sizeof(value), true, false).first != nullptr,
+                "ordered-write buffer allocation failed");
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      const auto write_data = [&](uint64_t offset, std::span<const uint32_t> values) {
+        std::vector<uint32_t> packet{
+            KYTY_PM4(static_cast<uint32_t>(values.size()) + 4u, Pm4::IT_WRITE_DATA, 0), 0,
+            static_cast<uint32_t>(base + offset), static_cast<uint32_t>((base + offset) >> 32u)};
+        packet.insert(packet.end(), values.begin(), values.end());
+        Pm4Execution execution;
+        return processor.Process(execution, packet) == Pm4ProcessResult::Complete;
+      };
+
+      write_on_gpu(gpu_offset, gpu_value);
+      const auto recording = scheduler.CurrentTick();
+      Require(name, "stores into a GPU-owned page",
+              write_data(beside_offset, beside_values) &&
+                  write_data(gpu_offset, std::array{cp_value}),
+              "WRITE_DATA did not complete");
+      processor.WriteAtEndOfPipe32(0, 0, 0x2f, 0x00, 0x06, 0x02,
+                                   reinterpret_cast<void *>(base + label_offset), label_value,
+                                   0);
+      Require(name, "no drain",
+              scheduler.CurrentTick() == recording && backing(beside_offset) == stale &&
+                  cache.HasGpuDirtyBytes(base + beside_offset, sizeof(beside_values)) &&
+                  cache.HasGpuDirtyBytes(base + label_offset, sizeof(label_value)),
+              "a command-processor store into a GPU-owned page drained the queue");
+
+      cache.ReadMemory(base + gpu_offset, label_offset + sizeof(label_value) - gpu_offset);
+      Require(name, "queue order",
+              backing(gpu_offset) == cp_value && backing(beside_offset) == beside_values[0] &&
+                  backing(beside_offset + sizeof(uint32_t)) == beside_values[1] &&
+                  backing(label_offset) == label_value,
+              "a command-processor store did not land after the GPU write before it");
+
+      write_on_gpu(gpu_offset, gpu_value);
+      Require(name, "store before a later GPU write",
+              write_data(beside_offset, std::array{cp_value}), "WRITE_DATA did not complete");
+      write_on_gpu(beside_offset, later_gpu_value);
+      cache.ReadMemory(base + beside_offset, sizeof(uint32_t));
+      Require(name, "later GPU write wins", backing(beside_offset) == later_gpu_value,
+              "a command-processor store landed after a GPU write recorded later");
+
+      const auto clean_tick = scheduler.CurrentTick();
+      Require(name, "clean page",
+              write_data(clean_offset, std::array{clean_value}) &&
+                  backing(clean_offset) == clean_value &&
+                  !cache.IsRegionGpuModified(base + clean_offset, sizeof(clean_value)) &&
+                  scheduler.CurrentTick() == clean_tick,
+              "a store into a CPU-owned page did not go straight to guest memory");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "ordered-write direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "ordered-write direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -52015,6 +52132,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheDetachedDownload();
+    vulkan.CheckBufferCacheOrderedWrite();
     vulkan.CheckTextureCacheCollectorProgress();
     return 0;
   }
@@ -52275,6 +52393,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheDetachedDownload();
+    vulkan.CheckBufferCacheOrderedWrite();
     vulkan.CheckBufferCacheBdaStoreOwnership();
     vulkan.CheckBufferCacheBdaResidency();
     vulkan.CheckBufferCacheSparsePageTable();

@@ -154,6 +154,7 @@ private:
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
+	void WriteMemory(void* dst, const void* src, uint64_t size);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	[[nodiscard]] uint32_t NumInstances();

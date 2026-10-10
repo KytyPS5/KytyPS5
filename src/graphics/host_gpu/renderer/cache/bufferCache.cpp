@@ -922,15 +922,22 @@ void BufferCache::FillBufferPattern(uint64_t vaddr, uint64_t size, const uint32_
 	for (size_t i = 0; i < data.size(); i++) {
 		data[i] = pattern[i % words];
 	}
-	if (!IsRegionGpuModified(vaddr, size)) {
+	WriteMemory(vaddr, data.data(), size);
+}
+
+void BufferCache::WriteMemory(uint64_t vaddr, const void* data, uint64_t size) {
+	if (data == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: invalid memory write\n");
+	}
+	if (!GuestRange {vaddr, size}.Valid() || !IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
-		std::memcpy(reinterpret_cast<void*>(vaddr), data.data(), size);
+		std::memcpy(reinterpret_cast<void*>(vaddr), data, size);
 		return;
 	}
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	(void)dst_offset;
-	WriteDataBuffer(*dst, vaddr, data.data(), size);
+	WriteDataBuffer(*dst, vaddr, data, size);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

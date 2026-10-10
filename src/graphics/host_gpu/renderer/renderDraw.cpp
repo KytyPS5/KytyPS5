@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -896,6 +897,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	ScopedStat stat_scope(StatSlotId::PrepareDraw);
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
@@ -1037,6 +1039,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	ScopedStat stat_scope(StatSlotId::ExecuteDraw);
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1183,6 +1186,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	ScopedStat stat_scope(StatSlotId::DrawIndex);
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1296,6 +1300,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+	ScopedStat stat_scope(StatSlotId::DrawAuto);
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());

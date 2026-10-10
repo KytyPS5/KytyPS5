@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/frameStats.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -227,6 +228,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	ScopedStat stat_scope(StatSlotId::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -72,6 +73,18 @@ void RecordSubmitHistory(uint64_t tick, uint32_t debug_op, uint64_t submit_id, u
 	g_history_count++;
 }
 
+namespace {
+std::mutex  g_perf_mutex;
+std::string g_perf_lines[12];
+size_t      g_perf_count = 0;
+} // namespace
+
+void RecordPerfLine(const char* line) {
+	std::lock_guard lock(g_perf_mutex);
+	g_perf_lines[g_perf_count % 12] = line;
+	g_perf_count++;
+}
+
 void NoteBoundShader(uint32_t stage_slot, uint64_t hash) {
 	// 0 = vertex, 1 = pixel, 2 = compute.
 	if (stage_slot == 0) {
@@ -97,6 +110,15 @@ void DumpSubmitHistory() {
 		            " cs=%016" PRIx64 "\n",
 		            r.tick, DebugOpName(r.op), r.op, r.submit_id, r.arg0, r.arg1, r.arg2, r.arg3,
 		            r.arg4, r.vs_hash, r.ps_hash, r.cs_hash);
+	}
+	{
+		std::lock_guard perf_lock(g_perf_mutex);
+		std::printf("--- Recent PERF3 lines (oldest first) ---\n");
+		const size_t n     = g_perf_count < 12 ? g_perf_count : 12;
+		const size_t start = g_perf_count - n;
+		for (size_t i = 0; i < n; i++) {
+			std::printf("%s\n", g_perf_lines[(start + i) % 12].c_str());
+		}
 	}
 	std::printf("--- end of submit history ---\n");
 	std::fflush(stdout);

@@ -48,6 +48,44 @@ uint64_t QueueSubmitter::Enqueue(MasterSemaphore& master, SubmitInfo info, vk::C
 	RecordSubmitHistory(item.tick, debug.op, debug.submit_id, debug.arg0, debug.arg1, debug.arg2,
 	                    debug.arg3, debug.arg4);
 	const auto tick = item.tick;
+	{
+		static auto     window_start = std::chrono::steady_clock::now();
+		static uint64_t last_submits = 0, last_us[static_cast<uint32_t>(StatSlotId::Count)] = {},
+		                last_calls[static_cast<uint32_t>(StatSlotId::Count)] = {};
+		static uint64_t last_wait_us = 0, last_submit_us = 0;
+		const auto      now          = std::chrono::steady_clock::now();
+		const double    elapsed      = std::chrono::duration<double>(now - window_start).count();
+		if (elapsed >= 2.0) {
+			static const char* const names[] = {"DrawIndex", "DrawAuto", "PrepareDraw", "ExecuteDraw",
+			                                    "Dispatch"};
+			char                     line[512];
+			int                      n = std::snprintf(line, sizeof(line), "PERF3 %.1fs: submits=%llu",
+			                                           elapsed,
+			                                           static_cast<unsigned long long>(
+			                                               g_frame_stats.submits.load() - last_submits));
+			last_submits = g_frame_stats.submits.load();
+			for (uint32_t i = 0; i < static_cast<uint32_t>(StatSlotId::Count) && n > 0 && n < 450; i++) {
+				const auto calls = g_stat_slots[i].calls.load();
+				const auto us    = g_stat_slots[i].us.load();
+				n += std::snprintf(line + n, sizeof(line) - n, " %s=%llu/%.0fms", names[i],
+				                   static_cast<unsigned long long>(calls - last_calls[i]),
+				                   static_cast<double>(us - last_us[i]) / 1000.0);
+				last_calls[i] = calls;
+				last_us[i]    = us;
+			}
+			const auto wait_us   = g_frame_stats.wait_us.load();
+			const auto submit_us = g_frame_stats.submit_us.load();
+			std::snprintf(line + n, sizeof(line) - n, " hostWait=%.0fms queueSubmit=%.0fms",
+			              static_cast<double>(wait_us - last_wait_us) / 1000.0,
+			              static_cast<double>(submit_us - last_submit_us) / 1000.0);
+			last_wait_us   = wait_us;
+			last_submit_us = submit_us;
+			std::printf("%s\n", line);
+			std::fflush(stdout);
+			RecordPerfLine(line);
+			window_start = now;
+		}
+	}
 	if (m_inline) {
 		std::vector<Item> batch;
 		batch.push_back(std::move(item));

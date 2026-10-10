@@ -15,6 +15,8 @@ struct GraphicContext;
 void RecordSubmitHistory(uint64_t tick, uint32_t debug_op, uint64_t submit_id, uint32_t arg0,
                          uint32_t arg1, uint32_t arg2, uint32_t arg3, uint64_t arg4);
 void DumpSubmitHistory();
+// Keeps the most recent PERF lines so they are reprinted next to a device-lost report.
+void RecordPerfLine(const char* line);
 // Remembers the guest hash of the most recently bound vertex/pixel/compute shader so the submit
 // history can name the shaders of the work that was in flight when the device was lost.
 void NoteBoundShader(uint32_t stage_slot, uint64_t hash);

@@ -3,6 +3,8 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ShaderCaptureMetadata.h"
+#include "graphics/shader/recompiler/ResourceReadReplay.h"
 #include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -158,7 +160,8 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     const auto manifest_path = std::filesystem::u8path(argv[2]);
     std::ifstream manifest_file(manifest_path);
     const auto manifest = Json::parse(manifest_file);
-    if (manifest.at("schema_version") != 1) {
+    const uint32_t capture_schema = manifest.at("schema_version");
+    if (capture_schema != 1u && capture_schema != 2u) {
       throw std::runtime_error("unsupported shader capture schema");
     }
     auto binary_path = manifest_path;
@@ -232,6 +235,96 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     phase = "input";
     const bool compute = stage == "compute" || stage == "cs";
     const bool header_profile = manifest.value("metadata_provenance", "") == "agc_header_profile";
+    if (capture_schema == 2u && (stage == "pixel" || stage == "ps")) {
+      if (!manifest.value("metadata_complete", false) || !manifest.contains("pixel"))
+        throw std::runtime_error("complete pixel compiler inputs required");
+      ShaderPixelInputInfo info;
+      ShaderRecompiler::Capture::ReadPixelInputMetadata(manifest.at("pixel"), info);
+      const uint32_t user_count = manifest.at("user_data_count");
+      const uint32_t user_base = manifest.at("user_data_base");
+      const uint32_t wave = manifest.at("wave_size");
+      auto user_data = ShaderRecompiler::Capture::ReadCapturedUserData(manifest);
+      if (user_count > 104u || user_base > 104u - user_count || user_data.size() != user_count || wave != info.wave_size)
+        throw std::runtime_error("invalid pixel capture userdata or wave");
+      ShaderRecompiler::CompileOptions options;
+      options.stage = ShaderType::Pixel; options.wave_size = wave;
+      options.user_data = user_data; options.user_data_base = user_base;
+      options.shader_hash = HexValue(manifest.at("shader_hash"));
+      options.input_info.pixel = &info;
+      const bool dump_pixel_ir = std::getenv("KYTY_SHADER_AUDIT_DUMP_IR") != nullptr;
+      options.dump_ir = dump_pixel_ir;
+      options.early_dump = dump_pixel_ir;
+      ShaderRecompiler::Capture::ReadHostProfileMetadata(manifest.at("host_profile"), options.host_profile);
+      if (manifest.contains("compute_workgroup_limits"))
+        ShaderRecompiler::Capture::ReadWorkgroupLimitsMetadata(manifest.at("compute_workgroup_limits"), options.compute_workgroup_limits);
+      // Early local schema2 PS captures predate the device-limits field. The
+      // pixel frontend does not consume native_subgroup_size; no GPU is replayed.
+      result["compiler_device_limits_captured"] = manifest.contains("compute_workgroup_limits");
+      if (manifest.value("back_code_size_bytes", 0u) != 0u)
+        throw std::runtime_error("pixel back-code replay pending; refusing incomplete input");
+      phase = "translate_resources"; Progress(phase);
+      auto translated = ShaderRecompiler::TranslateProgram(code, options);
+      if (dump_pixel_ir) {
+        std::printf("KYTY_SHADER_AUDIT_PIXEL_IR_BEGIN\n%sKYTY_SHADER_AUDIT_PIXEL_IR_END\n",
+                    ShaderRecompiler::IR::ProgramToString(translated.program).c_str());
+        std::fflush(stdout);
+      }
+      const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+      if (dump_pixel_ir) {
+        Json images = Json::array();
+        for (uint32_t logical = 0; logical < plan.info.images.size(); ++logical) {
+          const auto& image = plan.info.images[logical];
+          Json item{{"logical", logical}, {"source", image.source}, {"pc", image.first_use_pc}};
+          if (image.source < plan.descriptor_sources.size()) {
+            const auto& source = plan.descriptor_sources[image.source];
+            if (source.inline_descriptor) {
+              const auto& table = *source.inline_descriptor;
+              item["inline"] = {{"buffer_source", table.buffer_source}, {"stride", table.selector_stride},
+                                 {"offset", table.descriptor_offset}, {"limit", table.selector_limit},
+                                 {"dwords", table.descriptor_dwords}};
+              if (table.address_table) {
+                const auto& address = *table.address_table;
+                item["address_table"] = {{"pointer_offset", address.pointer_offset},
+                    {"row_stride", address.row_stride}, {"row_limit", address.row_limit},
+                    {"row_key_arg", address.row_key_arg}};
+              }
+            }
+          }
+          images.push_back(std::move(item));
+        }
+        std::printf("KYTY_SHADER_AUDIT_PIXEL_IMAGE_PLAN %s\n", images.dump().c_str());
+        std::fflush(stdout);
+      }
+      result["metadata_complete"] = true;
+      result["checked_through"] = "pixel_translate_resources";
+      result["runtime_resources_captured"] = manifest.value("runtime_resources_captured", false);
+      result["tracked_images"] = plan.info.images.size();
+      result["instructions"] = decoded.instructions.size();
+      if (manifest.contains("runtime")) {
+        phase = "input";
+        ShaderRecompiler::IR::SrtRuntime runtime;
+        runtime.user_data = user_data;
+        auto events = ShaderRecompiler::Capture::ReadResourceReadMetadata(manifest.at("runtime"), runtime);
+        ShaderRecompiler::Capture::ResourceReadReplay replay(runtime, std::move(events));
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        ShaderRecompiler::IR::ResourceSpecialization specialization;
+        phase = "materialize_resources"; Progress(phase);
+        const bool ok = ShaderRecompiler::IR::MaterializeResources(plan, replay.Runtime(), snapshot, specialization);
+        const std::string reason(ShaderRecompiler::IR::LastResourceSpecializationError());
+        if (!replay.Error().empty() || !replay.Consumed()) {
+          phase = "input";
+          throw std::runtime_error(replay.Error().empty() ? "unconsumed resource callbacks" : replay.Error());
+        }
+        result["resource_materialization_checked"] = true;
+        result["checked_through"] = "pixel_materialize_resources";
+        result["status"] = ok ? "passed" : "failed";
+        result["materialization_error"] = reason;
+        result["captured_outcome_reproduced"] = ok == manifest.at("runtime").at("materialization_succeeded").get<bool>() &&
+            (ok || reason == manifest.at("runtime").at("materialization_error").get<std::string>());
+      }
+      std::printf("KYTY_SHADER_AUDIT_RESULT %s\n", result.dump().c_str());
+      return result.at("status") == "passed" ? 0 : 1;
+    }
     if (compute && (manifest.value("metadata_complete", false) || header_profile) && manifest.contains("compute")) {
       const auto& input = manifest.at("compute");
       ShaderComputeInputInfo info;
@@ -247,6 +340,9 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       info.thread_ids_num = input.at("thread_ids_num");
       info.workgroup_register = input.at("workgroup_register");
       info.tg_size_en = input.at("tg_size_en");
+      if (capture_schema == 2u) {
+        ShaderRecompiler::Capture::ReadComputeInputMetadata(input, info);
+      }
       const uint32_t user_count = manifest.at("user_data_count");
       const uint32_t user_base = manifest.at("user_data_base");
       const uint32_t wave_size = manifest.at("wave_size");
@@ -263,6 +359,10 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
           {"dx10_clamp", info.initial_fp_state.dx10_clamp}};
       // Translation needs the register count, not runtime descriptor payloads.
       std::vector<uint32_t> user_data(user_count);
+      if (capture_schema == 2u) {
+        user_data = ShaderRecompiler::Capture::ReadCapturedUserData(manifest);
+        if (user_data.size() != user_count) throw std::runtime_error("capture userdata length mismatch");
+      }
       ShaderRecompiler::CompileOptions options;
       options.stage = ShaderType::Compute;
       options.wave_size = wave_size;
@@ -275,6 +375,14 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       options.dump_ir = dump_ir;
       options.early_dump = dump_ir;
       options.input_info.compute = &info;
+      if (capture_schema == 2u) {
+        ShaderRecompiler::Capture::ReadHostProfileMetadata(manifest.at("host_profile"), options.host_profile);
+        ShaderRecompiler::Capture::ReadWorkgroupLimitsMetadata(manifest.at("compute_workgroup_limits"), options.compute_workgroup_limits);
+        if (manifest.value("back_code_size_bytes", 0u) != 0u)
+          throw std::runtime_error("compute back-code replay pending; refusing incomplete input");
+        if (manifest.contains("runtime"))
+          throw std::runtime_error("compute runtime replay pending; use complete pixel replay for materialization");
+      }
       Json profiles = Json::array();
       const bool initial_barriers = info.needs_lds_barriers;
       Json precheck_errors = Json::array();

@@ -1,5 +1,29 @@
 # Emulator regression test debt
 
+## Exact capture and CPU replay (2026-10-10 12:17 UTC)
+
+Update12:40UTC: actual run121651 naturally exits32112:35:34.504814/no guards,
+minRAM19.09GiB; private EXEecfc2e59/original5178, source dirtycf4f7fe3 frozen.
+Complete PS617c capture has740 callback events and exact inputs. CPU RED123614
+consumes the whole transcript and reproduces the same unsupported record0row64
+error in~0.182s; RED123653 dumps exact IR and repeats it. IR row797 derives from
+ImageRead packed low-byte IDs and Phi/shift8/UMin/DPP/ReadLane31,63 reduction.
+Texture provenance/coherent contents and record-row correlation must be proved
+before using a sparse set. Extra reads after a semantic change are uncaptured
+inputs, not permission to synthesize zero bytes. Image format/tiling, writer
+overlap/dirty data and divergent records need independent synthetic negatives.
+
+Native missing-input RED/GREEN evidence now covers PS, compute subgroup/float
+state and VS metadata. Four capture CTests and the synthetic PS materialization
+audit pass. Callback recorder/replay preserves ordinary versus strict reads at
+the same address, failure output remains undefined/unrecorded, and absent
+callbacks/overflow/mismatched access/integer overflow are tested. A failure
+bundle from actual PS617c is still required to prove the game blocker offline.
+The ordered transcript is valid only for the captured access sequence; missing
+or extra accesses must remain input errors. It cannot supply a new sparse-domain
+algorithm with previously unread memory. Full VS reader/audit, compute runtime
+replay, back-code replay and broader input-boundary tests remain pending.
+
 ## Runtime menu comparison and exact row-domain proof (2026-10-10)
 
 User requests regression investigation before more gate-by-gate extensions.

@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ShaderCaptureMetadata.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -239,8 +240,10 @@ uint64_t ClampShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 void CaptureDispatchedShader(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              std::span<const uint32_t> static_state,
-                             std::optional<std::array<uint32_t, 3>> guest_workgroups) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+                             std::optional<std::array<uint32_t, 3>> guest_workgroups,
+                             const nlohmann::ordered_json* runtime_capture = nullptr,
+                             const std::filesystem::path& capture_directory = {}) {
+	if (!Config::GraphicsDebugDumpEnabled() && capture_directory.empty()) {
 		return;
 	}
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
@@ -249,70 +252,26 @@ void CaptureDispatchedShader(const ShaderParams& params,
 		const char* stage = options.stage == ShaderType::Compute ? "compute"
 		                    : options.stage == ShaderType::Vertex ? "vertex"
 		                    : options.stage == ShaderType::Pixel ? "pixel" : "unknown";
-		const auto content_hash = XXH3_64bits(params.code.data(), params.code.size_bytes());
 		const auto state_hash = XXH3_64bits(static_state.data(), static_state.size_bytes());
-		const auto stem = fmt::format("{}_{:016x}_{:016x}", stage, options.shader_hash, state_hash);
-		const auto directory = Config::GetShaderLogFolder() / "dispatched";
+		auto stem = fmt::format("{}_{:016x}_{:016x}", stage, options.shader_hash, state_hash);
+		static std::atomic<uint32_t> runtime_sequence {0};
+		if (runtime_capture) {
+			const auto sequence = runtime_sequence.fetch_add(1);
+			if (sequence >= 8u) return;
+			stem += fmt::format("_runtime_{:04}", sequence);
+		}
+		const auto directory = capture_directory.empty() ? Config::GetShaderLogFolder() / "dispatched" : capture_directory;
 		if (!Common::File::CreateDirectories(directory) && !Common::File::IsDirectoryExisting(directory)) {
 			LOGF("Shader capture: cannot create directory %s\n", Common::PathToString(directory).c_str());
 			return;
 		}
-		nlohmann::ordered_json metadata {
-		    {"schema_version", 1},
-		    {"kind", "dispatched"},
-		    {"stage", stage},
-		    {"shader_hash", fmt::format("{:016x}", options.shader_hash)},
-		    {"content_hash_xxh3_64", fmt::format("{:016x}", content_hash)},
-		    {"static_state_hash_xxh3_64", fmt::format("{:016x}", state_hash)},
-		    {"code_file", stem + ".bin"},
-		    {"code_size_bytes", params.code.size_bytes()},
-		    {"wave_size", options.wave_size},
-		    {"user_data_base", options.user_data_base},
-		    {"user_data_count", options.user_data.size()},
-		    {"scratch_dwords", options.input_info.compute ? options.input_info.compute->scratch_size_dwords :
- options.input_info.pixel ? options.input_info.pixel->scratch_size_dwords :
- options.input_info.vertex ? options.input_info.vertex->scratch_size_dwords : 0u},
-		    {"metadata_complete", false},
-	    {"host_profile", {{"known", options.host_profile.known},
-	                      {"storage_buffer_nonuniform_indexing",
-	                       options.host_profile.storage_buffer_nonuniform_indexing},
-	                      {"sampled_image_nonuniform_indexing",
-	                       options.host_profile.sampled_image_nonuniform_indexing},
-		                      {"float64", options.host_profile.float64},
-		                      {"fma_float64", options.host_profile.fma_float64},
-		                      {"rte_float64", options.host_profile.rte_float64},
-		                      {"rte_float32", options.host_profile.rte_float32},
-		                      {"signed_zero_inf_nan_preserve_float64",
-		                       options.host_profile.signed_zero_inf_nan_preserve_float64}}},
-		    {"static_state", std::vector<uint32_t>(static_state.begin(), static_state.end())},
-		};
-		if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr) {
-			const auto& input = *options.input_info.compute;
-			metadata["metadata_complete"] = true;
-			metadata["compute"] = {
-			    {"initial_fp_state", {{"known", input.initial_fp_state.known},
-			                          {"float_mode", input.initial_fp_state.float_mode},
-			                          {"ieee_mode", input.initial_fp_state.ieee_mode},
-			                          {"dx10_clamp", input.initial_fp_state.dx10_clamp}}},
-			    {"threads_num", std::array {input.threads_num[0], input.threads_num[1], input.threads_num[2]}},
-			    {"dispatch_threads_num", std::array {input.dispatch_threads_num[0], input.dispatch_threads_num[1], input.dispatch_threads_num[2]}},
-			    {"lds_size_dwords", input.lds_size_dwords},
-			    {"scratch_size_dwords", input.scratch_size_dwords},
-			    {"group_id", std::array {input.group_id[0], input.group_id[1], input.group_id[2]}},
-			    {"dispatch_thread_dimensions", input.dispatch_thread_dimensions},
-			    {"needs_lds_barriers", input.needs_lds_barriers},
-			    {"wave_size", input.wave_size},
-			    {"thread_ids_num", input.thread_ids_num},
-			    {"workgroup_register", input.workgroup_register},
-			    {"tg_size_en", input.tg_size_en},
-			};
-			metadata["compute_workgroup_limits"] = {
-			    {"max_size", options.compute_workgroup_limits.max_size},
-			    {"max_invocations", options.compute_workgroup_limits.max_invocations},
-			};
-			if (guest_workgroups.has_value()) {
-				metadata["compute"]["guest_workgroups"] = *guest_workgroups;
-			}
+		auto metadata = ShaderRecompiler::Capture::BuildCompileMetadata(
+		    params, options, static_state, guest_workgroups);
+		metadata["code_file"] = stem + ".bin";
+		if (!options.back_code.empty()) metadata["back_code_file"] = stem + "_back.bin";
+		if (runtime_capture) {
+			metadata["runtime"] = *runtime_capture;
+			metadata["runtime_resources_captured"] = runtime_capture->at("complete");
 		}
 		const auto json = metadata.dump(2) + '\n';
 		const auto write = [&](const std::filesystem::path& path, const void* data, size_t size) {
@@ -330,6 +289,8 @@ void CaptureDispatchedShader(const ShaderParams& params,
 		// Write the JSON last so a new manifest never advertises an unfinished binary. This
 		// capture precedes translation: even a fatal frontend error leaves a replayable record.
 		if (!write(directory / (stem + ".bin"), params.code.data(), params.code.size_bytes()) ||
+		    (!options.back_code.empty() &&
+		     !write(directory / (stem + "_back.bin"), options.back_code.data(), options.back_code.size_bytes())) ||
 		    !write(directory / (stem + ".json"), json.data(), json.size())) {
 			LOGF("Shader capture: cannot write dispatched shader %s\n", stem.c_str());
 		}
@@ -860,10 +821,55 @@ struct PipelineCache::ProgramCache {
 				runtime.compute_workgroups_trusted = true;
 			}
 		};
+		const auto materialize = [&](const auto& plan, auto& resources, auto& specialization) {
+			const auto* directory = std::getenv("KYTY_RESOURCE_CAPTURE_DIR");
+			const auto* filter = std::getenv("KYTY_RESOURCE_CAPTURE_HASH");
+			char* end = nullptr;
+			const auto capture_hash = filter ? std::strtoull(filter, &end, 16) : 0;
+			const bool selected = directory && *directory && filter && *filter && end &&
+			                      *end == '\0' && capture_hash == params.hash;
+			if (!selected)
+				return ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization);
+			ShaderRecompiler::Capture::ResourceReadCapture capture(runtime);
+			const auto observed = capture.Runtime();
+			const bool ok = ShaderRecompiler::IR::MaterializeResources(plan, observed, resources, specialization);
+			// Save before the caller's fatal error. No extra guest reads are made.
+			if (!ok || std::getenv("KYTY_RESOURCE_CAPTURE_SUCCESS")) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+				try {
+#endif
+					ShaderRecompiler::CompileOptions captured;
+					captured.stage = stage;
+					captured.shader_hash = params.hash;
+					captured.user_data = user_data;
+					captured.back_code = params.back_code;
+					captured.host_profile = host_profile;
+					captured.compute_workgroup_limits = compute_workgroup_limits;
+					captured.wave_size = input_info.wave_size;
+					if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+						captured.input_info.vertex = &input_info;
+						captured.user_data_base = stage == ShaderType::Mesh || stage == ShaderType::TessellationControl ? 0u : 8u;
+						if (stage == ShaderType::Mesh) captured.wave_size = input_info.mesh.wave_size;
+						if (stage == ShaderType::TessellationControl) captured.wave_size = 64u;
+					} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+						captured.input_info.pixel = &input_info;
+					} else captured.input_info.compute = &input_info;
+					const auto reads = ShaderRecompiler::Capture::BuildResourceReadMetadata(
+					    runtime, capture, ok, ok ? std::string_view{} : ShaderRecompiler::IR::LastResourceSpecializationError());
+					CaptureDispatchedShader(params, captured, lookup_key.static_state, runtime.compute_workgroups,
+					                        &reads, std::filesystem::u8path(directory));
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+				} catch (const std::exception& error) {
+					LOGF("Resource capture failed: %s\n", error.what());
+				}
+#endif
+			}
+			return ok;
+		};
 		if (entry != programs.end()) {
 			refresh_indirect_grid(entry->second.resource_plan);
-			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
+			if (!materialize(
+			        entry->second.resource_plan, entry->second.resources,
 			        entry->second.specialization)) {
 				const auto reason = ShaderRecompiler::IR::LastResourceSpecializationError();
 				EXIT("MaterializeResources failed for stage=%u hash=0x%016" PRIx64 ": %.*s\n",
@@ -1013,8 +1019,8 @@ struct PipelineCache::ProgramCache {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
 			refresh_indirect_grid(entry->second.resource_plan);
-			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
+			if (!materialize(
+			        entry->second.resource_plan, entry->second.resources,
 			        entry->second.specialization)) {
 				const auto reason = ShaderRecompiler::IR::LastResourceSpecializationError();
 				EXIT("MaterializeResources failed for stage=%u hash=0x%016" PRIx64 ": %.*s\n",

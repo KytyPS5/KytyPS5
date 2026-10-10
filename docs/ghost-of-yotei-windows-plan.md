@@ -1,5 +1,125 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 12:40 UTC** (actual failure reproduced on CPU):
+
+- Private diagnostic native EXEecfc2e59, dirty cf4f7fe3 source, original
+  eboot5178, Performance1280x720/redzone run121651 naturally exits321 at
+ 12:35:34.504814UTC; no timeout/guards, minimum available RAM19.09GiB.
+  Owned screenshot `window-initial.png` shows a loading spinner, no menu.
+  Process37120 and supervisor completed; native slot is idle.
+- `run121651/resource-capture/pixel_617c7166f3308810_02c8d1c576fa1d10_runtime_0000`
+  contains the original18176-byte shader and complete PS inputs/userdata/
+  runtime callback transcript (740 events, ~152KiB manifest). No back-code.
+  Source was frozen during the entire game run; original installed EXE and
+  SaveData remain untouched.
+- This early local schema2 bundle lacks compiler device limits. The current
+  PS frontend does not consume native_subgroup_size and CPU materialization
+  reproduces exactly; GPU/code-emission replay is not claimed. Final writer
+  now captures all five device-limit fields for every stage: intended native
+  RED124104 -> unchanged four-test GREEN124212. Final native build124605 passes.
+- Native CPU RED123614 (`shader_cfg_tests --audit-shader <capture.json>`)
+  exits1 in~0.182s, consumes all740 callbacks with no live/GPU memory access,
+  tracks31images and reproduces the EXACT same unsupported record0row64
+  descriptor/error as the game. `captured_outcome_reproduced=true`.
+  IR diagnostic RED123653 also reproduces it. This closes the current PS
+  failure-replay gate; it does not close the guest semantic defect.
+- Exact IR shows row797 = UMin(ReadLane(...31), ReadLane(...63)) after DPP
+  reduction of packed low-byte keys; initial keys originate in ImageRead
+  resource descriptors selected by record199, then Phi/Select/shift-by8
+  loop updates. The branch excludes255, but that is not proof of a64-row
+  bound. The needed finite set requires texture contents/provenance and
+  record/row correlation, not just scalar SRT or changing255 to64.
+- Diagnostic CPU RED125042 proves pointer_offset=0 for these wave tables
+  (supersedes older unverified120 notes). Input key image is source4/logical1,
+  inline buffer stride136/descriptor offset16. Captured record descriptors
+  decode as RGBA8UInt(format60),513x513,Standard4KB(tile5),identity swizzle,
+  mip0. Their pixel payloads were not read by the old materializer and are
+  not present in this capture. Nearby SRD-looking metadata/count63 is observed
+  data, not permission to invent a63/64 row cutoff.
+- Next required contract: synthetic packed-image key domain with divergent
+  records, sparse bytes and sentinel/loop/DPP propagation; immutable/coherent
+  texture backing proof, bounded formats/layouts and writer negatives. The
+  existing transcript supplies only reads used by the old implementation;
+  new texture reads require a separately complete capture, not invented data.
+  AlternativeB needs a selected-entry GPU fault consumed before successful
+  completion. Neither semantic approach is implemented or declared validated.
+- Capture workflow coverage remains PS replay, PS/VS/CS input serialization,
+  strict PS/CS readers and callback invariants. Full VS replay, compute runtime
+  replay and nonempty back-code replay pending. No new menu/gameplay milestone,
+  GPU numerical regression, cross-game runtime test, push or issue post.
+
+Final focused checks: native capture CTests124212=4/4; exact actual-resource
+CPU RED124343 and125042 still reproduce the same error; legacy schema1
+pixel capture CFG audit124501 passes. All game/test processes are cleaned up.
+
+Checkpoint **2026-10-10 12:17 UTC** (plan execution; capture/replay tests pass):
+
+- User authorizes implementing the research plan and asks for keyboard controls.
+  English layout/focused window: J=Cross/confirm, L=Circle/back, arrows=D-pad,
+  Enter=Options, I=Triangle, K=Square. Digital Deluxe Bonus asks for J.
+- Matched fresh baseline run104845 (b4eae640/EXE0c60) reached the user's
+  Digital Deluxe Bonus screenshot, then naturally exited321 at11:12:53.295UTC
+  on old SDL_OpenGamepad nullptr assertion. No guards; minRAM19.01GiB.
+  This is an initial dialog, not a main-menu or gameplay milestone. Targeted
+  J key messages were sent11:11:06..07UTC; causality of later exit is unproved.
+- Matched fresh current run111510 (a593/EXE454656) ended after1800s bounded
+  timeout, graceful close/exit0 at11:45:57.172UTC, no guards/minRAM13.27GiB.
+  CS54904 variants249..252 each finished driver compilation (~149..155s).
+  No new visually confirmed UI. Source regression remains unisolated.
+- P0.2 implementation is local/uncommitted on cf4f7fe3: schema2 records exact
+  PS/VS/compute compiler inputs and actual userdata. Strict PS/compute readers
+  reject missing fields and integer truncation. Runtime callbacks are bounded
+  to8MiB/131072events; normal/strict/clamp calls retain their original results
+  and are delegated once. Both cached and first materialization paths can save
+  a diagnostic bundle before the fatal error using explicit directory/hash
+  capture filters; no guest semantics or descriptor admission changed.
+- Ordered callback CPU replay refuses missing, changed or unconsumed accesses;
+  it is not a complete guest memory snapshot. Pixel audit now reaches resource
+  materialization with exact runtime flags, budgets and captured callback values.
+  VS decoding/audit, compute runtime replay and nonempty back-code replay remain
+  pending and are not claimed as working.
+- Native capture RED114642(pixel), RED115106(compute), RED115234(vertex)
+  failed on intended missing-input checks; unchanged GREENs114853/115146/115326
+  passed. Four CTests passed120400 and121324; read recording/replay checks
+  passed121059. Synthetic pixel CPU replay121355 reached materialization and
+  reproduced its successful result with no live backing. Native emulator
+  builds121439/121527 passed; private runtime EXE
+  ecfc2e590142808f53c50cbaa08f48558515781389ddadf6d87f128af98537a2.
+- Next: original Performance1280x720 retry with the PS617c capture filter, then
+  prove the actual failure in CPU replay before a sparse live-selector-domain
+  synthetic RED. Original SaveData/EXE454656 remain preserved; private runtime
+  and fixtures live under shader-replay-implementation-20261010. No push,
+  publication, game entry, new menu milestone or cross-game runtime proof.
+
+Checkpoint **2026-10-10 10:36 UTC** (research plan saved; matched runs finalized):
+
+- User now requests research/options/Markdown plan before further development,
+  explicitly focused on AnyPS5 and SharpEmu PR926. No new production edits,
+  builds or game launches were performed for this research. See
+  [research and development plan](yotei-debug-research-plan-2026-10-10.md).
+- Rebuilt baseline b4eae640/EXE0c60, copied current SaveData/cache, equal
+  None2560x1440/redzone run094629 naturally exits321 at10:00:40.881UTC,
+  no guards/minRAM16.83GiB; same historical CS34be pc05e8 sampler33, no menu.
+- Currenta593/EXE454656 same seeded inputs run100152 passes CS34be,
+  pipeline29done249ms. It ends10:19:02.166UTC exit1/no guards/minRAM16.31,
+  lastCS54904 pipeline242begin. Exit cause is unknown; bounded Windows
+  Application1000/1001/1002 search finds no matching event. Do not label this
+  PS617c/row64 or a driver crash. Native execution slot is now idle.
+- Historical Medium first-setup screenshot remains verified; source regression
+  of that exact stage is not isolated. Matched fresh first-run pair is prepared
+  but unexecuted. Original SaveData remains untouched; seeds/manifests/private
+  runtimes are under menu-regression-investigation-20261010.
+- Last exact actual-resource blocker remains diagnostic092136: full617c
+  tracking passes, hostenumerated table record0row64 is nontexture type4.
+  Next recommended work is complete PS/VS context capture/replay and a sparse
+  packed live-selector domain RED, not a guessed rowlimit or skipped descriptor.
+- Live research pins: AnyPS5maina29ef592, PR7574854d588, mergedPR2349
+  8dbea2c6; Sharp926 advanced to d6a88319/420commits379files during review.
+  New926 delta16commits35files leaves selector/materializer proof unchanged.
+  Author runtime reports remain distinct from local results. No new runtime
+  cross-game proof, no push/publication. Plan includes A/B alternatives, faster
+  bounded iteration, and ownership/no-framebuffer candidates with test gates.
+
 Checkpoint **2026-10-10 09:48 UTC** (paired menu comparison active):
 
 - User requests investigation of lost menu and a changed fixing approach.

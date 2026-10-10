@@ -3993,6 +3993,95 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBufferCachePrtHoleUpload() {
+    constexpr const char *name = "BufferCachePrtHoleUpload";
+    // A PRT aperture is GPU-visible as a whole while only some pages are resident.
+    constexpr uintptr_t base = 0x0000001000000000ull;
+    constexpr uint64_t aperture_size = 0x400000;
+    constexpr uint64_t resident_offset = 0x10000;
+    constexpr uint64_t resident_size = 0x10000;
+    constexpr uint64_t buffer_size = 0x20000;
+    constexpr uint32_t resident_value = 0x5a6b7c8du;
+
+    EnsureRuntimeContext();
+    void *reserved = reinterpret_cast<void *>(base);
+    Require(name, "aperture reservation",
+            Libs::LibKernel::Memory::KernelReserveVirtualRange(
+                &reserved, aperture_size, 0x10, 0x10000) == 0 &&
+                reserved == reinterpret_cast<void *>(base),
+            "fixed aperture reservation failed");
+    Require(name, "aperture",
+            Libs::LibKernel::Memory::KernelSetPrtAperture(0, reserved, aperture_size) == 0,
+            "PRT aperture registration failed");
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                resident_size, 0x10000, 0, &direct_offset) == 0,
+            "resident page allocation failed");
+    void *resident = reinterpret_cast<void *>(base + resident_offset);
+    Require(name, "resident mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &resident, resident_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                resident == reinterpret_cast<void *>(base + resident_offset),
+            "resident page mapping inside the aperture failed");
+    std::memcpy(resident, &resident_value, sizeof(resident_value));
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, aperture_size);
+      // The upload covers the non-resident head; reading it must not fault.
+      const auto [buffer, offset] = cache.ObtainBuffer(base, buffer_size, false, false);
+      Require(name, "buffer", buffer != nullptr, "aperture buffer allocation failed");
+      const auto read_word = [&](uint64_t at) {
+        auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                         vk::BufferUsageFlagBits::eTransferDst, {0xffffffffu});
+        const vk::BufferCopy copy{at, 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(buffer->Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+            nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        const auto value = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+        return value;
+      };
+      Require(name, "non-resident bytes",
+              read_word(offset) == 0u && read_word(offset + resident_offset - 4u) == 0u,
+              "non-resident aperture pages did not upload as zero");
+      Require(name, "resident bytes", read_word(offset + resident_offset) == resident_value,
+              "resident aperture page lost its contents");
+      context.UnmapMemory(base, aperture_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "aperture release",
+            Libs::LibKernel::Memory::KernelSetPrtAperture(0, nullptr, 0) == 0,
+            "PRT aperture release failed");
+    Require(name, "aperture unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, aperture_size) == 0,
+            "aperture range unmap failed");
+    Require(name, "direct release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, resident_size) == 0,
+            "resident page release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -43653,6 +43742,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-prt-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCachePrtHoleUpload();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
@@ -43852,6 +43946,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
+  vulkan.CheckBufferCachePrtHoleUpload();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
     vulkan.CheckRenderExecutorColorDiscovery();

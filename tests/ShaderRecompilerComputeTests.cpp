@@ -1333,6 +1333,7 @@ struct TestCase {
   std::vector<u32> storage_image_r32ui;
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
+  std::vector<std::pair<std::string, size_t>> spirv_counts;
   std::vector<std::string> forbidden_spirv;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
@@ -1355,6 +1356,9 @@ struct TestCase {
   float expected_float_tolerance = 0.0f;
   std::vector<u32> gds_initial;
   std::vector<u32> expected_gds;
+  // Pages whose BDA fault bit and fault summary bit the dispatch must set.
+  std::vector<uint64_t> expected_fault_pages;
+  std::vector<uint64_t> fault_free_pages;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
@@ -1601,7 +1605,8 @@ void CheckRectListShaders() {
 }
 
 void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
-  if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
+  if (test.required_spirv.empty() && test.forbidden_spirv.empty() &&
+      test.spirv_counts.empty()) {
     return;
   }
 
@@ -1621,6 +1626,13 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
     if (text.find(forbidden) != std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
            std::string("found forbidden text: ") + forbidden);
+    }
+  }
+  for (const auto &[counted, expected] : test.spirv_counts) {
+    const auto actual = CountText(text, counted);
+    if (actual != expected) {
+      Fail(test.name, "SPIR-V disassembly",
+           counted + " count=" + std::to_string(actual) + ", expected=" + std::to_string(expected));
     }
   }
 }
@@ -5212,6 +5224,247 @@ public:
               "staged BDA updates were stale, overwritten before their read, or incompletely flushed");
     }
     DestroyBuffer(&readback);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Runs `body` with renderer allocations whose new device memory has every bit set: device
+  // memory contents are undefined, and memory reused from freed allocations is often nonzero.
+  // Memory dedicated to one resource cannot be bound to the poisoning buffer and stays as is,
+  // so blocks are made large enough to hold the page table.
+  template <typename Body> void WithDirtyDeviceMemory(const char *name, Body &&body) {
+    EnsureRuntimeContext();
+    VmaVulkanFunctions functions{};
+    functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
+    functions.vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+    functions.vkAllocateMemory = &AllocatePoisonedMemory;
+    VmaAllocatorCreateInfo allocator_info{};
+    allocator_info.instance = m_instance;
+    allocator_info.physicalDevice = m_physical_device;
+    allocator_info.device = m_device;
+    allocator_info.pVulkanFunctions = &functions;
+    allocator_info.vulkanApiVersion = VK_API_VERSION_1_3;
+    allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    allocator_info.preferredLargeHeapBlockSize = 2 * BufferCache::BDA_PAGETABLE_SIZE;
+    VmaAllocator dirty = nullptr;
+    RequireVk(name, "dirty allocator",
+              static_cast<vk::Result>(vmaCreateAllocator(&allocator_info, &dirty)),
+              "vmaCreateAllocator");
+    s_poisoning = this;
+    s_poisoning_name = name;
+    m_largest_poisoned_memory = 0;
+    auto *const original = std::exchange(m_runtime_context.allocator, dirty);
+    body();
+    m_runtime_context.allocator = original;
+    s_poisoning = nullptr;
+    vmaDestroyAllocator(dirty);
+  }
+
+  static VKAPI_ATTR VkResult VKAPI_CALL AllocatePoisonedMemory(
+      VkDevice device, const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *callbacks,
+      VkDeviceMemory *memory) {
+    const auto result =
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(device, info, callbacks, memory);
+    for (auto *next = static_cast<const VkBaseInStructure *>(info->pNext); next != nullptr;
+         next = next->pNext) {
+      if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+        const auto *dedicated = reinterpret_cast<const VkMemoryDedicatedAllocateInfo *>(next);
+        if (dedicated->buffer != VK_NULL_HANDLE || dedicated->image != VK_NULL_HANDLE) {
+          return result;
+        }
+      }
+    }
+    if (result == VK_SUCCESS && s_poisoning != nullptr) {
+      s_poisoning->PoisonDeviceMemory(info->memoryTypeIndex, *memory, info->allocationSize);
+    }
+    return result;
+  }
+
+  void PoisonDeviceMemory(uint32_t type, vk::DeviceMemory memory, vk::DeviceSize size) {
+    const char *name = s_poisoning_name;
+    vk::BufferCreateInfo buffer_info{};
+    buffer_info.size = size & ~vk::DeviceSize{3};
+    buffer_info.usage = vk::BufferUsageFlagBits::eTransferDst;
+    vk::Buffer buffer = nullptr;
+    RequireVk(name, "dirty memory", m_device.createBuffer(&buffer_info, nullptr, &buffer),
+              "vkCreateBuffer");
+    vk::MemoryRequirements requirements{};
+    m_device.getBufferMemoryRequirements(buffer, &requirements);
+    // Memory that no transfer buffer can bind holds no renderer buffer either.
+    if (((requirements.memoryTypeBits >> type) & 1u) != 0 && requirements.size <= size) {
+      RequireVk(name, "dirty memory", m_device.bindBufferMemory(buffer, memory, 0),
+                "vkBindBufferMemory");
+      auto cmd = BeginCommands(name, "dirty memory");
+      cmd.fillBuffer(buffer, 0, VK_WHOLE_SIZE, ~0u);
+      EndSubmitAndFree(name, "dirty memory", cmd);
+      m_largest_poisoned_memory = std::max(m_largest_poisoned_memory, size);
+    }
+    m_device.destroyBuffer(buffer, nullptr);
+  }
+
+  void CheckBdaPageTableStartsCleared() {
+    constexpr const char *name = "BdaPageTableStartsCleared";
+    constexpr uintptr_t base = 0x0000000207b00000ull;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    const auto first = BufferCache::PageIndex(base);
+    // Entries around a registered two-page buffer, and at both ends and the middle of the table.
+    const std::array<uint64_t, 7> entries{0, first - 1, first, first + 1, first + 2,
+                                          BufferCache::CACHING_NUMPAGES / 2,
+                                          BufferCache::CACHING_NUMPAGES - 1};
+    WithDirtyDeviceMemory(name, [&] {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetBufferCache();
+      auto &table = *cache.GetBdaPageTableBuffer();
+      Require(name, "dirty memory", m_largest_poisoned_memory >= table.Size(),
+              "no poisoned memory block can hold the page table");
+      const auto &buffer = cache.GetBuffer(cache.FindBuffer(base, 2 * page));
+      auto readback = CreateHostBuffer(name, entries.size() * sizeof(vk::DeviceAddress),
+                                       vk::BufferUsageFlagBits::eTransferDst, {});
+      std::vector<vk::BufferCopy> copies;
+      for (size_t i = 0; i < entries.size(); ++i) {
+        copies.push_back({entries[i] * sizeof(vk::DeviceAddress), i * sizeof(vk::DeviceAddress),
+                          sizeof(vk::DeviceAddress)});
+      }
+      vk::MemoryBarrier written{};
+      written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      written.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eTransfer, {}, 1, &written, 0, nullptr, 0, nullptr);
+      scheduler.Current().Handle().copyBuffer(table.Handle(), readback.buffer,
+                                              static_cast<u32>(copies.size()), copies.data());
+      vk::MemoryBarrier copied{};
+      copied.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      copied.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &copied, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, readback, entries.size() * 2);
+      DestroyBuffer(&readback);
+      for (size_t i = 0; i < entries.size(); ++i) {
+        const auto actual = uint64_t{words[i * 2]} | (uint64_t{words[i * 2 + 1]} << 32);
+        const bool registered = entries[i] == first || entries[i] == first + 1;
+        // A zero entry is what sends an access to the fault path.
+        const auto expected = registered ? buffer.BufferDeviceAddress() + (entries[i] - first) * page
+                                         : vk::DeviceAddress{0};
+        Require(name, "page-table entry", actual == expected,
+                "entry " + std::to_string(entries[i]) +
+                    (registered ? " does not translate its registered page"
+                                : " of an unregistered page is not zero"));
+      }
+    });
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckFaultBufferSummary() {
+    constexpr const char *name = "FaultBufferSummary";
+    // Two faults in different summary words, and a page bit without its summary bit.
+    constexpr std::array<uint64_t, 3> addresses{0x0000000207c00000ull, 0x0000000247c00000ull,
+                                                0x0000000287c00000ull};
+    constexpr auto span_bits = std::countr_zero(BufferCache::FAULT_SUMMARY_SPAN);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetBufferCache();
+    auto &faults = *cache.GetFaultBuffer();
+    // Only the fixture's words may be set when the pass runs.
+    faults.Fill(0, faults.Size(), 0);
+    std::vector<uint64_t> words;
+    for (size_t i = 0; i < addresses.size(); ++i) {
+      const auto page = BufferCache::PageIndex(addresses[i]);
+      const auto group = page >> (5 + span_bits);
+      const u32 page_bit = 1u << (page & 31u);
+      const u32 group_bit = 1u << (group & 31u);
+      const auto summary = BufferCache::FAULT_BITMAP_WORDS + (group >> 5);
+      Require(name, "layout",
+              std::ranges::find(words, page >> 5) == words.end() &&
+                  std::ranges::find(words, summary) == words.end(),
+              "test pages share fault words");
+      words.push_back(page >> 5);
+      words.push_back(summary);
+      scheduler.Current().Handle().updateBuffer(faults.Handle(), (page >> 5) * sizeof(u32),
+                                                sizeof(u32), &page_bit);
+      const u32 summary_value = i != 2 ? group_bit : 0u;
+      scheduler.Current().Handle().updateBuffer(faults.Handle(), summary * sizeof(u32),
+                                                sizeof(u32), &summary_value);
+    }
+    vk::MemoryBarrier written{};
+    written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    written.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &written, 0, nullptr, 0, nullptr);
+    cache.ProcessFaultBuffer();
+    auto readback = CreateHostBuffer(name, words.size() * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst,
+                                     std::vector<u32>(words.size()));
+    std::vector<vk::BufferCopy> copies;
+    for (size_t i = 0; i < words.size(); ++i) {
+      copies.push_back({words[i] * sizeof(u32), i * sizeof(u32), sizeof(u32)});
+    }
+    vk::MemoryBarrier processed{};
+    processed.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    processed.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eTransfer, {}, 1, &processed, 0, nullptr, 0, nullptr);
+    scheduler.Current().Handle().copyBuffer(faults.Handle(), readback.buffer,
+                                            static_cast<u32>(copies.size()), copies.data());
+    vk::MemoryBarrier copied{};
+    copied.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    copied.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 1, &copied, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+    const auto values = ReadBuffer(name, readback, words.size());
+    DestroyBuffer(&readback);
+    for (size_t i = 0; i < 2; ++i) {
+      Require(name, "summarized faults",
+              BufferCacheTestAccess::PageOwner(cache, addresses[i]) != BufferId{} &&
+                  values[i * 2] == 0 && values[i * 2 + 1] == 0,
+              "a summarized fault was not reported, or its bits were not cleared");
+    }
+    // The pass reads only the bitmap words that a summary bit names.
+    Require(name, "unsummarized bit",
+            BufferCacheTestAccess::PageOwner(cache, addresses[2]) == BufferId{} &&
+                values[4] != 0,
+            "the pass scanned a bitmap word whose summary bit was clear");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckFaultBufferStartsCleared() {
+    constexpr const char *name = "FaultBufferStartsCleared";
+    WithDirtyDeviceMemory(name, [&] {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &faults = *context.GetBufferCache().GetFaultBuffer();
+      Require(name, "dirty memory", m_largest_poisoned_memory >= faults.Size(),
+              "no poisoned memory block can hold the fault buffer");
+      auto readback =
+          CreateHostBuffer(name, faults.Size(), vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::BufferCopy copy{0, 0, faults.Size()};
+      scheduler.Current().Handle().copyBuffer(faults.Handle(), readback.buffer, 1, &copy);
+      vk::MemoryBarrier copied{};
+      copied.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      copied.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &copied, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto values = ReadBuffer(name, readback, faults.Size() / sizeof(u32));
+      DestroyBuffer(&readback);
+      Require(name, "initial contents",
+              std::ranges::all_of(values, [](u32 value) { return value == 0; }),
+              "a new fault buffer starts with fault or summary bits set");
+    });
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -15362,6 +15615,34 @@ public:
     return sampler;
   }
 
+  std::vector<u32> ReadFaultWords(const char *shader_name, std::span<const uint64_t> words) {
+    auto readback = CreateHostBuffer(shader_name, words.size() * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst,
+                                     std::vector<u32>(words.size()));
+    std::vector<vk::BufferCopy> copies;
+    for (size_t i = 0; i < words.size(); ++i) {
+      copies.push_back({words[i] * sizeof(u32), i * sizeof(u32), sizeof(u32)});
+    }
+    auto cmd = BeginCommands(shader_name, "fault readback");
+    vk::MemoryBarrier before{};
+    before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+    before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                        vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr,
+                        0, nullptr);
+    cmd.copyBuffer(m_fault_buffer.buffer, readback.buffer, static_cast<u32>(copies.size()),
+                   copies.data());
+    vk::MemoryBarrier after{};
+    after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                        {}, 1, &after, 0, nullptr, 0, nullptr);
+    EndSubmitAndFree(shader_name, "fault readback", cmd);
+    auto values = ReadBuffer(shader_name, readback, words.size());
+    DestroyBuffer(&readback);
+    return values;
+  }
+
   std::vector<u32> ReadBuffer(const char *shader_name, const Buffer &buffer,
                               size_t dword_count) {
     if (!buffer.coherent) {
@@ -15753,6 +16034,9 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
+      cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
+                       BufferCache::BDA_ZERO_PAGE_SLOT * sizeof(vk::DeviceAddress),
+                       sizeof(vk::DeviceAddress), &m_bda_zero_page.device_address);
       for (const auto &[guest_base, backing] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
@@ -18679,6 +18963,7 @@ private:
     if (m_device != nullptr) {
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
       DestroyBuffer(&m_fault_buffer);
+      DestroyBuffer(&m_bda_zero_page);
       DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
@@ -18904,8 +19189,10 @@ private:
                        vk::BufferUsageFlagBits::eTransferDst;
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
-    m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+    m_bda_zero_page = CreateStorageBuffer(
+        shader_name, {}, BufferCache::CACHING_PAGESIZE / sizeof(u32), true);
+    m_fault_buffer = CreateDeviceBuffer(shader_name, BufferCache::FAULT_BUFFER_SIZE,
+                                        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -18983,7 +19270,11 @@ private:
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
+  Buffer m_bda_zero_page;
   GraphicContext m_runtime_context{};
+  vk::DeviceSize m_largest_poisoned_memory = 0;
+  inline static VulkanHarness *s_poisoning = nullptr;
+  inline static const char *s_poisoning_name = nullptr;
   std::unique_ptr<RenderContext> m_renderer;
 };
 
@@ -19142,6 +19433,22 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
     const auto gds_actual =
         vulkan->ReadBuffer(test.name, gds_buffer, test.expected_gds.size());
     CompareWords(test, "GDS readback", test.expected_gds, gds_actual);
+  }
+  for (const auto page : test.expected_fault_pages) {
+    constexpr auto span_bits = std::countr_zero(BufferCache::FAULT_SUMMARY_SPAN);
+    const auto group = page >> (5 + span_bits);
+    const std::array<uint64_t, 2> words{page >> 5, BufferCache::FAULT_BITMAP_WORDS + (group >> 5)};
+    const auto values = vulkan->ReadFaultWords(test.name, words);
+    Require(test.name, "fault readback", (values[0] >> (page & 31)) & 1u,
+            "the faulting page has no fault bit");
+    Require(test.name, "fault readback", (values[1] >> (group & 31)) & 1u,
+            "the faulting page has no fault summary bit");
+  }
+  for (const auto page : test.fault_free_pages) {
+    const std::array<uint64_t, 1> words{page >> 5};
+    const auto values = vulkan->ReadFaultWords(test.name, words);
+    Require(test.name, "fault readback", ((values[0] >> (page & 31)) & 1u) == 0,
+            "a page without a faulting access has a fault bit");
   }
   if (!test.expected_storage_image_rgba.empty()) {
     auto image_actual = vulkan->ReadImage(test.name, &storage_image);
@@ -31366,6 +31673,122 @@ TestCase FlatLoadVariants() {
   return test;
 }
 
+TestCase FlatLoadRecordsFaultSummary() {
+  using O = ShaderOpcode;
+  // An unmapped page reads zero and records both its fault bit and its summary bit.
+  constexpr uint64_t Unmapped = 0x0000001f00000000ull;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeFlat0(0x0c, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendVMovU32(&code, 22, static_cast<u32>(Unmapped));
+  AppendVMovU32(&code, 23, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 0));
+  code.push_back(EncodeFlat1(1, 0x7d, 0, 22));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "FlatLoadRecordsFaultSummary";
+  test.code = std::move(code);
+  test.initial = {0x11223344u, 0x55667788u};
+  test.expected = {0x11223344u, 0u};
+  test.bda_mappings = {{0, 0}};
+  test.expected_fault_pages = {BufferCache::PageIndex(Unmapped)};
+  test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BdaLoadsLookUpPagesWithoutBranches() {
+  using O = ShaderOpcode;
+  // Block-level BDA loads look their pages up without a branch and check their faults later;
+  // only the dword after an unaligned FLAT address keeps a checked lookup.
+  constexpr uint64_t GuestBase = 0x10000;
+  constexpr uint64_t Unmapped = 0x0000002f00000000ull;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 8, GuestBase);
+  AppendSMovLiteral(&code, 9, 0);
+  code.push_back(EncodeSop2(0x00, 8, 8, 4)); // the group ID keeps the base dynamic
+  code.push_back(EncodeSmem0(0x02, 12, 4));  // S_LOAD_DWORDX4 s[12:15], s[8:9]
+  code.push_back(EncodeSmem1(0, 0x7d));
+  AppendVMovU32(&code, 20, static_cast<u32>(Unmapped));
+  AppendVMovU32(&code, 21, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 0));
+  code.push_back(EncodeFlat1(4, 0x7d, 0, 20));
+  for (u32 i = 0; i < 4; ++i) {
+    AppendStoreSgpr(&code, 12 + i, i);
+  }
+  AppendStoreVgpr(&code, 4, 4);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BdaLoadsLookUpPagesWithoutBranches";
+  test.code = std::move(code);
+  test.initial.resize(20, 0x55555555u);
+  for (u32 i = 0; i < 4; ++i) {
+    test.initial[16 + i] = 0x11111111u * (i + 1);
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < 4; ++i) {
+    test.expected[i] = test.initial[16 + i];
+  }
+  test.expected[4] = 0;
+  test.bda_mappings = {{GuestBase, 64}};
+  test.expected_fault_pages = {BufferCache::PageIndex(Unmapped)};
+  test.required_spirv = {"get_bda_pointer"};
+  test.spirv_counts = {{"OpFunctionCall %ulong %get_bda_pointer", 1}};
+  test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_LOAD_DWORDX4, O::V_MOV_B32,
+                  O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase IndirectBufferLoadsLookUpPagesWithoutBranches() {
+  // Loads through run-time descriptors guard each dword with EXEC and its bounds, without a
+  // branch or a checked page lookup.
+  auto test = BufferLoadsGpuSelectedDescriptors(1);
+  test.name = "IndirectBufferLoadsLookUpPagesWithoutBranches";
+  test.forbidden_spirv = {"OpFunctionCall %ulong %get_bda_pointer"};
+  return test;
+}
+
+TestCase FlatLoadOfInactiveLaneRecordsNoFault() {
+  using O = ShaderOpcode;
+  // The lookup also runs for inactive lanes, which keep their value and record no fault.
+  constexpr uint64_t Unmapped = 0x0000003f00000000ull;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0x12345678u);
+  AppendVMovU32(&code, 20, static_cast<u32>(Unmapped));
+  AppendVMovU32(&code, 21, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 0)); // V_CMP_NE_U32 vcc, 0, v0
+  code.push_back(EncodeSop1(0x24, 2, 106));          // S_AND_SAVEEXEC_B64 s[2:3], vcc
+  code.push_back(EncodeFlat0(0x0c, 0));
+  code.push_back(EncodeFlat1(1, 0x7d, 0, 20));
+  code.push_back(EncodeSop1(0x04, 126, 2)); // S_MOV_B64 exec, s[2:3]
+  AppendStoreVgpr(&code, 1, 0);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "FlatLoadOfInactiveLaneRecordsNoFault";
+  test.code = std::move(code);
+  test.initial = {0u};
+  test.expected = {0x12345678u};
+  test.bda_mappings = {{0, 0}};
+  test.fault_free_pages = {BufferCache::PageIndex(Unmapped)};
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_NE_U32, O::S_AND_SAVEEXEC_B64, O::FLAT_LOAD_DWORD,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase FlatSubdwordLoadsApplyByteOffset() {
   using O = ShaderOpcode;
 
@@ -37448,6 +37871,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatStoreSlcCaptured);
   AddCase(FlatLoadVariants);
   AddCase(FlatSubdwordLoadsApplyByteOffset);
+  AddCase(FlatLoadRecordsFaultSummary);
+  AddCase(BdaLoadsLookUpPagesWithoutBranches);
+  AddCase(FlatLoadOfInactiveLaneRecordsNoFault);
+  AddCase(IndirectBufferLoadsLookUpPagesWithoutBranches);
   cases.push_back(GlobalLoadShortD16Captured(32));
   cases.push_back(GlobalLoadShortD16Captured(64));
   AddCase(FlatLoadShortD16AddressSegments);
@@ -43848,6 +44275,9 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckBdaPageTableStartsCleared();
+  vulkan.CheckFaultBufferSummary();
+  vulkan.CheckFaultBufferStartsCleared();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

@@ -5299,8 +5299,35 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
             ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 2u,
         "raw scalar load did not remain a live typed address operation");
-  Check(SpirvInstructionOpcodeCount(raw.spirv, 57) == 2u,
+  // Page-table entries the entry point reads at a computed index: the zero-page
+  // slot after the table is a constant index, and a checked lookup is a call to
+  // get_bda_pointer, which is defined whether or not a load uses it.
+  const auto count_page_lookups = [](const std::string &source) {
+    const auto main_function = source.find("%main = OpFunction");
+    Check(main_function != std::string::npos, "entry point function not found");
+    uint32_t count = 0;
+    std::istringstream stream(source.substr(main_function));
+    std::string line;
+    constexpr const char *lookup =
+        "OpAccessChain %_ptr_StorageBuffer_ulong %bda_pagetable %uint_0 %";
+    const auto lookup_length = std::strlen(lookup);
+    while (std::getline(stream, line)) {
+      const auto found = line.find(lookup);
+      if (found != std::string::npos &&
+          line.compare(found + lookup_length, 5, "uint_") != 0) {
+        count++;
+      }
+    }
+    return count;
+  };
+  const auto raw_source = DisassembleSpirvBinary(raw.spirv);
+  Check(count_page_lookups(raw_source) == 2u,
         "aligned scalar DWORDs must each use one BDA lookup");
+  Check(CountSourceOccurrences(raw_source,
+                               "OpFunctionCall %ulong %get_bda_pointer") == 0u,
+        "aligned scalar DWORDs must not use a checked BDA lookup");
+  Check(SpirvInstructionOpcodeCount(raw.spirv, 120) == 2u,
+        "aligned scalar DWORDs must each issue one physical load");
   Check(SpirvContainsOpcode(raw.spirv, 199),
         "raw scalar SOFFSET alignment was not emitted");
   CheckSpirvBinaryValidates(raw.spirv);

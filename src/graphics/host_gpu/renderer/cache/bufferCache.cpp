@@ -70,6 +70,17 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
+void BufferCache::PrepareBdaZeroPage() {
+	if (m_bda_zero_page_ready) {
+		return;
+	}
+	m_bda_zero_page_ready = true;
+	m_bda_zero_page.Fill(0, m_bda_zero_page.Size(), 0);
+	const vk::DeviceAddress address = m_bda_zero_page.BufferDeviceAddress();
+	WriteDataBuffer(m_bda_pagetable_buffer, BDA_ZERO_PAGE_SLOT * sizeof(vk::DeviceAddress),
+	                &address, sizeof(address));
+}
+
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
 }
@@ -223,6 +234,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
+      m_bda_zero_page(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, CACHING_PAGESIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -233,6 +246,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	// A zero entry marks a page without a buffer, and device memory starts undefined.
+	m_bda_pagetable_buffer.Fill(m_scheduler.BeginCommand(), 0, m_bda_pagetable_buffer.Size(), 0);
+	m_scheduler.Submit();
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);

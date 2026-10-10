@@ -111,6 +111,10 @@ struct EmitterState {
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
+	// Fault tags of the block-level BDA loads not checked yet (the missing page, or
+	// NoBdaFault), and the depth of the conditional constructs being emitted.
+	std::vector<uint32_t>                              deferred_bda_faults;
+	uint32_t                                           conditional_depth            = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         bvh_intersect_function  = 0;
@@ -470,6 +474,7 @@ uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t va
 
 uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_t value);
 
+void     FlushDeferredBdaFaults(EmitterState& state);
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32);
 
 inline constexpr auto EmitBitcastF32ToU32 = EmitNative<spv::OpBitcast, IR::Type::U32, uint32_t>;
@@ -539,6 +544,7 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
 	if constexpr (has_result) {
 		phi = {spv::OpPhi, result_type, state.builder.AllocateId()};
 	}
+	state.conditional_depth++;
 	for (uint32_t item = 0; item < count; item++) {
 		EmitLabel(state, labels[item]);
 		if constexpr (has_result) {
@@ -549,6 +555,7 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
 		}
 		state.builder.AddFunction(spv::OpBranch, merge_label);
 	}
+	state.conditional_depth--;
 	EmitLabel(state, merge_label);
 	if constexpr (has_result) {
 		state.builder.AddFunction(phi);
@@ -563,7 +570,9 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
 	EmitLabel(state, then_label);
+	state.conditional_depth++;
 	fn();
+	state.conditional_depth--;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);
 }
@@ -577,7 +586,9 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
 	EmitLabel(state, then_label);
+	state.conditional_depth++;
 	const auto then_value = fn();
+	state.conditional_depth--;
 	const auto then_exit  = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);

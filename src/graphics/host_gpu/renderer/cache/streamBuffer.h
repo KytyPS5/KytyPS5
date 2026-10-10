@@ -67,6 +67,7 @@ public:
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	void               Fill(CommandBuffer& command, uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;

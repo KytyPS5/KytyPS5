@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/archive.h"
 #include "common/assert.h"
 #include "common/dateTime.h"
 #include "common/file.h"
@@ -15,19 +16,18 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <atomic>
-#include <cinttypes>
-#include <iterator>
 #include <variant>
 #include <vector>
 
@@ -194,8 +194,11 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	ResolvedPathInfo  info {};
 	const std::string path(guest_path);
-	bool              found = false;
-	{
+	const auto        real_path = LibKernel::FileSystem::GetRealFilename(path);
+	// Only read-only archive contents can be cached; save data is rewritten while mounted.
+	const bool cacheable = Common::IsArchivePath(real_path);
+	bool       found     = false;
+	if (cacheable) {
 		std::scoped_lock lock(g_mutex);
 		const auto       it = g_resolved_paths.find(path);
 		if (it != g_resolved_paths.end()) {
@@ -205,8 +208,7 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 	}
 
 	if (!found) {
-		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
-		info.host_path       = real_path;
+		info.host_path = real_path;
 
 		if (Common::File::IsDirectoryExisting(real_path)) {
 			info.is_dir    = true;
@@ -221,19 +223,29 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		{
 			std::scoped_lock lock(g_mutex);
 			auto [it, inserted] = g_resolved_paths.emplace(path, info);
-			if (!inserted) {
+			if (!inserted && cacheable) {
 				info = it->second;
 			} else if (info.result == OK) {
-				// Allocate once under the cache lock; distinct paths can share a hash.
-				if (g_next_file_id == 0xffffffffu) {
+				if (!inserted && it->second.result == OK) {
+					// Save data is re-resolved on every call; keep its ID and refresh the size.
+					info.file_id               = it->second.file_id;
+					it->second                 = info;
+					g_files[info.file_id]      = info.host_path;
+					g_file_sizes[info.file_id] = info.is_dir ? 0 : info.file_size;
+				} else if (g_next_file_id == 0xffffffffu) {
+					// Allocate once under the cache lock; distinct paths can share a hash.
 					info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
 				} else {
-					info.file_id = it->second.file_id = g_next_file_id++;
-					g_files.emplace(info.file_id, info.host_path);
-					g_file_sizes.emplace(info.file_id, info.is_dir ? 0 : info.file_size);
+					info.file_id               = g_next_file_id++;
+					it->second                 = info;
+					g_files[info.file_id]      = info.host_path;
+					g_file_sizes[info.file_id] = info.is_dir ? 0 : info.file_size;
 				}
-			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
-				log_missing = true;
+			} else {
+				it->second = info;
+				if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
+					log_missing = true;
+				}
 			}
 		}
 		if (!log_missing && info.result == OK && path.starts_with("/addcont")) {

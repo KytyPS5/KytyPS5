@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -173,9 +175,10 @@ static std::atomic_uint64_t g_audioout2_next_port {1};
 static AudioOut2UserHandle  g_audioout2_next_user = 1;
 
 struct AudioOut2GrainPort {
-	AudioOut2PortHandle  port         = 0;
-	int                  audio_handle = 0;
-	std::vector<uint8_t> pcm;
+	AudioOut2PortHandle   port         = 0;
+	int                   audio_handle = 0;
+	std::vector<uint8_t>  pcm;
+	std::array<float, 16> gains {};
 };
 
 using AudioOut2Grain = std::vector<AudioOut2GrainPort>;
@@ -190,7 +193,8 @@ struct AudioOut2ContextState {
 	uint64_t               last_update_frac = 0; // in 1/48000 us, so grains need not be whole us
 	bool                   idle             = true;
 	std::deque<AudioOut2Grain> advanced;
-	bool                       uses_advance = false;
+	bool                       uses_advance        = false;
+	int                        object_audio_handle = 0;
 };
 
 struct AudioOut2PortStateEntry {
@@ -204,6 +208,10 @@ struct AudioOut2PortStateEntry {
 	uint32_t               samples_num   = 512;
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
 	int                    audio_handle  = 0;
+	std::array<float, 16>  gains {};
+	uint32_t               ambisonics        = UINT32_MAX;
+	bool                   attributes_locked = false;
+	bool                   pcm_fresh         = false;
 	std::vector<uint8_t>   pcm_data;
 };
 
@@ -239,7 +247,11 @@ static constexpr int AUDIO_OUT2_ERROR_INVALID_PARAM               = -2144960511;
 static constexpr int AUDIO_OUT2_ERROR_BUSY                        = -2144960505; /* 0x80268007 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999; /* 0x80268201 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
+static constexpr int AUDIO_OUT2_ERROR_OUT_OF_RESOURCE             = -2144960510; /* 0x80268002 */
+static constexpr int AUDIO_OUT2_ERROR_INVALID_PORT                = -2144960503; /* 0x80268009 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_DEFAULT  = 1;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_V2       = 2;
@@ -421,39 +433,253 @@ static size_t audioout2_pcm_size(const AudioOut2PortStateEntry& state) {
 	       audioout2_data_format_channels(state.data_format) * bytes_per_sample;
 }
 
+struct AudioOut2ObjectBus {
+	int      audio_handle = 0;
+	uint32_t num_grains   = 512;
+};
+
+static AudioOut2ObjectBus audioout2_object_bus(AudioOut2ContextHandle ctx) {
+	Common::LockGuard lock(g_audioout2_context_mutex);
+	const auto*       state = audioout2_find_context_locked(ctx);
+	return state != nullptr ? AudioOut2ObjectBus {state->object_audio_handle, state->num_grains}
+	                        : AudioOut2ObjectBus {};
+}
+
 static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
+	const auto        bus = audioout2_object_bus(ctx);
 	Common::LockGuard lock(g_audioout2_port_mutex);
 	for (const auto& state: g_audioout2_ports) {
-		if (state.used && state.context == ctx && state.audio_handle > 0 &&
-		    !state.pcm_data.empty() && AudioInternal::AudioOutHasDevice(state.audio_handle)) {
-			return true;
+		if (state.used && state.context == ctx && !state.pcm_data.empty()) {
+			const int handle = audioout2_port_type_is_object(state.port_type) ? bus.audio_handle
+			                                                                  : state.audio_handle;
+			if (handle > 0 && AudioInternal::AudioOutHasDevice(handle)) {
+				return true;
+			}
 		}
 	}
 	return false;
 }
 
-static AudioOut2Grain audioout2_snapshot_context_locked(AudioOut2ContextHandle ctx) {
-	AudioOut2Grain grain;
-	for (const auto& state: g_audioout2_ports) {
-		if (state.used && state.context == ctx && state.audio_handle > 0 &&
-		    !state.pcm_data.empty() && grain.size() < AudioInternal::OUT_PORTS_MAX) {
-			grain.push_back(AudioOut2GrainPort {state.handle, state.audio_handle, state.pcm_data});
+using AudioOut2StereoGains = std::array<float, 2>;
+
+using AudioOut2AmbisonicsTable = std::array<AudioOut2StereoGains, 36>;
+
+enum class AudioOut2AmbisonicsDecoder { Wide, Sharp, Ring12, Cardioid };
+
+// ACN/SN3D orders 0-5 to stereo through a horizontal ring of virtual speakers.
+static AudioOut2AmbisonicsTable audioout2_build_ambisonics_table(AudioOut2AmbisonicsDecoder decoder,
+                                                                 double front_gain) {
+	constexpr int    order    = 5;
+	constexpr double pi       = 3.14159265358979323846;
+	const int        speakers = decoder == AudioOut2AmbisonicsDecoder::Ring12 ? 12 : 24;
+	std::array<double, order + 1> sn3d {};   // horizon amplitude of the sectoral harmonics
+	std::array<double, order + 1> weight {}; // max-rE, or 1 (basic) for the sharp decode
+	for (int l = 0; l <= order; l++) {
+		double factorial = 1.0;
+		double odd       = 1.0;
+		for (int i = 2; i <= 2 * l; i++) {
+			factorial *= i;
 		}
+		for (int i = 1; i < 2 * l; i += 2) {
+			odd *= i;
+		}
+		sn3d[l]   = l == 0 ? 1.0 : std::sqrt(2.0 / factorial) * odd;
+		weight[l] = decoder == AudioOut2AmbisonicsDecoder::Sharp ? 1.0
+		            : decoder == AudioOut2AmbisonicsDecoder::Cardioid
+		                ? (l <= 1 ? 1.0 : 0.0)
+		                : std::cos(l * pi / (2 * order + 2));
+	}
+	std::array<std::array<double, 2>, 36> gains {};
+	std::array<std::array<double, 2>, 36> flat {};
+	if (decoder == AudioOut2AmbisonicsDecoder::Cardioid) {
+		gains[0] = flat[0] = {1.0, 1.0};
+		gains[1] = flat[1] = {1.0, -1.0};
+		gains[3]           = {front_gain - 1.0, front_gain - 1.0};
+	} else {
+		for (int k = 0; k < speakers; k++) {
+			const double azimuth = 2.0 * pi * k / speakers; // counterclockwise, 0 = front
+			double       side    = std::sin(azimuth);
+			if (decoder != AudioOut2AmbisonicsDecoder::Ring12) {
+				const double lateral = std::asin(std::clamp(side, -1.0, 1.0));
+				side                 = std::clamp(lateral / (pi / 6.0), -1.0, 1.0);
+			}
+			const double pan      = (1.0 - side) * pi / 4.0;
+			const double out[2]   = {std::cos(pan) / speakers, std::sin(pan) / speakers};
+			const double ahead    = std::max(0.0, std::cos(azimuth));
+			const double emphasis = 1.0 + (front_gain - 1.0) * ahead * ahead;
+			for (int ch = 0; ch < 2; ch++) {
+				std::array<double, 36> row {};
+				row[0] = out[ch] * weight[0];
+				for (int l = 1; l <= order; l++) {
+					row[l * l + 2 * l] =
+					    out[ch] * 2.0 * weight[l] * std::cos(l * azimuth) / sn3d[l];
+					row[l * l] = out[ch] * 2.0 * weight[l] * std::sin(l * azimuth) / sn3d[l];
+				}
+				for (size_t i = 0; i < row.size(); i++) {
+					flat[i][ch] += row[i];
+					gains[i][ch] += row[i] * emphasis;
+				}
+			}
+		}
+	}
+	double front = flat[0][0];
+	for (int l = 1; l <= order; l++) {
+		front += flat[l * l + 2 * l][0] * sn3d[l];
+	}
+	AudioOut2AmbisonicsTable result {};
+	for (size_t i = 0; i < result.size(); i++) {
+		for (int ch = 0; ch < 2; ch++) {
+			result[i][ch] = static_cast<float>(gains[i][ch] * 0.70710678118654752 / front);
+		}
+	}
+	return result;
+}
+
+static std::atomic<const AudioOut2AmbisonicsTable*> g_audioout2_ambisonics_table {nullptr};
+
+bool AudioOut2SelectAmbisonicsDecoder(const char* name, double front_gain_db) {
+	static constexpr const char*                NAMES[] = {"wide", "sharp", "ring12", "cardioid"};
+	static constexpr AudioOut2AmbisonicsDecoder DECODERS[] = {
+	    AudioOut2AmbisonicsDecoder::Wide, AudioOut2AmbisonicsDecoder::Sharp,
+	    AudioOut2AmbisonicsDecoder::Ring12, AudioOut2AmbisonicsDecoder::Cardioid};
+	size_t index = 0;
+	bool   known = name == nullptr;
+	for (size_t i = 0; i < std::size(NAMES); i++) {
+		if (name != nullptr && std::strcmp(name, NAMES[i]) == 0) {
+			index = i;
+			known = true;
+		}
+	}
+	const double gain = std::pow(10.0, std::clamp(front_gain_db, -12.0, 12.0) / 20.0);
+	// A replaced table is never freed: a mixer thread may still be reading it.
+	g_audioout2_ambisonics_table.store(
+	    new AudioOut2AmbisonicsTable(audioout2_build_ambisonics_table(DECODERS[index], gain)));
+	return known;
+}
+
+static const AudioOut2AmbisonicsTable& audioout2_ambisonics_stereo() {
+	const auto* table = g_audioout2_ambisonics_table.load();
+	if (table == nullptr) {
+		static Common::Mutex mutex;
+		Common::LockGuard    lock(mutex);
+		table = g_audioout2_ambisonics_table.load();
+		if (table == nullptr) {
+			const char* name       = std::getenv("KYTY_AMBI_DECODE");
+			const char* front      = std::getenv("KYTY_AMBI_FRONT_GAIN_DB");
+			const auto  front_gain = front != nullptr && front[0] != '\0'
+			                             ? std::strtod(front, nullptr)
+			                             : AUDIO_OUT2_DEFAULT_FRONT_GAIN_DB;
+			if (!AudioOut2SelectAmbisonicsDecoder(
+			        name != nullptr && name[0] != '\0' ? name : nullptr, front_gain)) {
+				LOGF("AudioOut2: unknown KYTY_AMBI_DECODE '%s', using wide\n", name);
+			}
+			table = g_audioout2_ambisonics_table.load();
+		}
+	}
+	return *table;
+}
+
+static bool audioout2_object_stereo_gains(uint32_t ambisonics, AudioOut2StereoGains* gains) {
+	const auto& acn = audioout2_ambisonics_stereo();
+	if (ambisonics == UINT32_MAX) {
+		*gains = {0.70710678f, 0.70710678f};
+	} else if (ambisonics >= 64 && ambisonics < 64 + acn.size()) {
+		*gains = acn[ambisonics - 64];
+	} else if (ambisonics <= 3) {
+		// FuMa W is -3 dB relative to SN3D; FuMa orders its first-order terms X, Y, Z.
+		static constexpr uint32_t FUMA_TO_ACN[4] = {0, 3, 1, 2};
+		*gains                                   = acn[FUMA_TO_ACN[ambisonics]];
+		if (ambisonics == 0) {
+			(*gains)[0] *= 1.41421356f;
+			(*gains)[1] *= 1.41421356f;
+		}
+	} else {
+		return false;
+	}
+	return true;
+}
+
+static void audioout2_mix_object(std::vector<float>* mix, const AudioOut2PortStateEntry& object) {
+	AudioOut2StereoGains stereo {};
+	if (!audioout2_object_stereo_gains(object.ambisonics, &stereo)) {
+		return;
+	}
+	float left  = stereo[0];
+	float right = stereo[1];
+	left *= object.gains[0];
+	right *= object.gains[0];
+	const auto frames = std::min<size_t>(mix->size() / 2, object.samples_num);
+	for (size_t frame = 0; frame < frames; frame++) {
+		const float sample =
+		    object.audio_format == AudioInternal::Format::FloatMono
+		        ? reinterpret_cast<const float*>(object.pcm_data.data())[frame]
+		        : reinterpret_cast<const int16_t*>(object.pcm_data.data())[frame] / 32768.0f;
+		(*mix)[frame * 2] += sample * left;
+		(*mix)[frame * 2 + 1] += sample * right;
+	}
+}
+
+static AudioOut2Grain audioout2_snapshot_context_locked(AudioOut2ContextHandle    ctx,
+                                                        const AudioOut2ObjectBus& bus,
+                                                        bool                      fresh_only) {
+	AudioOut2Grain     grain;
+	std::vector<float> object_mix;
+	for (const auto& state: g_audioout2_ports) {
+		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
+			continue;
+		}
+		// A port given no new PCM since the last advance is silent for this grain.
+		const bool stale = fresh_only && !state.pcm_fresh;
+		if (audioout2_port_type_is_object(state.port_type)) {
+			if (bus.audio_handle > 0) {
+				object_mix.resize(static_cast<size_t>(bus.num_grains) * 2, 0.0f);
+				if (!stale) {
+					audioout2_mix_object(&object_mix, state);
+				}
+			}
+		} else if (state.audio_handle > 0 && grain.size() < AudioInternal::OUT_PORTS_MAX) {
+			grain.push_back(AudioOut2GrainPort {
+			    state.handle, state.audio_handle,
+			    stale ? std::vector<uint8_t>(state.pcm_data.size(), 0) : state.pcm_data,
+			    state.gains});
+		}
+	}
+	for (auto& sample: object_mix) {
+		const float magnitude = std::abs(sample);
+		if (magnitude > 0.9f) {
+			sample = std::copysign(0.9f + 0.1f * std::tanh((magnitude - 0.9f) / 0.1f), sample);
+		}
+	}
+	if (!object_mix.empty() && grain.size() < AudioInternal::OUT_PORTS_MAX) {
+		AudioOut2GrainPort bus_entry {0, bus.audio_handle, {}, {}};
+		const auto*        bytes = reinterpret_cast<const uint8_t*>(object_mix.data());
+		bus_entry.pcm.assign(bytes, bytes + object_mix.size() * sizeof(float));
+		bus_entry.gains.fill(1.0f);
+		grain.push_back(std::move(bus_entry));
 	}
 	return grain;
 }
 
-static void audioout2_drop_dead_ports_locked(AudioOut2Grain* grain) {
-	std::erase_if(*grain, [](const AudioOut2GrainPort& entry) {
+static void audioout2_drop_dead_ports_locked(AudioOut2Grain* grain, int object_audio_handle) {
+	std::erase_if(*grain, [object_audio_handle](const AudioOut2GrainPort& entry) {
+		if (entry.port == 0) {
+			return entry.audio_handle != object_audio_handle;
+		}
 		const auto* state = audioout2_find_port_locked(entry.port);
 		return state == nullptr || state->audio_handle != entry.audio_handle;
 	});
 }
 
-static bool audioout2_take_advanced_grain(AudioOut2ContextHandle ctx, AudioOut2Grain* grain) {
+static bool audioout2_take_advanced_grain(AudioOut2ContextHandle ctx, AudioOut2Grain* grain,
+                                          AudioOut2ObjectBus* bus, bool* uses_advance) {
 	Common::LockGuard lock(g_audioout2_context_mutex);
 	auto*             state = audioout2_find_context_locked(ctx);
-	if (state == nullptr || state->advanced.empty()) {
+	if (state == nullptr) {
+		return false;
+	}
+	*bus          = AudioOut2ObjectBus {state->object_audio_handle, state->num_grains};
+	*uses_advance = state->uses_advance;
+	if (state->advanced.empty()) {
 		return false;
 	}
 	*grain = std::move(state->advanced.front());
@@ -464,21 +690,30 @@ static bool audioout2_take_advanced_grain(AudioOut2ContextHandle ctx, AudioOut2G
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking, bool cushion) {
 	std::shared_lock output_lock(g_audioout2_output_mutex);
 
-	AudioOut2Grain grain;
-	const bool     advanced = audioout2_take_advanced_grain(ctx, &grain);
+	AudioOut2Grain     grain;
+	AudioOut2ObjectBus bus;
+	bool               uses_advance = false;
+	const bool         advanced = audioout2_take_advanced_grain(ctx, &grain, &bus, &uses_advance);
 	{
 		Common::LockGuard lock(g_audioout2_port_mutex);
 		if (advanced) {
-			audioout2_drop_dead_ports_locked(&grain);
+			audioout2_drop_dead_ports_locked(&grain, bus.audio_handle);
 		} else {
-			grain = audioout2_snapshot_context_locked(ctx);
+			grain = audioout2_snapshot_context_locked(ctx, bus, false);
+		}
+	}
+	if (!advanced && uses_advance) {
+		// A push with no new advance is an underrun; replaying the last grain buzzes.
+		for (auto& entry: grain) {
+			std::fill(entry.pcm.begin(), entry.pcm.end(), uint8_t {0});
 		}
 	}
 
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(grain.size());
 	for (const auto& entry: grain) {
-		params.push_back(AudioInternal::OutputParam {entry.audio_handle, entry.pcm.data()});
+		params.push_back(
+		    AudioInternal::OutputParam {entry.audio_handle, entry.pcm.data(), entry.gains.data()});
 	}
 	if (!params.empty()) {
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
@@ -556,34 +791,47 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(ctx == nullptr);
 
-	*ctx = g_audioout2_next_context.fetch_add(1, std::memory_order_relaxed);
+	const auto num_grains  = (params->num_grains == 0 ? 512u : params->num_grains);
+	const auto queue_depth = (params->queue_depth == 0 ? 4u : params->queue_depth);
+	const int  object_audio_handle =
+	    params->max_object_ports == 0
+	        ? 0
+	        : AudioInternal::AudioOutOpen(AUDIO_OUT_PORT_TYPE_MAIN, num_grains, 48000,
+	                                      AudioInternal::Format::FloatStereo);
+	if (params->max_object_ports != 0 && object_audio_handle == 0) {
+		return AUDIO_OUT2_ERROR_OUT_OF_RESOURCE;
+	}
 
 	g_audioout2_context_mutex.Lock();
-	auto* state = audioout2_find_context_locked(0);
-	if (state == nullptr) {
-		for (auto& candidate: g_audioout2_contexts) {
-			if (!candidate.used) {
-				state = &candidate;
-				break;
-			}
+	AudioOut2ContextState* state = nullptr;
+	for (auto& candidate: g_audioout2_contexts) {
+		if (!candidate.used) {
+			state = &candidate;
+			break;
 		}
 	}
-	EXIT_NOT_IMPLEMENTED(state == nullptr);
-	*state             = AudioOut2ContextState {};
-	state->used        = true;
-	state->handle      = *ctx;
-	state->queue_depth = (params->queue_depth == 0 ? 4u : params->queue_depth);
-	state->queued      = 0;
-	state->num_grains  = (params->num_grains == 0 ? 512u : params->num_grains);
-	state->last_update = LibKernel::KernelGetProcessTime();
+	if (state == nullptr) {
+		g_audioout2_context_mutex.Unlock();
+		audioout2_close_audio_handle(object_audio_handle);
+		return AUDIO_OUT2_ERROR_OUT_OF_RESOURCE;
+	}
+	*ctx                       = g_audioout2_next_context.fetch_add(1, std::memory_order_relaxed);
+	*state                     = AudioOut2ContextState {};
+	state->used                = true;
+	state->handle              = *ctx;
+	state->queue_depth         = queue_depth;
+	state->queued              = 0;
+	state->num_grains          = num_grains;
+	state->last_update         = LibKernel::KernelGetProcessTime();
+	state->object_audio_handle = object_audio_handle;
 	g_audioout2_context_mutex.Unlock();
 
 	LOGF("\t buffer      = 0x%016" PRIx64 "\n"
 	     "\t buffer_size = 0x%016" PRIx64 "\n"
 	     "\t ctx         = 0x%016" PRIx64 "\n"
 	     "\t queue_depth = %" PRIu32 ", num_grains = %" PRIu32 "\n",
-	     reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(buffer_size), *ctx,
-	     state->queue_depth, state->num_grains);
+	     reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(buffer_size), *ctx, queue_depth,
+	     num_grains);
 
 	return OK;
 }
@@ -592,14 +840,17 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 "\n", ctx);
 
+	std::array<int, 257> audio_handles {};
+	size_t               audio_handles_num = 0;
+
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+		if (state->object_audio_handle > 0) {
+			audio_handles[audio_handles_num++] = state->object_audio_handle;
+		}
 		*state = AudioOut2ContextState {};
 	}
 	g_audioout2_context_mutex.Unlock();
-
-	std::array<int, 256> audio_handles {};
-	size_t               audio_handles_num = 0;
 
 	g_audioout2_port_mutex.Lock();
 	for (auto& port_state: g_audioout2_ports) {
@@ -629,10 +880,17 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
+	const auto     bus = audioout2_object_bus(ctx);
 	AudioOut2Grain grain;
 	{
 		Common::LockGuard lock(g_audioout2_port_mutex);
-		grain = audioout2_snapshot_context_locked(ctx);
+		grain = audioout2_snapshot_context_locked(ctx, bus, true);
+		for (auto& port: g_audioout2_ports) {
+			if (port.used && port.context == ctx) {
+				port.attributes_locked = false;
+				port.pcm_fresh         = false;
+			}
+		}
 	}
 
 	g_audioout2_context_mutex.Lock();
@@ -730,6 +988,14 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		g_audioout2_context_mutex.Unlock();
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
+	if (audioout2_port_type_is_object(params->port_type) &&
+	    (params->port_type != 0x100 || context_state->object_audio_handle == 0 ||
+	     params->sampling_freq != 48000 ||
+	     (audio_format != AudioInternal::Format::FloatMono &&
+	      audio_format != AudioInternal::Format::Signed16bitMono))) {
+		g_audioout2_context_mutex.Unlock();
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
 	const auto samples_num = context_state->num_grains == 0 ? 512u : context_state->num_grains;
 
 	g_audioout2_port_mutex.Lock();
@@ -757,6 +1023,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		port_state->sampling_freq = params->sampling_freq;
 		port_state->samples_num   = samples_num;
 		port_state->audio_format  = audio_format;
+		port_state->gains.fill(1.0f);
 	}
 	g_audioout2_port_mutex.Unlock();
 	g_audioout2_context_mutex.Unlock();
@@ -818,31 +1085,89 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 
 int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
-	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
+	if (num != 0 && attributes == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	Common::LockGuard lock(g_audioout2_port_mutex);
+	auto*             state = audioout2_find_port_locked(port);
+	if (state == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PORT;
+	}
 
-	const void* pcm_data = nullptr;
-	bool        has_pcm  = false;
+	const void* pcm_data   = nullptr;
+	auto        gains      = state->gains;
+	auto        ambisonics = state->ambisonics;
+	uint32_t    seen       = 0;
 	for (uint32_t i = 0; i < num; i++) {
-		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
-		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
-			AudioOut2Pcm pcm {};
-			std::memcpy(&pcm, attributes[i].value, sizeof(AudioOut2Pcm));
-			pcm_data = pcm.data;
-			has_pcm  = true;
+		const auto& attribute = attributes[i];
+		const auto  id        = attribute.attribute_id;
+		if (id != AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM && id != AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN &&
+		    id != AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS) {
+			continue;
+		}
+		if ((seen & (1u << id)) != 0) {
+			return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		}
+		seen |= 1u << id;
+		// An object's attributes are frozen from its PCM until the next advance.
+		if (id != AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM && state->attributes_locked) {
+			continue;
+		}
+		if (attribute.value == nullptr) {
+			return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		}
+		switch (id) {
+			case AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM: {
+				if (attribute.value_size < sizeof(AudioOut2Pcm)) {
+					return AUDIO_OUT2_ERROR_INVALID_PARAM;
+				}
+				AudioOut2Pcm pcm {};
+				std::memcpy(&pcm, attribute.value, sizeof(pcm));
+				pcm_data = pcm.data;
+				break;
+			}
+			case AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN: {
+				// Wwise passes an 8-float gain vector even for a mono pad-speaker port.
+				const auto channels = audioout2_data_format_channels(state->data_format);
+				if (attribute.value_size < channels * sizeof(float) ||
+				    attribute.value_size % sizeof(float) != 0 ||
+				    attribute.value_size > gains.size() * sizeof(float)) {
+					return AUDIO_OUT2_ERROR_INVALID_PARAM;
+				}
+				std::memcpy(gains.data(), attribute.value, channels * sizeof(float));
+				for (uint32_t ch = 0; ch < channels; ch++) {
+					if (!std::isfinite(gains[ch]) || gains[ch] < 0.0f) {
+						return AUDIO_OUT2_ERROR_INVALID_PARAM;
+					}
+				}
+				break;
+			}
+			case AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS:
+				if (!audioout2_port_type_is_object(state->port_type) ||
+				    attribute.value_size != sizeof(ambisonics)) {
+					return AUDIO_OUT2_ERROR_INVALID_PARAM;
+				}
+				std::memcpy(&ambisonics, attribute.value, sizeof(ambisonics));
+				if (ambisonics != UINT32_MAX && ambisonics > 15 &&
+				    (ambisonics < 64 || ambisonics > 99)) {
+					return AUDIO_OUT2_ERROR_INVALID_PARAM;
+				}
+				break;
+			default: break;
 		}
 	}
 
-	if (has_pcm) {
-		g_audioout2_port_mutex.Lock();
-		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
-			if (pcm_data != nullptr && state->audio_format != AudioInternal::Format::Unknown) {
-				const auto* bytes = static_cast<const uint8_t*>(pcm_data);
-				state->pcm_data.assign(bytes, bytes + audioout2_pcm_size(*state));
-			} else {
-				state->pcm_data.clear();
-			}
+	state->gains      = gains;
+	state->ambisonics = ambisonics;
+	if ((seen & (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM)) != 0) {
+		if (pcm_data != nullptr && state->audio_format != AudioInternal::Format::Unknown) {
+			const auto* bytes = static_cast<const uint8_t*>(pcm_data);
+			state->pcm_data.assign(bytes, bytes + audioout2_pcm_size(*state));
+		} else {
+			state->pcm_data.clear();
 		}
-		g_audioout2_port_mutex.Unlock();
+		state->attributes_locked = audioout2_port_type_is_object(state->port_type);
+		state->pcm_fresh         = !state->pcm_data.empty();
 	}
 
 	return OK;
@@ -920,7 +1245,9 @@ int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
 	*context_attributes = 0;
-	*port_attributes    = 1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM;
+	*port_attributes    = (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM) |
+	                      (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN) |
+	                      (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS);
 	return OK;
 }
 

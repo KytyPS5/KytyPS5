@@ -95,6 +95,10 @@ int KYTY_SYSV_ABI AudioOut2MasteringGetState(AudioOut2MasteringStatesHeader* sta
                                              AudioOut2UserHandle user);
 int KYTY_SYSV_ABI AudioOut2MasteringTerm();
 
+constexpr double AUDIO_OUT2_DEFAULT_FRONT_GAIN_DB = 2.0;
+bool AudioOut2SelectAmbisonicsDecoder(const char* name,
+                                      double      front_gain_db = AUDIO_OUT2_DEFAULT_FRONT_GAIN_DB);
+
 } // namespace AudioOut2
 
 namespace AudioIn {

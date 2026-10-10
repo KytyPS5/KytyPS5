@@ -3838,6 +3838,35 @@ public:
                 ordered_finished.load(),
             "idle fence did not drain prior PM4 work");
 
+    // A guest store releasing WAIT_REG_MEM is seen well inside the 1 ms condition-variable tick.
+    {
+      auto best = std::chrono::steady_clock::duration::max();
+      // A loaded host can deschedule either thread, so take the best of several trials.
+      for (u32 trial = 0; trial < 32 && best >= std::chrono::microseconds(200); trial++) {
+        label = 0;
+        prefix = 0;
+        suffix = 0;
+        gpu.Submit(commands);
+        while (std::atomic_ref<uint32_t>(prefix).load() != 11) {
+          std::this_thread::yield();
+        }
+        const auto blocked = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - blocked < std::chrono::microseconds(100)) {
+          std::this_thread::yield();
+        }
+        const auto stored = std::chrono::steady_clock::now();
+        std::atomic_ref<uint32_t>(label).store(1);
+        while (std::atomic_ref<uint32_t>(suffix).load() != 22) {
+          std::this_thread::yield();
+        }
+        best = std::min(best, std::chrono::steady_clock::now() - stored);
+        gpu.WaitForIdle();
+      }
+      Require("GpuCommandLane", "blocked queue sees a guest store",
+              best < std::chrono::microseconds(250),
+              "a WAIT_REG_MEM released by a guest store waited for the millisecond poll");
+    }
+
     auto &resources = context;
     constexpr uint64_t empty_unmap_base = 0x0000000200400000ull;
     constexpr uint64_t empty_unmap_size = 0x4000;

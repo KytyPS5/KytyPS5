@@ -1,0 +1,58 @@
+#version 450
+// One workgroup per metadata slice: a slice whose bytes all equal one of the clear codes gets a
+// non-zero predicate for that code and, when requested, its expanded keys (0xff).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer Metadata {
+	uint metadata[];
+};
+
+layout(std430, binding = 1) writeonly buffer Predicates {
+	uint predicates[];
+};
+
+layout(push_constant) uniform Parameters {
+	uint slice_dwords;
+	uint code_count;
+	uint codes_low;
+	uint codes_high;
+	uint expand;
+} parameters;
+
+shared uint mismatch;
+
+uint CodeAt(uint index) {
+	const uint packed = index < 4u ? parameters.codes_low : parameters.codes_high;
+	return (packed >> ((index & 3u) * 8u)) & 0xffu;
+}
+
+void main() {
+	const uint base    = gl_WorkGroupID.x * parameters.slice_dwords;
+	const uint code    = metadata[base] & 0xffu;
+	const uint pattern = code * 0x01010101u;
+	if (gl_LocalInvocationIndex == 0u) {
+		mismatch = 0u;
+	}
+	barrier();
+	for (uint i = gl_LocalInvocationIndex; i < parameters.slice_dwords; i += 256u) {
+		if (metadata[base + i] != pattern) {
+			atomicOr(mismatch, 1u);
+			break;
+		}
+	}
+	memoryBarrierBuffer();
+	barrier();
+	bool matched = false;
+	for (uint k = 0u; k < parameters.code_count; k++) {
+		const bool hit = mismatch == 0u && code == CodeAt(k);
+		matched        = matched || hit;
+		if (gl_LocalInvocationIndex == k) {
+			predicates[gl_WorkGroupID.x * parameters.code_count + k] = hit ? 1u : 0u;
+		}
+	}
+	if (matched && parameters.expand != 0u) {
+		for (uint i = gl_LocalInvocationIndex; i < parameters.slice_dwords; i += 256u) {
+			metadata[base + i] = 0xffffffffu;
+		}
+	}
+}

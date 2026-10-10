@@ -191,6 +191,10 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static bool HasWatchedRanges(const BufferCache &cache) {
+    return !cache.m_watches.empty() || !cache.m_watched.Empty();
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -226,6 +230,17 @@ struct TextureCacheTestAccess {
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
+  }
+
+  static size_t MetaClearDecisionCount(const TextureCache &cache) {
+    return cache.m_meta_clear_decisions.size();
+  }
+
+  // Stands in for a host format without color attachment support.
+  static vk::ImageUsageFlags ReplaceImageUsage(TextureCache &cache, ImageId id,
+                                               vk::ImageUsageFlags usage) {
+    auto lock = Lock(cache);
+    return std::exchange(cache.m_slot_images[id].backing.usage, usage);
   }
 
   static void ClearImage(TextureCache &cache, CommandBuffer &command, ImageId id,
@@ -10759,6 +10774,10 @@ public:
                           vk::Format::eR16G16B16A16Unorm,
                   "the aliased clear did not reuse its existing UNORM allocation");
         }
+        Require(name, "metadata decided without readback",
+                !m_conditional_rendering_supported ||
+                    context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
+                "binding a target read its GPU-written metadata back to the CPU");
         Require(name, "color clear metadata discovery",
                 color.image_id &&
                     color.desc.info.metadata.kind ==
@@ -10874,6 +10893,23 @@ public:
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
 
+        // Aliased views clear through an attachment on the CPU path as well.
+        if (!fill_case.reuse_unorm) {
+          paint();
+          const auto attachment_usage = TextureCacheTestAccess::ReplaceImageUsage(
+              texture_cache, color.image_id,
+              texture_cache.GetImage(color.image_id).backing.usage &
+                  ~vk::ImageUsageFlagBits::eColorAttachment);
+          fill_metadata(metadata_words);
+          bind();
+          Require(name, "non-attachment image clears through readback",
+                  !context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size) &&
+                      read_texel() == expected,
+                  "a conditional attachment clear targeted an image without attachment usage");
+          (void)TextureCacheTestAccess::ReplaceImageUsage(texture_cache, color.image_id,
+                                                          attachment_usage);
+        }
+
         // Consuming a clear key updates metadata backing without invalidating
         // a pooled image whose first texel precedes the metadata range.
         constexpr uint32_t alias_value = 0x13579bdfu;
@@ -10968,8 +11004,29 @@ public:
         Require(name, "native color clear after HTile reuse", read_texel() == expected,
                 "the former HTile entry swallowed the native color metadata fill");
         check_expanded_metadata();
+        if (&fill_case == &cases.front()) {
+          // Watching an overlapping range must not hide a change from the first watch.
+          auto &buffers = context.GetBufferCache();
+          const uint64_t first = base + 0x1c0000;
+          const uint64_t second = first + 0x1000;
+          // A written request uploads the whole range, so no page stays CPU-dirty.
+          (void)buffers.ObtainBuffer(first, 0x3000, true);
+          buffers.WatchRange(first, 0x2000);
+          Require(name, "fresh watch", buffers.IsWatchedRangeUnchanged(first, 0x2000),
+                  "a new watch reported a change");
+          (void)buffers.ObtainBuffer(second, 0x100, true);
+          buffers.WatchRange(second, 0x2000);
+          Require(name, "overlapping watches",
+                  !buffers.IsWatchedRangeUnchanged(first, 0x2000) &&
+                      buffers.IsWatchedRangeUnchanged(second, 0x2000),
+                  "watching an overlapping range cleared a change of the first watch");
+        }
         RenderExecutorTestAccess::ResetBindings(executor);
         resources.UnmapMemory(base, allocation_size);
+        Require(name, "unmap drops metadata clear decisions",
+                TextureCacheTestAccess::MetaClearDecisionCount(texture_cache) == 0 &&
+                    !BufferCacheTestAccess::HasWatchedRanges(context.GetBufferCache()),
+                "unmapped metadata kept its watched range or cached clear decision");
         scheduler.Finish();
       });
       context.ShutdownGpu();
@@ -18335,6 +18392,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_conditional_rendering_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -18371,6 +18429,7 @@ private:
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
+    m_runtime_context.conditional_rendering_enabled = m_conditional_rendering_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -18513,8 +18572,27 @@ private:
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
     available_provoking_vertex.pNext = &available_feedback_dynamic;
+    uint32_t extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> available_extensions(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, available_extensions.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    const bool conditional_rendering_extension = std::any_of(
+        available_extensions.begin(), available_extensions.end(), [](const auto &extension) {
+          return std::strcmp(extension.extensionName,
+                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) == 0;
+        });
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional{};
+    available_conditional.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
-    available_min_lod.pNext = &available_provoking_vertex;
+    available_min_lod.pNext = conditional_rendering_extension
+                                  ? static_cast<void *>(&available_conditional)
+                                  : static_cast<void *>(&available_provoking_vertex);
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
@@ -18554,6 +18632,8 @@ private:
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
+    m_conditional_rendering_supported =
+        conditional_rendering_extension && available_conditional.conditionalRendering;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.depthBounds &&
@@ -18630,7 +18710,12 @@ private:
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
-    device_info.pNext = &min_lod;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional{};
+    conditional.conditionalRendering = true;
+    conditional.pNext = &min_lod;
+    device_info.pNext = m_conditional_rendering_supported
+                            ? static_cast<void *>(&conditional)
+                            : static_cast<void *>(&min_lod);
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -18656,6 +18741,9 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (m_conditional_rendering_supported) {
+      device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());

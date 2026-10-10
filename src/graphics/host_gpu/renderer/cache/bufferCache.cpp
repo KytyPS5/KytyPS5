@@ -265,9 +265,56 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
+void BufferCache::WatchRange(uint64_t vaddr, uint64_t size) {
+	m_watches.insert_or_assign(vaddr, Watch {size, m_address_writes, false});
+	m_watched.Add(vaddr, size);
+	m_max_watch_size = std::max(m_max_watch_size, size);
+}
+
+bool BufferCache::IsWatchedRangeUnchanged(uint64_t vaddr, uint64_t size) {
+	const auto found = m_watches.find(vaddr);
+	return found != m_watches.end() && found->second.size == size && !found->second.changed &&
+	       found->second.address_writes == m_address_writes &&
+	       !m_memory_tracker.IsRegionCpuModified(vaddr, size);
+}
+
+void BufferCache::UnwatchRange(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	std::erase_if(m_watches, [&](const auto& watch) {
+		return watch.first < end && vaddr < watch.first + watch.second.size;
+	});
+	m_watched.Clear();
+	for (const auto& [address, watch]: m_watches) {
+		m_watched.Add(address, watch.size);
+	}
+}
+
+void BufferCache::NotifyAddressWrites() {
+	m_address_writes++;
+}
+
+void BufferCache::NotifyChange(uint64_t vaddr, uint64_t size) {
+	if (!m_watched.Intersects(vaddr, size)) {
+		return;
+	}
+	// A watch starting before vaddr - m_max_watch_size ends before vaddr.
+	const auto end = vaddr + size;
+	for (auto it = m_watches.lower_bound(vaddr - std::min(vaddr, m_max_watch_size));
+	     it != m_watches.end() && it->first < end; ++it) {
+		if (it->first + it->second.size > vaddr) {
+			it->second.changed = true;
+		}
+	}
+}
+
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	// Watched ranges belong to the GPU thread. A CPU write from another thread leaves its pages
+	// CPU-dirty until an upload, which reports the change there.
+	if (GuestGpu::IsGpuThread()) {
+		NotifyChange(vaddr, size);
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
@@ -410,6 +457,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
+		NotifyChange(vaddr, size);
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -435,8 +483,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
-	if (is_texel_buffer && !is_written) {
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	if (is_texel_buffer && !is_written && SynchronizeBufferFromImage(buffer, vaddr, size)) {
+		NotifyChange(vaddr, size);
+		return true;
 	}
 	return false;
 }
@@ -500,6 +549,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		NotifyChange(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

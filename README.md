@@ -338,6 +338,14 @@ folders recursively for game directories containing `eboot.bin` and ZArchive (`.
 whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
 ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
 
+Official release builds include a built-in updater. Leave **Check for updates on startup** enabled,
+or click **Check for updates**, then choose **Install Update**. The launcher downloads the package
+for your platform from GitHub, checks its SHA-256 checksum, and restarts after installation. Close
+any running games first. Settings, saves, patches, and other files outside the release package are
+preserved; replacement failures restore the previous files. The installation folder must be writable.
+If a package cannot be installed automatically, the updater offers the GitHub release page.
+Source and fork builds do not replace themselves with official releases.
+
 The emulator can also be started directly with a legally obtained game directory, ELF file, or
 ZArchive dump:
 

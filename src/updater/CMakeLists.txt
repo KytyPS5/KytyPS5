@@ -1,0 +1,26 @@
+# The installer is copied outside the application before it runs. Keep it free of
+# Qt and application DLL dependencies so it can replace those files on Windows.
+if(MSVC)
+	set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+add_library(update_installer STATIC UpdateInstaller.cpp)
+target_include_directories(update_installer PUBLIC "${KYTY_SOURCE_DIR}")
+add_executable(kyty_updater main.cpp)
+target_link_libraries(kyty_updater PRIVATE update_installer)
+
+if(MSVC)
+	target_compile_options(update_installer PUBLIC /EHsc)
+else()
+	target_compile_options(update_installer PUBLIC -fexceptions)
+endif()
+if(MINGW)
+	target_link_options(kyty_updater PRIVATE -static -municode)
+endif()
+
+if(BUILD_TESTING)
+	add_executable(update_installer_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/UpdateInstallerTests.cpp")
+	target_link_libraries(update_installer_tests PRIVATE update_installer)
+	add_dependencies(update_installer_tests kyty_updater)
+	add_test(NAME update_installer COMMAND update_installer_tests $<TARGET_FILE:kyty_updater>)
+	add_dependencies(kyty_tests update_installer_tests)
+endif()

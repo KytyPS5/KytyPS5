@@ -116,12 +116,12 @@ jobs:
             audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests update_release_tests update_installer_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|update_release|update_installer)$"
 
       - name: Install
         shell: cmd
@@ -205,14 +205,14 @@ jobs:
             --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests update_release_tests update_installer_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|update_release|update_installer)$'
 
       - name: Install
         shell: bash
@@ -257,6 +257,7 @@ jobs:
             "$install_dir/libMoltenVK.dylib" \
             "$app_dir/Contents/MacOS/KytyPS5" \
             "$app_dir/Contents/MacOS/kyty_emulator" \
+            "$app_dir/Contents/MacOS/kyty_updater" \
             "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
             file "$binary"
             lipo "$binary" -verify_arch x86_64
@@ -266,6 +267,7 @@ jobs:
             "$install_dir/libMoltenVK.dylib" \
             "$app_dir/Contents/MacOS/KytyPS5" \
             "$app_dir/Contents/MacOS/kyty_emulator" \
+            "$app_dir/Contents/MacOS/kyty_updater" \
             "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
             codesign --verify --strict "$binary"
           done
@@ -388,14 +390,14 @@ jobs:
             --target launcher page_manager_tests memory_tracker_tests \
               audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests update_release_tests update_installer_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|update_release|update_installer)$'
 
       - name: Install
         shell: bash
@@ -407,6 +409,7 @@ jobs:
         run: |
           file _Build/linux/install/launcher
           file _Build/linux/install/kyty_emulator
+          test -x _Build/linux/install/kyty_updater
           file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
           ldd _Build/linux/install/kyty_emulator > /dev/null
           readelf -d _Build/linux/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
@@ -495,7 +498,8 @@ jobs:
           test -d "$linux_dir"
           chmod a+x \
             "$linux_dir/launcher" \
-            "$linux_dir/kyty_emulator"
+            "$linux_dir/kyty_emulator" \
+            "$linux_dir/kyty_updater"
           tar -C "$linux_dir" -czf \
             "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
 

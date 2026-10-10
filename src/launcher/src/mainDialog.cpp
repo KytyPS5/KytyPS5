@@ -136,6 +136,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
 	        &QLabel::setDisabled);
+	connect(m_update_checker, &UpdateChecker::InstallingChanged, this, &MainDialogPrivate::Update);
 	connect(m_ui->check_updates_on_startup, &QCheckBox::toggled, this, [this](bool checked) {
 		g_check_updates_on_startup = checked;
 		m_ui->widget->WriteSettings();
@@ -146,6 +147,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	});
 
 	connect(&m_process, &QProcess::stateChanged, this, [this](QProcess::ProcessState state) {
+		m_update_checker->SetGameRunning(state != QProcess::NotRunning);
 		if (state == QProcess::NotRunning) {
 			if (m_running_item != nullptr) {
 				m_running_item->SetRunning(false);
@@ -162,6 +164,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 }
 
 void MainDialogPrivate::FindInterpreter() {
+	UpdateChecker::ShowPreviousResult(m_main_dialog);
 	QDir search_dir(QApplication::applicationDirPath());
 	m_interpreter = search_dir.absoluteFilePath(EMULATOR_EXE);
 
@@ -509,6 +512,9 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 }
 
 void MainDialogPrivate::Run() {
+	if (m_update_checker->IsInstalling()) {
+		return;
+	}
 	m_running_item = m_ui->widget->GetSelectedItem();
 	if (m_running_item == nullptr) {
 		return;
@@ -526,7 +532,8 @@ void MainDialogPrivate::Run() {
 void MainDialogPrivate::Update() {
 	const auto* item = m_ui->widget->GetSelectedItem();
 
-	bool run_enabled = (m_process.state() == QProcess::NotRunning && item != nullptr);
+	bool run_enabled = (m_process.state() == QProcess::NotRunning && item != nullptr &&
+	                    !m_update_checker->IsInstalling());
 
 	if (run_enabled) {
 		const auto& info = item->GetInfo();

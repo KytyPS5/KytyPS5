@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -179,6 +180,12 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+
+	// The description of a texture binding, kept for inputs seen before.
+	[[nodiscard]] const TextureDescription&
+	FindTextureDescription(const ShaderRecompiler::IR::ImageResource&   resource,
+	                       const ShaderRecompiler::IR::DescriptorValue& value);
+
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -215,6 +222,13 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	struct TextureDescriptionEntry {
+		ShaderRecompiler::IR::ImageResource   resource;
+		ShaderRecompiler::IR::DescriptorValue value;
+		TextureDescription                    description;
+	};
+	// Descriptions by input hash; an entry is used only when its inputs compare equal.
+	std::unordered_map<uint64_t, TextureDescriptionEntry> m_texture_descriptions;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

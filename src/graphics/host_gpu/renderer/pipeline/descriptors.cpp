@@ -500,9 +500,11 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+// Everything a texture binding needs before the cache lookup: a function of its inputs only.
+static TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                          const ShaderRecompiler::IR::DescriptorValue& value,
+                                          bool int64_atomics) {
+	if (resource.atomic64 && !int64_atomics) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
@@ -511,12 +513,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageImageResource(resource);
 	}
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		TextureDescription result {};
+		result.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                : TextureCache::BindingType::Texture);
+		result.null = true;
+		return result;
 	}
 
 	const auto address         = descriptor.Base40();
@@ -636,10 +638,77 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	TextureDescription result {};
+	result.desc              = std::move(desc);
+	result.descriptor        = descriptor;
+	result.pixel_format      = pixel_format;
+	result.view_format       = view_format;
+	result.shader_conversion = shader_conversion;
+	return result;
+}
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
-	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
+static uint64_t TextureDescriptionKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                                      const ShaderRecompiler::IR::DescriptorValue& value) {
+	uint64_t   hash = 0xcbf29ce484222325ull;
+	const auto mix  = [&hash](uint64_t word) {
+		hash = (hash ^ word) * 0x100000001b3ull;
+		hash ^= hash >> 32u;
+	};
+	for (uint32_t i = 0; i < value.dwords.size(); i += 2) {
+		mix(value.dwords[i] | (uint64_t {value.dwords[i + 1]} << 32u));
+	}
+	// Every compared field that tells two resources of the same descriptor apart.
+	mix(resource.source | (uint64_t {resource.first_use_pc} << 32u));
+	mix(resource.indirect_root | (uint64_t {resource.shader_swizzle} << 32u));
+	mix(static_cast<uint32_t>(resource.conversion_format) |
+	    (uint64_t {resource.indirect_mapping_offset} << 32u));
+	mix(value.dword_count | (uint64_t {static_cast<uint32_t>(resource.dimension)} << 32u));
+	mix(static_cast<uint32_t>(resource.resource_class) |
+	    (uint64_t {static_cast<uint32_t>(resource.numeric_class)} << 32u));
+	mix(static_cast<uint32_t>(resource.mip_mode) | (uint64_t {resource.mip_count} << 32u));
+	mix(uint64_t {resource.read} | (uint64_t {resource.written} << 8u) |
+	    (uint64_t {resource.atomic} << 16u) | (uint64_t {resource.atomic64} << 24u) |
+	    (uint64_t {resource.depth_compare} << 32u) | (uint64_t {resource.cube} << 40u) |
+	    (uint64_t {resource.r128} << 48u));
+	return hash;
+}
+
+const TextureDescription&
+RenderExecutor::FindTextureDescription(const ShaderRecompiler::IR::ImageResource&   resource,
+                                       const ShaderRecompiler::IR::DescriptorValue& value) {
+	constexpr size_t MaxTextureDescriptions = 16384;
+	const auto       key                    = TextureDescriptionKey(resource, value);
+	if (const auto found = m_texture_descriptions.find(key);
+	    found != m_texture_descriptions.end() && found->second.value == value &&
+	    found->second.resource == resource) {
+		return found->second.description;
+	}
+	if (m_texture_descriptions.size() >= MaxTextureDescriptions) {
+		m_texture_descriptions.clear();
+	}
+	auto& entry       = m_texture_descriptions[key];
+	entry.resource    = resource;
+	entry.value       = value;
+	entry.description = DescribeTexture(resource, value,
+	                                    m_context.GetGraphics().shader_image_int64_atomics_enabled);
+	return entry.description;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	// A copy: the cache lookups below must not depend on the memo's storage.
+	auto  described     = FindTextureDescription(resource, value);
+	auto& desc          = described.desc;
+	auto& texture_cache = m_context.GetTextureCache();
+	if (described.null) {
+		const auto id = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	const bool  storage             = resource.written;
+	const auto& descriptor          = described.descriptor;
+	auto        id                  = texture_cache.FindImage(desc, described.shader_conversion);
+	auto*       image               = &texture_cache.GetImage(id);
+	const bool  stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
@@ -647,12 +716,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
+		ValidateSampledDepthBinding(resource, descriptor, *image, described.pixel_format,
 		                            desc.info.data.size);
 	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+		ValidateStorageColorView(image->info.pixel_format, described.view_format,
+		                         descriptor.DstSelXYZW());
 	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		(void)SelectSampledColorView(image->info.pixel_format, described.pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};

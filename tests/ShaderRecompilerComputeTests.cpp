@@ -5154,6 +5154,146 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckTextureLookupReuse() {
+    constexpr const char *name = "TextureLookupReuse";
+    constexpr uintptr_t base = 0x000000020a000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t moved_offset = 0x100000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    {
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      const auto Value = [&](uint64_t address) {
+        ShaderTextureResource descriptor{{
+            static_cast<uint32_t>(address >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) |
+                (((width - 1u) & 3u) << 30u),
+            ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+            DstSel(4, 5, 6, 7) |
+                (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
+                (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        return value;
+      };
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto Resolve = [&](uint64_t address) {
+        return RenderExecutorTestAccess::ResolveTexture(executor, resource, Value(address));
+      };
+
+      // An unchanged binding finds its image without searching the image page table.
+      const auto first = Resolve(base);
+      const auto epoch = TextureCacheTestAccess::QueryEpoch(texture_cache);
+      const auto repeated = Resolve(base);
+      Require(name, "repeated binding",
+              first.image_id && repeated.image_id == first.image_id &&
+                  repeated.desc.info.data == first.desc.info.data &&
+                  repeated.desc.view_info == first.desc.view_info &&
+                  TextureCacheTestAccess::QueryEpoch(texture_cache) == epoch,
+              "an unchanged texture binding searched the image page table again");
+
+      // A registration change gives the result of a full search: the last exact match.
+      const auto newer = TextureCacheTestAccess::InsertImage(texture_cache, first.desc.info);
+      Require(name, "new registration", Resolve(base).image_id == newer,
+              "a lookup missed an image registered after the previous one");
+      TextureCacheTestAccess::DeleteImage(texture_cache, newer);
+      Require(name, "removed registration", Resolve(base).image_id == first.image_id,
+              "a lookup returned an image removed after the previous one");
+
+      // Another descriptor is described and searched anew.
+      const auto moved = Resolve(base + moved_offset);
+      Require(name, "changed descriptor",
+              moved.image_id && moved.image_id != first.image_id &&
+                  moved.desc.info.data.address == base + moved_offset &&
+                  Resolve(base).image_id == first.image_id,
+              "a different descriptor reused another binding");
+
+      // Re-associating a stencil plane re-describes a registered image: a
+      // plane read with the old depth's sample count stops matching it.
+      constexpr uint64_t stencil_offset = 0x180000;
+      constexpr uint64_t stencil_size = uint64_t{width} * height;
+      const auto Depth = [&](uint64_t offset, uint32_t samples) {
+        auto desc = MakeLinearDesc(
+            base + offset, uint64_t{width} * height * 4 * samples,
+            vk::Format::eD32SfloatS8Uint, Prospero::BufferFormat::k32Float,
+            Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, samples);
+        desc.type = BindingType::DepthTarget;
+        desc.info.stencil = {base + stencil_offset, stencil_size};
+        desc.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return texture_cache.FindImage(desc);
+      };
+      const auto Associate = [&](ImageId depth) {
+        TextureCacheTestAccess::AssociateStencil(
+            texture_cache, depth, {base + stencil_offset, stencil_size});
+      };
+      auto plane = MakeLinearDesc(base + stencil_offset, stencil_size,
+                                  vk::Format::eR8Uint,
+                                  Prospero::BufferFormat::k8UInt,
+                                  Prospero::ImageType::kColor2D,
+                                  {width, height, 1}, 1, 1, 1);
+      const auto single = Depth(0x140000, 1);
+      const auto multi = Depth(0x160000, 2);
+      Associate(single);
+      const auto association = texture_cache.FindImageFromRange(
+          base + stencil_offset, stencil_size, false);
+      Require(name, "stencil plane binding",
+              association && texture_cache.FindImage(plane) == association,
+              "a stencil plane read missed its depth association");
+      Associate(multi);
+      Require(name, "stencil plane re-association",
+              texture_cache.GetImage(association).depth_id &&
+                  texture_cache.FindImage(plane) != association,
+              "a lookup kept a stencil plane re-associated with another depth");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -43638,6 +43778,11 @@ int main(int argc, char **argv) {
     CheckDepthTargetFootprints();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-lookup-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureLookupReuse();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
@@ -43848,6 +43993,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckTextureLookupReuse();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

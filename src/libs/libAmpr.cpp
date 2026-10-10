@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/archive.h"
 #include "common/assert.h"
 #include "common/dateTime.h"
 #include "common/file.h"
@@ -183,8 +184,11 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	ResolvedPathInfo  info {};
 	const std::string path(guest_path);
-	bool              found = false;
-	{
+	const auto        real_path = LibKernel::FileSystem::GetRealFilename(path);
+	// Only read-only archive contents can be cached; save data is rewritten while mounted.
+	const bool cacheable = Common::IsArchivePath(real_path);
+	bool       found     = false;
+	if (cacheable) {
 		std::scoped_lock lock(g_mutex);
 		const auto       it = g_resolved_paths.find(path);
 		if (it != g_resolved_paths.end()) {
@@ -194,8 +198,7 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 	}
 
 	if (!found) {
-		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
-		info.host_path       = real_path;
+		info.host_path = real_path;
 
 		if (Common::File::IsDirectoryExisting(real_path)) {
 			info.is_dir    = true;
@@ -210,19 +213,29 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		{
 			std::scoped_lock lock(g_mutex);
 			auto [it, inserted] = g_resolved_paths.emplace(path, info);
-			if (!inserted) {
+			if (!inserted && cacheable) {
 				info = it->second;
 			} else if (info.result == OK) {
-				// Allocate once under the cache lock; distinct paths can share a hash.
-				if (g_next_file_id == 0xffffffffu) {
+				if (!inserted && it->second.result == OK) {
+					// Save data is re-resolved on every call; keep its ID and refresh the size.
+					info.file_id               = it->second.file_id;
+					it->second                 = info;
+					g_files[info.file_id]      = info.host_path;
+					g_file_sizes[info.file_id] = info.is_dir ? 0 : info.file_size;
+				} else if (g_next_file_id == 0xffffffffu) {
+					// Allocate once under the cache lock; distinct paths can share a hash.
 					info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
 				} else {
-					info.file_id = it->second.file_id = g_next_file_id++;
-					g_files.emplace(info.file_id, info.host_path);
-					g_file_sizes.emplace(info.file_id, info.is_dir ? 0 : info.file_size);
+					info.file_id               = g_next_file_id++;
+					it->second                 = info;
+					g_files[info.file_id]      = info.host_path;
+					g_file_sizes[info.file_id] = info.is_dir ? 0 : info.file_size;
 				}
-			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
-				log_missing = true;
+			} else {
+				it->second = info;
+				if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
+					log_missing = true;
+				}
 			}
 		}
 		if (log_missing) {
@@ -252,7 +265,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 }
 
 static int ResolvePathsCommon(const char* const* path_list, uint32_t count, uint32_t* ids,
-                              uint64_t* sizes, uint32_t* error_index, const char* prefix, int* results) {
+                              uint64_t* sizes, uint32_t* error_index, const char* prefix,
+                              int* results) {
 	if (path_list == nullptr || count == 0 || count > 1024 ||
 	    (ids == nullptr && sizes == nullptr && results == nullptr)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -282,8 +296,8 @@ static int ResolvePathsCommon(const char* const* path_list, uint32_t count, uint
 
 	char prefix_buf[1024] {};
 	if (prefix != nullptr) {
-		const int result = ReadGuestCString(reinterpret_cast<uint64_t>(prefix), prefix_buf,
-		                                   sizeof(prefix_buf));
+		const int result =
+		    ReadGuestCString(reinterpret_cast<uint64_t>(prefix), prefix_buf, sizeof(prefix_buf));
 		if (result != OK) {
 			return result;
 		}
@@ -294,8 +308,9 @@ static int ResolvePathsCommon(const char* const* path_list, uint32_t count, uint
 		char resolved_path[1024] {};
 		// Concatenate the prefix literally, including an empty prefix.
 		std::memcpy(resolved_path, prefix_buf, prefix_size);
-		int result = ReadGuestCString(reinterpret_cast<uint64_t>(path_list[i]),
-		                             resolved_path + prefix_size, sizeof(resolved_path) - prefix_size);
+		int result =
+		    ReadGuestCString(reinterpret_cast<uint64_t>(path_list[i]), resolved_path + prefix_size,
+		                     sizeof(resolved_path) - prefix_size);
 		if (result == OK) {
 			result = ResolveOnePath(resolved_path, ids != nullptr ? &ids[i] : nullptr,
 			                        sizes != nullptr ? &sizes[i] : nullptr);
@@ -327,7 +342,7 @@ static int ResolvePathsCommon(const char* const* path_list, uint32_t count, uint
 
 static uint32_t AllocateSubmissionId() {
 	std::scoped_lock lock(g_mutex);
-	auto id = g_next_submission_id++;
+	auto             id = g_next_submission_id++;
 	if (id == 0) {
 		id = g_next_submission_id++;
 	}
@@ -375,7 +390,7 @@ namespace LibAmpr::Ampr {
 enum class Engine { Apr, Amm };
 static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t bytes,
                               uint32_t priority, void* result, uint32_t* out_submission_id);
-}
+} // namespace LibAmpr::Ampr
 
 namespace LibKernelApr {
 
@@ -394,8 +409,8 @@ static int KernelSyscallResult(int result) {
 	return -1;
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIds(const char* const* path_list, uint32_t count, uint32_t* ids,
-                                               uint32_t* error_index) {
+static int KYTY_SYSV_ABI ResolveFilepathsToIds(const char* const* path_list, uint32_t count,
+                                               uint32_t* ids, uint32_t* error_index) {
 	PRINT_NAME();
 
 	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, nullptr,
@@ -455,16 +470,17 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const char* const* path_list, uint32_t count,
-                                                           uint32_t* ids, uint64_t* sizes,
-                                                           uint32_t* error_index) {
+static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const char* const* path_list,
+                                                           uint32_t count, uint32_t* ids,
+                                                           uint64_t* sizes, uint32_t* error_index) {
 	PRINT_NAME();
 
 	return KernelSyscallResult(
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, error_index, nullptr, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, const char* const* path_list,
+static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char*        prefix,
+                                                         const char* const* path_list,
                                                          uint32_t count, uint32_t* ids,
                                                          uint32_t* error_index) {
 	PRINT_NAME();
@@ -473,15 +489,15 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, con
 	                                                         error_index, prefix, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix,
+static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char*        prefix,
                                                                      const char* const* path_list,
                                                                      uint32_t count, uint32_t* ids,
                                                                      uint64_t* sizes,
                                                                      uint32_t* error_index) {
 	PRINT_NAME();
 
-	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, sizes,
-	                                                         error_index, prefix, nullptr));
+	return KernelSyscallResult(
+	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, error_index, prefix, nullptr));
 }
 
 static int KYTY_SYSV_ABI ResolveFilepathsToIdsForEach(const char* const* path_list, uint32_t count,
@@ -501,19 +517,19 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizesForEach(const char* co
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, nullptr, nullptr, results));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char* prefix,
+static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char*        prefix,
                                                                 const char* const* path_list,
                                                                 uint32_t count, uint32_t* ids,
                                                                 int* results) {
 	PRINT_NAME();
 
-	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, nullptr,
-	                                                         nullptr, prefix, results));
+	return KernelSyscallResult(
+	    AprShared::ResolvePathsCommon(path_list, count, ids, nullptr, nullptr, prefix, results));
 }
 
 static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizesForEach(
-    const char* prefix, const char* const* path_list, uint32_t count, uint32_t* ids, uint64_t* sizes,
-    int* results) {
+    const char* prefix, const char* const* path_list, uint32_t count, uint32_t* ids,
+    uint64_t* sizes, int* results) {
 	PRINT_NAME();
 
 	return KernelSyscallResult(
@@ -673,7 +689,7 @@ struct CommandBufferState {
 	using CommandData = std::variant<ReadFileCommand, KernelEventCommand, WriteAddressCommand,
 	                                 AmmMapCommand, WaitCommand, WriteCounterCommand>;
 	struct Command {
-		uint64_t record_offset;
+		uint64_t    record_offset;
 		CommandData data;
 	};
 	std::vector<Command> commands;
@@ -1160,7 +1176,7 @@ static bool AppendCommandRecord(uint64_t command_buffer, CommandBufferState::Com
 		return false;
 	}
 
-	auto* record_addr    = reinterpret_cast<void*>(state.buffer + state.write_offset);
+	auto* record_addr = reinterpret_cast<void*>(state.buffer + state.write_offset);
 	std::memset(record_addr, 0, static_cast<size_t>(record_size));
 	state.commands.push_back({state.write_offset, std::move(command)});
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
@@ -1363,8 +1379,7 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	}
 	static CommandEngine apr_engine(7);
 	static CommandEngine amm_engine(3);
-	(amm ? amm_engine : apr_engine)
-	    .Submit(priority, {std::move(state.commands), 0, result, id});
+	(amm ? amm_engine : apr_engine).Submit(priority, {std::move(state.commands), 0, result, id});
 	return OK;
 }
 
@@ -1421,7 +1436,8 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	}
 
 	static thread_local std::vector<uint8_t> buffer;
-	const auto buffer_size = static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable));
+	const auto                               buffer_size =
+	    static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable));
 	if (buffer.size() < buffer_size) {
 		buffer.resize(buffer_size);
 	}
@@ -2347,9 +2363,11 @@ static void KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_
                                                      uint64_t* multimap_va_end) {
 	PRINT_NAME();
 
-	constexpr auto end = LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
+	constexpr auto end =
+	    LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
 	if (va_start != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_start), LibKernel::Memory::kExtendedMemoryBase);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_start),
+		                      LibKernel::Memory::kExtendedMemoryBase);
 	}
 	if (va_end != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_end), end);

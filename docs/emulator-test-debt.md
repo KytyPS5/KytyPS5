@@ -1,5 +1,19 @@
 # Emulator regression test debt
 
+## Wave-selected scalar-address image table (2026-10-10)
+
+Original5178/sourceed3f2e74/EXEd2bd run042530 naturally exits321 at
+04:41:53.957UTC, no timeout/memory guard, min RAM17.64GiB. PS617c passes
+the first scalar-buffer IMAGE_LOAD check, then fails TrackResources atpc8b4:
+GetImageResource dword0 from LoadAddressU32 is not a valid runtime value.
+Existing diagnostic ps617c-early.txt covers this later block: raw scalar
+address loads use low/high ReadFirstLane pointer words,368-byte row offsets
+and an independently selected inline sampler. Require a minimal bounded
+native RED for paired pointer provenance, row selection, full-width mapping,
+independent sampler selection and exact numerical results. Diagnose pointer
+and row domains first; preserve full address bits, clean-memory ownership,
+write protection/bounds/quotas, and explicit unsupported cases.
+
 ## Scalar-buffer image descriptor runtime provenance (2026-10-10)
 
 Original5178/source0b147273/EXE3ddab run033329 naturally exits321 at

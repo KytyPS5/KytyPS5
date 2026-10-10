@@ -1,5 +1,25 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 04:44 UTC** (first inline load gate passed; wave pointer table next):
+
+- Native sourceed3f2e74 / EXEd2bd / original5178 run
+  `_Build/runs/game-20261010-042530-sampler-free-inline-loads-native`
+  naturally exits321 at04:41:53.957UTC, no timeout/memory guard, min available
+  RAM17.64GiB. The previous PS617c pc380 IMAGE_LOAD admission failure is
+  passed; tracking now reachespc8b4 and rejects LoadAddressU32 image words.
+  Whole PS617c emission/execution is not yet proved. Captured loading arc only.
+- Existing ps617c-early.txt includes the new block: paired ReadFirstLane
+  base pointer from a vector buffer load, dynamic368-byte image row offset
+  derived through a wave min/reduction, and an independent inline sampler
+  selected from136-byte material rows. Exact pointer/row domains require
+  proof before extending host materialization. Full pointer bits, bounds,
+  clean-memory/write protection and quotas must be preserved.
+- Next: inspect relevant pinned SharpEmu resource-planning code and existing
+  Kyty bounded-source mechanisms, minimal native RED for this pointer/table
+  pattern, then general correction/GREEN/build/original retry. No new game
+  diagnostic needed: saved IR covers later instructions. Native slot idle.
+  Async PS07b3 driver completion, menu, game entry and issue108 post pending.
+
 Checkpoint **2026-10-10 04:24 UTC** (sampler-free inline image loads proved):
 
 - Same native0b147273 / EXE3ddab / original5178 diagnostic run035159

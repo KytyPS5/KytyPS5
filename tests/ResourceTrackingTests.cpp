@@ -6597,7 +6597,7 @@ void TestSharedInlineImageCandidates(bool pair_domain_regression = false) {
 
 }
 
-void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = false, bool grow_mask = false) {
+void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = false, bool grow_mask = false, bool preceding_cycle = false) {
   Fixture fixture;
   auto* entry = fixture.block;
   auto* gate = fixture.AddBlock();
@@ -6660,6 +6660,15 @@ void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = 
     for (uint32_t id = 6u; id <= 8u; ++id) {
       fixture.program.block_info[id].terminator.kind = CFG::TerminatorKind::Branch;
       fixture.program.block_info[id].terminator.true_block = id == 8u ? 2u : 8u;
+    }
+    if (preceding_cycle) {
+      left->AddBranch(left);
+      fixture.program.block_info[6].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      fixture.program.block_info[6].terminator.true_block = 6u;
+      fixture.program.block_info[6].terminator.false_block = 8u;
+      fixture.program.block_info[6].condition = fixture.Emit(ValueOpcode::ConditionRef,
+          {fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(11u), Value(0u)}, 0u, left)},
+          CFG::BranchCondition::SccNonZero, left);
     }
     initial_predecessor = merge;
   } else { gate->AddBranch(header); gate->AddBranch(exit); }
@@ -9471,6 +9480,12 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ADDRESS_BACKED_INDIRECT_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--wave-address-mask-cycle-only") == 0) {
+      TestWaveAddressShrinkingMask(true, false, false, true);
+      TestWaveAddressShrinkingMask(true, true, false, true);
+      std::cout << "KYTY_WAVE_ADDRESS_MASK_CYCLE_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--wave-address-mask-merge-only") == 0) {
       TestWaveAddressShrinkingMask(true);
       TestWaveAddressShrinkingMask(true, true);
@@ -9753,6 +9768,8 @@ int main(int argc, char** argv) {
     Run("shrinking wave mask", [] { TestWaveAddressShrinkingMask(); });
     Run("merged wave mask", [] { TestWaveAddressShrinkingMask(true); });
     Run("empty wave mask bypass", [] { TestWaveAddressShrinkingMask(true, true); });
+    Run("original wave mask through cycle", [] { TestWaveAddressShrinkingMask(true, false, false, true); });
+    Run("cycle with empty mask bypass", [] { TestWaveAddressShrinkingMask(true, true, false, true); });
     Run("growing wave mask rejected", [] { TestWaveAddressShrinkingMask(false, false, true); });
     Run("inline full image loads", TestInlineFullWidthImageLoads);
     Run("inline native sampler capacity", TestInlineNativeSamplerCapacity);

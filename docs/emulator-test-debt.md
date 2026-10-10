@@ -1,5 +1,28 @@
 # Emulator regression test debt
 
+## Nonempty original mask after a preceding loop (2026-10-10)
+
+Original game8799c502/EXEa84498/eboot5178 run084004 naturally exits321 at
+08:56:54.123UTC,1265 completed pipelines, no guards, minimum RAM13.72GiB.
+Tracking passed pc8b4 and rejects pcA20 (transactional group). CPU083643
+identifies the individual remaining failure at pcDF4: initial mask1659
+remains nonempty from an earlier positive EXEC edge, but loops42/43 and46/47
+precede Phi1930 and the backward proof rejects cycles. Require synthetic RED
+with a preceding control-flow loop in the bounded CPU proof harness that leaves the original mask
+unchanged; an empty-mask bypass must remain rejected. Any dominance proof
+must establish that the witness tests the current mask definition, including
+re-evaluation boundaries, rather than reuse a previous iteration's value.
+
+Verified extension: native admission RED085811 -> same GREEN085900,
+including the zero-mask bypass negative. A dominating positive edge proves
+nonemptiness through loops only when the current mask definition dominates
+the witness and is reachable with that edge removed, while the incoming
+block is not. Full resource090014 and GPUAV090033 contracts/ownership/numeric
+readback PASS. Captured full shader CPU085935 passes tracking31images,
+unknown/unsupported instruction lists empty, with default pixel metadata.
+Materialization, SPIR-V/driver execution and original-game runtime remain
+pending; the temporary audit mode was removed and preserved as a patch.
+
 ## Nonempty wave mask across a control-flow merge (2026-10-10)
 
 Captured PS617c diagnostic CPU audit passes pc8b4 with the shrinking-mask

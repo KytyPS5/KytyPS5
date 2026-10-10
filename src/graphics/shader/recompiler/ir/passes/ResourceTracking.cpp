@@ -2176,7 +2176,36 @@ private:
 				proved.emplace(previous, nonempty);
 				return nonempty;
 			};
-			return prove(prove, from, to, 0u);
+			if (prove(prove, from, to, 0u)) return true;
+			const auto* definition = incoming.Resolve().TryInstruction();
+			if (definition == nullptr || definition->Parent() == nullptr ||
+			    m_program.blocks.empty() || !CanReach(m_program.blocks.front(), from, nullptr)) return false;
+			for (const auto* witness: m_program.blocks) {
+				if (!Dominates(definition->Parent(), witness)) continue;
+				for (const auto* successor: witness->ImmSuccessors()) {
+					const auto edge = ConditionalEdge(witness, successor);
+					if (!edge || !edge->positive || !Implies(edge->condition, incoming)) continue;
+					const auto reachable_without_edge = [&](const Block* target) {
+						std::vector<const Block*> pending {m_program.blocks.front()};
+						std::unordered_set<const Block*> visited;
+						while (!pending.empty()) {
+							const auto* current = pending.back(); pending.pop_back();
+							if (!visited.insert(current).second) continue;
+							if (current == target) return true;
+							for (const auto* next: current->ImmSuccessors()) {
+								if (current != witness || next != successor) pending.push_back(next);
+							}
+						}
+						return false;
+					};
+					// The edge must be required after every evaluation of this mask,
+					// not merely on an earlier iteration. Its definition is reachable
+					// without the edge; the incoming block is not.
+					if (reachable_without_edge(definition->Parent()) &&
+					    !reachable_without_edge(from)) return true;
+				}
+			}
+			return false;
 		};
 		const auto* phi = mask.TryInstruction();
 		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&

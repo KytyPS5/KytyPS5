@@ -1,5 +1,34 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 09:01 UTC** (captured full shader tracking passes):
+
+- Shared current-mask edge dominance proof passes admission RED085811 ->
+  same GREEN085900; empty-mask bypass remains rejected. Full resource090014
+  and GPUAV090033 contracts/ownership/numerical readback PASS. No masks,
+  required work, quotas or ownership checks are suppressed.
+- Captured PS617c CPU085935 tracking passes31images with no unknown or
+  unsupported instructions. Diagnostic default pixel metadata is incomplete;
+  actual resource materialization and SPIR-V/driver execution are unproved.
+  Diagnostic audit mode removed, patch/artifacts kept outside tracked source.
+- Last original8799c502/a84498 run084004 naturally exits321 atpcA20; only
+  loading arc, no menu/gameplay. Next commit the verified loop proof, native
+  build/install and original retry. Keep first rendered frame, menu and game
+  entry distinct; no issue108 publication or push before their authorization.
+
+Checkpoint **2026-10-10 08:57 UTC** (first real mask blocker passed; subsequent group rejected):
+
+- Source8799c502 / EXEa84498 / original5178 run
+  `_Build/runs/game-20261010-084004-wave-mask-proof-native` naturally exits321
+  at08:56:54.123UTC,1265 completed pipelines, timeout/memory guards=false,
+  minimum available RAM13.72GiB. Original pc8b4 tracking failure passed;
+  current failure pcA20 is transactional inline-group rejection. Saved CPU
+  diagnostics isolate the later pcDF4 nonempty-mask proof after prior loops.
+- window-progress.png shows loading arc only; no menu/gameplay/publication.
+  Next synthetic RED for preserved original mask after an intervening loop,
+  current-value witness/dominance correction, same GREEN and original retry.
+  CPU/GPU proof for previous correction remains valid; whole PS617c and
+  PS07b3 driver completion remain pending. Native slot idle; no push.
+
 Checkpoint **2026-10-10 08:40 UTC** (wave-mask proof extensions tested; full shader pending):
 
 - Native shrinking-mask RED072739 -> GREEN073014; merge RED083437 ->

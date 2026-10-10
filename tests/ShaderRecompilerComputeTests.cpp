@@ -1383,6 +1383,15 @@ struct GraphicsCase {
   u32 pixel_perspective_sample_vgpr = UINT32_MAX;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  u32 width = 1;
+  u32 height = 1;
+  std::vector<u32> gds_initial;
+  std::vector<u32> expected_gds;
+};
+
+struct GraphicsResult {
+  std::vector<u32> pixels;
+  std::vector<u32> gds;
 };
 
 struct CompiledShader {
@@ -1956,7 +1965,11 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
 
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  enum class Mode { Full, PortableCompute, PortableGraphics };
+
+  explicit VulkanHarness(Mode mode = Mode::Full) {
+    Init(mode);
+  }
   ~VulkanHarness() { Destroy(); }
 
   VulkanHarness(const VulkanHarness &) = delete;
@@ -16908,14 +16921,15 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  std::vector<u32> RenderFragment(const GraphicsCase &test,
+  GraphicsResult RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
     const auto vertex_spirv =
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
 
-    Image target =
-        CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
+    Image target = CreateImageMips(
+        test.name, test.width, test.height,
+        vk::Format::eR32G32B32A32Sfloat,
                       vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
@@ -16923,7 +16937,8 @@ public:
     Image resolved;
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
-          test.name, 1, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
+          test.name, test.width, test.height, target.format,
+          vk::ImageUsageFlagBits::eColorAttachment,
           {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
@@ -16946,6 +16961,56 @@ public:
     vk::ShaderModule fragment_module = CreateShaderModule(test.name, fragment.spirv);
 
     const auto &fragment_bind = fragment.program.bindings;
+    using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+    const bool has_gds = fragment_bind.descriptor_counts[static_cast<size_t>(Kind::Gds)] != 0;
+    Buffer gds_buffer;
+    if (has_gds) {
+      Require(test.name, "graphics", !test.gds_initial.empty(),
+              "GDS descriptor requested without initial data");
+      const auto gds_dwords = std::max(
+          {test.gds_initial.size(), test.expected_gds.size(), size_t{1}});
+      gds_buffer =
+          CreateStorageBuffer(test.name, test.gds_initial, gds_dwords);
+    }
+    vk::DescriptorSetLayout descriptor_layout = nullptr;
+    vk::DescriptorPool descriptor_pool = nullptr;
+    vk::DescriptorSet descriptor_set = nullptr;
+    if (has_gds) {
+      vk::DescriptorSetLayoutBinding binding{};
+      binding.binding =
+          ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, Kind::Gds);
+      binding.descriptorType = vk::DescriptorType::eStorageBuffer;
+      binding.descriptorCount = 1;
+      binding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+      vk::DescriptorSetLayoutCreateInfo descriptor_info{};
+      descriptor_info.sType =
+          vk::StructureType::eDescriptorSetLayoutCreateInfo;
+      descriptor_info.bindingCount = 1;
+      descriptor_info.pBindings = &binding;
+      RequireVk(test.name, "graphics",
+                m_device.createDescriptorSetLayout(&descriptor_info, nullptr,
+                                                   &descriptor_layout),
+                "vkCreateDescriptorSetLayout");
+      vk::DescriptorPoolSize pool_size{};
+      pool_size.type = vk::DescriptorType::eStorageBuffer;
+      pool_size.descriptorCount = 1;
+      vk::DescriptorPoolCreateInfo pool_info{};
+      pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
+      pool_info.maxSets = 1;
+      pool_info.poolSizeCount = 1;
+      pool_info.pPoolSizes = &pool_size;
+      RequireVk(test.name, "graphics",
+                m_device.createDescriptorPool(&pool_info, nullptr, &descriptor_pool),
+                "vkCreateDescriptorPool");
+      vk::DescriptorSetAllocateInfo set_info{};
+      set_info.sType = vk::StructureType::eDescriptorSetAllocateInfo;
+      set_info.descriptorPool = descriptor_pool;
+      set_info.descriptorSetCount = 1;
+      set_info.pSetLayouts = &descriptor_layout;
+      RequireVk(test.name, "graphics",
+                m_device.allocateDescriptorSets(&set_info, &descriptor_set),
+                "vkAllocateDescriptorSets");
+    }
     vk::PushConstantRange push_constant_range{};
     if (fragment_bind.UsesPushData()) {
       Require(test.name, "graphics",
@@ -16959,6 +17024,9 @@ public:
 
     vk::PipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    pipeline_layout_info.setLayoutCount = descriptor_layout != nullptr ? 1u : 0u;
+    pipeline_layout_info.pSetLayouts =
+        descriptor_layout != nullptr ? &descriptor_layout : nullptr;
     pipeline_layout_info.pushConstantRangeCount =
         push_constant_range.size != 0 ? 1u : 0u;
     pipeline_layout_info.pPushConstantRanges =
@@ -17007,13 +17075,13 @@ public:
     vk::Viewport viewport{};
     viewport.x = 0.0f;
     viewport.y = 0.0f;
-    viewport.width = 1.0f;
-    viewport.height = 1.0f;
+    viewport.width = static_cast<float>(test.width);
+    viewport.height = static_cast<float>(test.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vk::Rect2D scissor{};
-    scissor.extent.width = 1;
-    scissor.extent.height = 1;
+    scissor.extent.width = test.width;
+    scissor.extent.height = test.height;
     vk::PipelineViewportStateCreateInfo viewport_state{};
     viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
     viewport_state.viewportCount = 1;
@@ -17084,12 +17152,27 @@ public:
     }
     vk::RenderingInfo rendering{};
     rendering.sType = vk::StructureType::eRenderingInfo;
-    rendering.renderArea.extent = {1, 1};
+    rendering.renderArea.extent = {test.width, test.height};
     rendering.layerCount = test.layers;
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &color;
     cmd.beginRendering(rendering);
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+    if (has_gds) {
+      vk::DescriptorBufferInfo gds_info{gds_buffer.buffer, 0,
+                                        gds_buffer.size};
+      vk::WriteDescriptorSet write{};
+      write.sType = vk::StructureType::eWriteDescriptorSet;
+      write.dstSet = descriptor_set;
+      write.dstBinding =
+          ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, Kind::Gds);
+      write.descriptorCount = 1;
+      write.descriptorType = vk::DescriptorType::eStorageBuffer;
+      write.pBufferInfo = &gds_info;
+      m_device.updateDescriptorSets(1, &write, 0, nullptr);
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, 1,
+                             &descriptor_set, 0, nullptr);
+    }
     if (push_constant_range.size != 0) {
       ShaderRecompiler::IR::PushData push_data;
       std::copy(test.push_constants.begin(), test.push_constants.end(),
@@ -17101,20 +17184,42 @@ public:
     cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
     cmd.draw(3, test.layers, 0, 0);
     cmd.endRendering();
+    if (has_gds) {
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask =
+          vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = gds_buffer.buffer;
+      barrier.offset = 0;
+      barrier.size = gds_buffer.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
+                          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+                          &barrier, 0, nullptr);
+    }
     EndSubmitAndFree(test.name, "graphics", cmd);
     target.layout = vk::ImageLayout::eGeneral;
 
     auto pixel = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
-    pixel.resize(4 * test.layers);
+    pixel.resize(4 * test.width * test.height * test.layers);
+    std::vector<u32> gds;
+    if (has_gds) {
+      gds = ReadBuffer(test.name, gds_buffer, test.expected_gds.size());
+    }
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
+    m_device.destroyDescriptorPool(descriptor_pool, nullptr);
     m_device.destroyShaderModule(fragment_module, nullptr);
     m_device.destroyShaderModule(vertex_module, nullptr);
     DestroyBuffer(&vertex_buffer);
+    DestroyBuffer(&gds_buffer);
     DestroyImage(&resolved);
     DestroyImage(&target);
-    return pixel;
+    return {std::move(pixel), std::move(gds)};
   }
 
   void CheckGpuTilerCpuParity() {
@@ -18403,7 +18508,10 @@ private:
     m_renderer = std::make_unique<RenderContext>(m_runtime_context);
   }
 
-  void Init() {
+  void Init(Mode mode) {
+    const bool full = mode == Mode::Full;
+    const bool portable_compute = mode == Mode::PortableCompute;
+    const bool portable_graphics = mode == Mode::PortableGraphics;
     static vk::detail::DynamicLoader loader;
     const auto get_instance_proc_addr =
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>(
@@ -18461,17 +18569,17 @@ private:
           features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
           features.pNext = &barycentric;
           physical.getFeatures2(&features);
-          if (barycentric.fragmentShaderBarycentric != true ||
+          if ((full && barycentric.fragmentShaderBarycentric != true) ||
               features.features.shaderInt64 != true ||
-              features11.storageBuffer16BitAccess != true ||
-              features12.storageBuffer8BitAccess != true ||
-              features12.samplerMirrorClampToEdge != true ||
+              (full && (features11.storageBuffer16BitAccess != true ||
+                        features12.storageBuffer8BitAccess != true ||
+                        features12.samplerMirrorClampToEdge != true ||
               features12.shaderOutputViewportIndex != true ||
               features12.shaderBufferInt64Atomics != true ||
               features12.shaderSampledImageArrayNonUniformIndexing != true ||
               features12.shaderSharedInt64Atomics != true ||
-              image_atomic64.shaderImageInt64Atomics != true ||
-              workgroup_layout.workgroupMemoryExplicitLayout != true ||
+                        image_atomic64.shaderImageInt64Atomics != true ||
+                        workgroup_layout.workgroupMemoryExplicitLayout != true)) ||
               features12.bufferDeviceAddress != true) {
             continue;
           }
@@ -18485,7 +18593,9 @@ private:
       }
     }
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
-            "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
+            !full
+                ? "no Vulkan graphics+compute device with shaderInt64 and bufferDeviceAddress"
+                : "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
     vk::PhysicalDeviceFeatures available_features{};
@@ -18519,6 +18629,23 @@ private:
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
     m_physical_device.getFeatures2(&available_features2);
+    Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
+            "shaderInt64 is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features12.bufferDeviceAddress == true,
+            "bufferDeviceAddress is not supported");
+    if (portable_graphics) {
+      Require("VulkanHarness", "dispatch",
+              available_features13.dynamicRendering == true,
+              "dynamic rendering is not supported");
+      Require("VulkanHarness", "dispatch",
+              available_features13.synchronization2 == true,
+              "synchronization2 is not supported");
+      Require("VulkanHarness", "dispatch",
+              available_features.fragmentStoresAndAtomics == true,
+              "fragment stores and atomics are not supported");
+    }
+    if (full) {
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -18542,19 +18669,16 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features.sampleRateShading == true,
             "sample-rate shading is not supported");
-    Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
-            "shaderInt64 is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features12.bufferDeviceAddress == true,
-            "bufferDeviceAddress is not supported");
     Require("VulkanHarness", "dispatch",
             available_features12.shaderSampledImageArrayNonUniformIndexing == true,
             "nonuniform sampled image indexing is not supported");
     Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
             "image view minimum LOD is not supported");
-    Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
+      Require("VulkanHarness", "graphics",
+              available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
-    m_rasterization_supported = available_features.fillModeNonSolid &&
+    }
+    m_rasterization_supported = full && available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.depthBounds &&
                                 available_depth_clip.depthClipEnable &&
@@ -18590,21 +18714,25 @@ private:
     vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
     image_atomic64.shaderImageInt64Atomics = true;
     workgroup_layout.pNext = &image_atomic64;
+    if (!full) {
+      device_features12 = {};
+      device_features12.bufferDeviceAddress = true;
+    }
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
-    barycentric.fragmentShaderBarycentric = true;
+    barycentric.fragmentShaderBarycentric = full;
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
-    device_features13.pNext = &barycentric;
-    device_features13.dynamicRendering = true;
-    device_features13.synchronization2 = true;
+    device_features13.pNext =
+        full ? static_cast<void *>(&barycentric)
+             : static_cast<void *>(&device_features12);
+    device_features13.dynamicRendering = full || portable_graphics;
+    device_features13.synchronization2 = full || portable_graphics;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
-    derivatives.computeDerivativeGroupQuads = true;
-    // Requesting a feature the device does not support fails device creation, so the
-    // rasterization feature chain is only chained in when every part is available.
+    derivatives.computeDerivativeGroupQuads = full;
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
     vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{};
     vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write{};
@@ -18626,17 +18754,22 @@ private:
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
-    min_lod.minLod = true;
+    min_lod.minLod = full;
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
-    device_info.pNext = &min_lod;
+    device_info.pNext = portable_compute
+                            ? static_cast<const void *>(&device_features12)
+                            : portable_graphics
+                                  ? static_cast<const void *>(&device_features13)
+                                  : static_cast<const void *>(&min_lod);
     vk::PhysicalDeviceFeatures device_features{};
-    device_features.shaderStorageImageWriteWithoutFormat = true;
-    device_features.shaderImageGatherExtended = true;
-    device_features.sampleRateShading = true;
+    device_features.shaderStorageImageWriteWithoutFormat = full;
+    device_features.shaderImageGatherExtended = full;
+    device_features.sampleRateShading = full;
     device_features.shaderInt64 = true;
-    device_features.shaderFloat64 = available_features.shaderFloat64;
+    device_features.fragmentStoresAndAtomics = portable_graphics;
+    device_features.shaderFloat64 = full && available_features.shaderFloat64;
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
@@ -18648,6 +18781,12 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    if (!full) {
+      device_extensions.clear();
+      if (portable_graphics) {
+        device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+      }
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -19015,22 +19154,23 @@ void CompareWords(const TestCase &test, const char *stage,
   Fail(test.name, stage, out.str());
 }
 
-void CompareGraphicsWords(const GraphicsCase &test,
+void CompareGraphicsWords(const GraphicsCase &test, const char *stage,
+                          const std::vector<u32> &expected,
                           const std::vector<u32> &actual) {
-  if (actual == test.expected_pixel) {
+  if (actual == expected) {
     return;
   }
   std::ostringstream out;
   out << "expected [";
-  for (size_t i = 0; i < test.expected_pixel.size(); i++) {
-    out << (i == 0 ? "" : ", ") << Hex(test.expected_pixel[i]);
+  for (size_t i = 0; i < expected.size(); i++) {
+    out << (i == 0 ? "" : ", ") << Hex(expected[i]);
   }
   out << "] actual [";
   for (size_t i = 0; i < actual.size(); i++) {
     out << (i == 0 ? "" : ", ") << Hex(actual[i]);
   }
   out << "]";
-  Fail(test.name, "graphics readback", out.str());
+  Fail(test.name, stage, out.str());
 }
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
@@ -19174,7 +19314,9 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   }
   auto compiled = CompileFragmentCase(test);
   auto actual = vulkan->RenderFragment(test, compiled);
-  CompareGraphicsWords(test, actual);
+  CompareGraphicsWords(test, "graphics readback", test.expected_pixel,
+                       actual.pixels);
+  CompareGraphicsWords(test, "GDS readback", test.expected_gds, actual.gds);
   std::printf("[graphics] %-31s ok\n", test.name);
 }
 
@@ -33269,6 +33411,53 @@ TestCase Wave64AppendConsumeHighHalf() {
   return test;
 }
 
+TestCase Wave64AppendIndexFromExecRank() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 124, 8);
+  AppendVMovU32(&code, 2, 1);
+  AppendVop3(&code, 0x366, 1, 127u, InlineU32(0));
+  code.push_back(EncodeDs0(0x3e, 20, true));
+  code.push_back(EncodeDs1(3, 2, 0));
+  AppendVop3(&code, 0x365, 4, 126u, Vgpr(1));
+  code.push_back(EncodeVop2(0x25, 5, Vgpr(3), 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 128);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 192);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Wave64AppendIndexFromExecRank";
+  test.code = std::move(code);
+  test.initial.assign(256, 0xdeadbeefu);
+  test.expected.resize(256);
+  for (u32 lane = 0; lane < 64; lane++) {
+    test.expected[lane] = 10;
+    test.expected[64 + lane] = lane < 32 ? 0 : lane - 32;
+    test.expected[128 + lane] = lane;
+    test.expected[192 + lane] = 10 + lane;
+  }
+  test.gds_initial = {0, 0, 0, 0, 0, 10};
+  test.expected_gds = {0, 0, 0, 0, 0, 74};
+  test.opcodes = {O::S_MOV_B32,
+                  O::V_MOV_B32,
+                  O::V_MBCNT_HI_U32_B32,
+                  O::DS_APPEND,
+                  O::V_MBCNT_LO_U32_B32,
+                  O::V_ADD_NC_U32,
+                  O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                                   bool store_completion = false) {
   using O = ShaderOpcode;
@@ -36865,6 +37054,155 @@ GraphicsCase GraphicsDsAddtidScratchExport() {
            O::DS_READ_ADDTID_B32, O::EXP, O::S_ENDPGM}};
 }
 
+GraphicsCase GraphicsDsAppendHelperQuad() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 124, 8);
+  AppendVMovU32(&code, 2, 1);
+  AppendVop3(&code, 0x366, 1, 127u, InlineU32(0));
+  code.push_back(EncodeDs0(0x3e, 20, true));
+  code.push_back(EncodeDs1(3, 2, 0));
+  AppendVop3(&code, 0x365, 4, 126u, Vgpr(1));
+  code.push_back(EncodeVop2(0x25, 5, Vgpr(3), 4));
+  code.push_back(EncodeVop1(0x06, 8, Vgpr(3)));
+  code.push_back(EncodeVop1(0x06, 9, Vgpr(4)));
+  code.push_back(EncodeVop1(0x06, 10, Vgpr(5)));
+  AppendVMovLiteral(&code, 11, 0x3f800000u);
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(8, 9, 10, 11));
+  AppendEnd(&code);
+  GraphicsCase test;
+  test.name = "GraphicsDsAppendHelperQuad";
+  test.fragment_code = std::move(code);
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_MBCNT_HI_U32_B32, O::DS_APPEND,
+                  O::V_MBCNT_LO_U32_B32, O::V_ADD_NC_U32, O::V_CVT_F32_U32, O::EXP,
+                  O::S_ENDPGM};
+  test.width = 2;
+  test.height = 2;
+  // Covers (1,0), (0,1), (1,1); the top-left centre stays 0.35 px outside the
+  // x+y=-0.5 edge, so that pixel gets no invocation of its own.
+  test.vertices = {0x3f000000u, 0xbf800000u, 0, 0, 0, 0x3f800000u,
+                   0xbf800000u, 0x3f000000u, 0, 0, 0, 0x3f800000u,
+                   0x3f800000u, 0x3f800000u, 0, 0, 0, 0x3f800000u};
+  test.gds_initial = {0, 0, 0, 0, 0, 10};  // GDS[5] counter
+  test.expected_gds = {0, 0, 0, 0, 0, 0};  // sizes the GDS readback only
+  return test;
+}
+
+void RunDsAppendHelperQuadCase(VulkanHarness *vulkan) {
+  auto test = GraphicsDsAppendHelperQuad();
+  auto actual = vulkan->RenderFragment(test, CompileFragmentCase(test));
+  const auto gds5 = actual.gds.size() > 5 ? actual.gds[5] : 0u;
+  const auto delta = gds5 >= 10u ? gds5 - 10u : 0xffffffffu;
+  u32 covered = 0;
+  bool base_ok = true, index_ok = true;
+  for (u32 i = 0; i < 4; i++) {
+    const auto *w = &actual.pixels[i * 4];
+    if (w[3] != 0x3f800000u) {
+      std::printf("[graphics] %s pixel(%u,%u) absent sentinel=%s\n", test.name, i % 2, i / 2,
+                  Hex(w[3]).c_str());
+      continue;
+    }
+    const auto base = std::bit_cast<float>(w[0]), rank = std::bit_cast<float>(w[1]);
+    std::printf("[graphics] %s pixel(%u,%u) base=%g rank=%g index=%g\n", test.name, i % 2, i / 2,
+                base, rank, std::bit_cast<float>(w[2]));
+    covered++;
+    base_ok = base_ok && base == 10.0f;
+    index_ok = index_ok && rank == static_cast<float>(covered - 1u) &&
+               std::bit_cast<float>(w[2]) == base + rank;
+  }
+  std::printf("[graphics] %s GDS[5]=%u delta=%u covered=%u\n", test.name, gds5, delta,
+              covered);
+  Require(test.name, "graphics DS_APPEND quad", covered == 3,
+          "the triangle must cover three pixels");
+  Require(test.name, "graphics DS_APPEND quad", base_ok, "DS_APPEND base is not 10");
+  Require(test.name, "graphics DS_APPEND quad", index_ok,
+          "DS_APPEND ranks are not 0/1/2 or index != base + rank");
+  std::ostringstream evidence;
+  evidence << "GDS[5]=" << gds5 << " delta=" << delta;
+  if (delta == 3u) {
+    std::printf("[graphics] %s ok: helper excluded from the ballot (%s)\n", test.name,
+                evidence.str().c_str());
+    return;
+  }
+  Fail(test.name, "graphics DS_APPEND helper", evidence.str() + "; expected delta 3");
+}
+
+GraphicsCase GraphicsSwizzleHelperQuad() {
+  using O = ShaderOpcode;
+  auto test = GraphicsDsAppendHelperQuad();
+  test.name = "GraphicsSwizzleHelperQuad";
+  test.gds_initial.clear();
+  test.expected_gds.clear();
+  std::vector<u32> code;
+  AppendVMovU32(&code, 2, 7);
+  AppendVop3(&code, 0x365, 4, 126u, InlineU32(0));
+  code.push_back(EncodeDs0(0x35, 0x00b1)); // quad selector [1,0,3,2]
+  code.push_back(EncodeDs1(3, 0, 2));
+  code.push_back(EncodeVop1(0x06, 8, Vgpr(3)));
+  code.push_back(EncodeVop1(0x06, 9, Vgpr(4)));
+  AppendVMovU32(&code, 10, 0);
+  AppendVMovLiteral(&code, 11, 0x3f800000u);
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(8, 9, 10, 11));
+  AppendEnd(&code);
+  test.fragment_code = std::move(code);
+  test.opcodes = {O::V_MOV_B32, O::V_MBCNT_LO_U32_B32, O::DS_SWIZZLE_B32,
+                  O::V_CVT_F32_U32, O::EXP, O::S_ENDPGM};
+  return test;
+}
+
+void CheckSwizzleHelperPredicate(const CompiledShader &fragment) {
+  ValidateSpirv("GraphicsSwizzleHelperQuad", fragment.spirv);
+  u32 helper = 0;
+  std::vector<u32> helper_loads, nonhelpers, filtered, shuffles;
+  const auto contains = [](const std::vector<u32> &values, u32 value) { return std::ranges::find(values, value) != values.end(); };
+  bool masked_shuffle = false;
+  for (size_t i = 5; i < fragment.spirv.size();) {
+    const u32 count = fragment.spirv[i] >> 16u;
+    Require("GraphicsSwizzleHelperQuad", "host", count != 0 && i + count <= fragment.spirv.size(), "invalid SPIR-V instruction");
+    const auto *p = fragment.spirv.data() + i;
+    const auto op = static_cast<spv::Op>(p[0] & 0xffffu);
+    if (op == spv::OpDecorate && count == 4 && p[2] == spv::DecorationBuiltIn && p[3] == spv::BuiltInHelperInvocation) helper = p[1];
+    if (op == spv::OpLoad && count >= 4 && p[3] == helper) helper_loads.push_back(p[2]);
+    if (op == spv::OpLogicalNot && count == 4 && contains(helper_loads, p[3])) nonhelpers.push_back(p[2]);
+    if (op == spv::OpGroupNonUniformBallot && count == 5 && contains(nonhelpers, p[4])) filtered.push_back(p[2]);
+    if (op == spv::OpCompositeExtract && count >= 4 && contains(filtered, p[3])) filtered.push_back(p[2]);
+    if ((op == spv::OpBitwiseAnd || op == spv::OpINotEqual || op == spv::OpLogicalAnd) && count == 5 && (contains(filtered, p[3]) || contains(filtered, p[4]))) filtered.push_back(p[2]);
+    if (op == spv::OpGroupNonUniformShuffle && count == 6) shuffles.push_back(p[2]);
+    if (op == spv::OpSelect && count == 6) {
+      masked_shuffle |= contains(filtered, p[3]) && contains(shuffles, p[4]);
+      if (contains(filtered, p[4]) || contains(filtered, p[5])) filtered.push_back(p[2]);
+    }
+    i += count;
+  }
+  Require("GraphicsSwizzleHelperQuad", "host", helper != 0 && masked_shuffle, "masked fragment swizzle must select its lane read through a !HelperInvocation ballot");
+  std::printf("[host]    GraphicsSwizzleHelperQuad predicate ok\n");
+}
+
+void RunSwizzleHelperQuadCase(VulkanHarness *vulkan) {
+  const auto test = GraphicsSwizzleHelperQuad();
+  const auto fragment = CompileFragmentCase(test);
+  CheckSwizzleHelperPredicate(fragment);
+  const auto actual = vulkan->RenderFragment(test, fragment);
+  std::vector<u32> lanes;
+  for (u32 i = 0; i < 4; ++i) {
+    if (actual.pixels[i * 4 + 3] == 0x3f800000u) lanes.push_back(static_cast<u32>(std::bit_cast<float>(actual.pixels[i * 4 + 1])));
+  }
+  Require(test.name, "graphics", lanes.size() == 3, "the triangle must cover three pixels");
+  u32 excluded = 0;
+  for (u32 i = 0; i < 4; ++i) {
+    if (actual.pixels[i * 4 + 3] != 0x3f800000u) continue;
+    const auto lane = static_cast<u32>(std::bit_cast<float>(actual.pixels[i * 4 + 1]));
+    const bool source_covered = std::ranges::find(lanes, lane ^ 1u) != lanes.end();
+    const float expected = source_covered ? 7.0f : 0.0f;
+    Require(test.name, "graphics", std::bit_cast<float>(actual.pixels[i * 4]) == expected, "swizzle read a helper lane or dropped a covered lane");
+    excluded += !source_covered;
+  }
+  Require(test.name, "graphics", excluded == 1, "the quad must exercise one helper source");
+  std::printf("[graphics] GraphicsSwizzleHelperQuad ok\n");
+}
+
 GraphicsCase GraphicsDirectSgprPushConstantExport() {
   using O = ShaderOpcode;
 
@@ -37522,6 +37860,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64RawMasksAndScalarBranch);
   AddCase(Wave64PartialMultidimensionalWorkgroup);
   AddCase(Wave64AppendConsumeHighHalf);
+  AddCase(Wave64AppendIndexFromExecRank);
   AddCase(BufferAtomicVariants);
   AddCase(BufferAtomicCmpSwapExactRaw);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
@@ -43237,6 +43576,25 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageGatherExplicitLod());
     RunCase(&vulkan, SharedReturnKeepsSelectedValues());
     RunCase(&vulkan, SiblingSharedExitKeepsCapturedConditions());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-append-index-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableCompute);
+    RunCase(&vulkan, Wave64AppendIndexFromExecRank());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-append-helper-quad-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    RunDsAppendHelperQuadCase(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fragment-helper-host-only") == 0) {
+    CheckSwizzleHelperPredicate(CompileFragmentCase(GraphicsSwizzleHelperQuad()));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--swizzle-helper-quad-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    RunSwizzleHelperQuadCase(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {

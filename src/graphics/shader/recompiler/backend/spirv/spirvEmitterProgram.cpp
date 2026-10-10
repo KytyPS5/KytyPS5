@@ -1,6 +1,5 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <bit>
@@ -57,11 +56,11 @@ struct StructuredFunctionState {
 
 struct DispatcherFunctionState {
 	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
-	uint32_t                                      header_label       = 0;
-	uint32_t                                      select_label       = 0;
-	uint32_t                                      after_switch_label = 0;
-	uint32_t                                      continue_label     = 0;
-	uint32_t                                      merge_label        = 0;
+	uint32_t                                                     header_label       = 0;
+	uint32_t                                                     select_label       = 0;
+	uint32_t                                                     after_switch_label = 0;
+	uint32_t                                                     continue_label     = 0;
+	uint32_t                                                     merge_label        = 0;
 };
 
 void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
@@ -226,7 +225,7 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
-	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
+	                      inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
 		// Both operations already combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
@@ -322,7 +321,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx) {
-	const auto& program = ctx.state.program;
+	const auto&             program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
@@ -459,10 +458,23 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
-	const auto low         = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
-	                          other_half == nullptr || half == 0 ? Def(predicate)
-	                                                             : other_half->Def(predicate));
+	const auto live        = [&](uint32_t value) {
+		if (state.helper_invocation_variable == 0) {
+			return value;
+		}
+		const auto helper = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeBool(state), helper,
+		                          state.helper_invocation_variable);
+		const auto not_helper = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), not_helper, helper);
+		const auto masked = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), masked, value, not_helper);
+		return masked;
+	};
+	const auto low = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpGroupNonUniformBallot, ballot_type, low, scope,
+	    live(other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate)));
 	if (other_half == nullptr) {
 		return low;
 	}
@@ -471,7 +483,7 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto high_word = state.builder.AllocateId();
 	const auto ballot    = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
-	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
+	                          live(half == 1 ? Def(predicate) : other_half->Def(predicate)));
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
 	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
@@ -516,9 +528,9 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	}
 	const auto physical_lane =
 	    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
-	const auto high          = state.builder.AllocateId();
-	const auto in_high       = state.builder.AllocateId();
-	const auto value         = state.builder.AllocateId();
+	const auto high    = state.builder.AllocateId();
+	const auto in_high = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope,
 	                          HalfArg(inst, index, 0), physical_lane);
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope,
@@ -542,8 +554,7 @@ uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
 uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {
 	if (const auto id = inst.Definition(half); id != 0) {
 		if (id != value) {
-			state.builder.AddFunction(spv::OpCopyObject, TypeId(state, inst.GetType()),
-			                          id, value);
+			state.builder.AddFunction(spv::OpCopyObject, TypeId(state, inst.GetType()), id, value);
 		}
 		return id;
 	}
@@ -730,10 +741,12 @@ void EmitProgram(EmitterState& state) {
 		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
 		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
 		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
-		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
-		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
-		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
-		                                     ConstantU32(state, LdsDwordCount(state)));
+		const auto row =
+		    EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index =
+		    EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		state.lds_base_dwords =
+		    EmitBinaryU32(state, spv::OpIMul, index, ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

@@ -2,10 +2,12 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <optional>
 
@@ -353,6 +355,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	const auto submit_begin = std::chrono::steady_clock::now();
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
@@ -382,6 +385,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			                    m_command.m_debug_arg4);
 		}
 	}
+
+	g_frame_stats.submits.fetch_add(1, std::memory_order_relaxed);
+	g_frame_stats.submit_us.fetch_add(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                              std::chrono::steady_clock::now() - submit_begin)
+	                              .count()),
+	    std::memory_order_relaxed);
 
 	if (result == vk::Result::eSuccess && GpuSyncDebugEnabled()) {
 		// Debug mode (KYTY_GPU_SYNC=1): wait for every submit so a hung/lost GPU is blamed on the

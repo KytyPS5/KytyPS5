@@ -2,9 +2,11 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -141,7 +143,14 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	const auto wait_begin = std::chrono::steady_clock::now();
+	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	g_frame_stats.waits.fetch_add(1, std::memory_order_relaxed);
+	g_frame_stats.wait_us.fetch_add(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                              std::chrono::steady_clock::now() - wait_begin)
+	                              .count()),
+	    std::memory_order_relaxed);
 	if (result != vk::Result::eSuccess) {
 		ReportSemaphoreFatal("vkWaitSemaphores", result, tick, KnownGpuTick());
 	}

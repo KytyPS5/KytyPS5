@@ -8922,6 +8922,32 @@ public:
               "recursive association deletion stopped LRU traversal or "
               "exceeded the ten-entry deletion budget");
 
+      // More protected entries than the ten-candidate budget must not hide
+      // a reclaimable texture later in the LRU.
+      std::array<ImageId, 13> protected_lru{};
+      constexpr uint64_t protected_offset = 0x390000;
+      for (size_t index = 0; index < protected_lru.size(); ++index) {
+        const auto address = base + protected_offset + index * 0x1000;
+        auto desc = MakeLinearDesc(
+            address, sizeof(uint32_t), vk::Format::eR8G8B8A8Unorm,
+            Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
+            {1, 1, 1}, 1, 4, 1);
+        protected_lru[index] = texture_cache.FindImage(desc);
+        if (index + 1 < protected_lru.size()) {
+          Require(name, "protected LRU setup",
+                  texture_cache.ClearImageFromBuffer(command, address, sizeof(uint32_t), 0x12345678),
+                  "could not establish GPU-owned protected texture contents");
+        }
+      }
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, protected_lru, 17, UINT64_MAX);
+      texture_cache.RunGarbageCollector();
+      Require(name, "protected LRU scan",
+              !TextureCacheTestAccess::Contains(texture_cache, protected_lru.back()) &&
+                  std::all_of(protected_lru.begin(), protected_lru.end() - 1,
+                              [&](ImageId id) { return TextureCacheTestAccess::Contains(texture_cache, id); }),
+              "protected textures exhausted the scan budget or lost GPU contents");
+
       constexpr uint64_t large_offset = 0x400000;
       constexpr uint32_t large_width = 4096;
       constexpr uint32_t large_height = 2047;

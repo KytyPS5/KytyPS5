@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master, sync-upstream, vram-and-scalar-read-fix ]
+    branches: [ main, master, sync-upstream, vram-and-scalar-read-fix, diag-validation-faults ]
   pull_request:
 
 concurrency:

@@ -3,10 +3,12 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/frameStats.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -61,11 +63,22 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	const auto fault_begin = std::chrono::steady_clock::now();
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		g_frame_stats.write_faults.fetch_add(1, std::memory_order_relaxed);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		g_frame_stats.read_faults.fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto fault_us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(
+	        std::chrono::steady_clock::now() - fault_begin).count());
+	g_frame_stats.fault_us.fetch_add(fault_us, std::memory_order_relaxed);
+	auto previous_max = g_frame_stats.fault_us_max.load(std::memory_order_relaxed);
+	while (fault_us > previous_max &&
+	       !g_frame_stats.fault_us_max.compare_exchange_weak(previous_max, fault_us)) {
 	}
 	return true;
 }

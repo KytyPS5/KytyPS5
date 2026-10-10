@@ -28,6 +28,9 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -777,8 +780,34 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		// Aborting on the first validation error ends the run during loading, long before the
+		// frames that actually crash. Log each distinct VUID a few times and keep going, so one
+		// run collects every violation up to a device loss. KYTY_VALIDATION_FATAL=1 restores
+		// the old behaviour.
+		static const bool fatal = std::getenv("KYTY_VALIDATION_FATAL") != nullptr;
+		if (fatal) {
+			EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
+			           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		}
+		static std::mutex                             counts_mutex;
+		static std::unordered_map<std::string, uint32_t> counts;
+		const std::string id = callback_data->pMessageIdName != nullptr
+		                           ? callback_data->pMessageIdName
+		                           : std::string("(no id)");
+		uint32_t seen = 0;
+		{
+			std::scoped_lock lock(counts_mutex);
+			seen = ++counts[id];
+		}
+		if (seen <= 3) {
+			LOGF_COLOR(severity_style, "[Vulkan][%s][%u][%s] (#%u, continuing): %s\n", severity_str,
+			           static_cast<uint32_t>(message_types), id.c_str(), seen,
+			           callback_data->pMessage);
+		} else if (seen == 100 || seen == 1000 || seen == 10000) {
+			LOGF_COLOR(severity_style, "[Vulkan][%s] %s has now occurred %u times (not shown)\n",
+			           severity_str, id.c_str(), seen);
+		}
+		skip = true;
 	}
 
 	if (!skip) {

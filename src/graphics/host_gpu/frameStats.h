@@ -60,6 +60,12 @@ struct FrameStats {
 	std::atomic<uint64_t> draws {0};
 	std::atomic<uint64_t> dispatches {0};
 	std::atomic<uint64_t> eops {0};
+	// Guest write/read faults taken on tracked pages (GPU-cache invalidation). Each one stops the
+	// faulting guest thread, so many of them can cap the frame rate while the GPU sits idle.
+	std::atomic<uint64_t> write_faults {0};
+	std::atomic<uint64_t> read_faults {0};
+	std::atomic<uint64_t> fault_us {0};
+	std::atomic<uint64_t> fault_us_max {0};
 
 	struct WaitStat {
 		std::atomic<uint64_t> count {0};
@@ -118,6 +124,9 @@ inline void NotePresentedFrame() {
 	static uint64_t last_draws    = 0;
 	static uint64_t last_disp     = 0;
 	static uint64_t last_eops     = 0;
+	static uint64_t last_wfaults  = 0;
+	static uint64_t last_rfaults  = 0;
+	static uint64_t last_fault_us = 0;
 	static std::array<uint64_t, static_cast<size_t>(WaitSite::Count)> last_wait_count {};
 	static std::array<uint64_t, static_cast<size_t>(WaitSite::Count)> last_wait_us {};
 
@@ -163,6 +172,21 @@ inline void NotePresentedFrame() {
 	}
 	std::printf("PERF:   total blocked on GPU: %.0f ms of %.0f ms\n",
 	            static_cast<double>(total_wait_us) / 1000.0, elapsed * 1000.0);
+	{
+		const auto wf       = s.write_faults.load(std::memory_order_relaxed);
+		const auto rf       = s.read_faults.load(std::memory_order_relaxed);
+		const auto fus      = s.fault_us.load(std::memory_order_relaxed);
+		const auto fus_max  = s.fault_us_max.exchange(0, std::memory_order_relaxed);
+		std::printf("PERF:   guest page faults: %llu write, %llu read, %.0f ms inside handler "
+		            "(max %.2f ms) of %.0f ms\n",
+		            static_cast<unsigned long long>(wf - last_wfaults),
+		            static_cast<unsigned long long>(rf - last_rfaults),
+		            static_cast<double>(fus - last_fault_us) / 1000.0,
+		            static_cast<double>(fus_max) / 1000.0, elapsed * 1000.0);
+		last_wfaults  = wf;
+		last_rfaults  = rf;
+		last_fault_us = fus;
+	}
 	std::fflush(stdout);
 
 	window_start  = now;

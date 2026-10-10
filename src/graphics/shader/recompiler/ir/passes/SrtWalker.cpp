@@ -34,6 +34,21 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
+		// This path reads the host address space directly, so a null or out-of-range guest
+		// pointer (for example a null base plus a field offset) must fail the read instead of
+		// faulting the emulator.
+		constexpr uint64_t min_guest_address = 0x40000u;
+		constexpr uint64_t max_guest_address = 0x0000ffffffffffffull;
+		if (values.empty() || address > max_guest_address ||
+		    values.size_bytes() > max_guest_address - address) {
+			return false;
+		}
+		if (address < min_guest_address) {
+			// A load through a null base pointer cannot execute on hardware: the shader
+			// guards it, but the walker also evaluates the paths it does not take.
+			std::memset(values.data(), 0, values.size_bytes());
+			return true;
+		}
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
@@ -561,7 +576,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		// See ReadOrdinary: a scalar load through a null base pointer reads as zero.
+		constexpr uint64_t min_guest_address = 0x40000u;
+		if (address < min_guest_address) {
+			word = 0u;
+		} else {
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		}
 	}
 	result = word;
 	return true;

@@ -716,6 +716,37 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+void TestNullScalarPointerReadsZeroInOrdinaryPath() {
+  Fixture fixture;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x18);
+  const auto read = RawRead(
+      fixture, Address(fixture, Value(0u), Value(0u)), Value(0u), memory);
+  LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+  fixture.Plan();
+  const auto plan = ExtractResourcePlan(fixture.program);
+
+  // No reader at all: the host fallback treats the null base as zero.
+  uint32_t value = 0xffffffffu;
+  Check(SrtWalker(plan, SrtRuntime{}).Evaluate(read, value) && value == 0u,
+        "null-base scalar read without a reader did not evaluate to zero");
+
+  // Ordinary capture path with only a strict reader installed.
+  TestMemory memory_image;
+  SrtRuntime source{.userdata = &memory_image,
+                    .read_specialization_memory = ReadMemory};
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+  SrtReadCapture capture(source, ranges);
+  value = 0xffffffffu;
+  Check(SrtWalker(plan, capture.ObservedRuntime()).Evaluate(read, value) &&
+            value == 0u,
+        "null-base scalar read in the ordinary path did not evaluate to zero");
+
+  // The strict (clean) path must keep failing on unreadable addresses.
+  value = 0xffffffffu;
+  Check(!SrtWalker(plan, CleanRuntime(source)).Evaluate(read, value),
+        "strict scalar read of an unreadable address succeeded");
+}
+
 int main() {
   try {
     TestImmediateFlatteningAndGvn();
@@ -738,6 +769,7 @@ int main() {
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();
+    TestNullScalarPointerReadsZeroInOrdinaryPath();
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {

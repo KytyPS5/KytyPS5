@@ -204,7 +204,13 @@ void KernelEventFlagPrivate::Clear(uint64_t bits) {
 		m_mutex.Lock();
 	}
 
-	m_bits &= bits;
+	// A zero bit pattern clears all bits. Some games (e.g. Call of Duty: Vanguard)
+	// rely on this to reset an event flag before waiting on it.
+	if (bits == 0) {
+		m_bits = 0;
+	} else {
+		m_bits &= ~bits;
+	}
 }
 
 void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {

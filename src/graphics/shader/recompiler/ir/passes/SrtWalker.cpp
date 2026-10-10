@@ -11,6 +11,14 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+// Lowest address any host or guest mapping can occupy (matches the default Linux mmap_min_addr
+// and the Windows null-pointer reservation), so direct reads below it always fault.
+constexpr uint64_t NullPageLimit = 0x10000ull;
+
+} // namespace
+
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
 	runtime.userdata = this;
@@ -34,6 +42,12 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
+		// Same null-page rule as SrtWalker::EvaluateRawRead: such an address can never be mapped,
+		// so read it as zero. Nothing was read from guest memory, so no range is recorded.
+		if (address < NullPageLimit) {
+			std::fill(values.begin(), values.end(), 0u);
+			return true;
+		}
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
@@ -50,9 +64,6 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
-// Lowest address any host or guest mapping can occupy (matches the default Linux mmap_min_addr
-// and the Windows null-pointer reservation), so direct reads below it always fault.
-constexpr uint64_t NullPageLimit = 0x10000ull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {

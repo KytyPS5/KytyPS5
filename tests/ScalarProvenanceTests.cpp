@@ -171,6 +171,19 @@ void TestNullScalarAddressWithoutReaderReadsZero() {
   Check(flat == std::vector<uint32_t>{0u}, "null scalar SRT address did not read as zero");
 }
 
+void TestNullScalarAddressCaptureReadsZero() {
+  // The capture wrapper used by MaterializeResources falls back to a direct copy when the
+  // source runtime has no reader, so it must apply the same null-page rule.
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+  SrtReadCapture capture{SrtRuntime{}, ranges};
+  const auto runtime = capture.ObservedRuntime();
+  std::array<uint32_t, 2> words{0xdeadbeefu, 0xdeadbeefu};
+  Check(runtime.read_memory(runtime.userdata, 0x20u, words) &&
+            words == std::array<uint32_t, 2>{0u, 0u},
+        "captured null scalar SRT read did not read as zero");
+  Check(ranges.empty(), "captured null scalar SRT read recorded a guest memory range");
+}
+
 void TestScalarMemoryDomainMismatchFails() {
   Fixture raw;
   const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
@@ -738,6 +751,7 @@ int main() {
     TestImmediateFlatteningAndGvn();
     TestRawScalarComponentAlignment();
     TestNullScalarAddressWithoutReaderReadsZero();
+    TestNullScalarAddressCaptureReadsZero();
     TestScalarMemoryDomainMismatchFails();
     TestDynamicReadRemainsTyped();
     TestNestedSrtWalk();

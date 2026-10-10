@@ -327,6 +327,17 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 			                              GlslStd450(ctx.state), GLSLstd450UMax, shifted,
 			                              ConstantU32(ctx.state, 1));
 		}
+		if (info.arrayed != 0u) {
+			// The layer count is not mip dependent; a guest LOD past the view's levels leaves the query above undefined.
+			const auto layers_size = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpImageQuerySizeLod,
+			                              ImageViewSizeType(ctx.state, dimension), layers_size, image,
+			                              ConstantU32(ctx.state, 0));
+			result[info.spatial_components] = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state),
+			                              result[info.spatial_components], layers_size,
+			                              info.spatial_components);
+		}
 		result[3] = ConstantU32(ctx.state, resinfo.levels);
 	} else if (info.multisampled == 0u) {
 		result[3] = ctx.state.builder.AllocateId();

@@ -168,9 +168,14 @@ add_custom_target(KytyGitVersion
 		-D OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyGitVersion.h
 		-D GIT_EXECUTABLE=${GIT_EXECUTABLE}
 		-D GIT_WORKING_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}
+		-D SHADER_CACHE_SOURCE_DIR=${KYTY_SOURCE_DIR}
+		-D "SHADER_CACHE_TOOLCHAIN=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_BUILD_TYPE}"
+		-D SHADER_CACHE_INPUT_FILE=${KYTY_SOURCE_DIR}/kytyShaderCacheVersion.h.in
+		-D SHADER_CACHE_OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyShaderCacheVersion.h
 		-P ${KYTY_SOURCE_DIR}/generate_version.cmake
-	BYPRODUCTS ${PROJECT_BINARY_DIR}/kytyGitVersion.h
+	BYPRODUCTS ${PROJECT_BINARY_DIR}/kytyGitVersion.h ${PROJECT_BINARY_DIR}/kytyShaderCacheVersion.h
 	COMMENT "Generate kytyGitVersion.h"
+	VERBATIM
 )
 
 add_library(kyty_git_version INTERFACE)
@@ -639,6 +644,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+	add_test(NAME pipeline_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pipeline-cache-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets

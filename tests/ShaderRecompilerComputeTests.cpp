@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderCacheFile.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -77,18 +78,24 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <semaphore>
 #include <set>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -37684,6 +37691,510 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// A compute shader that stores through a user-data V#, so its program has a resource
+// specialization, with registers to dispatch it.
+struct CachedComputeShader {
+  std::vector<u32> code;
+  HW::ComputeShaderInfo regs{};
+
+  CachedComputeShader() {
+    AppendVMovU32(&code, 1, 7);
+    code.push_back(EncodeMubuf0(0x1cu)); // buffer_store_dword v1, v0, s[0:3]
+    code.push_back(EncodeMubuf1(1, 0, 0));
+    AppendEnd(&code);
+    Map();
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+    regs.cs_regs.num_thread_x = 64;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 64;
+    regs.cs_regs.user_sgpr = 4;
+    regs.cs_user_sgpr.value[0] = 0x00010000u;
+    regs.cs_user_sgpr.value[1] = 4u << 16u;
+    regs.cs_user_sgpr.value[2] = 64;
+    regs.cs_user_sgpr.value[3] =
+        (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | DstSel(4, 5, 6, 7);
+    regs.cs_user_sgpr.count = 4;
+  }
+  // AgcCreateShader maps a shader each time the game loads it.
+  void Map() {
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  }
+};
+
+void InitCacheTestGraphics(GraphicContext &graphics, VulkanHarness &vulkan) {
+  graphics.device = vulkan.Device();
+  graphics.physical_device_properties =
+      vulkan.RuntimeContext().GetPhysicalDeviceProperties();
+}
+
+std::filesystem::path CacheTestDirectory(const char *name) {
+  auto directory = std::filesystem::temp_directory_path() /
+                   (std::string("kyty_") + name + "_" + std::to_string(std::random_device{}()));
+  std::filesystem::remove_all(directory);
+  return directory;
+}
+
+std::vector<char> ReadTestFile(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+void WriteTestFile(const std::filesystem::path &path, std::span<const char> data) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file.write(data.data(), static_cast<std::streamsize>(data.size()));
+}
+
+// An object built over memory filled with `fill`: its padding bytes keep that value.
+template <typename T>
+struct GarbageBacked {
+  alignas(T) unsigned char bytes[sizeof(T)];
+  explicit GarbageBacked(unsigned char fill) { std::memset(bytes, fill, sizeof(bytes)); }
+  T &Make() { return *new (bytes) T; }
+};
+
+template <typename T, typename F>
+bool SameEncodingOverGarbage(F set) {
+  GarbageBacked<T> first(0xaa);
+  GarbageBacked<T> second(0x55);
+  auto &left = first.Make();
+  auto &right = second.Make();
+  set(left);
+  set(right);
+  return EncodeShaderCacheInput(left) == EncodeShaderCacheInput(right);
+}
+
+// Equal fields give equal records whatever the padding bytes of the recorded structures hold.
+void CheckShaderCacheRecordPadding() {
+  constexpr const char *name = "ShaderCacheRecordPadding";
+  Require(name, "compute input",
+          SameEncodingOverGarbage<ShaderComputeInputInfo>([](auto &info) {
+            info.float_mode = 0xc3;
+            info.group_id[1] = true;
+          }),
+          "padding bytes of the compute input info reached the record");
+  Require(name, "pixel input",
+          SameEncodingOverGarbage<ShaderPixelInputInfo>([](auto &info) {
+            info.input_num = 2;
+            info.ps_pos_x = true;
+          }),
+          "padding bytes of the pixel input info reached the record");
+  Require(name, "vertex input",
+          SameEncodingOverGarbage<ShaderVertexInputInfo>([](auto &info) {
+            info.resources_num = 1;
+            info.clip_space.enabled = true;
+            info.fetch_embedded = true;
+          }),
+          "padding bytes of the vertex input info reached the record");
+  ShaderCacheRecipes recipes;
+  for (const unsigned char fill : {0xaa, 0x55}) {
+    GarbageBacked<ShaderComputeInputInfo> input(fill);
+    auto &info = input.Make();
+    info.float_mode = 0xc3;
+    auto recipe = std::make_shared<ShaderCacheRecipe>();
+    recipe->stage = ShaderType::Compute;
+    recipe->code = {0xbf810000u};
+    recipe->input = EncodeShaderCacheInput(info);
+    recipe->specialization.buffers.resize(1);
+    recipe->specialization.images.resize(1);
+    auto *buffer = recipe->specialization.buffers.data();
+    auto *image = recipe->specialization.images.data();
+    std::memset(static_cast<void *>(buffer), fill, sizeof(*buffer));
+    std::memset(static_cast<void *>(image), fill, sizeof(*image));
+    new (buffer) ShaderRecompiler::IR::ResourceSpecialization::Buffer;
+    new (image) ShaderRecompiler::IR::ResourceSpecialization::Image;
+    buffer->zero_stride_oob = true;
+    image->cube = true;
+    recipes.push_back(std::move(recipe));
+  }
+  Require(name, "specialization",
+          SerializeShaderCache("KytySC1:test\n", {recipes[0]}) ==
+              SerializeShaderCache("KytySC1:test\n", {recipes[1]}),
+          "padding bytes of the resource specialization reached the record");
+  {
+    ShaderComputeInputInfo async{};
+    async.async_compute = true;
+    ShaderComputeInputInfo decoded{};
+    const auto key = [](const ShaderComputeInputInfo &info) {
+      std::vector<u32> words;
+      BuildStageStaticKey(info, words);
+      return words;
+    };
+    Require(name, "async compute",
+            DecodeShaderCacheInput(EncodeShaderCacheInput(async), decoded) &&
+                decoded.async_compute && key(decoded) == key(async),
+            "the queue of an async compute program was lost in its record");
+  }
+  ShaderComputeInputInfo decoded{};
+  auto encoded = recipes[0]->input;
+  Require(name, "decode",
+          DecodeShaderCacheInput(encoded, decoded) && decoded.float_mode == 0xc3 &&
+              EncodeShaderCacheInput(decoded) == encoded,
+          "the compute input info changed through its record");
+  for (auto &byte : encoded) {
+    byte = 2;
+  }
+  Require(name, "invalid bool", !DecodeShaderCacheInput(encoded, decoded),
+          "a record with an invalid bool was decoded");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+void CheckShaderCacheFileFormat() {
+  constexpr const char *name = "ShaderCacheFileFormat";
+  ShaderCacheRecipes recipes;
+  for (u32 i = 0; i < 2; i++) {
+    auto recipe = std::make_shared<ShaderCacheRecipe>();
+    recipe->stage = i == 0 ? ShaderType::Compute : ShaderType::Pixel;
+    recipe->user_data_count = 4 + i;
+    recipe->push_data_start = i;
+    recipe->hash = 0x1234u + i;
+    recipe->code = {0xbf810000u, i};
+    recipe->back_code.assign(i, 0xbf810000u);
+    recipe->input.assign(ShaderCacheInputSize(recipe->stage), static_cast<uint8_t>(i + 1));
+    recipe->specialization.buffers.resize(i + 1);
+    recipe->specialization.buffers[0].packed_stride = 16;
+    recipe->specialization.images.resize(i);
+    recipes.push_back(std::move(recipe));
+  }
+  const auto data = SerializeShaderCache("KytySC1:test\n", recipes);
+  ShaderCacheRecipes parsed;
+  size_t parsed_bytes = 0;
+  Require(name, "round trip",
+          ParseShaderCache(data, "KytySC1:test\n", parsed, &parsed_bytes) &&
+              parsed_bytes == data.size() && parsed.size() == 2 && *parsed[0] == *recipes[0] &&
+              *parsed[1] == *recipes[1],
+          "recipes changed through serialization");
+  parsed.clear();
+  Require(name, "other version",
+          !ParseShaderCache(data, "KytySC1:other\n", parsed) && parsed.empty(),
+          "a cache written for other graphics code was accepted");
+  const auto one_record = SerializeShaderCache("KytySC1:test\n", {recipes[0]}).size();
+  const std::span<const uint8_t> truncated(data.data(), data.size() - 1);
+  Require(name, "damaged tail",
+          ParseShaderCache(truncated, "KytySC1:test\n", parsed, &parsed_bytes) &&
+              parsed.size() == 1 && parsed_bytes == one_record,
+          "a truncated record was not dropped alone");
+  auto damaged = data;
+  damaged[std::string_view("KytySC1:test\n").size() + 20] ^= 1u;
+  parsed.clear();
+  Require(name, "damaged record",
+          ParseShaderCache(damaged, "KytySC1:test\n", parsed) && parsed.empty(),
+          "a record whose checksum fails was used");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A program compiled in one run is compiled ahead, off the caller's thread, in the next run.
+void CheckShaderCachePersistence(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderCachePersistence";
+  if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+    std::printf("[gpu]     %-32s skipped (non-Release build)\n", name);
+    return;
+  }
+  CachedComputeShader shader;
+  GraphicContext graphics;
+  InitCacheTestGraphics(graphics, vulkan);
+  const auto directory = CacheTestDirectory(name);
+  ShaderRecompiler::IR::CompiledShaderInfo expected;
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    ShaderComputeInputInfo input{};
+    cache.GetComputeProgram(shader.regs, {}, input);
+    Require(name, "first run", cache.GetProgramStats().compiled == 1 &&
+                                   !input.stage.program->info.buffers.empty(),
+            "the first lookup did not compile one program with its buffer");
+    expected = *input.stage.program;
+    cache.Save();
+  }
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    Require(name, "reload", cache.GetProgramStats().recorded == 1,
+            "the recorded program was not reloaded");
+    shader.Map();
+    cache.WaitForBackgroundCompilation();
+    Require(name, "compiled ahead", cache.GetProgramStats().compiled_ahead == 1,
+            "mapping the shader did not compile its recorded program");
+    ShaderComputeInputInfo input{};
+    const auto program = cache.GetComputeProgram(shader.regs, {}, input);
+    const auto stats = cache.GetProgramStats();
+    Require(name, "adoption", stats.compiled == 0 && stats.recorded == 1,
+            "the lookup compiled the program again");
+    const auto &actual = *input.stage.program;
+    Require(name, "same program",
+            actual.info == expected.info && actual.bindings == expected.bindings &&
+                actual.stage == expected.stage && actual.wave_size == expected.wave_size &&
+                actual.user_data_count == expected.user_data_count &&
+                actual.scratch_dwords == expected.scratch_dwords,
+            "the program compiled ahead differs from the recorded one");
+    Require(name, "pipeline", cache.GetComputePipeline(input, program).pipeline != nullptr,
+            "the program compiled ahead did not create a pipeline");
+  }
+  {
+    // Another cache created and destroyed meanwhile leaves this cache notified of mapped shaders.
+    PipelineCache cache(graphics, directory, "TEST00000");
+    const auto other_directory = CacheTestDirectory("ShaderCacheOther");
+    { PipelineCache other(graphics, other_directory, "TEST00000"); }
+    std::filesystem::remove_all(other_directory);
+    shader.Map();
+    cache.WaitForBackgroundCompilation();
+    Require(name, "two caches", cache.GetProgramStats().compiled_ahead == 1,
+            "another cache removed or replaced the shader map observer of this cache");
+  }
+  {
+    // A different shader input is compiled where it is needed and recorded too.
+    PipelineCache cache(graphics, directory, "TEST00000");
+    auto regs = shader.regs;
+    regs.cs_regs.num_thread_x = 32;
+    ShaderComputeInputInfo input{};
+    cache.GetComputeProgram(regs, {}, input);
+    // The recorded program of the first key is adopted from its pending job.
+    ShaderComputeInputInfo first{};
+    cache.GetComputeProgram(shader.regs, {}, first);
+    const auto stats = cache.GetProgramStats();
+    Require(name, "pending job", stats.compiled == 2 && stats.compiled_ahead == 0 &&
+                                     stats.recorded == 2,
+            "a new key or a pending recorded program was not compiled exactly once");
+  }
+  const auto path = directory / "TEST00000.shaders.bin";
+  auto file = ReadTestFile(path);
+  file[0] ^= 1;
+  WriteTestFile(path, file);
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    Require(name, "other version", cache.GetProgramStats().recorded == 0,
+            "a cache with another signature was used");
+  }
+  std::filesystem::remove_all(directory);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A recorded program that the lookup thread compiles itself is in flight like a worker job until it
+// ends, so a concurrent waiter wakes only after it and sees its result.
+void CheckShaderCacheConcurrentWaiters(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderCacheConcurrentWaiters";
+  if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+    std::printf("[gpu]     %-32s skipped (non-Release build)\n", name);
+    return;
+  }
+  CachedComputeShader shader;
+  GraphicContext graphics;
+  InitCacheTestGraphics(graphics, vulkan);
+  const auto directory = CacheTestDirectory(name);
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    ShaderComputeInputInfo input{};
+    cache.GetComputeProgram(shader.regs, {}, input);
+    cache.Save();
+  }
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    std::binary_semaphore started{0};
+    std::binary_semaphore release{0};
+    cache.SetRecordedCompileHook([&] {
+      started.release();
+      release.acquire();
+    });
+    // The shader is not mapped: the lookup takes the dormant job and compiles it itself.
+    std::thread lookup([&] {
+      ShaderComputeInputInfo input{};
+      cache.GetComputeProgram(shader.regs, {}, input);
+    });
+    started.acquire();
+    const auto during = cache.GetProgramStats();
+    // The hook runs under the job lock right before the wait, so the compilation released after
+    // it can only end once the waiter is blocked.
+    std::binary_semaphore waiting{0};
+    bool waiter_blocked = false;
+    cache.SetBackgroundWaitHook([&](bool blocking) {
+      waiter_blocked = blocking;
+      waiting.release();
+    });
+    uint64_t seen_by_waiter = 0;
+    std::thread waiter([&] {
+      cache.WaitForBackgroundCompilation();
+      seen_by_waiter = cache.GetProgramStats().compiled;
+    });
+    waiting.acquire();
+    release.release();
+    lookup.join();
+    waiter.join();
+    cache.SetBackgroundWaitHook(nullptr);
+    const auto after = cache.GetProgramStats();
+    Require(name, "in flight", during.in_flight == 1,
+            "a recorded program compiled by the lookup thread was not in flight");
+    Require(name, "waiter blocked", waiter_blocked,
+            "a waiter did not wait for the recorded program compiled by the lookup thread");
+    Require(name, "waiter", seen_by_waiter == 1,
+            "a waiter woke before the recorded program compiled by the lookup thread ended");
+    Require(name, "finished", after.in_flight == 0 && after.compiled == 1 &&
+                                  after.compiled_ahead == 0,
+            "the recorded program was not compiled exactly once by the lookup thread");
+  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  {
+    // Programs are looked up by one thread only; another thread is refused.
+    PipelineCache cache(graphics, directory, "TEST00000");
+    ShaderComputeInputInfo input{};
+    cache.GetComputeProgram(shader.regs, {}, input);
+    ExpectFatal("ShaderCacheLookupThread", [&] {
+      std::thread other([&] {
+        ShaderComputeInputInfo other_input{};
+        cache.GetComputeProgram(shader.regs, {}, other_input);
+      });
+      other.join();
+    });
+  }
+#endif
+  std::filesystem::remove_all(directory);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A SWAPPC program links guest functions that its record does not hold: a recorded one is left to
+// the draw instead of being compiled ahead from its own code alone.
+void CheckShaderCacheSwappcRecord(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderCacheSwappcRecord";
+  if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+    std::printf("[gpu]     %-32s skipped (non-Release build)\n", name);
+    return;
+  }
+  CachedComputeShader shader;
+  GraphicContext graphics;
+  InitCacheTestGraphics(graphics, vulkan);
+  const auto directory = CacheTestDirectory(name);
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    ShaderComputeInputInfo input{};
+    cache.GetComputeProgram(shader.regs, {}, input);
+    cache.Save();
+  }
+  const auto path = directory / "TEST00000.shaders.bin";
+  const auto file = ReadTestFile(path);
+  const std::span<const uint8_t> bytes(reinterpret_cast<const uint8_t *>(file.data()),
+                                       file.size());
+  const auto line_end = std::ranges::find(bytes, uint8_t{'\n'});
+  const std::string signature(bytes.begin(),
+                              line_end == bytes.end() ? line_end : line_end + 1);
+  ShaderCacheRecipes recipes;
+  Require(name, "saved record",
+          ParseShaderCache(bytes, signature, recipes) && recipes.size() == 1,
+          "the compute program was not recorded");
+  // s_swappc_b64 s[14:15], s[14:15] to a constant target.
+  std::vector<u32> call = {EncodeSMovB32(14, 255u), 0x100u, EncodeSMovB32(15, 128u),
+                           EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  auto recipe = std::make_shared<ShaderCacheRecipe>(*recipes[0]);
+  recipe->hash = 0x5a5a5a5au;
+  recipe->code = call;
+  recipe->specialization = {};
+  const auto data = SerializeShaderCache(signature, {recipe});
+  WriteTestFile(path, std::span(reinterpret_cast<const char *>(data.data()), data.size()));
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    Require(name, "reload", cache.GetProgramStats().recorded == 1,
+            "the SWAPPC record was not loaded");
+    ShaderMapUserData(reinterpret_cast<uint64_t>(call.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(call.size() * sizeof(u32))});
+    cache.WaitForBackgroundCompilation();
+    Require(name, "not compiled ahead", cache.GetProgramStats().compiled_ahead == 0,
+            "a recorded SWAPPC program was compiled without its linked functions");
+  }
+  std::filesystem::remove_all(directory);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Recorded vertex and pixel programs are compiled ahead for the next cache, which adopts them.
+void CheckShaderCacheGraphicsPrograms(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderCacheGraphicsPrograms";
+  if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+    std::printf("[gpu]     %-32s skipped (non-Release build)\n", name);
+    return;
+  }
+  static const auto vertex_code = [] {
+    std::vector<u32> code;
+    AppendVMovLiteral(&code, 1, 0xbf800000u);
+    AppendVMovU32(&code, 0, 0);
+    AppendVMovLiteral(&code, 6, 0x3f800000u);
+    code.push_back(EncodeExp0(0x0c, 0xf));
+    code.push_back(EncodeExp1(1, 1, 0, 6));
+    code.push_back(EncodeExp0(0x20, 0xf));
+    code.push_back(EncodeExp1(0, 0, 0, 0));
+    AppendEnd(&code);
+    return code;
+  }();
+  static const auto pixel_code = [] {
+    std::vector<u32> code;
+    AppendVMovLiteral(&code, 2, 0x3f800000u);
+    code.push_back(EncodeExp0(0x00, 0xf));
+    code.push_back(EncodeExp1(2, 2, 2, 2));
+    AppendEnd(&code);
+    return code;
+  }();
+  static ShaderUserData user_data{};
+  const auto map = [] {
+    ShaderMapUserData(reinterpret_cast<uint64_t>(vertex_code.data()),
+        {.type = Prospero::ShaderBinaryType::kGs, .user_data = &user_data,
+         .code_size_bytes = static_cast<u32>(vertex_code.size() * sizeof(u32))});
+    ShaderMapUserData(reinterpret_cast<uint64_t>(pixel_code.data()),
+        {.type = Prospero::ShaderBinaryType::kPs,
+         .code_size_bytes = static_cast<u32>(pixel_code.size() * sizeof(u32))});
+  };
+  map();
+  HW::VertexShaderInfo vertex_regs{};
+  vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(vertex_code.data());
+  HW::PixelShaderInfo pixel_regs{};
+  pixel_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(pixel_code.data());
+  HW::Context registers{};
+  registers.SetPsInControl(0x0008);
+  registers.SetViewportTransformControl(0x300);
+  HW::UserConfig user_config{};
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+  const std::array<Prospero::ColorComponentMapping, 8> export_mapping{};
+  GraphicContext graphics;
+  InitCacheTestGraphics(graphics, vulkan);
+  const auto directory = CacheTestDirectory(name);
+  std::array<ShaderVertexInputInfo, 3> vertex_info{};
+  ShaderPixelInputInfo pixel{};
+  const auto lookup = [&](PipelineCache &cache) {
+    vertex_info = {};
+    pixel = {};
+    return cache.GetGraphicsPrograms(vertex_regs, pixel_regs, registers.GetShaderRegisters(),
+                                     registers, user_config, export_mapping, true, vertex_info,
+                                     pixel);
+  };
+  const auto same = [](const ShaderRecompiler::IR::CompiledShaderInfo &left,
+                       const ShaderRecompiler::IR::CompiledShaderInfo &right) {
+    return left.info == right.info && left.bindings == right.bindings &&
+           left.stage == right.stage && left.wave_size == right.wave_size &&
+           left.param_export_mask == right.param_export_mask;
+  };
+  ShaderRecompiler::IR::CompiledShaderInfo vertex_program;
+  ShaderRecompiler::IR::CompiledShaderInfo pixel_program;
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    lookup(cache);
+    Require(name, "first run", cache.GetProgramStats().compiled == 2,
+            "the first lookup did not compile the vertex and pixel programs");
+    vertex_program = *vertex_info[0].stage.program;
+    pixel_program = *pixel.stage.program;
+  }
+  {
+    PipelineCache cache(graphics, directory, "TEST00000");
+    map();
+    cache.WaitForBackgroundCompilation();
+    lookup(cache);
+    const auto stats = cache.GetProgramStats();
+    Require(name, "adoption", stats.recorded == 2 && stats.compiled_ahead == 2 && stats.compiled == 0,
+            "the recorded vertex and pixel programs were not compiled ahead and adopted");
+    Require(name, "same programs",
+            same(*vertex_info[0].stage.program, vertex_program) &&
+                same(*pixel.stage.program, pixel_program),
+            "a program compiled ahead differs from the recorded one");
+  }
+  std::filesystem::remove_all(directory);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -42851,6 +43362,16 @@ int main(int argc, char **argv) {
     CheckComputeThreadDimensions(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--pipeline-cache-only") == 0) {
+    CheckShaderCacheFileFormat();
+    CheckShaderCacheRecordPadding();
+    VulkanHarness vulkan;
+    CheckShaderCachePersistence(vulkan);
+    CheckShaderCacheConcurrentWaiters(vulkan);
+    CheckShaderCacheSwappcRecord(vulkan);
+    CheckShaderCacheGraphicsPrograms(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);
@@ -43847,6 +44368,12 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  CheckShaderCacheFileFormat();
+  CheckShaderCacheRecordPadding();
+  CheckShaderCachePersistence(vulkan);
+  CheckShaderCacheConcurrentWaiters(vulkan);
+  CheckShaderCacheSwappcRecord(vulkan);
+  CheckShaderCacheGraphicsPrograms(vulkan);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

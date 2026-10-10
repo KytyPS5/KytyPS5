@@ -10,8 +10,10 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -103,9 +105,29 @@ struct ShaderProgram {
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
+	// Keeps the persistent caches of `title_id` in `directory` (tests).
+	PipelineCache(GraphicContext& graphics, const std::filesystem::path& directory,
+	              const std::string& title_id);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+
+	struct ProgramStats {
+		uint64_t compiled       = 0; // Permutations compiled by the caller of Get*Program.
+		uint64_t compiled_ahead = 0; // Permutations compiled from the shader cache.
+		uint64_t recorded       = 0; // Recipes known to the shader cache.
+		uint64_t waited         = 0; // Lookups that waited for a background compilation.
+		uint64_t waited_us      = 0;
+		uint64_t in_flight      = 0; // Recorded programs being compiled now, on any thread.
+	};
+	[[nodiscard]] ProgramStats GetProgramStats() const;
+	// Blocks until every queued background compilation has finished (tests).
+	void WaitForBackgroundCompilation();
+	// Runs on the compiling thread before recorded programs are compiled (tests).
+	void SetRecordedCompileHook(std::function<void()> hook);
+	// Runs in WaitForBackgroundCompilation before it waits, under the job lock; `blocking` tells
+	// whether compilations are still pending (tests).
+	void SetBackgroundWaitHook(std::function<void(bool blocking)> hook);
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -177,7 +199,8 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
-	void InitializeDriverCache();
+	void InitializeCaches(const std::filesystem::path& directory, const std::string& title_id);
+	void InitializeDriverCache(const std::filesystem::path& path);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

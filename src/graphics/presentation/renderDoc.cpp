@@ -1,4 +1,5 @@
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/host_gpu/renderer/queueSubmitter.h"
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -170,6 +171,7 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 
 	// Capture boundaries follow presentation and exclude concurrent queue access.
 	Common::LockGuard render_lock(renderer.GetMutex());
+	DrainQueueSubmits(renderer.GetGraphics());
 	Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
 	if (state == RenderDocState::Requested) {
 		StartCapture();

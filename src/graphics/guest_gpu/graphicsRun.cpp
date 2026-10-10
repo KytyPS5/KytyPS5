@@ -621,7 +621,7 @@ bool GuestGpu::Process(Submission& submission) {
 			static uint64_t window_flips  = 0;
 			static uint64_t last_compiles = 0;
 			static uint64_t last_us       = 0;
-			static uint64_t last_submits = 0, last_submit_us = 0, last_waits = 0, last_wait_us = 0;
+			static uint64_t last_batches = 0, last_submits = 0, last_submit_us = 0, last_waits = 0, last_wait_us = 0;
 			++window_flips;
 			const auto now     = std::chrono::steady_clock::now();
 			const auto elapsed = std::chrono::duration<double>(now - window_start).count();
@@ -637,16 +637,19 @@ bool GuestGpu::Process(Submission& submission) {
 				            static_cast<double>(us - last_us) / 1000.0,
 				            static_cast<double>(max_us) / 1000.0, elapsed);
 				std::fflush(stdout);
+				const auto batches   = stats.submit_batches.load(std::memory_order_relaxed);
 				const auto submits   = stats.submits.load(std::memory_order_relaxed);
 				const auto submit_us = stats.submit_us.load(std::memory_order_relaxed);
 				const auto waits     = stats.waits.load(std::memory_order_relaxed);
 				const auto wait_us   = stats.wait_us.load(std::memory_order_relaxed);
-				std::printf("PERF2: submits %llu (%.0f ms in vkQueueSubmit) | GPU waits %llu "
+				std::printf("PERF2: submits %llu in %llu batches (%.0f ms in vkQueueSubmit) | GPU waits %llu "
 				            "(%.0f ms blocked) in last %.1f s\n",
 				            static_cast<unsigned long long>(submits - last_submits),
+				            static_cast<unsigned long long>(batches - last_batches),
 				            static_cast<double>(submit_us - last_submit_us) / 1000.0,
 				            static_cast<unsigned long long>(waits - last_waits),
 				            static_cast<double>(wait_us - last_wait_us) / 1000.0, elapsed);
+				last_batches   = batches;
 				last_submits   = submits;
 				last_submit_us = submit_us;
 				last_waits     = waits;

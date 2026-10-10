@@ -13,6 +13,7 @@ struct FrameStats {
 	std::atomic<uint64_t> compile_us {0};
 	std::atomic<uint64_t> compile_us_max {0};
 	std::atomic<uint64_t> submits {0};
+	std::atomic<uint64_t> submit_batches {0};
 	std::atomic<uint64_t> submit_us {0};
 	std::atomic<uint64_t> waits {0};
 	std::atomic<uint64_t> wait_us {0};

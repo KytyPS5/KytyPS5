@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/queueSubmitter.h"
 
 #include <algorithm>
 #include <chrono>
@@ -353,45 +354,15 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
-	vk::Result result;
-	uint64_t   tick;
-	const auto submit_begin = std::chrono::steady_clock::now();
-	{
-		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
-
-		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
-		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
-		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
-		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
-
-		vk::SubmitInfo submit_info {};
-		submit_info.pNext                = &timeline_info;
-		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
-		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
-		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
-		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
-		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
-
-		result = graphics.queue.submit(1, &submit_info, nullptr);
-		if (result == vk::Result::eSuccess) {
-			RecordSubmitHistory(tick, m_command.m_debug_op, m_command.m_debug_submit_id,
-			                    m_command.m_debug_arg0, m_command.m_debug_arg1,
-			                    m_command.m_debug_arg2, m_command.m_debug_arg3,
-			                    m_command.m_debug_arg4);
-		}
+	if (graphics.submitter == nullptr) {
+		graphics.submitter = std::make_shared<QueueSubmitter>(graphics);
 	}
-
-	g_frame_stats.submits.fetch_add(1, std::memory_order_relaxed);
-	g_frame_stats.submit_us.fetch_add(
-	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-	                              std::chrono::steady_clock::now() - submit_begin)
-	                              .count()),
-	    std::memory_order_relaxed);
+	QueueSubmitter::DebugInfo debug {m_command.m_debug_op,   m_command.m_debug_submit_id,
+	                                 m_command.m_debug_arg0, m_command.m_debug_arg1,
+	                                 m_command.m_debug_arg2, m_command.m_debug_arg3,
+	                                 m_command.m_debug_arg4};
+	const uint64_t tick   = graphics.submitter->Enqueue(m_master, submit, buffer, debug);
+	vk::Result     result = vk::Result::eSuccess;
 
 	if (result == vk::Result::eSuccess && GpuSyncDebugEnabled()) {
 		// Debug mode (KYTY_GPU_SYNC=1): wait for every submit so a hung/lost GPU is blamed on the

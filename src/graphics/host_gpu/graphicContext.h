@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <tuple>
 #include <vector>
@@ -16,6 +17,7 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
+class QueueSubmitter;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -45,6 +47,8 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Created by the first CommandScheduler; submits queued command buffers from its own thread.
+	std::shared_ptr<QueueSubmitter>    submitter;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

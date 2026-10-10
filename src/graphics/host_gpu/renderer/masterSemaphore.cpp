@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/queueSubmitter.h"
 
 #include <array>
 #include <chrono>
@@ -173,6 +174,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
+	// The tick may still sit in the submit queue; make sure the GPU has actually been given it.
+	DrainQueueSubmits(m_graphics);
 	const auto wait_begin = std::chrono::steady_clock::now();
 	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	g_frame_stats.waits.fetch_add(1, std::memory_order_relaxed);

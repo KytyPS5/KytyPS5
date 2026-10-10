@@ -1060,6 +1060,7 @@ WindowContext::~WindowContext() {
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
 
+	graphic_ctx.submitter.reset(); // drains and joins the submit thread
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
 		graphic_ctx.DestroyAllocator();

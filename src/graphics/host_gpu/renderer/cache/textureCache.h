@@ -48,6 +48,8 @@ public:
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// A cached texture binding still has to see a fast clear that arrived since its lookup.
+	void                        MaterializeViewClear(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
@@ -134,8 +136,7 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
+	void MaterializeColorClear(ImageId id, const ImageDesc& binding, uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);

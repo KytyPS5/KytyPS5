@@ -109,7 +109,7 @@ void NoteBoundShader(uint32_t stage_slot, uint64_t hash) {
 
 bool CurrentDrawShadersSkipped() {
 	static const std::vector<uint64_t> skipped = [] {
-		std::vector<uint64_t> list = {0xb3b6b0fc2e9a1de7ull};
+		std::vector<uint64_t> list;
 		if (const char* env = std::getenv("KYTY_SKIP_SHADERS")) {
 			list.clear();
 			std::string text(env);

@@ -21,7 +21,7 @@ void RecordPerfLine(const char* line);
 // history can name the shaders of the work that was in flight when the device was lost.
 void NoteBoundShader(uint32_t stage_slot, uint64_t hash);
 // True when the draw that is being recorded uses a shader on the skip list. The default list holds
-// the pixel shader that was the last bound shader in every recorded UFC device-lost report;
+// empty by default (skipping b3b6b0fc2e9a1de7 did not prevent the UFC device loss);
 // KYTY_SKIP_SHADERS=<hex>[,<hex>...] replaces it and KYTY_SKIP_SHADERS=none disables skipping.
 bool CurrentDrawShadersSkipped();
 // True when the KYTY_GPU_SYNC environment variable is set: every submit is waited on so a GPU

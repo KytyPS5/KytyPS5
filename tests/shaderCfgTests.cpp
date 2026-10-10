@@ -134,7 +134,8 @@ TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
     ShaderRecompiler::IR::SrtMemoryReader read_memory = nullptr,
-    void *read_memory_data = nullptr, uint32_t push_data_start_dword = 0) {
+    void *read_memory_data = nullptr, uint32_t push_data_start_dword = 0,
+    bool min_lod_remap = false) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -145,6 +146,7 @@ TestCompileResult RecompileForTest(
       .read_memory = read_memory,
       .userdata = read_memory_data,
       .read_specialization_memory = ReadHostTestMemory,
+      .min_lod_remap = min_lod_remap,
   };
   Check(ShaderRecompiler::IR::MaterializeResources(
             plan, runtime, resources, specialization),
@@ -14535,6 +14537,92 @@ void TestScalarMemorySourcesCapturedBeforeWrites() {
   CheckOverlap(0x0a, true);  // s_buffer_load_dwordx4 overlapping SOFFSET
 }
 
+bool SpirvHasU32Constant(const std::vector<uint32_t> &binary, uint32_t value) {
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word = binary[i];
+    const uint32_t word_count = word >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return false;
+    }
+    if ((word & 0xffffu) == 43u && word_count == 4u && binary[i + 3u] == value) {
+      return true;
+    }
+    i += word_count;
+  }
+  return false;
+}
+
+size_t SpirvCountOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
+  size_t count = 0;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word_count = binary[i] >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      break;
+    }
+    count += (binary[i] & 0xffffu) == opcode ? 1u : 0u;
+    i += word_count;
+  }
+  return count;
+}
+
+// With the T# MinLod folded into the view base level, RESINFO answers from the T# (2048x2048, 11 levels)
+// instead of the shifted view (OpImageQueryLevels / the view size).
+void TestMinLodResinfoCorrection() {
+  const auto make_shader = [](uint32_t dim) {
+    return std::array<uint32_t, 7>{
+      EncodeMimg0(0x0e, 0x9, false, dim),
+      EncodeMimg1(5, 0, 0, 1), // image_get_resinfo v5 (width, mip count)
+      EncodeMubuf0(0x1c, 8),
+      EncodeMubuf1(5, 0, 1), // buffer_store_dword v5
+      EncodeMubuf0(0x1c, 12),
+      EncodeMubuf1(6, 0, 1), // buffer_store_dword v6
+      0xbf810000u,
+    };
+  };
+  const auto shader_2d = make_shader(1u);
+  const auto shader_2d_array = make_shader(3u);
+  const auto make_user_data = [](uint32_t min_lod, Prospero::ImageType type = Prospero::ImageType::kColor2D) {
+    auto data = ImageTestUserData();
+    constexpr uint32_t extent = 2048u;
+    for (uint32_t start = 0; start + 3u < data.size(); start += 4u) {
+      data[start + 1u] = (static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u) | (min_lod << 8u) |
+                         (((extent - 1u) & 3u) << 30u);
+      data[start + 2u] = ((extent - 1u) >> 2u) | ((extent - 1u) << 14u);
+      data[start + 3u] = (static_cast<uint32_t>(type) << 28u) | (10u << 16u);
+    }
+    // The T# at s[0..7] spans two fixture groups: clear the words the fixture fills with reserved bits.
+    std::fill(data.begin() + 4, data.begin() + 8, 0u);
+    return data;
+  };
+  const auto compile = [&](uint32_t min_lod, bool remap, Prospero::ImageType type = Prospero::ImageType::kColor2D) {
+    const auto &shader = type == Prospero::ImageType::kColor2D ? shader_2d : shader_2d_array;
+    auto user_data = make_user_data(min_lod, type);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    return RecompileForTest(shader, options, ReadZeroTestMemory, nullptr, 0, remap);
+  };
+
+  const auto plain = compile(1024u, false);
+  Check(SpirvContainsOpcode(plain.spirv, 106), "without the remap RESINFO queries the view levels");
+  Check(!SpirvHasU32Constant(plain.spirv, 11u), "without the remap RESINFO must not carry T# levels");
+
+  const auto remapped = compile(1024u, true);
+  Check(!SpirvContainsOpcode(remapped.spirv, 106), "remapped MinLod: RESINFO must not query the shifted view levels");
+  Check(SpirvHasU32Constant(remapped.spirv, 11u) && SpirvHasU32Constant(remapped.spirv, 2048u),
+        "remapped MinLod: RESINFO must answer 2048 / 11 levels from the T#");
+
+  const auto unclamped = compile(0u, true);
+  Check(SpirvContainsOpcode(unclamped.spirv, 106), "MinLod 0 needs no RESINFO correction");
+
+  // A 2D array with a guest LOD past the shifted view's levels: size at that LOD is undefined, so the layer count
+  // must come from a second query at LOD 0 (the 2D case keeps its single query).
+  const auto array_remapped = compile(1024u, true, Prospero::ImageType::kColor2DArray);
+  Check(!SpirvContainsOpcode(array_remapped.spirv, 106), "remapped array MinLod: no view levels query");
+  Check(SpirvCountOpcode(array_remapped.spirv, 103) == 2u,
+        "remapped array MinLod: layer count must be queried at LOD 0 (OpImageQuerySizeLod x2)");
+  Check(SpirvCountOpcode(remapped.spirv, 103) == 1u, "remapped 2D MinLod must keep a single size query");
+}
+
 void TestScalarMemoryLoadCrossesIntoVcc() {
   const uint32_t shader[] = {
       EncodeSmem0(0x02, 104, 4),
@@ -15727,6 +15815,7 @@ int main() {
   TestSrtWalkerRealSBufferTranslation();
   TestScalarMemorySourcesCapturedBeforeWrites();
   TestScalarMemoryLoadCrossesIntoVcc();
+  TestMinLodResinfoCorrection();
   TestScalarMemoryUnusedTailDce();
   TestResourceTrackingRealDensePatching();
   TestDirectTranslationResetsAnalysisState();

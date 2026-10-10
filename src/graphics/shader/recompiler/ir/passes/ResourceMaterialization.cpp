@@ -479,7 +479,7 @@ private:
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
+                                        ResourceSpecialization& specialization, bool min_lod_remap) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -558,6 +558,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail(
 			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
+		}
+		// RESINFO of a sampled view the host moved to a higher base level (T# MinLod): answer from the T#.
+		image.min_lod_resinfo = {};
+		if (min_lod_remap && base.queries_size && !storage && !image.fmask &&
+		    base.mip_mode != ImageMipMode::Dynamic) {
+			ShaderTextureResource t;
+			std::copy_n(descriptor.dwords.begin(), std::size(t.fields), t.fields);
+			const bool volume = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu) ==
+			                    Prospero::ImageType::kColor3D;
+			image.min_lod_resinfo = Libs::Graphics::MakeMinLodResinfo(
+			    true, t.BaseLevel(), t.LastLevel(), t.MinLod(), static_cast<uint32_t>(t.Width5()) + 1u,
+			    static_cast<uint32_t>(t.Height5()) + 1u, volume ? static_cast<uint32_t>(t.Depth()) + 1u : 1u);
 		}
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
@@ -1226,7 +1238,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	return BuildResourceSpecialization(program, snapshot, specialization, runtime.min_lod_remap);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
@@ -1278,6 +1290,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.min_lod_resinfo            = source.min_lod_resinfo;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

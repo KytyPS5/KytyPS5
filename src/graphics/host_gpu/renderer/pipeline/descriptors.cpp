@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/minLodView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -635,6 +636,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
+	// Without VK_EXT_image_view_min_lod (MoltenVK) the T# MinLod clamp cannot reach the view: fold it into a
+	// higher view base level (sampled, non-Dynamic only). The fraction rounds up to a whole level.
+	if (desc.view_info.min_lod != 0 && !storage && m_context.GetGraphics().min_lod_remap &&
+	    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+		const auto mapped = MapMinLodToBaseLevel(desc.view_info.base_level, desc.view_info.level_count,
+		                                         desc.view_info.min_lod);
+		desc.view_info.base_level  = mapped.base_level;
+		desc.view_info.level_count = mapped.level_count;
+		desc.view_info.min_lod     = mapped.min_lod;
+	}
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);

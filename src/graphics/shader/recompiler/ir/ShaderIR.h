@@ -10,6 +10,7 @@
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
+#include "graphics/shader/minLodShift.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
@@ -148,6 +149,8 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	bool                          queries_size      = false; // RESINFO / size query
+	Libs::Graphics::MinLodResinfo min_lod_resinfo;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;

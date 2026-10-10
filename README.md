@@ -242,6 +242,56 @@ sources, so it needs network access; a fully sandboxed `nix build` would require
 inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
 `hardware.graphics.enable = true`).
 
+### Building on Fedora and Fedora Atomic (Bazzite, Bluefin, Silverblue)
+
+On regular Fedora Workstation, install the packages below directly on the host. On image-based
+Fedora variants such as Bazzite, Bluefin and Silverblue, build inside a Distrobox (preinstalled on
+Bazzite and Bluefin) so the read-only base image stays untouched:
+
+```bash
+distrobox create --name kyty-build --image registry.fedoraproject.org/fedora:latest
+distrobox enter kyty-build
+```
+
+Install the toolchain, Qt 6 and the libraries the bundled SDL3 needs. These are the Fedora
+equivalents of the Debian/Ubuntu packages listed above:
+
+```bash
+sudo dnf install -y \
+  clang lld ninja-build cmake git glslang python3 pkgconf-pkg-config \
+  mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
+  libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
+  alsa-lib-devel pulseaudio-libs-devel systemd-devel dbus-devel \
+  wayland-devel wayland-protocols-devel qt6-qtbase-devel
+```
+
+Configure and build as on other distributions. Fedora's Qt 6 is found automatically, so
+`CMAKE_PREFIX_PATH` is not needed:
+
+```bash
+git submodule update --init --recursive
+
+cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+cmake --build _Build/linux --target launcher --parallel
+cmake --install _Build/linux --prefix _Build/linux/install
+```
+
+The install step bundles the Qt libraries next to the binaries, so on Fedora Atomic the result runs
+directly on the host, outside the container:
+
+```bash
+./_Build/linux/install/launcher
+```
+
+If the host is missing a library, run it through the container instead, which shares the host's
+display, audio, gamepads and GPU driver:
+
+```bash
+distrobox enter kyty-build -- ./_Build/linux/install/launcher
+```
+
 ### Building on macOS
 
 macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game

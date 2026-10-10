@@ -2688,7 +2688,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			    next_specialization.sampler_origins[image.independent_sampler_resources[0]] == pair.sampler;
 			std::vector<uint32_t> selected_samplers;
 			if (independent) {
-				selected_samplers = image.independent_sampler_resources;
+				// The image carries its complete independently selectable sampler set.
+				// Keep a representative use edge here; class usage consumes that set
+				// directly instead of expanding an image-by-sampler Cartesian graph.
+				selected_samplers.push_back(image.independent_sampler_resources[0]);
 			} else {
 				const bool dynamic_pair = image.indirect_sampler != UINT32_MAX &&
 				    image.indirect_sampler < next_specialization.sampler_origins.size() &&
@@ -2742,6 +2745,12 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 			return false;
 		}
 		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(images[pair.image]));
+	}
+	for (const auto& image: images) {
+		for (const auto sampler: image.independent_sampler_resources) {
+			if (sampler >= base.samplers.size()) return false;
+			usage[sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(image));
+		}
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];

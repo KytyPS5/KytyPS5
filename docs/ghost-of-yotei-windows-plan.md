@@ -1,5 +1,23 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 02:54 UTC** (compact independent use topology proved):
+
+- Native source1272580a / EXEfeb412 / original5178 run
+  `_Build/runs/game-20261010-023009-separate-image-sampler-bindings-native`
+  naturally exits321 at02:49:05.403UTC,1267 complete pipelines. No timeout
+  or memory guard; minimum available RAM18.17GiB. PS07b3 passes the image
+  budget but expanded sampled pairs exceed their compiler budget. Captures
+  show loading arc/black only; menu/gameplay and issue108 post still pending.
+- New shared correction stores all independently selectable samplers on the
+  image and computes per-class sampler usage directly. Explicit pair metadata
+  stays compact; actual image/sampler quotas and class cloning remain checked.
+  Native intended RED025026 -> unchanged GREEN025054. Full resource025129
+  PASS2/2 adds mixed float/UInt bindings and transactional quota failures.
+  Six numerical GPUAV cases plus wave64 neighbor025158 PASS2/2; native
+  sampler/image capacity and coherent selectors025311 PASS3/3.
+- Next: separate local fix commit, native build, preserve installedfeb412 EXE
+  and complete warmed driver cache, bounded original-game retry. No push.
+
 Checkpoint **2026-10-10 02:27 UTC** (independent bindings regression proved):
 
 - Original5178 / sourcef8b8e2f8 / EXE9b191 run

@@ -5648,6 +5648,8 @@ void TestIndependentInlineSampledSources() {
           "independent samplers duplicated image bindings");
     Check(root.independent_sampler_resources.size() >= 2u,
           "independent samplers lost sampler state");
+    Check(specialization.sampled_pairs.size() <= specialization.images.size(),
+          "independent sampler topology expanded a Cartesian use graph");
     const auto lookup = [&](uint32_t offset, uint32_t key) {
       for (uint32_t row = 0; row < snapshot.flattened_srt.at(offset); ++row) {
         const auto position = offset + 1u + row * 2u;
@@ -5679,6 +5681,37 @@ void TestIndependentInlineSampledSources() {
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
           "independent sampled combinations ignored the sampler budget");
     runtime.max_native_samplers = ShaderInfo::MaxSamplers;
+    // Every independent sampler is used by both numeric classes, even though
+    // explicit sampled-use metadata retains only one representative per image.
+    if (independent == 3u) {
+      const auto format_word = (872u + 152u) / 4u + 1u;
+      memory.words[format_word] = static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt) << 20u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "independent mixed-class samplers did not materialize");
+      const auto native_count = snapshot.samplers.size();
+      Check(native_count > specialization.sampler_origins.size(),
+            "independent mixed-class sampler usage lost native class variants");
+      const auto previous = snapshot;
+      const auto previous_specialization = specialization;
+      runtime.max_native_samplers = static_cast<uint32_t>(native_count - 1u);
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+                SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+            "independent sampler class overflow committed partial state");
+      runtime.max_native_samplers = ShaderInfo::MaxSamplers;
+      ApplyResourceSpecialization(fixture->program, previous_specialization);
+      for (const auto& candidate : fixture->program.info.images) {
+        const bool integer = candidate.numeric_class ==
+            Libs::Graphics::Prospero::TextureNumericClass::Uint;
+        for (const auto sampler_id : candidate.independent_sampler_resources) {
+          const auto& binding = fixture->program.info.samplers.at(sampler_id);
+          Check(binding.force_point_filtering == integer && binding.integer_border == integer,
+                "independent sampler lost per-image-class filtering or border semantics");
+        }
+      }
+      memory.words[format_word] = static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    }
     memory.fail_address = user_data[8] + 136u;
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
           "independent sampler accepted unavailable descriptor bytes");

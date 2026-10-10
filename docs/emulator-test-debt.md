@@ -1,5 +1,24 @@
 # Emulator regression test debt
 
+## Compact independent sampled-use topology (2026-10-10)
+
+Original5178 / source1272580a / EXEfeb412 run023009 naturally exits321
+at02:49:05.403UTC, without timeout or either memory guard. PS07b3 now passes
+the image-view budget but expanded sampled-use pairs exceed MaxSampledPairs.
+Required synthetic RED: independently selected images/samplers retain all
+native operands and class-specific sampler usage without constructing the
+Cartesian pair list. Prove bounded use metadata, unchanged numeric selection,
+class cloning and strict native descriptor budgets. Do not raise graph quotas
+or discard actual sampler states.
+
+Completed locally: native intended RED025026 -> unchanged GREEN025054.
+Full resource suite025129 PASS2/2 includes independent float/UInt class
+cloning and transactional native-sampler overflow. Six unchanged numeric
+GPUAV cases and wave64 neighbor025158 PASS2/2; sampler/image-capacity and
+coherent-selector GPUAV025311 PASS3/3. Complete sampler sets contribute
+class usage directly; explicit sampled pairs retain representative use edges.
+No descriptor or graph limits raised. Native emulator build/retry pending.
+
 ## Independent image/sampler bindings without Cartesian image duplication (2026-10-10)
 
 Nativef8b8e2f8 / EXE9b191 / original5178 run010007 naturally exits321 at

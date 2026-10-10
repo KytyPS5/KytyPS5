@@ -522,7 +522,8 @@ struct ShaderInfo {
 	static constexpr uint32_t MaxSamplers     = 32;
 	// Logical use edges between separate sampled-image and sampler descriptors.
 	// The backend allocates operands independently and combines them with
-	// OpSampledImage, so every validated operand combination must fit this graph.
+	// OpSampledImage. Independent candidate sets live on ImageResource instead
+	// of expanding every combination into this explicit-use graph.
 	// Vulkan DescriptorBudget still checks the actual descriptor allocations.
 	static constexpr uint32_t MaxSampledPairs = MaxImages * MaxSamplers;
 

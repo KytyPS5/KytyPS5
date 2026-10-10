@@ -5199,6 +5199,127 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckScalarLoadResidency() {
+    constexpr const char *name = "ScalarLoadResidency";
+    constexpr uintptr_t base = 0x0000000204900000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t output = base + 0x100;
+    // No descriptor of the dispatch covers this page, so it has no buffer yet.
+    constexpr uint64_t table = base + 2 * BufferCache::CACHING_PAGESIZE + 0x40;
+    // God of War Ragnarok CS 0x5c046e9ef798f2bc loads its loop bound like this (into s[6:7]).
+    // A page without a buffer read zero there, and the bound became 0xffffffff.
+    std::vector<u32> code{EncodeSmem0(0x01, 8, 0), EncodeSmem1(8, 125), // s_load_dwordx2 s[8:9], s[0:1], 0x8
+                          EncodeSopp(0x0c, 0xc07f),
+                          EncodeVop1(0x01, 1, 8), EncodeVop1(0x01, 2, 9),
+                          EncodeMubuf0(0x1cu, 0, false, false), EncodeMubuf1(1, 1, 0),
+                          EncodeMubuf0(0x1cu, 4, false, false), EncodeMubuf1(2, 1, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "scalar table allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "scalar table mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const std::array<u32, 4> values{0x11111111u, 0x22222222u, 3u, 2u};
+    std::memcpy(reinterpret_cast<void *>(table), values.data(), sizeof(values));
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      using ShaderRecompiler::IR::DescriptorBindingKind;
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 8});
+      shaders.SetCsUserSgpr(0, static_cast<u32>(table), HW::UserSgprType::Unknown);
+      shaders.SetCsUserSgpr(1, static_cast<u32>(table >> 32u), HW::UserSgprType::Unknown);
+      ShaderBufferResource descriptor{};
+      descriptor.UpdateAddress48(output);
+      descriptor.fields[2] = 2u * sizeof(u32);
+      descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; i++) {
+        shaders.SetCsUserSgpr(4 + i, descriptor.fields[i], HW::UserSgprType::Unknown);
+      }
+      ShaderComputeInputInfo input{};
+      (void)context.GetPipelineCache().GetComputeProgram(
+          shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+      const auto &counts = input.stage.program->bindings.descriptor_counts;
+      Require(name, "GPU-side scalar load",
+              counts[static_cast<size_t>(DescriptorBindingKind::FlattenedSrt)] == 0 &&
+                  counts[static_cast<size_t>(DescriptorBindingKind::BdaPagetable)] != 0 &&
+                  !BufferCacheTestAccess::PageOwner(cache, table),
+              "the table load is no longer a BDA read from a page without a buffer");
+
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      cache.ReadMemory(output, 2u * sizeof(u32));
+      std::array<u32, 2> actual{};
+      Require(name, "output readback",
+              LibKernel::Memory::TryReadBacking(output, actual.data(), sizeof(actual)),
+              "scalar load output could not be read back");
+      Require(name, "first dispatch reads the table", actual[0] == 3u && actual[1] == 2u,
+              "expected 0x00000003/0x00000002, got " + Hex(actual[0]) + "/" + Hex(actual[1]));
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "scalar table mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "scalar table allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckBdaReadBuffers() {
+    constexpr const char *name = "BdaReadBuffers";
+    constexpr uint64_t base = 0x0000000204a00000ull;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetBufferCache();
+    context.MapMemory(base, 3 * page);
+    const auto held = cache.FindBuffer(base, 2 * page);
+    // One read crosses from the held pages into an empty one, the other leaves the mapping.
+    const std::array<std::pair<uint64_t, uint64_t>, 2> reads{
+        {{base + 2 * page - 4, 8}, {base + 3 * page - 4, 8}}};
+    context.FindBdaBuffers(reads);
+    const auto added = BufferCacheTestAccess::PageOwner(cache, base + 2 * page);
+    Require(name, "page owners",
+            BufferCacheTestAccess::PageOwner(cache, base) == held &&
+                BufferCacheTestAccess::PageOwner(cache, base + page) == held && added &&
+                added != held && !BufferCacheTestAccess::PageOwner(cache, base + 3 * page),
+            "BDA reads joined a held buffer or created one outside the mapped range");
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -39964,6 +40085,10 @@ void CheckResourcePlanHandoff() {
             MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.buffers.size() == 1 && snapshot.buffers[0].dwords[0] == 0x1000u,
             "SRT buffer descriptor was not materialized");
+    using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
+    Require(name, "native scalar payload address",
+            snapshot.gpu_scalar_reads == (numeric_read ? Ranges{{16u, 4u}} : Ranges{}),
+            "the GPU-side scalar load address was not reported for residency");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options,
                                                      specialization);
     ValidateSpirv(name, compiled.spirv);
@@ -43320,6 +43445,12 @@ int main(int argc, char **argv) {
     CheckDepthTargetFootprints();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-load-residency-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaReadBuffers();
+    vulkan.CheckScalarLoadResidency();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
@@ -43530,6 +43661,8 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckBdaReadBuffers();
+  vulkan.CheckScalarLoadResidency();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

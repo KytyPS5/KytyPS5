@@ -53,6 +53,8 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// Gives the mapped parts of known BDA read ranges a buffer, which PrepareBda then uploads.
+	void               FindBdaBuffers(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	void               PrepareBda();
 	void               RunGarbageCollector();
 

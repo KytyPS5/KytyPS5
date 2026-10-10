@@ -199,6 +199,13 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
+		const auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
+		    "vkEnumerateDeviceExtensionProperties",
+		    [&](uint32_t* count, vk::ExtensionProperties* values) {
+			    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
+		    });
+		EXIT_NOT_IMPLEMENTED(available_extensions.empty());
+
 		vk::PhysicalDeviceFeatures2 device_features2 {};
 
 		vk::PhysicalDeviceVulkan13Features features13 {};
@@ -321,13 +328,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
 
 		if (!skip_device) {
-			auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
-			    "vkEnumerateDeviceExtensionProperties",
-			    [&](uint32_t* count, vk::ExtensionProperties* values) {
-				    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
-			    });
-			EXIT_NOT_IMPLEMENTED(available_extensions.empty());
-
 			for (const char* ext: device_extensions) {
 				if (!HasExtension(available_extensions, ext)) {
 					reject(fmt::format("{} is not supported", ext));

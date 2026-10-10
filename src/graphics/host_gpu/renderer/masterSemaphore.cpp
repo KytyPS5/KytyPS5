@@ -156,6 +156,13 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	NoteGpuWait(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	    std::chrono::steady_clock::now() - wait_begin).count()));
 	if (result != vk::Result::eSuccess) {
+		const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		    std::chrono::steady_clock::now() - wait_begin).count();
+		// A Windows TDR hang is reported after about 2000 ms of no progress; an invalid GPU
+		// memory access fails almost immediately.
+		std::printf("GPU wait failed after %lld ms (about 2000 ms or more means a hang/TDR; "
+		            "a few ms means a GPU memory fault)\n", static_cast<long long>(waited_ms));
+		std::fflush(stdout);
 		ReportSemaphoreFatal("vkWaitSemaphores", result, tick, KnownGpuTick());
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

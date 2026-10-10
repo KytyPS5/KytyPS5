@@ -1,5 +1,84 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 17:36 UTC** (uniform-row native retry finalized):
+
+- Source7cd25729/EXEc1563fc0, original5178, private Performance1280x720/
+  redzone run171740 naturally exits321 at17:35:20.446714UTC; no timeout,
+  memory guard or forced cleanup; minimum available RAM25.72GiB. PID3932
+  and supervisor/session10955 completed; native slot idle.
+- Runtime outcome remains exact PS617c pc8b4 record0row64 unsupportedtype4,
+  source2records/stride136, guard255,row_stride368,descriptor_offset64.
+  This is expected for the still-unproved texture-derived wave selector;
+  the pure user-data fix does not bypass it. No new menu/gameplay milestone.
+- Completed fix7cd25729 remains verified by RED155715/GREEN155906, U32
+  wrap/invalid-selected row171314, fullCPU170913 and GPUAV1711403/3. Texture
+  diagnostic e032366f/5 capture tests155114 and actual152221 payloads remain
+  the basis for the next origin/initialization/attachment-ownership proof.
+- Original SaveData and installed EXE454656 untouched; no push/issue post.
+  Next use the retained row expression and captured RGB channels to establish
+  a synthetic packed-image row-domain RED. Keep alpha/padding out only when
+  decoded semantics prove they are not sources; preserve dirty/alias/unknown
+  failures and invalid selected descriptors. Working game remains pending.
+
+Checkpoint **2026-10-10 17:18 UTC** (uniform-row fix verified, game retry active):
+
+- Local completed commits e032366f (bounded texture capture/logical byte
+  analysis) and7cd25729 (CPU-uniform wave row). Original installed EXE/SaveData
+  preserved; no push or issue publication. Source remains frozen during retry.
+- Actual texture input run152221/EXEdf930938 ended naturally321 at15:39:07UTC,
+  no guards/minRAM18.18GiB, same PS617c record0row64 failure. Supplement has
+  two stable513x513 RGBA8UInt/Standard4KB images at selector keys0 and136.
+  RGB sets have17 and20 members; neither includes64. Alpha has256 and255
+  distinct values respectively. RGB union has22 values including sentinel255.
+  Texture data plus primary740 callbacks are preserved in~12.8MiB manifest.
+- Native capture tests155114=5/5 cover logical RGB versus alpha/padding,
+  swizzle/constant channels, truncated payload and dirty/written-image gates.
+  Private Python analysis independently reports the actual RGB sets. No claim
+  of shader origin/attachment disjointness follows from these diagnostic sets.
+- Synthetic CPU-uniform row RED155715 fails because old materializer probes
+  unreadable, unselected rows. Same GREEN155906 passes; selected invalid64
+  still fails. Shared plan now retains/clones row expression; narrowing is
+  allowed only for pure user-data integer expressions, with a1024-node work
+  bound. Vector, image, memory and unknown expressions retain the full guard
+  domain. Wrapping U32 arithmetic passes171314; full affected CPU suite170913
+  passes. GPUAV171140 passes contracts/neighbors/numerical readback3/3.
+- Native emulator build171521 passes, EXEc1563fc0eba9f78c228b92bb9e4505b1a116bdc00c0570b78e127f580d4708ab.
+  Actual-resource CPU RED171618 continues to reproduce row64, as expected:
+  the game's texture-derived wave row is not a pure user-data expression.
+- ACTIVE _Build/runs/game-20261010-171740-uniform-wave-row-retry PID3932,
+  tested7cd25729, original5178/Performance1280x720/redzone,1800s32GiB/8GiB
+  reserve, private uniform-wave-row-retry runtime. No overlapping build/test.
+  Await actual retry outcome before recording a new runtime result.
+- Next required semantic work remains packed texture origin/initialized-lane
+  proof across ImageRead/Phi/shift8/UMin/DPP and attachment/alias writer ranges.
+  Optional Sharp1057 comparison pin e86d3a74 has explicit byte-channel,
+  initialization-mask and write-proof gates; no code from it has been ported.
+  Do not infer RGB-only origins from a game hash or use a hardcoded63/64 bound.
+  Visible main menu/game entry still pending.
+
+Checkpoint **2026-10-10 15:30 UTC** (texture input capture active):
+
+- User explicitly requests continuing until working. Branch7bef57c9 with
+  uncommitted diagnostic-only texture supplement; no guest semantic change.
+  Native capture tests130448=5/5; emulator build130631 passes. Private EXE
+  df9309383658d198cd76478dbe64f7a7ab7002c7ef601fe68a1670ceddedae6c.
+- Supplement uses strict reads for bounded direct-inline RGBA8UInt/Standard4KB
+  inputs, stores descriptor/raw pixels/stability separately from the original
+  callback transcript, and explicitly records specialization_proof=false.
+  It makes no claim of attachment disjointness or a proved live selector set.
+- Initial run130754 ended13:09:49UTC/exit0 before PS617c/no snapshot; no guards.
+  A background supervisor151902 produced no game run and is no longer alive.
+  Direct bounded restart _Build/runs/game-20261010-152221-texture-selector-input
+  PID31748 is active, original5178/Performance1280x720/1800s32GiB/8GiB reserve.
+  Source frozen; no overlapping build/test. Original installed EXE/SaveData
+  preserved. Private runtime: texture-selector-input-20261010T130753Z/runtime.
+- Next inspect additional_texture_inputs; private inspect-domains.py examines
+  logical RGBA8 texels with the existing Standard4KB address equation, excludes
+  padding and reports all channels/RGB union. This is diagnostic analysis only.
+  Prove sparse key provenance/coherence and attachment-writer negatives before
+  materialization changes. Current row64 failure/menu/game entry unresolved;
+  no new milestone publication or push.
+
 Checkpoint **2026-10-10 12:40 UTC** (actual failure reproduced on CPU):
 
 - Private diagnostic native EXEecfc2e59, dirty cf4f7fe3 source, original

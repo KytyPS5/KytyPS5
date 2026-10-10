@@ -1,5 +1,55 @@
 # Emulator regression test debt
 
+## CPU-uniform wave-address row overscan (2026-10-10)
+
+Finalized runtime17:36UTC: original171740/7cd25729/EXEc1563fc0 naturally exits321
+17:35:20.446714/no guards/minRAM25.72GiB, same texture-derived row64. Scope of
+the completed pure-user-data correction is unchanged; RGB origin/initialized
+lane coverage and attachment-write proofs remain required for the game.
+
+Verified17:18UTC: RED155715 -> unchanged GREEN155906. Pure immutable user-data
+integer row1 now avoids unselected reads; selected invalid64 still fails.
+Wrapping-U32 variant passes171314. Full resource_tracking170913 and GPUAV
+wave-address contracts/neighbors/readback1711403/3 pass. Completed local fix
+7cd25729 retains/clones row expression and bounds analysis to1024 visits;
+unknown/image/vector/memory expressions keep conservative behavior. Original
+PS617c CPU replay171618 remains row64. Native build171521 passes; actual game
+retry171740 active. This does not close the texture-origin/writer-proof debt.
+
+Minimal synthetic case: wave pointer selected from two records, row is an
+immutable per-draw user-data value1 under guard255; only row1 descriptor bytes
+are readable. Existing materializer scans unselected row0 and fails. Require
+native intended RED, then preserve the scalar row expression in the shared
+resource plan and admit narrowing only for proven pure uniform user-data
+integer expressions. GPU-varying/image/memory/unsupported expressions retain
+the existing conservative domain. A selected invalid row64 must still fail.
+This covers the common overscan mechanism but does not prove the game's
+texture-derived row expression or solve attachment ownership.
+
+## Texture-derived wave-row domain (2026-10-10 15:30 UTC, in progress)
+
+Baseline remains7bef57c9. Read-only diagnostic supplement now captures selected
+direct-inline RGBA8UInt/Standard4KB/mip0 image inputs, bounded8MiB/4096 descriptor
+probes. Unit tests130448=5/5 and native build130631 pass. Synthetic capture covers
+stable descriptor/raw payload, GPU-dirty failure without fabricated words and
+written-image rejection. Supplement always states specialization_proof=false;
+it does not establish draw-time immutability, attachment disjointness or row
+provenance. Primary ordered callbacks remain separate and unchanged.
+
+Run130754 ended13:09:49UTC/exit0 before target shader/no supplement, no guards.
+Restart152221 is active (PID31748, original5178, EXEdf930938, Performance1280x720,
+1800s32GiB/8GiB reserve); preserve frozen source and serialize native execution.
+Await full texture inputs before any semantic domain change. The synthetic RED
+must include sparse RGB bytes and sentinel255, padding bytes that must not enter
+the logical domain, shifted packed fields/loop updates, DPP/ReadLane propagation,
+divergent records, dirty/unsupported layout failures and a reachable invalid row.
+
+Read-only source inspection confirms RefreshShaders precedes color/depth target
+resolution in renderDraw.cpp. Existing neighboring_stages_read_only proves
+shader producers, not attachment disjointness. A graphics texture specialization
+must explicitly account for attachment writes/aliases or retain unsupported
+behavior; successful strict CPU reads alone do not establish that proof.
+
 ## Exact capture and CPU replay (2026-10-10 12:17 UTC)
 
 Update12:40UTC: actual run121651 naturally exits32112:35:34.504814/no guards,

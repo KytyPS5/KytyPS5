@@ -1196,7 +1196,6 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 
 	if (program->elf->IsValid()) {
 		LoadProgramToMemory(program);
-		ParseProgramDynamicInfo(program);
 		CreateSymbolDatabase(program);
 	} else {
 		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
@@ -1744,6 +1743,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				PatchProgram(program, segment_addr, segment_memory_size);
 				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}
+			// Relocations may still write a RELRO segment, so only plain read-only loads qualify.
+			if (patch_guest_instructions && phdr[i].p_type == PT_LOAD &&
+			    (phdr[i].p_flags & (PF_R | PF_W)) == PF_R) {
+				RegisterGuestInstructionPatchReadOnlyData(
+				    reinterpret_cast<void*>(program->base_vaddr), segment_addr, phdr[i].p_memsz);
+			}
 
 			if (!skip_protect) {
 				Libs::LibKernel::Memory::SetProgramMemoryProtection(segment_addr,
@@ -1784,7 +1789,28 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		}
 	}
 
+	// Relocations are needed by the instruction patcher, before they are applied.
+	ParseProgramDynamicInfo(program);
+
 	if (patch_guest_instructions) {
+		// Pointers into the module stored in its data, such as a table of label addresses.
+		std::vector<uint64_t> code_addresses;
+		const auto&           info = *program->dynamic_info;
+		for (uint64_t i = 0; i < info.rela_table_total_size / sizeof(Elf64_Rela); ++i) {
+			const auto& rela = info.rela_table[i];
+			if (rela.GetType() == R_X86_64_RELATIVE) {
+				code_addresses.push_back(program->base_vaddr + rela.r_addend);
+			} else if (rela.GetType() == R_X86_64_64 && info.symbol_table != nullptr &&
+			           rela.GetSymbol() < info.symbol_table_total_size / sizeof(Elf64_Sym)) {
+				const auto& symbol = info.symbol_table[rela.GetSymbol()];
+				if (symbol.st_value != 0) {
+					code_addresses.push_back(program->base_vaddr + symbol.st_value + rela.r_addend);
+				}
+			}
+		}
+		RegisterGuestInstructionPatchCodeAddresses(reinterpret_cast<void*>(program->base_vaddr),
+		                                           code_addresses);
+
 		std::vector<uintptr_t> function_starts;
 		const bool             have_function_starts =
 		    DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,

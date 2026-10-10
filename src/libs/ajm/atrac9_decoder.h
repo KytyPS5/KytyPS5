@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -329,10 +330,19 @@ private:
 			case AjmSampleEncoding::S16:
 				return Atrac9Decode(m_handle, input,
 				                    reinterpret_cast<int16_t*>(m_pcm_buffer.data()), bytes_used, 0);
-			case AjmSampleEncoding::S32:
-				return Atrac9DecodeS32(m_handle, input,
-				                       reinterpret_cast<int32_t*>(m_pcm_buffer.data()), bytes_used,
-				                       0);
+			case AjmSampleEncoding::S32: {
+				// LibAtrac9's S32 output keeps the 16-bit scale; AJM S32 PCM is full scale.
+				auto*      pcm   = reinterpret_cast<float*>(m_pcm_buffer.data());
+				const int  ret   = Atrac9DecodeF32(m_handle, input, pcm, bytes_used, 0);
+				const auto count = m_pcm_buffer.size() / sizeof(float);
+				for (size_t i = 0; ret == 0 && i < count; i++) {
+					const auto sample = static_cast<int32_t>(
+					    std::clamp(std::round(static_cast<double>(pcm[i]) * 32767.0 * 65536.0),
+					               -2147483648.0, 2147483647.0));
+					std::memcpy(m_pcm_buffer.data() + i * sizeof(int32_t), &sample, sizeof(sample));
+				}
+				return ret;
+			}
 			case AjmSampleEncoding::Float:
 				return Atrac9DecodeF32(
 				    m_handle, input, reinterpret_cast<float*>(m_pcm_buffer.data()), bytes_used, 0);

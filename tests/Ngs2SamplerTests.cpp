@@ -383,6 +383,41 @@ void TestAtrac9Vibration() {
 	}
 }
 
+void TestAtrac9SampleEncodingsShareScale() {
+	using namespace Libs::Audio::Ajm;
+	const std::array<uint8_t, 4> config {0xfe, 0x70, 0x0b, 0xf0};
+	std::array<uint8_t, 384> encoded {}; // One superframe; frames use the leading blocks.
+	for (int frame = 0; frame < 4; ++frame) {
+		auto block = encoded.begin() + frame * ATRAC9_MONO_BLOCK.size();
+		std::copy(ATRAC9_MONO_BLOCK.begin(), ATRAC9_MONO_BLOCK.end(), block);
+		if (frame != 0) *block |= 0x80;
+	}
+	auto decode = [&]<typename T>(AjmSampleEncoding encoding, std::vector<T>& pcm) {
+		AjmAt9Decoder decoder(1, 48000, encoding, 0);
+		Check(decoder.Initialize(config.data(), config.size()).result == OK,
+		      "ATRAC9 encoding fixture initialization failed");
+		pcm.assign(4 * 256, T {});
+		const auto decoded = decoder.Decode(encoded.data(), encoded.size(), pcm.data(),
+		                                    pcm.size() * sizeof(T), true, nullptr);
+		Check(decoded.result == OK && decoded.frames == 4 &&
+		          decoded.output_written == pcm.size() * sizeof(T),
+		      "ATRAC9 encoding fixture did not decode");
+	};
+	std::vector<int16_t> s16;
+	std::vector<int32_t> s32;
+	std::vector<float>   f32;
+	decode(AjmSampleEncoding::S16, s16);
+	decode(AjmSampleEncoding::S32, s32);
+	decode(AjmSampleEncoding::Float, f32);
+	Check(std::ranges::any_of(s16, [](int16_t sample) { return sample != 0; }),
+	      "ATRAC9 encoding fixture decoded to silence");
+	for (size_t i = 0; i < s16.size(); ++i) {
+		Check(std::abs(static_cast<int64_t>(s32[i]) - int64_t {s16[i]} * 65536) <= 33000,
+		      "ATRAC9 S32 PCM is not full scale");
+		Check(std::abs(f32[i] * 32768.0f - s16[i]) <= 2.0f, "ATRAC9 float PCM is not unit scale");
+	}
+}
+
 void TestAtrac9ResampleAcrossFrames() {
 	const auto make_voice = [] {
 		auto f = std::make_unique<Fixture>(24000);
@@ -1425,6 +1460,7 @@ int main() {
 	TestWaveformQueueCapacity();
 	TestWaveformRingReuse();
 	TestAtrac9Vibration();
+	TestAtrac9SampleEncodingsShareScale();
 	TestPcm16RenderOutput();
 	TestSubmixerSetupAndRouting();
 	TestWaveformBlockGeometry();

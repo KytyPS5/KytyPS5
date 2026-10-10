@@ -250,14 +250,17 @@ void TextureCache::DeleteImage(ImageId id) {
 		return;
 	}
 	if (!image->depth_id) {
-		std::vector<ImageId> associations;
-		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
-			if (associated.depth_id == id) {
-				associations.push_back(candidate);
+		if (const auto found = m_stencil_associations.find(id);
+		    found != m_stencil_associations.end()) {
+			const auto associations = std::move(found->second);
+			m_stencil_associations.erase(found);
+			for (const auto association: associations) {
+				// The list may hold images freed or associated with another depth image since.
+				const auto* associated = m_slot_images.try_get(association);
+				if (associated != nullptr && associated->depth_id == id) {
+					FreeImage(association);
+				}
 			}
-		});
-		for (const auto association: associations) {
-			FreeImage(association);
 		}
 	}
 	if (image->IsGpuModified()) {
@@ -1127,6 +1130,15 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
+	if (record.depth_id != depth_id) {
+		auto& associations = m_stencil_associations[depth_id];
+		// Drop the entries of images freed or associated elsewhere since.
+		std::erase_if(associations, [&](ImageId other) {
+			const auto* associated = m_slot_images.try_get(other);
+			return associated == nullptr || associated->depth_id != depth_id;
+		});
+		associations.push_back(association);
+	}
 	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
 		ImageInfo plane {};
 		plane.data         = stencil;

@@ -115,6 +115,7 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	void WriteMemory(void* dst, const void* src, uint64_t size);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	uint32_t            NumInstances();

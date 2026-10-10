@@ -4,12 +4,15 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/indirectDraw.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -63,6 +66,8 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Indices readable from index_addr (INDEX_BUFFER_SIZE); later ones read as zero.
+	uint32_t index_limit = UINT32_MAX;
 };
 
 struct DrawAutoArgs {
@@ -72,6 +77,18 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+};
+
+// Guest indirect draw packet whose arguments stay in GPU memory.
+struct DrawIndirectPacket {
+	uint64_t arguments           = 0;
+	uint64_t count_address       = 0;
+	uint32_t max_count           = 0;
+	uint32_t stride              = 0;
+	bool     indexed             = false;
+	uint64_t index_base          = 0;
+	uint32_t index_type_and_size = 0;
+	uint32_t index_buffer_size   = 0;
 };
 
 struct SubmitInfo {
@@ -169,8 +186,17 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	struct IndirectEmit;
+
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// Records the draws with their arguments read by the GPU; false leaves them to the CPU.
+	// instances: NUM_INSTANCES when the CPU knows it, kept if no draw runs.
+	[[nodiscard]] bool DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
+	                                const DrawIndirectPacket& args,
+	                                std::optional<uint32_t>   instances);
+	// NUM_INSTANCES left by the GPU indirect draws; waits for them.
+	[[nodiscard]] uint32_t ReadIndirectInstances();
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -193,7 +219,7 @@ private:
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable);
+	                         bool primitive_restart_enable, const IndirectEmit* indirect = nullptr);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -215,10 +241,48 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::unique_ptr<IndirectDrawPrepare>  m_indirect_prepare;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
+
+// An indexed draw of count indices, the first head of them real and the others zero, from a host
+// copy holding at most capacity indices. The copy holds copy_count indices: the head, then zeros.
+// The first draw takes first_count of them; the rest zero indices follow in draws of at most chunk
+// indices from index head of the copy. first_count and chunk are whole primitives of period
+// indices, so list primitives keep their indices; strips only regroup all-zero primitives.
+struct ZeroTailDraws {
+	uint32_t copy_count  = 0;
+	uint32_t first_count = 0;
+	uint32_t chunk       = 0;
+	uint32_t rest        = 0;
+
+	// Calls draw(first index in the copy, index count, first instance, instance count) for each
+	// draw, in order. Without a plan (rest 0), one draw of count indices and all instances; with
+	// one, each instance runs all its draws before the next, as one instanced draw does.
+	template <typename F>
+	void ForEachDraw(uint32_t count, uint32_t instances, F&& draw) const {
+		if (rest == 0) {
+			draw(0u, count, 0u, instances);
+			return;
+		}
+		for (uint32_t instance = 0; instance < instances; instance++) {
+			draw(0u, first_count, instance, 1u);
+			for (uint32_t left = rest; left != 0;) {
+				const auto size = std::min(left, chunk);
+				draw(copy_count - size, size, instance, 1u);
+				left -= size;
+			}
+		}
+	}
+};
+// False when the head and two primitives of zeros do not fit the capacity.
+[[nodiscard]] bool PlanZeroTailDraws(uint32_t count, uint32_t head, uint32_t period,
+                                     uint64_t capacity, ZeroTailDraws& draws);
+
+// The draw is a depth or stencil copy that DepthStencilCopy performs instead of drawing.
+[[nodiscard]] bool IsDepthStencilCopyDraw(const HW::Context& hw);
 
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,

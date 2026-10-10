@@ -1288,11 +1288,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
 				const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
 				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
-				const auto packed_index = entry_ir.Emit(
-				    IR::ValueOpcode::LoadAddressU32,
-				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
-				    IR::MemoryFlags {.index = memory_index});
+				// Indices past INDEX_BUFFER_SIZE (draw dword 6) read as zero: the load is inactive.
+				const auto readable = entry_ir.LogicalAnd(
+				    entry_ir.ULessThan(local, vertices), entry_ir.ULessThan(input_vertex, draw(6)));
+				const auto packed_index =
+				    entry_ir.Emit(IR::ValueOpcode::LoadAddressU32,
+				                  {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)),
+				                   u32(0), entry_ir.LogicalAnd(indexed, readable)},
+				                  IR::MemoryFlags {.index = memory_index});
 				const auto index = IR::U32(entry_ir.Emit(
 				    IR::ValueOpcode::BitFieldUExtract,
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),

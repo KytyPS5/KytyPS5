@@ -11193,12 +11193,20 @@ void TestMeshInputAssembly() {
     uint32_t wave_size = 64;
     bool fast_launch = false;
     uint32_t threads = 256;
+    uint32_t limit = UINT32_MAX;
   };
   std::vector<Case> cases = {
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
        0x40000309, 0x00c09000, 6, 7, 8, 340, 0xabcc, true},
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 9, 2, 0x1002, 0,
        0x40000309, 0x00c09000, 27, 28, 29, 356, 0, false},
+      // Indices from INDEX_BUFFER_SIZE on read as zero; the draw keeps its count.
+      {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, 5,
+       0x40000309, 0x00c09000, 6, 7, 8, 340, 5, false, 64, false, 256, 170},
+      {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, 5,
+       0x40000309, 0x00c09000, 6, 7, 8, 340, 0xabd2, true, 64, false, 256, 171},
+      {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 0, 2, 0x1002, 0,
+       0x40000305, 0x00c05000, 0, 1, 2, 0, 0, false, 64, false, 256, 0},
       {Prospero::PrimitiveType::kTriList, 8, 180, 0, 64, 2, 0x1002, 0,
        0x41000000, 0x00806000, 192, 193, 194, 128, 0, false},
       {Prospero::PrimitiveType::kTriList, 8, 180, 1, 1, 1, 0x1000, 5,
@@ -11293,7 +11301,7 @@ void TestMeshInputAssembly() {
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
     const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
-                             test.address_low, 0x12};
+                             test.address_low, 0x12, test.limit};
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {

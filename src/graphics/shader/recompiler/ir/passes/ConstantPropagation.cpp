@@ -245,8 +245,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		}
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
-			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) &&
-			    !Arg(inst, 2).U1()) {
+			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) && !Arg(inst, 2).U1()) {
 				auto result = block.PrependNewInst(instruction, ValueOpcode::LogicalAnd,
 				                                   {Arg(inst, 0), Arg(inst, 1)});
 				Replace(inst, Value(&*result));
@@ -263,8 +262,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				case 0u: Replace(inst, Value(false)); break;
 				case 0x3ffu: Replace(inst, Value(true)); break;
 				case 3u: {
-					const auto result = block.PrependNewInst(
-					    instruction, ValueOpcode::FPIsNan32, {Arg(inst, 0)});
+					const auto result =
+					    block.PrependNewInst(instruction, ValueOpcode::FPIsNan32, {Arg(inst, 0)});
 					Replace(inst, Value(&*result));
 					break;
 				}
@@ -682,19 +681,19 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::LogicalAnd:
 			if (!FoldLogical(inst, [](bool a, bool b) { return a && b; })) {
-				const auto lhs = Arg(inst, 0);
-				const auto rhs = Arg(inst, 1);
+				const auto lhs      = Arg(inst, 0);
+				const auto rhs      = Arg(inst, 1);
 				const auto simplify = [&](Value assumption, Value expression) {
 					const auto* disjunction = expression.TryInstruction();
-					if (disjunction == nullptr || disjunction->GetOpcode() != ValueOpcode::LogicalOr) {
+					if (disjunction == nullptr ||
+					    disjunction->GetOpcode() != ValueOpcode::LogicalOr) {
 						return false;
 					}
 					for (uint32_t i = 0; i < 2u; ++i) {
 						const auto* inverse = disjunction->Arg(i).Resolve().TryInstruction();
 						if (inverse != nullptr && inverse->GetOpcode() == ValueOpcode::LogicalNot &&
 						    inverse->Arg(0).Resolve() == assumption) {
-							inst.SetArg(assumption == lhs ? 1u : 0u,
-							            disjunction->Arg(i ^ 1u));
+							inst.SetArg(assumption == lhs ? 1u : 0u, disjunction->Arg(i ^ 1u));
 							return true;
 						}
 					}
@@ -760,12 +759,14 @@ public:
 		if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !Immediate(Arg(inst, 1), 0u)) return;
 		const auto* bit = Arg(inst, 0).TryInstruction();
 		if (bit == nullptr || bit->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
-		    !Immediate(Arg(*bit, 1), 1u)) return;
+		    !Immediate(Arg(*bit, 1), 1u))
+			return;
 		const auto* shift = Arg(*bit, 0).TryInstruction();
 		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical32) return;
 		const auto* index = Arg(*shift, 1).TryInstruction();
 		if (index == nullptr || index->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
-		    !Immediate(Arg(*index, 1), 31u)) return;
+		    !Immediate(Arg(*index, 1), 31u))
+			return;
 		const auto* lane = Arg(*index, 0).TryInstruction();
 		if (lane == nullptr || lane->GetOpcode() != ValueOpcode::LaneId) return;
 		m_visited.clear();
@@ -779,11 +780,11 @@ private:
 	}
 
 	static Value BallotPredicate(const Inst& inst) {
-		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
-		    !Immediate(Arg(inst, 1), 0u)) return {};
+		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 || !Immediate(Arg(inst, 1), 0u))
+			return {};
 		const auto* source = Arg(inst, 0).TryInstruction();
-		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot
-		           ? Arg(*source, 0) : Value {};
+		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot ? Arg(*source, 0)
+		                                                                       : Value {};
 	}
 
 	bool CanProject(Value value) {
@@ -801,7 +802,8 @@ private:
 		if (!m_visited.insert(inst).second) return true;
 		const auto op = inst->GetOpcode();
 		if (op != ValueOpcode::BitwiseAnd32 && op != ValueOpcode::BitwiseOr32 &&
-		    op != ValueOpcode::BitwiseNot32 && op != ValueOpcode::SelectU32 && op != ValueOpcode::Phi)
+		    op != ValueOpcode::BitwiseNot32 && op != ValueOpcode::SelectU32 &&
+		    op != ValueOpcode::Phi)
 			return false;
 		for (size_t arg = op == ValueOpcode::SelectU32 ? 1u : 0u; arg < inst->NumArgs(); ++arg) {
 			if (!CanProject(Arg(*inst, arg))) return false;
@@ -812,44 +814,48 @@ private:
 	Value Project(Value value) {
 		if (value.IsImmediate()) return Value(value.U32() != 0u);
 		auto* source = value.TryInstruction();
-		if (const auto found = m_values.find(source); found != m_values.end()) return found->second.Resolve();
+		if (const auto found = m_values.find(source); found != m_values.end())
+			return found->second.Resolve();
 		if (const auto predicate = BallotPredicate(*source); !predicate.IsEmpty()) return predicate;
-		auto* block = source->Parent();
-		const auto where = std::find_if(block->begin(), block->end(),
-		                               [source](const Inst& candidate) { return &candidate == source; });
-		const auto op = source->GetOpcode() == ValueOpcode::BitwiseAnd32 ? ValueOpcode::LogicalAnd
-		              : source->GetOpcode() == ValueOpcode::BitwiseOr32 ? ValueOpcode::LogicalOr
-		              : source->GetOpcode() == ValueOpcode::BitwiseNot32 ? ValueOpcode::LogicalNot
-		              : source->GetOpcode() == ValueOpcode::SelectU32 ? ValueOpcode::SelectU1
-		                                                               : ValueOpcode::Phi;
-		auto result = op == ValueOpcode::Phi ? block->PrependNewInst(where, op)
-		            : op == ValueOpcode::LogicalNot
-		                ? block->PrependNewInst(where, op, {Value(false)})
-		            : op == ValueOpcode::SelectU1
-		                ? block->PrependNewInst(where, op, {Arg(*source, 0), Value(false), Value(false)})
-		                : block->PrependNewInst(where, op, {Value(false), Value(false)});
+		auto*      block = source->Parent();
+		const auto where =
+		    std::find_if(block->begin(), block->end(),
+		                 [source](const Inst& candidate) { return &candidate == source; });
+		const auto op = source->GetOpcode() == ValueOpcode::BitwiseAnd32   ? ValueOpcode::LogicalAnd
+		                : source->GetOpcode() == ValueOpcode::BitwiseOr32  ? ValueOpcode::LogicalOr
+		                : source->GetOpcode() == ValueOpcode::BitwiseNot32 ? ValueOpcode::LogicalNot
+		                : source->GetOpcode() == ValueOpcode::SelectU32    ? ValueOpcode::SelectU1
+		                                                                   : ValueOpcode::Phi;
+		auto       result =
+		    op == ValueOpcode::Phi          ? block->PrependNewInst(where, op)
+		    : op == ValueOpcode::LogicalNot ? block->PrependNewInst(where, op, {Value(false)})
+		    : op == ValueOpcode::SelectU1
+		        ? block->PrependNewInst(where, op, {Arg(*source, 0), Value(false), Value(false)})
+		        : block->PrependNewInst(where, op, {Value(false), Value(false)});
 		m_values.emplace(source, Value(&*result));
 		if (op == ValueOpcode::Phi) result->SetFlags(Type::U1);
 		for (size_t arg = op == ValueOpcode::SelectU1 ? 1u : 0u; arg < source->NumArgs(); ++arg) {
 			const auto projected = Project(Arg(*source, arg));
-			if (op == ValueOpcode::Phi) result->AddPhiOperand(source->PhiBlock(arg), projected);
-			else result->SetArg(arg, projected);
+			if (op == ValueOpcode::Phi)
+				result->AddPhiOperand(source->PhiBlock(arg), projected);
+			else
+				result->SetArg(arg, projected);
 		}
 		FoldInstruction(*block, result, m_lowered_ancillary);
 		return Value(&*result).Resolve();
 	}
 
-	std::unordered_set<Inst*>& m_lowered_ancillary;
-	std::unordered_set<const Inst*> m_visited;
+	std::unordered_set<Inst*>&             m_lowered_ancillary;
+	std::unordered_set<const Inst*>        m_visited;
 	std::unordered_map<const Inst*, Value> m_values;
-	bool m_grounded = false;
+	bool                                   m_grounded = false;
 };
 
 } // namespace
 
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	std::unordered_set<Inst*> lowered_ancillary;
-	LaneMaskProjection mask_projection(lowered_ancillary);
+	LaneMaskProjection        mask_projection(lowered_ancillary);
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
 			if (wave_size == 32u) mask_projection.Fold(*inst);

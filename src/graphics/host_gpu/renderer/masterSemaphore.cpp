@@ -25,8 +25,15 @@ struct SubmitRecord {
 	uint32_t arg1      = 0;
 	uint32_t arg2      = 0;
 	uint32_t arg3      = 0;
+	uint64_t vs_hash   = 0;
+	uint64_t ps_hash   = 0;
+	uint64_t cs_hash   = 0;
 	bool     valid     = false;
 };
+
+std::atomic<uint64_t> g_bound_vs {0};
+std::atomic<uint64_t> g_bound_ps {0};
+std::atomic<uint64_t> g_bound_cs {0};
 
 constexpr size_t SubmitHistorySize = 64;
 
@@ -49,8 +56,30 @@ void RecordSubmitHistory(uint64_t tick, uint32_t debug_op, uint64_t submit_id, u
                          uint32_t arg1, uint32_t arg2, uint32_t arg3, uint64_t arg4) {
 	std::lock_guard lock(g_history_mutex);
 	auto&           r = g_history[g_history_count % SubmitHistorySize];
-	r                 = {tick, submit_id, arg4, debug_op, arg0, arg1, arg2, arg3, true};
+	r                 = {tick,
+	                     submit_id,
+	                     arg4,
+	                     debug_op,
+	                     arg0,
+	                     arg1,
+	                     arg2,
+	                     arg3,
+	                     g_bound_vs.load(std::memory_order_relaxed),
+	                     g_bound_ps.load(std::memory_order_relaxed),
+	                     g_bound_cs.load(std::memory_order_relaxed),
+	                     true};
 	g_history_count++;
+}
+
+void NoteBoundShader(uint32_t stage_slot, uint64_t hash) {
+	// 0 = vertex, 1 = pixel, 2 = compute.
+	if (stage_slot == 0) {
+		g_bound_vs.store(hash, std::memory_order_relaxed);
+	} else if (stage_slot == 1) {
+		g_bound_ps.store(hash, std::memory_order_relaxed);
+	} else if (stage_slot == 2) {
+		g_bound_cs.store(hash, std::memory_order_relaxed);
+	}
 }
 
 void DumpSubmitHistory() {
@@ -63,9 +92,10 @@ void DumpSubmitHistory() {
 			continue;
 		}
 		std::printf("tick=%" PRIu64 " op=%s(%u) submit_id=%" PRIu64
-		            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+		            " args=%u,%u,%u,%u,0x%016" PRIx64 " vs=%016" PRIx64 " ps=%016" PRIx64
+		            " cs=%016" PRIx64 "\n",
 		            r.tick, DebugOpName(r.op), r.op, r.submit_id, r.arg0, r.arg1, r.arg2, r.arg3,
-		            r.arg4);
+		            r.arg4, r.vs_hash, r.ps_hash, r.cs_hash);
 	}
 	std::printf("--- end of submit history ---\n");
 	std::fflush(stdout);

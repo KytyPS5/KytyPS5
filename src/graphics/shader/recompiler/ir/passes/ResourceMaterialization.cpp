@@ -43,6 +43,7 @@ struct IndirectImage {
 	uint64_t                     probe_count = 0;
 	uint32_t                     selector_stride = 0;
 	std::vector<uint32_t>        keys;
+	std::vector<uint32_t>        secondary_keys;
 	std::vector<uint32_t>        candidates;
 	std::vector<DescriptorValue> descriptors;
 	std::vector<DescriptorValue> samplers;
@@ -549,6 +550,65 @@ bool ReadInlineImageTable(const DescriptorSource::InlineDescriptor::ImageTable& 
 		next.dwords.fill(0u);
 	}
 	result = next;
+	return true;
+}
+
+bool MaterializeWaveAddressImage(const DescriptorSource::InlineDescriptor& image,
+                                 const DescriptorValue& buffer_value, uint32_t pc,
+                                 const SrtRuntime& runtime, IndirectImage& result) {
+	if (!image.address_table || image.descriptor_dwords != 8u || image.image_table)
+		return SpecializationFail("wave address image table has incompatible descriptor metadata");
+	const auto& table = *image.address_table;
+	ShaderBufferResource buffer;
+	if (!DecodeBufferDescriptor(buffer_value, buffer) || buffer.Stride() == 0u ||
+	    buffer.SwizzleEnabled() || buffer.AddTid() || buffer.IndexStride() != 0u ||
+	    buffer.NumRecords() == 0u || table.pointer_offset > buffer.Stride() ||
+	    buffer.Stride() - table.pointer_offset < 8u || table.row_stride == 0u || table.row_limit == 0u ||
+	    uint64_t{buffer.NumRecords()} * table.row_limit > MaxIndirectImageProbes)
+		return SpecializationFail(fmt::format("wave address image table at pc 0x{:08x} exceeds its bounded source domain", pc));
+	IndirectImage next;
+	next.buffer_size = buffer.GetSize();
+	next.probe_count = uint64_t{buffer.NumRecords()} * table.row_limit;
+	DescriptorValue zero;
+	zero.dword_count = 8u;
+	zero.dwords.fill(0u);
+	next.descriptors.push_back(zero);
+	for (uint32_t record = 0; record < buffer.NumRecords(); ++record) {
+		uint32_t low = 0, high = 0;
+		const auto offset = uint64_t{record} * buffer.Stride();
+		if (offset > UINT32_MAX ||
+		    !ReadScalarBufferWord(buffer, static_cast<uint32_t>(offset), table.pointer_offset, runtime, low) ||
+		    !ReadScalarBufferWord(buffer, static_cast<uint32_t>(offset), table.pointer_offset + 4u, runtime, high))
+			return SpecializationFail("wave address image table pointer fields are unavailable or GPU-dirty");
+		const auto base = uint64_t{low} | ((uint64_t{high} & 0xffffu) << 32u);
+		if (base == 0u || (base & 3u) != 0u)
+			return SpecializationFail("wave address image table has a null or unaligned pointer");
+		for (uint32_t row = 0; row < table.row_limit; ++row) {
+			// Scalar offset multiplication is guest U32 arithmetic; the immediate
+			// is added afterwards to the canonical full 48-bit address.
+			const auto relative = uint64_t{static_cast<uint32_t>(uint64_t{row} * table.row_stride)} +
+			                      image.descriptor_offset;
+			if (relative > AddressMask - base || base + relative > AddressMask - 31u)
+				return SpecializationFail("wave address image table descriptor address overflows guest VA");
+			DescriptorValue descriptor;
+			descriptor.dword_count = 8u;
+			for (uint32_t word = 0; word < 8u; ++word)
+				if (!ReadSpecializationWord(runtime, base + relative + word * 4u, descriptor.dwords[word]))
+					return SpecializationFail("wave address image descriptor is unavailable or GPU-dirty");
+			if (NullImageDescriptor(descriptor)) descriptor = zero;
+			else if (!ValidImageDescriptor(descriptor, false))
+				return SpecializationFail("wave address image table contains an unsupported image descriptor");
+			const auto found = std::ranges::find(next.descriptors, descriptor);
+			const auto candidate = static_cast<uint32_t>(found - next.descriptors.begin());
+			if (candidate == next.descriptors.size()) {
+				if (candidate >= runtime.max_dense_images || candidate >= ShaderInfo::MaxImages)
+					return SpecializationFail("wave address image candidates exceed the dense image resource limit");
+				next.descriptors.push_back(descriptor);
+			}
+			next.keys.push_back(record); next.secondary_keys.push_back(row); next.candidates.push_back(candidate);
+		}
+	}
+	result = std::move(next);
 	return true;
 }
 
@@ -1773,9 +1833,10 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	}
 	const bool protected_image = std::ranges::any_of(program.info.images, [&](const auto& image) {
 		const auto* source = Source(program, image.source);
-		return source != nullptr && source->indirect_image.has_value() &&
-		       (!source->indirect_image->selector_mask.IsEmpty() ||
-		        source->indirect_image->record_key);
+		return source != nullptr &&
+		       ((source->indirect_image.has_value() &&
+		         (!source->indirect_image->selector_mask.IsEmpty() || source->indirect_image->record_key)) ||
+		        (source->inline_descriptor && source->inline_descriptor->address_table));
 	});
 	if (protected_image && (program.has_address_writes ||
 	                        std::ranges::any_of(program.info.images, &ImageResource::written))) {
@@ -2018,10 +2079,12 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 				tables.push_back(value);
 			}
 			IndirectImage table;
-			if (!MaterializeInlineImage(*source->inline_descriptor, independent ? nullptr : inline_sampler,
+			if (!(source->inline_descriptor->address_table
+			          ? MaterializeWaveAddressImage(*source->inline_descriptor, tables[0], image.first_use_pc, runtime, table)
+			          : MaterializeInlineImage(*source->inline_descriptor, independent ? nullptr : inline_sampler,
 			                            tables[0], source->inline_descriptor->image_table ? &tables[1] : nullptr,
 			                            image.first_use_pc, runtime, table,
-			                            selector_values(*source->inline_descriptor))) {
+			                            selector_values(*source->inline_descriptor)))) {
 				return false;
 			}
 			if (independent && !MaterializeIndependentInlineSampler(*inline_sampler, tables.back(),
@@ -2209,7 +2272,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		}
 		image_capacity = std::min<size_t>(runtime.max_dense_images,
 		                                 image_capacity + table.descriptors.size() - 1u);
-		mapping_words += 1u + table.keys.size() * 2u;
+		if (!table.secondary_keys.empty() && table.secondary_keys.size() != table.keys.size())
+			return SpecializationFail("indirect image secondary key domain is inconsistent");
+		mapping_words += 1u + table.keys.size() * (table.secondary_keys.empty() ? 2u : 3u);
 	}
 	next_snapshot.images.reserve(image_capacity);
 	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + mapping_words);
@@ -2224,6 +2289,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .indirect_root              = image.indirect_root,
 		    .indirect_mapping_offset    = image.indirect_mapping_offset,
 		    .indirect_search_iterations = image.indirect_search_iterations,
+		    .indirect_key_dwords        = image.indirect_key_dwords,
 		    .indirect_sampler           = image.indirect_sampler,
 		    .independent_sampler_mapping_offset = image.independent_sampler_mapping_offset,
 		    .independent_sampler_search_iterations = image.independent_sampler_search_iterations,
@@ -2325,19 +2391,24 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		if (table.sampler_count != 0u) root.independent_sampler_resources = candidate_samplers;
 		root.indirect_mapping_offset    = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
 		root.indirect_search_iterations = std::bit_width(table.keys.size());
+		root.indirect_key_dwords = table.secondary_keys.empty() ? 1u : 2u;
 		root.independent_sampler_candidates = table.sampler_count;
+		const auto mapping_stride = root.indirect_key_dwords + 1u;
 		next_snapshot.flattened_srt.resize(next_snapshot.flattened_srt.size() + 1u +
-		                                   table.keys.size() * 2u);
+		                                   table.keys.size() * mapping_stride);
 		std::vector<uint32_t> order(table.keys.size());
 		std::iota(order.begin(), order.end(), 0u);
-		std::ranges::sort(order, {}, [&](uint32_t index) { return table.keys[index]; });
+		std::ranges::sort(order, {}, [&](uint32_t index) {
+			return std::pair{table.secondary_keys.empty() ? 0u : table.secondary_keys[index], table.keys[index]};
+		});
 		next_snapshot.flattened_srt[root.indirect_mapping_offset] =
 		    static_cast<uint32_t>(table.keys.size());
 		for (uint32_t entry = 0; entry < order.size(); entry++) {
 			const auto source                   = order[entry];
-			const auto offset                   = root.indirect_mapping_offset + 1u + entry * 2u;
+			const auto offset                   = root.indirect_mapping_offset + 1u + entry * mapping_stride;
 			next_snapshot.flattened_srt[offset] = table.keys[source];
-			next_snapshot.flattened_srt[offset + 1] = table.candidates[source];
+			if (!table.secondary_keys.empty()) next_snapshot.flattened_srt[offset + 1u] = table.secondary_keys[source];
+			next_snapshot.flattened_srt[offset + root.indirect_key_dwords] = table.candidates[source];
 		}
 		if (table.sampler_count != 0u) {
 			root.independent_sampler_mapping_offset = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
@@ -3124,6 +3195,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	bool masked_image = false;
 	for (const auto& image: plan.info.images) {
 		const auto* source = Source(plan, image.source);
+		if (source != nullptr && source->inline_descriptor && source->inline_descriptor->address_table) {
+			masked_image = true;
+			continue;
+		}
 		if (source == nullptr || !source->indirect_image.has_value()) {
 			continue;
 		}
@@ -3184,6 +3259,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	g_last_specialization_error.clear();
+	if (!runtime.neighboring_stages_read_only && std::ranges::any_of(program.descriptor_sources,
+	    [](const auto& source) { return source.inline_descriptor && source.inline_descriptor->address_table; }))
+		return SpecializationFail("wave address image tables require read-only neighboring shader stages");
 	if (!runtime.compute_workgroups_trusted &&
 	    std::ranges::any_of(program.bounded_srt_reads, [](const BoundedSrtRead& read) {
 		    return read.workgroup_axis != UINT32_MAX;
@@ -3243,6 +3321,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
+		image.indirect_key_dwords = source.indirect_key_dwords;
 		image.indirect_sampler           = source.indirect_sampler;
 		image.independent_sampler_mapping_offset = source.independent_sampler_mapping_offset;
 		image.independent_sampler_search_iterations = source.independent_sampler_search_iterations;

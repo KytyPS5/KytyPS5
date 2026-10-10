@@ -2733,6 +2733,119 @@ private:
 		return stride != 0u;
 	}
 
+	bool TryMakeWaveAddressImage(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource ||
+		    handle.NumArgs() != 8u) return false;
+		const Inst* address = nullptr;
+		Value byte_offset;
+		uint32_t descriptor_offset = 0;
+		for (uint32_t word = 0; word < 8u; ++word) {
+			const auto* read = handle.Arg(word).Resolve().TryInstruction();
+			uint32_t memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			uint32_t high = 1u;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress ||
+			    !MemoryIndexBelongsTo(memory_index, *read) || read->NumArgs() != 4u ||
+			    !ImmediateU32(read->Arg(2), high) || high != 0u ||
+			    read->Parent() != handle.Parent()) return false;
+			const auto* current = read->Arg(0).Resolve().TryInstruction();
+			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (address != nullptr && !EquivalentValue(m_program, Value(const_cast<Inst*>(address)),
+			                                        Value(const_cast<Inst*>(current))))) return false;
+			if (word == 0u) {
+				address = current; byte_offset = read->Arg(1).Resolve(); descriptor_offset = memory->offset;
+			} else if (!EquivalentValue(m_program, byte_offset, read->Arg(1)) ||
+			           uint64_t{descriptor_offset} + word * 4u != memory->offset) return false;
+			plan.memory[word] = memory_index; plan.reads[word] = read;
+		}
+		if ((descriptor_offset & 3u) != 0u || descriptor_offset > INT32_MAX - 28u) return false;
+		uint32_t row_stride = 0;
+		Value row;
+		if (!MatchInlineStride(byte_offset, row_stride, &row)) return false;
+		const auto row_limit = DominatingSelectorLimit(row, handle.Parent());
+		if (row_limit == 0u) return false;
+		const auto strip_high = [&](Value& value) {
+			const auto* inst = value.Resolve().TryInstruction();
+			uint32_t a = 0, b = 0;
+			if (inst == nullptr) return false;
+			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && inst->NumArgs() == 2u) {
+				if (ImmediateU32(inst->Arg(1), a) && a == 0xffffu) { value = inst->Arg(0); return true; }
+				if (ImmediateU32(inst->Arg(0), a) && a == 0xffffu) { value = inst->Arg(1); return true; }
+			}
+			if ((inst->GetOpcode() == ValueOpcode::BitFieldSExtract ||
+			     inst->GetOpcode() == ValueOpcode::BitFieldUExtract) && inst->NumArgs() == 3u &&
+			    ImmediateU32(inst->Arg(1), a) && a == 0u &&
+			    ImmediateU32(inst->Arg(2), b) && b == 16u) { value = inst->Arg(0); return true; }
+			return false;
+		};
+		std::array<const Inst*, 2> pointer_reads{};
+		std::array<const Inst*, 2> pointer_lanes{};
+		std::array<Value, 2> guards{};
+		for (uint32_t word = 0; word < 2u; ++word) {
+			auto value = address->Arg(word).Resolve();
+			if (word == 1u) strip_high(value);
+			const auto* lane = value.Resolve().TryInstruction();
+			if (lane == nullptr || lane->GetOpcode() != ValueOpcode::ReadFirstLane || lane->NumArgs() != 2u)
+				return false;
+			guards[word] = lane->Arg(1).Resolve();
+			pointer_lanes[word] = lane;
+			const bool all_lanes = guards[word].IsImmediate() && guards[word].GetType() == Type::U1 && guards[word].U1();
+			if (!all_lanes && !HasActiveLane(guards[word], lane->Parent()))
+				return false;
+			value = lane->Arg(0).Resolve();
+			for (uint32_t depth = 0; depth < 16u; ++depth) {
+				const auto* part = value.Resolve().TryInstruction();
+				if (part != nullptr && part->GetOpcode() == ValueOpcode::SelectU32 && part->NumArgs() == 3u) {
+					if (!Implies(guards[word], part->Arg(0))) return false;
+					value = part->Arg(1).Resolve(); continue;
+				}
+				if (word == 1u && strip_high(value)) continue;
+				break;
+			}
+			const auto* extract = value.Resolve().TryInstruction();
+			uint32_t component = UINT32_MAX;
+			if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x2 ||
+			    extract->NumArgs() != 2u || !ImmediateU32(extract->Arg(1), component) || component != word)
+				return false;
+			pointer_reads[word] = extract->Arg(0).Resolve().TryInstruction();
+		}
+		const auto* read = pointer_reads[0];
+		if (read == nullptr || pointer_reads[1] != read || read->GetOpcode() != ValueOpcode::LoadBufferU32x2 ||
+		    read->NumArgs() != 5u || !EquivalentValue(m_program, guards[0], guards[1]) ||
+		    pointer_lanes[0]->Parent() != pointer_lanes[1]->Parent() ||
+		    !Implies(guards[0], read->Arg(4))) return false;
+		const auto index = read->Flags<MemoryFlags>().index;
+		uint32_t zero_a = 1u, zero_b = 1u;
+		if (index >= m_program.memory_info.size() || !ImmediateU32(read->Arg(2), zero_a) || zero_a != 0u ||
+		    !ImmediateU32(read->Arg(3), zero_b) || zero_b != 0u) return false;
+		const auto& memory = m_program.memory_info[index];
+		if (memory.kind != ResourceKind::Buffer || !memory.idxen || memory.offen || memory.typed ||
+		    memory.formatted || memory.data_bits != 32u || memory.data_dwords != 2u ||
+		    (memory.offset & 3u) != 0u || memory.offset > UINT32_MAX - 4u) return false;
+		const auto* buffer = read->Arg(0).Resolve().TryInstruction();
+		DescriptorSource buffer_source;
+		uint32_t buffer_source_index = 0;
+		if (buffer == nullptr || !MakeRuntimeBufferSource(*buffer, pc, buffer_source_index, buffer_source)) return false;
+		// Capture the index at the pointer's original wave scope, before a later
+		// row guard or waterfall mask can change the first participating lane.
+		auto* lane_block = const_cast<Block*>(pointer_lanes[0]->Parent());
+		const auto where = std::ranges::find_if(*lane_block, [&](const Inst& inst) { return &inst == pointer_lanes[0]; });
+		plan.key = Value(&*lane_block->PrependNewInst(where, ValueOpcode::ReadFirstLane,
+		    {read->Arg(1), guards[0]}));
+		DescriptorSource source;
+		source.dword_count = 8u;
+		std::copy_n(buffer_source.dwords.begin(), 4u, source.dwords.begin());
+		for (uint32_t word = 4u; word < 8u; ++word) source.dwords[word] = Value(0u);
+		source.inline_descriptor = DescriptorSource::InlineDescriptor{buffer_source_index, 1u, descriptor_offset, 0u};
+		source.inline_descriptor->descriptor_dwords = 8u;
+		source.inline_descriptor->address_table = DescriptorSource::InlineDescriptor::AddressTable{
+		    memory.offset, row_stride, row_limit, 1u};
+		plan.handle = &handle; plan.source = InternSource(source); plan.read_count = 8u; plan.root_count = 5u;
+		plan.roots[0] = row;
+		std::copy_n(buffer_source.dwords.begin(), 4u, plan.roots.begin() + 1u);
+		return true;
+	}
+
 	bool TryMakeInlineDescriptor(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan,
 	                             bool compact_image = true) {
 		const bool image           = handle.GetOpcode() == ValueOpcode::GetImageResource;
@@ -2989,7 +3102,8 @@ private:
 				InlineDescriptorPlan image_plan;
 				InlineDescriptorPlan sampler_plan;
 				if (image == nullptr || FindIndirectImage(*image) != nullptr ||
-				    !(TryMakeInlineDescriptor(*image, flags.pc, image_plan,
+				    !(TryMakeWaveAddressImage(*image, flags.pc, image_plan) ||
+				      TryMakeInlineDescriptor(*image, flags.pc, image_plan,
 				                              m_program.memory_info[flags.index].image_r128) ||
 				      (!m_program.memory_info[flags.index].image_r128 &&
 				       TryMakeMaterialImageTable(*image, flags.pc, image_plan)))) {
@@ -3001,7 +3115,8 @@ private:
 				if (inline_sampler) {
 					const auto& image_source = *m_sources[image_plan.source].inline_descriptor;
 					const auto& sampler_source = *m_sources[sampler_plan.source].inline_descriptor;
-					if (image_source.buffer_source != sampler_source.buffer_source ||
+					if (image_source.address_table.has_value() ||
+					    image_source.buffer_source != sampler_source.buffer_source ||
 					    image_source.selector_stride != sampler_source.selector_stride ||
 					    !EquivalentValue(m_program, image_plan.key, sampler_plan.key)) {
 						m_sources[image_plan.source].inline_descriptor->independent_sampler = true;

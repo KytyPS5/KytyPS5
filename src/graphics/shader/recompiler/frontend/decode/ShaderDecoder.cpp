@@ -763,4 +763,38 @@ std::string ProgramToString(const Program& program) {
 	return text;
 }
 
+bool IsExternalMemoryReadOnly(std::span<const uint32_t> code) {
+	if (code.empty()) return false;
+	Program decoded;
+	DecodeProgram(code, decoded);
+	for (const auto& inst : decoded.instructions) {
+		const auto op = inst.opcode;
+		if (op == Opcode::UNKNOWN || op == Opcode::UNSUPPORTED ||
+		    op == Opcode::S_SETPC_B64 ||
+		    (op == Opcode::S_SENDMSG && inst.src0.value != 9u)) return false;
+		switch (inst.family) {
+			case Family::MUBUF:
+			case Family::MTBUF:
+				if (!((op >= Opcode::BUFFER_LOAD_FORMAT_X && op <= Opcode::BUFFER_LOAD_FORMAT_D16_XYZW) ||
+				      op == Opcode::BUFFER_LOAD_FORMAT_D16_HI_X ||
+				      (op >= Opcode::BUFFER_LOAD_UBYTE && op <= Opcode::BUFFER_LOAD_DWORDX4))) return false;
+				break;
+			case Family::FLAT:
+				if (op < Opcode::FLAT_LOAD_UBYTE || op > Opcode::FLAT_LOAD_DWORDX4) return false;
+				break;
+			case Family::MIMG:
+				if (op != Opcode::IMAGE_GET_RESINFO && op != Opcode::IMAGE_GET_LOD &&
+				    op != Opcode::IMAGE_LOAD && op != Opcode::IMAGE_LOAD_MIP &&
+				    !(op >= Opcode::IMAGE_SAMPLE && op <= Opcode::IMAGE_GATHER4H)) return false;
+				break;
+			case Family::DS:
+				if (inst.gds) return false;
+				break;
+			case Family::Unknown: return false;
+			default: break;
+		}
+	}
+	return true;
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

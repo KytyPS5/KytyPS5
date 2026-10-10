@@ -804,6 +804,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:resource_tracking_tests> --inline-full-image-loads-only)
 	add_test(NAME shader_inline_image_loads_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --inline-full-image-loads-only)
+	add_test(NAME shader_wave_address_image_table_contracts
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-address-contracts-only)
+	add_test(NAME shader_wave_address_image_table_neighbors
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-address-neighbor-exclusion-only)
+	add_test(NAME shader_wave_address_image_table_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-address-image-table-only)
+	set_tests_properties(shader_wave_address_image_table_contracts shader_wave_address_image_table_neighbors
+		PROPERTIES TIMEOUT 60)
+	set_tests_properties(shader_wave_address_image_table_gpu PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	set_tests_properties(shader_inline_image_loads_admission PROPERTIES TIMEOUT 60)
 	set_tests_properties(shader_inline_image_loads_gpu PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	set_tests_properties(shader_independent_sampler_code_size PROPERTIES TIMEOUT 60)

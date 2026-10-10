@@ -819,6 +819,9 @@ Family GetInstructionFamily(uint32_t word);
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
 void DecodeProgram(std::span<const uint32_t> code, Program& program);
+// Conservative proof for descriptor-input ownership across shader stages.
+// Unknown opcodes, indirect control flow, and non-local writes are not accepted.
+bool IsExternalMemoryReadOnly(std::span<const uint32_t> code);
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 

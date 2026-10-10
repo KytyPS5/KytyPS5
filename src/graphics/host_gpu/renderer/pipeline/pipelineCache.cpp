@@ -767,7 +767,8 @@ struct PipelineCache::ProgramCache {
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor,
  std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt,
- bool compute_workgroups_trusted = true, uint64_t indirect_args_addr = 0) {
+ bool compute_workgroups_trusted = true, uint64_t indirect_args_addr = 0,
+ bool neighboring_stages_read_only = false) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -843,6 +844,7 @@ struct PipelineCache::ProgramCache {
 		    .max_native_samplers        = native_sampler_capacity,
 		    .max_dense_images           = dense_image_capacity,
 		    .capture_scalar_selector_values = stage == ShaderType::Compute,
+		    .neighboring_stages_read_only = stage == ShaderType::Compute || neighboring_stages_read_only,
 		};
 		const auto refresh_indirect_grid = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
 			if (runtime.compute_workgroups_trusted || indirect_args_addr == 0 ||
@@ -1509,9 +1511,19 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	std::array<bool, 3> vertex_read_only{};
+	const uint32_t vertex_count = tess_active ? 3u : 1u;
+	for (uint32_t i = 0; i < vertex_count; ++i) {
+		vertex_read_only[i] = ShaderRecompiler::Decoder::IsExternalMemoryReadOnly(vertex_params[i].code) &&
+		    (vertex_params[i].back_code.empty() ||
+		     ShaderRecompiler::Decoder::IsExternalMemoryReadOnly(vertex_params[i].back_code));
+	}
 	vertex_info[tess_active ? 2u : 0u].linked_param_count = 0;
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		const bool producers_read_only = std::all_of(vertex_read_only.begin(),
+		    vertex_read_only.begin() + vertex_count, [](bool value) { return value; });
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor,
+		    std::nullopt, true, 0u, producers_read_only);
 		std::vector<uint32_t> active_inputs;
 		for (const auto& input: pixel_info.stage.program->info.inputs) {
 			if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter) {
@@ -1539,7 +1551,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		bool neighbors_read_only = !pixel_active ||
+		    (!pixel_info.stage.program->info.writes_dma &&
+		     !std::ranges::any_of(pixel_info.stage.program->info.buffers, &ShaderRecompiler::IR::BufferResource::written) &&
+		     !std::ranges::any_of(pixel_info.stage.program->info.images, &ShaderRecompiler::IR::ImageResource::written));
+		for (uint32_t other = 0; other < vertex_count; ++other)
+			if (other != i) neighbors_read_only &= vertex_read_only[other];
+		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor,
+		    std::nullopt, true, 0u, neighbors_read_only);
 	}
 	return result;
 }

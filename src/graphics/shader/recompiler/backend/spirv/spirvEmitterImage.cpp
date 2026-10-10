@@ -659,7 +659,8 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 }
 
 uint32_t EmitDescriptorKeySelection(ValueEmitContext& ctx, uint32_t key,
-                                    uint32_t mapping_offset, uint32_t iterations) {
+                                    uint32_t mapping_offset, uint32_t iterations,
+                                    uint32_t secondary_key = 0u) {
 	auto& state = ctx.state;
 	const auto LoadMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
@@ -684,19 +685,28 @@ uint32_t EmitDescriptorKeySelection(ValueEmitContext& ctx, uint32_t key,
 		const auto entry = Binary(
 		    state, OpIAdd, TypeU32(state), mapping,
 		    Binary(state, OpIAdd, TypeU32(state),
-		           Binary(state, OpShiftLeftLogical, TypeU32(state), probe,
-		                  ConstantU32(state, 1u)),
+		           secondary_key == 0u
+		               ? Binary(state, OpShiftLeftLogical, TypeU32(state), probe, ConstantU32(state, 1u))
+		               : Binary(state, OpIMul, TypeU32(state), probe, ConstantU32(state, 3u)),
 		           ConstantU32(state, 1u)));
 		const auto mapped_key = LoadMapping(entry);
 		const auto candidate =
-		    LoadMapping(Binary(state, OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
-		const auto equal = Binary(state, OpIEqual, TypeBool(state), mapped_key, key);
+		    LoadMapping(Binary(state, OpIAdd, TypeU32(state), entry, ConstantU32(state, secondary_key == 0u ? 1u : 2u)));
+		auto equal = Binary(state, OpIEqual, TypeBool(state), mapped_key, key);
+		auto less = Binary(state, OpULessThan, TypeBool(state), mapped_key, key);
+		if (secondary_key != 0u) {
+			const auto mapped_secondary = LoadMapping(Binary(state, OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+			const auto equal_secondary = Binary(state, OpIEqual, TypeBool(state), mapped_secondary, secondary_key);
+			less = Binary(state, OpLogicalOr, TypeBool(state),
+			    Binary(state, OpULessThan, TypeBool(state), mapped_secondary, secondary_key),
+			    Binary(state, OpLogicalAnd, TypeBool(state), equal_secondary, less));
+			equal = Binary(state, OpLogicalAnd, TypeBool(state), equal_secondary, equal);
+		}
 		const auto match = Binary(state, OpLogicalAnd, TypeBool(state), active, equal);
 		const auto next_selected = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpSelect, TypeU32(state), next_selected, match, candidate, selected});
 		selected = next_selected;
-		const auto less = Binary(state, OpULessThan, TypeBool(state), mapped_key, key);
 		const auto take_upper = Binary(state, OpLogicalAnd, TypeBool(state), active, less);
 		const auto take_lower = Binary(state, OpLogicalAnd, TypeBool(state), active,
 		                               Unary(state, OpLogicalNot, TypeBool(state), less));
@@ -735,8 +745,20 @@ uint32_t EmitIndirectImageSelection(ValueEmitContext& ctx, const IR::Inst& inst,
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 		return 0;
 	}
+	uint32_t secondary_key = 0u;
+	if (image.indirect_key_dwords == 2u) {
+		if (source == nullptr || !source->inline_descriptor || !source->inline_descriptor->address_table ||
+		    source->inline_descriptor->address_table->row_key_arg >= handle->NumArgs()) {
+			ctx.Fail(inst, "has invalid indirect image secondary key provenance");
+			return 0u;
+		}
+		secondary_key = ctx.Def(handle->Arg(source->inline_descriptor->address_table->row_key_arg));
+	} else if (image.indirect_key_dwords != 1u) {
+		ctx.Fail(inst, "has unsupported indirect image key width");
+		return 0u;
+	}
 	auto selected = EmitDescriptorKeySelection(ctx, key, image.indirect_mapping_offset,
-	                                           image.indirect_search_iterations);
+	                                           image.indirect_search_iterations, secondary_key);
 	return selected;
 }
 

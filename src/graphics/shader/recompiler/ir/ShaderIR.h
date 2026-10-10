@@ -168,6 +168,7 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset    = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	uint32_t                      indirect_key_dwords = 1;
 	uint32_t                      indirect_sampler = UINT32_MAX;
 	uint32_t                      independent_sampler_mapping_offset = 0;
 	uint32_t                      independent_sampler_search_iterations = 0;
@@ -605,6 +606,13 @@ struct DescriptorSource {
 	};
 
 	struct InlineDescriptor {
+		struct AddressTable {
+			uint32_t pointer_offset = 0;
+			uint32_t row_stride = 0;
+			uint32_t row_limit = 0;
+			uint32_t row_key_arg = 1;
+			bool operator==(const AddressTable&) const = default;
+		};
 		struct ImageTable {
 			uint32_t address_source = 0;
 			uint32_t table_offset   = 0;
@@ -619,6 +627,8 @@ struct DescriptorSource {
 		uint32_t descriptor_offset = 0;
 		uint32_t key_arg           = 0;
 		std::optional<ImageTable> image_table;
+		// Paired vector-buffer pointer fields and a guarded scalar-address row.
+		std::optional<AddressTable> address_table;
 		// Direct inline descriptors read four compact/sampler words or eight image words.
 		// ImageTable retains its separate packed selector and eight-word table-entry format.
 		uint32_t descriptor_dwords = 4;

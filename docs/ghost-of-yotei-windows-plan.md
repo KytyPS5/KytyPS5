@@ -1,5 +1,29 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 06:05 UTC** (bounded wave-address table regression proved):
+
+- Working shared correction supports paired indexed vector-buffer pointers,
+  guarded scalar-address rows and independent samplers. A live record/row key
+  pair preserves both U32 values; host descriptor reads retain all canonical
+  48-bit address bits. The index is captured at the pointer's original wave
+  scope. Own buffer writers are checked against captured immutable ranges;
+  unsafe/unknown neighboring stages and address/image writers are rejected.
+- Corrected admission RED052530 and secondary-key lifetime RED052939 ->
+  numeric GPUAV GREEN052958. Neighbor ownership RED054831 -> GREEN055328.
+  Full wave32/wave64/full-backing GPUAV055827 PASS. CPU055635 proves high
+  address bits, two-dimensional mapping, strict budgets, unavailable bytes and
+  writer-alias rejection. Registered060028 passes8/9; only the unsupported
+  atomic test encoding failed, fixed/rerun CPU060226 PASS1/1. Full resource
+  suite060325 PASS3/3; ordinary/shared sampling GPUAV060437 PASS.
+- Source/parser diagnostic traces removed. Null/unaligned pointers, unknown
+  row bounds, unreadable data, unsupported pointer shapes and unsafe stage
+  ownership remain explicit failures. No quotas raised. Pinned Sharp1057
+  resource planning is a reference; no wholesale import or foreign runtime claim.
+- Next: separate local fix commit, native Windows build, preserve installed
+  ed3f2e74/d2bd EXE and complete warmed cache, bounded original-game retry.
+  Whole PS617c execution, PS07b3 driver completion, menu/gameplay and issue108
+  publication remain pending. Other-game runtime coverage is unavailable.
+
 Checkpoint **2026-10-10 04:44 UTC** (first inline load gate passed; wave pointer table next):
 
 - Native sourceed3f2e74 / EXEd2bd / original5178 run

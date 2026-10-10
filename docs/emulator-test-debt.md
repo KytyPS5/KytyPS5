@@ -14,6 +14,25 @@ independent sampler selection and exact numerical results. Diagnose pointer
 and row domains first; preserve full address bits, clean-memory ownership,
 write protection/bounds/quotas, and explicit unsupported cases.
 
+Bounded shared implementation proved locally: paired indexed VMEMx2 pointer
+fields, matching ReadFirstLane masks/original scope, guarded row limit, full
+canonical48-bit address reads, independent inline sampler and separate U32
+record/row keys. Corrected-fixture admission RED052530 (scoped disable of only
+new admission, restored) -> numeric GPUAV GREEN052958. Secondary-key cleanup
+RED052939 proves CompileProgram must retain both GPU keys. Initial050228 used
+the wrong shift encoding and is superseded. Neighbor-stage ownership
+RED054831 -> GREEN055328; conservative decoder classification includes only
+known read-only producer code, rejects stores/atomics/unknown/indirect control.
+GPUAV055827 passes full wave32/wave64 and complete backing. CPU055635 proves
+same-low/different-high addresses, distinct rows, transactional image/sampler
+limits, unavailable upper words and writer-alias rejection. The060028 batch
+passes8/9; atomic fixture encoding was unsupported, corrected and rerun as
+CPU060226 PASS1/1. Resource tracking/admission060325 PASS3/3; shared ordinary
+sampling GPUAV060437 PASS. No compiler/device/probe ceilings raised.
+Null/unaligned pointers, unavailable descriptor bytes, unsafe stage writers,
+unproved row domains and unsupported addressing shapes remain failures.
+Native emulator rebuild and original PS617c retry pending.
+
 ## Scalar-buffer image descriptor runtime provenance (2026-10-10)
 
 Original5178/source0b147273/EXE3ddab run033329 naturally exits321 at

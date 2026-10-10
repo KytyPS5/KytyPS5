@@ -27,6 +27,7 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
+		uint32_t                      indirect_key_dwords = 1;
 		uint32_t                      indirect_sampler           = UINT32_MAX;
 		uint32_t                      independent_sampler_mapping_offset = 0;
 		uint32_t                      independent_sampler_search_iterations = 0;

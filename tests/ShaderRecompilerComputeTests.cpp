@@ -1766,6 +1766,7 @@ CompiledShader CompileCase(const TestCase &test,
       .max_native_samplers = max_native_samplers,
       .max_dense_images = max_dense_images,
       .capture_scalar_selector_values = test.capture_scalar_selector_values,
+      .neighboring_stages_read_only = true,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -40852,6 +40853,212 @@ TestCase WideIndirectImageTableSample(u32 active_count = 3u) {
   return test;
 }
 
+TestCase WaveAddressImageTable(u32 wave = 0u) {
+  auto test = MakeImageSampleDynamicMaterials(
+      MaterialImageSampleMode::FullStaticSampler, false, 0u, 3u, wave != 0u);
+  test.name = "WaveAddressImageTableIndependentSampler";
+  test.expected = {std::bit_cast<u32>(20.0f), std::bit_cast<u32>(2.0f),
+                   std::bit_cast<u32>(8.0f), std::bit_cast<u32>(80.0f)};
+  constexpr u32 pointer_offset = 120u;
+  constexpr u32 row_stride = 368u;
+  constexpr u32 image_offset = 64u;
+  test.initial.resize(0x8000u / 4u);
+  for (u32 record = 0u; record < 4u; ++record) {
+    const auto material = test.user_data[4] + record * 440u;
+    const auto table = 0x4000u + record * 0x1000u;
+    test.initial[(material + pointer_offset) / 4u] = table;
+    test.initial[(material + pointer_offset) / 4u + 1u] = 0x81000000u;
+    for (u32 row = 0u; row < 2u; ++row)
+      std::copy_n(test.initial.begin() + material / 4u + row * 8u, 8u,
+                  test.initial.begin() + (table + row * row_stride + image_offset) / 4u);
+  }
+  auto& code = test.code;
+  bool replaced = false;
+  for (size_t at = 0; at + 1u < code.size(); ++at) {
+    if (code[at] != EncodeSmem0(0x0b, 16, 2) || code[at + 1u] != EncodeSmem1(0, 61)) continue;
+    std::vector<u32> pointer;
+    pointer.push_back(EncodeVop1(0x01, 28, 60));
+    pointer.push_back(EncodeMubuf0(0x0d, pointer_offset, true, false));
+    pointer.push_back(EncodeMubuf1(26, 1, 28));
+    pointer.push_back(EncodeVop1(0x02, 66, Vgpr(26)));
+    pointer.push_back(EncodeVop1(0x02, 67, Vgpr(27)));
+    pointer.push_back(EncodeSop2(0x0e, 67, 67, 255u));
+    pointer.push_back(0x0000ffffu);
+    pointer.push_back(EncodeSop2(0x20, 64, 32, InlineU32(1)));
+    pointer.push_back(EncodeSopc(0x0a, 64, InlineU32(2)));
+    const auto guard = pointer.size();
+    pointer.push_back(EncodeSopp(0x04, 0u));
+    pointer.push_back(EncodeSop2(0x26, 65, 64, 255u));
+    pointer.push_back(row_stride);
+    pointer.push_back(EncodeSmem0(0x03, 16, 33));
+    pointer.push_back(EncodeSmem1(image_offset, 65));
+    code.erase(code.begin() + at, code.begin() + at + 2u);
+    code.insert(code.begin() + at, pointer.begin(), pointer.end());
+    // The exit edge skips only the sample/store body, then resumes the bounded loop.
+    const auto continuation = std::find(code.begin() + at + pointer.size(), code.end(),
+        EncodeSop2(0x00, 32, 32, InlineU32(1)));
+    Require(test.name, "bounded table fixture", continuation != code.end(), "missing loop increment");
+    const auto destination = static_cast<size_t>(continuation - code.begin());
+    code[at + guard] = EncodeSopp(0x04, static_cast<u32>(destination - (at + guard + 1u)));
+    // Inserting the pointer recipe changes the final backward scalar-loop distance.
+    const auto loop = std::find(code.begin(), code.end(), EncodeSop2(0x1e, 33, 32, InlineU32(2)));
+    const auto back = code.size() - 2u;
+    code[back] = EncodeSopp(0x05, static_cast<u32>(
+        static_cast<int64_t>(loop - code.begin()) - static_cast<int64_t>(back + 1u)));
+    replaced = true;
+    break;
+  }
+  Require(test.name, "bounded table fixture", replaced, "missing full descriptor load");
+  std::erase(test.opcodes, ShaderOpcode::S_BUFFER_LOAD_DWORDX8);
+  test.opcodes.push_back(ShaderOpcode::BUFFER_LOAD_DWORDX2);
+  test.opcodes.push_back(ShaderOpcode::V_READFIRSTLANE_B32);
+  test.opcodes.push_back(ShaderOpcode::S_LOAD_DWORDX8);
+  test.opcodes.push_back(ShaderOpcode::S_CBRANCH_SCC0);
+  test.opcodes.push_back(ShaderOpcode::S_LSHR_B32);
+  if (wave != 0u) {
+    test.name = wave == 32u ? "WaveAddressImageTableFullWave32" : "WaveAddressImageTableFullWave64";
+    test.compute_info.wave_size = wave;
+    const auto values = test.expected;
+    test.expected = test.initial;
+    for (u32 iteration = 0; iteration < values.size(); ++iteration)
+      std::fill_n(test.expected.begin() + iteration * 64u, 64u, values[iteration]);
+  }
+  return test;
+}
+
+struct WaveAddressTestMemory {
+  std::vector<u32>* words;
+  std::vector<std::pair<uint64_t, u32>> aliases;
+  uint64_t fail_address = UINT64_MAX;
+  static bool Read(void* data, uint64_t address, std::span<u32> values) {
+    const auto& memory = *static_cast<WaveAddressTestMemory*>(data);
+    if (address <= memory.fail_address && memory.fail_address - address < values.size_bytes()) return false;
+    auto offset = address;
+    if (address >= (uint64_t{1} << 32u)) {
+      const auto alias = std::ranges::find_if(memory.aliases, [&](const auto& entry) {
+        return address >= entry.first && address - entry.first < 0x1000u &&
+               values.size_bytes() <= 0x1000u - (address - entry.first);
+      });
+      if (alias == memory.aliases.end()) return false;
+      offset = alias->second + address - alias->first;
+    }
+    return ReadTestMemory(memory.words, offset, values);
+  }
+};
+
+void CheckWaveAddressMaterializationContracts() {
+  auto test = WaveAddressImageTable();
+  WaveAddressTestMemory memory{&test.initial};
+  for (u32 record = 0; record < 4u; ++record) {
+    const auto material = 128u + record * 440u;
+    const auto backing = 0x4000u + record * 0x1000u;
+    const auto address = (uint64_t{record + 1u} << 32u) | 0x4000u;
+    memory.aliases.push_back({address, backing});
+    test.initial[(material + 120u) / 4u] = 0x4000u;
+    test.initial[(material + 124u) / 4u] = 0x81000000u | (record + 1u);
+    for (u32 row = 0; row < 2u; ++row)
+      test.initial[(backing + row * 368u + 64u) / 4u] = 0x100u + record * 0x20u + row * 0x10u;
+  }
+  auto user_data = MakeNativeUserData(&test.user_data);
+  auto compute = test.compute_info;
+  compute.host_subgroup_size = 32u;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.user_data = user_data; options.wave_size = compute.wave_size; options.input_info.compute = &compute;
+  auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot snapshot;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data, .read_memory = WaveAddressTestMemory::Read,
+      .userdata = &memory, .read_specialization_memory = WaveAddressTestMemory::Read,
+      .neighboring_stages_read_only = true};
+  Require(test.name, "full guest address", ShaderRecompiler::IR::MaterializeResources(
+      plan, runtime, snapshot, specialization), "full-width pointer tables did not materialize");
+  const auto& root = specialization.images.at(0);
+  Require(test.name, "two-part keys", root.indirect_key_dwords == 2u, "secondary key lost");
+  for (u32 record = 0; record < 4u; ++record) {
+    for (u32 row = 0; row < 2u; ++row) {
+      u32 ordinal = 0u;
+      for (u32 entry = 0; entry < snapshot.flattened_srt.at(root.indirect_mapping_offset); ++entry) {
+        const auto position = root.indirect_mapping_offset + 1u + entry * 3u;
+        if (snapshot.flattened_srt[position] == record && snapshot.flattened_srt[position + 1u] == row)
+          ordinal = snapshot.flattened_srt[position + 2u];
+      }
+      Require(test.name, "full guest address", ordinal != 0u &&
+          snapshot.images.at(root.indirect_resources.at(ordinal)).dwords[0] ==
+              0x100u + record * 0x20u + row * 0x10u,
+          "pointer high words or independent row selection aliased");
+    }
+  }
+  const auto previous = snapshot;
+  const auto previous_specialization = specialization;
+  const auto reject = [&](ShaderRecompiler::IR::SrtRuntime limited, const char* reason) {
+    Require(test.name, reason, !ShaderRecompiler::IR::MaterializeResources(
+        plan, limited, snapshot, specialization) && snapshot.images == previous.images &&
+        snapshot.buffers == previous.buffers && snapshot.samplers == previous.samplers &&
+        snapshot.flattened_srt == previous.flattened_srt && specialization == previous_specialization,
+        "unsupported table was accepted or partial state was committed");
+  };
+  auto limited = runtime; limited.max_dense_images = 8u; reject(limited, "image ceiling");
+  limited = runtime; limited.max_native_samplers = 1u; reject(limited, "sampler ceiling");
+  limited = runtime; limited.neighboring_stages_read_only = false; reject(limited, "neighbor ownership");
+  memory.fail_address = memory.aliases[0].first + 64u + 20u;
+  reject(runtime, "unreadable upper descriptor word");
+  memory.fail_address = UINT64_MAX;
+  auto alias_data = user_data; alias_data[48] = 128u + 120u;
+  limited = runtime; limited.user_data = alias_data; reject(limited, "descriptor writer alias");
+  std::puts("KYTY_WAVE_ADDRESS_MATERIALIZATION_CONTRACTS_PASS");
+}
+
+void CheckWaveAddressNeighborExclusion() {
+  auto test = WaveAddressImageTable();
+  auto user_data = MakeNativeUserData(&test.user_data);
+  auto compute = test.compute_info;
+  compute.host_subgroup_size = 32u;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.user_data = user_data;
+  options.wave_size = compute.wave_size;
+  options.input_info.compute = &compute;
+  auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot snapshot;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data, .read_memory = ReadTestMemory,
+      .userdata = &test.initial, .read_specialization_memory = ReadTestMemory,
+      .neighboring_stages_read_only = false};
+  Require(test.name, "neighboring stage ownership",
+      !ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization),
+      "wave address table accepted untrusted neighboring shader memory");
+  std::puts("KYTY_WAVE_ADDRESS_NEIGHBOR_EXCLUSION_PASS");
+}
+
+void CheckDecodedStageMemoryOwnership() {
+  const auto check = [](std::vector<u32> code, bool read_only, const char* label) {
+    AppendEnd(&code);
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+    Require("DecodedStageMemoryOwnership", label,
+        std::ranges::none_of(decoded.instructions, [](const auto& inst) {
+          return inst.opcode == ShaderOpcode::UNKNOWN || inst.opcode == ShaderOpcode::UNSUPPORTED;
+        }), "ownership fixture did not decode the intended supported instruction");
+    Require("DecodedStageMemoryOwnership", label,
+        ShaderRecompiler::Decoder::IsExternalMemoryReadOnly(code) == read_only,
+        "neighboring stage memory ownership was misclassified");
+  };
+  check({EncodeMubuf0(0x0c), EncodeMubuf1(0, 0, 0)}, true, "raw buffer read");
+  check({EncodeMubuf0(0x1c), EncodeMubuf1(0, 0, 0)}, false, "raw buffer write");
+  check({EncodeMubuf0(0x32), EncodeMubuf1(0, 0, 0)}, false, "buffer atomic");
+  check({EncodeMimg0(0x00, 0xf), EncodeMimg1(0, 0)}, true, "image fetch");
+  check({EncodeMimg0(0x08, 0xf), EncodeMimg1(0, 0)}, false, "image store");
+  check({EncodeSmem0(0x03, 8, 0), EncodeSmem1(0, 0)}, true, "scalar address read");
+  check({EncodeSop1(0x20, 0, 0)}, false, "indirect control");
+  Require("DecodedStageMemoryOwnership", "missing code",
+      !ShaderRecompiler::Decoder::IsExternalMemoryReadOnly({}), "unknown stage was accepted");
+}
+
 TestCase ImageSampleR128DynamicMaterialPairs() {
   return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::CompactDynamicSampler);
 }
@@ -51408,6 +51615,23 @@ if (argc == 1) {
     std::printf("native combined image descriptor ceiling=%u\n", vulkan.DenseImageCapacity());
     RunCase(&vulkan, CombinedNativeImageCapacity());
     std::puts("KYTY_COMBINED_NATIVE_IMAGE_CAPACITY_GPU_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave-address-contracts-only") == 0) {
+    CheckDecodedStageMemoryOwnership();
+    CheckWaveAddressMaterializationContracts();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave-address-neighbor-exclusion-only") == 0) {
+    CheckWaveAddressNeighborExclusion();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave-address-image-table-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WaveAddressImageTable());
+    RunCase(&vulkan, WaveAddressImageTable(32u));
+    RunCase(&vulkan, WaveAddressImageTable(64u));
+    std::puts("KYTY_WAVE_ADDRESS_IMAGE_TABLE_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--inline-full-image-loads-only") == 0) {

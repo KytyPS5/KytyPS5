@@ -46,6 +46,9 @@ struct SrtRuntime {
 	// Opt in only with coherent input reads and immutable-range writer checks.
 	// Offline callers otherwise keep the full wrapped-U32 selector domain.
 	bool capture_scalar_selector_values = false;
+	// Explicit caller proof for graphics pipelines; a compute test/dispatch has
+	// no neighboring shader stages. Unknown graphics ownership remains false.
+	bool neighboring_stages_read_only = false;
 };
 
 // A raw scalar read bounded by a loop guard or one actual dispatch axis.

@@ -32,6 +32,10 @@
 
 namespace Libs::Graphics {
 
+// Bumped whenever any tracked page becomes CPU-dirty (a new region starts fully dirty). Lets
+// consumers skip work that only reacts to new CPU writes when nothing has changed.
+inline std::atomic<uint64_t> g_cpu_dirty_generation {0};
+
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
@@ -85,6 +89,7 @@ public:
 			EXIT("invalid region tracking manager construction\n");
 		}
 		m_cpu_dirty.Fill();
+		g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
 		m_writable.Fill();
 		m_readable.Fill();
 	}
@@ -114,6 +119,9 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
+			if constexpr (source == DirtySource::Cpu) {
+				g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
+			}
 		} else {
 			bits.UnsetRange(start, end);
 		}

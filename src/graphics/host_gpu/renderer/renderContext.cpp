@@ -79,6 +79,10 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool RenderContext::ResolvesWriteFaults(uint64_t vaddr, uint64_t size) const {
+	return IsMapped(vaddr, size) && m_page_manager.IsWatched(vaddr, size);
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;

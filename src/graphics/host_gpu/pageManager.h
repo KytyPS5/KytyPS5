@@ -24,6 +24,8 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
+	// True when every page of the range is protected by a watcher, so its faults are handled.
+	[[nodiscard]] bool IsWatched(uint64_t vaddr, uint64_t size) const;
 
 private:
 	struct Impl;

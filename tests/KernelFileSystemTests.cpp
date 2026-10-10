@@ -4,6 +4,9 @@
 #include "common/emulatorConfig.h"
 #include "common/archive.h"
 #include "common/file.h"
+#include "common/hostException.h"
+#include "common/platform/sysFileIO.h"
+#include "common/virtualMemory.h"
 #include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -285,6 +288,95 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
+// Guest pages the emulator write-protects make a direct host read stop early instead of
+// faulting. This handler stands in for the emulator's: it unprotects the guarded pages.
+std::atomic<uint64_t> g_guard_base {0};
+std::atomic<uint64_t> g_guard_size {0};
+std::atomic<int> g_guard_faults {0};
+
+bool UnprotectGuard(const Common::HostException::ExceptionInfo &info) {
+  const auto base = g_guard_base.load();
+  const auto size = g_guard_size.load();
+  if (info.type != Common::HostException::ExceptionType::AccessViolation ||
+      info.access_violation_vaddr < base || info.access_violation_vaddr - base >= size) {
+    return false;
+  }
+  g_guard_faults.fetch_add(1);
+  return Common::VirtualMemory::Protect(base, size, Common::VirtualMemory::Mode::ReadWrite);
+}
+
+void TestReadsIntoProtectedPages() {
+  constexpr uint64_t Half = 0x10000;
+  std::vector<uint8_t> payload(Half * 2);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>(i * 7 + i / 251);
+  }
+  const int fd = FileSystem::KernelOpen("/savedata0/protected-read.dat", 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, payload.data(), payload.size()) ==
+                       static_cast<int64_t>(payload.size()),
+        "create protected-read fixture");
+  const auto memory = Common::VirtualMemory::Alloc(0, Half * 2,
+                                                   Common::VirtualMemory::Mode::ReadWrite);
+  Check(memory != 0 && Common::HostException::InstallHandler(UnprotectGuard),
+        "allocate the read target and install the guard handler");
+  g_guard_base = memory + Half;
+  g_guard_size = Half;
+  // The emulator registers GPU-mapped guest memory; here only the guarded target qualifies.
+  static uint64_t recoverable_base = 0;
+  recoverable_base = memory;
+  SysFileSetRecoverableDestination([](const void *data, uint64_t size) {
+    const auto address = reinterpret_cast<uint64_t>(data);
+    return address >= recoverable_base && address - recoverable_base <= 0x20000 - size;
+  });
+  auto *target = reinterpret_cast<uint8_t *>(memory);
+  const auto guard = [&] {
+    std::memset(target, 0, Half * 2);
+    g_guard_faults = 0;
+    return Common::VirtualMemory::Protect(memory + Half, Half, Common::VirtualMemory::Mode::Read);
+  };
+  const auto filled = [&] {
+    return g_guard_faults.load() > 0 &&
+           std::memcmp(target, payload.data(), payload.size()) == 0;
+  };
+  Check(guard() && FileSystem::KernelPread(fd, target, payload.size(), 0) ==
+                       static_cast<int64_t>(payload.size()) && filled(),
+        "pread fills a buffer that crosses into a write-protected page");
+  Check(guard() && FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+            FileSystem::KernelRead(fd, target, payload.size()) ==
+                static_cast<int64_t>(payload.size()) &&
+            filled() && FileSystem::KernelLseek(fd, 0, 1) == static_cast<int64_t>(payload.size()),
+        "read fills a write-protected tail and advances by the full count");
+  FileSystem::KernelIovec iov[2] = {{target, Half / 2}, {target + Half / 2, Half * 2 - Half / 2}};
+  Check(guard() && FileSystem::KernelPreadv(fd, iov, 2, 0) ==
+                       static_cast<int64_t>(payload.size()) && filled(),
+        "preadv fills vectors that cross into a write-protected page");
+  // Only the bytes before EOF are probed: the request tail past the recoverable
+  // range is unused.
+  Check(guard() &&
+            FileSystem::KernelPread(fd, target + Half, Half + 0x1000, Half) ==
+                static_cast<int64_t>(Half) &&
+            g_guard_faults.load() > 0 &&
+            std::memcmp(target + Half, payload.data() + Half, Half) == 0,
+        "pread past EOF recovers the protected bytes the file still supplies");
+#if defined(__linux__)
+  // A destination the emulator cannot fault in is not recovered: the read stays short.
+  const long page = sysconf(_SC_PAGESIZE);
+  void *pages = mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  Check(pages != MAP_FAILED && munmap(static_cast<char *>(pages) + page, page) == 0,
+        "map a read target whose second page is unmapped");
+  Check(FileSystem::KernelPread(fd, pages, page * 2, 0) == page &&
+            std::memcmp(pages, payload.data(), page) == 0,
+        "pread into a partly unmapped buffer returns the mapped prefix");
+  munmap(pages, page);
+#endif
+  SysFileSetRecoverableDestination(nullptr);
+  g_guard_size = 0;
+  Common::VirtualMemory::Free(memory);
+  Check(FileSystem::KernelClose(fd) == OK &&
+            FileSystem::KernelUnlink("/savedata0/protected-read.dat") == OK,
+        "remove protected-read fixture");
 }
 
 void TestAioBatches() {
@@ -1701,6 +1793,7 @@ int main(int, char**) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+  Common::VirtualMemory::Init();
 
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
@@ -1727,6 +1820,7 @@ int main(int, char**) {
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestAioBatches();
+  TestReadsIntoProtectedPages();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();

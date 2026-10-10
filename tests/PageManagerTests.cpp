@@ -248,6 +248,25 @@ void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestIsWatched() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  Check(!manager.IsWatched(address, 1), "untracked page reported as watched");
+  manager.UpdatePageWatchers<true>(address + 16, 32);
+  Check(manager.IsWatched(address, page_size) &&
+            manager.IsWatched(address + 100, 1),
+        "write-watched page not reported as watched");
+  Check(!manager.IsWatched(address, page_size + 1),
+        "range ending in an unwatched page reported as watched");
+  manager.UpdatePageWatchers<false>(address + 16, 32);
+  Check(!manager.IsWatched(address, 1),
+        "unwatched page still reported as watched");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestSharedWatcherCounts() {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -699,6 +718,7 @@ int main(int argc, char **argv) {
   TestWatchAndUnwatch();
   TestWatchAndUnwatch(Libs::LibKernel::Memory::kExtendedMemoryBase);
   TestSharedWatcherCounts();
+  TestIsWatched();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();

@@ -410,7 +410,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	return true;
 }
 
-vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
+vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects(bool include_clears) const {
 	const auto format = desc.view_info.format;
 	if (format == vk::Format::eUndefined) {
 		return {};
@@ -419,7 +419,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 	const auto           available = ImageViewOps::DepthAspectMask(format);
 	vk::ImageAspectFlags writes {};
 	if ((available & vk::ImageAspectFlagBits::eDepth) &&
-	    (depth_load_clear_enable || depth_write_enable)) {
+	    ((include_clears && depth_load_clear_enable) || depth_write_enable)) {
 		writes |= vk::ImageAspectFlagBits::eDepth;
 	}
 	if (!(available & vk::ImageAspectFlagBits::eStencil)) {
@@ -457,7 +457,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
 		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
 	};
-	if (stencil_clear_enable ||
+	if ((include_clears && stencil_clear_enable) ||
 	    (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back)))) {
 		writes |= vk::ImageAspectFlagBits::eStencil;
 	}

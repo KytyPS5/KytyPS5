@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <deque>
@@ -292,6 +293,35 @@ struct StageOutput {
 
 	bool operator==(const StageOutput& other) const = default;
 };
+
+// Sizes of the gl_ClipDistance and gl_CullDistance arrays the SPIR-V backend declares for these
+// outputs, including the clip plane it appends to a vertex shader to cull zero homogeneous
+// positions (invalid_position_plane, last clip distance).
+struct OutputDistanceCounts {
+	uint32_t clip                   = 0;
+	uint32_t cull                   = 0;
+	bool     invalid_position_plane = false;
+};
+
+inline OutputDistanceCounts CountOutputDistances(ShaderType                      stage,
+                                                 const std::vector<StageOutput>& outputs) {
+	OutputDistanceCounts counts;
+	bool                 position = false;
+	for (const auto& output: outputs) {
+		if (output.kind == StageOutputKind::ClipDistance) {
+			counts.clip = std::max(counts.clip, output.index + 1);
+		} else if (output.kind == StageOutputKind::CullDistance) {
+			counts.cull = std::max(counts.cull, output.index + 1);
+		} else if (output.kind == StageOutputKind::Position) {
+			position = true;
+		}
+	}
+	if (stage == ShaderType::Vertex && counts.clip + counts.cull < 8u && position) {
+		counts.invalid_position_plane = true;
+		counts.clip++;
+	}
+	return counts;
+}
 
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;

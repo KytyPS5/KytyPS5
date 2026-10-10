@@ -487,31 +487,25 @@ static void queue_save_data_event(uint32_t type, int32_t user_id,
 	}
 }
 
+// '%' matches any run of characters, including none; '_' matches exactly one.
 static bool dir_name_match(const char* str, const char* pattern) {
-	while (*str != '\0' && *pattern != '\0') {
+	for (; *pattern != '\0'; pattern++) {
 		if (*pattern == '%') {
 			for (const char* s = str;; s++) {
 				if (dir_name_match(s, pattern + 1)) {
 					return true;
 				}
 				if (*s == '\0') {
-					break;
+					return false;
 				}
 			}
-			return false;
 		}
-		if (*pattern == '_') {
-			str++;
-			pattern++;
-			continue;
-		}
-		if (*pattern != *str) {
+		if (*str == '\0' || (*pattern != '_' && *pattern != *str)) {
 			return false;
 		}
 		str++;
-		pattern++;
 	}
-	return *str == '\0' && *pattern == '\0';
+	return *str == '\0';
 }
 
 static int mount_save_data(int slot, const std::filesystem::path& directory,
@@ -616,9 +610,35 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
+	const auto sort_value = [&](const std::string& name) -> uint64_t {
+		switch (cond->key) {
+			case SaveDataSortKey::UserParam: {
+				SaveDataParam param {};
+				return read_save_param(save_param_path(root / name), &param) == OK
+				           ? param.user_param
+				           : 0;
+			}
+			case SaveDataSortKey::Mtime:
+				return static_cast<uint64_t>(newest_save_time(root / name));
+			case SaveDataSortKey::Blocks:
+			case SaveDataSortKey::FreeBlocks: {
+				uint64_t blocks = 0;
+				return read_save_blocks(root / name, &blocks) == OK ? blocks : 0;
+			}
+			default: return 0;
+		}
+	};
+	std::vector<std::pair<uint64_t, std::string>> sorted;
+	for (const auto& name: dir_list) {
+		sorted.emplace_back(sort_value(name), name);
+	}
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+		return a.first != b.first ? a.first < b.first
+		                          : std::strcmp(a.second.c_str(), b.second.c_str()) < 0;
 	});
+	for (size_t i = 0; i < sorted.size(); i++) {
+		dir_list[i] = std::move(sorted[i].second);
+	}
 
 	if (cond->order == SaveDataSortOrder::Descent) {
 		std::vector<std::string> reversed;

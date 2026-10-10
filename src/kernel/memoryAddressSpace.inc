@@ -806,7 +806,9 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		// Mapping changes still exclude this. PageManager holds its own region lock while it
+		// protects a page, so concurrent callers never protect the same page.
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 

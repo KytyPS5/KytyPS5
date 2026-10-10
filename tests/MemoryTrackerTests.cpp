@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <semaphore>
 #include <string>
@@ -212,6 +213,8 @@ struct ProtectionCall {
 
 std::vector<ProtectionCall> g_protection_log;
 std::mutex g_protection_log_mutex;
+// Called once by the next protection change, before it is applied.
+std::function<void()> g_before_next_protection;
 
 void ResetProtectionLog() {
   g_protection_calls = 0;
@@ -227,10 +230,15 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     protection = PAGE_READWRITE;
   }
   DWORD old_protection = 0;
+  std::function<void()> before;
   {
     std::lock_guard lock(g_protection_log_mutex);
     g_protection_calls++;
     g_protection_log.push_back({vaddr, size, mode});
+    before = std::exchange(g_before_next_protection, nullptr);
+  }
+  if (before) {
+    before();
   }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
@@ -771,37 +779,35 @@ void TestConcurrentColdUploads() {
   auto &tracker = harness.tracker;
   auto *memory = AllocateFixedGuestRange(region_size * 2, region_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
-  std::counting_semaphore<2> start{0};
-  std::counting_semaphore<2> upload_entered{0};
-  std::counting_semaphore<2> finish_upload{0};
-  std::vector<std::jthread> workers;
+  // Uploads never overlap. A cold writable upload holding one region must not stop
+  // another thread from creating a disjoint region.
+  bool second_entered = false;
+  std::atomic_bool second_dirty{false};
   for (const auto page : {address, address + region_size}) {
-    workers.emplace_back([&, page] {
-      start.acquire();
-      uint32_t ranges = 0;
-      tracker.ForEachUploadRange(
-          page, page_size, true,
-          [&](uint64_t upload_address, uint64_t upload_size) noexcept {
-            Check(upload_address == page && upload_size == page_size,
-                  "concurrent cold upload lost its dirty page");
-            ranges++;
-          },
-          [&]() noexcept {
-            Check(ranges == 1, "concurrent cold upload skipped its dirty page");
-            upload_entered.release();
-            finish_upload.acquire();
+    uint32_t ranges = 0;
+    tracker.ForEachUploadRange(
+        page, page_size, true,
+        [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+          Check(upload_address == page && upload_size == page_size,
+                "cold upload lost its dirty page");
+          ranges++;
+        },
+        [&]() noexcept {
+          Check(ranges == 1, "cold upload skipped its dirty page");
+          if (page != address) {
+            return;
+          }
+          std::binary_semaphore query_finished{0};
+          std::jthread query([&] {
+            second_dirty.store(tracker.IsRegionCpuModified(address + region_size, page_size),
+                               std::memory_order_relaxed);
+            query_finished.release();
           });
-    });
+          second_entered = query_finished.try_acquire_for(std::chrono::seconds(5));
+        });
   }
-  start.release(2);
-  const bool first_entered = upload_entered.try_acquire_for(std::chrono::seconds(5));
-  const bool second_entered = upload_entered.try_acquire_for(std::chrono::seconds(5));
-  finish_upload.release(2);
-  for (auto &worker : workers) {
-    worker.join();
-  }
-  Check(first_entered && second_entered,
-        "cold writable uploads serialized disjoint regions");
+  Check(second_entered && second_dirty.load(std::memory_order_relaxed),
+        "cold writable upload serialized a disjoint region");
   for (const auto page : {address, address + region_size}) {
     Check(!tracker.IsRegionCpuModified(page, page_size) &&
               tracker.IsRegionGpuModified(page, page_size) &&
@@ -922,6 +928,63 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
   Release(memory);
   Check(completed_while_download_blocked && both_gpu_owned,
         "download callback serialized an unrelated tracker region");
+}
+
+void TestQueriesDoNotWaitForWriteFault() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  // A clean page before the faulted one keeps the fault to its own page.
+  const auto faulted = base + page_size;
+  const auto queried = base + page_size * 3;
+  Check(faulted / Libs::Graphics::TRACKER_REGION_SIZE ==
+            (queried + page_size - 1) / Libs::Graphics::TRACKER_REGION_SIZE,
+        "query test pages do not share a tracker region");
+  tracker.ForEachUploadRange(
+      base, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+
+  // A guest write fault holds the region while its pages change protection.
+  std::binary_semaphore fault_entered{0};
+  std::binary_semaphore finish_fault{0};
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_before_next_protection = [&] {
+      fault_entered.release();
+      finish_fault.acquire();
+    };
+  }
+  std::jthread fault([&] {
+    tracker.InvalidateRegion(faulted, 1, [] { Check(false, "clean page needed a flush"); });
+  });
+  fault_entered.acquire();
+  std::binary_semaphore queries_finished{0};
+  std::atomic_bool clean{false};
+  std::jthread queries([&] {
+    bool uploaded = false;
+    tracker.ForEachUploadRange(
+        queried, page_size, false,
+        [&](uint64_t, uint64_t) noexcept { uploaded = true; }, []() noexcept {});
+    clean.store(!tracker.IsRegionCpuModified(queried, page_size) &&
+                    !tracker.IsRegionGpuModified(queried, page_size) && !uploaded,
+                std::memory_order_relaxed);
+    queries_finished.release();
+  });
+  const bool completed_during_fault =
+      queries_finished.try_acquire_for(std::chrono::seconds(5));
+  finish_fault.release();
+  fault.join();
+  queries.join();
+
+  const bool fault_dirtied = tracker.IsRegionCpuModified(faulted, page_size) &&
+                             IsWritable(memory + page_size);
+  tracker.UntrackMemory(base, page_size * 4);
+  Release(memory);
+  Check(completed_during_fault && clean.load(std::memory_order_relaxed),
+        "dirty queries waited for a write fault in the same region");
+  Check(fault_dirtied, "write fault did not dirty its page");
 }
 
 void TestGpuUnmarkUsesRegionMask() {
@@ -1048,6 +1111,13 @@ void TestFullRegionGpuUnmarkBatching() {
     Libs::Graphics::TrackingSpinLock lock;
     lock.lock();
     lock.lock();
+  } else if (std::strcmp(name, "overlapping-gpu-dirty-owners") == 0) {
+    tracker.ForEachUploadRange(
+        address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept {
+          std::thread worker([&] { tracker.UnmarkRegionAsGpuModified(address, page_size); });
+          worker.join();
+        });
   } else if (std::strcmp(name, "non-owner-tracking-unlock") == 0) {
     Libs::Graphics::TrackingSpinLock lock;
     lock.lock();
@@ -1114,6 +1184,9 @@ void TestFatalPaths() {
                            "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
     CheckDeathCase(name);
   }
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+  CheckDeathCase("overlapping-gpu-dirty-owners");
+#endif
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -1212,6 +1285,7 @@ int main(int argc, char **argv) {
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
+  TestQueriesDoNotWaitForWriteFault();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();

@@ -378,6 +378,7 @@ struct EmitterState {
 	ComputeExecutionPlan compute_execution;
 	IR::F64Certificate f64_certificate;
 	bool storage_buffer_nonuniform_indexing = false;
+	bool sampled_image_nonuniform_indexing = false;
 	// SSA metadata selected by the bounded table's validated candidate switch.
 	// Nonzero only while emitting one shared buffer instruction.
 	uint32_t dynamic_buffer_index = 0;
@@ -662,6 +663,7 @@ uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
+uint32_t MakeSampledImageWithSamplerIndex(EmitterState& state, uint32_t resource, uint32_t sampler_index);
 
 uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
 

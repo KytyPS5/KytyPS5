@@ -1,5 +1,26 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 03:32 UTC** (bounded independent sampler indexing proved):
+
+- Original5178/sourceebf81d71/EXE452ce run025503 passes PS07b3 resource
+  materialization and SPIR-V validation:1203794 ->973501 words. Its graphics
+  pipeline creation does not complete before32GiB process memory guard;
+  timedOut=false, memoryGuard=true, closeRequested=true, forcedCleanup=true,
+  exit=-1 at03:23:16.681UTC. Supervisor minimum RAM13.46GiB covers its active
+  monitoring loop; independent read during close grace saw about8.25GiB.
+  Loading arc/black captures only; no menu/gameplay or issue108 post.
+- Shared emitter change uses an integer sampler-array index only for an
+  enabled shaderSampledImageArrayNonUniformIndexing logical-device feature.
+  Unknown/disabled profiles retain the validated switch path. All mappings,
+  sampler states, numerical classes and device/compiler quotas are preserved.
+  CPU RED032438 (expected3 sample operations, got11) -> same GREEN032629.
+  GPUAV032803 passes nine numeric cases including three forced fallbacks,
+  full T# and full wave32/64 backing. Registered GPUAV032942 PASS6/6 with
+  explicit indexed-path capability/count checks; ctest-details.log retained.
+- Next: separate local fix commit, native build, backup installed EXE/full
+  warmed cache, original-game retry under3600s/32GiB/8GiB reserve. Check the
+  system memory reserve during close grace too. No push; menu/entry pending.
+
 Checkpoint **2026-10-10 02:54 UTC** (compact independent use topology proved):
 
 - Native source1272580a / EXEfeb412 / original5178 run

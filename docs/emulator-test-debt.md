@@ -1,5 +1,31 @@
 # Emulator regression test debt
 
+## Independent sampler indexing without Cartesian sample instructions (2026-10-10)
+
+Original5178/sourceebf81d71/EXE452ce run025503 passes PS07b3 materialization
+and SPIR-V validation (1203794 ->973501 words), then exceeds32GiB while
+the driver creates its graphics pipeline. Supervisor memoryGuard=true,
+timeout=false; close grace expires and owned process is killed at03:23:16.681UTC.
+No menu/gameplay. Required bounded CPU RED: on an explicitly enabled sampled
+descriptor nonuniform-indexing host profile, independently selected samplers
+must not multiply sample instructions per image. Same numeric GPU oracles,
+NonUniform validation, mixed-class descriptor mapping, OOB/default keys and
+unsupported-feature fallback. Preserve all actual descriptors and quotas.
+Contract: Vulkan shaderSampledImageArrayNonUniformIndexing includes separate
+sampler arrays: https://docs.vulkan.org/spec/latest/chapters/interfaces.html .
+
+Completed locally: CPU RED032438 expects three sample operations but gets11;
+same GREEN032629, with disabled/unknown profiles validating the fallback.
+The RED adds only a disabled profile metadata field/test seam before emitter
+changes. Optional logical-device feature enabled only when advertised; shader
+profile and diagnostics record actual enablement. Integer index selection,
+bounded descriptor mappings and NonUniform sampler/sample annotations avoid
+opaque-object phi nodes and preserve class-specific operands. GPUAV032803
+passes nine numeric cases (three also force the fallback), full T# and full
+wave32/64 backing. Registered GPUAV032942 PASS6/6; saved ctest-details.log
+confirms sampled indexing enabled=1 and three sampling operations per image
+set. Native emulator rebuild and large original-game pipeline retry pending.
+
 ## Compact independent sampled-use topology (2026-10-10)
 
 Original5178 / source1272580a / EXEfeb412 run023009 naturally exits321

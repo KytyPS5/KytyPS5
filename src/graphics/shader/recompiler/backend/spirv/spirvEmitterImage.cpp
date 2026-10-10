@@ -1101,7 +1101,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    image.independent_sampler_mapping_offset, image.independent_sampler_search_iterations);
 		}
 		uint32_t sample_exit_label = 0u;
-		const auto EmitOneSample = [&](uint32_t resource, uint32_t forced_sampler = UINT32_MAX) {
+		const auto EmitOneSample = [&](uint32_t resource, uint32_t forced_sampler = UINT32_MAX,
+		                                uint32_t dynamic_sampler_index = 0u) {
 			const auto& selected_image = state.program.info.images[resource];
 			const auto candidate_dimension = selected_image.dimension;
 			const auto& candidate_dimension_info = ImageDimensionInfoFor(candidate_dimension);
@@ -1137,9 +1138,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				    AddressF32(ctx, mem, *address, candidate_layout.bias));
 			}
 			const auto candidate_sampler = state.program.info.images[resource].indirect_sampler;
-			const auto sampled = MakeSampledImage(state, resource,
-			    forced_sampler != UINT32_MAX ? forced_sampler
-			        : candidate_sampler != UINT32_MAX ? candidate_sampler : mem.sampler);
+			const auto sampled = dynamic_sampler_index != 0u
+			    ? MakeSampledImageWithSamplerIndex(state, resource, dynamic_sampler_index)
+			    : MakeSampledImage(state, resource,
+			        forced_sampler != UINT32_MAX ? forced_sampler
+			            : candidate_sampler != UINT32_MAX ? candidate_sampler : mem.sampler);
 			const auto candidate_result_type =
 			    dref && !use_manual_compare
 			        ? TypeF32(state)
@@ -1177,6 +1180,22 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			// as before; valid images retain each independently selected sampler state.
 			if (resource == mem.resource || samplers.size() == 1u)
 				return EmitOneSample(resource, samplers[0]);
+			if (state.sampled_image_nonuniform_indexing) {
+				// Select an integer array index, never merge opaque sampler objects.
+				// Class-specific resources have already been validated/materialized.
+				auto array_index = ConstantU32(state, ResourceForDescriptor(
+				    state, IR::DescriptorBindingKind::Samplers, samplers[0]));
+				for (uint32_t ordinal = 1u; ordinal < samplers.size(); ++ordinal) {
+					const auto matches = Binary(state, OpIEqual, TypeBool(state),
+					    independent_sampler, ConstantU32(state, ordinal));
+					const auto selected = state.builder.AllocateId();
+					state.builder.AddFunction({OpSelect, TypeU32(state), selected, matches,
+					    ConstantU32(state, ResourceForDescriptor(
+					        state, IR::DescriptorBindingKind::Samplers, samplers[ordinal])), array_index});
+					array_index = selected;
+				}
+				return EmitOneSample(resource, UINT32_MAX, array_index);
+			}
 			const auto default_sampler_label = state.builder.AllocateId();
 			const auto sampler_merge = state.builder.AllocateId();
 			std::vector<uint32_t> sampler_labels(samplers.size() - 1u);

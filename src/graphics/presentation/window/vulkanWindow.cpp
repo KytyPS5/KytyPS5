@@ -570,6 +570,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	physical_device.getFeatures2(&indexing_query);
 	features12.shaderStorageBufferArrayNonUniformIndexing =
 	    optional_features12.shaderStorageBufferArrayNonUniformIndexing;
+	features12.shaderSampledImageArrayNonUniformIndexing =
+	    optional_features12.shaderSampledImageArrayNonUniformIndexing;
 	const bool shader_fma_ext_enabled =
 	    HasExtension(device_extensions, VK_KHR_SHADER_FMA_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderFmaFeaturesKHR supported_fma {};
@@ -724,7 +726,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.shader_host_profile = QueryShaderHostProfile(
 	    physical_device, device_features.shaderFloat64 == VK_TRUE,
 	    fma_features.shaderFmaFloat64 == VK_TRUE,
-	    features12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE);
+	    features12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE,
+	    features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE);
 	LOGF("Vulkan shader FP64: enabled=%d fused_fma=%d rte64=%d rte32=%d signed_zero_inf_nan=%d\n",
 	     graphics.shader_host_profile.float64, graphics.shader_host_profile.fma_float64,
 	     graphics.shader_host_profile.rte_float64, graphics.shader_host_profile.rte_float32,

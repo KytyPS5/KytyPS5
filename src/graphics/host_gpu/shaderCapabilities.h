@@ -9,7 +9,8 @@ namespace Libs::Graphics {
 // Pass enabled logical-device features, not merely advertised availability.
 inline ShaderRecompiler::ShaderHostProfile QueryShaderHostProfile(
     vk::PhysicalDevice physical_device, bool float64_enabled, bool fma_float64_enabled,
-    bool storage_buffer_nonuniform_indexing_enabled = false) {
+    bool storage_buffer_nonuniform_indexing_enabled = false,
+    bool sampled_image_nonuniform_indexing_enabled = false) {
 	vk::PhysicalDeviceFloatControlsProperties controls {};
 	vk::PhysicalDeviceProperties2 properties {};
 	properties.pNext = &controls;
@@ -23,6 +24,7 @@ inline ShaderRecompiler::ShaderHostProfile QueryShaderHostProfile(
 	    .signed_zero_inf_nan_preserve_float64 =
 	        controls.shaderSignedZeroInfNanPreserveFloat64 == VK_TRUE,
 	    .storage_buffer_nonuniform_indexing = storage_buffer_nonuniform_indexing_enabled,
+	    .sampled_image_nonuniform_indexing = sampled_image_nonuniform_indexing_enabled,
 	};
 }
 

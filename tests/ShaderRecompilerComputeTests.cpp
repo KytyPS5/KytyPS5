@@ -1408,6 +1408,7 @@ struct TestCase {
   size_t storage_buffer_range_dwords = 0;
   bool use_descriptor_buffer_ranges = false;
   bool force_specialized_buffer_access = false;
+  bool force_specialized_sampler_access = false;
   bool check_shared_buffer_access = false;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
@@ -1739,6 +1740,8 @@ CompiledShader CompileCase(const TestCase &test,
   options.host_profile = host_profile;
   if (test.force_specialized_buffer_access)
     options.host_profile.storage_buffer_nonuniform_indexing = false;
+  if (test.force_specialized_sampler_access)
+    options.host_profile.sampled_image_nonuniform_indexing = false;
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
 
@@ -21918,6 +21921,8 @@ private:
     device_features12.shaderOutputLayer = true;
     device_features12.shaderStorageBufferArrayNonUniformIndexing =
         available_features12.shaderStorageBufferArrayNonUniformIndexing;
+    device_features12.shaderSampledImageArrayNonUniformIndexing =
+        available_features12.shaderSampledImageArrayNonUniformIndexing;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -22011,7 +22016,8 @@ private:
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_shader_host_profile = QueryShaderHostProfile(m_physical_device,
         device_features.shaderFloat64 == VK_TRUE, enabled_fma.shaderFmaFloat64 == VK_TRUE,
-        device_features12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE);
+        device_features12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE,
+        device_features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE);
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -51379,14 +51385,53 @@ if (argc == 1) {
     std::puts("KYTY_COMBINED_NATIVE_IMAGE_CAPACITY_GPU_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--independent-sampler-code-size-only") == 0) {
+    ShaderRecompiler::ShaderHostProfile profile{};
+    profile.known = true;
+    profile.sampled_image_nonuniform_indexing = true;
+    for (u32 independent : {1u, 2u, 3u}) {
+      auto test = MakeImageSampleDynamicMaterials(
+          MaterialImageSampleMode::CompactDynamicSampler, false, 0u, independent);
+      test.spirv_counts = {{"OpImageSample", 3u}};
+      CompileCase(test, {}, profile);
+      test.spirv_counts.clear();
+      test.forbidden_spirv = {"SampledImageArrayNonUniformIndexing"};
+      profile.sampled_image_nonuniform_indexing = false;
+      CompileCase(test, {}, profile);
+      profile.known = false;
+      profile.sampled_image_nonuniform_indexing = true;
+      CompileCase(test, {}, profile);
+      profile.known = true;
+    }
+    std::puts("KYTY_INDEPENDENT_SAMPLER_CODE_SIZE_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--independent-inline-sampled-sources-only") == 0) {
     VulkanHarness vulkan;
-    for (u32 independent : {1u, 2u, 3u})
-      RunCase(&vulkan, MakeImageSampleDynamicMaterials(
-          MaterialImageSampleMode::CompactDynamicSampler, false, 0u, independent));
+    const bool indexed = vulkan.HostProfile().known &&
+        vulkan.HostProfile().sampled_image_nonuniform_indexing;
+    std::printf("independent sampler nonuniform indexing enabled=%u\n", indexed);
+    const auto expect_indexed = [&](TestCase& test) {
+      if (!indexed) return;
+      test.spirv_counts = {{"OpImageSample", 3u}};
+      test.required_spirv.push_back("SampledImageArrayNonUniformIndexing");
+      test.required_spirv.push_back("NonUniform");
+    };
+    for (u32 independent : {1u, 2u, 3u}) {
+      auto test = MakeImageSampleDynamicMaterials(
+          MaterialImageSampleMode::CompactDynamicSampler, false, 0u, independent);
+      expect_indexed(test);
+      RunCase(&vulkan, test);
+      test.force_specialized_sampler_access = true;
+      test.spirv_counts.clear();
+      test.required_spirv.clear();
+      test.forbidden_spirv.push_back("SampledImageArrayNonUniformIndexing");
+      RunCase(&vulkan, test);
+    }
     auto full_descriptor = MakeImageSampleDynamicMaterials(
         MaterialImageSampleMode::FullStaticSampler, false, 0u, 3u);
     full_descriptor.name = "IndependentInlineSamplerFullImageDescriptor";
+    expect_indexed(full_descriptor);
     RunCase(&vulkan, full_descriptor);
     for (u32 wave : {32u, 64u}) {
       auto full = MakeImageSampleDynamicMaterials(
@@ -51394,6 +51439,7 @@ if (argc == 1) {
       full.name = wave == 32u ? "IndependentInlineSamplerFullWave32"
                              : "IndependentInlineSamplerFullWave64";
       full.compute_info.wave_size = wave;
+      expect_indexed(full);
       RunCase(&vulkan, full);
     }
     std::puts("KYTY_INDEPENDENT_INLINE_SAMPLED_SOURCES_GPU_PASS");

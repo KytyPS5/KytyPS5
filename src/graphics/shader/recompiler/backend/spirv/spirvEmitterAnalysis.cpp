@@ -217,6 +217,31 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 	return sampled_image;
 }
 
+uint32_t MakeSampledImageWithSamplerIndex(EmitterState& state, uint32_t resource,
+                                         uint32_t sampler_index) {
+	EXIT_IF(!state.sampled_image_nonuniform_indexing || state.sampler_variable == 0u);
+	state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+	state.builder.RequireCapability(spv::CapabilityShaderNonUniformEXT);
+	state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexingEXT);
+	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
+	const auto pointer_type = state.builder.Type(
+	    spv::OpTypePointer, spv::StorageClassUniformConstant, sampler_type);
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer,
+	                          state.sampler_variable, sampler_index);
+	state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniformEXT);
+	const auto sampler = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, sampler_type, sampler, pointer);
+	state.builder.AddAnnotation(spv::OpDecorate, sampler, spv::DecorationNonUniformEXT);
+	const auto image = LoadSampledImageDescriptor(state, resource);
+	const auto sampled = state.builder.AllocateId();
+	const auto sampled_type = state.builder.Type(
+	    spv::OpTypeSampledImage, ImageType(state, state.program.info.images.at(resource)));
+	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled, image, sampler);
+	state.builder.AddAnnotation(spv::OpDecorate, sampled, spv::DecorationNonUniformEXT);
+	return sampled;
+}
+
 uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource) {
 	const auto& image = state.program.info.images.at(resource);
 	EXIT_IF(image.resource_class != IR::ImageResourceClass::Storage);

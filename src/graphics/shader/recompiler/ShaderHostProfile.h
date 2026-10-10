@@ -13,6 +13,7 @@ struct ShaderHostProfile {
 	bool rte_float32                               = false;
 	bool signed_zero_inf_nan_preserve_float64       = false;
 	bool storage_buffer_nonuniform_indexing         = false;
+	bool sampled_image_nonuniform_indexing          = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler

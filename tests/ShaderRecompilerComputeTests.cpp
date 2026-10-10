@@ -205,6 +205,12 @@ struct ImageTestAccess {
                            uint64_t capacity) {
     return Image::CopyRows(row_size, rows, capacity);
   }
+  static uint32_t CopyExtent(uint32_t source, uint32_t destination,
+                             uint32_t source_block,
+                             uint32_t destination_block) {
+    return Image::CopyExtent(source, destination, source_block,
+                             destination_block);
+  }
 };
 
 struct TileManagerTestAccess {
@@ -38778,6 +38784,30 @@ void CheckImageTransitionState(RenderContext &renderer) {
           ImageTestAccess::CopyRows(32ull << 10, 4097, copy_capacity) == 4096 &&
           ImageTestAccess::CopyRows(copy_capacity + 4, 1, copy_capacity) == 0,
       "buffered image copy does not split at the fixed scratch capacity");
+  Require(name, "image copy extent stays inside both images",
+          ImageTestAccess::CopyExtent(475, 455, 1, 1) == 455 &&
+              ImageTestAccess::CopyExtent(455, 475, 1, 1) == 455 &&
+              ImageTestAccess::CopyExtent(64, 64, 4, 4) == 64 &&
+              ImageTestAccess::CopyExtent(64, 16, 4, 1) == 64 &&
+              ImageTestAccess::CopyExtent(64, 8, 4, 1) == 32 &&
+              ImageTestAccess::CopyExtent(16, 64, 1, 4) == 16 &&
+              ImageTestAccess::CopyExtent(16, 32, 1, 4) == 8 &&
+              ImageTestAccess::CopyExtent(1, 2, 1, 4) == 0 &&
+              ImageTestAccess::CopyExtent(8, 8, 0, 1) == 0,
+          "image-to-image copy extent can exceed the smaller image");
+  Require(name, "compressed image copy extent ends on a block or an edge",
+          ImageTestAccess::CopyExtent(475, 455, 4, 4) == 452 &&
+              ImageTestAccess::CopyExtent(455, 475, 4, 4) == 452 &&
+              ImageTestAccess::CopyExtent(455, 455, 4, 4) == 455 &&
+              ImageTestAccess::CopyExtent(475, 456, 4, 4) == 456 &&
+              ImageTestAccess::CopyExtent(2, 2, 4, 4) == 2 &&
+              ImageTestAccess::CopyExtent(3, 2, 4, 4) == 0 &&
+              ImageTestAccess::CopyExtent(2, 3, 4, 4) == 0 &&
+              ImageTestAccess::CopyExtent(7, 2, 4, 1) == 7 &&
+              ImageTestAccess::CopyExtent(9, 2, 4, 1) == 8 &&
+              ImageTestAccess::CopyExtent(1, 1, 4, 1) == 1 &&
+              ImageTestAccess::CopyExtent(200, 455, 1, 4) == 113,
+          "compressed image copy extent splits a block inside an image");
 
   Image image(context, scheduler, MakeInfo(vk::Format::eR8Unorm, 2, 3));
   auto barriers =

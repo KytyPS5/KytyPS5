@@ -88,6 +88,7 @@ public:
 	void  DeleteDescriptor(int d);
 	File* GetFile(int d);
 	File* GetFile(const std::filesystem::path& real_name);
+	bool  FlushWritable(const std::filesystem::path& real_name);
 	void  CloseAll();
 
 private:
@@ -237,6 +238,23 @@ File* FileDescriptors::GetFile(const std::filesystem::path& real_name) {
 	}
 
 	return nullptr;
+}
+
+bool FileDescriptors::FlushWritable(const std::filesystem::path& real_name) {
+	Common::LockGuard lock(m_mutex);
+
+	bool ok = true;
+	for (auto* f: m_files) {
+		if (f != nullptr && f->real_name == real_name) {
+			Common::LockGuard file_lock(f->mutex);
+			if (f->opened && f->writable && !f->directory && f->special == SpecialFile::None &&
+			    !f->f.IsInvalid()) {
+				ok = f->f.Flush() && ok;
+			}
+		}
+	}
+
+	return ok;
 }
 
 void FileDescriptors::CloseAll() {
@@ -574,11 +592,16 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	EXIT_IF(!file->opened);
 
-	if (!file->directory && file->special == SpecialFile::None) {
-		file->f.Close();
-	}
+	{
+		// Wait for an operation that holds the file lock, such as KernelFsync, before closing.
+		Common::LockGuard lock(file->mutex);
 
-	file->opened = false;
+		if (!file->directory && file->special == SpecialFile::None) {
+			file->f.Close();
+		}
+
+		file->opened = false;
+	}
 
 	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
 
@@ -1234,6 +1257,47 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 
 	LOGF("\tFtruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(file->real_name).c_str());
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
+	PRINT_NAME();
+
+	if (path == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+
+	if (length < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto real_file_name = g_mount_points->ResolvePath(path);
+	if (Common::IsArchivePath(real_file_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
+
+	if (Common::File::IsDirectoryExisting(real_file_name)) {
+		return KERNEL_ERROR_EISDIR;
+	}
+
+	if (real_file_name.empty() || !Common::File::IsFileExisting(real_file_name)) {
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	if (!g_files->FlushWritable(real_file_name)) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	// Resize by path so that only write access is needed. Common::File has no write-only mode
+	// that keeps the contents on every host (the POSIX backend opens Mode::Write with "r+").
+	std::error_code error;
+	std::filesystem::resize_file(real_file_name, static_cast<uintmax_t>(length), error);
+	if (error) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tTruncate (size = %" PRId64 ") file: %s\n", length, path);
 
 	return OK;
 }

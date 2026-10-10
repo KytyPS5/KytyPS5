@@ -287,6 +287,115 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
 }
 
+void TestTruncate(const std::filesystem::path &root) {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "truncate exports resolve");
+    return symbol->vaddr;
+  };
+  using Truncate = int (KYTY_SYSV_ABI *)(const char *, int64_t);
+  using Ftruncate = int (KYTY_SYSV_ABI *)(int, int64_t);
+  const auto truncate_path = reinterpret_cast<Truncate>(find("WlyEA-sLDf0"));
+  const auto truncate_fd = reinterpret_cast<Ftruncate>(find("VW3TVZiM4-E"));
+  constexpr char Path[] = "/savedata0/truncate.dat";
+  constexpr char Payload[] = "truncate payload";
+  FileSystem::FileStat stat {};
+
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload)) == sizeof(Payload),
+        "create truncate fixture");
+  Check(truncate_fd(fd, 4) == OK && FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_size == 4,
+        "sceKernelFtruncate shrinks an open file");
+  Check(truncate_path(Path, 32) == OK && FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_size == 32,
+        "sceKernelTruncate extends a file that is open for writing");
+  Check(FileSystem::KernelClose(fd) == OK, "close truncate fixture");
+
+  Check(truncate_path(Path, 2) == OK && FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_size == 2,
+        "sceKernelTruncate shrinks a closed file");
+  std::array<char, 4> bytes {};
+  const int reader = FileSystem::KernelOpen(Path, 0, 0);
+  Check(reader >= 3 && FileSystem::KernelRead(reader, bytes.data(), bytes.size()) == 2 &&
+            std::memcmp(bytes.data(), Payload, 2) == 0,
+        "sceKernelTruncate keeps the leading bytes");
+  Check(FileSystem::KernelClose(reader) == OK, "close truncate reader");
+
+  Check(truncate_path(nullptr, 0) == Kernel::KERNEL_ERROR_EFAULT &&
+            truncate_path(Path, -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            truncate_path("/savedata0/missing.dat", 0) == Kernel::KERNEL_ERROR_ENOENT &&
+            truncate_path("/savedata0", 0) == Kernel::KERNEL_ERROR_EISDIR,
+        "sceKernelTruncate rejects invalid arguments");
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 2,
+        "rejected truncations leave the file untouched");
+
+  constexpr char OldPath[] = "/savedata0/truncate-old.dat";
+  constexpr char MovedPath[] = "/savedata0/truncate-moved.dat";
+  const int moved = FileSystem::KernelOpen(OldPath, 0x602, 0777);
+  Check(moved >= 3 && FileSystem::KernelWrite(moved, "0123456789", 10) == 10 &&
+            FileSystem::KernelRename(OldPath, MovedPath) == OK,
+        "rename an open truncate fixture");
+  const int replacement = FileSystem::KernelOpen(OldPath, 0x602, 0777);
+  Check(replacement >= 3 && FileSystem::KernelWrite(replacement, "abcdefgh", 8) == 8 &&
+            FileSystem::KernelClose(replacement) == OK,
+        "create a replacement at the old path");
+  Check(truncate_path(OldPath, 3) == OK && FileSystem::KernelStat(OldPath, &stat) == OK &&
+            stat.st_size == 3,
+        "sceKernelTruncate resizes the file currently at the path");
+  Check(FileSystem::KernelClose(moved) == OK && FileSystem::KernelStat(MovedPath, &stat) == OK &&
+            stat.st_size == 10,
+        "sceKernelTruncate leaves a renamed open file alone");
+
+  // sceKernelTruncate flushes the writable descriptors for the path. Another
+  // thread keeps closing and reopening one of them, and every truncation must
+  // still succeed without touching a closed host file.
+  constexpr char RacePath[] = "/savedata0/truncate-race.dat";
+  std::atomic_bool closer_done {false};
+  std::atomic_int unexpected {0};
+  std::thread closer([&] {
+    for (int i = 0; i < 2000; ++i) {
+      const int d = FileSystem::KernelOpen(RacePath, 0x602, 0777);
+      if (d < 3 || FileSystem::KernelWrite(d, Payload, 7) != 7 ||
+          FileSystem::KernelClose(d) != OK) {
+        ++unexpected;
+      }
+    }
+    closer_done = true;
+  });
+  while (!closer_done) {
+    const int result = truncate_path(RacePath, 3);
+    if (result != OK && result != Kernel::KERNEL_ERROR_ENOENT) {
+      ++unexpected;
+    }
+  }
+  closer.join();
+  Check(unexpected == 0, "sceKernelTruncate races a concurrent close safely");
+
+  // Truncation needs write access only. Skip the check where the host still
+  // lets the file be read (Windows, or running as root).
+  constexpr char WriteOnlyPath[] = "/savedata0/truncate-write-only.dat";
+  const auto write_only = root / "truncate-write-only.dat";
+  const int wo = FileSystem::KernelOpen(WriteOnlyPath, 0x602, 0777);
+  Check(wo >= 3 && FileSystem::KernelWrite(wo, "0123456789", 10) == 10 &&
+            FileSystem::KernelClose(wo) == OK,
+        "create the write-only truncate fixture");
+  std::filesystem::permissions(write_only, std::filesystem::perms::owner_write,
+                               std::filesystem::perm_options::replace);
+  const bool readable =
+      !Common::File(write_only, Common::File::Mode::Read).IsInvalid();
+  if (!readable) {
+    Check(truncate_path(WriteOnlyPath, 4) == OK &&
+              std::filesystem::file_size(write_only) == 4,
+          "sceKernelTruncate resizes a write-only file");
+  }
+  std::filesystem::permissions(write_only, std::filesystem::perms::owner_all,
+                               std::filesystem::perm_options::replace);
+}
+
 void TestAioBatches() {
   namespace Kernel = Libs::LibKernel;
   Loader::SymbolDatabase symbols;
@@ -701,6 +810,8 @@ void CheckArchiveMount(const std::filesystem::path &root) {
             FileSystem::KernelMkdir("/app0/new-dir", 0777) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
             FileSystem::KernelRmdir("/app0/assets") == Libs::LibKernel::KERNEL_ERROR_EROFS &&
             FileSystem::KernelRename(GuestMember, "/app0/renamed.bin") ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelTruncate(GuestMember, 0) ==
                 Libs::LibKernel::KERNEL_ERROR_EROFS,
         "archive mount rejects path mutations");
   FileSystem::Umount("/app0");
@@ -1726,6 +1837,7 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestTruncate(temporary.Path());
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

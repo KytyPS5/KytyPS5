@@ -6,6 +6,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,7 @@ struct DialogState {
 std::mutex  g_dialog_mutex;
 DialogState g_error;
 DialogState g_signin;
+DialogState g_save_list;
 uint64_t    g_dialog_generation        = 0;
 uint64_t    g_dialog_revision          = 0;
 int32_t     g_error_code               = 0;
@@ -49,12 +51,30 @@ void SetDialogStatus(DialogState& dialog, int status, std::unique_lock<std::mute
 	}
 }
 
+struct SaveListSession {
+	SystemDialog::SaveListSnapshot                                         list;
+	std::vector<std::array<uint8_t, SaveDataDialog::SAVE_DATA_PARAM_SIZE>> params;
+	std::vector<bool>                                                      has_param;
+	bool                                                                   completed = false;
+	bool                                                                   cancelled = false;
+	int32_t                                                                choice    = -1;
+};
+
+SaveListSession                  g_save_session;
+SaveDataDialog::SaveInfoProvider g_save_info_provider = nullptr;
+
+void FinishSaveList(int32_t choice, bool cancelled, std::unique_lock<std::mutex>& lock);
+
 } // namespace
 
 namespace SystemDialog {
 
 bool GetHostSnapshot(HostSnapshot* snapshot) {
 	std::scoped_lock lock(g_dialog_mutex);
+	if (g_save_list.status == DIALOG_STATUS_RUNNING) {
+		*snapshot = {Kind::SaveList, g_save_list.generation, 0};
+		return true;
+	}
 	if (g_signin.status == DIALOG_STATUS_RUNNING) {
 		*snapshot = {Kind::Signin, g_signin.generation, 0};
 		return true;
@@ -66,10 +86,21 @@ bool GetHostSnapshot(HostSnapshot* snapshot) {
 	return false;
 }
 
+bool GetSaveListSnapshot(SaveListSnapshot* snapshot) {
+	std::scoped_lock lock(g_dialog_mutex);
+	if (g_save_list.status != DIALOG_STATUS_RUNNING) {
+		return false;
+	}
+	*snapshot            = g_save_session.list;
+	snapshot->generation = g_save_list.generation;
+	return true;
+}
+
 VisualState GetVisualState() noexcept {
 	std::scoped_lock lock(g_dialog_mutex);
-	const bool       signin = g_signin.status == DIALOG_STATUS_RUNNING;
-	return {g_error.status == DIALOG_STATUS_RUNNING || signin, signin, g_dialog_revision};
+	const bool       background =
+	    g_signin.status == DIALOG_STATUS_RUNNING || g_save_list.status == DIALOG_STATUS_RUNNING;
+	return {g_error.status == DIALOG_STATUS_RUNNING || background, background, g_dialog_revision};
 }
 
 void SetVisibilityCallback(void (*callback)()) {
@@ -77,9 +108,27 @@ void SetVisibilityCallback(void (*callback)()) {
 	g_dialog_visibility_callback = callback;
 }
 
+bool HostSelectSave(uint64_t generation, int32_t entry) {
+	std::unique_lock lock(g_dialog_mutex);
+	if (g_save_list.status != DIALOG_STATUS_RUNNING || generation != g_save_list.generation ||
+	    entry >= static_cast<int32_t>(g_save_session.list.entries.size()) ||
+	    (entry < 0 && !g_save_session.list.has_new_item)) {
+		return false;
+	}
+	FinishSaveList(entry, false, lock);
+	return true;
+}
+
 bool HostClose(uint64_t generation) {
 	std::unique_lock lock(g_dialog_mutex);
-	auto&            dialog = g_signin.status == DIALOG_STATUS_RUNNING ? g_signin : g_error;
+	if (g_save_list.status == DIALOG_STATUS_RUNNING) {
+		if (generation != g_save_list.generation) {
+			return false;
+		}
+		FinishSaveList(-1, true, lock);
+		return true;
+	}
+	auto& dialog = g_signin.status == DIALOG_STATUS_RUNNING ? g_signin : g_error;
 	if (dialog.status != DIALOG_STATUS_RUNNING || generation != dialog.generation) {
 		return false;
 	}
@@ -394,7 +443,9 @@ constexpr int SAVE_STATUS_INITIALIZED = 1;
 constexpr int SAVE_STATUS_RUNNING     = 2;
 constexpr int SAVE_STATUS_FINISHED    = 3;
 constexpr int SAVE_RESULT_OK          = 0;
+constexpr int SAVE_RESULT_CANCELED    = 1;
 constexpr int SAVE_BUTTON_ID_OK       = 1;
+constexpr int SAVE_MODE_LIST          = 1;
 
 struct SaveDataDialogParam {
 	uint8_t  base_param[48];
@@ -418,12 +469,21 @@ struct SaveDataDirName {
 	char data[32];
 };
 
+struct SaveDataDialogNewItem {
+	const char* title;
+	void*       icon_buf;
+	size_t      icon_size;
+	uint8_t     reserved[32];
+};
+
 struct SaveDataDialogItems {
-	int32_t                user_id;
-	int32_t                pad0;
-	const void*            title_id;
-	const SaveDataDirName* dir_names;
-	uint32_t               dir_names_num;
+	int32_t                      user_id;
+	int32_t                      pad0;
+	const char*                  title_id;
+	const SaveDataDirName*       dir_names;
+	uint32_t                     dir_names_num;
+	uint32_t                     pad1;
+	const SaveDataDialogNewItem* new_item;
 };
 
 struct SaveDataDialogResult {
@@ -443,9 +503,72 @@ static int              g_save_mode           = 0;
 static void*            g_save_user_data      = nullptr;
 static char             g_save_dir_name[sizeof(SaveDataDirName::data)] {};
 
+void SetSaveInfoProvider(SaveInfoProvider provider) {
+	std::scoped_lock lock(g_dialog_mutex);
+	g_save_info_provider = provider;
+}
+
+static void ResetSaveList() {
+	std::unique_lock lock(g_dialog_mutex);
+	g_save_session = {};
+	if (g_save_list.status == DIALOG_STATUS_RUNNING) {
+		SetDialogStatus(g_save_list, DIALOG_STATUS_FINISHED, lock);
+	}
+}
+
+// A list dialog waits for the user in the system overlay; without one it finishes on its own.
+static bool OpenSaveList(const SaveDataDialogParam& p) {
+	const auto* items = static_cast<const SaveDataDialogItems*>(p.items);
+	if (p.mode != SAVE_MODE_LIST || items == nullptr) {
+		return false;
+	}
+	SaveListSession session;
+	session.list.display_type = p.disp_type;
+	if (items->new_item != nullptr) {
+		session.list.has_new_item = true;
+		session.list.new_item_title =
+		    items->new_item->title != nullptr ? items->new_item->title : "New Saved Data";
+	}
+	std::unique_lock lock(g_dialog_mutex);
+	if (g_dialog_visibility_callback == nullptr) {
+		return false;
+	}
+	for (uint32_t i = 0; items->dir_names != nullptr && i < items->dir_names_num; i++) {
+		const auto* name = items->dir_names[i].data;
+		if (std::memchr(name, '\0', sizeof(SaveDataDirName::data)) == nullptr || name[0] == '\0') {
+			continue;
+		}
+		SystemDialog::SaveListEntry               entry;
+		std::array<uint8_t, SAVE_DATA_PARAM_SIZE> param {};
+		bool                                      has_param = false;
+		entry.dir_name                                      = name;
+		if (g_save_info_provider != nullptr) {
+			if (!g_save_info_provider(items->user_id, items->title_id, name, &entry,
+			                          param.data())) {
+				continue;
+			}
+			has_param = true;
+		}
+		if (entry.title.empty()) {
+			entry.title = name;
+		}
+		session.list.entries.push_back(std::move(entry));
+		session.params.push_back(param);
+		session.has_param.push_back(has_param);
+	}
+	if (session.list.entries.empty() && !session.list.has_new_item) {
+		return false;
+	}
+	g_save_session = std::move(session);
+	g_save_status  = SAVE_STATUS_RUNNING;
+	SetDialogStatus(g_save_list, DIALOG_STATUS_RUNNING, lock);
+	return true;
+}
+
 int KYTY_SYSV_ABI SaveDataDialogInitialize() {
 	PRINT_NAME();
 
+	ResetSaveList();
 	g_save_status         = SAVE_STATUS_INITIALIZED;
 	g_save_running_polled = false;
 	g_save_mode           = 0;
@@ -464,6 +587,12 @@ int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	PRINT_NAME();
 
+	{
+		std::scoped_lock lock(g_dialog_mutex);
+		if (g_save_list.status == DIALOG_STATUS_RUNNING) {
+			return SAVE_STATUS_RUNNING;
+		}
+	}
 	// Some games require a RUNNING update before FINISHED.
 	if (g_save_status == SAVE_STATUS_RUNNING) {
 		if (g_save_running_polled) {
@@ -484,7 +613,23 @@ int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 		r->result    = SAVE_RESULT_OK;
 		r->button_id = SAVE_BUTTON_ID_OK;
 		r->user_data = g_save_user_data;
-		if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
+		std::scoped_lock lock(g_dialog_mutex);
+		if (g_save_session.completed) {
+			const auto& session = g_save_session;
+			r->result           = session.cancelled ? SAVE_RESULT_CANCELED : SAVE_RESULT_OK;
+			if (r->dir_name != nullptr) {
+				auto* dir_name = static_cast<SaveDataDirName*>(r->dir_name);
+				std::memset(dir_name->data, 0, sizeof(dir_name->data));
+				if (!session.cancelled && session.choice >= 0) {
+					std::snprintf(dir_name->data, sizeof(dir_name->data), "%s",
+					              session.list.entries[session.choice].dir_name.c_str());
+				}
+			}
+			if (r->param != nullptr && !session.cancelled && session.choice >= 0 &&
+			    session.has_param[session.choice]) {
+				std::memcpy(r->param, session.params[session.choice].data(), SAVE_DATA_PARAM_SIZE);
+			}
+		} else if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
 			std::snprintf(static_cast<SaveDataDirName*>(r->dir_name)->data,
 			              sizeof(SaveDataDirName::data), "%s", g_save_dir_name);
 		}
@@ -496,6 +641,7 @@ int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 	PRINT_NAME();
 
+	ResetSaveList();
 	const auto* p = static_cast<const SaveDataDialogParam*>(param);
 	if (p != nullptr) {
 		g_save_mode        = p->mode;
@@ -527,8 +673,10 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 		}
 	}
 
-	g_save_status         = SAVE_STATUS_RUNNING;
 	g_save_running_polled = false;
+	if (p == nullptr || !OpenSaveList(*p)) {
+		g_save_status = SAVE_STATUS_RUNNING;
+	}
 
 	return OK;
 }
@@ -538,6 +686,12 @@ int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
 
 	LOGF("\t close_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(close_param));
 
+	{
+		std::unique_lock lock(g_dialog_mutex);
+		if (g_save_list.status == DIALOG_STATUS_RUNNING) {
+			FinishSaveList(-1, true, lock);
+		}
+	}
 	g_save_status         = SAVE_STATUS_FINISHED;
 	g_save_running_polled = false;
 
@@ -553,6 +707,7 @@ int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay() {
 int KYTY_SYSV_ABI SaveDataDialogTerminate() {
 	PRINT_NAME();
 
+	ResetSaveList();
 	g_save_status         = SAVE_STATUS_NONE;
 	g_save_running_polled = false;
 	g_save_mode           = 0;
@@ -583,6 +738,18 @@ int KYTY_SYSV_ABI SaveDataDialogProgressBarSetValue(int target, uint32_t rate) {
 }
 
 } // namespace SaveDataDialog
+
+namespace {
+
+void FinishSaveList(int32_t choice, bool cancelled, std::unique_lock<std::mutex>& lock) {
+	g_save_session.completed      = true;
+	g_save_session.cancelled      = cancelled;
+	g_save_session.choice         = choice;
+	SaveDataDialog::g_save_status = SaveDataDialog::SAVE_STATUS_FINISHED;
+	SetDialogStatus(g_save_list, DIALOG_STATUS_FINISHED, lock);
+}
+
+} // namespace
 
 namespace MsgDialog {
 

@@ -38072,9 +38072,171 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// GTA V's tree trunk tessellation: 64- and 128-bit LDS records, a masked patch ordinal, an
+// internal forward branch, and per-patch outputs at the top of the offchip ring read by the TES.
+void CheckTessellationPatchConstants() {
+  using namespace ShaderRecompiler;
+  const char *name = "TessellationPatchConstants";
+  constexpr u32 ls_stride = 40;
+  constexpr u32 hs_stride = 48;
+  constexpr u32 patch_size = 0x150;
+  constexpr u32 patch_base = 0x8000u - patch_size;
+  std::array<std::vector<u32>, 3> code;
+  auto &local = code[0];
+  local.push_back(EncodeVop2(0x0b, 18, 255u, 3)); // v18 = 40 * v3
+  local.push_back(ls_stride);
+  local.push_back(EncodeDs0(0x4e, 1u << 8u)); // DS_WRITE2_B64 offsets 0, 8
+  local.push_back(EncodeDs1Ex(0, 8, 6, 18));
+  local.push_back(EncodeDs0(0xdf, 16)); // DS_WRITE_B128
+  local.push_back(EncodeDs1Ex(0, 0, 12, 18));
+  local.push_back(EncodeDs0(0x4d, 32)); // DS_WRITE_B64
+  local.push_back(EncodeDs1Ex(0, 0, 10, 18));
+  local.push_back(EncodeSop1(0x20, 0, 6));
+  local.push_back(0xffffffffu);
+
+  auto &control = code[1];
+  AppendVop3(&control, 0x365, 0, 193u, InlineU32(0));
+  AppendVop3(&control, 0x366, 0, 193u, Vgpr(0));
+  control.push_back(EncodeSopp(0x0a));
+  control.push_back(EncodeVopc(0xd1, 249u, 3));
+  control.push_back(EncodeVopcSdwa(0, 0, 0, 6, 1, 0, 0, 0, 0, 0, 0, 0, 1));
+  AppendVop3(&control, 0x148, 10, Vgpr(1), InlineU32(8), InlineU32(5)); // control point
+  control.push_back(EncodeVop2(0x1b, 60, 255u, 1)); // relative patch = v1 & 0xff
+  control.push_back(0xffu);
+  control.push_back(EncodeVop2(0x0b, 1, 255u, 10)); // v1 = 40 * cp
+  control.push_back(ls_stride);
+  control.push_back(EncodeVop2(0x0b, 0, 255u, 10)); // v0 = 48 * cp
+  control.push_back(hs_stride);
+  AppendVop3(&control, 0x143, 11, 255u, Vgpr(60), Vgpr(0)); // output address
+  control.push_back(3 * hs_stride);
+  AppendVop3(&control, 0x143, 8, 255u, Vgpr(60), Vgpr(1)); // input address
+  control.push_back(3 * ls_stride);
+  control.push_back(EncodeDs0(0x77, 1u << 8u)); // DS_READ2_B64 offsets 0, 8
+  control.push_back(EncodeDs1Ex(20, 0, 0, 8));
+  control.push_back(EncodeDs0(0x76, 32)); // DS_READ_B64
+  control.push_back(EncodeDs1Ex(24, 0, 0, 8));
+  control.push_back(EncodeMubuf0(0x1e, 0)); // control point record
+  control.push_back(EncodeMubuf1(20, 2, 11, 2));
+  control.push_back(EncodeMubuf0(0x1d, 32));
+  control.push_back(EncodeMubuf1(24, 2, 11, 2));
+  control.push_back(EncodeVopc(0xd4, InlineU32(1), 10)); // CP0 only
+  control.push_back(EncodeSopp(0x08, 2)); // S_CBRANCH_EXECZ over the next move
+  AppendVMovLiteral(&control, 30, 0x3f800000u);
+  // The patch address is computed under CP0's EXEC: 0x8000 - 0x150 * (patch + 1).
+  control.push_back(EncodeVop2(0x25, 2, InlineU32(1), 60));
+  control.push_back(EncodeVop2(0x0b, 2, 255u, 2));
+  control.push_back(patch_size);
+  control.push_back(EncodeVop2(0x26, 2, 255u, 2));
+  control.push_back(0x8000u);
+  control.push_back(EncodeVop2(0x1a, 3, InlineU32(4), 60)); // factor address
+  for (u32 i = 0; i < 4; i++) {
+    AppendVMovLiteral(&control, 40 + i, std::bit_cast<u32>(static_cast<float>(i + 1)));
+  }
+  control.push_back(EncodeMubuf0(0x1e));
+  control.push_back(EncodeMubuf1(40, 2, 3, 4));
+  control.push_back(EncodeMubuf0(0x1c, 0));
+  control.push_back(EncodeMubuf1(30, 2, 2, 2));
+  control.push_back(EncodeMubuf0(0x1f, 64));
+  control.push_back(EncodeMubuf1(31, 2, 2, 2));
+  AppendEnd(&control);
+
+  auto &evaluation = code[2];
+  AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7));
+  evaluation.push_back(3 * hs_stride);
+  evaluation.push_back(EncodeMubuf0(0x0d, 4));
+  evaluation.push_back(EncodeMubuf1(10, 2, 24, 4));
+  evaluation.push_back(EncodeVop2(0x25, 1, InlineU32(1), 7));
+  AppendVop3(&evaluation, 0x169, 1, 255u, Vgpr(1));
+  evaluation.push_back(patch_size);
+  evaluation.push_back(EncodeVop2(0x26, 1, 255u, 1));
+  evaluation.push_back(0x8000u);
+  evaluation.push_back(EncodeMubuf0(0x0f, 64));
+  evaluation.push_back(EncodeMubuf1(12, 2, 1, 4));
+  evaluation.push_back(EncodeExp0(0x0c, 0xf));
+  evaluation.push_back(EncodeExp1(10, 12, 13, 14));
+  AppendEnd(&evaluation);
+
+  ShaderTessellationInputInfo tess{.input_control_points = 3,
+                                  .output_control_points = 3,
+                                  .domain = 1,
+                                  .partitioning = 2,
+                                  .output_topology = 2};
+  AnalyzeTessellationPrograms(local, control, tess);
+  Require(name, "decoded interface",
+          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride &&
+              tess.patch_base == patch_base && tess.patch_size == 76,
+          "64/128-bit LDS records and the ring-top patch block must be recognized");
+
+  constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
+                              ShaderType::TessellationEvaluation};
+  for (u32 stage = 0; stage < stages.size(); stage++) {
+    ShaderVertexInputInfo vertex;
+    vertex.logical_stage = stages[stage];
+    vertex.tess = tess;
+    CompileOptions options;
+    options.stage = stages[stage];
+    options.input_info.vertex = &vertex;
+    auto translated = TranslateProgram(code[stage], options);
+    std::set<u32> local_offsets, patch_outputs, patch_inputs, factor_offsets;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() != IR::ValueOpcode::GetTessellationAttribute &&
+            inst.GetOpcode() != IR::ValueOpcode::SetTessellationAttribute) {
+          continue;
+        }
+        if (!inst.Arg(1).IsImmediate()) {
+          continue;
+        }
+        switch (static_cast<IR::TessellationAttribute>(inst.Arg(0).U32())) {
+        case IR::TessellationAttribute::LocalOutput:
+          local_offsets.insert(inst.Arg(1).U32());
+          break;
+        case IR::TessellationAttribute::PatchOutput:
+          patch_outputs.insert(inst.Arg(1).U32());
+          break;
+        case IR::TessellationAttribute::PatchInput:
+          patch_inputs.insert(inst.Arg(1).U32());
+          break;
+        case IR::TessellationAttribute::Factor:
+          factor_offsets.insert(inst.Arg(1).U32());
+          break;
+        default:
+          break;
+        }
+      }
+    }
+    Require(name, "wide LDS components",
+            stage != 0 || local_offsets == std::set<u32>{0, 4, 8, 12, 16, 20, 24, 28, 32, 36},
+            "64- and 128-bit LDS writes must store every dword of the record");
+    Require(name, "patch outputs",
+            stage != 1 || patch_outputs == std::set<u32>{patch_base, patch_base + 64,
+                                                         patch_base + 68, patch_base + 72},
+            "CP0 patch stores must resolve their EXEC-dependent ring address");
+    Require(name, "factor layout",
+            stage != 1 || factor_offsets == std::set<u32>{0, 4, 8, 12},
+            "the masked patch ordinal must address the first factor record");
+    Require(name, "patch inputs",
+            stage != 2 || patch_inputs == std::set<u32>{patch_base + 64, patch_base + 68,
+                                                        patch_base + 72},
+            "TES reads of the patch block must become per-patch inputs");
+    auto result = CompileProgram(std::move(translated), options, {});
+    ValidateSpirv(name, result.spirv);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string assembly;
+    Require(name, "disassembly", tools.Disassemble(result.spirv, &assembly),
+            "failed to disassemble tessellation shader");
+    Require(name, "patch interface",
+            stage == 0 || assembly.find("OpDecorate %tess_attributes_0 Patch") != std::string::npos ||
+                assembly.find(" Patch") != std::string::npos,
+            "per-patch data must use Patch-decorated interface variables");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
+  CheckTessellationPatchConstants();
 }
 
 void CheckEmbeddedFetchVertexOffset() {

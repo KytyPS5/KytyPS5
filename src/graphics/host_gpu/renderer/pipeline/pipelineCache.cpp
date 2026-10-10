@@ -22,6 +22,8 @@
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
+#include <string>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -113,9 +115,45 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// Shaders that hung the GPU in recorded device-lost reports are always dumped to the shader log
+// folder; KYTY_DUMP_SHADERS=<hex>[,<hex>...] adds more (or "all"), whatever the config says.
+bool ShouldDumpShader(uint64_t shader_hash) {
+	if (Config::GraphicsDebugDumpEnabled()) {
+		return true;
+	}
+	static const std::vector<uint64_t> suspects = [] {
+		std::vector<uint64_t> list = {0xeab213d03d49e6e6ull, 0xb3b6b0fc2e9a1de7ull};
+		if (const char* env = std::getenv("KYTY_DUMP_SHADERS")) {
+			std::string text(env);
+			if (text == "all") {
+				list.push_back(0);
+			}
+			size_t pos = 0;
+			while (pos < text.size()) {
+				const auto end   = text.find(',', pos);
+				const auto token = text.substr(pos, end == std::string::npos ? end : end - pos);
+				if (!token.empty() && token != "all") {
+					list.push_back(std::strtoull(token.c_str(), nullptr, 16));
+				}
+				if (end == std::string::npos) {
+					break;
+				}
+				pos = end + 1;
+			}
+		}
+		return list;
+	}();
+	for (const auto hash : suspects) {
+		if (hash == 0 || hash == shader_hash) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShouldDumpShader(shader_hash)) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -133,7 +171,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShouldDumpShader(shader_hash)) {
 		return;
 	}
 	EXIT_IF(code.empty());

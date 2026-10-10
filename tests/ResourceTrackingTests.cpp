@@ -6597,6 +6597,119 @@ void TestSharedInlineImageCandidates(bool pair_domain_regression = false) {
 
 }
 
+void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = false, bool grow_mask = false) {
+  Fixture fixture;
+  auto* entry = fixture.block;
+  auto* gate = fixture.AddBlock();
+  auto* header = fixture.AddBlock();
+  auto* body = fixture.AddBlock();
+  auto* exit = fixture.AddBlock();
+  const auto active = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(8u), Value(0u)});
+  const auto row = fixture.UserData(9u);
+  const auto bounded = fixture.Emit(ValueOpcode::ULessThan32, {row, Value(2u)});
+  std::array<Value, 4> words;
+  for (uint32_t word = 0; word < 4u; ++word) words[word] = fixture.UserData(word);
+  const auto buffer = fixture.Buffer(words);
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto index = fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(1u)});
+  MemoryInfo vector;
+  vector.kind = ResourceKind::Buffer; vector.idxen = true; vector.data_dwords = 2u;
+  vector.component_count = 2u; vector.offset = 120u;
+  const auto pointer = fixture.Emit(ValueOpcode::LoadBufferU32x2,
+      {buffer, index, Value(0u), Value(0u), active}, fixture.AddMemory(vector, 0x10u));
+  const auto low = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pointer, Value(0u)});
+  const auto high = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pointer, Value(1u)});
+  const auto masked_low = fixture.Emit(ValueOpcode::SelectU32, {active, low, Value(0u)});
+  const auto masked_high = fixture.Emit(ValueOpcode::SelectU32, {active, high, Value(0u)});
+  const auto offset = fixture.Emit(ValueOpcode::IMul32, {row, Value(368u)});
+  entry->AddBranch(gate); entry->AddBranch(exit);
+  fixture.program.block_info[0].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+  fixture.program.block_info[0].terminator.true_block = 1u;
+  fixture.program.block_info[0].terminator.false_block = 4u;
+  fixture.program.block_info[0].condition = fixture.Emit(ValueOpcode::ConditionRef,
+      {bounded}, CFG::BranchCondition::SccNonZero);
+  fixture.program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+  fixture.program.block_info[1].terminator.true_block = 2u;
+  fixture.program.block_info[1].terminator.false_block = 4u;
+  fixture.program.block_info[1].condition = fixture.Emit(ValueOpcode::ConditionRef,
+      {active}, CFG::BranchCondition::ExecNonZero, gate);
+  header->AddBranch(body);
+  fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Branch;
+  fixture.program.block_info[2].terminator.true_block = 3u;
+  auto& mask = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+  auto* initial_predecessor = gate;
+  if (merge_paths) {
+    auto* fork = fixture.AddBlock();
+    auto* left = fixture.AddBlock();
+    auto* right = fixture.AddBlock();
+    auto* merge = fixture.AddBlock();
+    gate->AddBranch(fork);
+    fixture.program.block_info[1].terminator.true_block = 5u;
+    if (empty_bypass) {
+      gate->AddBranch(merge);
+      fixture.program.block_info[1].terminator.false_block = 8u;
+    } else { gate->AddBranch(exit); }
+    fork->AddBranch(left); fork->AddBranch(right);
+    fixture.program.block_info[5].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    fixture.program.block_info[5].terminator.true_block = 6u;
+    fixture.program.block_info[5].terminator.false_block = 7u;
+    fixture.program.block_info[5].condition = fixture.Emit(ValueOpcode::ConditionRef,
+        {fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(10u), Value(0u)}, 0u, fork)},
+        CFG::BranchCondition::SccNonZero, fork);
+    left->AddBranch(merge); right->AddBranch(merge); merge->AddBranch(header);
+    for (uint32_t id = 6u; id <= 8u; ++id) {
+      fixture.program.block_info[id].terminator.kind = CFG::TerminatorKind::Branch;
+      fixture.program.block_info[id].terminator.true_block = id == 8u ? 2u : 8u;
+    }
+    initial_predecessor = merge;
+  } else { gate->AddBranch(header); gate->AddBranch(exit); }
+  mask.AddPhiOperand(initial_predecessor, active);
+  fixture.block = body;
+  const auto selected_low = fixture.Emit(ValueOpcode::ReadFirstLane, {masked_low, Value(&mask)});
+  const auto normalized_high = fixture.Emit(ValueOpcode::BitFieldSExtract,
+      {masked_high, Value(0u), Value(16u)});
+  const auto selected_high = fixture.Emit(ValueOpcode::ReadFirstLane, {normalized_high, Value(&mask)});
+  const auto address = fixture.Address(selected_low, selected_high);
+  std::array<Value, 8> descriptor;
+  for (uint32_t word = 0; word < 8u; ++word) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress; scalar.offset = 64u + word * 4u;
+    scalar.component_count = 8u; scalar.component_index = word;
+    descriptor[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {address, offset, Value(0u), Value(true)}, fixture.AddMemory(scalar, 0x20u));
+  }
+  const auto image = fixture.Image(descriptor);
+  const auto sampler = fixture.Sampler({Value(146u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample; sample.kind = ResourceKind::Image; sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+      fixture.AddMemory(sample, 0x30u));
+  const auto first_index = fixture.Emit(ValueOpcode::ReadFirstLane, {index, Value(&mask)});
+  const auto equal = fixture.Emit(ValueOpcode::IEqual32, {first_index, index});
+  const auto remaining = fixture.Emit(grow_mask ? ValueOpcode::LogicalOr : ValueOpcode::LogicalAnd,
+      {Value(&mask), fixture.Emit(ValueOpcode::LogicalNot, {equal})});
+  mask.AddPhiOperand(body, remaining);
+  body->AddBranch(header); body->AddBranch(exit);
+  fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+  fixture.program.block_info[3].terminator.true_block = 2u;
+  fixture.program.block_info[3].terminator.false_block = 4u;
+  fixture.program.block_info[3].condition = fixture.Emit(ValueOpcode::ConditionRef,
+      {remaining}, CFG::BranchCondition::ExecNonZero);
+  fixture.program.block_info[4].terminator.kind = CFG::TerminatorKind::Return;
+  if (empty_bypass || grow_mask) {
+    bool rejected = false;
+    try { fixture.PlanAndTrack(); }
+    catch (const std::exception& error) {
+      rejected = std::string(error.what()).find("GetImageResource") != std::string::npos;
+    }
+    Check(rejected, "unsafe wave mask unexpectedly admitted an address table");
+    return;
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 1u &&
+      fixture.program.descriptor_sources.at(fixture.program.info.images[0].source).inline_descriptor->address_table.has_value(),
+      "shrinking mask lost paired pointer ancestry");
+}
+
 void TestInlineFullWidthImageLoads() {
   auto fixture = MakeInlineDescriptorFixture(true, false, true, false, 0u, true);
   fixture->PlanAndTrack();
@@ -9358,6 +9471,18 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ADDRESS_BACKED_INDIRECT_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--wave-address-mask-merge-only") == 0) {
+      TestWaveAddressShrinkingMask(true);
+      TestWaveAddressShrinkingMask(true, true);
+      std::cout << "KYTY_WAVE_ADDRESS_MASK_MERGE_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--wave-address-shrinking-mask-only") == 0) {
+      TestWaveAddressShrinkingMask();
+      TestWaveAddressShrinkingMask(false, false, true);
+      std::cout << "KYTY_WAVE_ADDRESS_SHRINKING_MASK_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--inline-full-image-loads-only") == 0) {
       TestInlineFullWidthImageLoads();
       std::cout << "KYTY_INLINE_FULL_IMAGE_LOADS_PASS\n";
@@ -9625,6 +9750,10 @@ int main(int argc, char** argv) {
     Run("sampled pair materialization", [] { TestSharedInlineImageCandidates(true); });
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
     Run("independent inline sampled sources", TestIndependentInlineSampledSources);
+    Run("shrinking wave mask", [] { TestWaveAddressShrinkingMask(); });
+    Run("merged wave mask", [] { TestWaveAddressShrinkingMask(true); });
+    Run("empty wave mask bypass", [] { TestWaveAddressShrinkingMask(true, true); });
+    Run("growing wave mask rejected", [] { TestWaveAddressShrinkingMask(false, false, true); });
     Run("inline full image loads", TestInlineFullWidthImageLoads);
     Run("inline native sampler capacity", TestInlineNativeSamplerCapacity);
     Run("coherent inline selector values", TestCoherentInlineSelectorValues);

@@ -1,5 +1,24 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 08:40 UTC** (wave-mask proof extensions tested; full shader pending):
+
+- Native shrinking-mask RED072739 -> GREEN073014; merge RED083437 ->
+  GREEN083519. Full resource083624 includes empty-mask bypass and mask-growth
+  rejection. GPUAV083740 passes existing wave-address contracts, ownership
+  negatives and numerical readback. No limits or write protection changed.
+- Last diagnostic game065921 / EXE95465 naturally exits321 at07:16:53.512UTC,
+  no timeout/memory guards, minimum RAM17.72GiB; only loading arc, no menu.
+  Its saved raw shader remains outside tracked files. Diagnostic CPU083643
+  passes individual image recognition through pcD88, rejects the remaining
+  nonempty-mask proof at pcDF4; the transactional group reports pcA20.
+  Default pixel metadata makes this diagnosis only, not an execution proof.
+- Production diagnostic hooks removed; diagnostic audit patch preserved in
+  `_Build/analysis/scalar-buffer-image-provenance-20261010/`.
+  Next commit this tested correction, native build and original-game retry;
+  then isolate the remaining mask shape with a new synthetic RED. PS07b3
+  driver completion, rendered pixels, menu/gameplay remain pending. No push
+  or issue108 publication. Other-game runtime remains unavailable.
+
 Checkpoint **2026-10-10 06:49 UTC** (synthetic wave table passes; real recognition still pending):
 
 - Local source1ee315aa / EXE6b8e6 / original5178 run

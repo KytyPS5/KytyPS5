@@ -2152,15 +2152,31 @@ private:
 		mask = mask.Resolve();
 		const auto incoming_is_nonempty = [&](const Block* from, const Block* to,
 		                                     Value incoming, const Block* header) {
-			for (size_t depth = 0; depth < m_program.blocks.size(); ++depth) {
-				const auto edge = ConditionalEdge(from, to);
+			std::unordered_map<const Block*, bool> proved;
+			std::unordered_set<const Block*> visiting;
+			const auto prove = [&](auto&& self, const Block* previous, const Block* next,
+			                       size_t depth) -> bool {
+				if (previous == nullptr || depth > m_program.blocks.size()) return false;
+				const auto edge = ConditionalEdge(previous, next);
 				if (edge && edge->positive && Implies(edge->condition, incoming)) return true;
-				if (from == header || from->ImmSuccessors().size() != 1u ||
-				    from->ImmPredecessors().size() != 1u) return false;
-				to = from;
-				from = from->ImmPredecessors()[0];
-			}
-			return false;
+				if (previous == header) return false;
+				if (const auto found = proved.find(previous); found != proved.end())
+					return found->second;
+				if (!visiting.insert(previous).second) return false;
+				// Every incoming route must carry a nonempty witness. A merge alone
+				// cannot establish it, and an unproved cycle must remain rejected.
+				bool nonempty = !previous->ImmPredecessors().empty();
+				for (const auto* predecessor: previous->ImmPredecessors()) {
+					if (!self(self, predecessor, previous, depth + 1u)) {
+						nonempty = false;
+						break;
+					}
+				}
+				visiting.erase(previous);
+				proved.emplace(previous, nonempty);
+				return nonempty;
+			};
+			return prove(prove, from, to, 0u);
 		};
 		const auto* phi = mask.TryInstruction();
 		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
@@ -2733,6 +2749,41 @@ private:
 		return stride != 0u;
 	}
 
+	bool WaveMaskImplies(Value guard, Value required, uint32_t depth = 0u) const {
+		if (depth > 32u) return false;
+		guard = SimplifyGuard(guard);
+		required = required.Resolve();
+		if (EquivalentValue(m_program, guard, required) ||
+		    (required.IsImmediate() && required.GetType() == Type::U1 && required.U1())) return true;
+		const auto* inst = guard.TryInstruction();
+		if (inst == nullptr) return false;
+		if (inst->GetOpcode() == ValueOpcode::LogicalAnd && inst->NumArgs() == 2u)
+			return WaveMaskImplies(inst->Arg(0), required, depth + 1u) ||
+			       WaveMaskImplies(inst->Arg(1), required, depth + 1u);
+		if (inst->GetOpcode() != ValueOpcode::Phi || inst->GetType() != Type::U1 ||
+		    inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->Parent() == nullptr) return false;
+		const auto subset = [&](auto&& self, Value value, uint32_t nesting) -> bool {
+			if (nesting > 16u) return false;
+			value = value.Resolve();
+			if (value.TryInstruction() == inst) return true;
+			const auto* conjunction = value.TryInstruction();
+			return conjunction != nullptr && conjunction->GetOpcode() == ValueOpcode::LogicalAnd &&
+			       conjunction->NumArgs() == 2u &&
+			       (self(self, conjunction->Arg(0), nesting + 1u) ||
+			        self(self, conjunction->Arg(1), nesting + 1u));
+		};
+		for (uint32_t back = 0; back < 2u; ++back) {
+			const auto* incoming = inst->PhiBlock(back);
+			if (incoming == nullptr ||
+			    std::ranges::find(incoming->ImmSuccessors(), inst->Parent()) == incoming->ImmSuccessors().end()) continue;
+			// Boolean conjunction can only remove lanes. The initial incoming
+			// mask establishes the invariant; every backedge preserves it.
+			if (subset(subset, inst->Arg(back), 0u) &&
+			    WaveMaskImplies(inst->Arg(back ^ 1u), required, depth + 1u)) return true;
+		}
+		return false;
+	}
+
 	bool TryMakeWaveAddressImage(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource ||
 		    handle.NumArgs() != 8u) return false;
@@ -2796,7 +2847,7 @@ private:
 			for (uint32_t depth = 0; depth < 16u; ++depth) {
 				const auto* part = value.Resolve().TryInstruction();
 				if (part != nullptr && part->GetOpcode() == ValueOpcode::SelectU32 && part->NumArgs() == 3u) {
-					if (!Implies(guards[word], part->Arg(0))) return false;
+					if (!WaveMaskImplies(guards[word], part->Arg(0))) return false;
 					value = part->Arg(1).Resolve(); continue;
 				}
 				if (word == 1u && strip_high(value)) continue;
@@ -2813,7 +2864,7 @@ private:
 		if (read == nullptr || pointer_reads[1] != read || read->GetOpcode() != ValueOpcode::LoadBufferU32x2 ||
 		    read->NumArgs() != 5u || !EquivalentValue(m_program, guards[0], guards[1]) ||
 		    pointer_lanes[0]->Parent() != pointer_lanes[1]->Parent() ||
-		    !Implies(guards[0], read->Arg(4))) return false;
+		    !WaveMaskImplies(guards[0], read->Arg(4))) return false;
 		const auto index = read->Flags<MemoryFlags>().index;
 		uint32_t zero_a = 1u, zero_b = 1u;
 		if (index >= m_program.memory_info.size() || !ImmediateU32(read->Arg(2), zero_a) || zero_a != 0u ||

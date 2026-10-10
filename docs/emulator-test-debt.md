@@ -1,5 +1,24 @@
 # Emulator regression test debt
 
+## Nonempty wave mask across a control-flow merge (2026-10-10)
+
+Captured PS617c diagnostic CPU audit passes pc8b4 with the shrinking-mask
+implication correction, then fails at pcA20: HasActiveLane stops at a
+merge with two predecessors. Require a synthetic positive EXEC witness
+before a diamond, preserving that witness on every route into the mask phi;
+a bypass permitting an empty mask must remain rejected. Establish native
+RED before extending the shared proof. Saved diagnostic audit081132 is
+tracking only with default pixel metadata; it does not prove GPU execution.
+
+Proof update: shrinking-mask native RED072739 -> GREEN073014; merge
+RED083437 -> unchanged GREEN083519. Full resource083624 passes, including
+empty-mask bypass and growing-mask rejection. GPUAV083740 passes three
+existing address-table contract/ownership/readback cases. Diagnostic CPU
+083643 now recognizes individual sampled images through pcD88 but fails a
+later nonempty-mask proof at pcDF4; transactional inline-group rejection
+still reports pcA20. Full captured shader tracking remains unproved. Next
+isolate that remaining mask shape before another semantic extension.
+
 ## Real wave-address graph recognition extension (2026-10-10)
 
 Original5178/source1ee315aa/EXE6b8e6 run060729 naturally exits321 at

@@ -67,8 +67,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// Guest buffers with device addresses up to DedicatedBdaSize share VMA blocks: a dedicated
+	// allocation (a vkAllocateMemory each) made creating a buffer cost ~90 us instead of ~5, and
+	// a streaming game creates hundreds when an area comes into view. Guest buffers span whole
+	// caching pages, so page-translated device addresses stay within them; the cache's own
+	// buffers (no guest address) keep their dedicated allocations.
+	constexpr uint64_t             DedicatedBdaSize = uint64_t {16} << 20u;
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && (cpu_address == 0 || size > DedicatedBdaSize)
+	        ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+	        : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);

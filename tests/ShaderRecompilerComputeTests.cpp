@@ -18437,7 +18437,42 @@ private:
                                                   physical_devices.data()),
               "vkEnumeratePhysicalDevices");
 
+    // A driver can report a feature without advertising the extension that provides it, and
+    // vkCreateDevice then fails, so a device also has to list every extension requested below.
+    constexpr std::array required_extensions{
+        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
+        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+        VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+        VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    const auto missing_extension = [&](vk::PhysicalDevice physical) -> const char * {
+      u32 extension_count = 0;
+      RequireVk("VulkanHarness", "dispatch",
+                physical.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr),
+                "vkEnumerateDeviceExtensionProperties");
+      std::vector<vk::ExtensionProperties> extensions(extension_count);
+      RequireVk("VulkanHarness", "dispatch",
+                physical.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                            extensions.data()),
+                "vkEnumerateDeviceExtensionProperties");
+      extensions.resize(extension_count);
+      for (const char *required : required_extensions) {
+        if (std::ranges::none_of(extensions, [required](const vk::ExtensionProperties &extension) {
+              return std::strcmp(extension.extensionName.data(), required) == 0;
+            })) {
+          return required;
+        }
+      }
+      return nullptr;
+    };
+
     for (auto physical : physical_devices) {
+      if (const char *missing = missing_extension(physical)) {
+        std::printf("[host]    %s lacks %s, skipped\n",
+                    physical.getProperties().deviceName.data(), missing);
+        continue;
+      }
       u32 queue_count = 0;
       physical.getQueueFamilyProperties(&queue_count, nullptr);
       std::vector<vk::QueueFamilyProperties> queues(queue_count);
@@ -18641,13 +18676,8 @@ private:
     device_features.tessellationShader = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
-    std::vector<const char *> device_extensions{
-        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
-        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
-        VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-        VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    std::vector<const char *> device_extensions(required_extensions.begin(),
+                                                required_extensions.end());
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);

@@ -378,51 +378,6 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	return desc;
 }
 
-static void PopulateTextureMipLayout(ImageInfo& info) {
-	if (info.IsVolume() && info.tile_mode != Prospero::TileMode::kLinear) {
-		TileSurfaceLayout            surface {};
-		const TileSurfaceDescription description {
-		    info.guest_format,  info.tile_mode,    TileSurfaceDimension::Dim3D, info.extent.width,
-		    info.extent.height, info.extent.depth, info.resources.levels,       1};
-		if (!TileGetTiledTextureLayout(description, surface)) {
-			EXIT("unsupported normalized volume texture layout\n");
-		}
-		for (uint32_t level = 0; level < info.resources.levels; level++) {
-			const auto& mip        = surface.mips[level];
-			info.mip_layout[level] = {
-			    mip.offset,
-			    mip.size,
-			    mip.padded_width,
-			    mip.padded_height,
-			};
-		}
-		return;
-	}
-
-	TileSizeOffset levels[16] {};
-	TilePaddedSize padded[16] {};
-	TileGetTextureSize(info.guest_format, info.extent.width, info.extent.height,
-	                   info.resources.levels, info.tile_mode, nullptr, levels, padded);
-	const auto texel_shift = info.IsBlock() ? 2u : 0u;
-	for (uint32_t level = 0; level < info.resources.levels; level++) {
-		const auto offset =
-		    levels[level].src_size != 0 ? levels[level].src_offset : levels[level].offset;
-		auto size = static_cast<uint64_t>(levels[level].src_size != 0 ? levels[level].src_size
-		                                                              : levels[level].size);
-		if (info.IsVolume()) {
-			size *= std::max(info.extent.depth >> level, 1u);
-		} else {
-			size *= info.resources.layers;
-		}
-		info.mip_layout[level] = {
-		    offset,
-		    size,
-		    padded[level].width >> texel_shift,
-		    padded[level].height >> texel_shift,
-		};
-	}
-}
-
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -490,45 +445,54 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-static bool ResolveTextureMipView(const TileSurfaceDescription& description, bool metadata,
-                                   uint32_t view_levels, uint32_t& levels, uint32_t& base_level) {
-	TileSurfaceLayout physical {};
-	TileSurfaceLayout view {};
-	auto              view_description = description;
-	view_description.levels            = levels;
-	if (!TileGetTiledTextureLayout(description, physical) ||
-	    !TileGetTiledTextureLayout(view_description, view)) {
+static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                                  uint32_t view_levels, uint32_t& base_level) {
+	if (!info.IsTiled()) {
 		return false;
 	}
-	if (physical.first_tail_level == view.first_tail_level &&
-	    physical.block_slice_size == view.block_slice_size &&
-	    physical.total_size == view.total_size &&
-	    std::equal(std::begin(physical.mips), std::begin(physical.mips) + description.levels,
-	               std::begin(view.mips))) {
-		return true;
+	ImageInfo physical        = info;
+	physical.resources.levels = physical_levels;
+	physical.UpdateSize();
+	info.UpdateSize();
+	const auto same_mip = [&](uint32_t target, uint32_t source) {
+		const auto& left  = physical.mip_layout[target];
+		const auto& right = info.mip_layout[source];
+		return left.offset == right.offset && left.size == right.size &&
+		       left.pitch == right.pitch && left.height == right.height &&
+		       left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
+		       left.surface_z == right.surface_z &&
+		       physical.MipExtent(target) == info.MipExtent(source);
+	};
+	if (physical.first_tail_level == info.first_tail_level &&
+	    physical.tiled_slice_stride == info.tiled_slice_stride &&
+	    physical.data.size == info.data.size) {
+		bool matches = true;
+		for (uint32_t level = 0; level < physical_levels; ++level) {
+			matches &= same_mip(level, level);
+		}
+		if (matches) {
+			return true;
+		}
 	}
-	if (metadata || ((description.layers > 1 || description.depth > 1) &&
-	                 physical.block_slice_size != view.block_slice_size)) {
+	if (metadata ||
+	    (info.TransferLayers() > 1 && physical.tiled_slice_stride != info.tiled_slice_stride)) {
 		return false;
 	}
 	// T# addresses the last mip. A view can select the same stored subresources
 	// with different mip indices; inaccessible mips need no host representation.
-	for (uint32_t base = 0; base + view_levels <= description.levels; ++base) {
+	for (uint32_t base = 0; base + view_levels <= physical_levels; ++base) {
 		bool matches = true;
 		for (uint32_t i = 0; i < view_levels; ++i) {
 			const auto source = base_level + i;
 			const auto target = base + i;
-			if (physical.mips[target] != view.mips[source] ||
-			    (target >= physical.first_tail_level) != (source >= view.first_tail_level) ||
-			    std::max(description.width >> target, 1u) != std::max(description.width >> source, 1u) ||
-			    std::max(description.height >> target, 1u) != std::max(description.height >> source, 1u) ||
-			    std::max(description.depth >> target, 1u) != std::max(description.depth >> source, 1u)) {
+			if (!same_mip(target, source) ||
+			    (target >= physical.first_tail_level) != (source >= info.first_tail_level)) {
 				matches = false;
 				break;
 			}
 		}
 		if (matches) {
-			levels     = description.levels;
+			info       = std::move(physical);
 			base_level = base;
 			return true;
 		}
@@ -613,40 +577,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
 	auto          view_base    = static_cast<uint32_t>(base_level);
-	if (levels > physical_levels) {
-		const TileSurfaceDescription physical {
-		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
-		    width, height, volume ? depth : 1u, physical_levels, image_layers};
-		if (!ResolveTextureMipView(physical, !resource.r128 && descriptor.MetaCompress(),
-		                           view_levels, levels, view_base)) {
-			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
-			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
-		}
-	}
-	uint32_t      pitch = 0;
-	TileSizeAlign size {};
-	if (multisampled) {
-		const auto bytes = Prospero::NumBytesPerElement(format);
-		pitch            = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
-		                              : TileGetRenderTargetPitch(width, bytes, last_level);
-		if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
-		    size.size > UINT32_MAX / image_layers) {
-			EXIT("unsupported multisample texture layout\n");
-		}
-		size.size *= image_layers;
-	} else {
-		pitch = TileGetTexturePitch(format, width, tile);
-		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
-		                        physical_levels, tile, volume, size);
-	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
-	if (storage) {
-		ValidateStorageTexture(resource, descriptor, size.size);
-	}
-
 	auto pixel_format = surface_format.vk_format;
 	if (resource.depth_compare) {
 		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
@@ -663,17 +593,35 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
-	desc.info.data         = {address, size.size};
+	desc.info.data         = {address, 0};
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
 	desc.info.type         = TextureBaseType(type);
 	desc.info.extent       = {width, height, volume ? depth : 1u};
 	desc.info.resources    = {levels, image_layers};
-	desc.info.pitch        = pitch;
 	desc.info.bytes_per_block =
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
+	if (levels > physical_levels) {
+		if (!ResolveTextureMipView(desc.info, physical_levels,
+		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
+		                           view_base)) {
+			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
+			     "extent=%ux%ux%u tile=%u\n",
+			     base_level, last_level, max_mip, width, height, depth,
+			     static_cast<uint32_t>(tile));
+		}
+	} else {
+		desc.info.UpdateSize();
+	}
+	const auto alignment =
+	    tile == Prospero::TileMode::kLinear ? 256u : desc.info.tiling.block.block_size;
+	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
+	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+	if (storage) {
+		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
+	}
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth &&
 	    !desc.info.IsDepth()) {
 		TileSizeAlign metadata_size {};
@@ -683,11 +631,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
-	}
-	if (samples > 1) {
-		desc.info.mip_layout[0] = {0, size.size, pitch, height};
-	} else {
-		PopulateTextureMipLayout(desc.info);
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
@@ -704,7 +647,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
+		                            desc.info.data.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {

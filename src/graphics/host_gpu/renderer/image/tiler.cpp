@@ -31,7 +31,12 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
     : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer) {
 	static_assert(FamilyCount == 9);
-	static_assert(sizeof(Push) == 60);
+	static_assert(sizeof(Mip) == 48);
+	static_assert(offsetof(TilingParams, mips) == 16);
+	static_assert(sizeof(TilingParams) == 784);
+	static_assert(sizeof(TilingParams) <= UINT16_MAX && PipelineCount <= UINT16_MAX);
+	static_assert(sizeof(Tiling) == 16);
+	static_assert(sizeof(Conversion) == 32);
 	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
 	for (uint32_t index = 0; index < 2; index++) {
 		bindings[index] = {index, vk::DescriptorType::eStorageBuffer, 1,
@@ -48,7 +53,8 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 	                                                                 &m_descriptor_layout),
 	                     "create TileManager descriptor layout");
 
-	const vk::PushConstantRange  push_range {vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push)};
+	const vk::PushConstantRange  push_range {vk::ShaderStageFlagBits::eCompute, 0,
+	                                         sizeof(Conversion)};
 	vk::PipelineLayoutCreateInfo layout_info {};
 	layout_info.setLayoutCount         = 1;
 	layout_info.pSetLayouts            = &m_descriptor_layout;
@@ -88,14 +94,25 @@ TileManager::~TileManager() {
 	}
 }
 
-void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
-                          std::span<const GpuTileInfo> infos, uint64_t source_base,
-                          uint64_t target_base, std::vector<Dispatch>& dispatches,
-                          ColorTransform transform) {
-	EXIT_IF(infos.empty() || tiled_capacity == 0 || linear_capacity == 0);
-	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
+                                         uint64_t linear_capacity, const ImageInfo& info,
+                                         uint32_t levels, uint64_t source_base,
+                                         uint64_t target_base) {
+	levels = levels != 0 ? levels : info.resources.levels;
+	EXIT_IF(levels == 0 || levels > MaxMipLevels || levels > info.resources.levels ||
+	        tiled_capacity == 0 || linear_capacity == 0);
 	EXIT_NOT_IMPLEMENTED(tiled_capacity > UINT32_MAX || linear_capacity > UINT32_MAX);
 
+	const auto& block     = info.tiling.block;
+	const auto  transform = info.GetColorTransform();
+	EXIT_NOT_IMPLEMENTED(
+	    !info.IsTiled() || info.samples != 1 || Prospero::IsFmaskTextureFormat(info.guest_format) ||
+	    block.family >= TileBlockFamily::Count || !std::has_single_bit(block.bytes_per_element) ||
+	    block.bytes_per_element > 16 || block.block_width == 0 || block.block_height == 0 ||
+	    block.block_depth == 0 || block.block_size == 0 || info.tiling.texel_width == 0 ||
+	    info.tiling.texel_height == 0 || info.tiled_slice_stride == 0);
+	EXIT_IF((transform == ColorTransform::SwapBgra16 && block.bytes_per_element != 8u) ||
+	        (transform == ColorTransform::Reverse10_11_11 && block.bytes_per_element != 4u));
 	const auto checked_multiply = [](uint64_t left, uint64_t right, uint64_t& result) {
 		return (left == 0 || right <= UINT64_MAX / left) && (result = left * right, true);
 	};
@@ -106,112 +123,96 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		return size != 0 && offset <= capacity && size <= capacity - offset;
 	};
 
-	dispatches.clear();
-	dispatches.reserve(infos.size());
-	for (const auto& info: infos) {
-		EXIT_IF((transform == ColorTransform::SwapBgra16 && info.bytes_per_element != 8u) ||
-		        (transform == ColorTransform::Reverse10_11_11 && info.bytes_per_element != 4u));
-		TileBlockLayout block {};
-		const uint32_t  tiled_width  = info.tiled_width != 0 ? info.tiled_width : info.pitch;
-		const uint32_t  tiled_height = info.tiled_height != 0 ? info.tiled_height : info.height;
-		const uint64_t  groups_x     = (static_cast<uint64_t>(info.width) + 7u) / 8u;
-		const uint64_t  groups_y     = (static_cast<uint64_t>(info.height) + 7u) / 8u;
-		EXIT_NOT_IMPLEMENTED(
-		    !TileGetBlockLayout(info.family, info.bytes_per_element, block) || info.width == 0 ||
-		    info.height == 0 || info.depth == 0 || info.pitch < info.width ||
-		    groups_x > limits.maxComputeWorkGroupCount[0] ||
-		    groups_y > limits.maxComputeWorkGroupCount[1] ||
-		    info.depth > limits.maxComputeWorkGroupCount[2] ||
-		    (!info.tail && (tiled_width < info.width || tiled_height < info.height)) ||
-		    !valid_range(info.linear_offset, info.linear_size, linear_capacity) ||
-		    !valid_range(info.tiled_offset, info.tiled_size, tiled_capacity) ||
-		    (block.block_depth == 1 && info.depth != 1));
+	// ImageInfo owns the layout. Upload only the header and active mip records.
+	TilingParams params;
+	params.color_transform = static_cast<uint32_t>(transform);
+	for (uint32_t level = 0; level < levels; ++level) {
+		const auto& mip    = info.mip_layout[level];
+		const auto  extent = info.MipExtent(level);
+		const auto  width  = static_cast<uint32_t>(
+		    (uint64_t {extent.width} + info.tiling.texel_width - 1u) / info.tiling.texel_width);
+		const auto height = static_cast<uint32_t>(
+		    (uint64_t {extent.height} + info.tiling.texel_height - 1u) / info.tiling.texel_height);
+		const auto depth = extent.depth;
+		const bool tail  = level >= info.first_tail_level;
+		EXIT_NOT_IMPLEMENTED(width == 0 || height == 0 || depth == 0 || mip.linear_pitch < width ||
+		                     mip.linear_size == 0 || mip.size == 0 ||
+		                     (!tail && (mip.pitch < width || mip.height < height)) ||
+		                     (!info.IsVolume() && mip.size % depth != 0));
 
 		uint64_t pitch_bytes = 0;
-		EXIT_NOT_IMPLEMENTED(!checked_multiply(info.pitch, info.bytes_per_element, pitch_bytes) ||
-		                     pitch_bytes > UINT32_MAX);
-		uint64_t slice_bytes   = info.linear_slice_stride;
+		EXIT_NOT_IMPLEMENTED(
+		    !checked_multiply(mip.linear_pitch, block.bytes_per_element, pitch_bytes) ||
+		    pitch_bytes > UINT32_MAX);
+		const uint64_t slice_bytes =
+		    info.linear_slice_stride != 0 ? info.linear_slice_stride : mip.linear_size;
 		uint64_t minimum_slice = 0;
-		EXIT_NOT_IMPLEMENTED(!checked_multiply(pitch_bytes, info.height, minimum_slice));
-		if (slice_bytes == 0) {
-			slice_bytes = minimum_slice;
-		}
 		uint64_t linear_used = 0;
-		uint64_t bytes       = 0;
-		EXIT_NOT_IMPLEMENTED((info.depth > 1 && slice_bytes < minimum_slice) ||
-		                     !checked_multiply(info.depth - 1u, slice_bytes, bytes) ||
+		uint64_t bytes         = 0;
+		uint64_t linear_span   = 0;
+		EXIT_NOT_IMPLEMENTED(!checked_multiply(pitch_bytes, height, minimum_slice) ||
+		                     (depth > 1 && slice_bytes < minimum_slice) ||
+		                     !checked_multiply(height - 1u, pitch_bytes, linear_used) ||
+		                     !checked_multiply(width, block.bytes_per_element, bytes) ||
 		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     !checked_multiply(info.height - 1u, pitch_bytes, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     !checked_multiply(info.width, info.bytes_per_element, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     linear_used > info.linear_size || slice_bytes > UINT32_MAX);
+		                     linear_used > mip.linear_size || slice_bytes > UINT32_MAX ||
+		                     !checked_multiply(depth - 1u, slice_bytes, linear_span) ||
+		                     !checked_add(linear_span, mip.linear_size, linear_span) ||
+		                     !valid_range(mip.linear_offset, linear_span, linear_capacity));
 
 		const uint64_t columns =
-		    (static_cast<uint64_t>(tiled_width) + block.block_width - 1u) / block.block_width;
-		const uint64_t rows =
-		    (static_cast<uint64_t>(tiled_height) + block.block_height - 1u) / block.block_height;
-		uint64_t blocks_per_slice = 0;
-		EXIT_NOT_IMPLEMENTED(!checked_multiply(columns, rows, blocks_per_slice) ||
-		                     columns > UINT32_MAX || blocks_per_slice > UINT32_MAX);
-		if (info.tail) {
+		    (uint64_t {mip.pitch} + block.block_width - 1u) / block.block_width;
+		if (tail) {
 			EXIT_NOT_IMPLEMENTED(
-			    info.family == TileBlockFamily::Standard256B || info.depth > block.block_depth ||
-			    info.tail_x >= block.block_width || info.width > block.block_width - info.tail_x ||
-			    info.tail_y >= block.block_height ||
-			    info.height > block.block_height - info.tail_y ||
-			    info.tiled_size < block.block_size);
-		} else {
-			const uint64_t slices =
-			    (static_cast<uint64_t>(info.depth) + block.block_depth - 1u) / block.block_depth;
-			uint64_t tiled_used = 0;
-			EXIT_NOT_IMPLEMENTED(!checked_multiply(blocks_per_slice, slices, tiled_used) ||
-			                     !checked_multiply(tiled_used, block.block_size, tiled_used) ||
-			                     tiled_used > info.tiled_size);
+			    block.family == TileBlockFamily::Standard256B || mip.tail_x >= block.block_width ||
+			    width > block.block_width - mip.tail_x || mip.tail_y >= block.block_height ||
+			    height > block.block_height - mip.tail_y);
 		}
+		const uint64_t tiled_plane = info.IsVolume() ? mip.size : mip.size / depth;
+		const uint64_t tiled_slice = info.tiled_slice_stride;
+		const uint64_t slices     = (uint64_t {depth} + block.block_depth - 1u) / block.block_depth;
+		uint64_t       tiled_span = 0;
+		EXIT_NOT_IMPLEMENTED(columns > UINT32_MAX || tiled_slice > UINT32_MAX ||
+		                     (slices > 1 && tiled_slice < tiled_plane) ||
+		                     !checked_multiply(slices - 1u, tiled_slice, tiled_span) ||
+		                     !checked_add(tiled_span, tiled_plane, tiled_span) ||
+		                     !valid_range(mip.offset, tiled_span, tiled_capacity));
 
-		const uint32_t alignment = std::min(info.bytes_per_element, 4u);
-		EXIT_NOT_IMPLEMENTED(((info.linear_offset | info.tiled_offset | pitch_bytes | slice_bytes) &
-		                      (alignment - 1u)) != 0);
-		const uint64_t src = source_base + (tile ? info.linear_offset : info.tiled_offset);
-		const uint64_t dst = target_base + (tile ? info.tiled_offset : info.linear_offset);
-		EXIT_NOT_IMPLEMENTED(src > UINT32_MAX || dst > UINT32_MAX);
-
-		const uint32_t family_index  = static_cast<uint32_t>(info.family);
-		const uint32_t element_index = std::countr_zero(info.bytes_per_element);
-		EXIT_NOT_IMPLEMENTED(family_index >= FamilyCount || element_index >= BytesPerElementCount);
-		Dispatch dispatch {};
-		dispatch.pipeline_slot =
-		    ((tile ? FamilyCount : 0u) + family_index) * BytesPerElementCount + element_index;
-		dispatch.push.src_base         = static_cast<uint32_t>(src);
-		dispatch.push.dst_base         = static_cast<uint32_t>(dst);
-		dispatch.push.width            = info.width;
-		dispatch.push.height           = info.height;
-		dispatch.push.depth            = info.depth;
-		dispatch.push.surface_z        = info.surface_z;
-		dispatch.push.pitch_bytes      = static_cast<uint32_t>(pitch_bytes);
-		dispatch.push.slice_bytes      = static_cast<uint32_t>(slice_bytes);
-		dispatch.push.blocks_per_row   = static_cast<uint32_t>(columns);
-		dispatch.push.blocks_per_slice = static_cast<uint32_t>(blocks_per_slice);
-		dispatch.push.tail_x           = info.tail_x;
-		dispatch.push.tail_y           = info.tail_y;
-		dispatch.push.tail             = info.tail;
-		dispatch.push.color_transform  = static_cast<uint32_t>(transform);
-		dispatches.push_back(dispatch);
+		const uint32_t alignment = std::min(block.bytes_per_element, 4u);
+		EXIT_NOT_IMPLEMENTED(
+		    ((mip.linear_offset | mip.offset | pitch_bytes | slice_bytes | tiled_slice) &
+		     (alignment - 1u)) != 0);
+		uint64_t src = 0, dst = 0, texels = 0;
+		EXIT_NOT_IMPLEMENTED(
+		    !checked_add(source_base, tile ? mip.linear_offset : mip.offset, src) ||
+		    !checked_add(target_base, tile ? mip.offset : mip.linear_offset, dst) ||
+		    src > UINT32_MAX || dst > UINT32_MAX || !checked_multiply(width, height, texels) ||
+		    !checked_multiply(texels, depth, texels) || texels > UINT32_MAX - params.num_texels);
+		params.mips[level] = {static_cast<uint32_t>(src),
+		                      static_cast<uint32_t>(dst),
+		                      width,
+		                      height,
+		                      static_cast<uint32_t>(pitch_bytes),
+		                      static_cast<uint32_t>(slice_bytes),
+		                      static_cast<uint32_t>(tiled_slice),
+		                      static_cast<uint32_t>(columns),
+		                      mip.surface_z,
+		                      tail ? mip.tail_x : 0u,
+		                      tail ? mip.tail_y : 0u,
+		                      static_cast<uint32_t>(texels)};
+		params.num_texels += static_cast<uint32_t>(texels);
 	}
 
-	const uint64_t uniform_alignment =
-	    std::max<uint64_t>(limits.minUniformBufferOffsetAlignment, 1);
-	const uint64_t stride = Common::AlignUp<uint64_t>(sizeof(Push), uniform_alignment);
-	EXIT_NOT_IMPLEMENTED(dispatches.size() > UINT64_MAX / stride);
-	const uint64_t bytes  = dispatches.size() * stride;
-	auto [mapped, offset] = m_stream_buffer.Map(bytes, uniform_alignment);
-	EXIT_IF(mapped == nullptr);
-	for (size_t index = 0; index < dispatches.size(); index++) {
-		std::memcpy(mapped + index * stride, &dispatches[index].push, sizeof(Push));
-		dispatches[index].params_offset = offset + index * stride;
-	}
-	m_stream_buffer.Commit();
+	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const auto  params_size =
+	    static_cast<uint16_t>(offsetof(TilingParams, mips) + levels * sizeof(Mip));
+	const auto offset = m_stream_buffer.Copy(
+	    &params, params_size,
+	    std::max<uint64_t>(limits.minUniformBufferOffsetAlignment, alignof(TilingParams)));
+	const auto slot =
+	    ((tile ? FamilyCount : 0u) + static_cast<uint32_t>(block.family)) * BytesPerElementCount +
+	    std::countr_zero(block.bytes_per_element);
+	return {offset, params.num_texels, params_size, static_cast<uint16_t>(slot)};
 }
 
 vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
@@ -257,10 +258,9 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	return m_pipelines[slot];
 }
 
-void TileManager::Record(vk::Buffer source, uint64_t source_offset,
-                         uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
-                         uint64_t target_capacity, std::span<Dispatch> dispatches,
-                         bool clear_target) {
+void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+                         vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
+                         const Tiling& tiling, bool clear_target) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -295,9 +295,8 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	barriers[2].srcAccessMask = vk::AccessFlagBits::eHostWrite;
 	barriers[2].dstAccessMask = vk::AccessFlagBits::eUniformRead;
 	barriers[2].buffer        = m_stream_buffer.Handle();
-	barriers[2].offset        = dispatches.front().params_offset;
-	barriers[2].size =
-	    dispatches.back().params_offset - dispatches.front().params_offset + sizeof(Push);
+	barriers[2].offset        = tiling.params_offset;
+	barriers[2].size          = tiling.params_size;
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
@@ -314,24 +313,26 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 
 	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
 	const vk::DescriptorBufferInfo target_info {target, target_descriptor_offset, target_range};
-	for (auto& dispatch: dispatches) {
-		const vk::DescriptorBufferInfo        params_info {m_stream_buffer.Handle(),
-		                                                   dispatch.params_offset, sizeof(Push)};
-		const vk::DescriptorBufferInfo        infos[] {source_info, target_info, params_info};
-		std::array<vk::WriteDescriptorSet, 3> writes {};
-		for (uint32_t index = 0; index < writes.size(); index++) {
-			writes[index].dstBinding      = index;
-			writes[index].descriptorCount = 1;
-			writes[index].descriptorType  = index == 2 ? vk::DescriptorType::eUniformBuffer
-			                                           : vk::DescriptorType::eStorageBuffer;
-			writes[index].pBufferInfo     = &infos[index];
-		}
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
-		                             static_cast<uint32_t>(writes.size()), writes.data());
-		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
-		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
-		                 dispatch.push.depth);
+	const vk::DescriptorBufferInfo params_info {m_stream_buffer.Handle(), tiling.params_offset,
+	                                            tiling.params_size};
+	const vk::DescriptorBufferInfo infos[] {source_info, target_info, params_info};
+	std::array<vk::WriteDescriptorSet, 3> writes {};
+	for (uint32_t index = 0; index < writes.size(); index++) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+		writes[index].descriptorType =
+		    index == 2 ? vk::DescriptorType::eUniformBuffer : vk::DescriptorType::eStorageBuffer;
+		writes[index].pBufferInfo = &infos[index];
 	}
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
+	                             static_cast<uint32_t>(writes.size()), writes.data());
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(tiling.pipeline_slot));
+	const uint64_t groups   = (uint64_t {tiling.num_texels} + 63u) / 64u;
+	const uint32_t groups_y = static_cast<uint32_t>(
+	    (groups + limits.maxComputeWorkGroupCount[0] - 1u) / limits.maxComputeWorkGroupCount[0]);
+	const uint32_t groups_x = static_cast<uint32_t>((groups + groups_y - 1u) / groups_y);
+	EXIT_NOT_IMPLEMENTED(groups_y > limits.maxComputeWorkGroupCount[1]);
+	command.dispatch(groups_x, groups_y, 1);
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
@@ -341,51 +342,53 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 }
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
-                                        uint64_t tiled_capacity, uint64_t linear_capacity,
-                                        std::span<const GpuTileInfo> infos,
-                                        ColorTransform transform) {
+                                        const ImageInfo& info) {
+	if (!info.IsTiled()) {
+		const Result source {tiled, tiled_offset, info.data.size};
+		return info.GetColorTransform() == ColorTransform::None
+		           ? source
+		           : TransformColor(source, info.GetColorTransform(), true);
+	}
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t        source_base = tiled_offset & (descriptor_alignment - 1);
-	std::vector<Dispatch> dispatches;
-	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches, transform);
+	const uint64_t source_base     = tiled_offset & (descriptor_alignment - 1);
+	const auto     linear_capacity = info.LinearSize();
+	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, source_base, 0);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
-	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
-	       true);
+	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                       std::span<const GpuTileInfo> infos) {
+                       const ImageInfo& info, uint32_t levels) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t        source_base = linear_offset & (descriptor_alignment - 1);
-	const uint64_t        target_base = tiled_offset & (descriptor_alignment - 1);
-	std::vector<Dispatch> dispatches;
-	Prepare(true, tiled_capacity, linear_capacity, infos, source_base, target_base, dispatches);
-	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity,
-	       dispatches, false);
+	const uint64_t source_base = linear_offset & (descriptor_alignment - 1);
+	const uint64_t target_base = tiled_offset & (descriptor_alignment - 1);
+	const auto     tiling =
+	    Prepare(true, tiled_capacity, linear_capacity, info, levels, source_base, target_base);
+	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling,
+	       false);
 }
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
-                            ColorTransform transform) {
+                            uint32_t levels) {
 	EXIT_IF(regions.empty());
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t        target_base = tiled_offset & (descriptor_alignment - 1);
-	std::vector<Dispatch> dispatches;
+	const uint64_t target_base     = tiled_offset & (descriptor_alignment - 1);
+	const auto     linear_capacity = image.info.LinearSize(levels);
 	// Reserve stream parameters before recording the image download.
-	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches, transform);
+	const auto tiling =
+	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, target_base);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
-	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity,
-	       dispatches, false);
+	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling, false);
 }
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
@@ -563,13 +566,13 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			}
 			command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 			                             static_cast<uint32_t>(writes.size()), writes.data());
-			Push push {};
+			Conversion push {};
 			push.src_base    = source_binding.base;
 			push.dst_base    = target_binding.base;
 			push.width       = layout.width;
 			push.height      = rows;
-			push.pitch_bytes = static_cast<uint32_t>(layout.source_row_stride);
-			push.slice_bytes = static_cast<uint32_t>(layout.target_row_stride);
+			push.source_pitch = static_cast<uint32_t>(layout.source_row_stride);
+			push.target_pitch = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
@@ -644,7 +647,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_transform);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
-	Push push {};
+	Conversion push {};
 	push.src_base        = input_binding.base;
 	push.dst_base        = output_binding.base;
 	push.width           = pixels;

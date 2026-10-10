@@ -178,12 +178,29 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			                        IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[0]}))});
 			return;
 		}
+		case O::S_BCNT0_I32_B32:
+		case O::S_FF0_I32_B32: {
+			const auto value = ir.BitwiseNot(ReadU32(inst.src0));
+			const bool count = inst.opcode == O::S_BCNT0_I32_B32;
+			const auto result = IR::U32(ir.Emit(count ? IR::ValueOpcode::BitCount32
+			                                       : IR::ValueOpcode::FindILsb32, {value}));
+			WriteOperand(inst.dst, result);
+			if (count) {
+				ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
+			}
+			return;
+		}
 		case O::S_BCNT1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitCount32, IR::Type::U32, false, false,
 			                     true);
+		case O::S_BCNT0_I32_B64:
 		case O::S_BCNT1_I32_B64: {
 			// Vulkan bit counts operate on 32-bit words; avoid packing only to split again.
-			const auto value  = ReadU32Pair(inst.src0);
+			auto value = ReadU32Pair(inst.src0);
+			if (inst.opcode == O::S_BCNT0_I32_B64) {
+				value[0] = ir.BitwiseNot(value[0]);
+				value[1] = ir.BitwiseNot(value[1]);
+			}
 			const auto low    = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[0]}));
 			const auto high   = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[1]}));
 			const auto result = ir.IAdd(low, high);
@@ -221,7 +238,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseOr32, false, true, true);
 		case O::S_XNOR_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseXor32, false, true, true);
-		case O::S_FF1_I32_B64: return S_FF1_I32_B64(inst);
+		case O::S_FF0_I32_B64: return S_FF_I32_B64(inst, true);
+		case O::S_FF1_I32_B64: return S_FF_I32_B64(inst, false);
 		case O::S_FLBIT_I32_B32: return V_FFBH_32(inst, false);
 		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst);
 
@@ -261,7 +279,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
 		case O::S_CBRANCH_CDBGSYS:
+		case O::S_CBRANCH_CDBGUSER:
 		case O::S_CBRANCH_CDBGSYS_OR_USER:
+		case O::S_CBRANCH_CDBGSYS_AND_USER:
 		case O::S_ENDPGM: return;
 		default: return FailMissingTranslation(inst);
 	}

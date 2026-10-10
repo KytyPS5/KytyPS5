@@ -139,9 +139,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// Nonlinear clear values are still stored as normalized components.
 	// Metadata clears are materialized during image discovery; render-pass loads preserve contents.
 	uint32_t   width  = 0;
-	uint32_t   height = 0;
-	uint32_t   pitch  = 0;
-	uint64_t   size   = 0;
+	uint32_t       height       = 0;
 	bool       tile   = false;
 	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
 	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
@@ -163,6 +161,9 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	if (texture_tile && samples != 1) {
 		EXIT("texture-tiled color render targets do not support multisampling\n");
+	}
+	if (volume && !tile) {
+		EXIT("linear 3D render targets are unsupported\n");
 	}
 
 	width  = rt.attrib2.width + 1;
@@ -198,80 +199,25 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
-	if (samples == 1) {
-		pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
-	} else {
-		pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
-	}
-	if (pitch == 0) {
-		EXIT("unsupported render-target pitch: width=%u bytes=%u\n", width, bytes_per_element);
-	}
-
-	TileSizeOffset    mip_sizes[16] {};
-	TilePaddedSize    mip_padded[16] {};
-	TileSurfaceLayout volume_layout {};
-	uint64_t          backing_size = 0;
-	if (volume) {
-		const TileSurfaceDescription description {transfer_format,
-		                                          rt.attrib3.tile_mode,
-		                                          TileSurfaceDimension::Dim3D,
-		                                          width,
-		                                          height,
-		                                          depth,
-		                                          levels,
-		                                          1};
-		if (!tile || !TileGetTiledTextureLayout(description, volume_layout)) {
-			EXIT("unsupported 3D render-target layout: %ux%ux%u levels=%u tile=%u\n", width, height,
-			     depth, levels, static_cast<uint32_t>(rt.attrib3.tile_mode));
-		}
-		size         = volume_layout.block_slice_size;
-		backing_size = volume_layout.total_size;
-	} else {
-		TileSizeAlign layout {};
-		bool          valid_layout = false;
-		if (samples == 1) {
-			TileGetTextureSize(transfer_format, width, height, levels, rt.attrib3.tile_mode,
-			                   &layout, mip_sizes, mip_padded);
-			valid_layout = layout.size != 0 && layout.align != 0 &&
-			               (rt.attrib3.tile_mode != Prospero::TileMode::kRenderTarget ||
-			                levels <= std::bit_width(std::max(width, height)));
-		} else {
-			valid_layout = TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
-			                                       layout, rt.attrib.num_fragments);
-			mip_sizes[0]  = {layout.size, 0, 0, 0, 0, 0};
-			mip_padded[0] = {pitch, height};
-		}
-		if (!valid_layout) {
-			EXIT("unsupported render-target layout: %ux%u pitch=%u bytes=%u levels=%u\n", width,
-			     height, pitch, bytes_per_element, levels);
-		}
-		size = layout.size;
-	}
-	if (size == 0 || (!volume && size > UINT64_MAX / view.image_layers)) {
-		EXIT("render-target memory footprint is invalid\n");
-	}
-	if (!volume) {
-		backing_size = size * view.image_layers;
-	}
-	if (backing_size == 0) {
-		EXIT("render-target backing is empty\n");
-	}
-	if (!GuestRange {rt.base.addr, backing_size}.Valid()) {
-		EXIT("render-target backing range is invalid\n");
-	}
-
 	auto& desc = r.desc;
 	desc.type              = TextureCache::BindingType::RenderTarget;
-	desc.info.data         = {rt.base.addr, backing_size};
+	desc.info.data            = {rt.base.addr, 0};
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = target_format.guest_format;
 	desc.info.type         = image_type;
 	desc.info.extent       = {width, height, depth};
-	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
-	desc.info.pitch        = pitch;
+	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
+	if (!volume && rt.attrib3.tile_mode == Prospero::TileMode::kRenderTarget &&
+	    levels > std::bit_width(std::max(width, height))) {
+		EXIT("unsupported render-target mip count\n");
+	}
+	desc.info.UpdateSize();
+	if (!desc.info.data.Valid()) {
+		EXIT("render-target backing range is invalid\n");
+	}
 	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
 	const bool has_cmask      = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
 	                            rt.cmask.addr != 0 && samples == 1 &&
@@ -292,30 +238,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
 		desc.info.metadata.clear_word           = rt.clear_word0.word0;
 		desc.info.metadata.clear_register_valid = true;
-	}
-	for (uint32_t level = 0; level < levels; level++) {
-		if (volume) {
-			const auto& mip             = volume_layout.mips[level];
-			desc.info.mip_layout[level] = {
-			    mip.offset,
-			    mip.size,
-			    mip.padded_width,
-			    mip.padded_height,
-			};
-			continue;
-		}
-		const auto level_offset =
-		    mip_sizes[level].src_size != 0 ? mip_sizes[level].src_offset : mip_sizes[level].offset;
-		const auto level_size =
-		    static_cast<uint64_t>(mip_sizes[level].src_size != 0 ? mip_sizes[level].src_size
-		                                                         : mip_sizes[level].size) *
-		    view.image_layers;
-		desc.info.mip_layout[level] = {
-		    level_offset,
-		    level_size,
-		    mip_padded[level].width,
-		    mip_padded[level].height,
-		};
 	}
 	desc.view_info.format = target_format.format;
 	if (is_1d) {

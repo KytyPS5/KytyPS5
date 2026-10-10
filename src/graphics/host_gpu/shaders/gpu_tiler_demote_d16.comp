@@ -6,20 +6,15 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
 layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
 
-layout(push_constant, std430) uniform Push {
+layout(push_constant, std430) uniform Conversion {
 	uint src_base;
 	uint dst_base;
 	uint width;
 	uint height;
-	uint depth;
-	uint surface_z;
-	uint pitch_bytes;
-	uint slice_bytes;
-	uint blocks_per_row;
-	uint blocks_per_slice;
-	uint tail_x;
-	uint tail_y;
-	uint tail;
+	uint source_pitch;
+	uint target_pitch;
+	uint color_transform;
+	uint to_host;
 } params;
 
 uint decode(uint value) {
@@ -35,8 +30,8 @@ void main() {
 	if (x >= params.width || y >= params.height) {
 		return;
 	}
-	uint src = params.src_base + y * params.pitch_bytes + x * 4u;
-	uint dst = params.dst_base + y * params.slice_bytes + x * 2u;
+	uint src = params.src_base + y * params.source_pitch + x * 4u;
+	uint dst = params.dst_base + y * params.target_pitch + x * 2u;
 	uint shift = (dst & 2u) * 8u;
 	uint mask = 0xffffu << shift;
 	uint word = dst >> 2u;

@@ -721,31 +721,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
 		                    block.sources.end());
 	}
-	// Only branches that can change future resource access belong in the host plan.
-	std::vector<uint8_t> resource_reachable(blocks.size());
-	std::vector<uint32_t> pending;
-	for (uint32_t i = 0; i < blocks.size(); ++i) {
-		if (!blocks[i].sources.empty() || !blocks[i].srt_reads.empty()) {
-			resource_reachable[i] = 1;
-			pending.push_back(i);
-		}
-	}
-	while (!pending.empty()) {
-		const auto index = pending.back();
-		pending.pop_back();
-		for (const auto* predecessor: program.blocks[index]->ImmPredecessors()) {
-			const auto found = indices.find(predecessor);
-			if (found == indices.end()) return {};
-			if (resource_reachable[found->second]) continue;
-			resource_reachable[found->second] = 1;
-			pending.push_back(found->second);
-		}
-	}
-	for (auto& block: blocks) {
-		block.condition = std::ranges::any_of(block.successors, [&](uint32_t successor) {
-			return resource_reachable[successor] != 0;
-		}) ? predicate(block.condition) : Value {};
-	}
+	for (auto& block: blocks) block.condition = predicate(block.condition);
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
 		return {};

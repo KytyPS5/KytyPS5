@@ -566,29 +566,23 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 			    "pixels unchanged (format=0x{:016x}).\n", attribute.pixel_format));
 		}
 	}
-	const auto tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
-	const auto pitch =
-	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, tile_mode);
-	Graphics::TileSizeAlign total {};
-	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
-	                                  1, 1, tile_mode, false, total);
-	if (total.size == 0 || total.align != 65536 ||
-	    (buffer.data_address & (total.align - 1u)) != 0) {
-		EXIT("invalid video-out surface footprint or alignment\n");
-	}
+	const auto          tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
 	Graphics::ImageInfo info {};
-	info.data            = {buffer.data_address, total.size};
+	info.data            = {buffer.data_address, 0};
 	info.pixel_format    = pixel_format.format;
 	info.guest_format    = pixel_format.guest_format;
 	info.type            = Graphics::Prospero::ImageType::kColor2D;
 	info.extent          = {attribute.width, attribute.height, 1};
 	info.resources       = {1, 1};
-	info.pitch           = pitch;
 	info.bytes_per_block = pixel_format.bytes_per_element;
 	info.samples         = 1;
 	info.tile_mode       = tile_mode;
 	info.bgra16          = pixel_format.bgra16;
-	info.mip_layout[0]   = {0, total.size, pitch, attribute.height};
+	info.UpdateSize();
+	if (info.data.size == 0 || info.tiling.block.block_size != 65536 ||
+	    (buffer.data_address & 65535u) != 0) {
+		EXIT("invalid video-out surface footprint or alignment\n");
+	}
 	if (compression != Graphics::VideoOutCompression::Uncompressed) {
 		Graphics::TileSizeAlign dcc_size {};
 		if (!Graphics::TileGetDccSize(attribute.width, attribute.height, 1,

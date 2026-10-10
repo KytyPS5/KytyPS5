@@ -193,6 +193,8 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
+	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
+	m_scheduler.GetDynamicState().Invalidate();
 }
 
 } // namespace Libs::Graphics

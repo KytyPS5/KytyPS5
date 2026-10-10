@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -12,6 +13,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -47,11 +49,19 @@ struct ImageSubresourceRange {
 };
 
 struct ImageMipInfo {
+	// Guest mip chains run backwards within each layer or volume block-slice.
+	// Tail levels share an offset and use tail_x/tail_y within that block.
 	uint64_t offset                                 = 0;
 	uint64_t size                                   = 0;
 	// Padded dimensions in storage elements (compressed blocks for BC formats).
 	uint32_t pitch                                  = 0;
 	uint32_t height                                 = 0;
+	uint64_t linear_offset                          = 0;
+	uint64_t linear_size                            = 0; // Per transfer slice.
+	uint32_t linear_pitch                           = 0; // Storage elements.
+	uint32_t tail_x                                 = 0;
+	uint32_t tail_y                                 = 0;
+	uint32_t surface_z                              = 0;
 	auto     operator<=>(const ImageMipInfo&) const = default;
 };
 
@@ -71,6 +81,17 @@ struct ImageInfo {
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
+	TileTextureBlockLayout       tiling;
+	uint64_t                     tiled_slice_stride = 0;
+	// Nonzero for guest-linear and depth-plane transfers; tiled colors are mip-major.
+	uint64_t linear_slice_stride = 0;
+	uint32_t first_tail_level    = 16;
+
+	void                                           UpdateSize();
+	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
+	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
+	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
+	                                                            uint32_t levels        = 0) const;
 
 	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
 		if (bgra16) return ColorTransform::SwapBgra16;

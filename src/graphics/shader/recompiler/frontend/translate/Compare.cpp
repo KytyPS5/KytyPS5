@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <bit>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -27,7 +28,8 @@ void Translator::EmitCompareConstant(const Decoder::Instruction& inst, bool valu
 }
 
 void Translator::EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
-                                    IR::Type type, bool scalar, bool cmpx) {
+                                    IR::Type type, bool scalar, bool cmpx, bool swap_operands) {
+	// The equality compares share their IR opcode with the unsigned ones.
 	const bool signed_64 = opcode == IR::ValueOpcode::SLessThan64 ||
 	                       opcode == IR::ValueOpcode::SLessThanEqual64 ||
 	                       inst.opcode == Decoder::Opcode::V_CMP_EQ_I64 ||
@@ -42,8 +44,12 @@ void Translator::EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueO
 		}
 		return ReadOperand(operand, type);
 	};
-	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {read(inst.src0), read(inst.src1)})), scalar,
-	                  cmpx);
+	auto lhs = read(inst.src0);
+	auto rhs = read(inst.src1);
+	if (swap_operands) {
+		std::swap(lhs, rhs);
+	}
+	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs})), scalar, cmpx);
 }
 
 void Translator::EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,

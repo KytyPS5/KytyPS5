@@ -807,6 +807,15 @@ private:
 				}
 			}
 		}
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				uint32_t index = 0;
+				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+				    ScalarReadMemory(inst, index) != nullptr && inst.Arg(1).Resolve().IsImmediate() &&
+				    ValidateRuntimeValue(m_program, Value(&inst)))
+					CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
+			}
+		}
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
 			auto& memory = m_program.memory_info[flags.index];

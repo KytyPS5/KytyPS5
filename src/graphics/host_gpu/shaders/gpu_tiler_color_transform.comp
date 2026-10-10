@@ -6,20 +6,13 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
 layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
 
-layout(push_constant, std430) uniform Push {
+layout(push_constant, std430) uniform Conversion {
 	uint src_base;
 	uint dst_base;
 	uint width;
 	uint height;
-	uint depth;
-	uint surface_z;
-	uint pitch_bytes;
-	uint slice_bytes;
-	uint blocks_per_row;
-	uint blocks_per_slice;
-	uint tail_x;
-	uint tail_y;
-	uint tail;
+	uint source_pitch;
+	uint target_pitch;
 	uint color_transform;
 	uint to_host;
 } params;

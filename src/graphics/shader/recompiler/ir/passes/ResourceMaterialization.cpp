@@ -337,6 +337,25 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			keys.resize(key_count);
 			std::iota(keys.begin(), keys.end(), 0u);
+		} else if (!indirect.selector_first.IsEmpty() && material_value.dword_count == 2u) {
+			// Selector words behind a scalar pointer: no buffer bounds to honour.
+			uint32_t first = 0, count = 0;
+			if (!clean.Evaluate(indirect.selector_first, first) ||
+			    !clean.Evaluate(indirect.key_count, count))
+				return false;
+			// Signed bounds normalize to zero before the probe limit, as for immediate keys.
+			if (std::bit_cast<int32_t>(count) <= 0) count = 0;
+			if (count > MaxIndirectDescriptorProbes) return false;
+			const auto material_base =
+			    (static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0];
+			keys.resize(count);
+			for (uint32_t i = 0; i < count; ++i) {
+				const uint64_t offset =
+				    (uint64_t {first} + i) * selector->stride + selector->offset;
+				if (offset > UINT32_MAX ||
+				    !ReadScalarTable(material_base, UINT64_MAX, offset, runtime, {&keys[i], 1}))
+					return false;
+			}
 		} else if (!indirect.selector_first.IsEmpty()) {
 			ShaderBufferResource material;
 			uint32_t             first = 0, count = 0;
@@ -379,8 +398,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				keys.push_back(key);
 				mask &= mask - 1u;
 			}
-		} else return false;
+		} else
+			return false;
 		if (selector != nullptr) {
+			if (indirect.selector_nonnegative)
+				std::erase_if(keys, [](uint32_t key) { return key >= 0x80000000u; });
 			std::ranges::sort(keys);
 			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		}

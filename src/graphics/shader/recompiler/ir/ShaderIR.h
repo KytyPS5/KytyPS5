@@ -514,6 +514,8 @@ struct DescriptorSource {
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;
+		// Negative selector values never reach the resource (a dominating key >= 0 test).
+		bool                  selector_nonnegative = false;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectDescriptor& other) const = default;

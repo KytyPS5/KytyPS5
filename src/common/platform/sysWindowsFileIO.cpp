@@ -13,6 +13,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -65,8 +66,35 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
-		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		DWORD         w = 0;
+		LARGE_INTEGER zero {};
+		LARGE_INTEGER start {};
+		SetFilePointerEx(f.handle, zero, &start, FILE_CURRENT);
+		if (ReadFile(f.handle, data, size, &w, nullptr) == FALSE) {
+			const DWORD error = GetLastError();
+			// The destination can be write-protected guest memory (for example pages tracked for
+			// GPU synchronization). ReadFile writes from kernel mode, which cannot trigger the
+			// emulator's fault handler, so the call fails without copying anything
+			// (ERROR_NOACCESS, or ERROR_INVALID_USER_BUFFER when the pages cannot be locked).
+			// Read into a host buffer instead and copy from user mode, where the fault handler
+			// can unprotect the pages, like the AMPR read path does.
+			if (error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER) {
+				SetFilePointerEx(f.handle, start, nullptr, FILE_BEGIN);
+				w = 0;
+				thread_local std::vector<uint8_t> chunk(1u << 20u);
+				while (w < size) {
+					const DWORD request =
+					    std::min<DWORD>(size - w, static_cast<DWORD>(chunk.size()));
+					DWORD got = 0;
+					if (ReadFile(f.handle, chunk.data(), request, &got, nullptr) == FALSE ||
+					    got == 0) {
+						break;
+					}
+					std::memcpy(static_cast<uint8_t*>(data) + w, chunk.data(), got);
+					w += got;
+				}
+			}
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

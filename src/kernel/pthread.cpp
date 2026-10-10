@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -94,6 +95,60 @@ constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// The guest's priority classes are mapped onto host priorities. On the console the graphics command
+// processor is hardware and competes with nothing; here it is a thread, and a game may keep a dozen
+// job workers spinning on a lock-free job table, so the whole guest band sits at or below the host's
+// normal priority and the emulator's own threads stay above the game's workers. Only the values the
+// operating system accepts outside the realtime class may be used here.
+constexpr int GUEST_HOST_PRIORITY_HIGH   = 0;
+constexpr int GUEST_HOST_PRIORITY_NORMAL = -1;
+constexpr int GUEST_HOST_PRIORITY_LOW    = -2;
+
+/// Maps a guest priority (a smaller value is more important) to the host priority of its band:
+/// <= 478 is high, >= 733 is low, everything in between is normal.
+static int GuestPriorityToHost(int guest_priority) {
+	if (guest_priority <= 478) {
+		return GUEST_HOST_PRIORITY_HIGH;
+	}
+	if (guest_priority >= 733) {
+		return GUEST_HOST_PRIORITY_LOW;
+	}
+	return GUEST_HOST_PRIORITY_NORMAL;
+}
+
+/// Tells whether a guest thread with this affinity runs one host priority step below its band.
+///
+/// A guest thread pinned to a single core owns that core on the console. A game that starts one such
+/// spinning job worker per core shares all of them with the threads that produce their work, on fewer
+/// host cores and in the same priority band, and the spinners starve those threads. Decided once when
+/// the thread starts: a main thread may pin itself to one core for a while and must not drop with it.
+static bool LowerCoreBoundThread(KernelCpumask affinity) {
+	return std::has_single_bit(affinity);
+}
+
+/// Host priority a guest thread runs at: the priority of its band, or one step below it (but not
+/// below the lowest band value) when the thread is pinned to a single core.
+static int GuestThreadHostPriority(int guest_priority, bool core_bound) {
+	const int host = GuestPriorityToHost(guest_priority);
+	return core_bound ? std::max(host - 1, -2) : host;
+}
+
+/// Maps a host priority of the guest band back to one of the three classes the guest sees
+/// (256 high, 700 normal, 767 low). The kernel objects use the class to order their waiters.
+static int HostPriorityToGuest(int host_priority) {
+	if (host_priority <= GUEST_HOST_PRIORITY_LOW) {
+		return 767;
+	}
+	if (host_priority >= GUEST_HOST_PRIORITY_HIGH) {
+		return 256;
+	}
+	return 700;
+}
+
+#endif
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;
 static constexpr KernelClockid KERNEL_CLOCK_VIRTUAL           = 1;
@@ -396,6 +451,9 @@ struct PthreadPrivate {
 	std::atomic_bool      almost_done;
 	std::atomic_bool      free;
 	uint64_t              host_thread_id;
+	// Pinned to one core when it started; such a thread runs one host priority step lower. Written
+	// by the thread itself, read by whoever changes its priority.
+	std::atomic_bool      core_bound = false;
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
 	uintptr_t             guest_host_rbp;
@@ -2137,6 +2195,8 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 	return OK;
 }
 
+/// Stores the guest priority in the attribute and, on Windows, the host priority of its band in the
+/// native attribute. Fails with EINVAL when the attribute or the parameter is invalid.
 int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedParam* param) {
 	// PRINT_NAME();
 
@@ -2147,13 +2207,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
-	if (param->sched_priority <= 478) {
-		pparam.sched_priority = +2;
-	} else if (param->sched_priority >= 733) {
-		pparam.sched_priority = -2;
-	} else {
-		pparam.sched_priority = 0;
-	}
+	pparam.sched_priority = GuestPriorityToHost(param->sched_priority);
 
 	if (pthread_attr_setschedparam(&attr_value->p, &pparam) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -3134,25 +3188,20 @@ bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_
 	return true;
 }
 
+/// Priority class (256, 700 or 767) of a guest thread as the kernel objects use it to order their
+/// waiters. It follows the guest's own priority, not the host step the thread runs at. Returns 700
+/// when the thread is unknown and on every platform but Windows.
 int PthreadGetPriorityForKernel(Pthread thread) {
-	if (thread == nullptr) {
+	if (thread == nullptr || thread->attr == nullptr) {
 		return 700;
 	}
 
-	sched_param param {};
-	int         pol = 0;
-
-	if (pthread_getschedparam(thread->p, &pol, &param) != 0) {
-		return 700;
-	}
-
-	if (param.sched_priority <= -2) {
-		return 767;
-	}
-	if (param.sched_priority >= +2) {
-		return 256;
-	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The class of the priority the guest asked for, whatever host step the thread runs at.
+	return HostPriorityToGuest(GuestPriorityToHost(thread->attr->guest_priority));
+#else
 	return 700;
+#endif
 }
 
 int PthreadGetCurrentPriorityForKernel() {
@@ -3178,6 +3227,10 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+/// Entry point of the host thread behind every guest thread: records its identity, applies the guest
+/// priority, then runs the guest entry function on the guest stack and cleans up afterwards.
+/// @param arg the Pthread that this host thread runs
+/// @return the value the guest entry function returned
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -3210,6 +3263,14 @@ static void* RunThread(void* arg) {
 	}
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Apply the guest's priority to this thread directly. The attribute carries it as well, but
+	// PthreadAttrSetinheritsched deliberately keeps inherit_sched out of the native attribute, so
+	// whether winpthreads honours the attribute at creation is not ours to rely on.
+	thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);
+	SetThreadPriority(GetCurrentThread(),
+	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+#endif
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
 	     thread->name.c_str(), thread->unique_id, os_thread_id,
@@ -3477,6 +3538,8 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 	return OK;
 }
 
+/// Sets the priority of a guest thread: the guest value is stored and, on Windows, the host priority
+/// of its band is applied, one step lower for a thread that started pinned to a single core.
 int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	PRINT_NAME();
 
@@ -3494,13 +3557,7 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (prio <= 478) {
-		param.sched_priority = +2;
-	} else if (prio >= 733) {
-		param.sched_priority = -2;
-	} else {
-		param.sched_priority = 0;
-	}
+	param.sched_priority = GuestThreadHostPriority(prio, thread->core_bound);
 
 	if (pthread_setschedparam(thread->p, pol, &param) != 0) {
 		return KERNEL_ERROR_EINVAL;

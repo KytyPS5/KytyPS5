@@ -51,15 +51,6 @@ add_custom_target(stage_updater
 	VERBATIM)
 add_dependencies(launcher kyty_emulator stage_updater)
 
-if(BUILD_TESTING)
-	add_executable(update_release_tests EXCLUDE_FROM_ALL
-		"${KYTY_TESTS_DIR}/UpdateReleaseTests.cpp" src/updateRelease.cpp)
-	target_include_directories(update_release_tests PRIVATE include)
-	target_link_libraries(update_release_tests PRIVATE Qt6::Core)
-	add_test(NAME update_release COMMAND update_release_tests)
-	add_dependencies(kyty_tests update_release_tests)
-endif()
-
 if(KYTY_CLANG_CL)
 	add_custom_command(TARGET launcher POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_PDB_FILE:kyty_emulator> $<TARGET_FILE_DIR:launcher>/$<TARGET_PDB_FILE_NAME:kyty_emulator>

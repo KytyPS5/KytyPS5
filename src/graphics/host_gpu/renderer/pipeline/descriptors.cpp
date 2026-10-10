@@ -311,8 +311,11 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic && !resource.atomic64;
+	// 32-bit atomics are typed by the opcode: a SINT view is bound as R32_UINT like a UINT one.
+	const bool raw_sint_atomic = format == Prospero::BufferFormat::k32SInt && uint_resource &&
+	                             resource.atomic && !resource.atomic64;
 	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
+	    raw_sint_storage || raw_float_atomic || raw_sint_atomic ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&

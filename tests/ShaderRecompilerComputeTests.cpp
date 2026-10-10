@@ -36275,6 +36275,49 @@ TestCase ImageAtomicVariants() {
   return test;
 }
 
+TestCase ImageAtomicSintDescriptor() {
+  using O = ShaderOpcode;
+
+  // A 32_SINT descriptor is bound through the R32_UINT view; the signed opcodes
+  // must still compare signed values (unsigned ones would pick the other texel).
+  const u32 initial[] = {0xfffffff6u, 5u, 0xfffffffbu, 3u};
+  const u32 values[] = {5u, 0xfffffffdu, 7u, 0xfffffffeu};
+  const u32 ops[] = {0x14, 0x16, 0x16, 0x14};
+
+  std::vector<u32> code;
+  for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+    AppendVMovU32(&code, 20, i & 3u);
+    AppendVMovU32(&code, 21, i >> 2u);
+    AppendVMovU32(&code, 22, 0);
+    AppendVMovLiteral(&code, 0, values[i]);
+    code.push_back(EncodeMimg0(ops[i], 0x1, 0, true));
+    code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&code, 0, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageAtomicSintDescriptor";
+  test.code = code;
+  test.expected = {initial[0], initial[1], initial[2], initial[3]};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_ATOMIC_SMIN, O::IMAGE_ATOMIC_SMAX,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32SInt);
+  test.has_user_data = true;
+  test.required_spirv = {"OpAtomicSMin", "OpAtomicSMax", "OpImageTexelPointer",
+                         "R32ui"};
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  for (u32 i = 0; i < static_cast<u32>(std::size(initial)); i++) {
+    test.storage_image_r32ui[i] = initial[i];
+  }
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui[0] = 0xfffffff6u;
+  test.expected_storage_image_r32ui[1] = 5u;
+  test.expected_storage_image_r32ui[2] = 7u;
+  test.expected_storage_image_r32ui[3] = 0xfffffffeu;
+  return test;
+}
+
 // Input and old texel cover high-DWORD ordering, carry/wrap, the unsigned sign
 // boundary, and equal-high-DWORD ordering through the RG32_UINT -> R64_UINT view.
 constexpr uint64_t ImageAtomicInputs[][2] = {
@@ -37588,6 +37631,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
+  AddCase(ImageAtomicSintDescriptor);
   for (const auto &atomic : ImageAtomicIntegerCases) {
     cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, false));
     cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, true));
@@ -39300,6 +39344,28 @@ ShaderRecompiler::IR::ImageResource AtomicStorageTextureResource() {
 ShaderTextureResource AtomicStorageTextureDescriptor() {
   return {{0x304bb700u, 0xc1400000u, 0x0000001fu, 0x91b00204u, 0x00000000u,
            0x00700000u, 0x00000000u, 0x00000000u}};
+}
+
+// The renderer binds 32-bit atomics on a 32_SINT descriptor through its R32_UINT view;
+// 64-bit atomics still need 32_32_UINT.
+void CheckAtomicSintStorageTexture() {
+  auto descriptor = AtomicStorageTextureDescriptor();
+  descriptor.fields[1] =
+      (descriptor.fields[1] & ~0x1ff00000u) |
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) << 20u);
+  Require("AtomicSintStorageTexture", "descriptor",
+          descriptor.Format() == Prospero::BufferFormat::k32SInt,
+          "32_SINT image-atomic descriptor fixture is malformed");
+  const auto resource = AtomicStorageTextureResource();
+  ValidateStorageTexture(resource, descriptor, 0x10000);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal("AtomicSintStorageTexture64", [&] {
+    auto atomic64 = resource;
+    atomic64.atomic64 = true;
+    ValidateStorageTexture(atomic64, descriptor, 0x10000);
+  });
+#endif
+  std::printf("[host]    %-32s ok\n", "AtomicSintStorageTexture");
 }
 
 [[noreturn]] void RunStorageTextureDescriptorDeathCase(const char *kind) {
@@ -43800,6 +43866,7 @@ int main(int argc, char **argv) {
   CheckImageSamplerSpecialization();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();
+  CheckAtomicSintStorageTexture();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
   CheckErrorDialogLifecycle();

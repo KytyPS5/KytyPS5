@@ -326,6 +326,14 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
+		} else if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
+			// Pads without a touchpad (Switch, Xbox, ...) have no way to click it, which
+			// blocks games that require it. Use their Back/Select button as a centered click.
+			auto* pad = SDL_GetGamepadFromID(f.id);
+			if (pad != nullptr && SDL_GetNumGamepadTouchpads(pad) == 0) {
+				Controller::SetButton(f.id, Controller::PAD_BUTTON_TOUCH_PAD, f.down);
+				Controller::SetTouchPad(f.id, 0, f.down, 0.5f, 0.5f);
+			}
 		}
 	}
 

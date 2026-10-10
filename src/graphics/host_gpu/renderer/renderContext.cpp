@@ -88,8 +88,25 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
+	std::vector<GuestRange> added;
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		auto            cursor = vaddr;
+		m_mapped_ranges.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
+			if (begin > cursor) {
+				added.push_back({cursor, begin - cursor});
+			}
+			cursor = end;
+		});
+		if (cursor < vaddr + size) {
+			added.push_back({cursor, vaddr + size - cursor});
+		}
+		m_mapped_ranges.Add(vaddr, size);
+	}
+	// Logged once mapped: a sweep that takes the log also sees the range mapped.
+	for (const auto& range: added) {
+		m_buffer_cache.NoteMappedMemory(range.address, range.size);
+	}
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -128,11 +145,16 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
 	m_fault_process_pending = true;
+	// Read before the sweep: a CPU write or a mapping landing during it changes the key for the
+	// next draw.
+	const auto key = m_buffer_cache.SynchronizationKey();
+	if (key == m_bda_sync_key) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_buffer_cache.SynchronizeAddressableBuffers(m_mapped_ranges);
+	m_bda_sync_key = key;
 }
 
 void RenderContext::RunGarbageCollector() {

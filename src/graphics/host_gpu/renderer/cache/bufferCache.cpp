@@ -26,6 +26,8 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+// Registrations remembered between addressable sweeps; more fall back to a full sweep.
+constexpr size_t MaxUnsweptBuffers = 1024;
 
 } // namespace
 
@@ -81,6 +83,7 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
+	m_registration_epoch++;
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -106,6 +109,14 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		if (m_unswept_complete) {
+			if (m_unswept_buffers.size() < MaxUnsweptBuffers) {
+				m_unswept_buffers.push_back({buffer.CpuAddress(), buffer.Size()});
+			} else {
+				m_unswept_buffers.clear();
+				m_unswept_complete = false;
+			}
+		}
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -402,13 +413,21 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
-	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	// Read before scanning: a CPU write that lands after the scan advances it past this value.
+	const auto generation = m_memory_tracker.CpuDirtyGeneration();
+	const bool whole      = vaddr == buffer.CpuAddress() && size == buffer.Size();
+	if (is_written || buffer.cpu_sync_generation != generation) {
+		m_memory_tracker.ForEachUploadRange(
+		    vaddr, size, is_written,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+			    total_size += bytes;
+		    },
+		    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+		if (whole) {
+			buffer.cpu_sync_generation = generation;
+		}
+	}
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -671,6 +690,65 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::SynchronizeAddressableBuffers(const RangeSet& mapped) {
+	// Taken before the scan: a CPU write that lands during it stays logged for the next call.
+	m_sweep_ranges.clear();
+	const bool logged     = m_memory_tracker.TakeCpuDirtyLog(m_sweep_ranges);
+	const bool registered = std::exchange(m_unswept_complete, true);
+	m_sweep_ranges.insert(m_sweep_ranges.end(), m_unswept_buffers.begin(), m_unswept_buffers.end());
+	m_unswept_buffers.clear();
+	if (!logged || !registered) {
+		mapped.ForEach([this](uint64_t start, uint64_t end) {
+			SynchronizeBuffersInRange(start, end - start);
+		});
+		return;
+	}
+	// A mapped CPU-dirty page of a registered buffer became dirty, was mapped or was registered
+	// since the previous sweep, so it lies in a logged range.
+	RangeSet candidates;
+	for (const auto& range: m_sweep_ranges) {
+		if (range.size != 0) {
+			candidates.Add(range.address, range.size);
+		}
+	}
+	// One upload per buffer and mapped span, as a full sweep would record.
+	BufferId   current {};
+	uint64_t   span_begin = 0;
+	uint64_t   span_end   = 0;
+	const auto flush      = [&] {
+		if (current) {
+			(void)SynchronizeBuffer(m_slot_buffers[current], span_begin, span_end - span_begin,
+			                        false, false);
+		}
+	};
+	candidates.ForEach([&](uint64_t begin, uint64_t end) {
+		mapped.ForEachInRange(begin, end - begin, [&](uint64_t piece_begin, uint64_t piece_end) {
+			auto it = m_buffers.upper_bound(piece_begin);
+			if (it != m_buffers.begin()) {
+				--it;
+			}
+			for (; it != m_buffers.end() && it->first < piece_end; ++it) {
+				const auto& buffer = m_slot_buffers[it->second];
+				const auto  start  = std::max(buffer.CpuAddress(), piece_begin);
+				const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), piece_end);
+				if (start >= finish) {
+					continue;
+				}
+				if (it->second == current &&
+				    (start <= span_end || mapped.Contains(span_end, start - span_end))) {
+					span_end = std::max(span_end, finish);
+					continue;
+				}
+				flush();
+				current    = it->second;
+				span_begin = start;
+				span_end   = finish;
+			}
+		});
+	});
+	flush();
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

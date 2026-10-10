@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -40,6 +41,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+
+namespace Libs::Graphics {
+
+struct MemoryTrackerTestAccess {
+  static std::mutex &CpuDirtyLogMutex(MemoryTracker &tracker) {
+    return tracker.m_cpu_dirty_log_mutex;
+  }
+};
+
+} // namespace Libs::Graphics
 
 namespace {
 
@@ -403,6 +414,146 @@ void TestCpuDirtyUpload() {
   tracker.MarkRegionAsCpuModified(address + 16, 32);
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "explicit CPU dirtiness did not release write protection");
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
+void TestCpuDirtyGeneration() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto created = tracker.CpuDirtyGeneration();
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.CpuDirtyGeneration() > created,
+        "region creation did not advance the CPU dirty generation");
+
+  const auto before_upload = tracker.CpuDirtyGeneration();
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.CpuDirtyGeneration() == before_upload,
+        "clean upload advanced the CPU dirty generation");
+
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  const auto marked = tracker.CpuDirtyGeneration();
+  Check(marked > before_upload,
+        "explicit CPU dirtiness did not advance the generation");
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  bool flushed = false;
+  tracker.InvalidateRegion(address, page_size, [&] { flushed = true; });
+  Check(!flushed && tracker.CpuDirtyGeneration() > marked,
+        "invalidation did not advance the generation");
+
+  const auto before_untrack = tracker.CpuDirtyGeneration();
+  tracker.UntrackMemory(address, page_size * 2);
+  Check(tracker.CpuDirtyGeneration() > before_untrack,
+        "untracking did not advance the generation");
+  Release(memory);
+}
+
+void TestCpuDirtyLog() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::vector<GuestRange> ranges;
+  const auto Take = [&] {
+    ranges.clear();
+    return tracker.TakeCpuDirtyLog(ranges);
+  };
+  const auto Logged = [&](uint64_t begin, uint64_t size) {
+    return std::any_of(ranges.begin(), ranges.end(), [&](const GuestRange &range) {
+      return range.address <= begin && begin + size <= range.End();
+    });
+  };
+  Check(!Take() && ranges.empty(),
+        "the first log take did not report unlogged history");
+
+  Check(tracker.IsRegionCpuModified(address, page_size) && Take() &&
+            Logged(address & ~(region_size - 1), region_size),
+        "a new region was not logged as CPU-dirty");
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(Take() && ranges.empty(), "a clean upload was logged");
+
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  bool flushed = false;
+  tracker.InvalidateRegion(address + page_size * 2 + 5, 10,
+                           [&] { flushed = true; });
+  Check(!flushed && Take() && ranges.size() == 2 &&
+            ranges[0] == GuestRange{address, page_size} &&
+            ranges[1] == GuestRange{address + page_size * 2, page_size},
+        "CPU-dirty pages were not logged as page ranges");
+
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.InvalidateRegion(address, 1, [] {});
+  tracker.InvalidateRegion(address + page_size, 1, [] {});
+  tracker.LogCpuDirtyRange(address + page_size * 2, page_size);
+  Check(Take() && ranges.size() == 1 &&
+            ranges[0] == GuestRange{address, page_size * 3},
+        "adjacent CPU-dirty pages were not merged");
+
+  // More disjoint ranges than the log holds: the next take reports a gap.
+  for (uint64_t i = 0; i < 5000; i++) {
+    tracker.LogCpuDirtyRange(address + region_size + i * page_size * 2, page_size);
+  }
+  Check(!Take() && ranges.empty() && Take() && ranges.empty(),
+        "an overflowing log did not report its gap once");
+
+  tracker.UntrackMemory(address, page_size * 4);
+  Check(Take() && Logged(address, page_size * 4),
+        "untracked memory was not logged as CPU-dirty");
+  Release(memory);
+}
+
+void TestUntakenLogSkipsItsMutex() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto Clean = [&] {
+    tracker.ForEachUploadRange(
+        address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  };
+  Clean();
+
+  // Until a sweep takes the log, CPU writes neither log nor wait for the log mutex.
+  std::unique_lock log_lock(
+      Libs::Graphics::MemoryTrackerTestAccess::CpuDirtyLogMutex(tracker));
+  const auto before = tracker.CpuDirtyGeneration();
+  std::binary_semaphore writes_finished{0};
+  std::jthread writer([&] {
+    tracker.InvalidateRegion(address, 1, [] {});
+    tracker.MarkRegionAsCpuModified(address + page_size, 1);
+    writes_finished.release();
+  });
+  const bool completed = writes_finished.try_acquire_for(std::chrono::seconds(5));
+  log_lock.unlock();
+  writer.join();
+  std::vector<GuestRange> ranges;
+  Check(completed && tracker.CpuDirtyGeneration() > before,
+        "a CPU write waited for a dirty log no sweep took");
+  Check(!tracker.TakeCpuDirtyLog(ranges) && ranges.empty(),
+        "an untaken dirty log did not report its gap");
+
+  Clean();
+  tracker.InvalidateRegion(address + page_size, 1, [] {});
+  Check(tracker.TakeCpuDirtyLog(ranges) && ranges.size() == 1 &&
+            ranges[0] == GuestRange{address + page_size, page_size},
+        "a taken dirty log did not record the next CPU write");
+
   tracker.UntrackMemory(address, page_size * 2);
   Release(memory);
 }
@@ -1202,6 +1353,9 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuDirtyGeneration();
+  TestCpuDirtyLog();
+  TestUntakenLogSkipsItsMutex();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

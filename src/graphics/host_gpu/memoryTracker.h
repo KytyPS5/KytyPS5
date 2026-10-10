@@ -16,6 +16,8 @@
 
 namespace Libs::Graphics {
 
+struct MemoryTrackerTestAccess;
+
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
@@ -29,6 +31,15 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Advances after any page becomes CPU-dirty. Equal values mean no new CPU writes since.
+	[[nodiscard]] uint64_t CpuDirtyGeneration() const noexcept {
+		return m_cpu_dirty_generation.load(std::memory_order_acquire);
+	}
+	// Appends the page ranges logged since the previous call. False when some went unlogged
+	// (first call, or more than the log holds): any page may then be CPU-dirty.
+	[[nodiscard]] bool TakeCpuDirtyLog(std::vector<GuestRange>& ranges);
+	// Logs a range whose pages may be CPU-dirty without a new write, such as memory mapped again.
+	void LogCpuDirtyRange(uint64_t vaddr, uint64_t size) noexcept { NoteCpuDirty(vaddr, size); }
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -51,6 +62,7 @@ public:
 				on_flush();
 			}
 		});
+		NoteCpuDirty(vaddr, size);
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -145,11 +157,24 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
+	// Called after the CPU-dirty bits are set, so a reader that saw the old value rescans and a
+	// log taken after the generation was read holds the range.
+	void NoteCpuDirty(uint64_t vaddr, uint64_t size) noexcept;
+
+	static constexpr size_t CPU_DIRTY_LOG_CAPACITY = 4096;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::atomic<uint64_t>                          m_cpu_dirty_generation {1};
+	std::mutex                                     m_cpu_dirty_log_mutex;
+	// Reserved once: logging from the fault handler never allocates.
+	std::vector<GuestRange> m_cpu_dirty_log;
+	// Written under the log mutex. While false, writes skip the log and its mutex.
+	std::atomic<bool> m_cpu_dirty_log_complete {false};
+
+	friend struct MemoryTrackerTestAccess;
 };
 
 } // namespace Libs::Graphics

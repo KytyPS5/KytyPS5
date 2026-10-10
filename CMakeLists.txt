@@ -674,6 +674,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME buffer_cache_bda_sweep
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sweep-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -683,6 +685,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+	add_test(NAME buffer_cache_bda_remap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-remap-only)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests

@@ -9,6 +9,7 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_cpu_dirty_log.reserve(CPU_DIRTY_LOG_CAPACITY);
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -45,6 +46,39 @@ void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t va
 }
 #endif
 
+void MemoryTracker::NoteCpuDirty(uint64_t vaddr, uint64_t size) noexcept {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	// Pairs with the fence in TakeCpuDirtyLog: if this load misses the take that completes the
+	// log, the sweep after that take sees the dirty bits set before this fence.
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	if (m_cpu_dirty_log_complete.load(std::memory_order_relaxed)) {
+		std::scoped_lock lock(m_cpu_dirty_log_mutex);
+		if (m_cpu_dirty_log_complete.load(std::memory_order_relaxed)) {
+			auto* last = m_cpu_dirty_log.empty() ? nullptr : &m_cpu_dirty_log.back();
+			if (last != nullptr && begin <= last->End() && last->address <= end) {
+				const auto first = std::min(last->address, begin);
+				*last            = {first, std::max(last->End(), end) - first};
+			} else if (m_cpu_dirty_log.size() < CPU_DIRTY_LOG_CAPACITY) {
+				m_cpu_dirty_log.push_back({begin, end - begin});
+			} else {
+				m_cpu_dirty_log.clear();
+				m_cpu_dirty_log_complete.store(false, std::memory_order_relaxed);
+			}
+		}
+	}
+	m_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
+}
+
+bool MemoryTracker::TakeCpuDirtyLog(std::vector<GuestRange>& ranges) {
+	std::scoped_lock lock(m_cpu_dirty_log_mutex);
+	ranges.insert(ranges.end(), m_cpu_dirty_log.begin(), m_cpu_dirty_log.end());
+	m_cpu_dirty_log.clear();
+	const bool complete = m_cpu_dirty_log_complete.exchange(true, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	return complete;
+}
+
 void MemoryTracker::ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("invalid memory tracker range\n");
@@ -63,6 +97,8 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	// A new region starts fully CPU-dirty.
+	NoteCpuDirty(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
 	return ptr;
 }
 
@@ -88,6 +124,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	NoteCpuDirty(vaddr, size);
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -128,6 +165,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	NoteCpuDirty(vaddr, size);
 }
 
 } // namespace Libs::Graphics

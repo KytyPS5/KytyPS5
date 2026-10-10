@@ -9,9 +9,12 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/pageDiff.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <deque>
 #include <map>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -114,6 +117,8 @@ public:
 	[[nodiscard]] bool     HasUnmarkedBdaStores() const { return !m_bda_unmarked_ranges.Empty(); }
 	void                   ClearUnmarkedBdaStores() { m_bda_unmarked_ranges.Clear(); }
 	void                   RunGarbageCollector();
+	void                   BeginPreciseWrites();
+	void                   EndPreciseWrites();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -185,6 +190,21 @@ private:
 		uint32_t codes = 0;
 	};
 
+	struct PreciseWrite {
+		uint64_t                begin      = 0;
+		uint64_t                end        = 0;
+		uint64_t                page_begin = 0;
+		uint64_t                page_end   = 0;
+		RangeSet                before;
+		RangeSet                rewritten;
+		std::unique_ptr<Buffer> snapshot;
+		std::unique_ptr<Buffer> changed;
+		bool                    compared = false;
+	};
+	[[nodiscard]] bool CanTrackPreciseWrite(const Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void TrackPreciseWrite(Buffer& buffer, uint64_t vaddr, uint64_t size, RangeSet before);
+	void ResolvePreciseWrite();
+
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;
 	FaultManager                                       m_fault_manager;
@@ -222,6 +242,21 @@ private:
 	uint64_t      m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t      m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t      m_gc_tick            = 0;
+
+	PageDiff                                          m_page_diff;
+	std::deque<PreciseWrite>                          m_precise_writes;
+	std::vector<std::unique_ptr<Buffer>>              m_precise_snapshots;
+	std::map<std::pair<uint64_t, uint64_t>, uint32_t> m_precise_dense;
+	bool                                              m_precise_scope   = false;
+	bool                                              m_precise_marking = false;
+
+	struct BatchedUpload {
+		vk::Buffer                  source;
+		vk::Buffer                  destination;
+		std::vector<vk::BufferCopy> copies;
+	};
+	bool                       m_upload_batch = false;
+	std::vector<BatchedUpload> m_batched_uploads;
 };
 
 } // namespace Libs::Graphics

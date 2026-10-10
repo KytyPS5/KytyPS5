@@ -206,7 +206,9 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t table_offset = 0,
-                         uint32_t table_shader_offset = 0, bool nested = false) {
+                         uint32_t table_shader_offset = 0, bool nested = false,
+                         std::vector<ValueOpcode> image_ops = {ValueOpcode::ImageSampleRaw},
+                         Decoder::ImageDimension dimension = Decoder::ImageDimension::Dim2D) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -266,15 +268,27 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
   const auto image = fixture->Image(image_words, 0x10f0);
   const auto sampler =
       fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
-  MemoryInfo sample;
-  sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress()},
-                                     fixture->AddMemory(sample, 0x10f0));
-  const auto sampled_x =
-      fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
-  fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  for (const auto op : image_ops) {
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = dimension;
+    if (op == ValueOpcode::ImageGatherRaw) sample.dmask = 1u;
+    const auto address = fixture->ImageAddress();
+    const auto flags = fixture->AddMemory(sample, 0x10f0);
+    const auto zero = Value(0u);
+    Value sampled;
+    if (op == ValueOpcode::ImageRead)
+      sampled = fixture->Emit(op, {image, address, Value(true)}, flags);
+    else if (op == ValueOpcode::ImageQueryDimensions)
+      sampled = fixture->Emit(op, {image, address}, flags);
+    else if (op == ValueOpcode::ImageGatherRaw)
+      sampled = fixture->Emit(op, {image, sampler, address, zero, zero, zero, zero}, flags);
+    else
+      sampled = fixture->Emit(op, {image, sampler, address}, flags);
+    const auto sampled_x =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
+    fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  }
   return fixture;
 }
 
@@ -434,8 +448,120 @@ void TestBoundedImageViewEligibility() {
     plan.descriptor_sources.push_back(source);
   }
   plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
+  // A plain sample reads it with its own type, as the T# drives the hardware.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u &&
+            snapshot.images[1].dwords == descriptor(0x30u, Type::kColor3D) &&
+            specialization.images[1].dimension == Decoder::ImageDimension::Dim3D &&
+            specialization.images[0].dimension == Decoder::ImageDimension::Dim2D,
+        "explicitly selected 3D descriptor was normalized to null or retyped as 2D");
+  // No sample reads a multisampled record, whatever its coordinates.
+  auto msaa = descriptor(0x31u, Type::kColor2DMsaa);
+  msaa[3] |= 1u << 16u; // two fragments
+  msaa[5] |= 1u << 4u;
+  DescriptorSource multisampled;
+  multisampled.dword_count = 8u;
+  for (uint32_t word = 0; word < msaa.size(); ++word) multisampled.dwords[word] = Value(msaa[word]);
+  plan.descriptor_sources.push_back(multisampled);
+  auto &sources = plan.descriptor_sources[image_source].indirect_descriptor->sources;
+  const auto volume = sources[1];
+  sources[1] = static_cast<uint32_t>(plan.descriptor_sources.size() - 1u);
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "explicitly selected multisampled descriptor was sampled");
+  sources[1] = volume;
+  // Depth comparison has no 3D form: the mixed table is refused.
+  for (auto &memory : plan.memory_info) {
+    if (memory.kind == ResourceKind::Image && memory.resource == 0u)
+      memory.image_sample_flags |= Decoder::ImageSampleFlagCompare;
+  }
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "a depth-compare sample accepted a mixed-dimension table");
+  for (auto &memory : plan.memory_info) {
+    if (memory.kind == ResourceKind::Image && memory.resource == 0u)
+      memory.image_sample_flags &= ~uint32_t{Decoder::ImageSampleFlagCompare};
+  }
+  // Derivatives are laid out for one dimension: the mixed table is refused.
+  for (auto &memory : plan.memory_info) {
+    if (memory.kind == ResourceKind::Image && memory.resource == 0u)
+      memory.image_sample_flags |= Decoder::ImageSampleFlagDerivative;
+  }
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected incompatible descriptor was silently normalized to null");
+}
+
+void TestMixedCandidateSamplers() {
+  using Format = Libs::Graphics::Prospero::BufferFormat;
+  // Light tables mix float and 8_UINT records under one sample. The S# applies to each
+  // record with the record's own format: every class gets its variant, whatever the root's.
+  // A table also read by image_load keeps one class: a typed fetch has no per-record view type.
+  for (const bool integer_root : {false, true}) {
+   for (const bool load : {false, true}) {
+    auto fixture = MakeIndirectImageFixture(
+        false, 48u, 0u, 16u, false,
+        load ? std::vector{ValueOpcode::ImageSampleRaw, ValueOpcode::ImageRead}
+             : std::vector{ValueOpcode::ImageSampleRaw});
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    const auto float_image = integer_root ? 1u : 0u;
+    const auto uint_image = integer_root ? 0u : 1u;
+    std::vector<uint32_t> selected;
+    for (const auto format : {integer_root ? Format::k8UInt : Format::k32_32_32_32Float,
+                              integer_root ? Format::k32_32_32_32Float : Format::k8UInt,
+                              Format::k16SInt}) {
+      const std::array<uint32_t, 8> value{
+          0x30u + static_cast<uint32_t>(selected.size()), static_cast<uint32_t>(format) << 20u,
+          3u | (3u << 14u),
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u),
+          0u, 0u, 0u, 0u};
+      DescriptorSource source;
+      source.dword_count = 8u;
+      for (uint32_t word = 0; word < value.size(); ++word) source.dwords[word] = Value(value[word]);
+      selected.push_back(static_cast<uint32_t>(plan.descriptor_sources.size()));
+      plan.descriptor_sources.push_back(source);
+    }
+    plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->sources = selected;
+    std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u,
+                                0x2000u, 48u << 16u, 5u, 0u};
+    LinearTestMemory memory;
+    memory.fail_address = 0x3000u;
+    SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    if (load) {
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "a table read by image_load accepted records of another numeric class");
+      continue;
+    }
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 3u,
+          "float and integer records were not kept as candidates of one table");
+    ApplyResourceSpecialization(fixture->program, specialization);
+    const auto &info = fixture->program.info;
+    const auto sample = std::ranges::find_if(fixture->program.memory_info, [](const auto &memory) {
+      return memory.kind == ResourceKind::Image;
+    });
+    Check(sample != fixture->program.memory_info.end() && info.images.size() == 3u &&
+              info.samplers.size() == 3u,
+          "mixed candidates did not get one sampler variant per class");
+    const auto variant = [&](uint32_t image) -> const SamplerResource * {
+      const auto index = SamplerVariantForImage(info, sample->sampler, image);
+      return index < info.samplers.size() ? &info.samplers[index] : nullptr;
+    };
+    const auto *filtered = variant(float_image);
+    const auto *integer = variant(uint_image);
+    const auto *point = variant(2u);
+    Check(filtered != nullptr && integer != nullptr && point != nullptr &&
+              &info.samplers[sample->sampler] == variant(0u) &&
+              !filtered->integer_border && !filtered->force_point_filtering &&
+              integer->integer_border && !integer->force_point_filtering &&
+              point->integer_border && point->force_point_filtering &&
+              filtered->snapshot_index == 0u && integer->snapshot_index == 0u &&
+              point->snapshot_index == 0u,
+          "a candidate was sampled with the border or filtering of another class");
+   }
+  }
 }
 
 void TestWaterfallImageTable() {
@@ -735,6 +861,401 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             endpoint.watched_reads == 0u,
         "batched descriptor read crossed the 48-bit endpoint");
+}
+
+void TestIndirectImageTableOperations() {
+  using Type = Libs::Graphics::Prospero::ImageType;
+  const auto descriptor = [](uint32_t identity, Type type) {
+    auto words = std::array<uint32_t, 8>{identity, 75u << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u),
+        0u, 0u, 0u, 0u};
+    if (type == Type::kColor2DMsaa || type == Type::kColor2DMsaaArray) {
+      words[3] |= 1u << 16u; // two fragments
+      words[5] |= 1u << 4u;
+    }
+    return words;
+  };
+  const auto materializes = [&](std::vector<ValueOpcode> ops, Decoder::ImageDimension dimension,
+                                std::initializer_list<Type> records) {
+    auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, false, std::move(ops), dimension);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    std::vector<uint32_t> selected;
+    for (const auto type : records) {
+      DescriptorSource source;
+      source.dword_count = 8u;
+      const auto value = descriptor(0x30u + static_cast<uint32_t>(selected.size()), type);
+      for (uint32_t word = 0; word < value.size(); ++word) source.dwords[word] = Value(value[word]);
+      selected.push_back(static_cast<uint32_t>(plan.descriptor_sources.size()));
+      plan.descriptor_sources.push_back(source);
+    }
+    plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->sources =
+        std::move(selected);
+    std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u, 0x2000u, 48u << 16u, 5u, 0u};
+    LinearTestMemory memory;
+    memory.fail_address = 0x3000u;
+    SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  constexpr auto Dim2D = Decoder::ImageDimension::Dim2D;
+  constexpr auto sample = ValueOpcode::ImageSampleRaw;
+  Check(materializes({sample}, Dim2D, {Type::kColor2D, Type::kColor3D}),
+        "a plain sample refused a table of mixed dimensions");
+  // A load fetches each record through its own view with the instruction's coordinates.
+  for (const auto &ops : std::initializer_list<std::vector<ValueOpcode>>{
+           {ValueOpcode::ImageRead}, {sample, ValueOpcode::ImageRead}}) {
+    Check(materializes(ops, Dim2D, {Type::kColor2D, Type::kColor3D}),
+          "a load refused a table of mixed dimensions");
+    Check(!materializes(ops, Decoder::ImageDimension::Dim3D, {Type::kColor3D, Type::kCube}),
+          "a load accepted a cube record of another dimension");
+  }
+  Check(materializes({sample}, Decoder::ImageDimension::Dim3D, {Type::kColor3D, Type::kCube}),
+        "a plain sample refused a cube record of another dimension");
+  // Gathers and queries read through the root's view only.
+  for (const auto &ops : std::initializer_list<std::vector<ValueOpcode>>{
+           {ValueOpcode::ImageGatherRaw}, {ValueOpcode::ImageQueryDimensions},
+           {sample, ValueOpcode::ImageGatherRaw}, {ValueOpcode::ImageRead, ValueOpcode::ImageGatherRaw}}) {
+    Check(materializes(ops, Dim2D, {Type::kColor2D, Type::kColor2D}),
+          "an image operation refused a table of one dimension");
+    Check(!materializes(ops, Dim2D, {Type::kColor2D, Type::kColor3D}),
+          "an image operation without per-candidate views accepted mixed dimensions");
+  }
+  // A sampler cannot read a multisampled record; image_load fetches its samples, with the
+  // fragment index of a multisampled instruction.
+  Check(materializes({ValueOpcode::ImageRead}, Decoder::ImageDimension::Dim2DMsaa,
+                     {Type::kColor2DMsaa, Type::kColor2DMsaa}),
+        "image_load refused a multisampled table");
+  Check(materializes({ValueOpcode::ImageRead}, Decoder::ImageDimension::Dim2DMsaaArray,
+                     {Type::kColor2DMsaaArray, Type::kColor2DMsaa}),
+        "a multisampled load refused multisampled records of mixed dimensions");
+  Check(!materializes({ValueOpcode::ImageRead}, Dim2D, {Type::kColor2D, Type::kColor2DMsaa}),
+        "a single-sampled load accepted a multisampled record");
+  Check(!materializes({ValueOpcode::ImageRead}, Decoder::ImageDimension::Dim2DMsaa,
+                      {Type::kColor2DMsaa, Type::kColor2D}),
+        "a multisampled load accepted a single-sampled record of another dimension");
+  Check(!materializes({sample}, Dim2D, {Type::kColor2DMsaa, Type::kColor2DMsaa}),
+        "a sample accepted a multisampled table");
+}
+
+void TestBitScanKeyRange() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Bound { None, Direct, Flags, Immediate };
+  // A bit scan loop (s_ff1 / s_bitset0) selects keys from the set bits of its mask and
+  // stops at the table's count: the host must not probe the other records.
+  struct Variant { bool runtime_mask; bool lane_wrapped; Bound bound; bool narrow = false; };
+  for (const auto variant : {Variant{true, false, Bound::None}, Variant{true, true, Bound::None},
+                             Variant{false, false, Bound::Direct}, Variant{false, false, Bound::Flags},
+                             Variant{true, true, Bound::Flags},
+                             Variant{false, false, Bound::None, true},
+                             Variant{false, false, Bound::Immediate}}) {
+    Fixture fixture(ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *count_test = fixture.AddBlock();
+    auto *sample = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(exit);
+    header->AddBranch(count_test);
+    count_test->AddBranch(exit);
+    count_test->AddBranch(sample);
+    sample->AddBranch(header);
+    entry->terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = header};
+    header->terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = exit, .false_block = count_test};
+    count_test->terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = exit, .false_block = sample};
+    sample->terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator = {.kind = CFG::TerminatorKind::Return};
+    const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    // A mask from the SRT is known to the host; one from a VGPR is a GPU-side selection.
+    auto initial = variant.runtime_mask
+        ? fixture.UserData(2)
+        : fixture.Emit(ValueOpcode::ReadFirstLane,
+                       {fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)}),
+                        Value(true)});
+    // s_bfe_u32 mask, word, 12 bits: the scan can select 12 keys at most.
+    if (variant.narrow)
+      initial = fixture.Emit(ValueOpcode::BitFieldUExtract, {initial, Value(0u), Value(12u)});
+    const auto active = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(1u), Value(0u)}), Value(0u)});
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, initial);
+    const auto mask = Value(&phi);
+    fixture.block = header;
+    // s_ff1 reads the SGPR mask; a wave64 emulation uniformizes it through a lane read.
+    const auto scanned = variant.lane_wrapped
+        ? fixture.Emit(ValueOpcode::ReadFirstLane, {mask, Value(true)}) : mask;
+    const auto nonzero = fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), scanned});
+    header->condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {fixture.Emit(ValueOpcode::LogicalNot, {nonzero})},
+        CFG::BranchCondition::SccZero);
+    const auto key = fixture.Emit(ValueOpcode::FindILsb32, {scanned});
+    fixture.block = count_test;
+    const auto count = variant.bound == Bound::Immediate ? Value(5u) : fixture.UserData(3);
+    const auto over = fixture.Emit(ValueOpcode::UGreaterThanEqual32, {key, count});
+    Value leave;
+    if (variant.bound == Bound::Direct || variant.bound == Bound::Immediate) {
+      // s_cmp_ge_u32 key, count; s_cbranch_scc1 exit.
+      leave = fixture.Emit(ValueOpcode::ConditionRef, {over}, CFG::BranchCondition::SccNonZero);
+    } else if (variant.bound == Bound::Flags) {
+      // s_cselect_b32 flag, 1, 0; s_or_b32 flags, flag, carried; continue while flags == 0.
+      const auto flags = fixture.Emit(ValueOpcode::BitwiseOr32,
+          {fixture.Emit(ValueOpcode::SelectU32, {over, Value(1u), Value(0u)}),
+           fixture.UserData(4)});
+      const auto valid = fixture.Emit(ValueOpcode::INotEqual32, {Value(0xffffffffu), key});
+      const auto stop = fixture.Emit(ValueOpcode::LogicalAnd,
+          {valid, fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), flags})});
+      const auto proceed = fixture.Emit(ValueOpcode::LogicalAnd,
+          {valid, fixture.Emit(ValueOpcode::LogicalNot, {stop})});
+      leave = fixture.Emit(ValueOpcode::ConditionRef,
+                           {fixture.Emit(ValueOpcode::LogicalNot, {proceed})},
+                           CFG::BranchCondition::SccZero);
+    } else {
+      // An unrelated exit keeps the full 32-key range.
+      leave = fixture.Emit(ValueOpcode::ConditionRef,
+          {fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(5), Value(7u)})},
+          CFG::BranchCondition::SccNonZero);
+    }
+    count_test->condition = leave;
+    fixture.block = sample;
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(344u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < 8u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, offset, Value(0u), Value(true)},
+                                 fixture.AddMemory(memory, 0x100 + word * 4u));
+    }
+    const auto image = fixture.Image(words, 0x128);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x128));
+    // s_bitset0 clears the scanned bit; inactive lanes keep the previous mask.
+    auto next = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {scanned, fixture.Emit(ValueOpcode::BitwiseNot32,
+            {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                {Value(1u), fixture.Emit(ValueOpcode::BitwiseAnd32, {key, Value(31u)})})})});
+    if (variant.lane_wrapped) next = fixture.Emit(ValueOpcode::SelectU32, {active, next, mask});
+    phi.AddPhiOperand(sample, next);
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    const auto key_count = indirect ? indirect->key_count.Resolve() : Value{};
+    const uint32_t width = variant.narrow ? 12u : 32u;
+    Check(indirect && !indirect->selector.has_value() && indirect->table_offset == 344u &&
+              indirect->selector_mask.IsEmpty() != variant.runtime_mask &&
+              indirect->key_limit == width &&
+              (variant.bound == Bound::None ? key_count == Value(width)
+                                            : key_count == count.Resolve()),
+          "bit scan loop lost its table, its mask or the count that bounds its keys");
+    // Planning bounds stay in the plan: the shader keeps its own instructions.
+    Check(std::ranges::none_of(fixture.program.blocks, [](const Block *block) {
+            return std::ranges::any_of(*block, [](const Inst &inst) {
+              return inst.GetOpcode() == ValueOpcode::UMin32;
+            });
+          }),
+          "bit scan planning inserted its key bound into the shader");
+    const auto plan = ExtractResourcePlan(fixture.program);
+
+    LinearTestMemory memory_image;
+    constexpr uint64_t table_base = 0x1800u + 344u;
+    const auto fill = [&](uint32_t key) {
+      const auto word = (table_base - memory_image.base) / 4u + key * 8u;
+      memory_image.words[word] = 0x100u + key;
+      memory_image.words[word + 1u] = static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+      memory_image.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    };
+    std::array<uint32_t, 6> user_data{0x1800u, 0u, (1u << 3u) | (1u << 9u), 5u, 0u, 0u};
+    SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                       .userdata = &memory_image,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    if (variant.runtime_mask) {
+      for (const uint32_t key : {3u, 9u}) fill(key);
+      // Every clear bit's record is unreadable: a probe there fails the refresh.
+      memory_image.fail_address = table_base + 1u * 32u;
+      user_data[3] = 10u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                snapshot.images.size() == 2u && memory_image.descriptor_reads == 2u &&
+                snapshot.images[0].dwords[0] == 0x103u && snapshot.images[1].dwords[0] == 0x109u,
+            "bit scan table probed records outside the set bits of its mask");
+      const auto mapping = specialization.images[0].indirect_mapping_offset;
+      Check(specialization.images[0].indirect_root == 0u &&
+                snapshot.flattened_srt[mapping] == 2u &&
+                snapshot.flattened_srt[mapping + 1u] == 3u &&
+                snapshot.flattened_srt[mapping + 3u] == 9u,
+            "bit scan table mapped keys other than the mask's set bits");
+      if (variant.bound != Bound::None) {
+        user_data[3] = 5u;
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == 0x103u &&
+                  specialization.images[0].indirect_root == ImageResource::NoIndirectImage,
+              "bit scan table kept a set bit at or past the loop's count");
+      }
+      // A scanned multisampled record (two fragments) cannot be sampled: the table is refused.
+      const auto record = (table_base - memory_image.base) / 4u + 9u * 8u;
+      memory_image.words[record + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) | (1u << 16u) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2DMsaa) << 28u);
+      memory_image.words[record + 5u] = 1u << 4u;
+      user_data[3] = 10u;
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "bit scan table sampled a multisampled record");
+      user_data[2] = 0u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                snapshot.images.size() == 1u &&
+                specialization.images[0].indirect_root == ImageResource::NoIndirectImage,
+            "an empty bit scan mask did not bind a null root without probing");
+      continue;
+    }
+    if (variant.narrow) {
+      for (uint32_t key = 0; key < 12u; ++key) fill(key);
+      memory_image.fail_address = table_base + 12u * 32u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                snapshot.images.size() == 12u && memory_image.descriptor_reads == 12u,
+            "bit scan table probed records past the width of its mask");
+      continue;
+    }
+    for (uint32_t key = 0; key < 5u; ++key) fill(key);
+    // The records at and past the count are unreadable: the count bounds the probe.
+    memory_image.fail_address = table_base + 5u * 32u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 5u && memory_image.descriptor_reads == 5u &&
+              snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 5u,
+          "bit scan table probed records at or past the loop's count");
+    if (variant.bound == Bound::Immediate) continue;
+    user_data[3] = 40u;
+    memory_image.fail_address = UINT64_MAX;
+    for (uint32_t key = 5; key < 32u; ++key) fill(key);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 32u,
+          "a count past the scan width did not clamp the probe to 32 keys");
+    user_data[3] = 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 1u &&
+              specialization.images[0].indirect_root == ImageResource::NoIndirectImage,
+          "an empty table did not bind a null root without probing");
+  }
+}
+
+void TestBitScanMaskProof() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // The host evaluates a bit scan's entry mask only when every back edge clears its bits.
+  enum class Next { GainsBitBehindAnd, ExecSelect, VccSelect, SwapsThroughSibling };
+  for (const auto variant : {Next::GainsBitBehindAnd, Next::ExecSelect, Next::VccSelect,
+                             Next::SwapsThroughSibling}) {
+    Fixture fixture(ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *guard = fixture.AddBlock();
+    auto *sample = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(exit);
+    header->AddBranch(guard);
+    guard->AddBranch(sample);
+    guard->AddBranch(exit);
+    sample->AddBranch(header);
+    entry->terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = header};
+    header->terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = exit, .false_block = guard};
+    guard->terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = sample, .false_block = exit};
+    sample->terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator = {.kind = CFG::TerminatorKind::Return};
+    const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto initial = fixture.UserData(2);
+    const auto lane = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(1u), Value(0u)}), Value(0u)});
+    const auto other_lane = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(2u), Value(0u)}), Value(0u)});
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, initial);
+    Inst *sibling = nullptr;
+    if (variant == Next::SwapsThroughSibling) {
+      sibling = &header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      sibling->AddPhiOperand(entry, fixture.UserData(3));
+    }
+    const auto mask = Value(&phi);
+    fixture.block = header;
+    const auto nonzero = fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), mask});
+    header->condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {fixture.Emit(ValueOpcode::LogicalNot, {nonzero})},
+        CFG::BranchCondition::SccZero);
+    const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    fixture.block = guard;
+    // s_and_saveexec + s_cbranch_execz leaves only lanes with `lane` set active at the sample;
+    // s_cbranch_vccnz keeps EXEC, so lanes without it reach the sample too.
+    guard->condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {lane},
+        variant == Next::VccSelect ? CFG::BranchCondition::VccNonZero
+                                   : CFG::BranchCondition::ExecNonZero);
+    fixture.block = sample;
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(344u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < 8u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, offset, Value(0u), Value(true)},
+                                 fixture.AddMemory(memory, 0x100 + word * 4u));
+    }
+    const auto image = fixture.Image(words, 0x128);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x128));
+    const auto bit = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+        {Value(1u), fixture.Emit(ValueOpcode::BitwiseAnd32, {key, Value(31u)})});
+    const auto cleared =
+        fixture.Emit(ValueOpcode::BitwiseAnd32, {mask, fixture.Emit(ValueOpcode::BitwiseNot32, {bit})});
+    const auto gained = fixture.Emit(ValueOpcode::BitwiseOr32, {mask, Value(0x80000000u)});
+    Value next;
+    if (variant == Next::SwapsThroughSibling) {
+      // mask takes the sibling's current value, which starts from another word: in the body a
+      // header phi is its current-iteration value, never its back arm.
+      sibling->AddPhiOperand(sample, cleared);
+      next = Value(sibling);
+    } else if (variant == Next::GainsBitBehindAnd) {
+      // gained & (c ? gained : mask) is gained when c holds: the select proves nothing.
+      next = fixture.Emit(ValueOpcode::BitwiseAnd32,
+          {gained, fixture.Emit(ValueOpcode::SelectU32, {other_lane, gained, mask})});
+    } else {
+      // Under the EXEC guard every active lane has `lane` set, so the select clears a bit.
+      next = fixture.Emit(ValueOpcode::SelectU32, {lane, cleared, gained});
+    }
+    phi.AddPhiOperand(sample, next);
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    const bool proven = variant == Next::ExecSelect;
+    Check(indirect.has_value() &&
+              (indirect->selector_mask.Resolve() == initial.Resolve()) == proven,
+          proven ? "a bit scan mask cleared under its EXEC guard lost its entry value"
+                 : "a bit scan mask that may gain bits was evaluated from its entry value");
+  }
 }
 
 void TestBoundedComputeImageLoop() {
@@ -3720,8 +4241,12 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+    Run("mixed candidate samplers", TestMixedCandidateSamplers);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("indirect image table operations", TestIndirectImageTableOperations);
+    Run("bit scan key range", TestBitScanKeyRange);
+    Run("bit scan mask proof", TestBitScanMaskProof);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);

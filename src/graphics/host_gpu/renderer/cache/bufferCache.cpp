@@ -522,11 +522,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+	if (staging != nullptr) {
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		}
+		m_staging_buffer.Commit();
+		return {&m_staging_buffer, stage_offset};
+	}
+	// The ring cannot map the range, for now or because the image is larger than the ring
+	// (streaming pools of hundreds of MiB): a one-off upload buffer carries the whole image
+	// and is released once the submission completes.
+	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+	                                          vk::BufferUsageFlagBits::eTransferSrc, size);
+	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, temporary->Mapped().data(), size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	temporary->Flush(0, size);
+	auto* source = temporary.get();
+	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {source, 0};
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {

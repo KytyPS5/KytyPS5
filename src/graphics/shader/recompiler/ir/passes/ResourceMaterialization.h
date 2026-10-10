@@ -50,6 +50,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
+// Variant of host sampler `sampler` (same guest S#) that samples `image` with the filtering and
+// border of the image's format; UINT32_MAX if the specialization made none.
+uint32_t SamplerVariantForImage(const ShaderInfo& info, uint32_t sampler, uint32_t image);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_ */

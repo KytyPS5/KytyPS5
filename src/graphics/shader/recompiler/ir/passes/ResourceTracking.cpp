@@ -909,15 +909,16 @@ private:
 				const auto& b = *descriptor.indirect_descriptor;
 				if (a.selector != b.selector || a.table_source != b.table_source ||
 				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
-				    a.table_stride != b.table_stride ||
-				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
+				    a.table_stride != b.table_stride || a.workgroup_axis != b.workgroup_axis ||
+				    a.sources != b.sources || a.key_limit != b.key_limit ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
 				     !EquivalentValue(m_program, a.selector_first, b.selector_first)) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
-				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask))) continue;
+				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask)))
+					continue;
 			}
 			bool same = true;
 			for (uint32_t i = 0; i < descriptor.dword_count; i++) {
@@ -1024,6 +1025,8 @@ private:
 		Value condition;
 		bool positive;
 		LaneQuantifier lanes = LaneQuantifier::All;
+		// An EXEC branch leaves only the lanes that satisfy it active.
+		bool exec = false;
 	};
 
 	bool NonzeroOnEntry(Value value, const Block* block) const {
@@ -1117,6 +1120,8 @@ private:
 				const bool nonzero = kind == CFG::BranchCondition::ExecNonZero ||
 				                     kind == CFG::BranchCondition::VccNonZero;
 				if (!scalar && !zero && !nonzero) break;
+				edge.exec = kind == CFG::BranchCondition::ExecZero ||
+				            kind == CFG::BranchCondition::ExecNonZero;
 				// SCC is uniform. Negating a lane reduction exchanges all and any.
 				edge.lanes = scalar || (zero == edge.positive) ? LaneQuantifier::All
 				                                              : LaneQuantifier::Any;
@@ -1315,6 +1320,216 @@ private:
 		const auto* first = position.Resolve().TryInstruction();
 		return first != nullptr && first->GetOpcode() == ValueOpcode::FindILsb32 &&
 		       first->NumArgs() == 1u && EquivalentValue(m_program, first->Arg(0), mask);
+	}
+
+	// The mask of a bit scan is the scanned value, or the entry value of a loop phi that only
+	// ever clears its bits. `width` receives the number of bits the mask can set; the mask
+	// itself is returned only when the host can evaluate it.
+	Value ScannedMask(Value value, uint32_t& width) const {
+		width = 32u;
+		value = value.Resolve();
+		// The scalar mask may reach s_ff1 through a lane read of a wave-emulated SGPR.
+		if (const auto* lane = value.TryInstruction();
+		    lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadFirstLane &&
+		    lane->NumArgs() == 2u && !ValidateRuntimeValue(m_program, value))
+			value = lane->Arg(0).Resolve();
+		const auto* phi = value.TryInstruction();
+		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi && phi->NumArgs() == 2u &&
+		    phi->GetType() == Type::U32) {
+			for (uint32_t back = 0; back < 2u; ++back) {
+				std::vector<const Inst*> proving;
+				uint32_t                 budget = 256u;
+				if (!ClearsBitsOf(phi->Arg(back), value, *phi, back, proving, budget)) continue;
+				value = ArmValue(phi->Arg(back ^ 1u), *phi, back ^ 1u);
+				break;
+			}
+		}
+		width = MaskWidth(value);
+		return ValidateRuntimeValue(m_program, value, RuntimeValueType::Integer) ? value : Value {};
+	}
+
+	// Bits a mask can set: a bit field extract or an immediate AND bounds it statically.
+	static uint32_t MaskWidth(Value value) {
+		const auto* inst      = value.Resolve().TryInstruction();
+		uint32_t    immediate = 0;
+		if (inst == nullptr) return 32u;
+		if (inst->GetOpcode() == ValueOpcode::BitFieldUExtract && inst->NumArgs() == 3u &&
+		    ImmediateU32(inst->Arg(2), immediate))
+			return std::min(immediate, 32u);
+		if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && inst->NumArgs() == 2u) {
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
+				if (ImmediateU32(inst->Arg(arg), immediate)) return std::bit_width(immediate);
+			}
+			return std::min(MaskWidth(inst->Arg(0)), MaskWidth(inst->Arg(1)));
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadFirstLane && inst->NumArgs() == 2u)
+			return MaskWidth(inst->Arg(0));
+		return 32u;
+	}
+
+	// Active lanes reaching the incoming block of a phi arm satisfy every positive edge
+	// predicate that holds for all lanes or sets EXEC on their way from the loop header;
+	// selects on those predicates take their true arm.
+	bool HoldsOnArm(Value predicate, const Inst& phi, uint32_t arm) const {
+		const auto* incoming = phi.PhiBlock(arm);
+		if (incoming == phi.Parent()) return false;
+		return GuardedOnEntry(
+		    incoming, [&](const Block* block) { return block == phi.Parent(); },
+		    [&](const EdgePredicate& edge) {
+			    return edge.positive && (edge.lanes == LaneQuantifier::All || edge.exec) &&
+			           Implies(edge.condition, predicate);
+		    });
+	}
+
+	// The value a phi arm carries: lane selects whose predicate holds on the arm resolve to the
+	// selected value. A sibling header phi stays as is: in the loop body it holds its
+	// current-iteration value, not the value of its back arm.
+	Value ArmValue(Value value, const Inst& phi, uint32_t arm, uint32_t depth = 0) const {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > 16u) return value;
+		if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
+			const auto predicate = ArmValue(inst->Arg(0), phi, arm, depth + 1u);
+			if (predicate.IsImmediate() && predicate.GetType() == Type::U1)
+				return ArmValue(inst->Arg(predicate.U1() ? 1u : 2u), phi, arm, depth + 1u);
+			if (HoldsOnArm(inst->Arg(0), phi, arm))
+				return ArmValue(inst->Arg(1), phi, arm, depth + 1u);
+		}
+		return value;
+	}
+
+	// value is mask, or mask with bits cleared, along every lane select and phi merge. Only a
+	// merge still being proven, the scanned phi first, may assume its own claim.
+	bool ClearsBitsOf(Value value, Value mask, const Inst& phi, uint32_t arm,
+	                  std::vector<const Inst*>& proving, uint32_t& budget) const {
+		if (value.Resolve() == mask) return true;
+		value = ArmValue(value, phi, arm);
+		if (value == mask) return true;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || budget == 0u) return false;
+		--budget;
+		const auto clears = [&](Value operand) {
+			return ClearsBitsOf(operand, mask, phi, arm, proving, budget);
+		};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ReadFirstLane: return inst->NumArgs() == 2u && clears(inst->Arg(0));
+			case ValueOpcode::Phi: {
+				if (std::ranges::find(proving, inst) != proving.end()) return true;
+				proving.push_back(inst);
+				bool cleared = inst->NumArgs() != 0u;
+				for (size_t index = 0; cleared && index < inst->NumArgs(); ++index)
+					cleared = clears(inst->Arg(index));
+				proving.pop_back();
+				return cleared;
+			}
+			case ValueOpcode::BitwiseAnd32:
+				return inst->NumArgs() == 2u && (clears(inst->Arg(0)) || clears(inst->Arg(1)));
+			case ValueOpcode::SelectU32:
+				return inst->NumArgs() == 3u && clears(inst->Arg(1)) && clears(inst->Arg(2));
+			default: return MaskOnlyLosesBits(value, mask);
+		}
+	}
+
+	// True when `condition` (negated when !positive) implies key < bound for a runtime bound.
+	// `facts` holds operands known true on this path, so a negated conjunction collapses.
+	bool ProvesKeyBelow(Value condition, bool positive, Value key, Value& bound,
+	                    std::vector<Value> facts = {}, uint32_t depth = 0) const {
+		if (depth > 12u) return false;
+		const auto* test = condition.Resolve().TryInstruction();
+		if (test == nullptr) return false;
+		const auto op = test->GetOpcode();
+		if (op == ValueOpcode::ConditionRef) {
+			return ProvesKeyBelow(test->Arg(0), positive, key, bound, facts, depth + 1u);
+		}
+		if (op == ValueOpcode::LogicalNot) {
+			return ProvesKeyBelow(test->Arg(0), !positive, key, bound, facts, depth + 1u);
+		}
+		if (op == ValueOpcode::LogicalAnd) {
+			if (positive) {
+				auto with_a = facts, with_b = facts;
+				with_a.push_back(test->Arg(0).Resolve());
+				with_b.push_back(test->Arg(1).Resolve());
+				return ProvesKeyBelow(test->Arg(0), true, key, bound, with_b, depth + 1u) ||
+				       ProvesKeyBelow(test->Arg(1), true, key, bound, with_a, depth + 1u);
+			}
+			const auto known = [&](Value value) {
+				return std::ranges::any_of(
+				    facts, [&](Value fact) { return EquivalentValue(m_program, fact, value); });
+			};
+			// A false conjunction with one true operand negates the other.
+			return (known(test->Arg(0)) &&
+			        ProvesKeyBelow(test->Arg(1), false, key, bound, facts, depth + 1u)) ||
+			       (known(test->Arg(1)) &&
+			        ProvesKeyBelow(test->Arg(0), false, key, bound, facts, depth + 1u));
+		}
+		if (op == ValueOpcode::LogicalOr && !positive) {
+			return ProvesKeyBelow(test->Arg(0), false, key, bound, facts, depth + 1u) ||
+			       ProvesKeyBelow(test->Arg(1), false, key, bound, facts, depth + 1u);
+		}
+		if (test->NumArgs() != 2u) return false;
+		const auto bounded = [&](Value compared, Value limit) {
+			if (!EquivalentValue(m_program, compared, key) ||
+			    !ValidateRuntimeValue(m_program, limit, RuntimeValueType::Integer))
+				return false;
+			bound = limit.Resolve();
+			return true;
+		};
+		if ((op == ValueOpcode::ULessThan32 && positive) ||
+		    (op == ValueOpcode::UGreaterThanEqual32 && !positive)) {
+			return bounded(test->Arg(0), test->Arg(1));
+		}
+		if ((op == ValueOpcode::UGreaterThan32 && positive) ||
+		    (op == ValueOpcode::ULessThanEqual32 && !positive)) {
+			return bounded(test->Arg(1), test->Arg(0));
+		}
+		// value == 0 (s_cmp_lg_u32 0, flags taken false): a flag set by key >= bound is clear.
+		if ((op == ValueOpcode::INotEqual32 && !positive) ||
+		    (op == ValueOpcode::IEqual32 && positive)) {
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
+				uint32_t zero = 1u;
+				if (ImmediateU32(test->Arg(arg), zero) && zero == 0u &&
+				    ProvesZeroKeyBelow(test->Arg(arg ^ 1u), key, bound, facts, depth + 1u))
+					return true;
+			}
+		}
+		return false;
+	}
+
+	// value == 0 implies key < bound: a nonzero flag selected by key >= bound, possibly
+	// or-ed with other flags or selected under a known-true lane predicate.
+	bool ProvesZeroKeyBelow(Value value, Value key, Value& bound, const std::vector<Value>& facts,
+	                        uint32_t depth) const {
+		if (depth > 12u) return false;
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr) return false;
+		if (inst->GetOpcode() == ValueOpcode::BitwiseOr32 && inst->NumArgs() == 2u) {
+			return ProvesZeroKeyBelow(inst->Arg(0), key, bound, facts, depth + 1u) ||
+			       ProvesZeroKeyBelow(inst->Arg(1), key, bound, facts, depth + 1u);
+		}
+		if (inst->GetOpcode() != ValueOpcode::SelectU32 || inst->NumArgs() != 3u) return false;
+		uint32_t set = 0, clear = 1;
+		if (ImmediateU32(inst->Arg(1), set) && set != 0u && ImmediateU32(inst->Arg(2), clear) &&
+		    clear == 0u)
+			return ProvesKeyBelow(inst->Arg(0), false, key, bound, facts, depth + 1u);
+		const auto condition = inst->Arg(0).Resolve();
+		return std::ranges::any_of(
+		           facts,
+		           [&](Value fact) { return EquivalentValue(m_program, fact, condition); }) &&
+		       ProvesZeroKeyBelow(inst->Arg(1), key, bound, facts, depth + 1u);
+	}
+
+	// Every path to `use` crosses an edge proving key < bound (the loop's count exit).
+	Value ScanBound(Value key, const Block* use) const {
+		Value      bound;
+		const bool guarded = GuardedOnEntry(
+		    use, [](const Block*) { return false; },
+		    [&](const EdgePredicate& edge) {
+			    Value limit;
+			    if (!ProvesKeyBelow(edge.condition, edge.positive, key, limit)) return false;
+			    if (bound.IsEmpty()) bound = limit;
+			    return EquivalentValue(m_program, bound, limit);
+		    });
+		return guarded ? bound : Value {};
 	}
 
 	Value InitialCandidateMask(Value value, const Block* update_block) const {
@@ -1775,7 +1990,12 @@ private:
 			    selector->NumArgs() == 1u && !m_shader_writes &&
 			    NonzeroOnEntry(selector->Arg(0), handle.Parent());
 			if (bitscan) {
-				indirect.key_count = Value(32u);
+				// The scan stops at the mask's set bits, its width and the loop's count exit.
+				uint32_t width         = 32u;
+				indirect.selector_mask = ScannedMask(selector->Arg(0), width);
+				const auto bound       = ScanBound(key, handle.Parent());
+				indirect.key_count     = bound.IsEmpty() ? Value(width) : bound;
+				indirect.key_limit     = width;
 			} else if (!m_shader_writes) {
 				if (const auto* bound = BoundedLoop(key, handle.Parent()))
 					indirect.key_count = bound->Arg(1);
@@ -2226,6 +2446,8 @@ private:
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
 		image.atomic64       = atomic64;
+		image.sample_only         = true;
+		image.sample_or_load_only = true;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -2239,6 +2461,10 @@ private:
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
+		image.sample_only  = image.sample_only && op == ValueOpcode::ImageSampleRaw;
+		image.sample_or_load_only =
+		    image.sample_or_load_only &&
+		    (op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageRead);
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

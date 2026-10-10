@@ -45,6 +45,12 @@ public:
 		return m_current_tick.fetch_add(1, std::memory_order_release);
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
+	// True once the Vulkan device has been reported lost. A lost device cannot complete
+	// another tick, so every later wait returns immediately instead of aborting the process
+	// from inside the wait.
+	[[nodiscard]] bool DeviceLost() const noexcept {
+		return m_device_lost.load(std::memory_order_acquire);
+	}
 
 	void Refresh();
 	void Wait(uint64_t tick);
@@ -54,6 +60,7 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::atomic<bool>     m_device_lost {false};
 };
 
 } // namespace Libs::Graphics

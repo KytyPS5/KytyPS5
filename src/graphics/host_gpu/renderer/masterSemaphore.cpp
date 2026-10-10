@@ -3,14 +3,12 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "graphics/host_gpu/frameStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/queueSubmitter.h"
 
 #include <array>
 #include <chrono>
 #include <cinttypes>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -216,10 +214,19 @@ MasterSemaphore::~MasterSemaphore() {
 }
 
 void MasterSemaphore::Refresh() {
+	if (DeviceLost()) {
+		return;
+	}
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
 		ReportSemaphoreFatal("vkGetSemaphoreCounterValue", result, 0, KnownGpuTick());
+		if (result == vk::Result::eErrorDeviceLost) {
+			// A lost device can never complete another tick. Stop treating that as fatal here
+			// so the emulator unwinds through its normal error path instead of aborting.
+			m_device_lost.store(true, std::memory_order_release);
+			return;
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -236,6 +243,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	}
 	Refresh();
 	if (IsFree(tick)) {
+		return;
+	}
+	if (DeviceLost()) {
 		return;
 	}
 
@@ -259,6 +269,13 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		            "a few ms means a GPU memory fault)\n", static_cast<long long>(waited_ms));
 		std::fflush(stdout);
 		ReportSemaphoreFatal("vkWaitSemaphores", result, tick, KnownGpuTick());
+		if (result == vk::Result::eErrorDeviceLost) {
+			// Aborting from inside the wait used to kill the process before the emulator could
+			// flush its own diagnostics. ReportSemaphoreFatal already dumped the submit history
+			// once; flag the loss and let the caller unwind.
+			m_device_lost.store(true, std::memory_order_release);
+			return;
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();

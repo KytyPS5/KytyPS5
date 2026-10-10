@@ -253,6 +253,14 @@ distrobox create --name kyty-build --image registry.fedoraproject.org/fedora:lat
 distrobox enter kyty-build
 ```
 
+On systems using the proprietary NVIDIA driver, add `--nvidia` to the `distrobox create` command.
+Without it the container cannot see the NVIDIA GPU and Vulkan falls back to integrated graphics
+or a software renderer:
+
+```bash
+distrobox create --nvidia --name kyty-build --image registry.fedoraproject.org/fedora:latest
+```
+
 Install the toolchain, Qt 6 and the libraries the bundled SDL3 needs. These are the Fedora
 equivalents of the Debian/Ubuntu packages listed above:
 
@@ -286,7 +294,7 @@ directly on the host, outside the container:
 ```
 
 If the host is missing a library, run it through the container instead, which shares the host's
-display, audio, gamepads and GPU driver:
+display, audio, gamepads and GPU driver (on NVIDIA, only if it was created with `--nvidia`):
 
 ```bash
 distrobox enter kyty-build -- ./_Build/linux/install/launcher

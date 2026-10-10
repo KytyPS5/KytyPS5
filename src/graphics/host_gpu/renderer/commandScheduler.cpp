@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -183,6 +184,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::FlushAndWait, true);
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
@@ -193,6 +195,7 @@ void CommandScheduler::Finish() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
+	Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::Finish, true);
 	m_master.Wait(CurrentTick() - 1);
 	BeginNext();
 	PopPendingOperations();

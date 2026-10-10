@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -9,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -57,6 +59,14 @@ const char* DebugOpName(uint32_t op) {
 
 void RecordSubmitHistory(uint64_t tick, uint32_t debug_op, uint64_t submit_id, uint32_t arg0,
                          uint32_t arg1, uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	// Debug op ids: see CommandBufferDebugOp (render.h) / DebugOpName above.
+	if (debug_op == 1 || debug_op == 2) {
+		g_frame_stats.draws.fetch_add(1, std::memory_order_relaxed);
+	} else if (debug_op == 0 || debug_op == 9) {
+		g_frame_stats.dispatches.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_frame_stats.eops.fetch_add(1, std::memory_order_relaxed);
+	}
 	std::lock_guard lock(g_history_mutex);
 	auto&           r = g_history[g_history_count % SubmitHistorySize];
 	r                 = {tick,
@@ -237,14 +247,17 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	// The tick may still sit in the submit queue; make sure the GPU has actually been given it.
 	DrainQueueSubmits(m_graphics);
 	const auto wait_begin = std::chrono::steady_clock::now();
-	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	g_frame_stats.waits.fetch_add(1, std::memory_order_relaxed);
-	g_frame_stats.wait_us.fetch_add(
-	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-	                              std::chrono::steady_clock::now() - wait_begin)
-	                              .count()),
-	    std::memory_order_relaxed);
+	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	NoteGpuWait(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	    std::chrono::steady_clock::now() - wait_begin).count()));
 	if (result != vk::Result::eSuccess) {
+		const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		    std::chrono::steady_clock::now() - wait_begin).count();
+		// A Windows TDR hang is reported after about 2000 ms of no progress; an invalid GPU
+		// memory access fails almost immediately.
+		std::printf("GPU wait failed after %lld ms (about 2000 ms or more means a hang/TDR; "
+		            "a few ms means a GPU memory fault)\n", static_cast<long long>(waited_ms));
+		std::fflush(stdout);
 		ReportSemaphoreFatal("vkWaitSemaphores", result, tick, KnownGpuTick());
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

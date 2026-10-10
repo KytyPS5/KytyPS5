@@ -73,7 +73,10 @@ uint64_t QueueSubmitter::Enqueue(MasterSemaphore& master, SubmitInfo info, vk::C
 				last_calls[i] = calls;
 				last_us[i]    = us;
 			}
-			const auto wait_us   = g_frame_stats.wait_us.load();
+			uint64_t wait_us = 0;
+			for (const auto& w : g_frame_stats.waits) {
+				wait_us += w.us.load(std::memory_order_relaxed);
+			}
 			const auto submit_us = g_frame_stats.submit_us.load();
 			std::snprintf(line + n, sizeof(line) - n, " hostWait=%.0fms queueSubmit=%.0fms",
 			              static_cast<double>(wait_us - last_wait_us) / 1000.0,

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -76,6 +77,7 @@ FaultManager::~FaultManager() {
 
 void FaultManager::ProcessFaultBuffer() {
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
+		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::FaultManager);
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}

@@ -86,6 +86,7 @@ enum class AjmCodec : uint32_t {
 
 constexpr int32_t AJM_ERROR_INVALID_CONTEXT     = static_cast<int32_t>(0x80930002u);
 constexpr int32_t AJM_ERROR_INVALID_PARAMETER   = static_cast<int32_t>(0x80930005u);
+constexpr int32_t AJM_ERROR_OUT_OF_RESOURCES    = static_cast<int32_t>(0x80930007u);
 constexpr int32_t AJM_ERROR_CODEC_NOT_SUPPORTED = static_cast<int32_t>(0x80930008u);
 constexpr int32_t AJM_ERROR_JOB_CREATION        = static_cast<int32_t>(0x80930012u);
 constexpr size_t  AJM_JOB_CONTROL_SIZE          = 48;
@@ -113,6 +114,7 @@ constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_MASK      = 0x7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_MAX_CHANNEL_MASK = 0x7fu;
 
 static std::atomic_uint32_t g_ajm_next_instance {1};
+constexpr uint32_t          AJM_INSTANCE_INDEX_MASK = 0x3fffu;
 static std::atomic_uint32_t g_ajm_next_batch {1};
 
 static uint32_t AjmGetFlagChannelCount(uint64_t flags) {
@@ -162,8 +164,8 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	}
 
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = AjmAt9InitDecoder(handle, static_cast<const uint8_t*>(config_data));
-	const int       info_result =
+	const int init_result = AjmAt9InitDecoder(handle, static_cast<const uint8_t*>(config_data));
+	const int info_result =
 	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
 	Atrac9ReleaseHandle(handle);
 
@@ -648,9 +650,6 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 	EXIT_NOT_IMPLEMENTED(instance == nullptr);
 	const auto supported = AjmLogCodecSupport(codec);
 
-	const auto slot = (g_ajm_next_instance.fetch_add(1, std::memory_order_relaxed) & 0x3fffu);
-	*instance       = (codec << 14u) | slot;
-
 	auto state    = AjmInstanceState {};
 	state.context = context;
 	state.codec   = codec;
@@ -659,7 +658,21 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 
 	{
 		std::scoped_lock lock(g_ajm_instances_mutex);
-		g_ajm_instances[*instance] = std::move(state);
+		// Wwise releases decoders by instance id, so a wrapped index must skip live instances.
+		uint32_t id = 0;
+		for (uint32_t attempt = 0;; attempt++) {
+			if (attempt > AJM_INSTANCE_INDEX_MASK) {
+				return AJM_ERROR_OUT_OF_RESOURCES;
+			}
+			const auto index = g_ajm_next_instance.fetch_add(1, std::memory_order_relaxed) &
+			                   AJM_INSTANCE_INDEX_MASK;
+			id               = (codec << 14u) | index;
+			if (!g_ajm_instances.contains(id)) {
+				break;
+			}
+		}
+		*instance           = id;
+		g_ajm_instances[id] = std::move(state);
 	}
 
 	LOGF("\t context  = %" PRIu32 "\n"

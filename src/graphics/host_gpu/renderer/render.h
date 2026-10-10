@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/dispatchHazard.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -149,6 +150,10 @@ public:
 	}
 	void MarkIndirectArgsBarrier() const noexcept { m_indirect_barrier_holds = true; }
 	void InvalidateIndirectArgsBarrier() const noexcept { m_indirect_barrier_holds = false; }
+	[[nodiscard]] bool FullBarrierIsLast() const noexcept {
+		return m_full_barrier_mark == m_handle_requests;
+	}
+	void MarkFullBarrier() const noexcept { m_full_barrier_mark = m_handle_requests; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -168,22 +173,29 @@ private:
 	void Begin();
 	void End() const;
 
-	RenderContext&      m_context;
-	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer          = nullptr;
-	uint32_t            m_debug_op        = 0;
-	uint64_t            m_debug_submit_id = 0;
-	uint32_t            m_debug_arg0      = 0;
-	uint32_t            m_debug_arg1      = 0;
-	uint32_t            m_debug_arg2      = 0;
-	uint32_t            m_debug_arg3      = 0;
-	uint64_t            m_debug_arg4      = 0;
-	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
-	mutable bool        m_indirect_barrier_holds = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	RenderContext&         m_context;
+	GraphicContext&        m_graphics;
+	vk::CommandBuffer      m_buffer          = nullptr;
+	uint32_t               m_debug_op        = 0;
+	uint64_t               m_debug_submit_id = 0;
+	uint32_t               m_debug_arg0      = 0;
+	uint32_t               m_debug_arg1      = 0;
+	uint32_t               m_debug_arg2      = 0;
+	uint32_t               m_debug_arg3      = 0;
+	uint64_t               m_debug_arg4      = 0;
+	mutable RenderState    m_render_state;
+	mutable bool           m_rendering              = false;
+	mutable bool           m_indirect_barrier_holds = false;
+	mutable uint64_t       m_handle_requests        = 0;
+	mutable uint64_t       m_full_barrier_mark      = UINT64_MAX;
+	mutable bool           m_deferred_barrier       = false;
+	mutable bool           m_deferred_full          = false;
+	mutable bool           m_deferred_joining       = false;
+	mutable uint32_t       m_deferred_dispatches    = 0;
+	mutable DispatchAccess m_deferred_access;
+	HW::Context*           m_registers   = nullptr;
+	HW::UserConfig*        m_user_config = nullptr;
+	HW::Shader*            m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };
@@ -272,6 +284,7 @@ private:
 	RenderContext&                        m_context;
 	GraphicsBindings                      m_graphics_bindings;
 	PreparedBindings                      m_compute_bindings;
+	DispatchAccess                        m_dispatch_access;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

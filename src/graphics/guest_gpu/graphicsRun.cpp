@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1398,8 +1399,15 @@ void CommandProcessor::EmitGlobalBarrier() {
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
+	auto& command                 = CurrentBuffer();
+	// A guest sync ends the dispatch group; a group that began fully ordered still elides this.
+	command.FlushDeferredBarrier();
+	if (BarrierElisionEnabled() && command.FullBarrierIsLast()) {
+		return;
+	}
 	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	command.Handle().pipelineBarrier2(dependency);
+	command.MarkFullBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

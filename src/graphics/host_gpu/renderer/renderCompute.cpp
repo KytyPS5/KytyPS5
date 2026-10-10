@@ -362,6 +362,96 @@ static void ReportOverLimitDispatch(RenderContext& context, uint64_t shader_hash
 	std::fflush(stdout);
 }
 
+static void MarkStorageImagesFlushed(TextureCache& cache, const PreparedBindings& bindings) {
+	for (const auto& binding: bindings.images) {
+		if (binding.desc.type != TextureCache::BindingType::Storage) {
+			continue;
+		}
+		auto*      image = &cache.GetImage(binding.image_id);
+		const bool whole =
+		    image->binding.force_general && !image->info.IsDepth() && !image->info.data.Empty();
+		const auto&                          view = binding.desc.view_info;
+		std::optional<ImageSubresourceRange> range;
+		if (!whole) {
+			range = ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                               view.layer_count};
+		}
+		image->MarkShaderWritesFlushed(range);
+	}
+}
+
+template <typename Handle>
+static uint64_t HandleKey(Handle handle) {
+	return (uint64_t)(handle); // NOLINT: a non-dispatchable handle is a pointer or an integer
+}
+
+static bool BindlessReadOnlyAccessEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_BINDLESS_READ_ONLY_ACCESS");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+// What the dispatch about to be recorded reads and writes, for JoinDeferredBarrier.
+static void CollectDispatchAccess(TextureCache& textures, const ShaderStageRuntime& stage,
+                                  const PreparedBindings& bindings, DispatchAccess& access) {
+	using Space = DispatchAccess::Space;
+	access.Clear();
+	const auto& program  = *stage.program;
+	const auto& layout   = program.bindings;
+	const bool  bindless = layout.uses_bindless || !bindings.bindless_patches.empty();
+	if (program.info.uses_dma || bindless) {
+		access.reads_all  = true;
+		access.writes_all = program.info.writes_dma || program.has_address_writes ||
+		                    (bindless && !BindlessReadOnlyAccessEnabled());
+	}
+	if (bindings.gds.buffer != nullptr) {
+		access.reads_all  = true;
+		access.writes_all = true;
+		// Named as well, so the guest-synced comparison still orders GDS users.
+		access.Add(Space::HostBuffer, HandleKey(static_cast<VkBuffer>(bindings.gds.buffer)),
+		           bindings.gds.offset, bindings.gds.range, true);
+	}
+	if (layout.memory_offset_count != 0) {
+		const auto& resources = layout.descriptors.front().resources;
+		if (bindings.buffer_sources.size() != resources.size()) {
+			access.reads_all  = true;
+			access.writes_all = true;
+		} else {
+			for (uint32_t i = 0; i < resources.size(); i++) {
+				const auto& source = bindings.buffer_sources[i];
+				access.Add(Space::Guest, 0, source.address, source.size,
+				           program.info.buffers[resources[i]].written);
+			}
+		}
+	}
+	EXIT_IF(bindings.images.size() < program.info.images.size());
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto& resource = program.info.images[i];
+		const bool  write =
+		    resource.written &&
+		    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+		if (resource.bindless) {
+			// A heap record names no image of this binding; reads are already all-reads.
+			access.writes_all = access.writes_all || resource.written || resource.atomic;
+			continue;
+		}
+		const auto& image = textures.GetImage(bindings.images[i].image_id);
+		access.Add(Space::HostImage, HandleKey(static_cast<VkImage>(image.backing.image)), 0, 1,
+		           write);
+		// An alias of the same guest memory is another host image; its guest range names it.
+		for (const auto range: {image.info.data, image.info.stencil, image.info.metadata.range}) {
+			access.Add(Space::Guest, 0, range.address, range.size, write);
+		}
+	}
+	if (bindings.shared_memory.buffer != nullptr) {
+		const auto& memory = bindings.shared_memory;
+		access.Add(Space::HostBuffer, HandleKey(static_cast<VkBuffer>(memory.buffer)),
+		           memory.offset, memory.range, true);
+	}
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.program->bindings.descriptor_counts[
@@ -622,6 +712,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	const PreciseWriteScope precise_writes(m_context.GetBufferCache());
 	RebindBuffers(bindings);
+	bool has_storage_writes =
+	    bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage);
+	has_storage_writes =
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& image) {
+		                return image.written &&
+		                       image.resource_class ==
+		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
+	                }) ||
+	    has_storage_writes;
+	const bool                  overlap = DispatchOverlapEnabled() && !GuestSyncOnly();
+	CommandBuffer::DeferredJoin join {};
+	if (overlap) {
+		CollectDispatchAccess(m_context.GetTextureCache(), input_info.stage, bindings,
+		                      m_dispatch_access);
+		// Writing the thread-dimension record is a transfer the group must be ordered before.
+		if (!use_thread_dimensions) {
+			join = buffer.JoinDeferredBarrier(m_dispatch_access, has_storage_writes);
+		}
+		if (!join.joined) {
+			buffer.FlushDeferredBarrier();
+		}
+	}
+	const bool ordered_before =
+	    join.joined ? join.ordered_before : BarrierElisionEnabled() && buffer.FullBarrierIsLast();
 
 	auto                     vk_buffer = buffer.Handle();
 	ThreadDispatcher::Record thread_record {};
@@ -632,17 +747,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	                          HasShaderBufferWrites(input_info.stage);
-	has_storage_writes =
-	    std::any_of(program.info.images.begin(), program.info.images.end(),
-	                [](const auto& image) {
-		                return image.written &&
-		                       image.resource_class ==
-		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
-	                }) ||
-	    has_storage_writes;
-	if (has_storage_writes) {
+	const bool hazard_barrier = has_storage_writes && !GuestSyncOnly() && !ordered_before;
+	if (hazard_barrier) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -655,7 +761,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetIndirectKeyFeedback().Flush(vk_buffer);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!GuestSyncOnly()) {
+		if (overlap) {
+			buffer.DeferBarrier(m_dispatch_access, hazard_barrier || ordered_before);
+		} else {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			if (hazard_barrier || ordered_before) {
+				buffer.MarkFullBarrier();
+			}
+		}
+		MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
+	}
 	ResetBindings();
 }
 
@@ -712,6 +828,16 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	const PreciseWriteScope precise_writes(m_context.GetBufferCache());
 	RebindBuffers(bindings);
+	// An indirect dispatch never joins a group: its argument barrier waits for compute anyway.
+	const bool overlap = DispatchOverlapEnabled() && !GuestSyncOnly() && !thread_dimensions;
+	if (overlap) {
+		CollectDispatchAccess(m_context.GetTextureCache(), input_info.stage, bindings,
+		                      m_dispatch_access);
+		m_dispatch_access.Add(DispatchAccess::Space::Guest, 0, args_addr,
+		                      sizeof(vk::DispatchIndirectCommand), false);
+	}
+	buffer.FlushDeferredBarrier();
+	const bool               ordered_before = BarrierElisionEnabled() && buffer.FullBarrierIsLast();
 	ThreadDispatcher::Record dispatch_record {args_buffer->Handle(), args_offset, 0};
 	if (thread_dimensions) {
 		const auto& limits = m_context.GetGraphics().physical_device_properties.limits;
@@ -733,7 +859,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.written &&
 		           image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
-	if (has_storage_writes) {
+	const bool hazard_barrier = has_storage_writes && !GuestSyncOnly() && !ordered_before;
+	if (hazard_barrier) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk::MemoryBarrier barrier {};
@@ -748,7 +875,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		PushThreadLimit(vk_buffer, pipeline, dispatch_record);
 	}
 	vk_buffer.dispatchIndirect(dispatch_record.buffer, dispatch_record.groups_offset);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!GuestSyncOnly()) {
+		if (overlap) {
+			buffer.DeferBarrier(m_dispatch_access, hazard_barrier || ordered_before);
+		} else {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			if (hazard_barrier || ordered_before) {
+				buffer.MarkFullBarrier();
+			}
+		}
+		MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
+	}
 	ResetBindings();
 }
 

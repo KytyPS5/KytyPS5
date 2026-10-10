@@ -100,6 +100,14 @@ namespace {
 	return usage;
 }
 
+bool ReenterFlushed(VulkanImageState& state, vk::ImageLayout layout, vk::AccessFlags2 access) {
+	if (!state.flushed || state.layout != layout || state.access_mask != access) {
+		return false;
+	}
+	state.flushed = false;
+	return true;
+}
+
 void ValidateOptionalRange(GuestRange range, const char* name) {
 	if (!range.ValidOrEmpty()) {
 		EXIT("invalid %s image range: address=0x%016llx size=0x%016llx\n", name,
@@ -163,6 +171,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				const auto index = level * info.resources.layers + layer;
 				EXIT_IF(index >= subresource_states.size());
 				auto& subresource_state = subresource_states[index];
+				if (ReenterFlushed(subresource_state, destination_layout, destination_access)) {
+					continue;
+				}
 
 				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
 				                              vk::AccessFlagBits2::eShaderWrite |
@@ -196,6 +207,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			subresource_states.clear();
 		}
 	} else {
+		if (ReenterFlushed(state, destination_layout, destination_access)) {
+			return {};
+		}
 		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
 		                                vk::AccessFlagBits2::eShaderWrite |
 		                                vk::AccessFlagBits2::eMemoryWrite;
@@ -254,6 +268,44 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
 	command_buffer.pipelineBarrier2(dependency);
+}
+
+void Image::MarkShaderWritesFlushed(std::optional<ImageSubresourceRange> range) {
+	const auto mark = [](VulkanImageState& state) {
+		constexpr auto shader_access =
+		    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+		if ((state.access_mask & vk::AccessFlagBits2::eShaderWrite) &&
+		    !(state.access_mask & ~shader_access) &&
+		    (state.pl_stage & vk::PipelineStageFlagBits2::eComputeShader)) {
+			state.flushed = true;
+		}
+	};
+	if (range && info.IsVolume()) {
+		range->base_layer  = 0;
+		range->layer_count = 1;
+	}
+	const bool partial =
+	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
+	              range->base_layer != 0 || range->layer_count != info.resources.layers);
+	auto& states = backing.subresource_states;
+	if (states.empty()) {
+		if (!partial) {
+			mark(backing.state);
+		}
+		return;
+	}
+	const uint32_t base_level  = partial ? range->base_level : 0;
+	const uint32_t level_count = partial ? range->level_count : info.resources.levels;
+	const uint32_t base_layer  = partial ? range->base_layer : 0;
+	const uint32_t layer_count = partial ? range->layer_count : info.resources.layers;
+	for (uint32_t level = base_level; level < base_level + level_count; level++) {
+		for (uint32_t layer = base_layer; layer < base_layer + layer_count; layer++) {
+			const auto index = level * info.resources.layers + layer;
+			if (index < states.size()) {
+				mark(states[index]);
+			}
+		}
+	}
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/frameStats.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -6,6 +7,7 @@
 
 #include <array>
 #include <cinttypes>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -45,6 +47,14 @@ const char* DebugOpName(uint32_t op) {
 
 void RecordSubmitHistory(uint64_t tick, uint32_t debug_op, uint64_t submit_id, uint32_t arg0,
                          uint32_t arg1, uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	// Debug op ids: see CommandBufferDebugOp (render.h) / DebugOpName above.
+	if (debug_op == 1 || debug_op == 2) {
+		g_frame_stats.draws.fetch_add(1, std::memory_order_relaxed);
+	} else if (debug_op == 0 || debug_op == 9) {
+		g_frame_stats.dispatches.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_frame_stats.eops.fetch_add(1, std::memory_order_relaxed);
+	}
 	std::lock_guard lock(g_history_mutex);
 	auto&           r = g_history[g_history_count % SubmitHistorySize];
 	r                 = {tick, submit_id, arg4, debug_op, arg0, arg1, arg2, arg3, true};
@@ -141,7 +151,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
+	const auto wait_begin = std::chrono::steady_clock::now();
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	NoteGpuWait(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	    std::chrono::steady_clock::now() - wait_begin).count()));
 	if (result != vk::Result::eSuccess) {
 		ReportSemaphoreFatal("vkWaitSemaphores", result, tick, KnownGpuTick());
 	}

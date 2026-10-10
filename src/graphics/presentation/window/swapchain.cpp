@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/frameStats.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -114,6 +115,7 @@ public:
 		frame->busy = true;
 		m_mutex.Unlock();
 
+		Libs::Graphics::WaitSiteScope wait_scope(Libs::Graphics::WaitSite::SwapchainFrame);
 		m_scheduler.Wait(frame->present_tick);
 		return frame;
 	}

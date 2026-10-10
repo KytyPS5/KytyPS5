@@ -616,31 +616,6 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation: {
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
-			// Every ~2 s: frames presented, and how much of that time went to compiling shaders.
-			static auto     window_start  = std::chrono::steady_clock::now();
-			static uint64_t window_flips  = 0;
-			static uint64_t last_compiles = 0;
-			static uint64_t last_us       = 0;
-			++window_flips;
-			const auto now     = std::chrono::steady_clock::now();
-			const auto elapsed = std::chrono::duration<double>(now - window_start).count();
-			if (elapsed >= 2.0) {
-				auto&      stats    = Libs::Graphics::g_frame_stats;
-				const auto compiles = stats.compiles.load(std::memory_order_relaxed);
-				const auto us       = stats.compile_us.load(std::memory_order_relaxed);
-				const auto max_us   = stats.compile_us_max.exchange(0, std::memory_order_relaxed);
-				std::printf("PERF: %.1f flips/s | shader compiles: %llu (%.0f ms total, max %.0f ms) "
-				            "in last %.1f s\n",
-				            static_cast<double>(window_flips) / elapsed,
-				            static_cast<unsigned long long>(compiles - last_compiles),
-				            static_cast<double>(us - last_us) / 1000.0,
-				            static_cast<double>(max_us) / 1000.0, elapsed);
-				std::fflush(stdout);
-				window_start  = now;
-				window_flips  = 0;
-				last_compiles = compiles;
-				last_us       = us;
-			}
 			break;
 		}
 		case SubmissionType::SuspendPoint:

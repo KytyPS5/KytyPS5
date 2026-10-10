@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -100,6 +101,7 @@ void GuestGpu::Shutdown() {
 		Common::LockGuard lock(m_queue_mutex);
 		m_accepting = false;
 		m_stopping  = true;
+		m_work_generation.fetch_add(1, std::memory_order_release);
 		m_work_available.SignalAll();
 	}
 	if (m_thread.joinable()) {
@@ -123,6 +125,7 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_generation.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
 }
 
@@ -466,6 +469,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
+	m_work_generation.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
 }
 
@@ -477,6 +481,31 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+static bool WaitBlockedBriefly(Common::Mutex& mutex, const std::atomic_uint64_t& work_generation,
+                               std::chrono::steady_clock::time_point& since) {
+	static const bool disabled = [] {
+		const char* text = std::getenv("KYTY_NO_GPU_BLOCKED_SPIN");
+		return text != nullptr && std::strcmp(text, "0") != 0;
+	}();
+	constexpr auto Budget = std::chrono::microseconds(2000);
+	constexpr auto Retry  = std::chrono::microseconds(50);
+	const auto     now    = std::chrono::steady_clock::now();
+	if (since == std::chrono::steady_clock::time_point {}) {
+		since = now;
+	}
+	if (disabled || now - since >= Budget) {
+		return false;
+	}
+	const auto generation = work_generation.load(std::memory_order_acquire);
+	mutex.Unlock();
+	while (std::chrono::steady_clock::now() - now < Retry &&
+	       work_generation.load(std::memory_order_acquire) == generation) {
+		std::this_thread::yield();
+	}
+	mutex.Lock();
+	return true;
+}
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -485,6 +514,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	std::chrono::steady_clock::time_point blocked_since {};
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -517,7 +547,10 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					if (!WaitBlockedBriefly(gpu->m_queue_mutex, gpu->m_work_generation,
+					                        blocked_since)) {
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -525,6 +558,7 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 					continue;
 				}
+				blocked_since = {};
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
 				submission  = std::move(queue.front());
 				queue.pop_front();

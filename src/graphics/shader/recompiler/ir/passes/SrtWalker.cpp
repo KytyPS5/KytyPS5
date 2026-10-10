@@ -356,21 +356,295 @@ private:
 	std::unordered_set<const Inst*> m_validated_dependencies;
 };
 
+} // namespace
+
+namespace {
+
+using WalkerNode      = ResourcePlan::WalkerNode;
+using WalkerImmediate = ResourcePlan::WalkerImmediate;
+
+// Reference encoding, as in SrtWalker.
+constexpr uint32_t ImmediateRef = 0x80000000u;
+constexpr uint32_t InlineRef    = 0xc0000000u;
+constexpr uint32_t NoRef        = UINT32_MAX;
+
+enum WalkerKind : uint8_t {
+	WalkerOpcode,  // evaluated by opcode
+	WalkerRawRead, // read opcode accepted by IsRawRead
+	WalkerFail,    // evaluation fails before touching any operand
+	WalkerExit,    // GetUserData without a scalar register: fail fast like Value::ScalarRegister
+};
+
+bool IsImmediateRef(uint32_t ref) {
+	return ref >= ImmediateRef && ref != NoRef;
+}
+
+WalkerImmediate MakeImmediate(Value value) {
+	WalkerImmediate immediate;
+	immediate.type = value.GetType();
+	switch (immediate.type) {
+		case Type::U1: immediate.payload = value.U1() ? 1u : 0u; break;
+		case Type::U8: immediate.payload = value.U8(); break;
+		case Type::U16: immediate.payload = value.U16(); break;
+		case Type::U32: immediate.payload = value.U32(); break;
+		case Type::U64: immediate.payload = value.U64(); break;
+		case Type::F32: immediate.payload = std::bit_cast<uint32_t>(value.F32Value()); break;
+		case Type::F16: immediate.payload = value.F16Bits(); break;
+		case Type::ScalarReg: immediate.payload = RegIndex(value.ScalarRegister()); break;
+		case Type::VectorReg: immediate.payload = RegIndex(value.VectorRegister()); break;
+		case Type::Void: break;
+		default: return immediate;
+	}
+	// Value::operator== compares these types by payload; only integer and F32 values evaluate.
+	immediate.comparable = true;
+	switch (immediate.type) {
+		case Type::U1:
+		case Type::U8:
+		case Type::U16:
+		case Type::U32:
+		case Type::U64:
+		case Type::F32: immediate.valid = true; break;
+		default: break;
+	}
+	return immediate;
+}
+
+// Maps a value to its walker reference, allocating the node slot of a new instruction.
+uint32_t WalkerRef(const ResourcePlan& plan, Value value) {
+	value = value.Resolve();
+	if (const auto* inst = value.TryInstruction(); inst != nullptr) {
+		const auto index = inst->EvaluationIndex(plan.evaluation_value_count);
+		EXIT_IF(index >= ImmediateRef);
+		if (index >= plan.walker_nodes.size()) {
+			plan.walker_nodes.resize(plan.evaluation_value_count);
+			++plan.walker_layout;
+		}
+		auto& node = plan.walker_nodes[index];
+		// Evaluation indices belong to the plan that owns the instruction.
+		EXIT_IF(node.inst != nullptr && node.inst != inst);
+		node.inst = inst;
+		return index;
+	}
+	const auto immediate = MakeImmediate(value);
+	if (immediate.type == Type::U32 && immediate.payload < (NoRef & ~InlineRef)) {
+		return InlineRef | static_cast<uint32_t>(immediate.payload);
+	}
+	plan.walker_immediates.push_back(immediate);
+	++plan.walker_layout;
+	EXIT_IF(plan.walker_immediates.size() > InlineRef - ImmediateRef);
+	return ImmediateRef | static_cast<uint32_t>(plan.walker_immediates.size() - 1u);
+}
+
+WalkerImmediate ImmediateOf(const ResourcePlan& plan, uint32_t ref) {
+	if (ref >= InlineRef) {
+		return {.type = Type::U32, .valid = true, .comparable = true, .payload = ref & ~InlineRef};
+	}
+	return plan.walker_immediates[ref & ~ImmediateRef];
+}
+
+// Same result as Value::operator== on the referenced values.
+bool RefEquals(const ResourcePlan& plan, uint32_t left, uint32_t right) {
+	if (left == NoRef || right == NoRef) {
+		return false;
+	}
+	if (!IsImmediateRef(left) || !IsImmediateRef(right)) {
+		return left == right;
+	}
+	const auto a = ImmediateOf(plan, left);
+	const auto b = ImmediateOf(plan, right);
+	return a.type == b.type && a.comparable && b.comparable && a.payload == b.payload;
+}
+
+// Value::operator== on two active masks, where NoRef stands for the empty mask.
+bool MaskEquals(const ResourcePlan& plan, uint32_t left, uint32_t right) {
+	return left == NoRef || right == NoRef ? left == right : RefEquals(plan, left, right);
+}
+
+// An immediate Void mask is the empty mask.
+uint32_t MaskRef(const ResourcePlan& plan, uint32_t ref) {
+	return IsImmediateRef(ref) && ImmediateOf(plan, ref).type == Type::Void ? NoRef : ref;
+}
+
+bool ImmediateU32(const ResourcePlan& plan, uint32_t ref, uint32_t& value) {
+	if (!IsImmediateRef(ref)) {
+		return false;
+	}
+	const auto immediate = ImmediateOf(plan, ref);
+	if (immediate.type != Type::U32) {
+		return false;
+	}
+	value = static_cast<uint32_t>(immediate.payload);
+	return true;
+}
+
+void CompileNode(const ResourcePlan& plan, uint32_t index) {
+	const Inst& inst = *plan.walker_nodes[index].inst;
+	WalkerNode  node;
+	node.inst      = &inst;
+	node.opcode    = inst.GetOpcode();
+	node.kind      = WalkerOpcode;
+	node.arg_count = static_cast<uint8_t>(std::min<size_t>(inst.NumArgs(), WalkerNode::MaxArgs));
+	for (uint32_t arg = 0; arg < node.arg_count; ++arg) {
+		node.args[arg] = WalkerRef(plan, inst.Arg(arg));
+	}
+	if (node.opcode == ValueOpcode::Phi) {
+		const auto invariant = ResolveInvariantPhi(plan, Value(const_cast<Inst*>(&inst)));
+		node.target          = invariant.IsEmpty() ? NoRef : WalkerRef(plan, invariant);
+	}
+	switch (node.opcode) {
+		case ValueOpcode::GetUserData: {
+			const auto reg = inst.Arg(0);
+			if (!reg.IsImmediate() || reg.GetType() != Type::ScalarReg) {
+				node.kind = WalkerExit;
+				break;
+			}
+			const auto index_reg = RegIndex(reg.ScalarRegister());
+			node.aux = index_reg >= plan.user_data_base ? index_reg - plan.user_data_base : NoRef;
+			break;
+		}
+		case ValueOpcode::CompositeExtractU64:
+		case ValueOpcode::CompositeExtractU32x2: {
+			uint32_t component = 0;
+			node.aux =
+			    ImmediateU32(plan, node.args[1], component) && component < 2u ? component : NoRef;
+			break;
+		}
+		case ValueOpcode::LoadAddressU32:
+		case ValueOpcode::ReadConstBuffer:
+		case ValueOpcode::LoadBufferU32:
+			if (IsRawRead(plan, inst)) {
+				const auto flags = inst.Flags<SrtReadFlags>();
+				node.kind        = WalkerRawRead;
+				node.aux         = flags.clean;
+				node.target      = plan.memory_info[flags.index].offset;
+			} else {
+				node.kind = WalkerFail;
+			}
+			break;
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+			node.aux = inst.Flags<FPCompareFlags>().flush_input_denorms ? 1u : 0u;
+			break;
+		default: break;
+	}
+	node.compiled            = true;
+	plan.walker_nodes[index] = node;
+}
+
+// Compiles every node the walker can reach from `root`, so evaluation never adds nodes.
+void CompileClosure(const ResourcePlan& plan, uint32_t root) {
+	if (IsImmediateRef(root) || plan.walker_nodes[root].compiled) {
+		return;
+	}
+	std::vector<uint32_t> pending {root};
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		if (plan.walker_nodes[index].compiled) {
+			continue;
+		}
+		CompileNode(plan, index);
+		const auto& node = plan.walker_nodes[index];
+		for (uint32_t arg = 0; arg < node.arg_count; ++arg) {
+			if (!IsImmediateRef(node.args[arg])) {
+				pending.push_back(node.args[arg]);
+			}
+		}
+		if (node.opcode == ValueOpcode::Phi && node.target != NoRef &&
+		    !IsImmediateRef(node.target)) {
+			pending.push_back(node.target);
+		}
+	}
+}
 
 } // namespace
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator, Value active_mask)
-    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
-      m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {}
+    : SrtWalker(program, runtime, clean_evaluator, NoRef) {
+	if (m_program.evaluation_depth == 1) {
+		// A walk starts. Compiled reads of SRT slots hold the slot values: a replaced value
+		// drops the compiled form.
+		auto&       roots   = m_program.walker_srt_reads;
+		const auto& reads   = m_program.srt_reads;
+		bool        changed = roots.size() != reads.size();
+		for (size_t slot = 0; !changed && slot < reads.size(); ++slot) {
+			changed = !SameRoot(roots[slot].value, reads[slot].value);
+		}
+		if (changed) {
+			m_program.walker_nodes.clear();
+			m_program.walker_immediates.clear();
+			m_program.walker_descriptors.clear();
+			roots.assign(reads.size(), {});
+			for (size_t slot = 0; slot < reads.size(); ++slot) {
+				CompileRoot(roots[slot], reads[slot].value);
+				const auto* inst  = reads[slot].value.ResolveInstruction();
+				roots[slot].clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
+			}
+		}
+	}
+	if (!active_mask.Resolve().IsEmpty()) {
+		m_active_mask = MaskRef(m_program, WalkerRef(m_program, active_mask));
+		CompileClosure(m_program, m_active_mask);
+	}
+	Refresh();
+}
 
-SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
+// Also used during evaluation: it must not compile nodes.
+SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
+                     SrtWalker* clean_evaluator, Ref active_mask)
+    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
+      m_active_mask(MaskRef(program, active_mask)), m_context(AcquireContext(program)),
+      m_generation(m_context.generation) {
+	Refresh();
+}
+
+SrtWalker::~SrtWalker() {
+	if (--m_program.evaluation_depth == 0 && !m_program.walker_cached) {
+		m_program.walker_nodes.clear();
+		m_program.walker_immediates.clear();
+		m_program.walker_srt_reads.clear();
+		m_program.walker_descriptors.clear();
+	}
+}
+
+void SrtWalker::Refresh() {
+	const auto size = m_program.walker_nodes.size();
+	for (auto* walker = this; walker != nullptr; walker = walker->m_clean_evaluator) {
+		if (walker->m_context.values.size() < size) {
+			walker->m_context.values.resize(size);
+		}
+		walker->m_nodes      = m_program.walker_nodes.data();
+		walker->m_immediates = m_program.walker_immediates.data();
+		walker->m_values     = walker->m_context.values.data();
+		walker->m_layout     = m_program.walker_layout;
+	}
+}
+
+SrtWalker::Ref SrtWalker::CompileRoot(ResourcePlan::WalkerRoot& root, Value value) {
+	root.value = value;
+	root.ref   = WalkerRef(m_program, value);
+	CompileClosure(m_program, root.ref);
+	Refresh();
+	return root.ref;
+}
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
+	value         = value.Resolve();
 	uint64_t wide = 0;
-	if (!EvaluateWide(value, wide)) {
-		return false;
+	if (value.IsImmediate()) {
+		const auto immediate = MakeImmediate(value);
+		if (!immediate.valid) {
+			return false;
+		}
+		wide = immediate.payload;
+	} else {
+		const auto ref = WalkerRef(m_program, value);
+		CompileClosure(m_program, ref);
+		Refresh();
+		if (!EvaluateRef(ref, wide)) {
+			return false;
+		}
 	}
 	result = static_cast<uint32_t>(wide);
 	return true;
@@ -389,95 +663,66 @@ float SrtWalker::Float32(uint64_t bits) {
 	return std::bit_cast<float>(static_cast<uint32_t>(bits));
 }
 
-bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
-	value = value.Resolve();
-	if (value.IsImmediate()) {
-		switch (value.GetType()) {
-			case Type::U1: result = value.U1(); return true;
-			case Type::U8: result = value.U8(); return true;
-			case Type::U16: result = value.U16(); return true;
-			case Type::U32: result = value.U32(); return true;
-			case Type::U64: result = value.U64(); return true;
-			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
-			default: return false;
-		}
-	}
-	if (!m_active_mask.IsEmpty() && value == m_active_mask) {
+bool SrtWalker::EvaluateNodeRef(Ref ref, uint64_t& result) {
+	EXIT_IF(m_layout != m_program.walker_layout);
+	if (ref == m_active_mask) {
 		result = 1u;
 		return true;
 	}
-	auto* inst = value.TryInstruction();
-	if (inst == nullptr) {
-		return false;
+	const auto& node = m_nodes[ref];
+	if (m_active_mask != NoRef && IsRuntimeSelect(node.opcode) &&
+	    RefEquals(m_program, node.args[0], m_active_mask)) {
+		return EvaluateRef(node.args[1], result);
 	}
-	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
-	    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
-		return EvaluateWide(inst->Arg(1), result);
-	}
-	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
-	if (index >= m_context.values.size()) {
-		m_context.values.resize(m_program.evaluation_value_count);
-	}
-	if (m_context.values[index].generation == m_context.generation) {
-		result = m_context.values[index].value;
+	auto& memo = m_values[ref];
+	if (memo.generation == m_generation) {
+		result = memo.value;
 		return true;
 	}
-	// The low generation bit marks an instruction that is still being evaluated.
-	if (m_context.values[index].generation == (m_context.generation | 1u)) {
+	// The low generation bit marks a node that is still being evaluated.
+	if (memo.generation == (m_generation | 1u)) {
 		return false;
 	}
-	m_context.values[index].generation = m_context.generation | 1u;
-	uint64_t out = 0;
-	const bool evaluated = EvaluateInst(*inst, out);
-	// Recursive evaluation may grow the dense memo vector.
-	auto& memo = m_context.values[index];
+	memo.generation      = m_generation | 1u;
+	uint64_t   out       = 0;
+	const bool evaluated = EvaluateNode(node, out);
+	auto&      entry     = m_values[ref];
 	if (!evaluated) {
-		memo.generation = 0;
+		entry.generation = 0;
 		return false;
 	}
-	memo.value      = out;
-	memo.generation = m_context.generation;
-	result = out;
+	entry.value      = out;
+	entry.generation = m_generation;
+	result           = out;
 	return true;
 }
 
-bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
-	return EvaluateWide(inst.Arg(index), result);
-}
-
-bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
-	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
-	return !value.IsEmpty() && EvaluateWide(value, result);
-}
-
-bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
-	const auto index = inst.Arg(1).Resolve();
-	if (!index.IsImmediate() || index.GetType() != Type::U32) {
+bool SrtWalker::EvaluateExtract(const ResourcePlan::WalkerNode& node, uint64_t& result) {
+	if (node.aux == NoRef) {
 		return false;
 	}
-	const auto component = index.U32();
-	if (component >= 2u) {
-		return false;
-	}
-	if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
+	const auto component = node.aux;
+	if (node.opcode == ValueOpcode::CompositeExtractU64) {
 		uint64_t packed = 0;
-		if (!Arg(inst, 0, packed)) {
+		if (!Arg(node, 0, packed)) {
 			return false;
 		}
 		result = static_cast<uint32_t>(packed >> (component * 32u));
 		return true;
 	}
-	const auto* source = inst.Arg(0).ResolveInstruction();
-	if (source == nullptr) {
+	if (IsImmediateRef(node.args[0])) {
+		// Fails fast on a non-instruction source, as Value::ResolveInstruction does.
+		(void)node.inst->Arg(0).ResolveInstruction();
 		return false;
 	}
-	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
-		return EvaluateWide(source->Arg(component), result);
+	const auto& source = m_nodes[node.args[0]];
+	if (source.opcode == ValueOpcode::CompositeConstructU32x2) {
+		return Arg(source, component, result);
 	}
-	if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
+	if (source.opcode == ValueOpcode::IAddCarry32) {
 		uint64_t lhs = 0;
 		uint64_t rhs = 0;
-		if (!Arg(*source, 0, lhs) || !Arg(*source, 1, rhs)) {
+		if (!Arg(source, 0, lhs) || !Arg(source, 1, rhs)) {
 			return false;
 		}
 		const auto sum =
@@ -489,39 +734,46 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	return false;
 }
 
-bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
-	const auto flags = inst.Flags<SrtReadFlags>();
-	if (flags.index >= m_program.memory_info.size()) {
-		return false;
-	}
-	const auto& mem    = m_program.memory_info[flags.index];
-	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
-	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
-	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
-		uint64_t enabled = 0;
-		if (!Arg(inst, 4, enabled)) return false;
-		if (enabled == 0u) {
-			result = 0u;
-			return true;
+bool SrtWalker::EvaluateRawRead(const ResourcePlan::WalkerNode& node, uint64_t& result) {
+	const bool vector = node.opcode == ValueOpcode::LoadBufferU32;
+	if (vector) {
+		const auto guard = node.args[4];
+		if (IsImmediateRef(guard) || !RefEquals(m_program, guard, m_active_mask)) {
+			uint64_t enabled = 0;
+			if (!EvaluateRef(guard, enabled)) return false;
+			if (enabled == 0u) {
+				result = 0u;
+				return true;
+			}
 		}
 	}
-	const auto* handle = inst.Arg(0).ResolveInstruction();
-	if (handle == nullptr) {
+	if (IsImmediateRef(node.args[0])) {
+		// Fails fast on a non-instruction handle, as Value::ResolveInstruction does.
+		(void)node.inst->Arg(0).ResolveInstruction();
 		return false;
 	}
+	const auto& handle     = m_nodes[node.args[0]];
+	const auto  handle_arg = [&](uint32_t index, uint64_t& value) {
+		if (index >= handle.arg_count) {
+			// Same failure as Inst::Arg past the handle's arity.
+			(void)handle.inst->Arg(index);
+			return false;
+		}
+		return EvaluateRef(handle.args[index], value);
+	};
 	uint64_t low    = 0;
 	uint64_t high   = 0;
 	uint64_t offset = 0;
-	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
+	if (!handle_arg(0, low) || !handle_arg(1, high) || !Arg(node, 1, offset)) {
 		return false;
 	}
 	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(node.target));
 	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
+	if (node.opcode == ValueOpcode::ReadConstBuffer || vector) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
+		if (handle.arg_count != 4u || !handle_arg(2, records) || !handle_arg(3, word3)) {
 			return false;
 		}
 		if (immediate < 0) {
@@ -542,10 +794,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		const auto size = stride == 0u
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+		// Like a scalar read, the DWORD must stay in the 48-bit address space.
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t) ||
+		    !AddSignedAddress(base & ~uint64_t {3}, static_cast<int64_t>(byte_offset), address)) {
 			return false;
 		}
-		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
@@ -567,39 +820,48 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	return true;
 }
 
-bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
+bool SrtWalker::EvaluateNode(const ResourcePlan::WalkerNode& node, uint64_t& result) {
 	uint64_t   a       = 0;
 	uint64_t   b       = 0;
 	uint64_t   c       = 0;
-	const auto binary  = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b); };
-	const auto ternary = [&]() {
-		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
-	};
-	switch (inst.GetOpcode()) {
-		case ValueOpcode::GetUserData: {
-			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
-			if (reg < m_program.user_data_base ||
-			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
+	const auto binary  = [&]() { return Arg(node, 0, a) && Arg(node, 1, b); };
+	const auto ternary = [&]() { return Arg(node, 0, a) && Arg(node, 1, b) && Arg(node, 2, c); };
+	switch (node.kind) {
+		case WalkerFail: return false;
+		case WalkerExit: (void)node.inst->Arg(0).ScalarRegister(); return false;
+		case WalkerRawRead:
+			if (m_clean_evaluator != nullptr &&
+			    (node.aux != 0u ||
+			     (node.opcode == ValueOpcode::LoadBufferU32 &&
+			      MaskEquals(m_program, m_clean_evaluator->m_active_mask, m_active_mask)))) {
+				const auto self = static_cast<Ref>(&node - m_nodes);
+				return m_clean_evaluator->EvaluateRef(self, result);
+			}
+			return EvaluateRawRead(node, result);
+		default: break;
+	}
+	switch (node.opcode) {
+		case ValueOpcode::GetUserData:
+			if (node.aux == NoRef || node.aux >= m_runtime.user_data.size()) {
 				return false;
 			}
-			result = m_runtime.user_data[reg - m_program.user_data_base];
+			result = m_runtime.user_data[node.aux];
 			return true;
-		}
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
-		case ValueOpcode::Phi: return EvaluatePhi(inst, result);
+		case ValueOpcode::Phi: return node.target != NoRef && EvaluateRef(node.target, result);
 		case ValueOpcode::ReadFirstLane: {
-			if (!m_active_mask.IsEmpty() && inst.Arg(1).Resolve() == m_active_mask) {
-				return EvaluateWide(inst.Arg(0), result);
+			if (m_active_mask != NoRef && RefEquals(m_program, node.args[1], m_active_mask)) {
+				return Arg(node, 0, result);
 			}
 			const auto clean_runtime = CleanRuntime(m_runtime);
-			SrtWalker  clean_active(m_program, clean_runtime, nullptr, inst.Arg(1));
-			SrtWalker  active(m_program, m_runtime, &clean_active, inst.Arg(1));
-			return active.EvaluateWide(inst.Arg(0), result);
+			SrtWalker  clean_active(m_program, clean_runtime, nullptr, node.args[1]);
+			SrtWalker  active(m_program, m_runtime, &clean_active, node.args[1]);
+			return active.Arg(node, 0, result);
 		}
 		case ValueOpcode::BitCastU32F32:
-		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
+		case ValueOpcode::BitCastF32U32: return Arg(node, 0, result);
 		case ValueOpcode::CompositeExtractU64:
-		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(node, result);
 		case ValueOpcode::CompositeConstructU64:
 			if (!binary()) {
 				return false;
@@ -607,19 +869,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			result = static_cast<uint32_t>(a) |
 			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
 			return true;
-		case ValueOpcode::LoadAddressU32:
-		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU32:
-			if (IsRawRead(m_program, inst)) {
-				if (m_clean_evaluator != nullptr &&
-				    (inst.Flags<SrtReadFlags>().clean != 0u ||
-				     (inst.GetOpcode() == ValueOpcode::LoadBufferU32 &&
-				      m_clean_evaluator->m_active_mask == m_active_mask))) {
-					return m_clean_evaluator->EvaluateWide(Value(const_cast<Inst*>(&inst)), result);
-				}
-				return EvaluateRawRead(inst, result);
-			}
-			break;
 		case ValueOpcode::IAdd32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a + b);
@@ -669,13 +918,13 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::ConvertF32U32:
-			if (Arg(inst, 0, a)) {
+			if (Arg(node, 0, a)) {
 				result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
 				return true;
 			}
 			return false;
 		case ValueOpcode::ConvertU32F32:
-			if (Arg(inst, 0, a)) {
+			if (Arg(node, 0, a)) {
 				const auto value = Float32(a);
 				if (!std::isfinite(value) || value < 0.0f ||
 				    static_cast<double>(value) > UINT32_MAX) {
@@ -692,13 +941,13 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::FPTrunc32:
-			if (Arg(inst, 0, a)) {
+			if (Arg(node, 0, a)) {
 				result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
 				return true;
 			}
 			return false;
 		case ValueOpcode::FPRecipIFlag32:
-			if (Arg(inst, 0, a)) {
+			if (Arg(node, 0, a)) {
 				const auto exponent = (a >> 23u) & 0xffu;
 				// Normal positive powers of two have exact normal reciprocals in every FP mode.
 				if ((a & 0x807fffffu) != 0u || exponent == 0u || exponent >= 254u) return false;
@@ -707,7 +956,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::FPIsNan32:
-			if (Arg(inst, 0, a)) {
+			if (Arg(node, 0, a)) {
 				result = std::isnan(Float32(a));
 				return true;
 			}
@@ -716,13 +965,12 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::FPOrdGreaterThanEqual32:
 			if (binary()) {
 				const auto operand = [&](uint64_t bits) {
-					if (inst.Flags<FPCompareFlags>().flush_input_denorms &&
-					    (bits & 0x7fffffffu) < 0x00800000u) {
+					if (node.aux != 0u && (bits & 0x7fffffffu) < 0x00800000u) {
 						bits &= 0x80000000u;
 					}
 					return Float32(bits);
 				};
-				result = inst.GetOpcode() == ValueOpcode::FPOrdLessThanEqual32
+				result = node.opcode == ValueOpcode::FPOrdLessThanEqual32
 				             ? operand(a) <= operand(b)
 				             : operand(a) >= operand(b);
 				return true;
@@ -753,7 +1001,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::BitwiseNot32:
-			if (Arg(inst, 0, a)) {
+			if (Arg(node, 0, a)) {
 				result = ~static_cast<uint32_t>(a);
 				return true;
 			}
@@ -831,7 +1079,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::BitFieldInsert: {
 			uint64_t d = 0;
-			if (!ternary() || !Arg(inst, 3, d)) {
+			if (!ternary() || !Arg(node, 3, d)) {
 				return false;
 			}
 			const auto offset = static_cast<uint32_t>(c);
@@ -853,8 +1101,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectF32: {
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-			if (predicate.EvaluateWide(inst.Arg(0), a)) {
-				return Arg(inst, a != 0u ? 1u : 2u, result);
+			if (predicate.Arg(node, 0, a)) {
+				return Arg(node, a != 0u ? 1u : 2u, result);
 			}
 			return false;
 		}
@@ -896,22 +1144,22 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::LogicalAnd: {
-			const bool left = Arg(inst, 0, a);
+			const bool left = Arg(node, 0, a);
 			if (left && a == 0u) {
 				result = 0u;
 				return true;
 			}
-			if (!Arg(inst, 1, b) || (b != 0u && !left)) return false;
+			if (!Arg(node, 1, b) || (b != 0u && !left)) return false;
 			result = b != 0u;
 			return true;
 		}
 		case ValueOpcode::LogicalOr: {
-			const bool left = Arg(inst, 0, a);
+			const bool left = Arg(node, 0, a);
 			if (left && a != 0u) {
 				result = 1u;
 				return true;
 			}
-			if (!Arg(inst, 1, b) || (b == 0u && !left)) return false;
+			if (!Arg(node, 1, b) || (b == 0u && !left)) return false;
 			result = b != 0u;
 			return true;
 		}
@@ -921,48 +1169,61 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::ConditionRef: return Arg(inst, 0, result);
+		case ValueOpcode::ConditionRef: return Arg(node, 0, result);
 		case ValueOpcode::LogicalNot:
-			if (Arg(inst, 0, a)) {
+			if (Arg(node, 0, a)) {
 				result = a == 0u;
 				return true;
 			}
 			return false;
-		case ValueOpcode::UndefU1:
-		case ValueOpcode::UndefU8:
-		case ValueOpcode::UndefU16:
-		case ValueOpcode::UndefU32:
-		case ValueOpcode::UndefU64: return false;
 		default: break;
 	}
 	return false;
 }
+
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (source >= m_program.descriptor_sources.size()) {
 		return false;
 	}
+	auto& roots = m_program.walker_descriptors;
+	if (roots.size() < m_program.descriptor_sources.size() * 8u) {
+		roots.resize(m_program.descriptor_sources.size() * 8u);
+	}
+	// Another walker of this plan may have compiled nodes since this one last ran.
+	Refresh();
 	const auto& descriptor = m_program.descriptor_sources[source];
-	result = {};
-	result.dword_count = descriptor.dword_count;
+	result                 = {};
+	result.dword_count     = descriptor.dword_count;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
-		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
+		uint64_t   wide = 0;
+		const auto ref  = RootRef(roots, size_t {source} * 8u + index, descriptor.dwords[index]);
+		if (!EvaluateRef(ref, wide)) {
 			return false;
 		}
+		result.dwords[index] = static_cast<uint32_t>(wide);
 	}
 	return true;
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
+	const auto& roots = m_program.walker_srt_reads;
+	Refresh();
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
-		const auto* inst = read.value.ResolveInstruction();
-		const bool clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
-		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
+		const auto& root = roots[slot];
+		if (root.clean &&
+		    (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 			return false;
-		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		if (read.flat_offset >= flat.size()) return false;
+		auto&    evaluator = root.clean ? *m_clean_evaluator : *this;
+		uint64_t wide      = 0;
+		if (!evaluator.EvaluateRef(root.ref, wide)) {
+			return false;
+		}
+		flat[read.flat_offset] = static_cast<uint32_t>(wide);
+		return true;
 	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {
@@ -1002,6 +1263,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
+		Refresh();
 	}
 	return true;
 }

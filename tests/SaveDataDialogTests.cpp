@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace Loader::Timer {
 double GetTimeMs() {
@@ -123,6 +124,125 @@ bool TestCloseAndReset(Param& param) {
 	passed = TestRunningThenFinished(param) && passed;
 	return passed;
 }
+
+struct DirName {
+	char data[32];
+};
+
+struct NewItem {
+	const char* title;
+	void*       icon;
+	size_t      icon_size;
+	uint8_t     reserved[32];
+};
+
+struct Result {
+	int32_t  mode;
+	int32_t  result;
+	int32_t  button_id;
+	uint32_t pad0;
+	void*    dir_name;
+	void*    param;
+	void*    user_data;
+	uint8_t  reserved[32];
+};
+
+void NoVisibilityCallback() {}
+
+bool ProvideSaveInfo(int32_t, const char*, const char* dir_name,
+                     Libs::Dialog::SystemDialog::SaveListEntry* entry, void* param) {
+	if (std::strcmp(dir_name, "MISSING") == 0) {
+		return false;
+	}
+	entry->title = std::string("Title ") + dir_name;
+	std::memset(param, 0, Save::SAVE_DATA_PARAM_SIZE);
+	std::memcpy(param, dir_name, std::strlen(dir_name));
+	return true;
+}
+
+bool Fail(const char* stage) {
+	std::fprintf(stderr, "SaveDataDialogTests: %s\n", stage);
+	return false;
+}
+
+// Opens a list dialog and returns the overlay snapshot of it.
+bool OpenList(Param& param, Libs::Dialog::SystemDialog::SaveListSnapshot* snapshot) {
+	return Save::SaveDataDialogOpen(&param) == 0 &&
+	       Libs::Dialog::SystemDialog::GetSaveListSnapshot(snapshot);
+}
+
+bool TestSaveList(Param& param) {
+	namespace System = Libs::Dialog::SystemDialog;
+	const DirName dirs[] = {{"SLOT1"}, {"MISSING"}, {"SLOT2"}};
+	NewItem       new_item {};
+	new_item.title = "New Saved Data";
+	Items items {};
+	items.user_id       = 1000;
+	items.dir_names     = dirs;
+	items.dir_names_num = 3;
+	items.new_item      = &new_item;
+	Param list          = param;
+	list.mode           = 1; // LIST
+	list.items          = &items;
+	bool passed         = true;
+
+	// Without the overlay the list finishes on its own.
+	System::SetVisibilityCallback(nullptr);
+	System::SaveListSnapshot snapshot;
+	if (OpenList(list, &snapshot)) {
+		passed = Fail("list opened without an overlay");
+	}
+	Save::SaveDataDialogUpdateStatus();
+	passed = CheckStatus(Save::SaveDataDialogUpdateStatus(), 3, "list without overlay") && passed;
+
+	System::SetVisibilityCallback(NoVisibilityCallback);
+	Save::SetSaveInfoProvider(ProvideSaveInfo);
+	if (!OpenList(list, &snapshot)) {
+		return Fail("list did not reach the overlay");
+	}
+	if (snapshot.entries.size() != 2 || snapshot.entries[1].dir_name != "SLOT2" ||
+	    snapshot.entries[1].title != "Title SLOT2" || !snapshot.has_new_item ||
+	    snapshot.new_item_title != "New Saved Data") {
+		passed = Fail("list snapshot has the wrong rows");
+	}
+	for (int poll = 0; poll < 4; ++poll) {
+		passed = CheckStatus(Save::SaveDataDialogUpdateStatus(), 2, "list waits") && passed;
+	}
+	passed = CheckStatus(System::HostSelectSave(snapshot.generation, 1), 1, "select") && passed;
+	passed = CheckStatus(Save::SaveDataDialogUpdateStatus(), 3, "list selected") && passed;
+	DirName  chosen {"stale"};
+	uint8_t  chosen_param[Save::SAVE_DATA_PARAM_SIZE] {};
+	Result   result {};
+	result.dir_name = &chosen;
+	result.param    = chosen_param;
+	Save::SaveDataDialogGetResult(&result);
+	if (result.result != 0 || std::strcmp(chosen.data, "SLOT2") != 0 ||
+	    std::memcmp(chosen_param, "SLOT2", 5) != 0) {
+		passed = Fail("selected save not returned");
+	}
+
+	if (!OpenList(list, &snapshot)) {
+		return Fail("second list did not reach the overlay");
+	}
+	passed = CheckStatus(System::HostSelectSave(snapshot.generation, -1), 1, "new item") && passed;
+	std::strcpy(chosen.data, "stale");
+	Save::SaveDataDialogGetResult(&result);
+	if (result.result != 0 || chosen.data[0] != '\0') {
+		passed = Fail("new item not returned as an empty dir name");
+	}
+
+	if (!OpenList(list, &snapshot)) {
+		return Fail("third list did not reach the overlay");
+	}
+	passed = CheckStatus(System::HostClose(snapshot.generation), 1, "cancel") && passed;
+	passed = CheckStatus(Save::SaveDataDialogGetStatus(), 3, "list cancelled") && passed;
+	Save::SaveDataDialogGetResult(&result);
+	passed = CheckStatus(result.result, 1, "cancel result") && passed;
+
+	System::SetVisibilityCallback(nullptr);
+	Save::SetSaveInfoProvider(nullptr);
+	return passed;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -159,6 +279,7 @@ int main(int argc, char** argv) {
 	if (!consistency_only) {
 		passed = TestRunningThenFinished(param) && passed;
 		passed = TestCloseAndReset(param) && passed;
+		passed = TestSaveList(param) && passed;
 	}
 	Save::SaveDataDialogTerminate();
 	passed = CheckLatestStatus("terminated") && passed;

@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/fileSystem.h"
+#include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/saveDataMountSlots.h"
@@ -122,6 +123,7 @@ struct SaveDataParam {
 	int64_t  mtime;
 	uint8_t  reserved[32];
 };
+static_assert(sizeof(SaveDataParam) == Dialog::SaveDataDialog::SAVE_DATA_PARAM_SIZE);
 
 struct SaveParamTextField {
 	char*  data;
@@ -518,6 +520,31 @@ static int mount_save_data(int slot, const std::filesystem::path& directory,
 	result->required_blocks = 0;
 	result->mount_status    = status;
 	return OK;
+}
+
+static std::string param_text(const char* text, size_t size) {
+	return {text, static_cast<size_t>(std::find(text, text + size, '\0') - text)};
+}
+
+static bool save_dialog_info(int32_t user_id, const char* title_id, const char* dir_name,
+                             Dialog::SystemDialog::SaveListEntry* entry, void* param) {
+	if (!valid_path_component(dir_name) ||
+	    (title_id != nullptr && title_id[0] != '\0' && !valid_path_component(title_id))) {
+		return false;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const auto        directory = save_directory(
+	    title_id != nullptr && title_id[0] != '\0' ? title_id : get_title_id(), dir_name, user_id);
+	SaveDataParam loaded {};
+	if (load_save_param(directory, &loaded) != OK) {
+		return false;
+	}
+	entry->title     = param_text(loaded.title, sizeof(loaded.title));
+	entry->sub_title = param_text(loaded.sub_title, sizeof(loaded.sub_title));
+	entry->detail    = param_text(loaded.detail, sizeof(loaded.detail));
+	entry->mtime     = loaded.mtime;
+	std::memcpy(param, &loaded, sizeof(loaded));
+	return true;
 }
 
 int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
@@ -1351,6 +1378,7 @@ LIB_DEFINE(InitSaveDataNative_1) {
 } // namespace LibSaveDataNative
 
 LIB_DEFINE(InitSaveData_1) {
+	Dialog::SaveDataDialog::SetSaveInfoProvider(SaveData::save_dialog_info);
 	LIB_FUNC("TywrFKCoLGY", SaveData::SaveDataInitialize3);
 	LIB_FUNC("dyIhnXq-0SM", SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("ZP4e7rlzOUk", SaveData::SaveDataMount3);

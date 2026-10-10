@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fmt/format.h>
 #include <initializer_list>
@@ -599,6 +600,25 @@ const char* EnterLabel(Ime::EnterLabel label) {
 	}
 }
 
+std::string FormatSaveTime(int64_t unix_time) {
+	if (unix_time <= 0) {
+		return {};
+	}
+	const auto time = static_cast<std::time_t>(unix_time);
+	std::tm    local {};
+#ifdef _WIN32
+	if (localtime_s(&local, &time) != 0) {
+		return {};
+	}
+#else
+	if (localtime_r(&time, &local) == nullptr) {
+		return {};
+	}
+#endif
+	char text[32];
+	return std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M", &local) != 0 ? text : "";
+}
+
 float AlignmentPivot(Ime::Alignment alignment) {
 	switch (alignment) {
 		case Ime::Alignment::Start: return 0.0f;
@@ -767,9 +787,13 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		return false;
 	}
 	if (keyboard_event && session.kind == OverlayKind::Dialog) {
+		SystemDialog::HostSnapshot dialog {};
+		const bool                 save_list =
+		    SystemDialog::GetHostSnapshot(&dialog) && dialog.kind == SystemDialog::Kind::SaveList;
+		// Enter must not dismiss the save list; it picks with the mouse or controller.
 		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-		    (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER ||
-		     event.key.key == SDLK_ESCAPE)) {
+		    (event.key.key == SDLK_ESCAPE ||
+		     (!save_list && (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER)))) {
 			SystemDialog::HostClose(generation);
 		}
 		return true;
@@ -1375,7 +1399,89 @@ struct SystemOverlay::Impl {
 		ImGui::End();
 	}
 
+	void DrawSaveList(const SystemDialog::HostSnapshot& host, vk::Extent2D extent) {
+		SystemDialog::SaveListSnapshot list;
+		if (!SystemDialog::GetSaveListSnapshot(&list) || list.generation != host.generation) {
+			return;
+		}
+		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
+		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
+		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display,
+		                                              IM_COL32(0, 0, 0, 160));
+		ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always,
+		                        {0.5f, 0.5f});
+		ImGui::SetNextWindowSize(
+		    {std::max(std::min(720.0f * scale, display.x - 32.0f), 1.0f), 0.0f}, ImGuiCond_Always);
+		if (focus_pending) {
+			ImGui::SetNextWindowFocus();
+		}
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 24.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 10.0f * scale});
+		ImGui::PushFont(nullptr, 20.0f * scale);
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings |
+		                                   ImGuiWindowFlags_AlwaysAutoResize;
+		ImGui::Begin("##SaveList", nullptr, flags);
+		ImGui::TextUnformatted(list.display_type == 2   ? "Load"
+		                       : list.display_type == 3 ? "Delete"
+		                                                : "Save");
+		ImGui::Separator();
+
+		const float  row_height = ImGui::GetTextLineHeight() * 2.0f + 12.0f * scale;
+		const size_t rows       = list.entries.size() + (list.has_new_item ? 1 : 0);
+		const float  list_height =
+		    std::min(static_cast<float>(rows) * (row_height + ImGui::GetStyle().ItemSpacing.y),
+		             display.y * 0.6f);
+		bool    picked = false;
+		int32_t choice = -1;
+		ImGui::BeginChild("##Saves", {0.0f, list_height});
+		if (list.has_new_item) {
+			if (ImGui::Selectable((list.new_item_title + "##new").c_str(), false, 0,
+			                      {0.0f, row_height})) {
+				picked = true;
+			}
+			if (focus_pending) {
+				ImGui::SetItemDefaultFocus();
+			}
+		}
+		for (size_t i = 0; i < list.entries.size(); i++) {
+			const auto& entry = list.entries[i];
+			std::string label = entry.title + "\n" + entry.sub_title;
+			if (const auto time = FormatSaveTime(entry.mtime); !time.empty()) {
+				label += (entry.sub_title.empty() ? "" : "   ") + time;
+			}
+			label += "##" + std::to_string(i);
+			if (ImGui::Selectable(label.c_str(), false, 0, {0.0f, row_height})) {
+				picked = true;
+				choice = static_cast<int32_t>(i);
+			}
+			if (focus_pending && !list.has_new_item && i == 0) {
+				ImGui::SetItemDefaultFocus();
+			}
+		}
+		ImGui::EndChild();
+		focus_pending = false;
+
+		ImGui::TextDisabled("Cross: select    Circle: cancel");
+		const float button_width = std::min(140.0f * scale, ImGui::GetContentRegionAvail().x);
+		ImGui::SetCursorPosX((ImGui::GetWindowSize().x - button_width) * 0.5f);
+		const bool cancelled = ImGui::Button("Cancel", {button_width, 44.0f * scale}) ||
+		                       ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false);
+		ImGui::End();
+		ImGui::PopFont();
+		ImGui::PopStyleVar(2);
+		if (picked) {
+			SystemDialog::HostSelectSave(list.generation, choice);
+		} else if (cancelled) {
+			SystemDialog::HostClose(list.generation);
+		}
+	}
+
 	void DrawDialog(const SystemDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
+		if (snapshot.kind == SystemDialog::Kind::SaveList) {
+			DrawSaveList(snapshot, extent);
+			return;
+		}
 		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
 		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
 		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display,

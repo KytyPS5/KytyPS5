@@ -33,6 +33,10 @@ double GetTimeMs() {
 } // namespace Timer
 } // namespace Loader
 
+namespace Libs::Dialog::SaveDataDialog {
+void SetSaveInfoProvider(SaveInfoProvider) {}
+} // namespace Libs::Dialog::SaveDataDialog
+
 namespace Libs::LibKernel::FileSystem {
 void Mount(const std::filesystem::path& directory, const std::string& point) {
 	g_mounted_directory = directory;
@@ -362,6 +366,12 @@ void TestDirNamePatterns() {
 	CHECK(result.hit_num == 2);
 	CHECK(std::string(names[0].data) == "LINE-0-14Slot");
 	CHECK(std::string(names[1].data) == "LINE-0-1Slot");
+
+	Libs::Dialog::SystemDialog::SaveListEntry entry;
+	std::array<uint8_t, sizeof(SaveDataParam)> param {};
+	CHECK(save_dialog_info(1, nullptr, "LINE-0-1Slot", &entry, param.data()));
+	CHECK(!save_dialog_info(1, nullptr, "LINE-0-2Slot", &entry, param.data()));
+	CHECK(!save_dialog_info(1, nullptr, "../LINE-0-1Slot", &entry, param.data()));
 }
 
 void TestSearchSortKeys() {

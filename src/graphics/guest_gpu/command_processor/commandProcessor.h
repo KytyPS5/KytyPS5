@@ -184,6 +184,8 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	// A ZPASS predication waits for host occlusion query results it asked for.
+	bool      m_occlusion_wait_requested = false;
 };
 
 } // namespace Libs::Graphics

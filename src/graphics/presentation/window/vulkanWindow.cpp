@@ -578,6 +578,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
+	// Host occlusion queries back the guest's ZPASS_DONE counters: exact sample counts, and slots
+	// reset from the host once their results were read.
+	device_features.occlusionQueryPrecise = supported_features2.features.occlusionQueryPrecise;
+	features12.hostQueryReset             = supported_features12.hostQueryReset;
+	graphics.occlusion_query_precise      = device_features.occlusionQueryPrecise == VK_TRUE;
+	graphics.host_query_reset_enabled     = features12.hostQueryReset == VK_TRUE;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&

@@ -10789,6 +10789,46 @@ void TestMeshExportStorage() {
     Check(private_bytes == (4u * 16u + 4u + 4u * 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
   }
+  ShaderPixelInputInfo pixel {};
+  pixel.input_num                = 2;
+  pixel.interpolator_settings[0] = 0;
+  pixel.interpolator_settings[1] = 2;
+  input.pixel_input              = &pixel;
+  mesh.max_vertices              = 190;
+  mesh.max_primitives            = 152;
+  mesh.host_subgroup_size        = 64;
+  options.back_code              = std::span {back};
+  const auto pruned = RecompileForTest(std::span {front}, options, nullptr, nullptr,
+                                       PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(pruned.spirv);
+  const auto pruned_source = DisassembleSpirvBinary(pruned.spirv);
+  Check(pruned_source.find("OutputVertices 190") != std::string::npos &&
+            pruned_source.find("OutputPrimitivesEXT 152") != std::string::npos,
+        "mesh output pruning changed allocation limits");
+  Check(pruned_source.find("out_param_0") != std::string::npos &&
+            pruned_source.find("out_param_1") == std::string::npos &&
+            pruned_source.find("out_param_2") != std::string::npos,
+        "mesh output pruning did not follow pixel inputs");
+  Check(pruned_source.find("BuiltIn ClipDistance") != std::string::npos && pruned_source.find("BuiltIn CullDistance") != std::string::npos, "mesh pruning removed clip/cull builtins");
+  std::vector<uint32_t> key_a, key_b;
+  BuildStageStaticKey(input, key_a);
+  pixel.interpolator_settings[1] = 1;
+  BuildStageStaticKey(input, key_b);
+  Check(key_a != key_b, "mesh key ignored pixel inputs");
+  pixel.interpolator_settings[1] = 2;
+  pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  BuildStageStaticKey(input, key_b);
+  Check(key_a != key_b, "mesh key ignored conservative rectangle fallback");
+  const auto rectangle = RecompileForTest(std::span {front}, options, nullptr, nullptr, PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(rectangle.spirv);
+  Check(DisassembleSpirvBinary(rectangle.spirv).find("out_param_1") != std::string::npos, "mesh pruning did not preserve rectangle fallback");
+  pixel.parameter_mode = ShaderPixelParameterMode::FirstVertex;
+  for (const uint32_t unresolved : {31u, 0u}) {
+    pixel.interpolator_settings[1] = unresolved;
+    const auto fallback = RecompileForTest(std::span {front}, options, nullptr, nullptr, PushData::MeshDrawDwordCount);
+    CheckSpirvBinaryValidates(fallback.spirv);
+    Check(DisassembleSpirvBinary(fallback.spirv).find("out_param_1") != std::string::npos, "mesh output pruning was not conservative for missing or aliased input mappings");
+  }
 }
 
 void TestMergedShaderUserDataSnapshot() {

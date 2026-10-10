@@ -35,6 +35,29 @@ uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
 	}
 }
 
+bool MeshOutputIsConsumed(const EmitterState& state, const OutputBinding& output) {
+	if (output.kind != IR::StageOutputKind::Parameter) {
+		return true;
+	}
+	const auto* pixel = state.input_info.vertex->pixel_input;
+	if (pixel == nullptr || pixel->input_num > std::size(pixel->interpolator_settings) ||
+	    pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
+		return true;
+	}
+	std::array<bool, 32> consumed_locations {};
+	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		const auto location = ShaderPixelParameterMappedLocation(*pixel, input);
+		const bool exported = std::ranges::any_of(state.outputs, [=](const auto& binding) {
+			return binding.kind == IR::StageOutputKind::Parameter && binding.location == location;
+		});
+		if (location >= consumed_locations.size() || consumed_locations[location] || !exported) {
+			return true;
+		}
+		consumed_locations[location] = true;
+	}
+	return output.location < consumed_locations.size() && consumed_locations[output.location];
+}
+
 } // namespace
 
 void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
@@ -42,41 +65,48 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 	const auto& mesh = state.input_info.vertex->mesh;
 	for (auto& output: state.outputs) {
 		const auto type = MeshOutputType(state, output.kind);
-		const bool clip = output.kind == IR::StageOutputKind::ClipDistance;
-		const bool cull = output.kind == IR::StageOutputKind::CullDistance;
-		auto& variable = clip ? state.clip_distance_variable
-		                 : cull ? state.cull_distance_variable : output.variable_id;
-		if (variable == 0) {
-			const auto element_type = clip || cull
-			                              ? state.builder.Type(spv::OpTypeArray, type,
-			                                                   ConstantU32(state, clip ? clip_distance_count
-			                                                                           : cull_distance_count))
-			                              : type;
-			variable = MeshArray(state, spv::StorageClassOutput, element_type,
-			                     output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives
-			                                                             : mesh.max_vertices);
-			state.interface_variables.push_back(variable);
-			state.builder.AddName(variable, output.debug_name.c_str());
-			if (output.kind == IR::StageOutputKind::Parameter) {
-				state.builder.AddAnnotation(spv::OpDecorate, variable,
-				                            spv::DecorationLocation, output.location);
-			} else {
-				const auto builtin = clip ? spv::BuiltInClipDistance
-				                     : cull ? spv::BuiltInCullDistance
-				                     : output.kind == IR::StageOutputKind::Layer ? spv::BuiltInLayer
-				                                                                 : spv::BuiltInPosition;
-				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
-			}
-			if (output.kind == IR::StageOutputKind::Layer) {
-				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPerPrimitiveEXT);
-			}
-		}
-		output.variable_id = variable;
 		// Only Layer is read by another invocation, through the primitive's provoking vertex.
 		const bool shared = output.kind == IR::StageOutputKind::Layer;
 		output.mesh_data_variable =
 		    MeshArray(state, shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, type,
 		              shared ? mesh.max_vertices : state.lane_count);
+		if (!MeshOutputIsConsumed(state, output)) {
+			continue;
+		}
+		const bool clip     = output.kind == IR::StageOutputKind::ClipDistance;
+		const bool cull     = output.kind == IR::StageOutputKind::CullDistance;
+		auto&      variable = clip   ? state.clip_distance_variable
+		                      : cull ? state.cull_distance_variable
+		                             : output.variable_id;
+		if (variable == 0) {
+			const auto element_type =
+			    clip || cull ? state.builder.Type(spv::OpTypeArray, type,
+			                                      ConstantU32(state, clip ? clip_distance_count
+			                                                              : cull_distance_count))
+			                 : type;
+			variable = MeshArray(state, spv::StorageClassOutput, element_type,
+			                     output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives
+			                                                               : mesh.max_vertices);
+			state.interface_variables.push_back(variable);
+			state.builder.AddName(variable, output.debug_name.c_str());
+			if (output.kind == IR::StageOutputKind::Parameter) {
+				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationLocation,
+				                            output.location);
+			} else {
+				const auto builtin = clip   ? spv::BuiltInClipDistance
+				                     : cull ? spv::BuiltInCullDistance
+				                     : output.kind == IR::StageOutputKind::Layer
+				                         ? spv::BuiltInLayer
+				                         : spv::BuiltInPosition;
+				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+				                            builtin);
+			}
+			if (output.kind == IR::StageOutputKind::Layer) {
+				state.builder.AddAnnotation(spv::OpDecorate, variable,
+				                            spv::DecorationPerPrimitiveEXT);
+			}
+		}
+		output.variable_id = variable;
 	}
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
 	state.mesh_primitive_data =
@@ -156,10 +186,10 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_vertex, index, vertices);
 		EmitIfCondition(state, is_vertex, [&] {
 			for (const auto& output: state.outputs) {
-				if (output.kind == IR::StageOutputKind::Layer) {
+				if (output.kind == IR::StageOutputKind::Layer || output.variable_id == 0) {
 					continue;
 				}
-				const auto type  = MeshOutputType(state, output.kind);
+				const auto type = MeshOutputType(state, output.kind);
 				const auto value =
 				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
 				             ConstantU32(state, half));
@@ -168,10 +198,11 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				    output.kind == IR::StageOutputKind::CullDistance) {
 					pointer = state.builder.AllocateId();
 					state.builder.AddFunction(
-					    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, type), pointer,
-					    output.variable_id, index, ConstantU32(state, output.index));
+					    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, type),
+					    pointer, output.variable_id, index, ConstantU32(state, output.index));
 				} else {
-					pointer = MeshElement(state, output.variable_id, spv::StorageClassOutput, type, index);
+					pointer = MeshElement(state, output.variable_id, spv::StorageClassOutput, type,
+					                      index);
 				}
 				state.builder.AddFunction(spv::OpStore, pointer, value);
 			}

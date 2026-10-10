@@ -43,11 +43,11 @@ namespace Libs::Graphics {
 
 struct ShaderMapEntry {
 	ShaderMappedData data;
-	uint64_t hash;
+	uint64_t         hash;
 };
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
-static std::mutex                                                      g_shader_map_mutex;
+static std::mutex                                                    g_shader_map_mutex;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -59,10 +59,11 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	EXIT_IF(g_shader_map == nullptr);
 
 	if (addr == 0 || data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
-		EXIT("ShaderMapUserData shader=0x%016" PRIx64 " has invalid AGC shader_size=0x%08" PRIx32 "\n",
+		EXIT("ShaderMapUserData shader=0x%016" PRIx64 " has invalid AGC shader_size=0x%08" PRIx32
+		     "\n",
 		     addr, data.code_size_bytes);
 	}
-	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
+	const auto       hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {data, hash};
 }
@@ -80,10 +81,10 @@ static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, uint64_t hash,
-	                                std::span<const uint32_t> user_data,
-	                                const ShaderMappedData& data, uint32_t user_data_base = 0) {
-	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
-	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+                                    std::span<const uint32_t> user_data,
+                                    const ShaderMappedData& data, uint32_t user_data_base = 0) {
+	const auto   code_words = data.code_size_bytes / sizeof(uint32_t);
+	const auto   code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
 	ShaderParams params {
 	    .code            = code,
 	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
@@ -304,14 +305,13 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 		const auto& r = info.resources[ri];
 
 		auto& destination = info.resources_dst[ri];
-		int bi = 0;
+		int   bi          = 0;
 		for (; bi < info.buffers_num; bi++) {
 			auto& b = info.buffers[bi];
 
 			uint64_t stride = b.stride;
 
-			if (stride == r.Stride() &&
-			    b.fetch_index == destination.fetch_index) {
+			if (stride == r.Stride() && b.fetch_index == destination.fetch_index) {
 				uint64_t rbase   = r.Base48();
 				uint64_t base    = std::min(rbase, b.addr);
 				uint64_t offset1 = rbase - base;
@@ -327,8 +327,8 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 
 		if (bi == info.buffers_num) {
 			EXIT_NOT_IMPLEMENTED(info.buffers_num >= ShaderVertexInputInfo::RES_MAX);
-			info.buffers[bi] = {.addr = r.Base48(),
-			                    .stride = r.Stride(),
+			info.buffers[bi] = {.addr        = r.Base48(),
+			                    .stride      = r.Stride(),
 			                    .num_records = r.NumRecords(),
 			                    .fetch_index = destination.fetch_index};
 			info.buffers_num++;
@@ -337,7 +337,7 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
-static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
+static void ShaderApplyAttribSemantics(ShaderVertexInputInfo&          info,
                                        std::span<const ShaderSemantic> input_semantics,
                                        const uint32_t* attrib, const uint32_t* buffer) {
 	KYTY_PROFILER_FUNCTION();
@@ -384,13 +384,12 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		EXIT_NOT_IMPLEMENTED(r.AddTid());
 		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
-			const auto                   format_raw    = static_cast<uint32_t>(format);
-			const auto                   buffer_format = format_raw >> 2u;
-			const auto                   channels      = (format_raw & 3u) + 1u;
+			const auto format_raw    = static_cast<uint32_t>(format);
+			const auto buffer_format = format_raw >> 2u;
+			const auto channels      = (format_raw & 3u) + 1u;
 			// AGC vertex formats encode the buffer format above the two channel-count bits.
 			// The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
-			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
-			              (buffer_format << 12u) |
+			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) | (buffer_format << 12u) |
 			              DstSel(4, channels > 1u ? 5u : 0u, channels > 2u ? 6u : 0u,
 			                     channels > 3u ? 7u : 1u);
 		}
@@ -511,14 +510,14 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
+    const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
-	ps_info = {};
+	ps_info                     = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 
 	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
-	ps_info.input_num            = sh.ps_in_control & 0x3fu;
+	ps_info.input_num = sh.ps_in_control & 0x3fu;
 	if ((sh.ps_in_control & 0x8000u) != 0) {
 		ps_info.wave_size = 32;
 	}
@@ -563,7 +562,7 @@ static void ShaderGetStaticInputInfoPS(
 
 	ps_info.target_shader_mask = sh.m_cbShaderMask;
 	for (int i = 0; i < 8; i++) {
-		const auto slot = ShaderPixelExportTarget(ps_info.target_shader_mask, i);
+		const auto slot                  = ShaderPixelExportTarget(ps_info.target_shader_mask, i);
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
 		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0 && slot < 8
 		                                       ? target_export_mapping[slot]
@@ -574,7 +573,7 @@ static void ShaderGetStaticInputInfoPS(
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
-	const bool async_compute             = info.async_compute;
+	const bool async_compute              = info.async_compute;
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
 	const auto host_subgroup_size         = info.host_subgroup_size;
 	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
@@ -583,16 +582,16 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
 	info.host_subgroup_size               = host_subgroup_size;
 	std::ranges::copy(workgroup_counts, info.workgroup_counts);
-	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
-	info.threads_num[1]                   = regs.cs_regs.num_thread_y;
-	info.threads_num[2]                   = regs.cs_regs.num_thread_z;
-	info.lds_size_dwords                  = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
-	info.scratch_size_dwords              = data.scratch_size_dwords;
-	info.float_mode                       = regs.cs_regs.float_mode;
-	info.group_id[0]                      = regs.cs_regs.tgid_x_en != 0;
-	info.group_id[1]                      = regs.cs_regs.tgid_y_en != 0;
-	info.group_id[2]                      = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size                        = regs.cs_regs.wave_size;
+	info.threads_num[0]      = regs.cs_regs.num_thread_x;
+	info.threads_num[1]      = regs.cs_regs.num_thread_y;
+	info.threads_num[2]      = regs.cs_regs.num_thread_z;
+	info.lds_size_dwords     = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
+	info.scratch_size_dwords = data.scratch_size_dwords;
+	info.float_mode          = regs.cs_regs.float_mode;
+	info.group_id[0]         = regs.cs_regs.tgid_x_en != 0;
+	info.group_id[1]         = regs.cs_regs.tgid_y_en != 0;
+	info.group_id[2]         = regs.cs_regs.tgid_z_en != 0;
+	info.wave_size           = regs.cs_regs.wave_size;
 	info.thread_ids_num      = regs.cs_regs.tidig_comp_cnt + 1;
 	info.tg_size_en          = regs.cs_regs.tg_size_en != 0;
 
@@ -602,6 +601,17 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
+	if (info.pixel_input != nullptr) {
+		key.push_back(1u);
+		key.push_back(info.pixel_input->input_num);
+		key.push_back(static_cast<uint32_t>(info.pixel_input->parameter_mode));
+		for (uint32_t i = 0; i < info.pixel_input->input_num && i < 32u; i++) {
+			key.push_back(info.pixel_input->interpolator_settings[i]);
+		}
+		key.push_back(info.pixel_input->custom_interpolation_mask);
+	} else {
+		key.push_back(0u);
+	}
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
@@ -625,11 +635,11 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
-		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
-		                       mesh.scratch_size_dwords, mesh.input_primitive,
-		                       mesh.primitives_per_group, mesh.vertices_per_group,
-		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		key.insert(key.end(),
+		           {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
+		            mesh.scratch_size_dwords, mesh.input_primitive, mesh.primitives_per_group,
+		            mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
+		            mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch)});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
@@ -706,13 +716,14 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
-	const auto& sh     = context.GetShaderRegisters();
-	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	const auto& sh = context.GetShaderRegisters();
+	const auto [data, hash] =
+	    ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
 	// GS_EN controls amplification, not whether an NGG shader uses a workgroup.
-	const bool native_ngg = !merged && data.type == Prospero::ShaderBinaryType::kGs &&
-	                        regs.gs_regs.rsrc2.lds_size != 0;
-	auto        params = GetShaderParams(
+	const bool native_ngg =
+	    !merged && data.type == Prospero::ShaderBinaryType::kGs && regs.gs_regs.rsrc2.lds_size != 0;
+	auto params = GetShaderParams(
 	    regs.es_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	    merged || native_ngg ? 8u : 0u);
@@ -736,19 +747,19 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
 	mesh.scratch_size_dwords = data.scratch_size_dwords;
-	const auto fast_launch = (context.GetShaderStages() >> 19u) & 3u;
+	const auto fast_launch   = (context.GetShaderStages() >> 19u) & 3u;
 	EXIT_NOT_IMPLEMENTED(fast_launch > 1u);
 	mesh.fast_launch = fast_launch != 0;
 	if (data.type == Prospero::ShaderBinaryType::kGsFront) {
 		EXIT_IF(regs.gs_regs.data_addr == 0);
-		const auto [back, back_hash] = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
-		const auto back_params =
-		    GetShaderParams(regs.gs_regs.data_addr, back_hash, {}, back);
-		params.back_code = back_params.code;
-		params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
-		params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
-		const uint64_t hashes[] = {params.hash, back_params.hash};
-		params.hash = XXH3_64bits(hashes, sizeof(hashes));
+		const auto [back, back_hash] =
+		    ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
+		const auto back_params   = GetShaderParams(regs.gs_regs.data_addr, back_hash, {}, back);
+		params.back_code         = back_params.code;
+		params.user_data[0]      = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
+		params.user_data[1]      = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
+		const uint64_t hashes[]  = {params.hash, back_params.hash};
+		params.hash              = XXH3_64bits(hashes, sizeof(hashes));
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
 	const auto& group = user_config.GetGeControl();
@@ -771,22 +782,22 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
 	    sh.m_vgtGsOutPrimType != 2u || (!native_ngg && sh.m_vgtGsMaxVertOut < 3u) ||
-	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
-	    mesh.max_vertices == 0u) {
+	    group.vertex_group_size < mesh.InputPrimitiveSize() || mesh.max_vertices == 0u) {
 		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
 		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
 		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
 	}
-	mesh.max_primitives = mesh.fast_launch ? mesh.max_vertices :
-	                      native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices) :
-	                      group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
-	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
-	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
-	                                      native_ngg ? mesh.max_primitives :
-	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
+	mesh.max_primitives = mesh.fast_launch ? mesh.max_vertices
+	                      : native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices)
+	                                   : group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
+	mesh.primitives_per_group =
+	    std::min({static_cast<uint32_t>(group.primitive_group_size),
+	              mesh.InputPrimitiveCount(group.vertex_group_size),
+	              native_ngg ? mesh.max_primitives : mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-	const auto threads = native_ngg && !mesh.fast_launch ? mesh.vertices_per_group : mesh.max_vertices;
+	const auto threads =
+	    native_ngg && !mesh.fast_launch ? mesh.vertices_per_group : mesh.max_vertices;
 	mesh.threads_num[0] = ((threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 	return params;
@@ -795,10 +806,13 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info) {
-	const auto& sh        = context.GetShaderRegisters();
-	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
-	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
-	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
+	const auto& sh = context.GetShaderRegisters();
+	const auto [local, local_hash] =
+	    ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
+	const auto [control, control_hash] =
+	    ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+	const auto [evaluation, evaluation_hash] =
+	    ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
 	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
 	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
@@ -811,8 +825,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	std::array<ShaderParams, 3> params {
 	    GetShaderParams(regs.ls_regs.data_addr, local_hash, local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, control_hash, local_users, control, 8u),
-	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users,
-	                    evaluation),
+	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users, evaluation),
 	};
 	// The fused HS back half receives its separate user-data address in s0:s1.
 	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
@@ -847,11 +860,12 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
-ShaderParams PrepareProgram(
-    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo&                               ps_info) {
-	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
+ShaderParams
+PrepareProgram(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+               std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+               ShaderPixelInputInfo&                               ps_info) {
+	const auto [data, hash] =
+	    ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
@@ -860,7 +874,8 @@ ShaderParams PrepareProgram(
 
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& info) {
-	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
+	const auto [data, hash] =
+	    ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
@@ -942,14 +957,12 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_execute_on_noop   = %s\n",
 	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
 	     info.ps_perspective_center_vgpr, info.ps_perspective_sample_vgpr,
-	     info.ps_perspective_centroid_vgpr,
-	     info.ps_pos_x ? "true" : "false",
+	     info.ps_perspective_centroid_vgpr, info.ps_pos_x ? "true" : "false",
 	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",
 	     info.ps_pos_w ? "true" : "false", info.ps_front_face ? "true" : "false",
-	     info.ps_ancillary ? "true" : "false",
-	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
-	     info.ps_pixel_kill_enable ? "true" : "false", info.ps_early_z ? "true" : "false",
-	     info.ps_execute_on_noop ? "true" : "false");
+	     info.ps_ancillary ? "true" : "false", info.ps_sample_shading ? "true" : "false",
+	     info.ps_no_perspective ? "true" : "false", info.ps_pixel_kill_enable ? "true" : "false",
+	     info.ps_early_z ? "true" : "false", info.ps_execute_on_noop ? "true" : "false");
 
 	for (uint32_t i = 0; i < info.input_num; i++) {
 		LOGF("\t interpolator_settings[%u] = %u\n", i, info.interpolator_settings[i]);

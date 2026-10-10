@@ -131,7 +131,7 @@ the Vulkan/SPIR-V validation rules.
 - Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
 - A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)
 - A Vulkan 1.3-capable GPU with current drivers (on macOS, Vulkan is provided by the bundled
-  MoltenVK)
+  MoltenVK). An AMD RDNA 2+ or modern GPU supporting `VK_KHR_fragment_shader_barycentric` is recommended for full shader fidelity.
 
 ### Build requirements (Windows)
 

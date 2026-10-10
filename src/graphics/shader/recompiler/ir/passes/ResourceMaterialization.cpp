@@ -597,7 +597,16 @@ bool MaterializeWaveAddressImage(const DescriptorSource::InlineDescriptor& image
 					return SpecializationFail("wave address image descriptor is unavailable or GPU-dirty");
 			if (NullImageDescriptor(descriptor)) descriptor = zero;
 			else if (!ValidImageDescriptor(descriptor, false))
-				return SpecializationFail("wave address image table contains an unsupported image descriptor");
+				return SpecializationFail(fmt::format(
+				    "wave address image table contains an unsupported image descriptor at pc=0x{:08x} "
+				    "record={} row={} source_records={} source_stride={} row_limit={} row_stride={} "
+				    "descriptor_offset={} base=0x{:012x} source={:08x},{:08x},{:08x},{:08x} "
+				    "descriptor={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+				    pc, record, row, buffer.NumRecords(), buffer.Stride(), table.row_limit,
+				    table.row_stride, image.descriptor_offset, base, buffer_value.dwords[0],
+				    buffer_value.dwords[1], buffer_value.dwords[2], buffer_value.dwords[3],
+				    descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3],
+				    descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]));
 			const auto found = std::ranges::find(next.descriptors, descriptor);
 			const auto candidate = static_cast<uint32_t>(found - next.descriptors.begin());
 			if (candidate == next.descriptors.size()) {

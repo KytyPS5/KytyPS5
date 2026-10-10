@@ -1,5 +1,21 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 09:19 UTC** (actual full tracking passed; table validity next):
+
+- Source5df6ff5d / EXE4fefcb / original5178 run
+  `_Build/runs/game-20261010-090158-wave-mask-loop-native` naturally exits321
+  at09:18:42.632UTC,1266 complete pipelines, timeout/memory guards=false,
+  minimum RAM13.25GiB. Actual full PS617c tracking passes; materialization
+  rejects an unsupported image descriptor in a wave-address image table.
+- Current blocker is resource validity/provenance, not the prior mask proof.
+  Need exact record/row/source metadata and eight descriptor words before
+  synthetic RED and a contract-backed correction. No descriptor skipping,
+  zero substitution or weakened reserved-bit/format validation.
+- window-progress.png shows loading arc only; menu/gameplay/issue108 pending.
+  PS07b3 driver pipeline has begin only before failure. Source/workload/caches
+  preserved; native slot idle. Next diagnostic build and bounded original
+  retry unless existing artifacts contain the required descriptor evidence.
+
 Checkpoint **2026-10-10 09:01 UTC** (captured full shader tracking passes):
 
 - Shared current-mask edge dominance proof passes admission RED085811 ->

@@ -1,5 +1,17 @@
 # Emulator regression test debt
 
+## Wave-address table descriptor validity (2026-10-10)
+
+Original5df6ff5d/EXE4fefcb/eboot5178 run090158 naturally exits321 at
+09:18:42.632UTC,1266 completed pipelines, no guards, minRAM13.25GiB.
+Full actual PS617c tracking passes, then materialization rejects an
+unsupported image descriptor from the wave-address table. Require bounded
+diagnostic evidence for source record/row, pointer/source metadata and all
+eight descriptor words. Determine whether this is unsupported guest format,
+incorrect field validation/provenance, or an unreachable table row; derive
+the contract independently and reproduce synthetically before a semantic fix.
+Do not discard the descriptor, substitute zero or disable validity checks.
+
 ## Nonempty original mask after a preceding loop (2026-10-10)
 
 Original game8799c502/EXEa84498/eboot5178 run084004 naturally exits321 at

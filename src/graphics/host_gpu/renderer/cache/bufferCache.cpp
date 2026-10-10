@@ -273,6 +273,13 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateWriteFault(uint64_t vaddr) {
+	if (!GuestRange {vaddr, 1}.Valid()) {
+		EXIT("BufferCache: invalid write-fault address\n");
+	}
+	m_memory_tracker.InvalidateWriteFault(vaddr, [this, vaddr] { ReadMemory(vaddr, 1, true); });
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "

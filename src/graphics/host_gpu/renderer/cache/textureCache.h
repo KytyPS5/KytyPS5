@@ -175,6 +175,11 @@ private:
 	void                  WakeImage(ImageId id, const ImageIds& candidates);
 	[[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                          ImageId cached);
+	[[nodiscard]] ImageId ReuseDepthTwin(ImageId cached, const ImageInfo& info);
+	[[nodiscard]] bool    LinkDepthTwins(ImageId live, ImageId parked);
+	void                  SyncDepthTwin(ImageId destination, ImageId source);
+	static void NarrowTwinWrite(Image& image, std::vector<uint64_t>&& before, bool was_dirty,
+	                            const ImageViewInfo& view);
 	[[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId source);
 	// Copies in the newest GPU write of a same-layout image whose format cannot share the backing.
 	void SyncLayoutAlias(ImageId id, const ImageIds& candidates);

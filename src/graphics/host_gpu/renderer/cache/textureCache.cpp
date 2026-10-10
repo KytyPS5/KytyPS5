@@ -190,6 +190,8 @@ bool GrowLayers(ImageInfo& info, const ImageInfo& requested, const ImageInfo& ca
 	return true;
 }
 
+// VK_KHR_maintenance8 copies between a depth aspect and a size-matched colour format.
+bool DepthColorCopyEnabled(const GraphicContext& graphics) {
 [[nodiscard]] bool LayoutAliasCandidate(const Image& image) {
 	return image.registered && !image.dormant && !image.depth_id && !image.info.data.Empty() &&
 	       image.backing.image != nullptr && image.backing.samples == 1 &&
@@ -408,6 +410,16 @@ void TextureCache::DeleteImage(ImageId id) {
 	m_evict_pending.erase(id);
 	std::erase_if(m_stencil_planes, [id](const auto& entry) { return entry.second == id; });
 	auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && image->depth_twin) {
+		if (auto* twin = m_slot_images.try_get(image->depth_twin);
+		    twin != nullptr && twin->depth_twin == id && !twin->dormant) {
+			twin->depth_twin = {};
+			twin->layer_content.clear();
+		}
+		// A parked twin keeps the dead id, so FindImage never wakes it and the collector frees it.
+		image->depth_twin = {};
+		image->layer_content.clear();
+	}
 	if (image == nullptr || !image->registered) {
 		return;
 	}
@@ -753,7 +765,13 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    (source.backing.format == destination.backing.format ||
 	     (!source_depth && !dest_depth &&
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
-	if (direct_copy) {
+	const bool depth_color_copy =
+	    !direct_copy && source_depth != dest_depth && DepthColorCopyEnabled(m_graphics) &&
+	    source.backing.samples == 1 && destination.backing.samples == 1 &&
+	    source.info.GetColorTransform() == destination.info.GetColorTransform() &&
+	    source.backing.image_type == destination.backing.image_type &&
+	    Image::DepthColorCopyCompatible(source.backing.format, destination.backing.format);
+	if (direct_copy || depth_color_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
@@ -864,6 +882,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.linear_slice_stride = cached.info.linear_slice_stride;
 		info.first_tail_level    = cached.info.first_tail_level;
 		}
+	info.htile_initial_clear = false;
+	if (const auto twin_id = ReuseDepthTwin(cached_id, info)) {
+		return twin_id;
 	}
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
@@ -896,6 +917,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
+	if (binding != BindingType::Texture && LinkDepthTwins(replacement_id, cached_id)) {
+		return replacement_id;
+	}
 	const auto carried_meta =
 	    cached.info.HasMetadata() && cached.info.metadata.kind == ImageMetadataKind::Htile
 	        ? m_surface_metas.find(cached.info.metadata.range.address)
@@ -908,6 +932,129 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		m_surface_metas.insert_or_assign(carried_address, carried_info);
 	}
 	return replacement_id;
+}
+
+ImageId TextureCache::ReuseDepthTwin(ImageId cached_id, const ImageInfo& info) {
+	auto& cached = m_slot_images[cached_id];
+	if (!cached.depth_twin) {
+		return {};
+	}
+	const auto twin_id = cached.depth_twin;
+	const auto twin    = m_slot_images.try_get(twin_id);
+	if (twin == nullptr || twin->depth_twin != cached_id || !twin->dormant || !twin->registered ||
+	    twin->info.pixel_format != info.pixel_format || twin->info.data != info.data ||
+	    twin->info.resources != info.resources || twin->info.extent != info.extent ||
+	    twin->info.type != info.type || twin->info.tile_mode != info.tile_mode ||
+	    twin->info.samples != info.samples) {
+		return {};
+	}
+	(void)UnparkImage(twin_id);
+	twin->binding = {};
+	SyncDepthTwin(twin_id, cached_id);
+	auto& revived = m_slot_images[twin_id];
+	revived.usage = cached.usage;
+	TouchImage(revived);
+	cached.ClearGpuModified();
+	if (!ParkImage(cached_id)) {
+		FreeImage(cached_id);
+	}
+	return twin_id;
+}
+
+bool TextureCache::LinkDepthTwins(ImageId live_id, ImageId parked_id) {
+	auto&      live   = m_slot_images[live_id];
+	auto&      parked = m_slot_images[parked_id];
+	const bool shape = live.info.IsDepth() != parked.info.IsDepth() &&
+	                   live.info.data == parked.info.data && !live.info.HasStencil() &&
+	                   !parked.info.HasStencil() && !parked.depth_id && live.backing.samples == 1 &&
+	                   parked.backing.samples == 1 &&
+	                   live.backing.image_type == vk::ImageType::e2D &&
+	                   parked.backing.image_type == vk::ImageType::e2D &&
+	                   live.backing.extent == parked.backing.extent &&
+	                   live.backing.mip_levels == parked.backing.mip_levels &&
+	                   live.backing.layers == parked.backing.layers &&
+	                   live.info.GetColorTransform() == parked.info.GetColorTransform() &&
+	                   DepthColorCopyEnabled(m_graphics) &&
+	                   Image::DepthColorCopyCompatible(live.backing.format, parked.backing.format);
+	if (!shape) {
+		return false;
+	}
+	if (parked.depth_twin && parked.depth_twin != live_id) {
+		const auto stale = parked.depth_twin;
+		if (auto* old = m_slot_images.try_get(stale); old != nullptr && old->dormant) {
+			old->ClearGpuModified();
+			FreeImage(stale);
+		}
+	}
+	parked.ClearGpuModified();
+	if (!ParkImage(parked_id)) {
+		return false;
+	}
+	const auto epoch  = live.IsGpuModified() ? live.GpuWriteEpoch() : NextImageWriteEpoch();
+	live.depth_twin   = parked_id;
+	parked.depth_twin = live_id;
+	live.layer_content.assign(live.backing.layers, epoch);
+	parked.layer_content.assign(parked.backing.layers, epoch);
+	return true;
+}
+
+void TextureCache::SyncDepthTwin(ImageId destination_id, ImageId source_id) {
+	RefreshCopySource(source_id);
+	auto&      destination = m_slot_images[destination_id];
+	auto&      source      = m_slot_images[source_id];
+	const auto layers      = destination.backing.layers;
+	const bool layered     = !source.IsBufferModified() && !destination.IsBufferModified() &&
+	                         !destination.IsCpuDirty() && source.layer_content.size() == layers &&
+	                         destination.layer_content.size() == layers;
+	if (!layered) {
+		auto content = source.layer_content;
+		CopyImage(destination_id, source_id);
+		auto& copied = m_slot_images[destination_id];
+		if (content.size() == layers) {
+			copied.layer_content = std::move(content);
+		} else {
+			copied.layer_content.assign(layers, NextImageWriteEpoch());
+		}
+		return;
+	}
+	PrepareImageCopy(destination);
+	auto     merged = destination.layer_content;
+	uint32_t first  = 0;
+	while (first < layers) {
+		if (source.layer_content[first] <= destination.layer_content[first]) {
+			first++;
+			continue;
+		}
+		uint32_t end = first + 1;
+		while (end < layers && source.layer_content[end] > destination.layer_content[end]) {
+			end++;
+		}
+		destination.CopyLayers(source, first, end - first);
+		for (uint32_t layer = first; layer < end; layer++) {
+			merged[layer] = source.layer_content[layer];
+		}
+		first = end;
+	}
+	if (source.IsGpuModified()) {
+		destination.MarkGpuModified();
+	}
+	destination.ClearBufferModified();
+	destination.layer_content = std::move(merged);
+}
+
+void TextureCache::NarrowTwinWrite(Image& image, std::vector<uint64_t>&& before, bool was_dirty,
+                                   const ImageViewInfo& view) {
+	if (was_dirty || before.empty() || before.size() != image.layer_content.size() ||
+	    image.info.IsVolume()) {
+		return;
+	}
+	const auto epoch = image.GpuWriteEpoch();
+	const auto end =
+	    std::min<uint64_t>(uint64_t {view.base_layer} + view.layer_count, before.size());
+	for (uint64_t layer = view.base_layer; layer < end; layer++) {
+		before[layer] = epoch;
+	}
+	image.layer_content = std::move(before);
 }
 
 bool TextureCache::ParkImage(ImageId id) {
@@ -1495,6 +1642,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (!cpu_dirty) {
 		return;
 	}
+	std::fill(image.layer_content.begin(), image.layer_content.end(), NextImageWriteEpoch());
 	InitializeImage(id);
 }
 
@@ -1604,6 +1752,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		const bool stencil_plane_found = static_cast<bool>(result);
 		for (const auto id: candidates) {
 			const auto image = m_slot_images.try_get(id);
+			// A parked twin is only revived through ResolveDepthOverlap, which syncs it first.
+			if (image == nullptr || stencil_plane_found || (image->dormant && image->depth_twin)) {
 				continue;
 				// Only an exact backing match hands a parked image back; prefer a live owner.
 				(image->dormant ? parked : result) = id;
@@ -1741,7 +1891,10 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
+	auto&            image       = m_slot_images[id];
+	auto             twin_before = image.layer_content;
+	const bool       twin_dirty =
+	    image.IsBufferModified() || image.IsCpuDirty() || image.IsMaybeCpuDirty();
 	TouchImage(image);
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
@@ -1767,6 +1920,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
 			CommitGpuWrite(image);
+			NarrowTwinWrite(image, std::move(twin_before), twin_dirty, desc.view_info);
 			TrackImageDownload(id, image);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
@@ -1783,11 +1937,15 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
+	auto       twin_before = image.layer_content;
+	const bool twin_dirty =
+	    image.IsBufferModified() || image.IsCpuDirty() || image.IsMaybeCpuDirty();
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
+	NarrowTwinWrite(image, std::move(twin_before), twin_dirty, desc.view_info);
 	TrackImageDownload(id, image);
 	return image.FindView(desc.view_info);
 }
@@ -1801,6 +1959,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
+	auto       twin_before = image.layer_content;
+	const bool twin_dirty =
+	    image.IsBufferModified() || image.IsCpuDirty() || image.IsMaybeCpuDirty();
 	TouchImage(image);
 	image.MarkGpuModified();
 	if (desc.info.HasStencil()) {
@@ -1845,6 +2006,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
+	NarrowTwinWrite(image, std::move(twin_before), twin_dirty, desc.view_info);
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil));
 	}

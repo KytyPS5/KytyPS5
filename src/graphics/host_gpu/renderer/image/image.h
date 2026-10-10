@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -69,6 +70,7 @@ public:
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
+	void CopyLayers(Image& source, uint32_t base_layer, uint32_t layer_count);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
@@ -112,6 +114,7 @@ public:
 		m_gpu_modified = true;
 		++m_gpu_write_serial;
 		m_gpu_write_epoch = NextImageWriteEpoch();
+		std::fill(layer_content.begin(), layer_content.end(), m_gpu_write_epoch);
 	}
 	void ClearGpuModified() noexcept { m_gpu_modified = false; }
 	// Counts GPU writes, never reset - unlike m_gpu_modified, which only the free path clears.
@@ -167,6 +170,9 @@ public:
 	// vkCmdCopyImage needs matching aspect masks, so only identical formats carry stencil.
 	[[nodiscard]] static bool CopyCarriesStencil(vk::Format source,
 	                                             vk::Format destination) noexcept;
+	// Bit-identical under VK_KHR_maintenance8; 24-bit depth keeps the buffered copy's packing.
+	[[nodiscard]] static bool DepthColorCopyCompatible(vk::Format source,
+	                                                   vk::Format destination) noexcept;
 
 	ImageInfo                    info;
 	VulkanImage                  backing;
@@ -191,6 +197,8 @@ public:
 	size_t                lru_id              = 0;
 	uint64_t              alias_stamp_epoch   = 0;
 	uint64_t              alias_content_epoch = 0;
+	ImageId               depth_twin {};
+	std::vector<uint64_t> layer_content;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 

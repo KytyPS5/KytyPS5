@@ -13,7 +13,9 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <set>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -61,6 +63,9 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+/// Whether the eight dwords are an image descriptor the emulator can bind: reserved bits clear, a
+/// known type, a format the encoding defines, and for an r128 load a 1D or 2D type. Rejected values
+/// are bound as a null image instead of aborting.
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
@@ -73,6 +78,12 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
 	    format > Prospero::BufferFormat::kBc7Srgb) {
+		return false;
+	}
+	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
+	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead of
+	// being treated as what it is: eight dwords that are not a descriptor.
+	if (!Prospero::IsDefinedBufferFormat(format)) {
 		return false;
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
@@ -1067,6 +1078,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+/// Walks the plan's descriptor graph against the guest state in `runtime` and fills `snapshot` with
+/// the buffer, image and sampler descriptors of this call and `specialization` with the properties
+/// that select the shader permutation. Returns false when a value could not be read or a descriptor
+/// cannot be expressed; the caller must not use a failed result.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
@@ -1198,6 +1213,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				return false;
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+				// A null image keeps the draw alive, but the walk read something that is not a
+				// descriptor, so say so once per slot instead of hiding it. All-zero dwords are an
+				// unbound slot rather than a wrong read, and were rejected here before as well.
+				static std::set<std::pair<uint64_t, uint32_t>> reported;
+				if (!NullImageDescriptor(snapshot.images[i]) && reported.size() < 64 &&
+				    reported.emplace(program.shader_hash, i).second) {
+					const auto& words = snapshot.images[i].dwords;
+					printf("image descriptor %u of shader 0x%016" PRIx64
+					       " is not a descriptor, binding null: "
+					       "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+					       i, program.shader_hash, words[0], words[1], words[2], words[3], words[4],
+					       words[5], words[6], words[7]);
+					fflush(stdout);
+				}
 				snapshot.images[i].dwords.fill(0);
 			}
 		}

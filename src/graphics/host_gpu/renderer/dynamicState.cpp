@@ -42,7 +42,10 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.depth_bias_enabled = false;
 		cmdbuf.setDepthBiasEnable(depth_bias_enabled);
 	}
-	if (depth_bias_enabled && dirty_state.depth_bias) {
+	// Pipelines declare depth bias and the stencil state as dynamic, and Vulkan requires every
+	// dynamic state to be set in the command buffer before a draw even while the bias or the
+	// stencil test is disabled (VUID-vkCmdDraw-None-07848).
+	if (dirty_state.depth_bias) {
 		dirty_state.depth_bias = false;
 		cmdbuf.setDepthBias(depth_bias_constant, depth_bias_clamp, depth_bias_slope);
 	}
@@ -50,79 +53,77 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.stencil_test_enabled = false;
 		cmdbuf.setStencilTestEnable(stencil_test_enabled);
 	}
-	if (stencil_test_enabled) {
-		if (dirty_state.stencil_front_ops && dirty_state.stencil_back_ops &&
-		    stencil_front_ops == stencil_back_ops) {
+	if (dirty_state.stencil_front_ops && dirty_state.stencil_back_ops &&
+	    stencil_front_ops == stencil_back_ops) {
+		dirty_state.stencil_front_ops = false;
+		dirty_state.stencil_back_ops  = false;
+		cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eFrontAndBack, stencil_front_ops.fail_op,
+		                    stencil_front_ops.pass_op, stencil_front_ops.depth_fail_op,
+		                    stencil_front_ops.compare_op);
+	} else {
+		if (dirty_state.stencil_front_ops) {
 			dirty_state.stencil_front_ops = false;
-			dirty_state.stencil_back_ops  = false;
-			cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eFrontAndBack, stencil_front_ops.fail_op,
+			cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eFront, stencil_front_ops.fail_op,
 			                    stencil_front_ops.pass_op, stencil_front_ops.depth_fail_op,
 			                    stencil_front_ops.compare_op);
-		} else {
-			if (dirty_state.stencil_front_ops) {
-				dirty_state.stencil_front_ops = false;
-				cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eFront, stencil_front_ops.fail_op,
-				                    stencil_front_ops.pass_op, stencil_front_ops.depth_fail_op,
-				                    stencil_front_ops.compare_op);
-			}
-			if (dirty_state.stencil_back_ops) {
-				dirty_state.stencil_back_ops = false;
-				cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eBack, stencil_back_ops.fail_op,
-				                    stencil_back_ops.pass_op, stencil_back_ops.depth_fail_op,
-				                    stencil_back_ops.compare_op);
-			}
 		}
-		if (dirty_state.stencil_front_reference && dirty_state.stencil_back_reference &&
-		    stencil_front_reference == stencil_back_reference) {
+		if (dirty_state.stencil_back_ops) {
+			dirty_state.stencil_back_ops = false;
+			cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eBack, stencil_back_ops.fail_op,
+			                    stencil_back_ops.pass_op, stencil_back_ops.depth_fail_op,
+			                    stencil_back_ops.compare_op);
+		}
+	}
+	if (dirty_state.stencil_front_reference && dirty_state.stencil_back_reference &&
+	    stencil_front_reference == stencil_back_reference) {
+		dirty_state.stencil_front_reference = false;
+		dirty_state.stencil_back_reference  = false;
+		cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack,
+		                           stencil_front_reference);
+	} else {
+		if (dirty_state.stencil_front_reference) {
 			dirty_state.stencil_front_reference = false;
-			dirty_state.stencil_back_reference  = false;
-			cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack,
+			cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFront,
 			                           stencil_front_reference);
-		} else {
-			if (dirty_state.stencil_front_reference) {
-				dirty_state.stencil_front_reference = false;
-				cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFront,
-				                           stencil_front_reference);
-			}
-			if (dirty_state.stencil_back_reference) {
-				dirty_state.stencil_back_reference = false;
-				cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eBack, stencil_back_reference);
-			}
 		}
-		if (dirty_state.stencil_front_write_mask && dirty_state.stencil_back_write_mask &&
-		    stencil_front_write_mask == stencil_back_write_mask) {
+		if (dirty_state.stencil_back_reference) {
+			dirty_state.stencil_back_reference = false;
+			cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eBack, stencil_back_reference);
+		}
+	}
+	if (dirty_state.stencil_front_write_mask && dirty_state.stencil_back_write_mask &&
+	    stencil_front_write_mask == stencil_back_write_mask) {
+		dirty_state.stencil_front_write_mask = false;
+		dirty_state.stencil_back_write_mask  = false;
+		cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack,
+		                           stencil_front_write_mask);
+	} else {
+		if (dirty_state.stencil_front_write_mask) {
 			dirty_state.stencil_front_write_mask = false;
-			dirty_state.stencil_back_write_mask  = false;
-			cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack,
+			cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
 			                           stencil_front_write_mask);
-		} else {
-			if (dirty_state.stencil_front_write_mask) {
-				dirty_state.stencil_front_write_mask = false;
-				cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
-				                           stencil_front_write_mask);
-			}
-			if (dirty_state.stencil_back_write_mask) {
-				dirty_state.stencil_back_write_mask = false;
-				cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eBack, stencil_back_write_mask);
-			}
 		}
-		if (dirty_state.stencil_front_compare_mask && dirty_state.stencil_back_compare_mask &&
-		    stencil_front_compare_mask == stencil_back_compare_mask) {
+		if (dirty_state.stencil_back_write_mask) {
+			dirty_state.stencil_back_write_mask = false;
+			cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eBack, stencil_back_write_mask);
+		}
+	}
+	if (dirty_state.stencil_front_compare_mask && dirty_state.stencil_back_compare_mask &&
+	    stencil_front_compare_mask == stencil_back_compare_mask) {
+		dirty_state.stencil_front_compare_mask = false;
+		dirty_state.stencil_back_compare_mask  = false;
+		cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFrontAndBack,
+		                             stencil_front_compare_mask);
+	} else {
+		if (dirty_state.stencil_front_compare_mask) {
 			dirty_state.stencil_front_compare_mask = false;
-			dirty_state.stencil_back_compare_mask  = false;
-			cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFrontAndBack,
+			cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
 			                             stencil_front_compare_mask);
-		} else {
-			if (dirty_state.stencil_front_compare_mask) {
-				dirty_state.stencil_front_compare_mask = false;
-				cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
-				                             stencil_front_compare_mask);
-			}
-			if (dirty_state.stencil_back_compare_mask) {
-				dirty_state.stencil_back_compare_mask = false;
-				cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
-				                             stencil_back_compare_mask);
-			}
+		}
+		if (dirty_state.stencil_back_compare_mask) {
+			dirty_state.stencil_back_compare_mask = false;
+			cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
+			                             stencil_back_compare_mask);
 		}
 	}
 	if (dirty_state.cull_mode) {

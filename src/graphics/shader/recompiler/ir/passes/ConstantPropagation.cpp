@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -53,6 +54,44 @@ bool FoldU64Shift(Inst& inst, Function function) {
 	}
 	Replace(inst, Value(static_cast<uint64_t>(function(value.U64(), shift.U32()))));
 	return true;
+}
+
+// True when a U32 shift count is known to be within 0..31, so a shift by it stays in range for
+// a 32 bit word and cannot reach the undefined out of range behaviour of the emitted shift.
+bool IsShiftCountBounded0To31(Value shift) {
+	const auto bounded = [](Value value) {
+		return IsImmediate(value, Type::U32) && value.U32() < 32u;
+	};
+	if (bounded(shift)) {
+		return true;
+	}
+	auto* producer = shift.TryInstruction();
+	return producer != nullptr && producer->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
+	       (bounded(Arg(*producer, 0)) || bounded(Arg(*producer, 1)));
+}
+
+// Folds ((word >> shift) & 1) when the constant word is all zeros or all ones: every bit of such
+// a word is the same, so the tested bit holds for any in range shift and the lane query behind
+// the shift dies with the test. Only the test folds, an all ones word shifted by a dynamic
+// amount is not that word.
+bool FoldU32ShiftedBitTest(Inst& inst) {
+	const auto test = [&inst](Value bit, Value shifted) {
+		if (!IsImmediate(bit, Type::U32) || bit.U32() != 1u) {
+			return false;
+		}
+		auto* producer = shifted.TryInstruction();
+		if (producer == nullptr || producer->GetOpcode() != ValueOpcode::ShiftRightLogical32 ||
+		    !IsShiftCountBounded0To31(Arg(*producer, 1))) {
+			return false;
+		}
+		const auto word = Arg(*producer, 0);
+		if (!IsImmediate(word, Type::U32) || (word.U32() != 0u && word.U32() != UINT32_MAX)) {
+			return false;
+		}
+		Replace(inst, Value(word.U32() == 0u ? 0u : 1u));
+		return true;
+	};
+	return test(Arg(inst, 0), Arg(inst, 1)) || test(Arg(inst, 1), Arg(inst, 0));
 }
 
 template <typename Function>
@@ -196,7 +235,7 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 }
 
 void FoldInstruction(Block& block, Block::iterator instruction,
-                      std::unordered_set<Inst*>& lowered_ancillary) {
+                     std::unordered_set<Inst*>& lowered_ancillary) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::StoreBufferU32: {
@@ -206,8 +245,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		}
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
-			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) &&
-			    !Arg(inst, 2).U1()) {
+			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) && !Arg(inst, 2).U1()) {
 				auto result = block.PrependNewInst(instruction, ValueOpcode::LogicalAnd,
 				                                   {Arg(inst, 0), Arg(inst, 1)});
 				Replace(inst, Value(&*result));
@@ -224,8 +262,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				case 0u: Replace(inst, Value(false)); break;
 				case 0x3ffu: Replace(inst, Value(true)); break;
 				case 3u: {
-					const auto result = block.PrependNewInst(
-					    instruction, ValueOpcode::FPIsNan32, {Arg(inst, 0)});
+					const auto result =
+					    block.PrependNewInst(instruction, ValueOpcode::FPIsNan32, {Arg(inst, 0)});
 					Replace(inst, Value(&*result));
 					break;
 				}
@@ -258,7 +296,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			const auto value  = Arg(inst, 0);
 			const auto offset = Arg(inst, 1);
 			const auto count  = Arg(inst, 2);
-			auto* source = value.TryInstruction();
+			auto*      source = value.TryInstruction();
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
 			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32)) {
 				const auto shift = Arg(*source, 1);
@@ -270,16 +308,19 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::GetBuiltin &&
 			    source->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) &&
-			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) && count.U32() != 0u) {
+			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) &&
+			    count.U32() != 0u) {
 				constexpr struct {
 					uint32_t       start;
 					uint32_t       end;
 					StageInputKind kind;
-				} fields[] = {{8u, 12u, StageInputKind::SampleId}, {16u, 27u, StageInputKind::Layer}};
+				} fields[] = {{8u, 12u, StageInputKind::SampleId},
+				              {16u, 27u, StageInputKind::Layer}};
 				for (const auto& field: fields) {
 					if (offset.U32() >= field.start && offset.U32() < field.end &&
 					    count.U32() <= field.end - offset.U32()) {
-						// Preserve extraction and sign extension while exposing only the used field.
+						// Preserve extraction and sign extension while exposing only the used
+						// field.
 						const auto input = block.PrependNewInst(
 						    instruction, ValueOpcode::GetBuiltin,
 						    {Value(static_cast<uint32_t>(field.kind)), Value(0u)});
@@ -510,8 +551,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::BitwiseAnd32:
-			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; }) &&
+			    !ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu)) {
+				FoldU32ShiftedBitTest(inst);
 			}
 			return;
 		case ValueOpcode::BitwiseAnd64:
@@ -639,19 +681,19 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::LogicalAnd:
 			if (!FoldLogical(inst, [](bool a, bool b) { return a && b; })) {
-				const auto lhs = Arg(inst, 0);
-				const auto rhs = Arg(inst, 1);
+				const auto lhs      = Arg(inst, 0);
+				const auto rhs      = Arg(inst, 1);
 				const auto simplify = [&](Value assumption, Value expression) {
 					const auto* disjunction = expression.TryInstruction();
-					if (disjunction == nullptr || disjunction->GetOpcode() != ValueOpcode::LogicalOr) {
+					if (disjunction == nullptr ||
+					    disjunction->GetOpcode() != ValueOpcode::LogicalOr) {
 						return false;
 					}
 					for (uint32_t i = 0; i < 2u; ++i) {
 						const auto* inverse = disjunction->Arg(i).Resolve().TryInstruction();
 						if (inverse != nullptr && inverse->GetOpcode() == ValueOpcode::LogicalNot &&
 						    inverse->Arg(0).Resolve() == assumption) {
-							inst.SetArg(assumption == lhs ? 1u : 0u,
-							            disjunction->Arg(i ^ 1u));
+							inst.SetArg(assumption == lhs ? 1u : 0u, disjunction->Arg(i ^ 1u));
 							return true;
 						}
 					}
@@ -717,12 +759,14 @@ public:
 		if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !Immediate(Arg(inst, 1), 0u)) return;
 		const auto* bit = Arg(inst, 0).TryInstruction();
 		if (bit == nullptr || bit->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
-		    !Immediate(Arg(*bit, 1), 1u)) return;
+		    !Immediate(Arg(*bit, 1), 1u))
+			return;
 		const auto* shift = Arg(*bit, 0).TryInstruction();
 		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical32) return;
 		const auto* index = Arg(*shift, 1).TryInstruction();
 		if (index == nullptr || index->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
-		    !Immediate(Arg(*index, 1), 31u)) return;
+		    !Immediate(Arg(*index, 1), 31u))
+			return;
 		const auto* lane = Arg(*index, 0).TryInstruction();
 		if (lane == nullptr || lane->GetOpcode() != ValueOpcode::LaneId) return;
 		m_visited.clear();
@@ -736,11 +780,11 @@ private:
 	}
 
 	static Value BallotPredicate(const Inst& inst) {
-		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
-		    !Immediate(Arg(inst, 1), 0u)) return {};
+		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 || !Immediate(Arg(inst, 1), 0u))
+			return {};
 		const auto* source = Arg(inst, 0).TryInstruction();
-		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot
-		           ? Arg(*source, 0) : Value {};
+		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot ? Arg(*source, 0)
+		                                                                       : Value {};
 	}
 
 	bool CanProject(Value value) {
@@ -758,7 +802,8 @@ private:
 		if (!m_visited.insert(inst).second) return true;
 		const auto op = inst->GetOpcode();
 		if (op != ValueOpcode::BitwiseAnd32 && op != ValueOpcode::BitwiseOr32 &&
-		    op != ValueOpcode::BitwiseNot32 && op != ValueOpcode::SelectU32 && op != ValueOpcode::Phi)
+		    op != ValueOpcode::BitwiseNot32 && op != ValueOpcode::SelectU32 &&
+		    op != ValueOpcode::Phi)
 			return false;
 		for (size_t arg = op == ValueOpcode::SelectU32 ? 1u : 0u; arg < inst->NumArgs(); ++arg) {
 			if (!CanProject(Arg(*inst, arg))) return false;
@@ -769,44 +814,48 @@ private:
 	Value Project(Value value) {
 		if (value.IsImmediate()) return Value(value.U32() != 0u);
 		auto* source = value.TryInstruction();
-		if (const auto found = m_values.find(source); found != m_values.end()) return found->second.Resolve();
+		if (const auto found = m_values.find(source); found != m_values.end())
+			return found->second.Resolve();
 		if (const auto predicate = BallotPredicate(*source); !predicate.IsEmpty()) return predicate;
-		auto* block = source->Parent();
-		const auto where = std::find_if(block->begin(), block->end(),
-		                               [source](const Inst& candidate) { return &candidate == source; });
-		const auto op = source->GetOpcode() == ValueOpcode::BitwiseAnd32 ? ValueOpcode::LogicalAnd
-		              : source->GetOpcode() == ValueOpcode::BitwiseOr32 ? ValueOpcode::LogicalOr
-		              : source->GetOpcode() == ValueOpcode::BitwiseNot32 ? ValueOpcode::LogicalNot
-		              : source->GetOpcode() == ValueOpcode::SelectU32 ? ValueOpcode::SelectU1
-		                                                               : ValueOpcode::Phi;
-		auto result = op == ValueOpcode::Phi ? block->PrependNewInst(where, op)
-		            : op == ValueOpcode::LogicalNot
-		                ? block->PrependNewInst(where, op, {Value(false)})
-		            : op == ValueOpcode::SelectU1
-		                ? block->PrependNewInst(where, op, {Arg(*source, 0), Value(false), Value(false)})
-		                : block->PrependNewInst(where, op, {Value(false), Value(false)});
+		auto*      block = source->Parent();
+		const auto where =
+		    std::find_if(block->begin(), block->end(),
+		                 [source](const Inst& candidate) { return &candidate == source; });
+		const auto op = source->GetOpcode() == ValueOpcode::BitwiseAnd32   ? ValueOpcode::LogicalAnd
+		                : source->GetOpcode() == ValueOpcode::BitwiseOr32  ? ValueOpcode::LogicalOr
+		                : source->GetOpcode() == ValueOpcode::BitwiseNot32 ? ValueOpcode::LogicalNot
+		                : source->GetOpcode() == ValueOpcode::SelectU32    ? ValueOpcode::SelectU1
+		                                                                   : ValueOpcode::Phi;
+		auto       result =
+		    op == ValueOpcode::Phi          ? block->PrependNewInst(where, op)
+		    : op == ValueOpcode::LogicalNot ? block->PrependNewInst(where, op, {Value(false)})
+		    : op == ValueOpcode::SelectU1
+		        ? block->PrependNewInst(where, op, {Arg(*source, 0), Value(false), Value(false)})
+		        : block->PrependNewInst(where, op, {Value(false), Value(false)});
 		m_values.emplace(source, Value(&*result));
 		if (op == ValueOpcode::Phi) result->SetFlags(Type::U1);
 		for (size_t arg = op == ValueOpcode::SelectU1 ? 1u : 0u; arg < source->NumArgs(); ++arg) {
 			const auto projected = Project(Arg(*source, arg));
-			if (op == ValueOpcode::Phi) result->AddPhiOperand(source->PhiBlock(arg), projected);
-			else result->SetArg(arg, projected);
+			if (op == ValueOpcode::Phi)
+				result->AddPhiOperand(source->PhiBlock(arg), projected);
+			else
+				result->SetArg(arg, projected);
 		}
 		FoldInstruction(*block, result, m_lowered_ancillary);
 		return Value(&*result).Resolve();
 	}
 
-	std::unordered_set<Inst*>& m_lowered_ancillary;
-	std::unordered_set<const Inst*> m_visited;
+	std::unordered_set<Inst*>&             m_lowered_ancillary;
+	std::unordered_set<const Inst*>        m_visited;
 	std::unordered_map<const Inst*, Value> m_values;
-	bool m_grounded = false;
+	bool                                   m_grounded = false;
 };
 
 } // namespace
 
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	std::unordered_set<Inst*> lowered_ancillary;
-	LaneMaskProjection mask_projection(lowered_ancillary);
+	LaneMaskProjection        mask_projection(lowered_ancillary);
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
 			if (wave_size == 32u) mask_projection.Fold(*inst);

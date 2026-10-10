@@ -1,5 +1,41 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 09:48 UTC** (paired menu comparison active):
+
+- User requests investigation of lost menu and a changed fixing approach.
+  Older sourceb4eae640 / EXE87f24 truly rendered the initial Medium difficulty
+  setup: `yotei-20261005-234419-original-resolution-nodiag/window-medium-ready.png`
+  was viewed again. After Quality confirmation, the SAME old EXE later run011540
+  failed sampler33 and did not prove a menu/game entry. First-setup versus
+  post-settings loading is therefore confounded; a source regression is unproved.
+- Baseline used None optimization/default and2560x1440; recent retries use
+  Performance1280x720. Compare equal SaveData snapshots/parameters before
+  bisecting code. User SaveData/cache copied only after diagnostic process ended;
+  seed manifests/evidence under `_Build/analysis/menu-regression-investigation-20261010/`.
+- Diagnostic sourcea593e9b0 / EXE454656 / original5178 run092136 naturally
+  exits321 at09:39:32.199UTC, no guards, minimum RAM13.39GiB. Actual PS617c
+  tracking passes; table record0 row64 fails after preceding rows pass.
+  Source has2records/stride136; current row bound255/stride368. Captured words
+  have reserved image type4, so an LLC-only validator correction cannot resolve
+  this descriptor. Exact descriptor words remain in untracked run logs.
+- Current table implementation enumerates the complete numeric guard range;
+  it has not proved every row is a possible live selector value. Required next
+  reproduction must exercise a sparse/packed selector domain and guard sentinel,
+  preserve invalid/unreadable rejection for actually reachable rows, and derive
+  actual source bounds rather than hardcode64/255 or zero the rejected entry.
+- Detached baseline `_Build/worktrees/menu-baseline-b4eae640` has exact source
+  and14 pinned dependencies; native configure/build pass (765 build steps).
+  Rebuilt baseline EXE0c60 differs from historical87f24; keep the original
+  screenshot proof distinct from this replay. Current active owned42340 is
+  `_Build/runs/game-20261010-094629-menu-baseline-saved-none`, None2560x1440/
+  redzone, copied SaveData and identical seeded cache in a private runtime.
+  Current head runtime is separately seeded and ready. No concurrent native
+  tests/builds. No production semantic edits while investigating. Next head
+  replay under equal inputs after baseline completes; if needed paired
+  fresh isolated first-run state. Keep all user data intact. Restore the prior
+  visible setup/menu as a runtime regression criterion alongside CPU/GPU tests.
+  No push or intermediate issue108 publication; historical menu already exists.
+
 Checkpoint **2026-10-10 09:19 UTC** (actual full tracking passed; table validity next):
 
 - Source5df6ff5d / EXE4fefcb / original5178 run

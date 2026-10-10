@@ -1,5 +1,25 @@
 # Emulator regression test debt
 
+## Runtime menu comparison and exact row-domain proof (2026-10-10)
+
+User requests regression investigation before more gate-by-gate extensions.
+Oldb4eae640/87f24 initial Medium setup is visually verified; the same binary
+later failed sampler33 after saved Quality selection. Source regression is
+not isolated. Compare exact copied save/cache state, None2560x1440/redzone
+for baseline/current; then separate fresh first-run cases if needed. No user
+SaveData reset. Investigation/seed manifests and native baseline helper are
+under _Build/analysis/menu-regression-investigation-20261010; baseline checkout
+has exact pinned dependencies and must use serialized native execution.
+
+Diagnostic092136/a593/454656 naturally exits32109:39:32.199UTC/no guards,
+minRAM13.39GiB. Wave table record0,row64 is not a texture (type4 reserved);
+source2records/stride136, guard range255,row_stride368. Earlier rows passed.
+Do not patch only LLC bits or replace this entry with null. Require minimal
+native RED for a packed sparse selector set with an excluded sentinel and
+unavailable/invalid rows elsewhere in the guard range, then prove shared
+selector provenance/materialization bounds. An invalid actually reachable
+row must still fail transactionally. Hardcoded game row counts are prohibited.
+
 ## Wave-address table descriptor validity (2026-10-10)
 
 Original5df6ff5d/EXE4fefcb/eboot5178 run090158 naturally exits321 at

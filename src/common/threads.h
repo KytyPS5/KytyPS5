@@ -34,6 +34,7 @@ public:
 	static void SleepMicro(uint32_t micros);
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
+	static void PreferPerformance();
 
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.

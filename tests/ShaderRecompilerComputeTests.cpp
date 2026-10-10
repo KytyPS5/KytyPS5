@@ -42220,30 +42220,36 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
               payload == std::array<uint32_t, 3>{0xc0011000u, 0x12345678u, 0x9abcdef0u},
           "NOP emitter overwrote the caller's reserved payload");
   alignas(8) uint64_t released = 0;
-  std::array<uint32_t, 18> disabled_commands{};
+  std::array<uint32_t, 20> disabled_commands{};
   const auto disabled_write = write(&returned, 99);
   std::copy(disabled_write.begin(), disabled_write.end(), disabled_commands.begin());
-  CommandBufferLayout release_dcb{disabled_commands.data() + 5, disabled_commands.data() + 13,
-      disabled_commands.data() + 5, disabled_commands.data() + 13, nullptr, nullptr, 0};
+  disabled_commands[5] = KYTY_PM4(2, Pm4::IT_NUM_INSTANCES, 0);
+  disabled_commands[6] = 0x68750123u;
+  CommandBufferLayout release_dcb{disabled_commands.data() + 7, disabled_commands.data() + 15,
+      disabled_commands.data() + 7, disabled_commands.data() + 15, nullptr, nullptr, 0};
   auto* release = Gen5::AgcCbReleaseMem(
       reinterpret_cast<Gen5::CommandBuffer*>(&release_dcb), 0x28, 0, 0, 0,
       reinterpret_cast<const volatile Gen5::Label*>(&released), 2, 77, 0, 0, 0, 0);
   const auto enabled_write = write(&selected, 88);
-  std::copy(enabled_write.begin(), enabled_write.end(), disabled_commands.begin() + 13);
+  std::copy(enabled_write.begin(), enabled_write.end(), disabled_commands.begin() + 15);
   const auto unpatched_commands = disabled_commands;
   Require(name, "SetNop packets",
-          release == disabled_commands.data() + 5 &&
-              Gen5::AgcSetNop(disabled_commands.data()) == 0 && Gen5::AgcSetNop(release) == 0 &&
+          release == disabled_commands.data() + 7 &&
+              Gen5::AgcSetNop(disabled_commands.data()) == 0 &&
+              Gen5::AgcSetNop(disabled_commands.data() + 5) == 0 && Gen5::AgcSetNop(release) == 0 &&
               disabled_commands[0] == ((disabled_write[0] & 0xffff00ffu) | (Pm4::IT_NOP << 8u)) &&
+              disabled_commands[5] == KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO) &&
+              disabled_commands[6] == 0x123u &&
               release[0] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ZERO) &&
-              unpatched_commands[5] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM) &&
+              unpatched_commands[7] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM) &&
               Gen5::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
+              Gen5::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
               Gen5::AgcGetPacketSize(release) == 8 &&
               std::equal(disabled_commands.begin() + 1, disabled_commands.begin() + 5,
                          unpatched_commands.begin() + 1) &&
-              std::equal(disabled_commands.begin() + 6, disabled_commands.end(),
-                         unpatched_commands.begin() + 6),
-          "SetNop changed a packet length, kept its operation, or touched its payload");
+              std::equal(disabled_commands.begin() + 8, disabled_commands.end(),
+                         unpatched_commands.begin() + 8),
+          "SetNop changed a packet length, kept its operation or marker, or touched its payload");
   selected = returned = 0;
   Pm4Execution disabled_execution;
   Require(name, "SetNop execution",

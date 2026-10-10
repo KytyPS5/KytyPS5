@@ -393,10 +393,38 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto info = Format::GetFormatInfo(format);
 	EXIT_IF(Prospero::RemapTextureFormat(format) == format || info.component_count == 0u ||
 	        info.component_count > 4u);
-	EXIT_IF(info.type != Format::ComponentType::Uscaled &&
-	        (info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
-	         info.byte_size != sizeof(uint32_t)));
+	EXIT_IF(
+	    info.type != Format::ComponentType::Uscaled &&
+	    ((info.type != Format::ComponentType::Uint && info.type != Format::ComponentType::Unorm) ||
+	     !info.packed_bitfield || info.byte_size != sizeof(uint32_t)));
 	return info;
+}
+
+// Packed UNORM conversions keep a UINT image class; texels carry float bit patterns.
+bool PackedUnormConversion(const Format::BufferFormatInfo& info) {
+	return info.packed_bitfield && info.type == Format::ComponentType::Unorm;
+}
+
+uint32_t UnormFieldToFloatBits(EmitterState& state, uint32_t field, uint32_t bits) {
+	const auto value = Unary(state, spv::OpConvertUToF, TypeF32(state), field);
+	const auto scaled =
+	    Binary(state, spv::OpFMul, TypeF32(state), value,
+	           ConstantF32Value(state, 1.0f / static_cast<float>((1u << bits) - 1u)));
+	return Unary(state, spv::OpBitcast, TypeU32(state), scaled);
+}
+
+uint32_t FloatBitsToUnormField(EmitterState& state, uint32_t float_bits, uint32_t bits) {
+	const auto value   = Unary(state, spv::OpBitcast, TypeF32(state), float_bits);
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FClamp, value, ConstantF32Value(state, 0.0f),
+	                          ConstantF32Value(state, 1.0f));
+	const auto scaled  = Binary(state, spv::OpFMul, TypeF32(state), clamped,
+	                            ConstantF32Value(state, static_cast<float>((1u << bits) - 1u)));
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state),
+	                          GLSLstd450RoundEven, scaled);
+	return Unary(state, spv::OpConvertFToU, TypeU32(state), rounded);
 }
 
 uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem) {
@@ -428,6 +456,10 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 			                              components[component], packed,
 			                              ConstantU32(ctx.state, info.component_bit_offset[component]),
 			                              ConstantU32(ctx.state, info.component_bits[component]));
+			if (PackedUnormConversion(info)) {
+				components[component] = UnormFieldToFloatBits(ctx.state, components[component],
+				                                              info.component_bits[component]);
+			}
 		} else {
 			ctx.state.builder.AddFunction(spv::OpCompositeExtract, scalar_type,
 			                              components[component], texel, component);
@@ -445,8 +477,9 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 	for (uint32_t component = 0; component < 4u; component++) {
 		const auto selector = (swizzle >> (component * 3u)) & 7u;
 		if (selector == 1u) {
-			selected[component] = info.packed_bitfield ? ConstantU32(ctx.state, 1u)
-			                                          : ConstantF32Value(ctx.state, 1.0f);
+			selected[component] = PackedUnormConversion(info) ? ConstantU32(ctx.state, 0x3f800000u)
+			                      : info.packed_bitfield      ? ConstantU32(ctx.state, 1u)
+			                                                  : ConstantF32Value(ctx.state, 1.0f);
 		} else if (selector >= 4u) {
 			selected[component] = components[selector - 4u];
 		} else {
@@ -476,6 +509,9 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 			case Format::ComponentType::Uscaled:
 				value = ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
 				break;
+			case Format::ComponentType::Unorm:
+				value = ConstantU32(ctx.state, selector == 1u ? 0x3f800000u : 0u);
+				break;
 			default: value = ConstantU32(ctx.state, selector == 1u ? 1u : 0u); break;
 		}
 		return ctx.state.builder.Constant(spv::OpConstantComposite, vector_type, value, value,
@@ -499,6 +535,10 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 		                              packed,
 		                              ConstantU32(ctx.state, info.component_bit_offset[physical]),
 		                              ConstantU32(ctx.state, info.component_bits[physical]));
+		if (PackedUnormConversion(info)) {
+			values[lane] =
+			    UnormFieldToFloatBits(ctx.state, values[lane], info.component_bits[physical]);
+		}
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
@@ -551,13 +591,18 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
-	EXIT_IF(info.type != Format::ComponentType::Uint || !info.packed_bitfield);
+	EXIT_IF(
+	    (info.type != Format::ComponentType::Uint && info.type != Format::ComponentType::Unorm) ||
+	    !info.packed_bitfield);
 
 	auto packed = ConstantU32(ctx.state, 0u);
 	for (uint32_t component = 0; component < info.component_count; component++) {
-		const auto value = ctx.state.builder.AllocateId();
+		auto value = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), value, texel,
 		                              component);
+		if (PackedUnormConversion(info)) {
+			value = FloatBitsToUnormField(ctx.state, value, info.component_bits[component]);
+		}
 		const auto maximum =
 		    ConstantU32(ctx.state, info.component_bits[component] == 32u
 		                               ? UINT32_MAX

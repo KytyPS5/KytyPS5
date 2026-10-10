@@ -1,0 +1,44 @@
+#version 450
+
+// One workgroup per page: sets the page's bit when any word differs from the snapshot.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer current_buf {
+	uint current[];
+};
+
+layout(std430, binding = 1) readonly buffer snapshot_buf {
+	uint snapshot[];
+};
+
+layout(std430, binding = 2) buffer changed_buf {
+	uint changed[];
+};
+
+layout(push_constant) uniform Params {
+	uint words;
+	uint page_words;
+} params;
+
+shared uint page_changed;
+
+void main() {
+	const uint page  = gl_WorkGroupID.x;
+	const uint first = page * params.page_words;
+	const uint last  = min(first + params.page_words, params.words);
+	if (gl_LocalInvocationIndex == 0u) {
+		page_changed = 0u;
+	}
+	barrier();
+	bool differs = false;
+	for (uint i = first + gl_LocalInvocationIndex; !differs && i < last; i += gl_WorkGroupSize.x) {
+		differs = current[i] != snapshot[i];
+	}
+	if (differs) {
+		page_changed = 1u;
+	}
+	barrier();
+	if (gl_LocalInvocationIndex == 0u && page_changed != 0u) {
+		atomicOr(changed[page >> 5u], 1u << (page & 31u));
+	}
+}

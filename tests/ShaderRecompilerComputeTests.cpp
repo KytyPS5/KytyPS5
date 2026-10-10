@@ -4924,6 +4924,116 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // RE3 binds a 26 MiB buffer read-write and writes only a few pages of it.
+  void CheckBufferCachePreciseWrites() {
+    constexpr const char *name = "BufferCachePreciseWrites";
+    constexpr uintptr_t base = 0x000000020a800000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t binding_size = 0x200000;
+    constexpr uint64_t page = 0x1000;
+    constexpr uint32_t stale = 0x0badf00du;
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "precise-write direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "precise-write fixed direct-memory mapping failed");
+    for (uint64_t offset = 0; offset < allocation_size; offset += sizeof(stale)) {
+      std::memcpy(static_cast<uint8_t *>(mapped) + offset, &stale, sizeof(stale));
+    }
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto backing = [&](uint64_t offset) {
+        uint32_t value = 0;
+        Libs::LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value));
+        return value;
+      };
+      const auto owned = [&](uint64_t offset) {
+        return cache.IsRegionGpuModified(base + offset, page) ||
+               cache.HasGpuDirtyBytes(base + offset, page);
+      };
+      // A dispatch writing only `pages` of the bound range, as a shader store would.
+      const auto dispatch = [&](std::initializer_list<std::pair<uint64_t, uint32_t>> pages) {
+        cache.BeginPreciseWrites();
+        auto [buffer, offset] = cache.ObtainBuffer(base, binding_size, true, false);
+        Require(name, "binding", buffer != nullptr, "the written binding was not obtained");
+        for (const auto &[written, value] : pages) {
+          buffer->Fill(offset + written, page, value);
+        }
+        cache.EndPreciseWrites();
+      };
+
+      dispatch({{3 * page, 0x11111111u}});
+      Require(name, "conservative until completion",
+              owned(0) && owned(3 * page) && owned(binding_size - page),
+              "the binding was narrowed before its dispatch completed");
+      scheduler.Finish();
+      Require(name, "narrowed to the written page",
+              owned(3 * page) && !owned(0) && !owned(4 * page) && !owned(binding_size - page),
+              "the completed binding was not narrowed to the page it changed");
+      cache.ReadMemory(base + 3 * page, sizeof(uint32_t));
+      Require(name, "written page downloads",
+              backing(3 * page) == 0x11111111u && backing(0) == stale,
+              "the written page did not reach guest memory");
+
+      // A second dispatch recorded before the first completes takes over its proof.
+      dispatch({{5 * page, 0x22222222u}});
+      dispatch({{7 * page, 0x33333333u}});
+      scheduler.Finish();
+      Require(name, "chained dispatches",
+              owned(5 * page) && owned(7 * page) && !owned(6 * page) && !owned(0),
+              "back-to-back dispatches of one binding lost or kept the wrong pages");
+      cache.ReadMemory(base + 5 * page, 3 * page);
+
+      // Bytes the GPU owned before the dispatch, and a later untracked write, stay owned.
+      (void)cache.ObtainBuffer(base + 9 * page, sizeof(uint32_t), true, false);
+      cache.FillBuffer(base + 9 * page, sizeof(uint32_t), 0x44444444u, false);
+      dispatch({});
+      (void)cache.ObtainBuffer(base + 11 * page, sizeof(uint32_t), true, false);
+      cache.FillBuffer(base + 11 * page, sizeof(uint32_t), 0x55555555u, false);
+      scheduler.Finish();
+      Require(name, "earlier and later writers keep their pages",
+              owned(9 * page) && owned(11 * page) && !owned(10 * page) && !owned(0),
+              "a page owned before the dispatch or rewritten after it was released");
+      cache.ReadMemory(base + 9 * page, 3 * page);
+      Require(name, "earlier and later writers download",
+              backing(9 * page) == 0x44444444u && backing(11 * page) == 0x55555555u &&
+                  backing(10 * page) == stale,
+              "a kept page did not download its GPU bytes");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "precise-write direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "precise-write direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -58447,6 +58557,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheDetachedDownload();
     vulkan.CheckBufferCacheOrderedWrite();
+    vulkan.CheckBufferCachePreciseWrites();
     vulkan.CheckTextureCacheCollectorProgress();
     return 0;
   }
@@ -58757,6 +58868,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheDetachedDownload();
     vulkan.CheckBufferCacheOrderedWrite();
+    vulkan.CheckBufferCachePreciseWrites();
     vulkan.CheckBufferCacheBdaStoreOwnership();
     vulkan.CheckBufferCacheBdaResidency();
     vulkan.CheckBufferCacheSparsePageTable();

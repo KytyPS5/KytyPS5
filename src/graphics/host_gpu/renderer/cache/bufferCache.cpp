@@ -374,6 +374,16 @@ void BufferCache::MarkGpuWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
+	const auto end = vaddr + size;
+	if (!m_precise_marking) {
+		for (auto& write: m_precise_writes) {
+			const auto begin  = std::max(write.begin, vaddr);
+			const auto finish = std::min(write.end, end);
+			if (begin < finish) {
+				write.rewritten.Add(begin, finish - begin);
+			}
+		}
+	}
 	const auto tick = m_scheduler.CurrentTick();
 	auto       it   = m_gpu_write_marks.lower_bound(vaddr);
 	// A binding re-marked with its previous extent, the common case, only moves its tick.
@@ -510,7 +520,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-      m_texture_cache(texture_cache) {
+      m_texture_cache(texture_cache), m_page_diff(graphics, scheduler) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -801,6 +811,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+		RangeSet   before;
+		if (precise) {
+		}
+		m_precise_marking = precise;
+		m_precise_marking = false;
+		if (precise) {
+		}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer, raw_image_read);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
@@ -1052,6 +1069,133 @@ void BufferCache::RunGarbageCollector() {
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
 		m_slot_buffers.erase(id);
+	}
+}
+
+namespace {
+
+constexpr uint64_t PreciseWriteMinSize = 1024 * 1024;
+constexpr size_t   MaxPreciseWrites    = 4;
+constexpr size_t   MaxPreciseSnapshots = 2;
+constexpr uint32_t DenseResolves       = 3;
+
+} // namespace
+
+void BufferCache::BeginPreciseWrites() {
+	m_precise_scope = true;
+}
+
+bool BufferCache::CanTrackPreciseWrite(const Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	if (!m_precise_scope || size < PreciseWriteMinSize ||
+	    m_precise_writes.size() >= MaxPreciseWrites) {
+		return false;
+	}
+	const auto page_begin = Common::AlignDown(vaddr, PageDiff::PageSize);
+	const auto page_end   = Common::AlignUp(vaddr + size, PageDiff::PageSize);
+	if ((page_end - page_begin) / PageDiff::PageSize > PageDiff::MaxPages ||
+	    !buffer.IsInBounds(page_begin, page_end - page_begin)) {
+		return false;
+	}
+	const auto dense = m_precise_dense.find({vaddr, size});
+	if (dense != m_precise_dense.end() && dense->second >= DenseResolves) {
+		return false;
+	}
+	return std::ranges::none_of(m_precise_writes, [&](const PreciseWrite& write) {
+		return !write.compared && write.page_begin < page_end && page_begin < write.page_end;
+	});
+}
+
+void BufferCache::TrackPreciseWrite(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                    RangeSet before) {
+	auto& write       = m_precise_writes.emplace_back();
+	write.begin       = vaddr;
+	write.end         = vaddr + size;
+	write.page_begin  = Common::AlignDown(vaddr, PageDiff::PageSize);
+	write.page_end    = Common::AlignUp(vaddr + size, PageDiff::PageSize);
+	write.before      = std::move(before);
+	const auto bytes  = write.page_end - write.page_begin;
+	const auto pages  = bytes / PageDiff::PageSize;
+	const auto pooled = std::ranges::find_if(
+	    m_precise_snapshots, [&](const auto& snapshot) { return snapshot->Size() >= bytes; });
+	if (pooled != m_precise_snapshots.end()) {
+		write.snapshot = std::move(*pooled);
+		m_precise_snapshots.erase(pooled);
+	} else {
+		write.snapshot = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+		                                          0, AllFlags, bytes);
+	}
+	const auto words = Common::AlignUp((pages + 31u) / 32u * sizeof(uint32_t), 16);
+	write.changed    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                            AllFlags, words);
+	write.changed->Fill(0, words, 0);
+	write.snapshot->CopyFrom(m_scheduler.Current(), buffer, buffer.Offset(write.page_begin), 0,
+	                         bytes);
+}
+
+void BufferCache::EndPreciseWrites() {
+	m_precise_scope = false;
+	for (auto& write: m_precise_writes) {
+		if (write.compared) {
+			continue;
+		}
+		const auto  bytes   = write.page_end - write.page_begin;
+		const auto& buffer  = m_slot_buffers[FindBuffer(write.page_begin, bytes)];
+		auto&       command = m_scheduler.Current();
+		command.EndRendering();
+		m_page_diff.Compare(command.Handle(), buffer.Handle(), buffer.Offset(write.page_begin),
+		                    write.snapshot->Handle(), write.changed->Handle(), bytes);
+		write.compared = true;
+		m_scheduler.DeferOperation([this] { ResolvePreciseWrite(); });
+	}
+}
+
+void BufferCache::ResolvePreciseWrite() {
+	EXIT_IF(m_precise_writes.empty() || !m_precise_writes.front().compared);
+	auto write = std::move(m_precise_writes.front());
+	m_precise_writes.pop_front();
+	const auto pages = (write.page_end - write.page_begin) / PageDiff::PageSize;
+	write.changed->Invalidate(0, write.changed->Size());
+	const auto* bits = reinterpret_cast<const uint32_t*>(write.changed->Mapped().data());
+	RangeSet    proven;
+	uint64_t    changed = 0;
+	proven.Add(write.begin, write.end - write.begin);
+	for (uint64_t page = 0; page < pages; page++) {
+		if (((bits[page / 32u] >> (page % 32u)) & 1u) != 0) {
+			proven.Subtract(write.page_begin + page * PageDiff::PageSize, PageDiff::PageSize);
+			changed++;
+		}
+	}
+	write.before.ForEach(
+	    [&](uint64_t begin, uint64_t end) { proven.Subtract(begin, end - begin); });
+	write.rewritten.ForEach(
+	    [&](uint64_t begin, uint64_t end) { proven.Subtract(begin, end - begin); });
+	auto& dense = m_precise_dense[{write.begin, write.end - write.begin}];
+	dense       = changed * 4u >= pages * 3u ? dense + 1u : 0u;
+	for (auto& later: m_precise_writes) {
+		RangeSet handed;
+		proven.ForEachInRange(
+		    later.begin, later.end - later.begin,
+		    [&](uint64_t begin, uint64_t end) { handed.Add(begin, end - begin); });
+		handed.ForEach([&](uint64_t begin, uint64_t end) {
+			later.before.Subtract(begin, end - begin);
+			proven.Subtract(begin, end - begin);
+		});
+	}
+	RangeSet pages_touched;
+	proven.ForEach([&](uint64_t begin, uint64_t end) {
+		m_gpu_modified_ranges.Subtract(begin, end - begin);
+		const auto first = Common::AlignDown(begin, PageDiff::PageSize);
+		pages_touched.Add(first, Common::AlignUp(end, PageDiff::PageSize) - first);
+	});
+	pages_touched.ForEach([&](uint64_t begin, uint64_t end) {
+		for (auto page = begin; page < end; page += PageDiff::PageSize) {
+			if (!m_gpu_modified_ranges.Intersects(page, PageDiff::PageSize)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(page, PageDiff::PageSize);
+			}
+		}
+	});
+	if (m_precise_snapshots.size() < MaxPreciseSnapshots) {
+		m_precise_snapshots.push_back(std::move(write.snapshot));
 	}
 }
 

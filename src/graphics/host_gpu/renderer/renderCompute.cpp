@@ -42,6 +42,20 @@
 #include <vector>
 
 namespace Libs::Graphics {
+namespace {
+
+class PreciseWriteScope {
+public:
+	explicit PreciseWriteScope(BufferCache& cache): m_cache(cache) { m_cache.BeginPreciseWrites(); }
+	~PreciseWriteScope() { m_cache.EndPreciseWrites(); }
+	KYTY_CLASS_NO_COPY(PreciseWriteScope);
+
+private:
+	BufferCache& m_cache;
+};
+
+} // namespace
+
 static void PushThreadLimit(vk::CommandBuffer command, const PipelineCache::Pipeline& pipeline,
                             const ThreadDispatcher::Record& record) {
 	const uint32_t words[ShaderRecompiler::IR::PushData::DispatchLimitDwordCount] {
@@ -559,6 +573,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
+	const PreciseWriteScope precise_writes(m_context.GetBufferCache());
 	RebindBuffers(bindings);
 
 	auto vk_buffer = buffer.Handle();
@@ -648,6 +663,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	const PreciseWriteScope precise_writes(m_context.GetBufferCache());
 	RebindBuffers(bindings);
 	ThreadDispatcher::Record dispatch_record {args_buffer->Handle(), args_offset, 0};
 	if (thread_dimensions) {

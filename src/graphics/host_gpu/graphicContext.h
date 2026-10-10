@@ -41,6 +41,8 @@ struct GraphicContext {
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
+	// From the calibrated-timestamps extension the device enabled (KHR or EXT), or null.
+	PFN_vkGetCalibratedTimestampsKHR   get_calibrated_timestamps = nullptr;
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;

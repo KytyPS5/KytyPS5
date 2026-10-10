@@ -39,6 +39,10 @@ public:
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	// Recorded at the end of every command buffer, before it is submitted.
+	void SetBeforeSubmit(Common::UniqueFunction<void>&& callback) {
+		m_before_submit = std::move(callback);
+	}
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
@@ -101,6 +105,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	Common::UniqueFunction<void> m_before_submit;
 };
 
 } // namespace Libs::Graphics

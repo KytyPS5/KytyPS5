@@ -1,0 +1,615 @@
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
+
+#include "common/assert.h"
+#include "common/threads.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/sync.h"
+
+#include <algorithm>
+#include <cinttypes>
+#include <cstring>
+
+namespace Libs::Graphics {
+
+namespace {
+
+constexpr double   FixedPointOne       = 4294967296.0;
+constexpr uint64_t ReferenceFrequency  = 100000000;
+constexpr uint64_t CalibrationInterval = 2 * ReferenceFrequency;
+// A new segment starts this long after its sample: a batch submitted before the sample and run
+// within this delay converts with the segment the previous batches used.
+constexpr uint64_t SegmentDelay = ReferenceFrequency;
+
+uint64_t Scale(uint64_t delta, uint64_t rate) {
+	const uint64_t delta_lo = delta & 0xffffffffu;
+	return (delta >> 32u) * rate + delta_lo * (rate >> 32u) +
+	       ((delta_lo * (rate & 0xffffffffu)) >> 32u);
+}
+
+double RateOf(const GpuTimestamps::Segment& segment) {
+	return static_cast<double>(segment.rate) / FixedPointOne;
+}
+
+uint64_t FixedRate(double rate) {
+	return static_cast<uint64_t>(rate * FixedPointOne);
+}
+
+uint8_t AllBytes(uint32_t size) {
+	return static_cast<uint8_t>((1u << size) - 1u);
+}
+
+uint64_t ValidMask(GraphicContext& graphics) {
+	uint32_t count = 0;
+	graphics.physical_device.getQueueFamilyProperties(&count, nullptr);
+	std::vector<vk::QueueFamilyProperties> families(count);
+	graphics.physical_device.getQueueFamilyProperties(&count, families.data());
+	const auto bits = graphics.queue_family < families.size()
+	                      ? families[graphics.queue_family].timestampValidBits
+	                      : 0u;
+	return bits == 0 ? 0 : bits >= 64 ? UINT64_MAX : (uint64_t {1} << bits) - 1u;
+}
+
+double NominalRate(const GraphicContext& graphics) {
+	// Reference ticks (10 ns) per host GPU tick.
+	return graphics.physical_device_properties.limits.timestampPeriod / 10.0;
+}
+
+} // namespace
+
+GpuTimestamps::GpuTimestamps(GraphicContext& graphics, CommandScheduler& scheduler,
+                             RenderContext& context)
+    : m_graphics(graphics), m_scheduler(scheduler), m_context(context), m_mask(ValidMask(graphics)),
+      m_readback(graphics, scheduler, MemoryUsage::Download, 0,
+                 vk::BufferUsageFlagBits::eTransferDst, QueryCount * sizeof(uint64_t)),
+      m_clock(m_mask, NominalRate(graphics)) {
+	SetVulkanObjectNameF(m_graphics.device, m_readback.Handle(), "GPU Timestamp Readback");
+	if (m_mask == 0) {
+		return;
+	}
+	vk::QueryPoolCreateInfo pool_info {};
+	pool_info.queryType  = vk::QueryType::eTimestamp;
+	pool_info.queryCount = QueryCount;
+	RequireVulkanSuccess(m_graphics.device.createQueryPool(&pool_info, nullptr, &m_pool),
+	                     "create GPU timestamp query pool");
+	// A first sample here gives the first segment a measured rate.
+	uint64_t   ticks     = 0;
+	uint64_t   reference = 0;
+	const bool sampled   = SampleClocks(ticks, reference);
+	if (sampled) {
+		m_clock.Sample(ticks, reference);
+	}
+	InitializeWithSubmission(!sampled);
+	m_scheduler.SetBeforeSubmit([this] { Resolve(); });
+}
+
+GpuTimestamps::~GpuTimestamps() {
+	m_scheduler.SetBeforeSubmit({});
+	if (m_pool != nullptr) {
+		m_graphics.device.destroyQueryPool(m_pool, nullptr);
+	}
+}
+
+uint64_t GpuTimestamps::ToReference(const Segment& previous, const Segment& current,
+                                    uint64_t ticks) {
+	return Clock::Convert(previous, current, ticks, UINT64_MAX);
+}
+
+uint64_t GpuTimestamps::Clock::Convert(const Segment& previous, const Segment& current,
+                                       uint64_t ticks, uint64_t mask) {
+	const bool  after_current = ((ticks - current.device_base) & mask) <= (mask >> 1u);
+	const auto& segment       = after_current ? current : previous;
+	const auto  forward       = (ticks - segment.device_base) & mask;
+	return forward <= (mask >> 1u)
+	           ? segment.reference_base + Scale(forward, segment.rate)
+	           : segment.reference_base - Scale((segment.device_base - ticks) & mask, segment.rate);
+}
+
+uint64_t GpuTimestamps::Clock::Convert(uint64_t ticks) const {
+	return Convert(m_previous, m_current, ticks & m_mask, m_mask);
+}
+
+void GpuTimestamps::Clock::Restart(uint64_t ticks, uint64_t reference) {
+	m_measure_reference = reference;
+	m_measure_ticks     = 0;
+	m_last_ticks        = ticks;
+	m_last_reference    = reference;
+}
+
+void GpuTimestamps::Clock::Sample(uint64_t ticks, uint64_t reference) {
+	ticks &= m_mask;
+	if (!m_sampled) {
+		m_sampled = true;
+		Restart(ticks, reference);
+		return;
+	}
+	// A masked interval is only known while it is shorter than half a counter period: past a
+	// quarter, by the current rate, measure again from this sample.
+	const double rate_before = m_anchored ? RateOf(m_current) : m_nominal_rate;
+	const auto   interval    = (ticks - m_last_ticks) & m_mask;
+	if (static_cast<double>(reference - m_last_reference) / rate_before >=
+	    static_cast<double>(m_mask >> 2u)) {
+		Restart(ticks, reference);
+		m_current  = {ticks, reference, FixedRate(rate_before)};
+		m_previous = m_current;
+		m_anchored = true;
+		return;
+	}
+	if (interval == 0) {
+		return;
+	}
+	m_measure_ticks += interval;
+	// Host periods can be off: RADV reports 10.019 ns for a 10 ns counter on Strix Halo.
+	const auto   measured_reference = reference - m_measure_reference;
+	const double rate =
+	    measured_reference >= ReferenceFrequency / 20
+	        ? static_cast<double>(measured_reference) / static_cast<double>(m_measure_ticks)
+	        : rate_before;
+	if (!m_anchored) {
+		m_current  = {ticks, reference, FixedRate(rate)};
+		m_previous = m_current;
+		m_anchored = true;
+	} else {
+		// Remove the offset error over the next interval.
+		const double error = static_cast<double>(static_cast<int64_t>(reference - Convert(ticks)));
+		const double correction =
+		    std::clamp(error / static_cast<double>(interval), -rate / 1000.0, rate / 1000.0);
+		const auto knot =
+		    (ticks + static_cast<uint64_t>(static_cast<double>(SegmentDelay) / rate)) & m_mask;
+		const auto knot_reference = Convert(knot);
+		m_previous                = m_current;
+		m_current                 = {knot, knot_reference, FixedRate(rate + correction)};
+	}
+	m_last_ticks     = ticks;
+	m_last_reference = reference;
+}
+
+void GpuTimestamps::Clock::Anchor(uint64_t ticks, uint64_t reference) {
+	m_anchor   = {ticks & m_mask, reference, FixedRate(m_nominal_rate)};
+	m_current  = m_anchor;
+	m_previous = m_current;
+	m_anchored = true;
+	Restart(ticks & m_mask, reference);
+}
+
+void GpuTimestamps::Clock::Advance(uint64_t reference) {
+	// The anchor line from a base at this reference time, counted from the anchor so that
+	// rounding does not accumulate.
+	const auto elapsed =
+	    reference > m_anchor.reference_base ? reference - m_anchor.reference_base : uint64_t {0};
+	const auto ticks = static_cast<uint64_t>(static_cast<double>(elapsed) / RateOf(m_anchor));
+	m_current        = {(m_anchor.device_base + ticks) & m_mask,
+	                    m_anchor.reference_base + Scale(ticks, m_anchor.rate), m_anchor.rate};
+	m_previous       = m_current;
+	m_last_reference = reference;
+}
+
+bool GpuTimestamps::SampleClocks(uint64_t& ticks, uint64_t& reference) const {
+	const auto get = m_graphics.get_calibrated_timestamps;
+	if (get == nullptr) {
+		return false;
+	}
+	VkCalibratedTimestampInfoKHR info {};
+	info.sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+	info.timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+	// The device sample lies between the two reference reads; keep the tightest bracket.
+	uint64_t best = UINT64_MAX;
+	for (int attempt = 0; attempt < 4; ++attempt) {
+		uint64_t   device    = 0;
+		uint64_t   deviation = 0;
+		const auto before    = Sync::ReadReferenceClock();
+		const auto result    = get(m_graphics.device, 1, &info, &device, &deviation);
+		const auto after     = Sync::ReadReferenceClock();
+		RequireVulkanSuccess(static_cast<vk::Result>(result), "vkGetCalibratedTimestamps");
+		if (after - before < best) {
+			best      = after - before;
+			ticks     = device;
+			reference = before + (after - before) / 2;
+		}
+	}
+	return true;
+}
+
+void GpuTimestamps::InitializeWithSubmission(bool anchor) {
+	// Queries start reset. Without calibrated timestamps, one timestamp read back right after its
+	// batch anchors the clock.
+	vk::CommandPoolCreateInfo pool_info {};
+	pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient;
+	pool_info.queueFamilyIndex = m_graphics.queue_family;
+	vk::CommandPool pool       = nullptr;
+	RequireVulkanSuccess(m_graphics.device.createCommandPool(&pool_info, nullptr, &pool),
+	                     "create GPU clock setup pool");
+	vk::CommandBufferAllocateInfo allocate {};
+	allocate.commandPool        = pool;
+	allocate.level              = vk::CommandBufferLevel::ePrimary;
+	allocate.commandBufferCount = 1;
+	vk::CommandBuffer command   = nullptr;
+	RequireVulkanSuccess(m_graphics.device.allocateCommandBuffers(&allocate, &command),
+	                     "allocate GPU clock setup commands");
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(command.begin(&begin), "begin GPU clock setup commands");
+	command.resetQueryPool(m_pool, 0, QueryCount);
+	vk::QueryPool anchor_pool = nullptr;
+	if (anchor) {
+		vk::QueryPoolCreateInfo anchor_info {};
+		anchor_info.queryType  = vk::QueryType::eTimestamp;
+		anchor_info.queryCount = 1;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&anchor_info, nullptr, &anchor_pool),
+		                     "create GPU clock anchor query");
+		command.resetQueryPool(anchor_pool, 0, 1);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, anchor_pool, 0);
+	}
+	RequireVulkanSuccess(command.end(), "end GPU clock setup commands");
+	vk::Fence           fence = nullptr;
+	vk::FenceCreateInfo fence_info {};
+	RequireVulkanSuccess(m_graphics.device.createFence(&fence_info, nullptr, &fence),
+	                     "create GPU clock setup fence");
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		vk::SubmitInfo    submit {};
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers    = &command;
+		RequireVulkanSuccess(m_graphics.queue.submit(1, &submit, fence), "submit GPU clock setup");
+	}
+	RequireVulkanSuccess(m_graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX),
+	                     "wait GPU clock setup");
+	const auto reference = Sync::ReadReferenceClock();
+	if (anchor) {
+		uint64_t ticks = 0;
+		RequireVulkanSuccess(m_graphics.device.getQueryPoolResults(anchor_pool, 0, 1, sizeof(ticks),
+		                                                           &ticks, sizeof(ticks),
+		                                                           vk::QueryResultFlagBits::e64),
+		                     "read GPU clock anchor");
+		m_graphics.device.destroyQueryPool(anchor_pool, nullptr);
+		m_clock.Anchor(ticks, reference);
+	}
+	m_graphics.device.destroyFence(fence, nullptr);
+	m_graphics.device.destroyCommandPool(pool, nullptr);
+}
+
+void GpuTimestamps::Write(uint64_t vaddr, uint32_t size, bool end_of_pipe) {
+	if ((size != sizeof(uint32_t) && size != sizeof(uint64_t)) || vaddr == 0 ||
+	    (vaddr & (sizeof(uint32_t) - 1u)) != 0) {
+		EXIT("invalid GPU clock write, dst=0x%016" PRIx64 " size=%u\n", vaddr, size);
+	}
+	if (m_mask == 0) {
+		// The host GPU has no timestamps here: the parse time stands in.
+		const auto value = Sync::ReadReferenceClock();
+		std::memcpy(reinterpret_cast<void*>(vaddr), &value, size);
+		return;
+	}
+	StoreRetries();
+	const auto now = Sync::ReadReferenceClock();
+	if (m_graphics.get_calibrated_timestamps != nullptr) {
+		if (!m_clock.Anchored() || now - m_clock.LastReference() >= CalibrationInterval) {
+			uint64_t ticks     = 0;
+			uint64_t reference = 0;
+			EXIT_IF(!SampleClocks(ticks, reference));
+			m_clock.Sample(ticks, reference);
+		}
+	} else if (now - m_clock.LastReference() >= CalibrationInterval) {
+		m_clock.Advance(now);
+	}
+	if (m_issued - m_retired.load(std::memory_order_acquire) >= QueryCount) {
+		// Every query waits for its batch to complete.
+		m_scheduler.Finish();
+		m_scheduler.WaitPriorityOperations(m_scheduler.CurrentTick() - 1);
+	}
+	auto&      batch = CurrentBatch();
+	const auto query = static_cast<uint32_t>(m_issued % QueryCount);
+	if (batch.queries == 0) {
+		batch.first_query = query;
+	}
+	m_issued++;
+	batch.queries++;
+	uint64_t serial = 0;
+	{
+		std::lock_guard lock(m_mutex);
+		serial = ++m_serial;
+		m_deferred.push_back({{vaddr, 0, size, serial, AllBytes(size)}, false});
+	}
+	batch.writes.push_back({vaddr, 0, query, size, false, serial});
+	m_unstored.fetch_add(1, std::memory_order_relaxed);
+	// Timestamps may be written inside a render pass; their readback waits for the batch end.
+	m_scheduler.Current().Handle().writeTimestamp2(end_of_pipe
+	                                                   ? vk::PipelineStageFlagBits2::eAllCommands
+	                                                   : vk::PipelineStageFlagBits2::eTopOfPipe,
+	                                               m_pool, query);
+}
+
+bool GpuTimestamps::WriteLabel(uint64_t vaddr, uint64_t value, uint32_t size) {
+	StoreRetries();
+	if (m_unstored.load(std::memory_order_acquire) == 0) {
+		return false;
+	}
+	uint64_t serial = 0;
+	{
+		std::lock_guard lock(m_mutex);
+		serial = ++m_serial;
+		m_deferred.push_back({{vaddr, value, size, serial, AllBytes(size)}, true});
+	}
+	CurrentBatch().writes.push_back({vaddr, value, 0, size, true, serial});
+	m_unstored.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+std::vector<GpuTimestamps::Label> GpuTimestamps::PendingLabels(uint64_t vaddr, uint32_t size) {
+	std::vector<Label> labels;
+	std::lock_guard    lock(m_mutex);
+	for (const auto& deferred: m_deferred) {
+		if (deferred.label && deferred.live != 0 && deferred.vaddr < vaddr + size &&
+		    vaddr < deferred.vaddr + deferred.size) {
+			labels.push_back(deferred);
+		}
+	}
+	return labels;
+}
+
+uint64_t GpuTimestamps::ApplyLabels(const std::vector<Label>& labels, uint64_t vaddr, uint32_t size,
+                                    uint64_t value) {
+	// Byte by byte: a 64-bit read can cover a 32-bit label, or a 32-bit read half of a 64-bit one.
+	for (const auto& label: labels) {
+		const auto begin = std::max(vaddr, label.vaddr);
+		const auto end   = std::min(vaddr + size, label.vaddr + label.size);
+		for (auto address = begin; address < end; ++address) {
+			if (((label.live >> (address - label.vaddr)) & 1u) != 0) {
+				reinterpret_cast<uint8_t*>(&value)[address - vaddr] =
+				    reinterpret_cast<const uint8_t*>(&label.value)[address - label.vaddr];
+			}
+		}
+	}
+	return value;
+}
+
+void GpuTimestamps::Overwritten(uint64_t vaddr, uint64_t size) {
+	// Entries are added on this thread: none counted means none to update.
+	if (m_unstored.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	std::lock_guard lock(m_mutex);
+	for (auto& deferred: m_deferred) {
+		const auto begin = std::max(vaddr, deferred.vaddr);
+		const auto end   = std::min(vaddr + size, deferred.vaddr + deferred.size);
+		for (auto address = begin; address < end; ++address) {
+			deferred.live &= static_cast<uint8_t>(~(1u << (address - deferred.vaddr)));
+		}
+	}
+}
+
+std::deque<GpuTimestamps::Deferred>::iterator GpuTimestamps::FindDeferred(uint64_t serial) {
+	const auto deferred = std::lower_bound(
+	    m_deferred.begin(), m_deferred.end(), serial,
+	    [](const Deferred& pending, uint64_t value) { return pending.serial < value; });
+	EXIT_IF(deferred == m_deferred.end() || deferred->serial != serial);
+	return deferred;
+}
+
+template <typename F>
+bool GpuTimestamps::ForEachLiveRun(const Label& deferred, F&& run) {
+	for (uint32_t begin = 0; begin < deferred.size;) {
+		if (((deferred.live >> begin) & 1u) == 0) {
+			begin++;
+			continue;
+		}
+		auto end = begin + 1;
+		while (end < deferred.size && ((deferred.live >> end) & 1u) != 0) {
+			end++;
+		}
+		if (!run(begin, end - begin)) {
+			return false;
+		}
+		begin = end;
+	}
+	return true;
+}
+
+void GpuTimestamps::StoreAll() {
+	if (m_unstored.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	m_scheduler.Finish();
+	m_scheduler.WaitPriorityOperations(m_scheduler.CurrentTick() - 1);
+	StoreRetries();
+	EXIT_IF(m_unstored.load(std::memory_order_acquire) != 0);
+}
+
+GpuTimestamps::Batch& GpuTimestamps::CurrentBatch() {
+	if (m_batch == nullptr) {
+		m_batch = std::make_shared<Batch>();
+		// Queued before the interrupts recorded after this write, so it runs first.
+		m_scheduler.DeferPriorityOperation([this, batch = m_batch] { Complete(*batch); });
+	}
+	return *m_batch;
+}
+
+void GpuTimestamps::Resolve() {
+	if (m_batch == nullptr) {
+		return;
+	}
+	const auto batch = std::move(m_batch);
+	m_batch          = nullptr;
+	if (batch->queries != 0) {
+		Copy(*batch);
+	}
+
+	std::lock_guard lock(m_mutex);
+	batch->previous = m_clock.Previous();
+	batch->current  = m_clock.Current();
+	batch->resolved = true;
+}
+
+void GpuTimestamps::Copy(const Batch& batch) {
+	auto& command_buffer = m_scheduler.Current();
+	command_buffer.EndRendering();
+	auto       command = command_buffer.Handle();
+	const auto count   = batch.queries;
+	const auto first   = std::min(count, QueryCount - batch.first_query);
+	const auto copy    = [&](uint32_t query, uint32_t queries) {
+		command.copyQueryPoolResults(m_pool, query, queries, m_readback.Handle(),
+		                             query * sizeof(uint64_t), sizeof(uint64_t),
+		                             vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		// Query commands execute in submission order: the reset follows the copy.
+		command.resetQueryPool(m_pool, query, queries);
+	};
+	copy(batch.first_query, first);
+	if (count > first) {
+		copy(0, count - first);
+	}
+	vk::MemoryBarrier2 copied {};
+	copied.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	copied.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	copied.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	copied.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &copied;
+	command.pipelineBarrier2(dependency);
+}
+
+void GpuTimestamps::Complete(const Batch& batch) {
+	const auto count = batch.queries;
+	Segment    previous;
+	Segment    current;
+	bool       deferred = false;
+	{
+		std::lock_guard lock(m_mutex);
+		// Submitting the command buffer resolves its batch, before the batch can complete.
+		EXIT_IF(!batch.resolved);
+		previous = batch.previous;
+		current  = batch.current;
+		deferred = m_retrying || !m_retries.empty();
+	}
+	if (count != 0) {
+		const auto first = std::min(count, QueryCount - batch.first_query);
+		m_readback.Invalidate(batch.first_query * sizeof(uint64_t), first * sizeof(uint64_t));
+		m_readback.Invalidate(0, (count - first) * sizeof(uint64_t));
+	}
+	uint64_t stored = 0;
+	for (const auto& write: batch.writes) {
+		auto value = write.value;
+		if (!write.label) {
+			uint64_t ticks = 0;
+			std::memcpy(&ticks, m_readback.Mapped().data() + write.query * sizeof(uint64_t),
+			            sizeof(ticks));
+			value = Clock::Convert(previous, current, ticks & m_mask, m_mask);
+		}
+		if (!deferred) {
+			// Stored under the lock: a later write of the GPU thread either finds this entry
+			// gone and lands after it, or clears the bytes it covers first.
+			std::lock_guard lock(m_mutex);
+			const auto      entry = FindDeferred(write.serial);
+			const auto*     bytes = reinterpret_cast<const uint8_t*>(&value);
+			if (ForEachLiveRun(*entry, [&](uint32_t offset, uint32_t size) {
+				    return m_context.StoreAtCompletion(write.vaddr + offset, bytes + offset, size);
+			    })) {
+				m_deferred.erase(entry);
+				stored++;
+				continue;
+			}
+		}
+		// Later values must not land before this one.
+		deferred = true;
+		std::lock_guard lock(m_mutex);
+		m_retries.push_back({write.vaddr, value, write.size, {}, write.serial});
+	}
+	m_retired.fetch_add(count, std::memory_order_release);
+	Stored(stored);
+	if (deferred) {
+		QueueRetries();
+	}
+}
+
+void GpuTimestamps::Stored(uint64_t count) {
+	if (count == 0) {
+		return;
+	}
+	m_unstored.fetch_sub(count, std::memory_order_release);
+	// A queue waiting for one of these values polls again.
+	m_context.NotifyGuestWrite();
+}
+
+void GpuTimestamps::QueueRetries() {
+	// A guest may wait for a deferred value without another GPU clock write: the GPU thread
+	// stores it as soon as it is between packets. One queued store covers all retries so far.
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_retries.empty() || m_retry_queued) {
+			return;
+		}
+		m_retry_queued = true;
+	}
+	const bool queued = m_context.PostGpuCommand([this] {
+		{
+			std::lock_guard lock(m_mutex);
+			m_retry_queued = false;
+		}
+		StoreRetries();
+	});
+	if (!queued) {
+		// The GPU is shutting down: the unmaps of the teardown store what is left.
+		std::lock_guard lock(m_mutex);
+		m_retry_queued = false;
+	}
+}
+
+void GpuTimestamps::Signal(Common::UniqueFunction<void>&& effect) {
+	bool queued = false;
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_retrying || !m_retries.empty()) {
+			m_retries.push_back({0, 0, 0, std::move(effect)});
+			queued = true;
+		}
+	}
+	if (queued) {
+		QueueRetries();
+	} else {
+		effect();
+	}
+}
+
+void GpuTimestamps::StoreRetries() {
+	// The GPU thread and a teardown unmap can both store: one at a time keeps the order.
+	std::lock_guard store_lock(m_store_mutex);
+	for (;;) {
+		std::vector<Retry> retries;
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_retries.empty()) {
+				m_retrying = false;
+				return;
+			}
+			retries.swap(m_retries);
+			m_retrying = true;
+		}
+		// Plain stores fault here like other GPU-thread writes, so the watching caches see them.
+		// Unmapping a range stores its retries first, so every destination is still mapped.
+		uint64_t stored = 0;
+		for (const auto& retry: retries) {
+			if (retry.effect) {
+				retry.effect();
+			} else {
+				Label entry;
+				{
+					std::lock_guard lock(m_mutex);
+					const auto      deferred = FindDeferred(retry.serial);
+					entry                    = *deferred;
+					m_deferred.erase(deferred);
+				}
+				// Retries run on the GPU thread (or once it stopped), which makes the writes that
+				// overwrite them: the live bytes stay as read.
+				(void)ForEachLiveRun(entry, [&](uint32_t offset, uint32_t size) {
+					std::memcpy(reinterpret_cast<uint8_t*>(retry.vaddr) + offset,
+					            reinterpret_cast<const uint8_t*>(&retry.value) + offset, size);
+					return true;
+				});
+				stored++;
+			}
+		}
+		Stored(stored);
+	}
+}
+
+} // namespace Libs::Graphics

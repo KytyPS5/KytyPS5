@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -1300,6 +1301,144 @@ void CheckLeastRecentlyUsedCacheOrdering() {
           visited == std::vector<uint32_t>{1, 3, 2},
           "touching a non-tail item left a cycle or changed LRU order");
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
+}
+
+// Host GPU ticks convert to the guest clock with one continuous, monotonic function.
+void CheckGpuClockSegments() {
+  using Segment = GpuTimestamps::Segment;
+  const auto expected = [](const Segment &segment, uint64_t ticks) {
+    const auto delta = ticks - segment.device_base;
+    return segment.reference_base +
+           static_cast<uint64_t>(
+               (static_cast<unsigned __int128>(delta) * segment.rate) >> 32u);
+  };
+  // 100 MHz counter (AMD), 1 GHz counter (NVIDIA) and a 19.2 MHz counter (Intel).
+  for (const uint64_t rate :
+       {uint64_t{1} << 32u, uint64_t{429496730}, uint64_t{22369621333}}) {
+    const Segment segment{0x123456789abcull, 0x1000000000ull, rate};
+    for (const uint64_t delta :
+         {uint64_t{0}, uint64_t{1}, uint64_t{0xffffffff}, uint64_t{0x100000000},
+          uint64_t{1} << 40u, (uint64_t{1} << 44u) + 12345u}) {
+      Require("GpuClockSegments", "segment scale",
+              GpuTimestamps::ToReference(segment, segment,
+                                         segment.device_base + delta) ==
+                  expected(segment, segment.device_base + delta),
+              "host GPU ticks did not scale exactly to the guest clock");
+    }
+  }
+  const Segment previous{1000000, 5000000, uint64_t{1} << 32u};
+  const uint64_t knot = 3000000;
+  const Segment current{knot,
+                        GpuTimestamps::ToReference(previous, previous, knot),
+                        (uint64_t{1} << 32u) + (uint64_t{1} << 22u)};
+  uint64_t last = 0;
+  bool monotonic = true;
+  for (uint64_t ticks = knot - 1000; ticks < knot + 1000; ++ticks) {
+    const auto value = GpuTimestamps::ToReference(previous, current, ticks);
+    monotonic &= value >= last;
+    last = value;
+  }
+  Require("GpuClockSegments", "segment continuity",
+          monotonic &&
+              GpuTimestamps::ToReference(previous, current, knot - 1) + 1 ==
+                  GpuTimestamps::ToReference(previous, current, knot) &&
+              GpuTimestamps::ToReference(previous, current, previous.device_base - 10) ==
+                  previous.reference_base - 10,
+          "segments do not join into one monotonic function");
+  std::printf("[host]    %-32s ok\n", "GpuClockSegments");
+}
+
+// A narrow counter (36 bits at 19.2 MHz wraps every hour) converts correctly across wraps,
+// calibrated or not, and a correction keeps the function monotonic.
+void CheckGpuClockCalibration() {
+  constexpr uint64_t mask = (uint64_t{1} << 36u) - 1u;
+  constexpr uint64_t second = 100000000;
+  constexpr uint64_t start_reference = 1000000000000ull;
+  constexpr uint64_t start_ticks = mask - 192000000; // 10 s before the counter wraps
+  constexpr uint64_t tolerance = 100;                // 1 us of the 100 MHz clock
+  const auto device_ticks = [&](double ticks_per_reference, uint64_t reference) {
+    return (start_ticks + static_cast<uint64_t>(
+                              static_cast<double>(reference - start_reference) *
+                              ticks_per_reference)) &
+           mask;
+  };
+  const auto close_to = [&](uint64_t value, uint64_t reference) {
+    return (value > reference ? value - reference : reference - value) <= tolerance;
+  };
+  const auto rate_of = [](const GpuTimestamps::Segment &segment) {
+    return static_cast<double>(segment.rate) / 4294967296.0;
+  };
+
+  // Calibrated: the counter runs 50 ppm faster than its reported period, wraps three times.
+  const double nominal = 100.0 / 19.2;
+  const double actual = 0.192 * (1.0 + 50e-6);
+  GpuTimestamps::Clock clock(mask, nominal);
+  clock.Sample(device_ticks(actual, start_reference), start_reference);
+  bool accurate = true;
+  bool monotonic = true;
+  bool corrected = true;
+  bool rate_measured = true;
+  uint64_t reference = start_reference + second / 5;
+  for (int sample = 0; sample < 5400; ++sample, reference += 2 * second) {
+    // One sample reads the reference 20 us late; the next samples remove the error.
+    const bool skewed = sample == 2000;
+    clock.Sample(device_ticks(actual, reference), reference + (skewed ? 2000 : 0));
+    corrected &= std::abs(rate_of(clock.Current()) - rate_of(clock.Previous())) <=
+                 rate_of(clock.Previous()) / 500.0;
+    uint64_t last = 0;
+    for (uint64_t offset = 0; offset < 2 * second; offset += second / 1000) {
+      const auto value = clock.Convert(device_ticks(actual, reference + offset));
+      monotonic &= value >= last;
+      last = value;
+    }
+    const bool settled = sample < 2000 || sample > 2020;
+    if (settled) {
+      for (const uint64_t offset : {second / 2, 3 * second / 2}) {
+        accurate &= close_to(clock.Convert(device_ticks(actual, reference + offset)),
+                         reference + offset);
+      }
+    }
+    if (sample > 100 && settled) {
+      rate_measured &=
+          std::abs(rate_of(clock.Current()) * actual - 1.0) <= 1e-5;
+    }
+  }
+  // Longer than a quarter period without a sample: the clock measures again from there.
+  reference += 40 * 60 * second;
+  clock.Sample(device_ticks(actual, reference), reference);
+  bool resumed = true;
+  for (int sample = 0; sample < 4; ++sample, reference += 2 * second) {
+    clock.Sample(device_ticks(actual, reference), reference);
+    resumed &= close_to(clock.Convert(device_ticks(actual, reference + second / 2)),
+                    reference + second / 2);
+  }
+  // A first write long after the first sample still anchors the clock.
+  GpuTimestamps::Clock late_clock(mask, nominal);
+  late_clock.Sample(device_ticks(actual, start_reference), start_reference);
+  const auto late = start_reference + 40 * 60 * second;
+  late_clock.Sample(device_ticks(actual, late), late);
+  resumed &= late_clock.Anchored() &&
+             close_to(late_clock.Convert(device_ticks(actual, late + second / 1000)),
+                  late + second / 1000);
+  Require("GpuClockCalibration", "calibrated narrow counter",
+          accurate && monotonic && corrected && rate_measured && resumed,
+          "a calibrated narrow GPU counter lost the guest clock across a wrap");
+
+  // Uncalibrated: one anchor, then the segment follows the counter across its wraps.
+  GpuTimestamps::Clock nominal_clock(mask, 1.0 / 0.192);
+  nominal_clock.Anchor(device_ticks(0.192, start_reference), start_reference);
+  bool followed = true;
+  for (uint64_t step = 1; step <= 3600; ++step) {
+    const auto now = start_reference + step * 2 * second;
+    nominal_clock.Advance(now);
+    for (const uint64_t offset : {uint64_t{0}, second / 2, 19 * second / 10}) {
+      followed &= close_to(nominal_clock.Convert(device_ticks(0.192, now + offset)),
+                       now + offset);
+    }
+  }
+  Require("GpuClockCalibration", "uncalibrated narrow counter", followed,
+          "an uncalibrated narrow GPU counter went backwards after a wrap");
+  std::printf("[host]    %-32s ok\n", "GpuClockCalibration");
 }
 
 struct BdaMapping {
@@ -2820,6 +2959,28 @@ public:
             nested_thread == gpu_thread,
         "host command did not run on the GPU thread or nested sync deadlocked");
 
+    // GPU clock writes go to GPU-visible guest memory, like any other GPU write.
+    constexpr uintptr_t clock_base = 0x0000000200700000ull;
+    constexpr uint64_t clock_size = 0x4000;
+    constexpr uint64_t clock_tolerance = 100000; // 1 ms of the 100 MHz clock
+    int64_t clock_direct_offset = -1;
+    void *clock_memory = reinterpret_cast<void *>(clock_base);
+    Require("GpuCommandLane", "GPU clock destination",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                clock_size, clock_size, 0, &clock_direct_offset) == 0 &&
+                Libs::LibKernel::Memory::KernelMapDirectMemory(
+                    &clock_memory, clock_size, 0x33, 0x10, clock_direct_offset,
+                    clock_size) == 0 &&
+                clock_memory == reinterpret_cast<void *>(clock_base),
+            "GPU clock destination mapping failed");
+    context.MapMemory(clock_base, clock_size);
+    const auto read_clock = [&](uint64_t address) {
+      uint64_t value = 0;
+      std::memcpy(&value, reinterpret_cast<const void *>(address), sizeof(value));
+      return value;
+    };
+
     {
       const auto make_release_mem =
           [](uint32_t data_sel, uint32_t interrupt_selector, void *destination,
@@ -2902,19 +3063,16 @@ public:
               gpu_scheduler.CurrentTick() == cb_db_tick;
 
           for (const auto gcr : {0u, 1u << 9u}) {
-            const auto before = Sync::ReadReferenceClock();
-            auto timestamp =
-                make_release_mem(3, 0, &cb_db_release_label, UINT64_MAX, 0x14u, gcr);
+            auto timestamp = make_release_mem(
+                3, 0, reinterpret_cast<void *>(clock_base + (gcr != 0 ? 8 : 0)),
+                UINT64_MAX, 0x14u, gcr);
             Pm4Execution timestamp_execution;
             const auto timestamp_result =
                 processor->Process(timestamp_execution, timestamp);
             Require("GpuCommandLane", "timestamp write",
                     timestamp_result == Pm4ProcessResult::Complete &&
-                        cb_db_release_label >= before &&
-                        cb_db_release_label <= Sync::ReadReferenceClock() &&
                         gpu_scheduler.CurrentTick() == cb_db_tick,
-                    "timestamp write failed, returned an invalid time, or "
-                    "submitted extra GPU work");
+                    "timestamp write failed or submitted extra GPU work");
           }
 
           auto gds_interrupt_only =
@@ -2934,6 +3092,9 @@ public:
       });
       const bool parser_did_not_wait_gpu =
           parser_complete.try_acquire_for(std::chrono::seconds(2));
+      // The GPU cannot run the timestamps before this point, long after they were parsed.
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      const auto gpu_released = Sync::ReadReferenceClock();
 
       vk::SemaphoreSignalInfo signal_info{};
       signal_info.sType = vk::StructureType::eSemaphoreSignalInfo;
@@ -2944,7 +3105,18 @@ public:
                   vk::Result::eSuccess,
               "failed to release the blocked GPU timeline");
       no_gpu_wait.join();
-      gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
+      gpu.SendCommandSync([&] {
+        gpu_scheduler.Finish();
+        gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+      });
+      const auto gpu_finished = Sync::ReadReferenceClock();
+      const auto first_timestamp = read_clock(clock_base);
+      const auto second_timestamp = read_clock(clock_base + 8);
+      Require("GpuCommandLane", "timestamp at GPU execution",
+              first_timestamp + clock_tolerance >= gpu_released &&
+                  first_timestamp <= second_timestamp &&
+                  second_timestamp <= gpu_finished + clock_tolerance,
+              "timestamp was not taken when the GPU ran the packet");
       m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
       Require("GpuCommandLane", "CPU-only unmap with pending host retirement",
               parser_did_not_wait_gpu && cpu_unmap_did_not_submit &&
@@ -2959,16 +3131,29 @@ public:
       alignas(uint64_t) uint64_t release_label = 0;
       alignas(uint64_t) uint64_t gds_label = UINT64_MAX;
       bool release_mem_submission_counts = false;
+      uint64_t clock_before = 0;
+      alignas(uint64_t) uint64_t ordered_label = 0;
+      uint64_t ordered_label_at_parse = UINT64_MAX;
+      uint32_t ordered_label_for_gpu = 0;
+      alignas(uint64_t) uint64_t wide_label = 0;
+      alignas(uint64_t) std::array<uint32_t, 2> narrow_label{0, 0x9abcdef0u};
+      bool other_width_waits = false;
+      bool other_width_deferred = false;
+      uint32_t cond_exec_ran = 0;
+      alignas(16) uint64_t predicate_label = 0;
+      uint32_t predicated_ran = 0;
+      uint32_t branch_ran = 0;
+      alignas(uint64_t) uint64_t reset_label = 0;
+      alignas(uint64_t) uint64_t half_label = 0;
+      constexpr uint64_t overwritten_clock = clock_base + 32;
+      // DMA_DATA needs a guest range.
+      auto *filled_label = reinterpret_cast<uint32_t *>(clock_base + 40);
+      *filled_label = 0;
+      bool reset_deferred = false;
+      bool later_writes_read = false;
+      uint32_t reset_cond_ran = 0;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
-
-        const auto clock_before = Sync::ReadReferenceClock();
-        processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
-                                     &release_label, UINT64_MAX, 2);
-        Require("GpuCommandLane", "EOP reference clock with interrupt",
-                release_label >= clock_before &&
-                    release_label <= Sync::ReadReferenceClock(),
-                "clock write with writeback and interrupt lost its data");
 
         for (const auto interrupt : {0u, 3u, 1u, 2u}) {
           release_label = 0;
@@ -3014,11 +3199,372 @@ public:
             interrupt_split_once &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
+
+        clock_before = Sync::ReadReferenceClock();
+        processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
+                                     reinterpret_cast<void *>(clock_base + 16),
+                                     UINT64_MAX, 2);
+        // A label behind a GPU clock value not stored yet lands after it, at completion.
+        auto ordered = make_release_mem(1, 0, &ordered_label, 0x55667788u);
+        Pm4Execution ordered_execution;
+        (void)processor->Process(ordered_execution, ordered);
+        ordered_label_at_parse = ordered_label;
+        // Later commands run after it on the host queue: a GPU-side wait sees it already.
+        ordered_label_for_gpu = processor->ReadLabel(
+            reinterpret_cast<const volatile uint32_t *>(&ordered_label));
+        // A GPU-side read of another width sees the bytes of the deferred labels it covers.
+        auto wide = make_release_mem(2, 0, &wide_label, 0x1122334455667788ull);
+        Pm4Execution wide_execution;
+        (void)processor->Process(wide_execution, wide);
+        auto narrow = make_release_mem(1, 0, narrow_label.data(), 0x13579bdfu);
+        Pm4Execution narrow_execution;
+        (void)processor->Process(narrow_execution, narrow);
+        other_width_deferred = wide_label == 0 && narrow_label[0] == 0;
+        const auto wait_passes = [&](const void *address, uint64_t reference, bool wide_wait) {
+          const auto a = reinterpret_cast<uint64_t>(address);
+          std::array<uint32_t, 9> packet{};
+          packet[0] = wide_wait ? KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0)
+                                : KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+          packet[1] = 0x10u | 3u;
+          packet[2] = static_cast<uint32_t>(a);
+          packet[3] = static_cast<uint32_t>(a >> 32u);
+          packet[4] = static_cast<uint32_t>(reference);
+          packet[5] = wide_wait ? static_cast<uint32_t>(reference >> 32u) : UINT32_MAX;
+          packet[6] = wide_wait ? UINT32_MAX : 0;
+          packet[7] = wide_wait ? UINT32_MAX : 0;
+          Pm4Execution execution;
+          return processor->Process(execution, std::span<const uint32_t>(
+                                                   packet.data(), wide_wait ? 9u : 7u)) ==
+                 Pm4ProcessResult::Complete;
+        };
+        other_width_waits =
+            wait_passes(&wide_label, 0x55667788u, false) &&
+            wait_passes(reinterpret_cast<const uint8_t *>(&wide_label) + 4, 0x11223344u,
+                        false) &&
+            wait_passes(narrow_label.data(), 0x9abcdef013579bdfull, true);
+        // COND_EXEC runs the packets it guards when the deferred label is not zero.
+        const auto ordered_address = reinterpret_cast<uint64_t>(&ordered_label);
+        const auto ran_address = reinterpret_cast<uint64_t>(&cond_exec_ran);
+        const std::array<uint32_t, 10> cond_exec{
+            KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), static_cast<uint32_t>(ordered_address),
+            static_cast<uint32_t>(ordered_address >> 32u), 0, 5,
+            KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(ran_address),
+            static_cast<uint32_t>(ran_address >> 32u), 1};
+        Pm4Execution cond_exec_execution;
+        (void)processor->Process(cond_exec_execution, cond_exec);
+        // Boolean predication and COND_INDIRECT_BUFFER read deferred labels too.
+        auto predicate = make_release_mem(2, 0, &predicate_label, 1);
+        Pm4Execution predicate_label_execution;
+        (void)processor->Process(predicate_label_execution, predicate);
+        const auto predicate_address = reinterpret_cast<uint64_t>(&predicate_label);
+        const auto predicated_address = reinterpret_cast<uint64_t>(&predicated_ran);
+        const std::array<uint32_t, 13> predicated{
+            KYTY_PM4(4, Pm4::IT_SET_PREDICATION, 0), (3u << 16u) | (1u << 8u),
+            static_cast<uint32_t>(predicate_address),
+            static_cast<uint32_t>(predicate_address >> 32u),
+            KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | 1u, 0,
+            static_cast<uint32_t>(predicated_address),
+            static_cast<uint32_t>(predicated_address >> 32u), 1,
+            KYTY_PM4(4, Pm4::IT_SET_PREDICATION, 0), 0, 0, 0};
+        Pm4Execution predicated_execution;
+        (void)processor->Process(predicated_execution, predicated);
+        const auto branch_address = reinterpret_cast<uint64_t>(&branch_ran);
+        const std::array<uint32_t, 5> then_commands{
+            KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(branch_address),
+            static_cast<uint32_t>(branch_address >> 32u), 1};
+        const auto then_address = reinterpret_cast<uint64_t>(then_commands.data());
+        const auto narrow_address = reinterpret_cast<uint64_t>(narrow_label.data());
+        const std::array<uint32_t, 14> branch{
+            KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0), 1u | (3u << 8u),
+            static_cast<uint32_t>(narrow_address), static_cast<uint32_t>(narrow_address >> 32u),
+            UINT32_MAX, 0, 0x13579bdfu, 0, static_cast<uint32_t>(then_address),
+            static_cast<uint32_t>(then_address >> 32u), 5, 0, 0, 0};
+        Pm4Execution branch_execution;
+        (void)processor->Process(branch_execution, branch);
+        // A write after a deferred label or GPU clock value wins over it, for later reads and
+        // in memory.
+        const auto process = [&](auto packet) {
+          Pm4Execution execution;
+          return processor->Process(execution, packet) == Pm4ProcessResult::Complete;
+        };
+        const auto write_data = [&](const void *address, uint32_t value) {
+          const auto a = reinterpret_cast<uint64_t>(address);
+          return process(std::array<uint32_t, 5>{KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+                                                 static_cast<uint32_t>(a),
+                                                 static_cast<uint32_t>(a >> 32u), value});
+        };
+        (void)process(make_release_mem(1, 0, &reset_label, 1));
+        reset_deferred = reset_label == 0;
+        const bool reset_written = write_data(&reset_label, 0);
+        const auto reset_address = reinterpret_cast<uint64_t>(&reset_label);
+        const auto reset_ran_address = reinterpret_cast<uint64_t>(&reset_cond_ran);
+        (void)process(std::array<uint32_t, 10>{
+            KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), static_cast<uint32_t>(reset_address),
+            static_cast<uint32_t>(reset_address >> 32u), 0, 5,
+            KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(reset_ran_address),
+            static_cast<uint32_t>(reset_ran_address >> 32u), 1});
+        (void)process(make_release_mem(2, 0, &half_label, 0x1111111122222222ull));
+        const bool half_written =
+            write_data(reinterpret_cast<const uint8_t *>(&half_label) + 4, 0x33333333u);
+        (void)process(make_release_mem(1, 0, filled_label, 5));
+        const auto filled_address = reinterpret_cast<uint64_t>(filled_label);
+        const bool filled = process(std::array<uint32_t, 7>{
+            KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, 0xabcdu, 0,
+            static_cast<uint32_t>(filled_address), static_cast<uint32_t>(filled_address >> 32u),
+            4});
+        (void)process(make_release_mem(3, 0, reinterpret_cast<void *>(overwritten_clock), 0,
+                                       0x14u, 0));
+        const bool clock_written =
+            process(std::array<uint32_t, 6>{
+                KYTY_PM4(6, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(overwritten_clock),
+                static_cast<uint32_t>(overwritten_clock >> 32u), 0x89abcdefu, 0x01234567u});
+        later_writes_read = reset_written && half_written && filled && clock_written &&
+                            wait_passes(&reset_label, 0, false) &&
+                            wait_passes(&half_label, 0x3333333322222222ull, true) &&
+                            wait_passes(filled_label, 0xabcdu, false);
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
         gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
       });
+      const auto clock_after = Sync::ReadReferenceClock();
+      const auto interrupt_clock = read_clock(clock_base + 16);
+      Require("GpuCommandLane", "EOP reference clock with interrupt",
+              interrupt_clock + clock_tolerance >= clock_before &&
+                  interrupt_clock <= clock_after + clock_tolerance,
+              "clock write with writeback and interrupt lost its data");
+      Require("GpuCommandLane", "label behind a timestamp",
+              ordered_label_at_parse == 0 && ordered_label_for_gpu == 0x55667788u &&
+                  ordered_label == 0x55667788u &&
+                  processor->ReadLabel(reinterpret_cast<const volatile uint32_t *>(
+                      &ordered_label)) == 0x55667788u,
+              "a label was written before the GPU clock value recorded before it, or a "
+              "GPU-side read after it missed it");
+      Require("GpuCommandLane", "deferred label read with another width",
+              other_width_deferred && other_width_waits &&
+                  wide_label == 0x1122334455667788ull && narrow_label[0] == 0x13579bdfu,
+              "a GPU-side wait missed part of a deferred label it covers");
+      Require("GpuCommandLane", "COND_EXEC on a deferred label", cond_exec_ran == 1,
+              "COND_EXEC skipped its packets on a label deferred to completion");
+      Require("GpuCommandLane", "predication and branch on deferred labels",
+              predicated_ran == 1 && branch_ran == 1,
+              "predication or COND_INDIRECT_BUFFER missed a label deferred to completion");
+      Require("GpuCommandLane", "write after a deferred label",
+              reset_deferred && later_writes_read && reset_cond_ran == 0 && reset_label == 0 &&
+                  half_label == 0x3333333322222222ull && *filled_label == 0xabcdu &&
+                  read_clock(overwritten_clock) == 0x0123456789abcdefull,
+              "a deferred label or GPU clock value hid or overwrote a later write");
+      // More timestamps than queries in flight, over fewer slots: every slot holds the time of
+      // its last write, in recording order.
+      constexpr uint32_t batch_slots = 1000;
+      constexpr uint32_t batch_count = GpuTimestamps::QueryCount + 100;
+      constexpr uint64_t batch_base = clock_base + 0x100;
+      const auto batch_before = Sync::ReadReferenceClock();
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        for (uint32_t index = 0; index < batch_count; ++index) {
+          auto timestamp = make_release_mem(
+              3, 0, reinterpret_cast<void *>(batch_base + (index % batch_slots) * 8), 0,
+              0x14u, 0);
+          Pm4Execution timestamp_execution;
+          (void)processor->Process(timestamp_execution, timestamp);
+        }
+        gpu_scheduler.Finish();
+        gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+      });
+      bool batch_ordered = true;
+      uint64_t previous_clock = batch_before;
+      for (uint32_t index = batch_count - batch_slots; index < batch_count; ++index) {
+        const auto value = read_clock(batch_base + (index % batch_slots) * 8);
+        batch_ordered &= index == batch_count - batch_slots
+                             ? value + clock_tolerance >= previous_clock
+                             : value >= previous_clock;
+        previous_clock = value;
+      }
+      Require("GpuCommandLane", "timestamps beyond the queries in flight",
+              batch_ordered && previous_clock <= Sync::ReadReferenceClock() + clock_tolerance,
+              "timestamps lost a write or their order");
+
+      // A page with GPU data not read back yet takes the value from the GPU thread, after
+      // that data: a store at completion would be overwritten by the readback.
+      constexpr uint64_t watched_clock = clock_base + 0x3000;
+      bool watched_before = false;
+      uint64_t watched_early = 0;
+      LibKernel::Memory::InstallGpuResources(&context);
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        (void)context.GetBufferCache().ObtainBuffer(watched_clock, sizeof(uint64_t), true);
+        watched_before = context.GetBufferCache().IsRegionGpuModified(watched_clock, sizeof(uint64_t));
+        for (const uint64_t destination : {watched_clock, uint64_t {clock_base + 0x2800}}) {
+          auto timestamp = make_release_mem(
+              3, 0, reinterpret_cast<void *>(destination), 0, 0x14u, 0);
+          Pm4Execution timestamp_execution;
+          (void)processor->Process(timestamp_execution, timestamp);
+          gpu_scheduler.Finish();
+          gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+          if (destination == watched_clock) {
+            std::memcpy(&watched_early, reinterpret_cast<const void *>(watched_clock),
+                        sizeof(watched_early));
+          }
+        }
+      });
+      const auto watched_value = read_clock(watched_clock);
+      const bool watched_after = context.GetBufferCache().IsRegionGpuModified(watched_clock, sizeof(uint64_t));
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      Require("GpuCommandLane", "timestamp on a watched page",
+              watched_before && watched_early == 0 &&
+                  watched_value + clock_tolerance >= batch_before &&
+                  watched_value <= Sync::ReadReferenceClock() + clock_tolerance &&
+                  !watched_after,
+              "a watched clock destination was not stored through a fault");
+
+      // A value left to the GPU thread lands without another GPU clock write: a guest waiting
+      // for the only timestamp it wrote to a watched page must not wait for the next one.
+      constexpr uint64_t lone_clock = clock_base + 0x3800;
+      bool lone_before = false;
+      LibKernel::Memory::InstallGpuResources(&context);
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        (void)context.GetBufferCache().ObtainBuffer(lone_clock, sizeof(uint64_t), true);
+        lone_before = context.GetBufferCache().IsRegionGpuModified(lone_clock, sizeof(uint64_t));
+        auto timestamp = make_release_mem(
+            3, 0, reinterpret_cast<void *>(lone_clock), 0, 0x14u, 0);
+        Pm4Execution timestamp_execution;
+        (void)processor->Process(timestamp_execution, timestamp);
+        gpu_scheduler.Finish();
+      });
+      const auto lone_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      uint64_t lone_value = 0;
+      while ((lone_value = read_clock(lone_clock)) == 0 &&
+             std::chrono::steady_clock::now() < lone_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      gpu.WaitForIdle();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      Require("GpuCommandLane", "lone timestamp on a watched page",
+              lone_before && lone_value != 0 && lone_value + clock_tolerance >= batch_before &&
+                  lone_value <= Sync::ReadReferenceClock() + clock_tolerance &&
+                  lone_value == read_clock(lone_clock),
+              "a timestamp left to the GPU thread waited for another GPU clock write");
+
+      // Destinations deferred behind a watched one in the same batch are stored too: memory
+      // the GPU cannot see by the next timestamp, a range being unmapped by its unmap.
+      constexpr uintptr_t cpu_clock_base = 0x0000000200800000ull;
+      constexpr uintptr_t unmapped_clock_base = 0x0000000200900000ull;
+      std::array<int64_t, 2> retry_direct_offsets{-1, -1};
+      const auto map_clock_memory = [&](uintptr_t base, int64_t &offset) {
+        void *memory = reinterpret_cast<void *>(base);
+        return Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                   0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), clock_size,
+                   clock_size, 0, &offset) == 0 &&
+               Libs::LibKernel::Memory::KernelMapDirectMemory(
+                   &memory, clock_size, 0x33, 0x10, offset, clock_size) == 0 &&
+               memory == reinterpret_cast<void *>(base);
+      };
+      Require("GpuCommandLane", "retried clock destinations",
+              map_clock_memory(cpu_clock_base, retry_direct_offsets[0]) &&
+                  map_clock_memory(unmapped_clock_base, retry_direct_offsets[1]),
+              "retried clock destination mapping failed");
+      context.MapMemory(unmapped_clock_base, clock_size);
+      LibKernel::Memory::InstallGpuResources(&context);
+      bool rewatched = true;
+      uint64_t cpu_early = 0;
+      uint64_t unmapped_early = 0;
+      uint64_t unmapped_at_unmap = 0;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        const auto write_timestamp = [&](uint64_t destination) {
+          auto timestamp = make_release_mem(
+              3, 0, reinterpret_cast<void *>(destination), 0, 0x14u, 0);
+          Pm4Execution timestamp_execution;
+          (void)processor->Process(timestamp_execution, timestamp);
+        };
+        const auto complete = [&] {
+          gpu_scheduler.Finish();
+          gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+        };
+        const auto batch_behind_watched = [&](uint64_t destination) {
+          (void)context.GetBufferCache().ObtainBuffer(watched_clock, sizeof(uint64_t), true);
+          rewatched &= context.GetBufferCache().IsRegionGpuModified(watched_clock,
+                                                                    sizeof(uint64_t));
+          write_timestamp(watched_clock);
+          write_timestamp(destination);
+          complete();
+        };
+        batch_behind_watched(cpu_clock_base);
+        cpu_early = read_clock(cpu_clock_base);
+        write_timestamp(clock_base + 0x2800);
+        complete();
+        batch_behind_watched(unmapped_clock_base);
+        unmapped_early = read_clock(unmapped_clock_base);
+        context.UnmapMemory(unmapped_clock_base, clock_size);
+        unmapped_at_unmap = read_clock(unmapped_clock_base);
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      const auto cpu_value = read_clock(cpu_clock_base);
+      const auto retry_limit = Sync::ReadReferenceClock() + clock_tolerance;
+      Require("GpuCommandLane", "timestamps retried behind a watched one",
+              rewatched && cpu_early == 0 && unmapped_early == 0 &&
+                  cpu_value + clock_tolerance >= batch_before && cpu_value <= retry_limit &&
+                  unmapped_at_unmap + clock_tolerance >= batch_before &&
+                  unmapped_at_unmap <= retry_limit,
+              "a timestamp deferred behind a watched destination was dropped");
+      for (size_t index = 0; index < retry_direct_offsets.size(); index++) {
+        const auto base = index == 0 ? cpu_clock_base : unmapped_clock_base;
+        Require("GpuCommandLane", "retried clock destination release",
+                Libs::LibKernel::Memory::KernelMunmap(base, clock_size) == 0 &&
+                    Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                        retry_direct_offsets[index], clock_size) == 0,
+                "retried clock destination release failed");
+      }
+
+      // Completion work queued after a timestamp, like the interrupt of its packet, sees it.
+      constexpr uint64_t ordered_clock = clock_base + 0x2c00;
+      uint64_t queued_after = 0;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        auto timestamp = make_release_mem(
+            3, 0, reinterpret_cast<void *>(ordered_clock), 0, 0x14u, 0);
+        Pm4Execution timestamp_execution;
+        (void)processor->Process(timestamp_execution, timestamp);
+        gpu_scheduler.DeferPriorityOperation([&] {
+          std::memcpy(&queued_after, reinterpret_cast<const void *>(ordered_clock),
+                      sizeof(queued_after));
+        });
+        gpu_scheduler.Finish();
+        gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+      });
+      Require("GpuCommandLane", "timestamp before later completions",
+              queued_after != 0 && queued_after == read_clock(ordered_clock),
+              "a completion queued after a timestamp ran before its value was stored");
+
+      // Program data and stacks are GPU-visible without a backing alias: their values go
+      // through the GPU thread like a watched page.
+      LibKernel::Memory::InstallGpuResources(&context);
+      const auto program_clock = LibKernel::Memory::AllocateProgramMemory(
+          0x0000000200a00000ull, clock_size, Common::VirtualMemory::Mode::ReadWrite,
+          "gpu_clock_program_data");
+      if (program_clock != 0) {
+        gpu.SendCommandSync([&] {
+          processor->BufferInit();
+          auto timestamp = make_release_mem(
+              3, 0, reinterpret_cast<void *>(program_clock + 8), 0, 0x14u, 0);
+          Pm4Execution timestamp_execution;
+          (void)processor->Process(timestamp_execution, timestamp);
+          gpu_scheduler.Finish();
+          gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+        });
+        gpu.WaitForIdle();
+      }
+      const auto program_value = program_clock != 0 ? read_clock(program_clock + 8) : 0;
+      const bool program_released =
+          program_clock != 0 &&
+          Libs::LibKernel::Memory::KernelMunmap(program_clock, clock_size) == 0;
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      Require("GpuCommandLane", "timestamp to program data",
+              program_released && program_value + clock_tolerance >= batch_before &&
+                  program_value <= Sync::ReadReferenceClock() + clock_tolerance,
+              "a timestamp to memory without a backing alias was lost");
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
@@ -3204,12 +3750,13 @@ public:
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_interrupt_label == 0x55667788u;
 
-    uint64_t compute_clock_label = 0;
+    const auto compute_clock_before = Sync::ReadReferenceClock();
     auto compute_clock_commands = make_interrupt_packet(
-        3, 1, &compute_clock_label, 0, 0x567u);
+        3, 1, reinterpret_cast<void *>(clock_base + 24), 0, 0x567u);
     gpu.SubmitCompute(0x20, compute_clock_commands);
     gpu.WaitForIdle();
     finish_gpu();
+    const auto compute_clock_label = read_clock(clock_base + 24);
 
     interrupt_count = 0;
     const auto compute_clock_wait =
@@ -3218,7 +3765,8 @@ public:
         compute_clock_wait == 0 && interrupt_count == 1 &&
         interrupt_event.ident == 0x20 && interrupt_event.data == 0x567u &&
         interrupt_event.udata == &compute_interrupt_udata &&
-        compute_clock_label != 0;
+        compute_clock_label + clock_tolerance >= compute_clock_before &&
+        compute_clock_label <= Sync::ReadReferenceClock() + clock_tolerance;
 
     constexpr uint64_t compute_done_value = 0x1234567887654321ull;
     uint64_t compute_done_label = 0;
@@ -3239,6 +3787,57 @@ public:
                 compute_done_label == compute_done_value,
             "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
 
+    // The interrupt of a GPU clock write whose value is left to the GPU thread, and a label
+    // after it, wait for that value: a game woken by either reads the new time.
+    constexpr uint64_t held_clock = clock_base + 0x3100;
+    constexpr uint64_t held_label = clock_base + 0x2f00;
+    constexpr uint64_t held_label_value = 0x0123456789abcdefull;
+    auto held_processor = std::make_unique<CommandProcessor>(context, 0);
+    std::binary_semaphore held_recorded{0};
+    std::binary_semaphore held_release{0};
+    bool held_watched = false;
+    const auto held_before = Sync::ReadReferenceClock();
+    LibKernel::Memory::InstallGpuResources(&context);
+    gpu.SendCommand([&] {
+      auto &scheduler = context.GetCommandScheduler();
+      held_processor->BufferInit();
+      (void)context.GetBufferCache().ObtainBuffer(held_clock, sizeof(uint64_t), true);
+      held_watched =
+          context.GetBufferCache().IsRegionGpuModified(held_clock, sizeof(uint64_t));
+      held_processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
+                                         reinterpret_cast<void *>(held_clock), 0, 2,
+                                         0x99u);
+      held_processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 2,
+                                         reinterpret_cast<void *>(held_label),
+                                         held_label_value, 0);
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      // The GPU thread stays busy: the value and its interrupt wait for it. The page is
+      // not read here, as the read would need the GPU thread too.
+      held_recorded.release();
+      held_release.acquire();
+    });
+    held_recorded.acquire();
+    interrupt_count = 0;
+    const auto held_early_wait = wait_for_interrupt(interrupt_event, interrupt_count);
+    const auto held_early_count = interrupt_count;
+    const auto held_label_early = read_clock(held_label);
+    held_release.release();
+    gpu.WaitForIdle();
+    interrupt_count = 0;
+    const auto held_wait = wait_for_interrupt(interrupt_event, interrupt_count);
+    const auto held_value = read_clock(held_clock);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require("GpuCommandLane", "interrupt behind a deferred timestamp",
+            held_watched && held_early_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
+                held_early_count == 0 && held_label_early == 0 &&
+                read_clock(held_label) == held_label_value && held_wait == 0 &&
+                interrupt_count == 1 && interrupt_event.ident == 0 &&
+                interrupt_event.data == 0x99u &&
+                held_value + clock_tolerance >= held_before &&
+                held_value <= Sync::ReadReferenceClock() + clock_tolerance,
+            "an interrupt or a label landed before the GPU clock value written before it");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
@@ -3254,6 +3853,12 @@ public:
                 interrupt_count == 0 && delete_other_compute_event == 0,
             "compute kOnly interrupt was misrouted, broadcast, or lost a "
             "label write");
+    context.UnmapMemory(clock_base, clock_size);
+    Require("GpuCommandLane", "GPU clock destination release",
+            Libs::LibKernel::Memory::KernelMunmap(clock_base, clock_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    clock_direct_offset, clock_size) == 0,
+            "GPU clock destination release failed");
 
     std::array<uint32_t, 1024> polling_loop{};
     for (size_t i = 0; i < polling_loop.size() - 4; i += 2) {
@@ -18335,6 +18940,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  PFN_vkGetCalibratedTimestampsKHR m_calibrated_timestamps = nullptr;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -18368,6 +18974,7 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    m_runtime_context.get_calibrated_timestamps = m_calibrated_timestamps;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
@@ -18648,6 +19255,21 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    // GPU clock writes use the main calibration path when the device provides it.
+    const auto available_extensions =
+        m_physical_device.enumerateDeviceExtensionProperties().value;
+    const char *calibrated_timestamps = nullptr;
+    for (const char *name : {VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+                             VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME}) {
+      if (std::any_of(available_extensions.begin(), available_extensions.end(),
+                      [name](const vk::ExtensionProperties &extension) {
+                        return std::strcmp(extension.extensionName, name) == 0;
+                      })) {
+        device_extensions.push_back(name);
+        calibrated_timestamps = name;
+        break;
+      }
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -18664,6 +19286,13 @@ private:
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
+    if (calibrated_timestamps != nullptr) {
+      m_calibrated_timestamps =
+          std::strcmp(calibrated_timestamps,
+                      VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0
+              ? VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsKHR
+              : VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsEXT;
+    }
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -42846,6 +43475,8 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckGpuClockSegments();
+  CheckGpuClockCalibration();
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);

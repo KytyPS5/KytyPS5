@@ -78,6 +78,36 @@ static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions,
 	                   [name](const auto& ext) { return strcmp(ext.extensionName, name) == 0; });
 }
 
+// GPU clock writes are calibrated against the host when the device clock can be sampled. The
+// entry points must come from the extension enabled: a KHR one can fail on an EXT-only driver.
+static const char*
+CalibratedTimestampsExtension(vk::PhysicalDevice                          device,
+                              const std::vector<vk::ExtensionProperties>& extensions) {
+	const bool khr = HasExtension(extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+	if (!khr && !HasExtension(extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+		return nullptr;
+	}
+	const auto get_domains =
+	    khr ? VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+	        : VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
+	if (get_domains == nullptr) {
+		return nullptr;
+	}
+	uint32_t count = 0;
+	if (get_domains(device, &count, nullptr) != VK_SUCCESS) {
+		return nullptr;
+	}
+	std::vector<VkTimeDomainKHR> domains(count);
+	if (get_domains(device, &count, domains.data()) != VK_SUCCESS) {
+		return nullptr;
+	}
+	if (std::find(domains.begin(), domains.end(), VK_TIME_DOMAIN_DEVICE_KHR) == domains.end()) {
+		return nullptr;
+	}
+	return khr ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME
+	           : VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+}
+
 static bool HasExtension(const std::vector<const char*>& extensions, const char* name) {
 	return std::any_of(extensions.begin(), extensions.end(),
 	                   [name](const char* ext) { return strcmp(ext, name) == 0; });
@@ -989,6 +1019,7 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
 	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
 
+	const char* calibrated_timestamps = nullptr;
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",
@@ -1011,6 +1042,11 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		calibrated_timestamps =
+		    CalibratedTimestampsExtension(graphic_ctx.physical_device, available_extensions);
+		if (calibrated_timestamps != nullptr) {
+			device_extensions.push_back(calibrated_timestamps);
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -1023,6 +1059,12 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	if (calibrated_timestamps != nullptr) {
+		graphic_ctx.get_calibrated_timestamps =
+		    std::strcmp(calibrated_timestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0
+		        ? VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsKHR
+		        : VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsEXT;
+	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 

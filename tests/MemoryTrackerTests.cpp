@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <semaphore>
 #include <string>
@@ -212,6 +213,10 @@ struct ProtectionCall {
 
 std::vector<ProtectionCall> g_protection_log;
 std::mutex g_protection_log_mutex;
+// Called once by the next backing write, before it is applied.
+std::function<void()> g_before_next_backing_write;
+// Private memory (program data, stacks) has no backing alias.
+bool g_backing_available = true;
 
 void ResetProtectionLog() {
   g_protection_calls = 0;
@@ -924,6 +929,74 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
         "download callback serialized an unrelated tracker region");
 }
 
+void TestStoreUnwatchedExcludesRegistration() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  PageManager page_manager;
+  auto *memory = Allocate(page_manager, 2);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  std::memset(memory, 0, page_size * 2);
+  const uint64_t value = 0x1122334455667788ull;
+  const auto stored_at = [&](uint64_t offset) {
+    uint64_t stored = 0;
+    std::memcpy(&stored, memory + offset, sizeof(stored));
+    return stored;
+  };
+
+  // A watched page refuses the store and keeps its bytes, from either end of the range.
+  page_manager.UpdatePageWatchers<true>(base, page_size);
+  const bool refused = !page_manager.StoreUnwatched(base + 8, sizeof(value), &value);
+  page_manager.UpdatePageWatchers<false>(base, page_size);
+  page_manager.UpdatePageWatchers<true>(base + page_size, page_size);
+  const bool refused_second =
+      !page_manager.StoreUnwatched(base + page_size - 4, sizeof(value), &value);
+  page_manager.UpdatePageWatchers<false>(base + page_size, page_size);
+  const bool kept = stored_at(8) == 0 && stored_at(page_size - 4) == 0;
+
+  // A watcher registering during the store waits for it, then reads the stored bytes.
+  std::binary_semaphore registered{0};
+  bool registered_during_store = false;
+  std::jthread watcher;
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_before_next_backing_write = [&] {
+      watcher = std::jthread([&] {
+        page_manager.UpdatePageWatchers<true>(base, page_size);
+        registered.release();
+      });
+      registered_during_store =
+          registered.try_acquire_for(std::chrono::milliseconds(300));
+    };
+  }
+  const bool accepted = page_manager.StoreUnwatched(base + 8, sizeof(value), &value);
+  watcher.join();
+  const bool protected_after = !IsWritable(memory);
+  const bool stored = stored_at(8) == value;
+  page_manager.UpdatePageWatchers<false>(base, page_size);
+  const bool crossing = page_manager.StoreUnwatched(base + page_size - 4, sizeof(value), &value) &&
+                        stored_at(page_size - 4) == value;
+  Release(memory);
+  Check(refused && refused_second && kept, "a watched page accepted a completion store");
+  Check(accepted && stored && protected_after && !registered_during_store,
+        "a watcher registered between the watch check and the store");
+  Check(crossing, "a store across two unwatched pages failed");
+}
+
+void TestStoreUnwatchedWithoutBacking() {
+  PageManager page_manager;
+  auto *memory = Allocate(page_manager, 1);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  std::memset(memory, 0, 16);
+  const uint64_t value = 0x1122334455667788ull;
+  g_backing_available = false;
+  const bool refused = !page_manager.StoreUnwatched(base + 8, sizeof(value), &value);
+  g_backing_available = true;
+  uint64_t stored = 0;
+  std::memcpy(&stored, memory + 8, sizeof(stored));
+  Release(memory);
+  Check(refused && stored == 0,
+        "a completion store to memory without a backing alias did not fall back");
+}
+
 void TestGpuUnmarkUsesRegionMask() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1187,6 +1260,22 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+bool TryWriteBacking(uint64_t vaddr, const void *data, uint64_t size) {
+  if (!g_backing_available) {
+    return false;
+  }
+  std::function<void()> before;
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    before = std::exchange(g_before_next_backing_write, nullptr);
+  }
+  if (before) {
+    before();
+  }
+  std::memcpy(reinterpret_cast<void *>(vaddr), data, size);
+  return true;
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
@@ -1212,6 +1301,8 @@ int main(int argc, char **argv) {
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
+  TestStoreUnwatchedExcludesRegistration();
+  TestStoreUnwatchedWithoutBacking();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();

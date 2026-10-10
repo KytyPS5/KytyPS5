@@ -98,10 +98,30 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	const bool sent = TrySendCommand(std::move(command));
+	EXIT_IF(!sent);
+}
+
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
 	Common::LockGuard lock(m_queue_mutex);
-	EXIT_IF(!m_accepting);
+	if (!m_accepting) {
+		return false;
+	}
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+	return true;
+}
+
+void GuestGpu::NotifyGuestWrite() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_guest_writes++;
+	for (auto& queue: m_queues) {
+		if (!queue.empty()) {
+			queue.front().blocked = false;
+		}
+	}
 	m_work_available.Signal();
 }
 
@@ -288,6 +308,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
+	BeforeImmediateWrite(dst, static_cast<uint64_t>(dw_num) * 4);
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
@@ -315,7 +336,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -342,6 +363,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	BeforeImmediateWrite(dst, (write_one_address ? 1 : uint64_t {dw_num}) * sizeof(uint32_t));
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
@@ -357,13 +379,11 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
-	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.GetGpuTimestamps().Write(dst_address, num_bytes, false);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
-		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
-		     " size=%u\n",
-		     dst_address, value, num_bytes);
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " size=%u\n", dst_address,
+		     num_bytes);
 	}
 }
 
@@ -403,6 +423,10 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	bool dst_gds = false;
 	if (!decode_gds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+	}
+	if (!dst_gds) {
+		// A GPU fill or copy lands at execution, also after the labels recorded before it.
+		BeforeImmediateWrite(reinterpret_cast<const void*>(dst_address_or_offset), num_bytes);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	if (src_sel == 2) {
@@ -451,6 +475,7 @@ void GuestGpu::ThreadRun(void* data) {
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
+		uint64_t                     guest_writes   = 0;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
@@ -493,6 +518,7 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 				has_submission    = true;
+				guest_writes      = gpu->m_guest_writes;
 			}
 		}
 		if (should_stop) {
@@ -519,7 +545,8 @@ void GuestGpu::ThreadRun(void* data) {
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
-			submission.blocked = true;
+			// A write while it ran may be what it waits for.
+			submission.blocked = gpu->m_guest_writes == guest_writes;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -828,7 +855,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			value = ReadLabel(static_cast<const volatile uint64_t*>(address));
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -1085,7 +1112,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		WriteLabel(dst, data);
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1109,6 +1136,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
+					// Written here, after the GPU clock values before it.
+					m_renderer.GetGpuTimestamps().StoreAll();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
@@ -1134,12 +1163,15 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 				}
 			} else {
-				if (event_write_source == 0x04) {
-					value = Sync::ReadReferenceClock();
-				}
-				auto write64 = [&](bool with_writeback) {
+				const bool gpu_clock = event_write_source == 0x04;
+				auto       write64   = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					if (gpu_clock) {
+						m_renderer.GetGpuTimestamps().Write(reinterpret_cast<uint64_t>(dst),
+						                                    sizeof(uint64_t), true);
+					} else {
+						WriteLabel(dst, value);
+					}
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1253,6 +1285,34 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
+template <typename T>
+T CommandProcessor::ReadLabel(const volatile T* addr) {
+	// A label deferred to completion counts for the commands after it, as when it was written
+	// at parse time. Memory is read after the lookup: a label stored meanwhile is in it.
+	const auto vaddr  = reinterpret_cast<uint64_t>(addr);
+	const auto labels = m_renderer.GetGpuTimestamps().PendingLabels(vaddr, sizeof(T));
+	const T    value  = *addr;
+	return labels.empty()
+	           ? value
+	           : static_cast<T>(GpuTimestamps::ApplyLabels(labels, vaddr, sizeof(T), value));
+}
+
+template uint32_t CommandProcessor::ReadLabel(const volatile uint32_t*);
+template uint64_t CommandProcessor::ReadLabel(const volatile uint64_t*);
+
+void CommandProcessor::BeforeImmediateWrite(const volatile void* dst, uint64_t size) {
+	m_renderer.GetGpuTimestamps().Overwritten(reinterpret_cast<uint64_t>(dst), size);
+}
+
+template <typename T>
+void CommandProcessor::WriteLabel(T* dst, T value) {
+	// End-of-pipe labels land in packet order with the GPU clock values before them.
+	if (!m_renderer.GetGpuTimestamps().WriteLabel(reinterpret_cast<uint64_t>(dst), value,
+	                                              sizeof(T))) {
+		std::memcpy(dst, &value, sizeof(T));
+	}
+}
+
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
 
@@ -1342,6 +1402,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
 			for (uint32_t db = 0; db < 16u; db++) {
+				BeforeImmediateWrite(&results[db * 2u], sizeof(uint64_t));
 				results[db * 2u] = value;
 			}
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
@@ -1375,7 +1436,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	WriteLabel(static_cast<uint32_t*>(dst_gpu_addr), value);
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
@@ -1400,7 +1461,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	WriteLabel(static_cast<uint32_t*>(dst_gpu_addr), value);
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(

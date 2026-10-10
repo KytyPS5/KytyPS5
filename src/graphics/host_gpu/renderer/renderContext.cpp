@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -15,7 +16,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_gpu_timestamps(graphics, m_command_scheduler, *this) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -27,13 +29,19 @@ RenderContext::~RenderContext() {
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
-	m_gpu       = std::make_unique<GuestGpu>(*this);
+	std::lock_guard lock(m_gpu_mutex);
+	m_gpu = std::make_unique<GuestGpu>(*this);
 }
 
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
-		m_gpu.reset();
+		std::unique_ptr<GuestGpu> gpu;
+		{
+			std::lock_guard lock(m_gpu_mutex);
+			gpu.swap(m_gpu);
+		}
+		gpu.reset();
 	}
 	if (m_video_out != nullptr) {
 		if (m_command_scheduler.Active()) {
@@ -47,6 +55,18 @@ void RenderContext::ShutdownGpu() {
 GuestGpu& RenderContext::GetGpu() const {
 	EXIT_IF(m_gpu == nullptr);
 	return *m_gpu;
+}
+
+bool RenderContext::PostGpuCommand(Common::UniqueFunction<void>&& command) {
+	std::lock_guard lock(m_gpu_mutex);
+	return m_gpu != nullptr && m_gpu->TrySendCommand(std::move(command));
+}
+
+void RenderContext::NotifyGuestWrite() {
+	std::lock_guard lock(m_gpu_mutex);
+	if (m_gpu != nullptr) {
+		m_gpu->NotifyGuestWrite();
+	}
 }
 
 VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
@@ -79,6 +99,16 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool RenderContext::StoreAtCompletion(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		std::memcpy(reinterpret_cast<void*>(vaddr), data, size);
+		return true;
+	}
+	// Cached copies cannot be invalidated here. Unwatched pages have none that a write can
+	// stale, and the store excludes a cache registering a watcher meanwhile.
+	return m_page_manager.StoreUnwatched(vaddr, size, data);
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
@@ -109,6 +139,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
+		// Timestamps left to this thread would otherwise land after the range is unmapped.
+		m_gpu_timestamps.StoreRetries();
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);

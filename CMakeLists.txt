@@ -569,6 +569,8 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
+add_kyty_full_emulator_test(ajm_instance_tests "${KYTY_TESTS_DIR}/AjmInstanceTests.cpp")
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
@@ -683,6 +685,7 @@ if(BUILD_TESTING)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME ajm_instance COMMAND $<TARGET_FILE:ajm_instance_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
@@ -797,6 +800,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests
+		ajm_instance_tests
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests

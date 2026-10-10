@@ -331,8 +331,13 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 			// blocks games that require it. Use their Back/Select button as a centered click.
 			auto* pad = SDL_GetGamepadFromID(f.id);
 			if (pad != nullptr && SDL_GetNumGamepadTouchpads(pad) == 0) {
+				if (f.down) {
+					Controller::SetTouchPad(f.id, 0, true, 0.5f, 0.5f);
+				}
 				Controller::SetButton(f.id, Controller::PAD_BUTTON_TOUCH_PAD, f.down);
-				Controller::SetTouchPad(f.id, 0, f.down, 0.5f, 0.5f);
+				if (f.up) {
+					Controller::SetTouchPad(f.id, 0, false, 0.5f, 0.5f);
+				}
 			}
 		}
 	}

@@ -26568,6 +26568,52 @@ TestCase VectorFractF64CapturedChainRuntimeExec() {
   return test;
 }
 
+TestCase VectorExecRegionForwardsSelects() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorExecRegionForwardsSelects";
+  auto &code = test.code;
+  code.push_back(EncodeVop1(0x01, 20, Vgpr(0)));         // v20 = lane
+  AppendVMovU32(&code, 3, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(20), 3));      // v1 = lane + 100
+  AppendVMovU32(&code, 2, 1000);
+  code.push_back(EncodeVopc(0xc4, InlineU32(3), 20));   // vcc = 3 > lane
+  code.push_back(EncodeSop1(0x24, 8, 106));              // s_and_saveexec_b64 s[8:9], vcc
+  // Each write reads the previous one under the same EXEC.
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(1), 1));       // v1 = v1 + v1
+  code.push_back(EncodeVop2(0x1d, 2, Vgpr(1), 2));       // v2 = v1 ^ v2
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(7), 2));  // v1 = 7 + v2
+  code.push_back(EncodeVop2(0x0b, 2, Vgpr(1), 1));       // v2 = u24(v1) * u24(v1)
+  code.push_back(EncodeSop1(0x04, 126, 8));              // s_mov_b64 exec, s[8:9]
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 20, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 20, 64);
+  AppendEnd(&code);
+  test.initial.assign(128, 0);
+  test.expected.assign(128, 0);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    u32 v1 = lane + 100, v2 = 1000;
+    if (lane < 3) {
+      v1 += v1;
+      v2 ^= v1;
+      v1 = v2 + 7;
+      v2 = (v1 & 0xffffffu) * (v1 & 0xffffffu);
+    }
+    test.expected[lane] = v1;
+    test.expected[64 + lane] = v2;
+  }
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  // Only the two values that leave the region keep their EXEC select.
+  test.ir_counts = {{" = SelectU32 ", 2}};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_CMP_GT_U32, O::S_AND_SAVEEXEC_B64,
+                  O::V_XOR_B32, O::V_MUL_U32_U24, O::S_MOV_B64, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorF64WideningConversions() {
   using O = ShaderOpcode;
   TestCase test;
@@ -37280,6 +37326,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxF64CapturedAndEdges);
   AddCase(VectorRoundF64EdgesAndModifiers);
   AddCase(VectorFractF64CapturedChainRuntimeExec);
+  AddCase(VectorExecRegionForwardsSelects);
   AddCase(VectorF64ModesModifiersAndExec);
   AddCase(VectorF64WideningConversions);
   AddCase(VectorSinCosMaxFiniteSpecialCases);

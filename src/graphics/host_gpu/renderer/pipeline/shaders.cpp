@@ -197,6 +197,13 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 		descriptor_count += binding.descriptorCount;
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+#if defined(__APPLE__)
+	// MoltenVK 1.4.1+ leaves buffer-size metadata stale when pushing descriptors.
+	// Its driverVersion uses decimal major * 10000 + minor * 100 + patch.
+	if (graphics.GetPhysicalDeviceProperties().driverVersion >= 10401) {
+		pipeline.uses_push_descriptors = false;
+	}
+#endif
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors

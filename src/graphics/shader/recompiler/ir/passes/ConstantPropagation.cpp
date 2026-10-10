@@ -713,7 +713,7 @@ public:
 	explicit LaneMaskProjection(std::unordered_set<Inst*>& lowered_ancillary)
 	    : m_lowered_ancillary(lowered_ancillary) {}
 
-	void Fold(Inst& inst) {
+	void Fold(Inst& inst, bool uniform_masks_only = false) {
 		if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !Immediate(Arg(inst, 1), 0u)) return;
 		const auto* bit = Arg(inst, 0).TryInstruction();
 		if (bit == nullptr || bit->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
@@ -725,6 +725,10 @@ public:
 		    !Immediate(Arg(*index, 1), 31u)) return;
 		const auto* lane = Arg(*index, 0).TryInstruction();
 		if (lane == nullptr || lane->GetOpcode() != ValueOpcode::LaneId) return;
+		// Uniform mask words have the same bit in both halves of wave64. Ballot
+		// projections still require wave32 because their low word omits lanes 32-63.
+		const auto mask = Arg(*shift, 0);
+		if (uniform_masks_only && !Immediate(mask, 0u) && !Immediate(mask, UINT32_MAX)) return;
 		m_visited.clear();
 		m_grounded = false;
 		if (CanProject(Arg(*shift, 0)) && m_grounded) Replace(inst, Project(Arg(*shift, 0)));
@@ -809,7 +813,16 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	LaneMaskProjection mask_projection(lowered_ancillary);
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
-			if (wave_size == 32u) mask_projection.Fold(*inst);
+			if (wave_size == 32u) {
+				mask_projection.Fold(*inst);
+			}
+#if defined(__APPLE__)
+			// Metal has no subgroup builtins in vertex shaders, so drop LaneId uses that
+			// only read uniform wave64 masks.
+			else {
+				mask_projection.Fold(*inst, true);
+			}
+#endif
 			FoldInstruction(*block, inst, lowered_ancillary);
 		}
 	}

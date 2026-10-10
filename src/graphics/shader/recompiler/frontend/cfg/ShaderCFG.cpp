@@ -3,12 +3,16 @@
 #include "common/assert.h"
 
 #include <algorithm>
-#include <fmt/format.h>
-#include <iterator>
+#include <cstdlib>
 #include <deque>
+#include <fmt/format.h>
+#include <functional>
+#include <iterator>
 #include <list>
 #include <map>
+#include <set>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -568,7 +572,8 @@ bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
 }
 
 bool IsValidTarget(uint32_t target, std::span<const Instruction> instructions, uint32_t end_pc) {
-	return target == end_pc || std::ranges::binary_search(instructions, target, {}, &Instruction::pc);
+	return target == end_pc ||
+	       std::ranges::binary_search(instructions, target, {}, &Instruction::pc);
 }
 
 std::vector<uint32_t> AllBlockIds(uint32_t count) {
@@ -962,33 +967,40 @@ class GotoStructurizer {
 	struct Node;
 	using List = std::list<Node*>;
 	struct Node {
-		Kind kind;
-		Node* parent = nullptr;
-		Node* target = nullptr;
-		List children;
+		Kind           kind;
+		Node*          parent = nullptr;
+		Node*          target = nullptr;
+		List           children;
 		List::iterator position;
-		uint32_t condition = 1;
-		uint32_t id = UINT32_MAX;
+		uint32_t       condition = 1;
+		uint32_t       id        = UINT32_MAX;
 	};
 
 public:
 	explicit GotoStructurizer(const Graph& source): m_source(source) {
-		m_graph.expressions = {{ExprOp::Constant, 0}, {ExprOp::Constant, 1}};
+		m_graph.expressions         = {{ExprOp::Constant, 0}, {ExprOp::Constant, 1}};
 		m_graph.code_table_load_pcs = source.code_table_load_pcs;
-		m_root = New(Kind::Root);
+		m_root                      = New(Kind::Root);
 		std::vector<Node*> labels;
 		for (const auto& block: source.blocks) {
 			auto* label = Insert(m_root, m_root->children.end(), Kind::Label);
-			label->id = block.id;
+			label->id   = block.id;
 			labels.push_back(label);
 		}
 		// Give every natural loop one backedge before eliminating gotos. Otherwise
 		// multiple latches become nested loops that retest the same exit predicate.
-		struct Continue { uint32_t header; uint32_t after; size_t body_size; Node* label; };
+		struct Continue {
+			uint32_t header;
+			uint32_t after;
+			size_t   body_size;
+			Node*    label;
+		};
 		std::vector<Continue> continues;
 		for (const auto& loop: source.natural_loops) {
-			if (std::ranges::any_of(continues, [&](const auto& value) { return value.header == loop.header; }) ||
-			    std::ranges::count(source.natural_loops, loop.header, &NaturalLoop::header) < 2) continue;
+			if (std::ranges::any_of(
+			        continues, [&](const auto& value) { return value.header == loop.header; }) ||
+			    std::ranges::count(source.natural_loops, loop.header, &NaturalLoop::header) < 2)
+				continue;
 			std::vector<uint32_t> body;
 			for (const auto& member: source.natural_loops) {
 				if (member.header == loop.header)
@@ -996,7 +1008,7 @@ public:
 			}
 			SortUnique(body);
 			auto* label = New(Kind::Label);
-			label->id = static_cast<uint32_t>(labels.size());
+			label->id   = static_cast<uint32_t>(labels.size());
 			labels.push_back(label);
 			continues.push_back({loop.header, body.back(), body.size(), label});
 		}
@@ -1005,14 +1017,14 @@ public:
 		});
 		m_route_expressions.resize(labels.size(), UINT32_MAX);
 		for (const auto& block: source.blocks) {
-			auto* label = labels.at(block.id);
-			const auto end = std::next(label->position);
-			auto* code = Insert(m_root, end, Kind::Code);
-			code->id = block.id;
+			auto*      label    = labels.at(block.id);
+			const auto end      = std::next(label->position);
+			auto*      code     = Insert(m_root, end, Kind::Code);
+			code->id            = block.id;
 			const auto add_goto = [&](uint32_t condition, uint32_t target) {
-				auto* node = Insert(m_root, end, Kind::Goto);
+				auto* node      = Insert(m_root, end, Kind::Goto);
 				node->condition = condition;
-				node->target = labels.at(target);
+				node->target    = labels.at(target);
 				for (const auto& value: continues) {
 					if (value.header == target && source.Dominates(target, block.id))
 						node->target = value.label;
@@ -1034,10 +1046,10 @@ public:
 			}
 			for (const auto& value: continues) {
 				if (value.after != block.id) continue;
-				value.label->parent = m_root;
+				value.label->parent   = m_root;
 				value.label->position = m_root->children.insert(end, value.label);
-				auto* repeat = Insert(m_root, end, Kind::Goto);
-				repeat->target = labels[value.header];
+				auto* repeat          = Insert(m_root, end, Kind::Goto);
+				repeat->target        = labels[value.header];
 				m_gotos.push_back(repeat);
 			}
 		}
@@ -1048,7 +1060,7 @@ public:
 			Eliminate(*it);
 		}
 		if (m_failure != nullptr) return Failed();
-		const auto entry = Allocate();
+		const auto entry    = Allocate();
 		m_graph.entry_block = entry;
 		Place(entry);
 		Branch(Visit(m_root, entry, UINT32_MAX), UINT32_MAX);
@@ -1062,7 +1074,7 @@ public:
 		RebuildPredecessors(m_graph);
 		if (std::ranges::any_of(m_graph.blocks, [&](const auto& block) {
 			    return block.id != m_graph.entry_block && block.predecessors.empty();
-			})) {
+		    })) {
 			Fail("structured control flow requires an unreachable merge");
 			return Failed();
 		}
@@ -1075,7 +1087,7 @@ public:
 	}
 
 private:
-	void Fail(const char* reason) { m_failure = reason; }
+	void  Fail(const char* reason) { m_failure = reason; }
 	Graph Failed() {
 		SetFailure(m_graph, FailureKind::StructuredControlFlow, UINT32_MAX, m_failure);
 		return std::move(m_graph);
@@ -1089,12 +1101,12 @@ private:
 		return &m_nodes.back();
 	}
 	Node* Insert(Node* parent, List::iterator before, Kind kind) {
-		auto* node = New(kind);
-		node->parent = parent;
+		auto* node     = New(kind);
+		node->parent   = parent;
 		node->position = parent->children.insert(before, node);
 		return node;
 	}
-	void Erase(Node* node) { node->parent->children.erase(node->position); }
+	void     Erase(Node* node) { node->parent->children.erase(node->position); }
 	uint32_t Expression(ExprOp op, uint32_t lhs, uint32_t rhs = UINT32_MAX) {
 		if (op == ExprOp::Not) {
 			const auto& inner = m_graph.expressions[lhs];
@@ -1115,22 +1127,29 @@ private:
 		if (expression == UINT32_MAX) {
 			expression = Expression(ExprOp::Variable, label->id);
 			// SSA initializes route variables to false; clear them again on each label visit.
-			auto* reset = Insert(label->parent, std::next(label->position), Kind::Set);
-			reset->id = label->id;
+			auto* reset      = Insert(label->parent, std::next(label->position), Kind::Set);
+			reset->id        = label->id;
 			reset->condition = 0;
 		}
 		return expression;
 	}
 	static size_t Depth(Node* node) {
 		size_t depth = 0;
-		for (; node->parent != nullptr; node = node->parent) ++depth;
+		for (; node->parent != nullptr; node = node->parent)
+			++depth;
 		return depth;
 	}
 	static bool Related(Node* a, Node* b) {
 		auto a_depth = Depth(a);
 		auto b_depth = Depth(b);
-		while (a_depth > b_depth) { a = a->parent; --a_depth; }
-		while (b_depth > a_depth) { b = b->parent; --b_depth; }
+		while (a_depth > b_depth) {
+			a = a->parent;
+			--a_depth;
+		}
+		while (b_depth > a_depth) {
+			b = b->parent;
+			--b_depth;
+		}
 		return a->parent == b->parent;
 	}
 	static bool Ordered(Node* a, Node* b) {
@@ -1140,36 +1159,38 @@ private:
 		return false;
 	}
 	static Node* Sibling(Node* uncle, Node* nephew) {
-		while (nephew->parent != uncle->parent) nephew = nephew->parent;
+		while (nephew->parent != uncle->parent)
+			nephew = nephew->parent;
 		return nephew;
 	}
 	static void Adopt(Node* parent) {
-		for (auto* child: parent->children) child->parent = parent;
+		for (auto* child: parent->children)
+			child->parent = parent;
 	}
 	void SetBefore(Node* node, uint32_t id, uint32_t expression) {
-		auto* set = Insert(node->parent, node->position, Kind::Set);
-		set->id = id;
+		auto* set      = Insert(node->parent, node->position, Kind::Set);
+		set->id        = id;
 		set->condition = expression;
 	}
 	Node* GotoAfter(Node* construct, Node* label, uint32_t condition) {
-		auto* node = Insert(construct->parent, std::next(construct->position), Kind::Goto);
-		node->target = label;
+		auto* node      = Insert(construct->parent, std::next(construct->position), Kind::Goto);
+		node->target    = label;
 		node->condition = condition;
 		return node;
 	}
 	Node* Outward(Node* node) {
-		auto* parent = node->parent;
-		auto* target = node->target;
+		auto*      parent   = node->parent;
+		auto*      target   = node->target;
 		const auto variable = RouteVariable(target);
 		SetBefore(node, target->id, node->condition);
 		if (parent->kind == Kind::If) {
-			auto* rest = Insert(parent, node->position, Kind::If);
+			auto* rest      = Insert(parent, node->position, Kind::If);
 			rest->condition = Expression(ExprOp::Not, variable);
-			rest->children.splice(rest->children.end(), parent->children,
-			                      std::next(node->position), parent->children.end());
+			rest->children.splice(rest->children.end(), parent->children, std::next(node->position),
+			                      parent->children.end());
 			Adopt(rest);
 		} else if (parent->kind == Kind::Loop) {
-			auto* stop = Insert(parent, node->position, Kind::Break);
+			auto* stop      = Insert(parent, node->position, Kind::Break);
 			stop->condition = variable;
 		} else {
 			Fail("goto has no enclosing selection or loop");
@@ -1179,15 +1200,15 @@ private:
 		return GotoAfter(parent, target, variable);
 	}
 	Node* Inward(Node* node) {
-		auto* parent = node->parent;
-		auto* target = node->target;
-		auto* nested = Sibling(node, target);
+		auto*      parent   = node->parent;
+		auto*      target   = node->target;
+		auto*      nested   = Sibling(node, target);
 		const auto variable = RouteVariable(target);
 		SetBefore(node, target->id, node->condition);
-		auto* rest = Insert(parent, node->position, Kind::If);
+		auto* rest      = Insert(parent, node->position, Kind::If);
 		rest->condition = Expression(ExprOp::Not, variable);
-		rest->children.splice(rest->children.end(), parent->children,
-		                      std::next(node->position), nested->position);
+		rest->children.splice(rest->children.end(), parent->children, std::next(node->position),
+		                      nested->position);
 		Adopt(rest);
 		Erase(node);
 		if (nested->kind == Kind::If) {
@@ -1196,31 +1217,32 @@ private:
 			Fail("goto target has no enclosing construct");
 			return node;
 		}
-		auto* moved = Insert(nested, nested->children.begin(), Kind::Goto);
-		moved->target = target;
+		auto* moved      = Insert(nested, nested->children.begin(), Kind::Goto);
+		moved->target    = target;
 		moved->condition = variable;
 		return moved;
 	}
 	Node* Lift(Node* node) {
-		auto* parent = node->parent;
-		auto* target = node->target;
-		auto* nested = Sibling(node, target);
+		auto*      parent   = node->parent;
+		auto*      target   = node->target;
+		auto*      nested   = Sibling(node, target);
 		const auto variable = RouteVariable(target);
-		auto* loop = Insert(parent, node->position, Kind::Loop);
-		loop->condition = variable;
-		loop->children.splice(loop->children.end(), parent->children,
-		                      nested->position, loop->position);
+		auto*      loop     = Insert(parent, node->position, Kind::Loop);
+		loop->condition     = variable;
+		loop->children.splice(loop->children.end(), parent->children, nested->position,
+		                      loop->position);
 		Adopt(loop);
-		if (std::ranges::any_of(loop->children, [](auto* child) { return child->kind == Kind::Break; })) {
+		if (std::ranges::any_of(loop->children,
+		                        [](auto* child) { return child->kind == Kind::Break; })) {
 			Fail("goto lifting would capture an enclosing loop exit");
 			return node;
 		}
-		auto* moved = Insert(loop, loop->children.begin(), Kind::Goto);
-		moved->target = target;
+		auto* moved      = Insert(loop, loop->children.begin(), Kind::Goto);
+		moved->target    = target;
 		moved->condition = variable;
-		auto* set = Insert(loop, loop->children.end(), Kind::Set);
-		set->id = target->id;
-		set->condition = node->condition;
+		auto* set        = Insert(loop, loop->children.end(), Kind::Set);
+		set->id          = target->id;
+		set->condition   = node->condition;
 		Erase(node);
 		return moved;
 	}
@@ -1242,16 +1264,16 @@ private:
 		}
 		auto* parent = node->parent;
 		if (Ordered(node, target)) {
-			auto* selection = Insert(parent, node->position, Kind::If);
+			auto* selection      = Insert(parent, node->position, Kind::If);
 			selection->condition = Expression(ExprOp::Not, node->condition);
 			selection->children.splice(selection->children.end(), parent->children,
 			                           std::next(node->position), target->position);
 			Adopt(selection);
 		} else {
-			auto* loop = Insert(parent, node->position, Kind::Loop);
+			auto* loop      = Insert(parent, node->position, Kind::Loop);
 			loop->condition = node->condition;
-			loop->children.splice(loop->children.end(), parent->children,
-			                      target->position, loop->position);
+			loop->children.splice(loop->children.end(), parent->children, target->position,
+			                      loop->position);
 			Adopt(loop);
 		}
 		Erase(node);
@@ -1266,19 +1288,19 @@ private:
 	void Place(uint32_t block) { m_order.push_back(block); }
 	void Branch(uint32_t from, uint32_t to) {
 		if (from == UINT32_MAX) return;
-		auto& block = m_graph.blocks[from];
+		auto& block           = m_graph.blocks[from];
 		block.terminator.kind = to == UINT32_MAX ? TerminatorKind::Return : TerminatorKind::Branch;
 		block.terminator.true_block = to;
 		block.successors = to == UINT32_MAX ? std::vector<uint32_t> {} : std::vector<uint32_t> {to};
 	}
 	void Conditional(uint32_t block_id, uint32_t condition, uint32_t yes, uint32_t no,
 	                 uint32_t merge = UINT32_MAX) {
-		auto& block = m_graph.blocks[block_id];
-		auto& term = block.terminator;
-		term.kind = TerminatorKind::ConditionalBranch;
-		term.expression = condition;
-		term.condition = BranchCondition::Expression;
-		term.true_block = yes;
+		auto& block      = m_graph.blocks[block_id];
+		auto& term       = block.terminator;
+		term.kind        = TerminatorKind::ConditionalBranch;
+		term.expression  = condition;
+		term.condition   = BranchCondition::Expression;
+		term.true_block  = yes;
 		term.false_block = no;
 		term.merge_block = merge;
 		block.successors = {yes, no};
@@ -1302,14 +1324,15 @@ private:
 		if (node->kind == Kind::Set && RefersTo(expression, node->id)) return true;
 		if (node->kind == Kind::Code &&
 		    m_source.blocks[node->id].terminator.kind == TerminatorKind::ConditionalBranch &&
-		    RefersTo(expression, CaptureVariable(node->id))) return true;
-		return std::ranges::any_of(node->children, [&](auto* child) { return Modifies(child, expression); });
+		    RefersTo(expression, CaptureVariable(node->id)))
+			return true;
+		return std::ranges::any_of(node->children,
+		                           [&](auto* child) { return Modifies(child, expression); });
 	}
 	bool Complements(uint32_t first, uint32_t second) const {
 		const auto& a = m_graph.expressions[first];
 		const auto& b = m_graph.expressions[second];
-		return (a.op == ExprOp::Not && a.lhs == second) ||
-		       (b.op == ExprOp::Not && b.lhs == first);
+		return (a.op == ExprOp::Not && a.lhs == second) || (b.op == ExprOp::Not && b.lhs == first);
 	}
 	uint32_t Visit(Node* parent, uint32_t current, uint32_t break_block) {
 		for (auto it = parent->children.begin(); it != parent->children.end(); ++it) {
@@ -1321,26 +1344,30 @@ private:
 			}
 			switch (node->kind) {
 				case Kind::Code: {
-					const auto& source = m_source.blocks[node->id];
+					const auto& source   = m_source.blocks[node->id];
 					const auto& previous = m_graph.blocks[current];
-					// Route assignments cannot observe guest writes; native predicates must stay at their original Code.
-					const bool captures_native = std::ranges::any_of(previous.assignments, [&](const auto& assignment) {
-						return m_graph.expressions[assignment.expression].op == ExprOp::Native;
-					});
-					if (captures_native ||
-					    (previous.inst_begin != previous.inst_end && previous.inst_end != source.inst_begin)) {
+					// Route assignments cannot observe guest writes; native predicates must stay at
+					// their original Code.
+					const bool captures_native =
+					    std::ranges::any_of(previous.assignments, [&](const auto& assignment) {
+						    return m_graph.expressions[assignment.expression].op == ExprOp::Native;
+					    });
+					if (captures_native || (previous.inst_begin != previous.inst_end &&
+					                        previous.inst_end != source.inst_begin)) {
 						current = Advance(current);
 					}
 					auto& block = m_graph.blocks[current];
 					if (block.inst_begin == block.inst_end) {
-						block.start_pc = source.start_pc;
+						block.start_pc   = source.start_pc;
 						block.inst_begin = source.inst_begin;
 					}
-					block.end_pc = source.end_pc;
+					block.end_pc   = source.end_pc;
 					block.inst_end = source.inst_end;
 					if (source.terminator.kind == TerminatorKind::ConditionalBranch) {
-						block.assignments.push_back({CaptureVariable(source.id),
-						    Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition))});
+						block.assignments.push_back(
+						    {CaptureVariable(source.id),
+						     Expression(ExprOp::Native,
+						                static_cast<uint32_t>(source.terminator.condition))});
 					}
 					break;
 				}
@@ -1355,13 +1382,14 @@ private:
 						break;
 					}
 					auto next = std::next(it);
-					while (next != parent->children.end() && (*next)->kind == Kind::Label) ++next;
-					Node* other = next != parent->children.end() ? *next : nullptr;
-					const bool paired = other != nullptr && other->kind == Kind::If &&
-					                    Complements(node->condition, other->condition) &&
-					                    !Modifies(node, node->condition);
-					const auto body = Allocate();
-					const auto merge = Allocate();
+					while (next != parent->children.end() && (*next)->kind == Kind::Label)
+						++next;
+					Node*      other       = next != parent->children.end() ? *next : nullptr;
+					const bool paired      = other != nullptr && other->kind == Kind::If &&
+					                         Complements(node->condition, other->condition) &&
+					                         !Modifies(node, node->condition);
+					const auto body        = Allocate();
+					const auto merge       = Allocate();
 					const auto alternative = paired ? Allocate() : merge;
 					Conditional(current, node->condition, body, alternative, merge);
 					Place(body);
@@ -1377,26 +1405,29 @@ private:
 				}
 				case Kind::Loop: {
 					const auto& previous = m_graph.blocks[current];
-					const bool empty = previous.inst_begin == previous.inst_end &&
-					                   previous.assignments.empty();
+					const bool  empty =
+					    previous.inst_begin == previous.inst_end && previous.assignments.empty();
 					const auto header = empty ? current : Advance(current);
-					const auto body = Allocate();
-					const auto merge = Allocate();
+					const auto body   = Allocate();
+					const auto merge  = Allocate();
 					Branch(header, body);
 					Place(body);
 					auto repeat = Visit(node, body, merge);
 					// A construct merge belongs to the loop body, not its continue construct.
-					if (repeat == UINT32_MAX || std::ranges::any_of(m_graph.blocks, [&](const auto& block) {
+					if (repeat == UINT32_MAX ||
+					    std::ranges::any_of(m_graph.blocks, [&](const auto& block) {
 						    return block.terminator.merge_block == repeat;
-						})) {
+					    })) {
 						repeat = Advance(repeat);
 					}
-					auto& term = m_graph.blocks[header].terminator;
-					term.loop_header = true;
-					term.merge_block = merge;
+					auto& term          = m_graph.blocks[header].terminator;
+					term.loop_header    = true;
+					term.merge_block    = merge;
 					term.continue_block = repeat;
-					if (node->condition <= 1) Branch(repeat, node->condition ? header : merge);
-					else Conditional(repeat, node->condition, header, merge);
+					if (node->condition <= 1)
+						Branch(repeat, node->condition ? header : merge);
+					else
+						Conditional(repeat, node->condition, header, merge);
 					Place(merge);
 					current = merge;
 					break;
@@ -1422,21 +1453,19 @@ private:
 					Branch(current, UINT32_MAX);
 					current = UINT32_MAX;
 					break;
-				default:
-					Fail("uneliminated control-flow statement");
-					return UINT32_MAX;
+				default: Fail("uneliminated control-flow statement"); return UINT32_MAX;
 			}
 			if (m_failure != nullptr) return UINT32_MAX;
 		}
 		return current;
 	}
 
-	const char* m_failure = nullptr;
-	const Graph& m_source;
-	Graph m_graph;
-	std::deque<Node> m_nodes;
-	Node* m_root = nullptr;
-	std::vector<Node*> m_gotos;
+	const char*           m_failure = nullptr;
+	const Graph&          m_source;
+	Graph                 m_graph;
+	std::deque<Node>      m_nodes;
+	Node*                 m_root = nullptr;
+	std::vector<Node*>    m_gotos;
 	std::vector<uint32_t> m_route_expressions;
 	std::vector<uint32_t> m_order;
 };
@@ -1514,7 +1543,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 		if (start > end_pc) {
 			continue;
 		}
-		const auto begin = std::ranges::lower_bound(program.instructions, start, {}, &Instruction::pc);
+		const auto begin =
+		    std::ranges::lower_bound(program.instructions, start, {}, &Instruction::pc);
 		if (start != end_pc && (begin == program.instructions.end() || begin->pc != start)) {
 			ExitBuildFailure(
 			    graph, FailureKind::InvalidLabel, UINT32_MAX,
@@ -1526,7 +1556,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 		block.start_pc   = start;
 		block.end_pc     = i + 1u < labels.size() ? labels[i + 1u] : end_pc;
 		block.inst_begin = static_cast<uint32_t>(begin - program.instructions.begin());
-		block.inst_end = static_cast<uint32_t>(
+		block.inst_end   = static_cast<uint32_t>(
 		    std::lower_bound(program.instructions.begin(), program.instructions.end(), block.end_pc,
 		                     [](const Instruction& inst, uint32_t pc) { return inst.pc < pc; }) -
 		    program.instructions.begin());
@@ -1552,7 +1582,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 		if (last.opcode == Opcode::S_ENDPGM) {
 			block.terminator.kind = TerminatorKind::Return;
 		} else if (last.opcode == Opcode::S_SWAPPC_B64 && last.branch_target != UINT32_MAX) {
-			block.terminator.kind = TerminatorKind::Branch;
+			block.terminator.kind       = TerminatorKind::Branch;
 			block.terminator.true_block = block_at_pc(last.branch_target);
 		} else if (last.opcode == Opcode::S_SETPC_B64) {
 			const auto& target_info = setpc_targets.at(last.pc);
@@ -1687,27 +1717,97 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
 	       (ScalarOperandCode(inst.dst, destination) && code == destination + 1u);
 }
 
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code) {
+uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph, uint32_t before,
+                              uint32_t code, const std::function<bool(uint32_t)>& confirm) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
 	});
 	EXIT_IF(found == graph.blocks.end());
-	const auto* block = &*found;
-	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
-		for (uint32_t i = before; i > block->inst_begin;) {
-			const auto& inst = program.instructions[--i];
-			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
-			if (MayWriteScalarRegister(inst, code)) return i;
-		}
-		if (block->id == graph.entry_block) return UINT32_MAX;
-		EXIT_IF(block->predecessors.size() != 1u);
-		block = graph.FindBlock(block->predecessors[0]);
-		EXIT_IF(block == nullptr);
-		before = block->inst_end;
+	using BlockT = std::remove_cvref_t<decltype(*found)>;
+
+	std::set<uint32_t> defs;    // definitions found (UINT32_MAX = comes from outside shader)
+	std::set<uint32_t> visited; // blocks already fully scanned
+	std::vector<std::pair<const BlockT*, uint32_t>> work;
+	work.emplace_back(&*found, before);
+
+	// --- DIAGNOSTIC: FSD entry ---
+	const bool fsd_trace = (std::getenv("KYTY_FSD_TRACE") != nullptr);
+	if (fsd_trace) {
+		printf("    FSD: s%u before=%u start_block=%u [%u,%u)\n", code, before, (unsigned)found->id,
+		       found->inst_begin, found->inst_end);
 	}
-	EXIT("scalar shader call source has cyclic reaching definitions");
+
+	while (!work.empty()) {
+		auto [block, from] = work.back();
+		work.pop_back();
+		// --- DIAGNOSTIC: FSD worklist step ---
+		if (fsd_trace) {
+			printf("    FSD:  scan block=%u from=%u [%u,%u)\n", (unsigned)block->id, from,
+			       block->inst_begin, block->inst_end);
+		}
+		bool done = false;
+		for (uint32_t i = from; i > block->inst_begin;) {
+			const auto& inst = program.instructions[--i];
+			if (!MayWriteScalarRegister(inst, code)) {
+				continue;
+			}
+			// --- DIAGNOSTIC: candidate found, check confirm ---
+			const bool confirmed = !confirm || confirm(i);
+			if (fsd_trace) {
+				printf("    FSD:   candidate @%u opcode=%d confirmed=%s\n", i, (int)inst.opcode,
+				       confirmed ? "yes" : "no");
+			}
+			if (!confirmed) {
+				continue; // false positive "dst + 1"
+			}
+			defs.insert(i);
+			done = true;
+			break;
+		}
+		if (done) continue;
+		if (block->id == graph.entry_block) {
+			if (fsd_trace) {
+				printf("    FSD:   reached entry block -> user_data (UINT32_MAX)\n");
+			}
+			defs.insert(UINT32_MAX);
+			continue;
+		}
+		EXIT_IF(block->predecessors.empty());
+		for (auto p: block->predecessors) {
+			const auto* pb = graph.FindBlock(p);
+			EXIT_IF(pb == nullptr);
+			if (!visited.insert(static_cast<uint32_t>(pb->id)).second) {
+				if (fsd_trace) {
+					printf("    FSD:   pred block=%u already visited, skip\n", (unsigned)pb->id);
+				}
+				continue;
+			}
+			if (fsd_trace) {
+				printf("    FSD:   enqueue pred block=%u [%u,%u)\n", (unsigned)pb->id,
+				       pb->inst_begin, pb->inst_end);
+			}
+			work.emplace_back(pb, pb->inst_end);
+		}
+	}
+	if (defs.size() != 1u) {
+		printf("FSD: s%u from %u has %zu distinct definitions:", code, before, defs.size());
+		for (auto d: defs)
+			printf(" %d", d == UINT32_MAX ? -1 : (int)d);
+		printf("\n");
+	} else {
+		const auto def = *defs.begin();
+		if (fsd_trace) {
+			if (def == UINT32_MAX) {
+				printf("    FSD: s%u result -> user_data (UINT32_MAX)\n", code);
+			} else {
+				printf("    FSD: s%u result -> def @%u opcode=%d\n", code, def,
+				       (int)program.instructions[def].opcode);
+			}
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(defs.size() != 1u);
+	return *defs.begin();
 }
 
 std::string BranchConditionToString(BranchCondition condition) {
@@ -1771,10 +1871,13 @@ std::string GraphToString(const Graph& graph) {
 		    VectorToString(block.terminator.indirect_selector_values).c_str(),
 		    block.terminator.expression);
 		for (const auto& assignment: block.assignments) {
-			text += fmt::format("  variable_{} = expression_{}", assignment.variable, assignment.expression);
+			text += fmt::format("  variable_{} = expression_{}", assignment.variable,
+			                    assignment.expression);
 			const auto& expression = graph.expressions[assignment.expression];
 			if (expression.op == ConditionExpression::Op::Native)
-				text += fmt::format(" condition={}", BranchConditionToString(static_cast<BranchCondition>(expression.lhs)));
+				text += fmt::format(
+				    " condition={}",
+				    BranchConditionToString(static_cast<BranchCondition>(expression.lhs)));
 			text += "\n";
 		}
 	}

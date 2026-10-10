@@ -408,7 +408,7 @@ struct PipelineCache::ProgramCache {
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
-			if (current->call) {
+			if (!current->calls.empty()) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
 				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 				translated.program.source_reads = current->reads;
@@ -419,7 +419,7 @@ struct PipelineCache::ProgramCache {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
 		if (entry == programs.end()) {
-			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
+			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(

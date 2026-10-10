@@ -573,6 +573,44 @@ struct ResourcePlan {
 		uint64_t           generation = 0;
 	};
 
+	// A plan value in the form the SRT walker evaluates, indexed by evaluation index. Operands
+	// are walker references to nodes or immediates (see SrtWalker).
+	struct WalkerNode {
+		static constexpr uint32_t MaxArgs = 8;
+
+		const Inst*                   inst      = nullptr;
+		ValueOpcode                   opcode    = ValueOpcode::Void;
+		bool                          compiled  = false;
+		uint8_t                       kind      = 0;
+		uint8_t                       arg_count = 0;
+		uint32_t                      aux       = 0;
+		uint32_t                      target    = 0;
+		std::array<uint32_t, MaxArgs> args {};
+	};
+	struct WalkerImmediate {
+		Type     type       = Type::Void;
+		bool     valid      = false;
+		bool     comparable = false;
+		uint64_t payload    = 0;
+	};
+	// Reference of a root value (SRT read, descriptor DWORD, block condition), redone when the
+	// value changes.
+	struct WalkerRoot {
+		Value    value;
+		uint32_t ref   = UINT32_MAX;
+		bool     clean = false; // SRT read evaluated through the clean evaluator
+	};
+	// An SRT read root that is a DWORD read at a constant offset: its handle DWORDs and aligned
+	// offset, so a flat-buffer refresh reads it without the generic dispatch. low is UINT32_MAX
+	// for any other root.
+	struct WalkerRead {
+		uint32_t low     = UINT32_MAX;
+		uint32_t high    = UINT32_MAX;
+		uint32_t records = UINT32_MAX; // constant-buffer reads only, with word3
+		uint32_t word3   = UINT32_MAX;
+		int64_t  offset  = 0;
+	};
+
 	ResourcePlan() = default;
 	~ResourcePlan();
 
@@ -605,6 +643,18 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// Walker nodes of the values above. Only extracted plans, whose instructions never change,
+	// keep them across walks; other plans compile them again in each walk.
+	bool                                 walker_cached = false;
+	mutable std::vector<WalkerNode>      walker_nodes;
+	mutable std::vector<WalkerImmediate> walker_immediates;
+	mutable std::vector<WalkerRoot>      walker_srt_reads;
+	mutable std::vector<WalkerRead>      walker_reads; // per SRT read root
+	mutable std::vector<WalkerRoot>      walker_descriptors;
+	mutable std::vector<WalkerRoot>      walker_conditions;
+	// Counts additions to the arrays above, which may move them: a walker refreshes its
+	// pointers after any compilation before it evaluates again.
+	mutable uint32_t walker_layout = 0;
 };
 
 struct Program: ResourcePlan {

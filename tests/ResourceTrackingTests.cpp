@@ -3218,6 +3218,32 @@ ResourcePlan ConditionalBufferPlan(ConditionalBufferUse use) {
   return ExtractResourcePlan(fixture.program);
 }
 
+// Block conditions are walk roots: a replaced condition is followed by the next walk.
+void TestReplacedBlockConditionIsFollowed() {
+  auto plan = ConditionalBufferPlan(ConditionalBufferUse::Optional);
+  std::array<uint32_t, 8> user_data{0x1000, 16u << 16u, 1, 0x4dfac,
+                                    0xc0107600, 0x8c, 0x97730000, 0x100020};
+  TestMemory memory;
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto taken = [&] {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers.size() == 2,
+          "conditional buffer plan failed to materialize");
+    return std::equal(user_data.begin() + 4, user_data.end(), snapshot.buffers[1].dwords.begin());
+  };
+  auto block = std::ranges::find_if(plan.control_flow,
+                                     [](const auto &block) { return !block.condition.IsEmpty(); });
+  Check(block != plan.control_flow.end() && !taken(), "the scalar flag did not skip the branch");
+  const auto condition = block->condition;
+  block->condition = Value(true);
+  Check(taken(), "a replaced block condition was not followed");
+  block->condition = condition;
+  Check(!taken(), "a restored block condition was not followed");
+}
+
 void TestConditionalBufferMaterialization() {
   auto plan = ConditionalBufferPlan(ConditionalBufferUse::Optional);
   // GTA III leaves packet words in s[12:15] when its scalar control word is zero.
@@ -3741,6 +3767,7 @@ int main() {
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
+    Run("replaced block condition", TestReplacedBlockConditionIsFollowed);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);

@@ -601,6 +601,20 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
+bool FastF32MinMax();
+
+struct F32MinMaxOperand {
+	uint32_t value = 0;
+	uint32_t bits  = 0;
+	uint32_t abs   = 0;
+	uint32_t nan   = 0;
+};
+
+F32MinMaxOperand EmitMinMaxOperandF32(EmitterState& state, uint32_t value);
+
+F32MinMaxOperand EmitMinMaxF32Operands(EmitterState& state, F32MinMaxOperand& lhs,
+                                       F32MinMaxOperand& rhs, bool max_value, bool nan_free);
+
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);

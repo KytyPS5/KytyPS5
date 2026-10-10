@@ -21,8 +21,8 @@ uint32_t              EmitConvertU16U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU8U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertF16F32(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitConvertF32F16 = EmitF16BitsToF32;
-uint32_t              EmitConvertS32F32(EmitterState& state, uint32_t arg0);
-uint32_t              EmitConvertU32F32(EmitterState& state, uint32_t arg0);
+uint32_t              EmitConvertS32F32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitConvertU32F32(ValueEmitContext& ctx, const IR::Inst& inst);
 EMIT_NATIVE(ConvertF32S32, OpConvertSToF, F32, uint32_t)
 EMIT_NATIVE(ConvertF64S32, OpConvertSToF, F64, uint32_t)
 uint32_t              EmitConvertF32F64(EmitterState& state, uint32_t arg0);

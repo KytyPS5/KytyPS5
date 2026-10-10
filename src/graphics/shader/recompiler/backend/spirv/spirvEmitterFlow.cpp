@@ -110,9 +110,27 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	return EmitInputComponentU32(state, kind, component);
 }
 
+static bool DppFullMaskFoldDisabled() {
+	static const bool disabled = [] {
+		const char* text = std::getenv("KYTY_NO_DPP_FULL_MASK_FOLD");
+		return text != nullptr && text[0] != '\0' && text[0] != '0';
+	}();
+	return disabled;
+}
+
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
                                uint32_t exec) {
-	auto&      state      = ctx.state;
+	auto& state = ctx.state;
+	if ((flags.bank_mask & 0xfu) == 0xfu && (flags.row_mask & 0xfu) == 0xfu &&
+	    !DppFullMaskFoldDisabled()) {
+		uint32_t writable = exec;
+		if (!flags.bound_control) {
+			writable = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), writable, exec,
+			                          EmitDppTargetLane(state, flags).valid);
+		}
+		return writable;
+	}
 	const auto lane       = EmitSubgroupLocalInvocationId(state);
 	const auto bank_shift = state.builder.AllocateId();
 	const auto row_shift  = state.builder.AllocateId();

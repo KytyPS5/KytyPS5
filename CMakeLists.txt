@@ -800,6 +800,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --independent-inline-sampled-sources-only)
 	add_test(NAME shader_independent_sampler_code_size
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --independent-sampler-code-size-only)
+	add_test(NAME shader_inline_image_loads_admission
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --inline-full-image-loads-only)
+	add_test(NAME shader_inline_image_loads_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --inline-full-image-loads-only)
+	set_tests_properties(shader_inline_image_loads_admission PROPERTIES TIMEOUT 60)
+	set_tests_properties(shader_inline_image_loads_gpu PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 	set_tests_properties(shader_independent_sampler_code_size PROPERTIES TIMEOUT 60)
 	set_tests_properties(shader_independent_inline_sampled_sources_admission PROPERTIES TIMEOUT 60)
 	set_tests_properties(shader_independent_inline_sampled_sources_gpu PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)

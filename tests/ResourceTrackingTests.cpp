@@ -5121,7 +5121,8 @@ std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = fa
                                                     bool image_table = false,
                                                     bool full_width_images = false,
                                                     bool guarded_selector = false,
-                                                    uint32_t independent_sampler = 0u) {
+                                                    uint32_t independent_sampler = 0u,
+                                                    bool image_load = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> index_words;
@@ -5214,9 +5215,11 @@ std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = fa
       sample.kind = ResourceKind::Image;
       sample.image_dimension = Decoder::ImageDimension::Dim2D;
       sample.image_r128 = false;
-      const auto sampled = fixture->Emit(
-          ValueOpcode::ImageSampleRaw, {image, sampler, fixture->ImageAddress()},
-          fixture->AddMemory(sample, 0x1c30 + image_index * 8u));
+      const auto sampled = image_load
+          ? fixture->Emit(ValueOpcode::ImageRead, {image, fixture->ImageAddress(), Value(true)},
+                          fixture->AddMemory(sample, 0x1c30 + image_index * 8u))
+          : fixture->Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture->ImageAddress()},
+                          fixture->AddMemory(sample, 0x1c30 + image_index * 8u));
       const auto sampled_x =
           fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
       fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
@@ -6592,6 +6595,71 @@ void TestSharedInlineImageCandidates(bool pair_domain_regression = false) {
             specialization == capacity_specialization,
         "shared admission accepted distinct-image capacity plus one or partially committed it");
 
+}
+
+void TestInlineFullWidthImageLoads() {
+  auto fixture = MakeInlineDescriptorFixture(true, false, true, false, 0u, true);
+  fixture->PlanAndTrack();
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  const auto plan = ExtractResourcePlan(fixture->program);
+  Check(fixture->program.info.images.size() == 2u &&
+            fixture->program.info.samplers.empty() && fixture->program.info.sampled_pairs.empty(),
+        "inline image loads incorrectly required sampler resources");
+  for (uint32_t image = 0; image < 2u; ++image) {
+    const auto& source = plan.descriptor_sources.at(fixture->program.info.images[image].source);
+    Check(source.inline_descriptor && source.inline_descriptor->descriptor_dwords == 8u &&
+              source.inline_descriptor->descriptor_offset == image * 32u,
+          "inline image load lost its full adjacent descriptor");
+  }
+  std::array<uint32_t, 8> user_data{0x1000u, 440u << 16u, 2u, 0u,
+                                  0x2800u, 0u, 16u, 0u};
+  LinearTestMemory memory;
+  for (uint32_t record = 0; record < 2u; ++record) {
+    for (uint32_t image = 0; image < 2u; ++image) {
+      const auto offset = (record * 440u + image * 32u) / 4u;
+      memory.words[offset] = 0x20u + record * 0x40u + image * 0x20u;
+      memory.words[offset + 1u] = static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+      memory.words[offset + 2u] = 3u | (3u << 14u);
+      memory.words[offset + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+      memory.words[offset + 5u] = 0x00700000u;
+    }
+  }
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.samplers.empty(),
+        "full inline image loads did not materialize without samplers");
+  for (uint32_t image = 0; image < 2u; ++image) {
+    const auto& root = specialization.images[image];
+    for (uint32_t record = 0; record < 2u; ++record) {
+      uint32_t selected = 0u;
+      for (uint32_t row = 0; row < snapshot.flattened_srt[root.indirect_mapping_offset]; ++row) {
+        const auto position = root.indirect_mapping_offset + 1u + row * 2u;
+        if (snapshot.flattened_srt[position] == record * 440u)
+          selected = snapshot.flattened_srt[position + 1u];
+      }
+      Check(selected != 0u, "inline image load lost a valid record key");
+      const auto& descriptor = snapshot.images.at(root.indirect_resources.at(selected));
+      Check(descriptor.dwords[0] == 0x20u + record * 0x40u + image * 0x20u &&
+                descriptor.dwords[5] == 0x00700000u,
+            "inline image load selected the wrong full descriptor");
+    }
+  }
+  const auto previous = snapshot;
+  const auto previous_specialization = specialization;
+  auto limited = runtime;
+  limited.max_dense_images = 2u;
+  Check(!MaterializeResources(plan, limited, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+        "inline image load budget overflow committed partial state");
+  memory.fail_address = 0x1000u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+        "inline image load accepted unavailable descriptor bytes");
 }
 
 void TestInlineFullWidthImages() {
@@ -9290,6 +9358,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ADDRESS_BACKED_INDIRECT_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-full-image-loads-only") == 0) {
+      TestInlineFullWidthImageLoads();
+      std::cout << "KYTY_INLINE_FULL_IMAGE_LOADS_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--independent-inline-sampled-sources-only") == 0) {
       TestIndependentInlineSampledSources();
       std::cout << "KYTY_INDEPENDENT_INLINE_SAMPLED_SOURCES_PASS\n";
@@ -9552,6 +9625,7 @@ int main(int argc, char** argv) {
     Run("sampled pair materialization", [] { TestSharedInlineImageCandidates(true); });
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
     Run("independent inline sampled sources", TestIndependentInlineSampledSources);
+    Run("inline full image loads", TestInlineFullWidthImageLoads);
     Run("inline native sampler capacity", TestInlineNativeSamplerCapacity);
     Run("coherent inline selector values", TestCoherentInlineSelectorValues);
     Run("combined native image capacity", TestCombinedNativeImageCapacity);

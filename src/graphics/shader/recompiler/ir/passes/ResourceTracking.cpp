@@ -3006,7 +3006,7 @@ private:
 					    !EquivalentValue(m_program, image_plan.key, sampler_plan.key)) {
 						m_sources[image_plan.source].inline_descriptor->independent_sampler = true;
 					}
-				} else {
+				} else if (image_info.needs_sampler) {
 					if (sampler == nullptr || sampler->GetOpcode() != ValueOpcode::GetSamplerResource) {
 						continue;
 					}

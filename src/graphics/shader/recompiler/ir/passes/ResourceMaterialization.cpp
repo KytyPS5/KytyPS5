@@ -1986,13 +1986,15 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 			}
 			const bool expects_r128 = !source->inline_descriptor->image_table.has_value() &&
 			                          source->inline_descriptor->descriptor_dwords == 4u;
+			// Fetch/query-only sampled image views have no image/sampler use edge.
+			// Preserve width/class checks and validate any actual sampler pairing.
 			if (image.r128 != expects_r128 ||
 			    image.resource_class != ImageResourceClass::Sampled ||
-			    pair == nullptr || pair->sampler >= program.info.samplers.size()) {
+			    (pair != nullptr && pair->sampler >= program.info.samplers.size())) {
 				return SpecializationFail(fmt::format(
 				    "inline image at pc 0x{:08x} has an invalid sampled descriptor width", image.first_use_pc));
 			}
-			const auto* inline_sampler = sampler->inline_descriptor.has_value()
+			const auto* inline_sampler = sampler != nullptr && sampler->inline_descriptor.has_value()
 			                                 ? &*sampler->inline_descriptor : nullptr;
 			std::vector<uint32_t> requests {source->inline_descriptor->buffer_source};
 			if (source->inline_descriptor->image_table.has_value()) {

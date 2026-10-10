@@ -1,5 +1,24 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 04:24 UTC** (sampler-free inline image loads proved):
+
+- Same native0b147273 / EXE3ddab / original5178 diagnostic run035159
+  naturally exits321 at04:07:43.598UTC, no timeout/memory/log guards.
+  Min available RAM17.66GiB. Extracted PS617c decoded/IR is in
+  `_Build/analysis/scalar-buffer-image-provenance-20261010/diagnostic-20261010T035159Z-66f1f556/ps617c-early.txt`.
+  IMAGE_LOAD uses a full half of scalar x16 descriptor reads with a
+  vector-derived ReadFirstLane selector. Two shared gates wrongly require
+  samplers for fetch-only inline image views; no acceptance rule was guessed.
+- CPU intended RED041137 and GPU ReadFirstLane RED041524 -> CPU GREEN041903
+  and full/compact numeric GPUAV042018. Initial ordinary-scalar GPU041236
+  already passed and is not reproduction evidence. Full resource042210
+  PASS2/2 covers exact full payload/mapping, no sampler and strict transactional
+  budget/unavailable-memory refusal. Registered GPUAV042244 PASS2/2 adds
+  independent sampling; shared/ordinary full-image GPUAV042332 PASS.
+- Next: separate local fix commit, native build, preserve installed EXE/cache,
+  bounded original retry with normal silent logging. Async PS07b3 driver
+  completion, visually confirmed menu and game entry remain pending. No post.
+
 Checkpoint **2026-10-10 03:50 UTC** (new scalar-buffer descriptor frontier):
 
 - Native source0b147273 / EXE3ddab / original5178 run

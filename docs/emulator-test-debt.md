@@ -12,6 +12,21 @@ root=ReadConstBuffer. Require diagnosis of buffer/key/provenance before the
 minimal synthetic native RED; preserve scalar-read bounds, loop predicates,
 resource ownership and source lifetime. No zero substitutes/error suppression.
 
+Diagnostic same-source run035159 naturally exits321 at04:07:43.598UTC,
+no guards. Relevant decoded/normalized IR extracted (12911 lines) to
+`_Build/analysis/scalar-buffer-image-provenance-20261010/diagnostic-20261010T035159Z-66f1f556/ps617c-early.txt`.
+IMAGE_LOAD consumes one eight-word half of S_BUFFER_LOAD_DWORDX16,
+136-byte record stride and vector-derived ReadFirstLane key. Tracking and
+materialization incorrectly require a sampler for this fetch-only image view.
+Synthetic CPU intended RED041137; GPU ReadFirstLane RED041524. Initial CPU
+arity failure is setup only; scalar-selector GPU041236 passes old code and
+is not RED. Same CPU GREEN041903; full resource/admission042210 PASS2/2,
+including full upper-word payload, no sampler, exact mapping, transactional
+image-budget/unavailable-byte failures. Full/compact GPU loads042018 PASS
+with OOB key; registered loads plus independent sampling042244 PASS2/2;
+ordinary/shared full-image sampling GPUAV042332 PASS. Native rebuild and
+original-game retry pending; async PS07b3 driver completion remains unproved.
+
 ## Independent sampler indexing without Cartesian sample instructions (2026-10-10)
 
 Original5178/sourceebf81d71/EXE452ce run025503 passes PS07b3 materialization

@@ -40312,7 +40312,8 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
                                          bool expanded_samplers = false,
                                          u32 selector_limit = 0u,
                                          u32 independent_sampler = 0u,
-                                         bool full_wave = false) {
+                                         bool full_wave = false,
+                                         bool image_load = false) {
   using O = ShaderOpcode;
   const u32 material_base = full_wave ? 2048u : 128u;
   const u32 index_base = full_wave ? 1024u : 64u;
@@ -40327,7 +40328,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   const bool image_table = mode == MaterialImageSampleMode::ImageTableDynamicSampler;
   const bool dynamic_sampler = mode == MaterialImageSampleMode::CompactDynamicSampler || image_table || independent_sampler != 0u;
   const u32 image_offset = full_inline ? 0u : dynamic_sampler ? 152u : 588u;
-  const u32 iteration_count = expanded_samplers ? 4u : image_table ? 5u : material_count;
+  const u32 iteration_count = expanded_samplers ? 4u : image_table || image_load ? 5u : material_count;
 
   TestCase test;
   test.name = full_inline ? "ImageSampleLzFullDynamicMaterialStaticSampler"
@@ -40393,6 +40394,15 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
     // The second full descriptor in the same x16 load selects the other image.
     for (const float value : {8.0f, 80.0f, 8.0f, 80.0f}) {
       test.expected.push_back(std::bit_cast<u32>(value));
+    }
+  }
+  if (image_load) {
+    test.name = full_inline ? "FullInlineImageLoadsWithoutSampler" : "CompactInlineImageLoadsWithoutSampler";
+    test.expected = {std::bit_cast<u32>(80.0f), std::bit_cast<u32>(8.0f),
+                     std::bit_cast<u32>(80.0f), std::bit_cast<u32>(8.0f), 0u};
+    if (full_inline) {
+      for (const float value : {8.0f, 80.0f, 8.0f, 80.0f, 0.0f})
+        test.expected.push_back(std::bit_cast<u32>(value));
     }
   }
 
@@ -40486,11 +40496,22 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   }
   AppendVMovLiteral(&code, 24, std::bit_cast<u32>(1.3125f));
   AppendVMovLiteral(&code, 25, std::bit_cast<u32>(0.375f));
+  if (image_load) {
+    AppendVMovU32(&code, 24, 3u);
+    AppendVMovU32(&code, 25, 1u);
+  }
   code.push_back(EncodeSMovB32(32, InlineU32(0)));
   const auto loop = code.size();
   code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(2)));
-  code.push_back(EncodeSmem0(0x08, 60, 4));
-  code.push_back(EncodeSmem1(0, 33));
+  if (image_load) {
+    code.push_back(EncodeVop1(0x01, 30, 33));
+    code.push_back(EncodeMubuf0(0x0c));
+    code.push_back(EncodeMubuf1(28, 2, 30));
+    code.push_back(EncodeVop1(0x02, 60, Vgpr(28)));
+  } else {
+    code.push_back(EncodeSmem0(0x08, 60, 4));
+    code.push_back(EncodeSmem1(0, 33));
+  }
   size_t bound_branch = 0u;
   if (selector_limit != 0u) {
     code.push_back(EncodeSopc(0x0a, 60, 255u));
@@ -40543,7 +40564,7 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
       AppendSMovLiteral(&code, sgpr, 0xdeadc000u + sgpr);
     }
   }
-  code.push_back(EncodeMimg0(dynamic_sampler ? 0x22u : 0x27u,
+  code.push_back(EncodeMimg0(image_load ? 0x00u : dynamic_sampler ? 0x22u : 0x27u,
                              0x1, 0, false, 1, !image_table && !full_inline));
   code.push_back(EncodeMimg1(0, dynamic_sampler ? 20u : 24u, 4,
                              dynamic_sampler ? 3u : 19u));
@@ -40557,9 +40578,9 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   }
   AppendBufferStoreDword(&code, 0, 30);
   if (full_inline && independent_sampler == 0u) {
-    code.push_back(EncodeMimg0(0x27, 0x1, 0, false, 1, false));
+    code.push_back(EncodeMimg0(image_load ? 0x00u : 0x27u, 0x1, 0, false, 1, false));
     code.push_back(EncodeMimg1(1, 24, 6, 19));
-    code.push_back(EncodeSop2(0x00, 34, 33, InlineU32(material_count * 4u)));
+    code.push_back(EncodeSop2(0x00, 34, 33, InlineU32(iteration_count * 4u)));
     code.push_back(EncodeVop1(0x01, 30, 34));
     AppendBufferStoreDword(&code, 1, 30);
   }
@@ -40575,11 +40596,11 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
   AppendEnd(&code);
 
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_LSHL_B32,
-                  O::S_BUFFER_LOAD_DWORD, O::S_MUL_I32,
+                  image_load ? O::BUFFER_LOAD_DWORD : O::S_BUFFER_LOAD_DWORD, O::S_MUL_I32,
                   full_inline ? independent_sampler != 0u ? O::S_BUFFER_LOAD_DWORDX8 : O::S_BUFFER_LOAD_DWORDX16
                   : dynamic_sampler && !image_table && independent_sampler == 0u ? O::S_BUFFER_LOAD_DWORDX8
                                                   : O::S_BUFFER_LOAD_DWORDX4,
-                  O::IMAGE_SAMPLE,
+                  image_load ? O::IMAGE_LOAD : O::IMAGE_SAMPLE,
                   O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
                   O::S_CBRANCH_SCC1, O::S_ENDPGM};
   if (selector_limit != 0u) test.opcodes.push_back(O::S_CBRANCH_SCC0);
@@ -40597,7 +40618,11 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode,
     test.expected = test.initial;
     std::copy(output.begin(), output.end(), test.expected.begin());
   }
-  if (!dynamic_sampler) {
+  if (image_load) {
+    test.opcodes.push_back(O::V_READFIRSTLANE_B32);
+    test.required_spirv = {"OpLoopMerge", "OpSwitch", "OpImageFetch"};
+    test.forbidden_spirv = {"OpSampledImage", "OpTypeSampler"};
+  } else if (!dynamic_sampler) {
     test.decoded_counts.push_back({"image_sample_lz ", full_inline ? 2u : 1u});
     test.forbidden_spirv = {"Grad"};
   }
@@ -51383,6 +51408,14 @@ if (argc == 1) {
     std::printf("native combined image descriptor ceiling=%u\n", vulkan.DenseImageCapacity());
     RunCase(&vulkan, CombinedNativeImageCapacity());
     std::puts("KYTY_COMBINED_NATIVE_IMAGE_CAPACITY_GPU_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--inline-full-image-loads-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto mode : {MaterialImageSampleMode::FullStaticSampler,
+                           MaterialImageSampleMode::CompactStaticSampler})
+      RunCase(&vulkan, MakeImageSampleDynamicMaterials(mode, false, 0u, 0u, false, true));
+    std::puts("KYTY_INLINE_FULL_IMAGE_LOADS_GPU_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--independent-sampler-code-size-only") == 0) {

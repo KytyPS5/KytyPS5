@@ -4517,6 +4517,128 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckDepthColorTwin() {
+    constexpr const char *name = "DepthColorTwin";
+    constexpr uintptr_t base = 0x0000000209e00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    if (!m_runtime_context.depth_color_copy_enabled) {
+      std::printf("[gpu]     %-32s skipped (no maintenance8)\n", name);
+      return;
+    }
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "twin test direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed twin test mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    constexpr std::array<float, 4> initial{0.25f, 0.75f, 0.5f, 0.125f};
+    std::memcpy(memory, initial.data(), sizeof(initial));
+    {
+      auto &resources = context;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      auto &texture_cache = resources.GetTextureCache();
+      resources.MapMemory(base, allocation_size);
+      auto depth = MakeLinearDesc(base, sizeof(initial), vk::Format::eD32Sfloat,
+                                  Prospero::BufferFormat::k32Float,
+                                  Prospero::ImageType::kColor2D, {2, 1, 1}, 2,
+                                  sizeof(float), 1);
+      depth.type = BindingType::DepthTarget;
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      auto storage = MakeLinearDesc(base, sizeof(initial), vk::Format::eR32Uint,
+                                    Prospero::BufferFormat::k32UInt,
+                                    Prospero::ImageType::kColor2D, {2, 1, 1}, 2,
+                                    sizeof(uint32_t), 1);
+      storage.type = BindingType::Storage;
+      storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+
+      auto depth_desc = depth;
+      const auto depth_id = texture_cache.FindImage(depth_desc);
+      (void)texture_cache.FindDepthTarget(depth_id, depth_desc);
+      auto storage_desc = storage;
+      const auto color_id = texture_cache.FindImage(storage_desc);
+      Require(name, "first switch parks the depth surface",
+              color_id && color_id != depth_id &&
+                  TextureCacheTestAccess::Contains(texture_cache, depth_id) &&
+                  texture_cache.GetImage(depth_id).dormant &&
+                  texture_cache.GetImage(color_id).depth_twin == depth_id &&
+                  texture_cache.GetImage(depth_id).depth_twin == color_id,
+              "a storage binding over depth freed the depth image instead of parking it");
+
+      // The dispatch binds layer 1 only; layer 0 is scribbled on behind the cache's back, so
+      // only the layer the binding wrote may travel back to the depth twin.
+      storage_desc.view_info.base_layer = 1;
+      storage_desc.view_info.layer_count = 1;
+      (void)texture_cache.FindTexture(color_id, storage_desc);
+      auto &color = texture_cache.GetImage(color_id);
+      scheduler.Current().EndRendering();
+      color.Transit(vk::ImageLayout::eTransferDstOptimal,
+                    vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      vk::ClearColorValue written{};
+      written.uint32[0] = 0x3f800000u;
+      vk::ClearColorValue scribble{};
+      scribble.uint32[0] = 0x3e000000u;
+      const vk::ImageSubresourceRange layer0{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      const vk::ImageSubresourceRange layer1{vk::ImageAspectFlagBits::eColor, 0, 1, 1, 1};
+      scheduler.Current().Handle().clearColorImage(
+          color.backing.image, vk::ImageLayout::eTransferDstOptimal, &written, 1, &layer1);
+      scheduler.Current().Handle().clearColorImage(
+          color.backing.image, vk::ImageLayout::eTransferDstOptimal, &scribble, 1, &layer0);
+
+      auto depth_again = depth;
+      const auto revived = texture_cache.FindImage(depth_again);
+      Require(name, "second switch revives the twin",
+              revived == depth_id && !texture_cache.GetImage(depth_id).dormant &&
+                  texture_cache.GetImage(color_id).dormant,
+              "a depth binding over the colour surface rebuilt instead of reviving its twin");
+      const auto layer0_texels =
+          ReadCachedTexel(name, context, depth_id, {}, {2, 1, 1}, 0);
+      const auto layer1_texels =
+          ReadCachedTexel(name, context, depth_id, {}, {2, 1, 1}, 1);
+      Require(name, "only the written layer travels",
+              layer0_texels ==
+                      std::vector<u32>{std::bit_cast<u32>(0.25f), std::bit_cast<u32>(0.75f)} &&
+                  layer1_texels == std::vector<u32>{0x3f800000u, 0x3f800000u},
+              "the twin sync copied an unwritten layer or lost the written one");
+
+      auto storage_again = storage;
+      const auto color_again = texture_cache.FindImage(storage_again);
+      Require(name, "third switch reuses the colour twin",
+              color_again == color_id && texture_cache.GetImage(depth_id).dormant,
+              "the colour twin was not reused");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "twin test mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "twin test allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckTextureCacheCollectorProgress() {
     constexpr const char *name = "TextureCacheCollectorProgress";
     constexpr uintptr_t base = 0x0000000208800000ull;
@@ -7901,8 +8023,12 @@ public:
           texture_cache.GetImage(layered_raw_d16_depth_image);
       Require(name, "layered raw D16 owner layout",
               layered_raw_d16_depth_image != layered_d16_color_image &&
-                  !TextureCacheTestAccess::Contains(texture_cache,
-                                                    layered_d16_color_image) &&
+                  // A depth binding over the colour surface parks it as the depth twin.
+                  (!TextureCacheTestAccess::Contains(texture_cache,
+                                                     layered_d16_color_image) ||
+                   (texture_cache.GetImage(layered_d16_color_image).dormant &&
+                    texture_cache.GetImage(layered_d16_color_image).depth_twin ==
+                        layered_raw_d16_depth_image)) &&
                   layered_depth_owner.info.resources.layers == 6 &&
                   layered_depth_owner.info.data.size ==
                       sizeof(layered_raw_d16_values) &&
@@ -23190,6 +23316,7 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_draw_indirect_supported = false;
+  bool m_depth_color_copy_supported = false;
   bool m_sparse_residency_supported = false;
   u32   m_skipped_cases          = 0;
 
@@ -23231,6 +23358,7 @@ private:
     m_runtime_context.multi_draw_indirect_enabled = m_draw_indirect_supported;
     m_runtime_context.draw_indirect_count_enabled = m_draw_indirect_supported;
     m_runtime_context.sparse_residency_buffer_enabled = m_sparse_residency_supported;
+    m_runtime_context.depth_color_copy_enabled = m_depth_color_copy_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -23532,6 +23660,28 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8{};
+    {
+      uint32_t count = 0;
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &count,
+                                                                  nullptr);
+      std::vector<vk::ExtensionProperties> extensions(count);
+      (void)m_physical_device.enumerateDeviceExtensionProperties(
+          nullptr, &count, extensions.data());
+      for (const auto &extension : extensions) {
+        if (std::strcmp(extension.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME) == 0) {
+          vk::PhysicalDeviceFeatures2 query{};
+          query.pNext = &maintenance8;
+          m_physical_device.getFeatures2(&query);
+          m_depth_color_copy_supported = maintenance8.maintenance8 == VK_TRUE;
+        }
+      }
+      if (m_depth_color_copy_supported) {
+        device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+        maintenance8.pNext = const_cast<void *>(device_info.pNext);
+        device_info.pNext = &maintenance8;
+      }
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -47398,6 +47548,65 @@ void CheckImageTransitionState(RenderContext &renderer) {
   StreamBuffer copy_parameters(context, scheduler, MemoryUsage::Stream, 4096);
   TileManager copy_tiler(context, scheduler, copy_parameters);
   buffered_destination.CopyImageWithBuffer(buffered_source, copy_scratch, copy_tiler);
+
+  Require(name, "depth/colour copy formats",
+          Image::DepthColorCopyCompatible(vk::Format::eD32Sfloat, vk::Format::eR32Uint) &&
+              Image::DepthColorCopyCompatible(vk::Format::eR32Sfloat,
+                                              vk::Format::eD32SfloatS8Uint) &&
+              Image::DepthColorCopyCompatible(vk::Format::eD16Unorm, vk::Format::eR16Unorm) &&
+              !Image::DepthColorCopyCompatible(vk::Format::eD32Sfloat, vk::Format::eR16Uint) &&
+              !Image::DepthColorCopyCompatible(vk::Format::eX8D24UnormPack32,
+                                               vk::Format::eR32Uint) &&
+              !Image::DepthColorCopyCompatible(vk::Format::eD32Sfloat, vk::Format::eD32Sfloat) &&
+              !Image::DepthColorCopyCompatible(vk::Format::eR32Uint, vk::Format::eR32Sfloat),
+          "depth/colour copy compatibility diverged from the maintenance8 table");
+  constexpr std::array<uint32_t, 16> depth_color_expected{
+      0x00000000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u, 0x3dcccccdu,
+      0x3e4ccccdu, 0x3e99999au, 0x3ecccccdu, 0x3f19999au, 0x3f333333u, 0x3f4ccccdu,
+      0x3f666666u, 0x3c23d70au, 0x3d23d70au, 0x3f7d70a4u};
+  uint8_t *depth_color_download = nullptr;
+  uint64_t depth_color_download_offset = 0;
+  std::optional<Image> depth_color_source;
+  std::optional<Image> depth_color_depth;
+  std::optional<Image> depth_color_result;
+  if (context.depth_color_copy_enabled) {
+    auto color_info = MakeInfo(vk::Format::eR32Sfloat, 1, 2);
+    color_info.extent = {4, 2, 1};
+    color_info.pitch = 4;
+    color_info.bytes_per_block = 4;
+    auto copy_depth_info = color_info;
+    copy_depth_info.pixel_format = vk::Format::eD32Sfloat;
+    copy_depth_info.guest_format = Prospero::BufferFormat::k32Float;
+    copy_depth_info.tile_mode = Prospero::TileMode::kDepth;
+    auto result_info = color_info;
+    result_info.pixel_format = vk::Format::eR32Uint;
+    depth_color_source.emplace(context, scheduler, color_info);
+    depth_color_depth.emplace(context, scheduler, copy_depth_info);
+    depth_color_result.emplace(context, scheduler, result_info);
+    const auto [data, offset] = upload.Map(sizeof(depth_color_expected), 4);
+    Require(name, "depth/colour upload map", data != nullptr,
+            "depth/colour copy source allocation failed");
+    std::memcpy(data, depth_color_expected.data(), sizeof(depth_color_expected));
+    upload.Commit();
+    vk::BufferImageCopy region{};
+    region.bufferOffset = offset;
+    region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 2};
+    region.imageExtent = {4, 2, 1};
+    depth_color_source->Upload(std::span{&region, 1}, upload.Handle(), offset,
+                               sizeof(depth_color_expected));
+    depth_color_depth->CopyImage(*depth_color_source);
+    depth_color_result->CopyImage(*depth_color_depth);
+    const auto [download_data, download_offset] =
+        download.Map(sizeof(depth_color_expected), 4);
+    Require(name, "depth/colour download map", download_data != nullptr,
+            "depth/colour copy destination allocation failed");
+    download.Commit();
+    depth_color_download = download_data;
+    depth_color_download_offset = download_offset;
+    region.bufferOffset = download_offset;
+    depth_color_result->Download(std::span{&region, 1}, download.Handle(),
+                                 download_offset, sizeof(depth_color_expected));
+  }
   const auto [buffered_download_data, buffered_download_offset] =
       download.Map(buffered_expected.size(), 4);
   Require(name, "buffered-copy download map", buffered_download_data != nullptr,
@@ -47420,6 +47629,16 @@ void CheckImageTransitionState(RenderContext &renderer) {
           std::memcmp(buffered_download_data, buffered_expected.data(),
                       buffered_expected.size()) == 0,
           "real buffered image copy lost a row across its scratch boundary");
+  if (depth_color_download != nullptr) {
+    download.Invalidate(depth_color_download_offset, sizeof(depth_color_expected));
+    Require(name, "depth/colour direct copy contents",
+            std::memcmp(depth_color_download, depth_color_expected.data(),
+                        sizeof(depth_color_expected)) == 0,
+            "colour -> depth -> colour image copies changed the texel bits");
+    std::printf("[host]    %-32s ok\n", "DepthColorImageCopy");
+  } else {
+    std::printf("[host]    %-32s skipped (no maintenance8)\n", "DepthColorImageCopy");
+  }
 
   std::printf("[host]    %-32s ok\n", name);
 }
@@ -52524,6 +52743,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-twin-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthColorTwin();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
     VulkanHarness vulkan;
     CheckImageTransitionState(vulkan.RuntimeRenderer());
@@ -52704,6 +52928,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckRefusedShaderSkipsDispatch();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckDepthColorTwin();
   vulkan.CheckMetaSliceClears();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

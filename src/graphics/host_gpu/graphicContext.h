@@ -42,6 +42,8 @@ struct GraphicContext {
 	bool                               shader_stencil_export_enabled         = false;
 	bool                               pipeline_library_enabled              = false;
 	bool                               pipeline_library_fast_linking         = false;
+	// VK_KHR_maintenance8: vkCmdCopyImage between a depth aspect and a size-matched colour format.
+	bool                               depth_color_copy_enabled               = false;
 	bool                               supports_block_texel_view              = false;
 	// Guest indirect draws stay on the GPU only when all three are enabled.
 	bool                               draw_indirect_first_instance_enabled  = false;

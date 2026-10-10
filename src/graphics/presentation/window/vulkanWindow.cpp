@@ -716,7 +716,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
-	graphics.depth_color_copy_enabled = maintenance8_extension && maintenance8.maintenance8;
+	{
+		const char* disable               = std::getenv("KYTY_NO_DEPTH_COLOR_COPY");
+		graphics.depth_color_copy_enabled = maintenance8_extension &&
+		                                    maintenance8.maintenance8 == VK_TRUE &&
+		                                    (disable == nullptr || std::strcmp(disable, "0") == 0);
+	}
 	LOGF("Vulkan depth/color copy support: %s\n",
 	     graphics.depth_color_copy_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -834,6 +839,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
+	}
+	if (graphics.depth_color_copy_enabled) {
+		maintenance8.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &maintenance8;
 	}
 	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT enable_pipeline_library {};
 	std::vector<const char*>                             enabled_extensions = device_extensions;

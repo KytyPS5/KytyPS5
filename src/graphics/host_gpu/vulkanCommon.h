@@ -24,8 +24,8 @@
 
 namespace Libs::Graphics {
 
-vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
-void        RequireVulkanSuccess(vk::Result result, const char* operation);
+vk::Format       VulkanFormat(Prospero::BufferFormat guest_format);
+void             RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 
 template <typename Handle, typename... Args>

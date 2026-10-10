@@ -1461,6 +1461,38 @@ void TestUniformizedMaterialImageKeys() {
   }
 }
 
+// GTA V PS 0xf6b18542ea0e938a computes its sampler's border color word in a way tracking cannot
+// follow; only that word may fall back to a constant.
+void TestUntrackableSamplerBorderWord() {
+  const auto track = [](uint32_t lane_word) {
+    Fixture fixture;
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      words[word] = fixture.UserData(word);
+    }
+    const auto image = fixture.Image(words);
+    std::array<Value, 4> sampler_words{fixture.UserData(8), fixture.UserData(9),
+                                       fixture.UserData(10), fixture.UserData(11)};
+    sampler_words[lane_word] = fixture.Emit(ValueOpcode::LaneId);
+    const auto sampler = fixture.Sampler(sampler_words);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x80));
+    fixture.PlanAndTrack();
+    // The descriptor refers to the fixture's instructions: inspect it before they are freed.
+    const auto &border =
+        fixture.program.descriptor_sources[fixture.program.info.samplers[0].source];
+    return border.dwords[3].Resolve().IsImmediate() && border.dwords[3].Resolve().U32() == 0u &&
+           !border.dwords[0].Resolve().IsImmediate();
+  };
+  Check(track(3u),
+        "untrackable sampler border word did not fall back to a transparent black border");
+  CheckFatal([&] { (void)track(2u); }, "not a valid runtime value",
+             "untrackable sampler word other than the border color was accepted");
+}
+
 void TestImageDescriptorFields() {
   constexpr std::array<std::pair<uint32_t, uint32_t>, 5> reserved{
       {{1u, 0x20000000u}, {2u, 0x70003000u}, {4u, 0xe000e000u},
@@ -1997,13 +2029,20 @@ void TestSampleAdjustSamplerScratch() {
                   {rejected_image, rejected_sampler, rejected.ImageAddress()},
                   rejected.AddMemory(rejected_memory, 0x200));
 
-    CheckFatal([&] { rejected.PlanAndTrack(); },
-               "not a valid runtime value", message);
+    // Lane-dependent bits in the border word are dropped instead of failing the shader; the
+    // user-data part of the word stays.
+    rejected.PlanAndTrack();
+    const auto *kept = rejected.program
+                           .descriptor_sources[rejected.program.info.samplers[0].source]
+                           .dwords[3]
+                           .Resolve()
+                           .TryInstruction();
+    Check(kept != nullptr && kept->GetOpcode() == ValueOpcode::GetUserData, message);
   };
   CheckRejected(0u, 12u,
-                "ordinary sampling accepted SampleAdjust reserved scratch");
+                "ordinary sampling lost the runtime part of a scratch-ORed border word");
   CheckRejected(Decoder::ImageSampleFlagAdjust, 30u,
-                "SampleAdjust canonicalization discarded border-mode bits");
+                "SampleAdjust sampling lost the runtime part of a lane-ORed border word");
 }
 
 void TestFmaskLoadSpecialization() {
@@ -3712,6 +3751,7 @@ int main() {
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+    Run("untrackable sampler border word", TestUntrackableSamplerBorderWord);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);

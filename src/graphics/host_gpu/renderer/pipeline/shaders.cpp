@@ -498,7 +498,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
 #endif
-	if (graphics.attachment_feedback_loop_enabled) {
+	if (graphics.attachment_feedback_loop_dynamic_state_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
 
@@ -529,6 +529,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDynamicState           = &dynamic_state;
 	pipeline_info.layout                  = pipeline.pipeline_layout;
 	pipeline_info.basePipelineIndex       = -1;
+	if (rendering.depth_stencil_feedback_loop) {
+		EXIT_IF(!graphics.attachment_feedback_loop_enabled || !with_depth);
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDepthStencilAttachmentFeedbackLoopEXT;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 

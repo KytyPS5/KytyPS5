@@ -187,6 +187,7 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	}
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.depth_format));
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.stencil_format));
+	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.rendering.depth_stencil_feedback_loop));
 	for (const auto id: key.vertex_shader_ids) {
 		PipelineKeyHash::Mix(hash, id);
 	}
@@ -762,7 +763,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool depth_feedback_loop) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -862,6 +863,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
 		                               ? depth.desc.view_info.format
 		                               : vk::Format::eUndefined;
+		// Hosts with the dynamic-state extension enable the loop per draw on one pipeline.
+		rendering.depth_stencil_feedback_loop =
+		    depth_feedback_loop && !m_graphics.attachment_feedback_loop_dynamic_state_enabled;
+		EXIT_IF(rendering.depth_stencil_feedback_loop &&
+		        !m_graphics.attachment_feedback_loop_enabled);
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
 		} else if (attachment_samples != depth.desc.info.samples) {

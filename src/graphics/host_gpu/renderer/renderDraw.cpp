@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/frameStats.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1040,6 +1041,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
 	ScopedStat stat_scope(StatSlotId::ExecuteDraw);
+	if (CurrentDrawShadersSkipped()) {
+		return;
+	}
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};

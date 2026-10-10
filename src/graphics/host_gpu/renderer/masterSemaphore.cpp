@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <vector>
 #include <string>
 
 namespace Libs::Graphics {
@@ -94,6 +95,43 @@ void NoteBoundShader(uint32_t stage_slot, uint64_t hash) {
 	} else if (stage_slot == 2) {
 		g_bound_cs.store(hash, std::memory_order_relaxed);
 	}
+}
+
+bool CurrentDrawShadersSkipped() {
+	static const std::vector<uint64_t> skipped = [] {
+		std::vector<uint64_t> list = {0xb3b6b0fc2e9a1de7ull};
+		if (const char* env = std::getenv("KYTY_SKIP_SHADERS")) {
+			list.clear();
+			std::string text(env);
+			size_t      pos = 0;
+			while (pos < text.size()) {
+				const auto end   = text.find(',', pos);
+				const auto token = text.substr(pos, end == std::string::npos ? end : end - pos);
+				if (!token.empty() && token != "none") {
+					list.push_back(std::strtoull(token.c_str(), nullptr, 16));
+				}
+				if (end == std::string::npos) {
+					break;
+				}
+				pos = end + 1;
+			}
+		}
+		for (const auto hash : list) {
+			std::printf("Draws using shader %016" PRIx64 " are skipped (KYTY_SKIP_SHADERS=none to disable)\n", hash);
+		}
+		return list;
+	}();
+	if (skipped.empty()) {
+		return false;
+	}
+	const auto ps = g_bound_ps.load(std::memory_order_relaxed);
+	const auto vs = g_bound_vs.load(std::memory_order_relaxed);
+	for (const auto hash : skipped) {
+		if (hash == ps || hash == vs) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void DumpSubmitHistory() {

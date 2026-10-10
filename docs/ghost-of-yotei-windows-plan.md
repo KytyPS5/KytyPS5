@@ -1,5 +1,21 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-10 03:50 UTC** (new scalar-buffer descriptor frontier):
+
+- Native source0b147273 / EXE3ddab / original5178 run
+  `_Build/runs/game-20261010-033329-indexed-independent-samplers-native`
+  naturally exits321 at03:49:08.420UTC,1262 completed pipelines, timeout and
+  memory guards=false, minimum available RAM18.77GiB. PS07b3 now emits350494
+  ->324041 words versus1203794 ->973501 earlier. Its asynchronous graphics
+  pipeline has begin but no done before the next failure; completion pending.
+- Next PS617c7166f3308810 TrackResources fails atpc380: eight-word image
+  descriptor's first ReadConstBuffer source is not a valid runtime value.
+  Trace lists eight scalar-buffer reads but lacks their buffer/key ancestry.
+  Loading arc only; no menu/gameplay or issue108 publication.
+- Next: unchanged-EXE bounded diagnostic retry with early decoded/normalized
+  IR logging to unique artifacts, identify provenance, synthetic native RED,
+  shared correction and unchanged GREEN. No speculative runtime acceptance.
+
 Checkpoint **2026-10-10 03:32 UTC** (bounded independent sampler indexing proved):
 
 - Original5178/sourceebf81d71/EXE452ce run025503 passes PS07b3 resource

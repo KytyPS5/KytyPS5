@@ -1,5 +1,17 @@
 # Emulator regression test debt
 
+## Scalar-buffer image descriptor runtime provenance (2026-10-10)
+
+Original5178/source0b147273/EXE3ddab run033329 naturally exits321 at
+03:49:08.420UTC,1262 completed pipelines, no timeout/memory guard, available
+RAM minimum18.77GiB. PS07b3 passes tracking/emission/validation with350494
+->324041 SPIR-V words; its asynchronous graphics pipeline has a begin only,
+so driver completion remains unproved. Next PS617c fails TrackResources at
+pc380: full eight-word GetImageResource dword0 is not a valid runtime value,
+root=ReadConstBuffer. Require diagnosis of buffer/key/provenance before the
+minimal synthetic native RED; preserve scalar-read bounds, loop predicates,
+resource ownership and source lifetime. No zero substitutes/error suppression.
+
 ## Independent sampler indexing without Cartesian sample instructions (2026-10-10)
 
 Original5178/sourceebf81d71/EXE452ce run025503 passes PS07b3 materialization

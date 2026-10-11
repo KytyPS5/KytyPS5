@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
@@ -104,7 +105,120 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, vk::BufferUsageFlags flags,
+               uint64_t size, SparseResidency residency)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_size(size) {
+	EXIT_IF(!graphics.sparse_buffer_enabled || size == 0 || residency.chunk_size == 0);
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.flags =
+	    vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+	buffer_info.size   = size;
+	buffer_info.usage  = flags;
+	const auto created = graphics.device.createBuffer(buffer_info);
+	EXIT_IF(created.result != vk::Result::eSuccess);
+	m_buffer                = created.value;
+	const auto requirements = graphics.device.getBufferMemoryRequirements(m_buffer);
+	m_sparse_memory_types   = requirements.memoryTypeBits;
+	m_sparse_chunk_size     = Common::AlignUp(residency.chunk_size, requirements.alignment);
+	m_sparse_chunks.resize((size + m_sparse_chunk_size - 1) / m_sparse_chunk_size);
+}
+
+void Buffer::EnsureResident(uint64_t offset, uint64_t size) {
+	if (!IsSparse() || size == 0) {
+		return;
+	}
+	EXIT_IF(offset >= m_size || size > m_size - offset);
+	const auto                        first = offset / m_sparse_chunk_size;
+	const auto                        last  = (offset + size - 1) / m_sparse_chunk_size;
+	std::vector<vk::SparseMemoryBind> binds;
+	std::vector<VmaAllocation>        fresh;
+	for (auto chunk = first; chunk <= last; chunk++) {
+		if (m_sparse_chunks[chunk] != nullptr) {
+			continue;
+		}
+		const VkMemoryRequirements requirements {
+		    .size           = m_sparse_chunk_size,
+		    .alignment      = m_sparse_chunk_size,
+		    .memoryTypeBits = m_sparse_memory_types,
+		};
+		VmaAllocationCreateInfo create {};
+		create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		VmaAllocationInfo info {};
+		EXIT_IF(vmaAllocateMemory(m_graphics->allocator, &requirements, &create,
+		                          &m_sparse_chunks[chunk], &info) != VK_SUCCESS);
+		const auto bind_size = std::min(m_sparse_chunk_size, m_size - chunk * m_sparse_chunk_size);
+		binds.emplace_back(chunk * m_sparse_chunk_size, bind_size, info.deviceMemory, info.offset);
+		fresh.push_back(m_sparse_chunks[chunk]);
+	}
+	if (binds.empty()) {
+		return;
+	}
+	// Work already recorded or in flight may read entries in these chunks and must keep seeing
+	// zero, so clear the memory before it becomes part of the table: through a temporary buffer,
+	// in a submission of its own. Binds happen the first few times the guest maps memory in a
+	// new part of its address space.
+	auto&                     device = m_graphics->device;
+	std::vector<vk::Buffer>   scratch;
+	vk::CommandPoolCreateInfo pool_info {};
+	pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient;
+	pool_info.queueFamilyIndex = m_graphics->queue_family;
+	const auto pool            = device.createCommandPool(pool_info);
+	EXIT_IF(pool.result != vk::Result::eSuccess);
+	vk::CommandBufferAllocateInfo command_info {};
+	command_info.commandPool        = pool.value;
+	command_info.level              = vk::CommandBufferLevel::ePrimary;
+	command_info.commandBufferCount = 1;
+	vk::CommandBuffer command;
+	EXIT_IF(device.allocateCommandBuffers(&command_info, &command) != vk::Result::eSuccess);
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_IF(command.begin(begin) != vk::Result::eSuccess);
+	for (size_t i = 0; i < binds.size(); i++) {
+		vk::BufferCreateInfo buffer_info {};
+		buffer_info.size  = m_sparse_chunk_size;
+		buffer_info.usage = vk::BufferUsageFlagBits::eTransferDst;
+		const auto buffer = device.createBuffer(buffer_info);
+		EXIT_IF(buffer.result != vk::Result::eSuccess);
+		EXIT_IF(vmaBindBufferMemory(m_graphics->allocator, fresh[i], buffer.value) != VK_SUCCESS);
+		command.fillBuffer(buffer.value, 0, VK_WHOLE_SIZE, 0);
+		scratch.push_back(buffer.value);
+	}
+	EXIT_IF(command.end() != vk::Result::eSuccess);
+	const auto fence = device.createFence({});
+	EXIT_IF(fence.result != vk::Result::eSuccess);
+	{
+		Common::LockGuard lock(m_graphics->queue_mutex);
+		vk::SubmitInfo    submit {};
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers    = &command;
+		EXIT_IF(m_graphics->queue.submit(1, &submit, fence.value) != vk::Result::eSuccess);
+		EXIT_IF(device.waitForFences(1, &fence.value, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
+		EXIT_IF(device.resetFences(1, &fence.value) != vk::Result::eSuccess);
+		const vk::SparseBufferMemoryBindInfo buffer_bind {
+		    m_buffer, static_cast<uint32_t>(binds.size()), binds.data()};
+		vk::BindSparseInfo bind_info {};
+		bind_info.bufferBindCount = 1;
+		bind_info.pBufferBinds    = &buffer_bind;
+		EXIT_IF(m_graphics->queue.bindSparse(1, &bind_info, fence.value) != vk::Result::eSuccess);
+		EXIT_IF(device.waitForFences(1, &fence.value, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
+	}
+	device.destroyFence(fence.value);
+	for (const auto buffer: scratch) {
+		device.destroyBuffer(buffer);
+	}
+	device.destroyCommandPool(pool.value);
+}
+
 Buffer::~Buffer() {
+	if (IsSparse()) {
+		m_graphics->device.destroyBuffer(m_buffer);
+		for (auto* chunk: m_sparse_chunks) {
+			if (chunk != nullptr) {
+				vmaFreeMemory(m_graphics->allocator, chunk);
+			}
+		}
+		return;
+	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}

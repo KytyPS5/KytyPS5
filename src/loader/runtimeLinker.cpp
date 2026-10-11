@@ -1,5 +1,6 @@
 #include "loader/runtimeLinker.h"
 
+#include "common/amdCpuMode.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -81,6 +82,19 @@ static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
 
 static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value;
+}
+
+// Decided once per run; the reason is logged so a slow Rosetta run and a patched one can be told apart.
+static bool AmdCpuPatchEnabled() {
+	static const bool enabled = [] {
+		const auto host     = GetGuestInstructionHostFeatures();
+		const auto decision = Common::DecideAmdCpu(Config::GetAmdCpuMode(),
+		                                           {host.sse4a, host.rdpid, host.clwb});
+		Log::WriteToConsoleAndLog(fmt::format("AMD CPU compatibility: patching {} ({})\n",
+		                                      decision.enabled ? "on" : "off", decision.reason));
+		return decision.enabled;
+	}();
+	return enabled;
 }
 
 ThreadLocalStorage::~ThreadLocalStorage() {
@@ -1666,7 +1680,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
-	const bool emulate_amd = Config::AmdCpuEnabled();
+	const bool emulate_amd = AmdCpuPatchEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
 #else

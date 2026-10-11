@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -27,6 +29,21 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+}
+
+uint32_t LongRecordingBudgetMicros() {
+	static const uint32_t budget = [] {
+		const char* off = std::getenv("KYTY_NO_PERIODIC_SUBMIT");
+		if (off != nullptr && off[0] != '\0' && std::strcmp(off, "0") != 0) {
+			return 0u;
+		}
+		const char* text = std::getenv("KYTY_PERIODIC_SUBMIT_US");
+		if (text == nullptr || text[0] == '\0') {
+			return 1500u;
+		}
+		return static_cast<uint32_t>(std::clamp(std::atol(text), 100l, 100000l));
+	}();
+	return budget;
 }
 
 } // namespace
@@ -541,8 +558,28 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_recorded_guest_ops = 0;
 	m_dynamic_state.Invalidate();
 	return m_command;
+}
+
+bool CommandScheduler::SubmitLongRecording() {
+	constexpr uint32_t MinGuestOps = 8;
+	const auto         budget      = LongRecordingBudgetMicros();
+	if (budget == 0 || !Active() || m_command.IsInvalid()) {
+		return false;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (m_recorded_guest_ops++ == 0) {
+		m_first_guest_op = now;
+	}
+	if (m_recorded_guest_ops < MinGuestOps ||
+	    now - m_first_guest_op < std::chrono::microseconds(budget) ||
+	    m_command.RenderingWithClear()) {
+		return false;
+	}
+	Flush();
+	return true;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -33,6 +34,7 @@ public:
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	bool           SubmitLongRecording();
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -117,6 +119,9 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	// Guest draws and dispatches in the open recording, and when the first of them was recorded.
+	uint32_t                              m_recorded_guest_ops = 0;
+	std::chrono::steady_clock::time_point m_first_guest_op {};
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::deque<PendingOperation> m_priority_operations;

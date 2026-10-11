@@ -98,6 +98,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -2572,6 +2573,62 @@ public:
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckLongRecordingSubmit() {
+    constexpr const char *name = "LongRecordingSubmit";
+    EnsureRuntimeContext();
+    const char *off = std::getenv("KYTY_NO_PERIODIC_SUBMIT");
+    const bool enabled = off == nullptr || off[0] == '\0' || std::strcmp(off, "0") == 0;
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    const auto past_budget = [] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    };
+
+    // The clock starts at the first guest op, not when the recording was opened.
+    const auto first_tick = scheduler.CurrentTick();
+    past_budget();
+    bool submitted = false;
+    for (int i = 0; i < 16; i++) {
+      submitted |= scheduler.SubmitLongRecording();
+    }
+    Require(name, "short burst", !submitted && scheduler.CurrentTick() == first_tick,
+            "a burst of guest ops submitted although it was recorded inside the budget");
+
+    past_budget();
+    submitted = scheduler.SubmitLongRecording();
+    Require(name, "long recording",
+            submitted == enabled &&
+                scheduler.CurrentTick() == first_tick + (enabled ? 1u : 0u),
+            enabled ? "a recording older than the budget was not submitted"
+                    : "KYTY_NO_PERIODIC_SUBMIT still submitted a long recording");
+    Require(name, "fresh recording", !scheduler.SubmitLongRecording(),
+            "the next recording inherited the previous one's clock");
+
+    // A render pass that clears when it begins is never split: restarting it would clear again.
+    const auto clear_tick = scheduler.CurrentTick();
+    for (int i = 0; i < 16; i++) {
+      (void)scheduler.SubmitLongRecording();
+    }
+    RenderState state{};
+    state.width = 64;
+    state.height = 64;
+    state.depth_stencil_attachment.depth_clear = true;
+    scheduler.BeginRendering(state);
+    past_budget();
+    Require(name, "clearing pass",
+            !scheduler.SubmitLongRecording() && scheduler.CurrentTick() == clear_tick,
+            "a render pass that clears on begin was split");
+    scheduler.EndRendering();
+    Require(name, "after the pass", scheduler.SubmitLongRecording() == enabled,
+            "the recording was not submitted once the clearing pass ended");
+
+    scheduler.FlushAndWait();
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -52919,6 +52976,16 @@ int main(int argc, char **argv) {
     CheckScalarSelectIntoVccFeedsDescriptor(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--long-recording-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLongRecordingSubmit();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dispatch-overlap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDispatchOverlap();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--stencil-plane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStencilPlaneEqualFootprint(true);
@@ -54005,6 +54072,7 @@ int main(int argc, char **argv) {
   CheckPs5GameExampleImageClearRuntimeShape();
   CheckWholeWaveReadlane(&vulkan);
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckLongRecordingSubmit();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();

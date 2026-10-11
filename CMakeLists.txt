@@ -303,19 +303,8 @@ list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
-set(gpu_blit_shader_sources
-	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
-	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
-	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
-	"${gpu_tiler_shader_dir}/gpu_color_clear.frag"
-	"${gpu_tiler_shader_dir}/gpu_color_clear_uint.frag"
-	"${gpu_tiler_shader_dir}/gpu_color_clear_sint.frag"
-	"${gpu_tiler_shader_dir}/gpu_color_clear_classify.comp"
-	"${gpu_tiler_shader_dir}/gpu_dispatch_threads.comp"
-	"${gpu_tiler_shader_dir}/gpu_page_diff.comp"
-)
-foreach(shader_source IN LISTS gpu_blit_shader_sources)
-	get_filename_component(shader_name "${shader_source}" NAME_WE)
+function(add_gpu_blit_shader shader_name shader_file)
+	set(shader_source "${gpu_tiler_shader_dir}/${shader_file}")
 	set(shader_spv "${gpu_blit_generated_dir}/${shader_name}.spv")
 	set(shader_header "${gpu_blit_generated_dir}/${shader_name}_spv.h")
 	string(TOUPPER "${shader_name}_SPV" shader_symbol)
@@ -335,6 +324,12 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+add_gpu_blit_shader(gpu_color_clear gpu_color_clear.frag)
+add_gpu_blit_shader(gpu_color_clear_uint gpu_color_clear_uint.frag)
+add_gpu_blit_shader(gpu_color_clear_sint gpu_color_clear_sint.frag)
+add_gpu_blit_shader(gpu_color_clear_classify gpu_color_clear_classify.comp)
+add_gpu_blit_shader(gpu_dispatch_threads gpu_dispatch_threads.comp)
+add_gpu_blit_shader(gpu_page_diff gpu_page_diff.comp)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -409,12 +404,14 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/bindlessTranslation.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(scalar_provenance_tests fmt::fmt xxhash Tracy::TracyClient xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -496,7 +493,6 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/IndexRangeFold.cpp"
 )
 target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
@@ -717,6 +713,18 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	add_test(NAME dispatch_overlap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
+	add_test(NAME dispatch_overlap_kill_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
+	set_tests_properties(dispatch_overlap_kill_switch
+		PROPERTIES ENVIRONMENT "KYTY_NO_DISPATCH_OVERLAP=1")
+	add_test(NAME long_recording_submit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --long-recording-only)
+	add_test(NAME long_recording_submit_kill_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --long-recording-only)
+	set_tests_properties(long_recording_submit_kill_switch
+		PROPERTIES ENVIRONMENT "KYTY_NO_PERIODIC_SUBMIT=1")
 	add_test(NAME image_transfer_layout
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-layout-only)
 

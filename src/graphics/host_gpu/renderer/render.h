@@ -154,6 +154,29 @@ public:
 		return m_full_barrier_mark == m_handle_requests;
 	}
 	void MarkFullBarrier() const noexcept { m_full_barrier_mark = m_handle_requests; }
+	// The open render pass clears an attachment when it begins: restarting it would clear again.
+	[[nodiscard]] bool RenderingWithClear() const noexcept {
+		if (!m_rendering) {
+			return false;
+		}
+		const auto& depth = m_render_state.depth_stencil_attachment;
+		bool        clear = depth.depth_clear || depth.stencil_clear;
+		for (uint32_t i = 0; i < m_render_state.num_color_attachments; i++) {
+			clear |= m_render_state.color_attachments[i].is_clear;
+		}
+		return clear;
+	}
+
+	struct DeferredJoin {
+		bool joined = false;
+		// Everything recorded before the group is ordered before the joining dispatch too.
+		bool ordered_before = false;
+	};
+	[[nodiscard]] DeferredJoin JoinDeferredBarrier(const DispatchAccess& access, bool writes) const;
+	// Leaves this dispatch's barrier pending: starts a group, or extends the one just joined.
+	void               DeferBarrier(const DispatchAccess& access, bool full) const;
+	void               FlushDeferredBarrier() const;
+	[[nodiscard]] bool HasDeferredBarrier() const noexcept { return m_deferred_barrier; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }

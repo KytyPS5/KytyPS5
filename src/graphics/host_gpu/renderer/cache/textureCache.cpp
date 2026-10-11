@@ -285,10 +285,11 @@ bool DepthTwinsEnabled() {
 }
 
 [[nodiscard]] bool SameAliasLayout(const ImageInfo& a, const ImageInfo& b) {
-	return a.data == b.data && a.extent == b.extent && a.resources == b.resources &&
-	       a.pitch == b.pitch && a.bytes_per_block == b.bytes_per_block &&
-	       a.tile_mode == b.tile_mode && a.type == b.type && a.IsBlock() == b.IsBlock() &&
-	       a.mip_layout == b.mip_layout;
+	// Equal pitch and tile mode put a texel at the same address in both, so extents may differ.
+	return a.data == b.data && a.resources == b.resources && a.pitch == b.pitch &&
+	       a.bytes_per_block == b.bytes_per_block && a.tile_mode == b.tile_mode &&
+	       a.type == b.type && a.IsBlock() == b.IsBlock() && a.mip_layout == b.mip_layout &&
+	       a.extent.depth == b.extent.depth;
 }
 
 } // namespace
@@ -1371,6 +1372,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.type != cached.info.type) {
+			return {merged_id};
+		}
+		// A view of the wider image would stretch normalized coordinates over its extent.
+		const auto blocks = [](const ImageInfo& info, uint32_t texels) {
+			return info.IsBlock() ? (texels + 3u) / 4u : texels;
+		};
+		if ((binding == BindingType::Texture || binding == BindingType::Storage) &&
+		    (blocks(requested, requested.extent.width) <
+		         blocks(cached.info, cached.info.extent.width) ||
+		     blocks(requested, requested.extent.height) <
+		         blocks(cached.info, cached.info.extent.height))) {
 			return {merged_id};
 		}
 		if (requested.pixel_format != cached.info.pixel_format ||

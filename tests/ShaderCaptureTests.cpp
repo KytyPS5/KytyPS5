@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ShaderCaptureMetadata.h"
 #include <array>
 #include <bit>
+#include <chrono>
 #include <iostream>
 #include <filesystem>
 #include <fstream>
@@ -28,7 +29,199 @@ int main(int argc, char **argv) {
     options.shader_hash = params.hash;
     options.user_data = std::span(params.user_data).first(3u);
     options.wave_size = 64u;
-    if (argc == 2 && std::string_view(argv[1]) == "--texture-capture-only") {
+    if (argc == 2 && std::string_view(argv[1]) == "--compile-capture-only") {
+      ShaderComputeInputInfo compute;
+      compute.host_subgroup_size = 32u;
+      compute.wave_size = 64u;
+      options.stage = ShaderType::Compute;
+      options.input_info.compute = &compute;
+      const std::array<uint32_t, 2> back{0xbe800000u, 0xbf810000u};
+      options.back_code = back;
+      const std::array<uint32_t, 2> static_state{0x1234u, 0xfedcba98u};
+      const auto directory = std::getenv("KYTY_CAPTURE_TEST_DIR")
+          ? std::filesystem::u8path(std::getenv("KYTY_CAPTURE_TEST_DIR"))
+          : std::filesystem::temp_directory_path() /
+            ("kyty-capture-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+      Capture::CompileCaptureArchive archive(32u, 1024u * 1024u);
+      const auto first = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u}, "rev-a", "tree-a");
+      Check(first.has_value() && std::filesystem::exists(first->manifest), "pre-generation manifest not published");
+      const auto duplicate = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u}, "rev-b", "tree-b");
+      Check(duplicate && duplicate->manifest == first->manifest && archive.Inputs() == 1u,
+            "observational revision or repeated input defeated exact capture reuse");
+      const auto read_words = [&](const std::string& filename) {
+        std::ifstream file(directory / filename, std::ios::binary | std::ios::ate);
+        Check(file.good() && file.tellg() >= 0 && static_cast<uint64_t>(file.tellg()) % 4u == 0u,
+              "captured binary unavailable or truncated");
+        std::vector<uint32_t> result(static_cast<size_t>(file.tellg()) / 4u);
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(result.data()), result.size() * sizeof(uint32_t));
+        Check(file.good(), "captured binary read incomplete");
+        return result;
+      };
+      Check(read_words(first->metadata.at("code_file").get<std::string>()) == std::vector<uint32_t>(code.begin(), code.end()) &&
+            read_words(first->metadata.at("back_code_file").get<std::string>()) == std::vector<uint32_t>(back.begin(), back.end()),
+            "main/back shader capture changed binary input");
+      params.user_data[0] = 18u;
+      auto changed_user = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u});
+      Check(changed_user && changed_user->manifest != first->manifest && first->metadata.at("user_data").at(0) == 17u,
+            "same shader hash overwrote distinct runtime userdata");
+      params.user_data[0] = 17u;
+      const std::array<uint32_t, 2> other_back{0xbe800001u, 0xbf810000u};
+      options.back_code = other_back;
+      auto changed_back = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u});
+      Check(changed_back && changed_back->manifest != first->manifest, "distinct back code reused the prior capture");
+      options.back_code = back;
+      const std::array<uint32_t, 1> other_code{0xbf800000u};
+      params.code = other_code;
+      auto changed_code = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u});
+      Check(changed_code && changed_code->manifest != first->manifest, "same shader hash hid different binary code");
+      params.code = code;
+      options.host_profile.known = true;
+      options.host_profile.float64 = true;
+      auto changed_host = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u});
+      Check(changed_host && changed_host->manifest != first->manifest, "different host capabilities reused compiler capture");
+      options.host_profile = {};
+      nlohmann::ordered_json policy{{"shader_optimization_type", 0u},
+                                    {"shader_validation_enabled", false},
+                                    {"gpu_assisted_validation_enabled", false}};
+      auto policy_none = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u}, {}, {}, nullptr, &policy);
+      policy["shader_optimization_type"] = 2u;
+      auto policy_performance = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u}, {}, {}, nullptr, &policy);
+      Check(policy_none && policy_performance && policy_none->manifest != policy_performance->manifest &&
+            policy_none->metadata.at("captured_compile_policy").at("shader_optimization_type") == 0u,
+            "changed compilation policy reused or overwrote an earlier input");
+      auto changed_push = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u}, {}, {}, nullptr, nullptr, 16u);
+      Check(changed_push && changed_push->manifest != first->manifest &&
+            changed_push->metadata.at("push_data_start_dword") == 16u,
+            "different graphics push-data origin reused an incompatible input");
+      IR::SrtRuntime runtime;
+      runtime.read_memory = +[](void*, uint64_t, std::span<uint32_t> words) { words[0] = 0x12345678u; return true; };
+      Capture::ResourceReadCapture recorder(runtime);
+      auto observed = recorder.Runtime();
+      std::array<uint32_t,1> word{};
+      Check(observed.read_memory(observed.userdata, 0x1000u, word), "synthetic runtime read failed");
+      auto reads = Capture::BuildResourceReadMetadata(runtime, recorder, true, "");
+      auto captured_runtime = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u}, {}, {}, &reads);
+      Check(captured_runtime && captured_runtime->manifest != first->manifest &&
+            captured_runtime->metadata.at("runtime_resources_captured") == true &&
+            captured_runtime->metadata.at("runtime").at("events").size() == 1u,
+            "successful materialization inputs not independently preserved");
+      reads["events"][0]["words"][0] = 0x87654321u;
+      auto changed_runtime = archive.Begin(directory, params, options, static_state, std::array<uint32_t,3>{3u,5u,7u}, {}, {}, &reads);
+      Check(changed_runtime && changed_runtime->manifest != captured_runtime->manifest &&
+            captured_runtime->metadata.at("runtime").at("events").at(0).at("words").at(0) == 0x12345678u,
+            "later callback contents overwrote a successful replay input");
+      Check(Capture::CompileCaptureArchive::Update(*captured_runtime, "compile_emit", "pending"), "pending capture phase not persisted");
+      nlohmann::ordered_json saved;
+      { std::ifstream file(captured_runtime->manifest); file >> saved; }
+      Check(saved.at("capture_attempt").at("phase_status") == "pending" &&
+            saved.at("capture_attempt").at("reason") == "" && saved.at("runtime") == captured_runtime->metadata.at("runtime"),
+            "in-flight phase invents failure or loses callback inputs");
+      Check(!Capture::CompileCaptureArchive::Update(*captured_runtime, "compile_emit", "assumed_failed"),
+            "unsupported capture outcome accepted");
+      Check(Capture::CompileCaptureArchive::Update(*captured_runtime, "spirv_validate", "failed", "synthetic known failure"),
+            "known capture failure not persisted");
+      { std::ifstream file(captured_runtime->manifest); file >> saved; }
+      Check(saved.at("capture_attempt").at("reason") == "synthetic known failure" &&
+            saved.at("user_data") == first->metadata.at("user_data") &&
+            read_words(saved.at("back_code_file").get<std::string>()) == std::vector<uint32_t>(back.begin(), back.end()),
+            "phase update altered exact compiler inputs");
+      Capture::CompileCaptureArchive count_limited(1u, 1024u * 1024u);
+      auto bounded = count_limited.Begin(directory / "bounded", params, options, {}, std::nullopt);
+      Check(bounded.has_value(), "bounded capture rejected first valid input");
+      params.user_data[0] = 19u;
+      Check(!count_limited.Begin(directory / "bounded", params, options, {}, std::nullopt), "capture input count limit ignored");
+      params.user_data[0] = 17u;
+      const auto bounded_duplicate = count_limited.Begin(directory / "bounded", params, options, {}, std::nullopt);
+      Check(bounded_duplicate && bounded_duplicate->manifest == bounded->manifest,
+            "exact capture reuse rejected after count limit");
+      Capture::CompileCaptureArchive byte_limited(1u, 0u);
+      Check(!byte_limited.Begin(directory / "no-budget", params, options, {}, std::nullopt) &&
+            !std::filesystem::exists(directory / "no-budget"), "zero capture budget wrote an advertised artifact");
+      // Separate recorder traffic must not consume the compiler input reservation.
+      Capture::CompileCaptureArchive compiler_pool(1u, 1024u * 1024u), runtime_pool(1u, 1024u * 1024u);
+      auto runtime_slot = runtime_pool.Begin(directory / "runtime-pool", params, options, {}, std::nullopt, {}, {}, &reads);
+      Check(runtime_slot.has_value(), "runtime pool rejected first transcript");
+      reads["events"][0]["words"][0] = 1u;
+      Check(!runtime_pool.Begin(directory / "runtime-pool", params, options, {}, std::nullopt, {}, {}, &reads),
+            "runtime reservation count boundary ignored");
+      Check(compiler_pool.Begin(directory / "compiler-pool", params, options, {}, std::nullopt).has_value(),
+            "exhausted runtime reservation blocked an independent compiler input");
+
+      // Independent ISA fixtures for the real offline Emit/validator runner.
+      // SOP1 encoding matches EncodeSop1 in shaderCfgTests: front SETPC s[6:7]
+      // is required by DecodeFrontProgram whenever a back body is present.
+      constexpr auto sop1 = [](uint32_t opcode, uint32_t dst, uint32_t src) {
+        return 0x80000000u | (0x7du << 23u) | ((dst & 0x7fu) << 16u) |
+               ((opcode & 0xffu) << 8u) | (src & 0xffu);
+      };
+      const std::array<uint32_t, 2> fused_front{sop1(0x03u, 12u, 129u), sop1(0x20u, 0u, 6u)};
+      const std::array<uint32_t, 2> fused_back{sop1(0x03u, 13u, 12u), 0xbf810000u};
+      const auto fixture_directory = directory / "emit-fixtures";
+      Capture::CompileCaptureArchive fixtures(2u, 1024u * 1024u);
+      const auto export_fixture = [&](const ShaderParams& fixture_params, const CompileOptions& fixture_options,
+                                      std::optional<std::array<uint32_t,3>> groups, const char* name) {
+        std::vector<uint32_t> fixture_static_state;
+        if (fixture_options.stage == ShaderType::Pixel)
+          BuildStageStaticKey(*fixture_options.input_info.pixel, fixture_static_state);
+        else BuildStageStaticKey(*fixture_options.input_info.compute, fixture_static_state);
+        IR::SrtRuntime empty_runtime;
+        empty_runtime.user_data = fixture_options.user_data;
+        empty_runtime.compute_workgroups = groups;
+        Capture::ResourceReadCapture empty_capture(empty_runtime);
+        const auto empty_reads = Capture::BuildResourceReadMetadata(empty_runtime, empty_capture, true, "");
+        nlohmann::ordered_json fixture_policy{{"shader_optimization_type", 0u},
+                                             {"shader_validation_enabled", true},
+                                             {"gpu_assisted_validation_enabled", false},
+                                             {"gpuav_shader_instrumentation", false}};
+        auto fixture = fixtures.Begin(fixture_directory, fixture_params, fixture_options,
+            fixture_static_state, groups, {}, {}, &empty_reads, &fixture_policy, 16u);
+        Check(fixture && fixture->metadata.at("metadata_complete") == true &&
+              fixture->metadata.at("runtime_resources_captured") == true &&
+              fixture->metadata.at("runtime").at("events").empty(), "complete synthetic Emit fixture not captured");
+        fixture->metadata["capture_attempt"]["synthetic_fixture"] = true;
+        Check(Capture::CompileCaptureArchive::Update(*fixture, "synthetic_fixture_ready", "completed"),
+              "synthetic fixture manifest update failed");
+        auto alias = fixture_directory / (std::string(name) + "-emit.json");
+        for (uint32_t index = 1u; std::filesystem::exists(alias); ++index)
+          alias = fixture_directory / (std::string(name) + "-emit-" + std::to_string(index) + ".json");
+        std::ofstream manifest(alias);
+        manifest << fixture->metadata.dump(2) << '\n';
+        manifest.flush();
+        Check(manifest.good(), "named synthetic Emit fixture not written");
+        std::cout << "KYTY_CAPTURE_EMIT_FIXTURE_" << name << '=' << alias.string() << '\n';
+      };
+      ShaderParams pixel_fixture;
+      pixel_fixture.code = code;
+      pixel_fixture.hash = 0xc001u;
+      ShaderPixelInputInfo pixel_input;
+      pixel_input.wave_size = 32u;
+      pixel_input.initial_fp_state = {true, 0xc0u, false, false};
+      CompileOptions fixture_options;
+      fixture_options.stage = ShaderType::Pixel;
+      fixture_options.wave_size = 32u;
+      fixture_options.shader_hash = pixel_fixture.hash;
+      fixture_options.host_profile.known = true;
+      fixture_options.compute_workgroup_limits = {{1024u,1024u,64u}, 1024u, 32u, false, 65536u};
+      fixture_options.input_info.pixel = &pixel_input;
+      export_fixture(pixel_fixture, fixture_options, std::nullopt, "pixel");
+      ShaderParams compute_fixture;
+      compute_fixture.code = fused_front;
+      compute_fixture.back_code = fused_back;
+      compute_fixture.hash = 0xc002u;
+      ShaderComputeInputInfo compute_input;
+      compute_input.wave_size = compute_input.host_subgroup_size = 32u;
+      compute_input.threads_num[0] = compute_input.dispatch_threads_num[0] = 32u;
+      compute_input.threads_num[1] = compute_input.threads_num[2] = 1u;
+      compute_input.dispatch_threads_num[1] = compute_input.dispatch_threads_num[2] = 1u;
+      compute_input.initial_fp_state = {true, 0xc0u, false, false};
+      fixture_options.stage = ShaderType::Compute;
+      fixture_options.shader_hash = compute_fixture.hash;
+      fixture_options.back_code = fused_back;
+      fixture_options.input_info.compute = &compute_input;
+      export_fixture(compute_fixture, fixture_options, std::array<uint32_t,3>{1u,1u,1u}, "compute");
+      std::cout << "KYTY_CAPTURE_ARTIFACT_DIR=" << directory.string() << '\n';
+    } else if (argc == 2 && std::string_view(argv[1]) == "--texture-capture-only") {
       ShaderTextureResource texture;
       texture.fields[1] = (60u << 20u) | (1u << 30u);
       texture.fields[2] = 1u << 14u;

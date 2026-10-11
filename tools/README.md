@@ -68,7 +68,7 @@ The examples use the Ninja build directory `_Build/windows`. Pass `-Auditor` to 
 
 ## Prepare a corpus
 
-Choose either capture during an emulator run or extraction from a supported container. A corpus consists of JSON manifests and their referenced `.bin` files. Keep unrelated JSON files outside the corpus: the runner discovers manifests recursively by extension.
+Choose either capture during an emulator run or extraction from a supported container. A corpus consists of JSON manifests and their referenced `.bin` files. The runner scans JSON recursively, inventories shader manifests and ignores unrelated reports, run state, host profiles and diagnostic texture JSON. A malformed manifest with a sibling binary remains an explicit input error.
 
 ### Capture registered and dispatched shaders
 
@@ -83,6 +83,28 @@ With an installed emulator build:
 `registered` captures code and AGC metadata when shaders are registered, before a later compilation failure can stop the run. It includes only registrations reached during that run. `dispatched` captures shaders reaching pipeline compilation, including the compute parameters needed for deeper auditing. Captures contain code and plain metadata; runtime resource contents and usable host pointers are not included. Matching code with different compilation metadata can produce separate manifests.
 
 Audit either subdirectory. Auditing their parent includes both sets and may count the same code with multiple metadata records.
+
+### Retain inputs before generation
+
+For a diagnostic run using a build containing the capture workflow, set
+`KYTY_SHADER_CAPTURE_DIR` in that emulator process to a fresh directory outside
+tracked source files. Inputs are saved before frontend generation or cached
+resource materialization. Each record contains exact main/back code, user data,
+stage/static inputs, host limits, compilation policy and push-data offset.
+Successful and failed resource callback transcripts are separate input variants.
+
+Compiler inputs and runtime transcripts each have a 128-MiB/4096-input reservation;
+the aggregate byte budget is 256 MiB. Exhaustion or incomplete callback recording
+is reported explicitly. Keep `KYTY_RESOURCE_CAPTURE_DIR` and
+`KYTY_RESOURCE_CAPTURE_ALL_FAILURES=1` enabled together for the independent fatal
+resource-failure capture reserve. Ordinary launch helpers can clear diagnostic
+environment variables; verify the actual child environment when using a helper.
+
+`capture_attempt.phase_status=pending` means the recorded operation had not returned.
+It can result from an interrupted run and is not proof of a shader failure. Replay
+the input to establish the outcome. Fix each shared cause using an independent
+synthetic regression, rerun its affected input group, and retry the game after
+the batch is validated. A successful offline generation does not prove GPU results.
 
 ### Extract a KCAP container
 
@@ -113,18 +135,50 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\audit-shaders.ps
   -Jobs 4 -TimeoutSeconds 30
 ```
 
-For live captures, replace `-CorpusDirectory` with the `registered` or `dispatched` directory. `-OutputDirectory` must be new or empty and outside the corpus; existing results are preserved and audit artifacts cannot become shader inputs. Omit it to create a unique directory under `_Build/shader-audits`.
+For live captures, replace `-CorpusDirectory` with the `registered`, `dispatched` or `KYTY_SHADER_CAPTURE_DIR` directory. `-OutputDirectory` must be new or empty and outside the corpus unless `-Resume` is supplied. Omit it to create a unique directory under `_Build/shader-audits`.
 
-Each manifest runs in a separate worker process, with up to `-Jobs` workers active. Workers create no console windows and both output streams are drained asynchronously. A failure or timeout is recorded and the batch continues. Timeout handling kills the affected worker and waits for termination with a bound; normal completion and script cleanup dispose of worker processes. Forcibly terminating the PowerShell host can bypass script cleanup.
+Dedup uses canonical compiler input: every metadata field, userdata, host and device limits, root `captured_compile_policy`, push-data offset, main/back binary contents and captured runtime callbacks. File names and observation-only `capture_attempt` fields do not create duplicate work. Same shader hash with different inputs remains separate. Unknown metadata is retained conservatively. Inputs used by workers are copied into their artifact directories and binary hashes are verified after copying.
+
+Resume the same output directory after interruption or after rebuilding the auditor:
+
+```powershell
+pwsh.exe -NoProfile -File .\tools\audit-shaders.ps1 `
+  -CorpusDirectory .\_Build\shader-capture\example `
+  -OutputDirectory .\_Build\shader-audits\example -Resume
+```
+
+Completed results are reused only with identical input, auditor bytes, runner version, arguments, host profile, mode, budgets and compiler environment identity. A changed auditor reruns the inputs against that implementation. Add `-RetryFailed` to rerun failed/timed-out workers without repeating passes from the same auditor. Missing or malformed inputs are checked again. An interrupted final journal line is preserved separately; earlier corrupt records stop reuse.
+
+Each distinct complete input runs in a separate worker process, with up to `-Jobs` workers active. Workers create no console windows and both output streams drain asynchronously into files. `-TimeoutSeconds` bounds each worker, and `-MaxOutputMegabytes` bounds combined stdout/stderr with a small polling overshoot. A failure, timeout or output-limit termination is recorded and the batch continues. PowerShell7 stops the owned process tree directly; Windows PowerShell5 uses hidden `taskkill /PID <owned-worker> /T /F` with bounded, drained helper execution. Completion and script cleanup drain output, confirm termination and dispose worker handles. Forcibly terminating the PowerShell host can bypass script cleanup.
 
 The runner writes:
 
 - `report.md`: coverage, status totals and grouped failures.
 - `report.json`: the structured report and individual results.
 - `results.jsonl`: one completed result per line.
-- Numbered job directories: each worker's `stdout.txt` and `stderr.txt`.
+- `checkpoint.json`: completed inputs saved at progress checkpoints.
+- `replay-failed.ps1`: sequential replay commands using preserved inputs and host profile.
+- Unique job directories: each worker's frozen inputs, `stdout.txt`, `stderr.txt` and optional `shader.spv`.
 
-The runner exits with code 1 if any manifest fails or times out, and 0 if all pass. Input or runner errors also produce a nonzero exit code. Counts refer to manifests, not unique binaries. Unsupported instructions are grouped by family, opcode and reason, with distinct shader counts and PC examples; one shader can appear in several groups.
+The runner exits with code1 if any input fails, is incomplete or times out, and0 if all pass. Reports distinguish capture-manifest count, complete-input count, distinct main binaries, executed/reused entries and input errors. Failures are classified as decode, translate, resource_plan, materialize, emit, validation, driver or worker_error; missing inputs remain input_error. The CPU auditor never creates driver pipelines. Cause groups count complete inputs and capture aliases; unsupported instructions and independent planner reasons can overlap, so group memberships must not be summed into the failed-input total. A captured pending phase is an unfinished call, not a proven failure cause.
+
+### Replay generation through SPIR-V validation
+
+```powershell
+pwsh.exe -NoProfile -File .\tools\audit-shaders.ps1 `
+  -CorpusDirectory .\_Build\shader-capture\example -EmitSpirv -Jobs 4 `
+  -OutputDirectory .\_Build\shader-audits\example-emission
+```
+
+`-EmitSpirv` supports complete schema2 pixel and compute captures, including verified back-code and ordered runtime resource callbacks. Successful resource materialization proceeds to shared `CompileProgram`, preserves raw SPIR-V and runs the production Vulkan1.3 validator. Captured push-data offsets are applied; older captures without that field explicitly use isolated-stage offset0. No optimizer, driver pipeline, GPU execution or linked graphics-stage validation runs. Unsupported stage replay, missing runtime, incomplete callbacks or changed callback order is input_error; no host pointers or resource values are fabricated. Diagnostic texture snapshots remain available through the direct `--audit-shader-snapshot manifest.json --emit-spirv` command and retain their explicit diagnostic scope.
+
+Run the script-only workflow fixtures without launching an emulator or GPU test:
+
+```powershell
+pwsh.exe -NoProfile -File .\tests\ShaderAuditRunnerTests.ps1
+```
+
+These use a synthetic PowerShell worker to check complete-input dedup, policy/runtime/back-code differences, resume/retry, simultaneous output draining and limits, timeout cleanup, overlapping causes and interrupted journals. They do not validate native compiler semantics. `-AuditorArgumentPrefix` supports explicit wrapper arguments and is included in audit identity; normal native audits need no prefix.
 
 ### Check compute execution planning for a host
 
@@ -173,7 +227,7 @@ execution. Compare counts only between audits using the same stages and host pro
 | `resource_tracking` | Compute IR translation and resource-plan extraction completed, using captured dispatch parameters or the explicitly assumed header profile. |
 | `compute_execution_precheck` | The CPU compute planner checked the available profiles before specialization; individual outcomes and unknown descriptor requirements are recorded. |
 
-A passing result applies only to the reported coverage. Non-compute stages and compute captures without sufficient metadata stop at control-flow analysis. The audit does not materialize runtime descriptors, emit or validate SPIR-V, execute GPU work, or prove that a game renders correctly. Use targeted compiler tests, GPU regression tests and runtime checks to validate fixes beyond the audit's scope.
+A passing result applies only to reported coverage. Incomplete or unsupported stages can stop at control-flow analysis. Schema2 pixel runtime captures check materialization; `-EmitSpirv` extends complete pixel/compute runtime replay to unoptimized emission and production validation. None of these checks executes GPU work or proves a rendered frame/menu/gameplay. Use independent synthetic compiler regressions, GPU cases and bounded runtime retries for shared fixes.
 
 ## Run compute fixtures and retain every failure
 

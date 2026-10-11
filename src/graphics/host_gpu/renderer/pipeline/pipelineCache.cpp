@@ -242,12 +242,80 @@ uint64_t ClampShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::TryClampRangeSize(address, size);
 }
 
+using ShaderCaptureAttempt = ShaderRecompiler::Capture::CompileCaptureAttempt;
+
+std::mutex& ShaderCaptureMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+std::optional<ShaderCaptureAttempt> BeginShaderCapture(
+    const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
+    std::span<const uint32_t> static_state,
+    std::optional<std::array<uint32_t, 3>> guest_workgroups,
+    const nlohmann::ordered_json* runtime = nullptr, uint32_t push_data_start_dword = 0u) {
+	const auto* directory = std::getenv("KYTY_SHADER_CAPTURE_DIR");
+	if (!directory || !*directory) return {};
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+	try {
+#endif
+		std::lock_guard lock(ShaderCaptureMutex());
+		// Keep compiler inputs available when large successful resource transcripts
+		// fill their pool. The aggregate byte bound stays 256MiB.
+		static ShaderRecompiler::Capture::CompileCaptureArchive compiler_archive(4096u, 128u * 1024u * 1024u);
+		static ShaderRecompiler::Capture::CompileCaptureArchive runtime_archive(4096u, 128u * 1024u * 1024u);
+		auto& archive = runtime ? runtime_archive : compiler_archive;
+		const nlohmann::ordered_json policy {
+		    {"shader_optimization_type", static_cast<uint32_t>(Config::GetShaderOptimizationType())},
+		    {"shader_validation_enabled", Config::ShaderValidationEnabled()},
+		    {"gpu_assisted_validation_enabled", Config::GpuAssistedValidationEnabled()},
+		    {"gpuav_shader_instrumentation", DriverCacheShaderInstrumentationEnabled()},
+		};
+		auto attempt = archive.Begin(std::filesystem::u8path(directory), params, options,
+		    static_state, guest_workgroups, KYTY_GIT_REVISION, KYTY_GIT_WORKTREE_FINGERPRINT,
+		    runtime, &policy, push_data_start_dword);
+		if (!attempt) {
+			LOGF("Shader capture incomplete: %s pool write/input/128MiB budget exhausted "
+			     "stage=%u hash=0x%016" PRIx64 " captured=%zu bytes=%" PRIu64 "\n",
+			     runtime ? "runtime" : "compiler", static_cast<unsigned>(options.stage),
+			     options.shader_hash, archive.Inputs(), archive.Bytes());
+		}
+		return attempt;
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+	} catch (const std::exception& error) {
+		LOGF("Shader capture incomplete: %s\n", error.what());
+		return {};
+	}
+#endif
+}
+
+void UpdateShaderCapture(std::optional<ShaderCaptureAttempt>& attempt, std::string_view phase,
+                         std::string_view status = "pending", std::string_view reason = {}) {
+	if (!attempt) return;
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+	try {
+#endif
+		std::lock_guard lock(ShaderCaptureMutex());
+		if (!ShaderRecompiler::Capture::CompileCaptureArchive::Update(*attempt, phase, status, reason))
+			LOGF("Shader capture incomplete: cannot update %s\n", Common::PathToString(attempt->manifest).c_str());
+		std::printf("ShaderCaptureAttempt: manifest=%s phase=%.*s phase_status=%.*s\n",
+		    Common::PathToString(attempt->manifest).c_str(), static_cast<int>(phase.size()), phase.data(),
+		    static_cast<int>(status.size()), status.data());
+		std::fflush(stdout);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+	} catch (const std::exception& error) {
+		LOGF("Shader capture incomplete: phase update: %s\n", error.what());
+	}
+#endif
+}
+
 void CaptureDispatchedShader(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              std::span<const uint32_t> static_state,
                              std::optional<std::array<uint32_t, 3>> guest_workgroups,
                              const nlohmann::ordered_json* runtime_capture = nullptr,
-                             const std::filesystem::path& capture_directory = {}) {
+                             const std::filesystem::path& capture_directory = {},
+                             const ShaderCaptureAttempt* attempt = nullptr) {
 	if (!Config::GraphicsDebugDumpEnabled() && capture_directory.empty()) {
 		return;
 	}
@@ -278,6 +346,7 @@ void CaptureDispatchedShader(const ShaderParams& params,
 			metadata["runtime"] = *runtime_capture;
 			metadata["runtime_resources_captured"] = runtime_capture->at("complete");
 		}
+		if (attempt) metadata["capture_attempt"] = attempt->metadata.at("capture_attempt");
 		const auto json = metadata.dump(2) + '\n';
 		const auto write = [&](const std::filesystem::path& path, const void* data, size_t size) {
 			if (size > UINT32_MAX) {
@@ -595,7 +664,8 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
-	                               const std::vector<Permutation>& siblings) {
+	                               const std::vector<Permutation>& siblings,
+	                               std::optional<ShaderCaptureAttempt>& capture_attempt) {
 		const char* stage_name = nullptr;
 		switch (options.stage) {
 			case ShaderType::Vertex: stage_name = "vs"; break;
@@ -607,12 +677,14 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
+		UpdateShaderCapture(capture_attempt, "compile_emit");
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		const char* optimization_trace = std::getenv("KYTY_SPIRV_OPTIMIZATION_TRACE");
 		uint32_t    wave_partition_factor = 1;
 		bool        cooperative_wave64    = false;
 		if (options.stage == ShaderType::Compute) {
+			UpdateShaderCapture(capture_attempt, "compute_execution_plan");
 			if (optimization_trace != nullptr && *optimization_trace != '\0') {
 				std::printf("ComputePlanBegin: hash=0x%016" PRIx64 "\n", options.shader_hash);
 				std::fflush(stdout);
@@ -628,6 +700,7 @@ struct PipelineCache::ProgramCache {
 				std::fflush(stdout);
 			}
 			if (!execution.error.empty()) {
+				UpdateShaderCapture(capture_attempt, "compute_execution_plan", "failed", execution.error);
 				EXIT("compute execution plan failed: %s\n", execution.error.c_str());
 			}
 			wave_partition_factor = execution.wave_partition_factor;
@@ -643,6 +716,7 @@ struct PipelineCache::ProgramCache {
 		}
 		if (ShouldOptimizeShaderSpirv(result.program.dispatcher_fallback, cooperative_wave64,
 		                              Config::GetShaderOptimizationType())) {
+			UpdateShaderCapture(capture_attempt, "spirv_optimize");
 			result.spirv = OptimizeShaderSpirv(result.spirv, Config::GetShaderOptimizationType(),
 			                                  cooperative_wave64);
 		}
@@ -667,7 +741,9 @@ struct PipelineCache::ProgramCache {
 			std::printf("CompilePermutationPostOriginal: hash=0x%016" PRIx64 "\n", options.shader_hash);
 			std::fflush(stdout);
 		}
+		UpdateShaderCapture(capture_attempt, "spirv_validate");
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+			UpdateShaderCapture(capture_attempt, "spirv_validate", "failed", "SPIR-V validation failed");
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -707,6 +783,7 @@ struct PipelineCache::ProgramCache {
 			    stage_name, options.shader_hash, result.spirv.size(), spirv_hash, handle.id,
 			    siblings.size());
 		} else {
+			UpdateShaderCapture(capture_attempt, "host_shader_module");
 			handle.module = CompileSPV(result.spirv, device);
 			EXIT_IF(handle.module == nullptr);
 			handle.id = ++next_shader_id;
@@ -720,6 +797,7 @@ struct PipelineCache::ProgramCache {
 		auto compiled_info = std::move(result.program).TakeCompiledInfo();
 		compiled_info.compute_wave_partition_factor = wave_partition_factor;
 		compiled_info.compute_cooperative_wave64 = cooperative_wave64;
+		UpdateShaderCapture(capture_attempt, "shader_module", "completed");
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(compiled_info),
@@ -753,6 +831,26 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		// Capture each requested full compiler input before a cached materializer or
+		// frontend can terminate. Capturing is opt-in and never skips guest work.
+		ShaderRecompiler::CompileOptions options;
+		options.stage = stage;
+		options.shader_hash = params.hash;
+		options.user_data = user_data;
+		options.back_code = params.back_code;
+		options.host_profile = host_profile;
+		options.compute_workgroup_limits = compute_workgroup_limits;
+		options.wave_size = input_info.wave_size;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			options.input_info.vertex = &input_info;
+			options.user_data_base = stage == ShaderType::Mesh || stage == ShaderType::TessellationControl ? 0u : 8u;
+			if (stage == ShaderType::Mesh) options.wave_size = input_info.mesh.wave_size;
+			if (stage == ShaderType::TessellationControl) options.wave_size = 64u;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			options.input_info.pixel = &input_info;
+		} else options.input_info.compute = &input_info;
+		auto capture_attempt = BeginShaderCapture(params, options, lookup_key.static_state,
+		    guest_workgroups, nullptr, push_data_cursor);
 		auto                                         entry = programs.find(lookup_key);
 		if (entry == programs.end()) {
 			for (const auto& [existing_key, existing_source]: programs) {
@@ -798,6 +896,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (entry != programs.end() && entry->second.skip_dispatch) {
+			UpdateShaderCapture(capture_attempt, "compiler_zero_work", "completed");
 			return {};
 		}
 		ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -831,6 +930,7 @@ struct PipelineCache::ProgramCache {
 			}
 		};
 		const auto materialize = [&](const auto& plan, auto& resources, auto& specialization) {
+			UpdateShaderCapture(capture_attempt, "resource_materialize");
 			const auto* directory = std::getenv("KYTY_RESOURCE_CAPTURE_DIR");
 			const auto* filter = std::getenv("KYTY_RESOURCE_CAPTURE_HASH");
 			char* end = nullptr;
@@ -839,13 +939,40 @@ struct PipelineCache::ProgramCache {
 			                      *end == '\0' && capture_hash == params.hash;
 			const bool all_failures = directory && *directory &&
 			    std::getenv("KYTY_RESOURCE_CAPTURE_ALL_FAILURES");
-			if (!selected && !all_failures)
+			const auto* attempts_directory = std::getenv("KYTY_SHADER_CAPTURE_DIR");
+			const bool all_attempts = attempts_directory && *attempts_directory;
+			if (!selected && !all_failures && !all_attempts)
 				return ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization);
 			ShaderRecompiler::Capture::ResourceReadCapture capture(runtime);
 			const auto observed = capture.Runtime();
 			const bool ok = ShaderRecompiler::IR::MaterializeResources(plan, observed, resources, specialization);
+			if (all_attempts) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+				try {
+#endif
+					auto reads = ShaderRecompiler::Capture::BuildResourceReadMetadata(
+					    runtime, capture, ok, ok ? std::string_view{} : ShaderRecompiler::IR::LastResourceSpecializationError());
+					UpdateShaderCapture(capture_attempt, "resource_materialize", ok ? "completed" : "failed",
+					    ok ? std::string_view{} : ShaderRecompiler::IR::LastResourceSpecializationError());
+					// Runtime contents form a separate exact identity. Preserve all
+					// earlier compiler inputs and successful callback transcripts.
+					auto with_runtime = BeginShaderCapture(params, options, lookup_key.static_state,
+					    runtime.compute_workgroups, &reads, push_data_cursor);
+					if (with_runtime) {
+						if (capture_attempt) with_runtime->metadata["capture_attempt"]["compiler_input_id"] =
+						    capture_attempt->metadata.at("capture_attempt").at("input_id");
+						capture_attempt = std::move(with_runtime);
+					}
+					UpdateShaderCapture(capture_attempt, "resource_materialize", ok ? "completed" : "failed",
+					    ok ? std::string_view{} : ShaderRecompiler::IR::LastResourceSpecializationError());
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+				} catch (const std::exception& error) {
+					LOGF("Shader capture incomplete: runtime metadata: %s\n", error.what());
+				}
+#endif
+			}
 			// Save before the caller's fatal error. No extra guest reads are made.
-			if (!ok || (selected && std::getenv("KYTY_RESOURCE_CAPTURE_SUCCESS"))) {
+			if ((selected || all_failures) && (!ok || (selected && std::getenv("KYTY_RESOURCE_CAPTURE_SUCCESS")))) {
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 				try {
 #endif
@@ -875,7 +1002,7 @@ struct PipelineCache::ProgramCache {
 							    plan, runtime, static_cast<uint32_t>(logical));
 					}
 					CaptureDispatchedShader(params, captured, lookup_key.static_state, runtime.compute_workgroups,
-					                        &reads, std::filesystem::u8path(directory));
+					                        &reads, std::filesystem::u8path(directory), capture_attempt ? &*capture_attempt : nullptr);
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 				} catch (const std::exception& error) {
 					LOGF("Resource capture failed: %s\n", error.what());
@@ -906,6 +1033,7 @@ struct PipelineCache::ProgramCache {
 			    permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
+				UpdateShaderCapture(capture_attempt, "compiled_variant_reuse", "completed");
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -1004,7 +1132,6 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
-		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
@@ -1027,13 +1154,16 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		CaptureDispatchedShader(params, options, lookup_key.static_state, guest_workgroups);
+		UpdateShaderCapture(capture_attempt, "translate");
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (translated.skip_dispatch) {
+			UpdateShaderCapture(capture_attempt, "compiler_zero_work", "completed");
 			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
 			entry->second.skip_dispatch = true;
 			return {};
 		}
 		if (entry == programs.end()) {
+			UpdateShaderCapture(capture_attempt, "resource_plan_extract");
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
 			refresh_indirect_grid(entry->second.resource_plan);
@@ -1068,7 +1198,7 @@ struct PipelineCache::ProgramCache {
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor,
-		    entry->second.permutations));
+		    entry->second.permutations, capture_attempt));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);

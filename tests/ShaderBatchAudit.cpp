@@ -25,6 +25,11 @@
 #include <string>
 #include <vector>
 
+namespace Libs::Graphics {
+bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
+                              const std::vector<uint32_t>& spirv);
+}
+
 namespace {
 using Json = nlohmann::json;
 using namespace Libs::Graphics;
@@ -32,6 +37,44 @@ using namespace Libs::Graphics;
 void Progress(const char* phase) {
   std::printf("KYTY_SHADER_AUDIT_PHASE %s\n", phase);
   std::fflush(stdout);
+}
+
+void EmitCapturedProgram(ShaderRecompiler::TranslateResult translated,
+                         const ShaderRecompiler::CompileOptions& options,
+                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                         Json& result, const char*& phase, uint32_t push_data_start_dword) {
+  if (translated.skip_dispatch) {
+    result["checked_through"] = "dispatch_skipped";
+    result["dispatch_skipped"] = true;
+    return;
+  }
+  phase = "emit"; Progress(phase);
+  auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, push_data_start_dword);
+  result["spirv_emitted"] = true;
+  result["spirv_words"] = compiled.spirv.size();
+  result["standalone_stage_bindings"] = true;
+  result["push_data_start_dword"] = push_data_start_dword;
+  result["optimized"] = false;
+  const auto output = std::filesystem::absolute("shader.spv");
+  std::ofstream artifact(output, std::ios::binary);
+  if (!artifact.write(reinterpret_cast<const char*>(compiled.spirv.data()),
+                      static_cast<std::streamsize>(compiled.spirv.size() * sizeof(uint32_t)))) {
+    phase = "input";
+    throw std::runtime_error("cannot preserve emitted SPIR-V artifact");
+  }
+  artifact.close();
+  if (!artifact) {
+    phase = "input";
+    throw std::runtime_error("cannot flush emitted SPIR-V artifact");
+  }
+  result["spirv_file"] = output.string();
+  phase = "validation"; Progress(phase);
+  const bool valid = ValidateShaderSpirvForTest("ShaderBatchAudit", options.shader_hash, compiled.spirv);
+  result["spirv_validation_checked"] = true;
+  result["checked_through"] = "spirv_validation";
+  result["status"] = valid ? "passed" : "failed";
+  result["phase"] = phase;
+  if (!valid) result["error"] = "production SPIR-V validation failed";
 }
 
 uint64_t HexValue(const Json& value) {
@@ -322,14 +365,21 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
   const bool snapshot_mode = argc > 1 && std::string_view(argv[1]) == "--audit-shader-snapshot";
   Json snapshot_diagnostics = Json::object();
   try {
-    if (argc != 3 && !(argc == 5 && std::string_view(argv[3]) == "--compute-host-profile")) {
-      throw std::runtime_error("usage: shader_cfg_tests --audit-shader <manifest.json> [--compute-host-profile <host.json>] or --audit-shader-snapshot <pixel-manifest.json>");
+    if (argc < 3) throw std::runtime_error("usage: --audit-shader manifest.json [--emit-spirv] [--compute-host-profile host.json]");
+    bool emit_spirv = false;
+    const char* host_profile_file = nullptr;
+    for (int index = 3; index < argc; ++index) {
+      const std::string_view option(argv[index]);
+      if (option == "--emit-spirv" && !emit_spirv) emit_spirv = true;
+      else if (option == "--compute-host-profile" && !host_profile_file && index + 1 < argc)
+        host_profile_file = argv[++index];
+      else throw std::runtime_error("unknown or repeated shader audit option");
     }
-    if (snapshot_mode && argc != 3) throw std::runtime_error("snapshot replay requires an exact pixel capture");
+    if (snapshot_mode && host_profile_file) throw std::runtime_error("snapshot replay requires an exact pixel capture");
     std::optional<ShaderRecompiler::ComputeWorkgroupLimits> host_limits;
     Json host_profile;
-    if (argc == 5) {
-      std::ifstream host_file(std::filesystem::u8path(argv[4]));
+    if (host_profile_file) {
+      std::ifstream host_file(std::filesystem::u8path(host_profile_file));
       host_profile = Json::parse(host_file);
       host_limits = ReadComputeHostProfile(host_profile);
     }
@@ -337,6 +387,8 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     std::ifstream manifest_file(manifest_path);
     const auto manifest = Json::parse(manifest_file);
     const uint32_t capture_schema = manifest.at("schema_version");
+    const auto push_data_start_dword = manifest.contains("push_data_start_dword")
+        ? static_cast<uint32_t>(SnapshotUnsigned(manifest.at("push_data_start_dword"), UINT32_MAX)) : 0u;
     if (capture_schema != 1u && capture_schema != 2u) {
       throw std::runtime_error("unsupported shader capture schema");
     }
@@ -353,6 +405,8 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     if (size == 0 || size % 4u != 0 || size > 64u * 1024u * 1024u) {
       throw std::runtime_error("invalid or oversized shader code capture");
     }
+    if (manifest.contains("code_size_bytes") && manifest.at("code_size_bytes") != size)
+      throw std::runtime_error("shader code size mismatch");
     std::vector<uint32_t> code(size / 4u);
     std::ifstream binary(binary_path, std::ios::binary);
     if (!binary.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(size))) {
@@ -362,12 +416,29 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
         XXH3_64bits(code.data(), size) != HexValue(manifest.at("content_hash_xxh3_64"))) {
       throw std::runtime_error("shader capture content hash mismatch");
     }
+    std::vector<uint32_t> back_code;
+    const auto back_size = manifest.value("back_code_size_bytes", uint64_t{0});
+    if (back_size != 0) {
+      if (back_size % 4u || back_size > 64u * 1024u * 1024u || !manifest.contains("back_code_file"))
+        throw std::runtime_error("invalid or missing back-code capture");
+      const auto name = std::filesystem::u8path(manifest.at("back_code_file").get<std::string>());
+      if (name.has_parent_path()) throw std::runtime_error("back_code_file must be a sibling filename");
+      const auto path = manifest_path.parent_path() / name;
+      if (std::filesystem::file_size(path) != back_size) throw std::runtime_error("back-code size mismatch");
+      back_code.resize(back_size / 4u);
+      std::ifstream binary(path, std::ios::binary);
+      if (!binary.read(reinterpret_cast<char*>(back_code.data()), static_cast<std::streamsize>(back_size)) ||
+          !manifest.contains("back_code_hash_xxh3_64") ||
+          XXH3_64bits(back_code.data(), back_size) != HexValue(manifest.at("back_code_hash_xxh3_64")))
+        throw std::runtime_error("back-code content mismatch");
+    }
 
     static Common::Subsystems subsystems;
     Common::InitializeThreads();
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions config;
     config.printf_direction = Config::LogDirection::Silent;
+    config.shader_validation_enabled = emit_spirv;
     Config::Load(config);
     subsystems.Initialize<Log::Lifecycle>();
     ShaderInit();
@@ -376,7 +447,11 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     if (snapshot_mode && (capture_schema != 2u || (stage != "pixel" && stage != "ps") || !manifest.contains("runtime")))
       throw std::runtime_error("snapshot replay requires schema2 pixel runtime inputs");
     Json result{{"status", "passed"}, {"stage", stage}, {"code_bytes", size},
-                {"gpu_execution_checked", false}, {"resource_materialization_checked", false}};
+                {"gpu_execution_checked", false}, {"driver_pipeline_checked", false},
+                {"spirv_emitted", false}, {"spirv_validation_checked", false},
+                {"resource_materialization_checked", false}};
+    result["push_data_start_captured"] = manifest.contains("push_data_start_dword");
+    if (manifest.contains("capture_attempt")) result["capture_attempt"] = manifest.at("capture_attempt");
     if (host_limits) {
       result["compute_host_profile"] = host_profile;
       result["runtime_descriptor_values_captured"] = false;
@@ -387,20 +462,39 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     phase = "decode";
     Progress(phase);
     ShaderRecompiler::Decoder::Program decoded;
-    ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+    ShaderRecompiler::Decoder::Program decoded_back;
+    if (back_code.empty()) {
+      ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+    } else {
+      // Preflight both captured bodies with their actual terminator contracts.
+      // TranslateProgram owns fusion and the handoff's real CFG edge.
+      decoded = ShaderRecompiler::Decoder::DecodeFrontProgram(code);
+      ShaderRecompiler::Decoder::DecodeProgram(back_code, decoded_back);
+      result["decode_preflight"] = "front_and_back_separately";
+      result["front_instructions"] = decoded.instructions.size();
+      result["back_instructions"] = decoded_back.instructions.size();
+      result["back_pc_offset_bytes"] = decoded.code.size_bytes();
+    }
+    const auto preflight_instructions = decoded.instructions.size() + decoded_back.instructions.size();
     Json unknown = Json::array();
     Json unsupported = Json::array();
-    for (const auto& inst: decoded.instructions) {
-      if (inst.opcode == ShaderRecompiler::Decoder::Opcode::UNKNOWN ||
-          inst.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED) {
-        unknown.push_back(inst.pc);
-        unsupported.push_back({{"pc", inst.pc}, {"reason", inst.unsupported_reason},
+    const auto collect_unsupported = [&](const ShaderRecompiler::Decoder::Program& body,
+                                         uint32_t offset, const char* segment) {
+      for (const auto& inst: body.instructions) {
+        if (inst.opcode == ShaderRecompiler::Decoder::Opcode::UNKNOWN ||
+            inst.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED) {
+          unknown.push_back(inst.pc + offset);
+          unsupported.push_back({{"pc", inst.pc + offset}, {"body_pc", inst.pc},
+                                {"code_segment", segment}, {"reason", inst.unsupported_reason},
                                 {"family", static_cast<uint32_t>(inst.family)},
                                 {"opcode_id", inst.opcode_id},
                                 {"instruction", ShaderRecompiler::Decoder::InstructionToString(inst)}});
+        }
       }
-    }
-    result["instructions"] = decoded.instructions.size();
+    };
+    collect_unsupported(decoded, 0u, back_code.empty() ? "main" : "front");
+    collect_unsupported(decoded_back, static_cast<uint32_t>(decoded.code.size_bytes()), "back");
+    result["instructions"] = preflight_instructions;
     result["unknown_instruction_pcs"] = unknown;
     result["unsupported_instructions"] = unsupported;
     if (!unknown.empty()) {
@@ -413,6 +507,13 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     phase = "input";
     const bool compute = stage == "compute" || stage == "cs";
     const bool header_profile = manifest.value("metadata_provenance", "") == "agc_header_profile";
+    if (!back_code.empty() && (capture_schema != 2u || !manifest.value("metadata_complete", false) ||
+                              (!compute && stage != "pixel" && stage != "ps")))
+      throw std::runtime_error("fused audit requires complete schema2 pixel or compute compiler inputs");
+    if (emit_spirv && (capture_schema != 2u || !manifest.value("metadata_complete", false) || header_profile))
+      throw std::runtime_error("SPIR-V audit requires complete schema2 compiler inputs");
+    if (emit_spirv && stage != "pixel" && stage != "ps" && stage != "compute" && stage != "cs")
+      throw std::runtime_error("SPIR-V audit stage replay pending; no other stage inputs are fabricated");
     if (capture_schema == 2u && (stage == "pixel" || stage == "ps")) {
       if (!manifest.value("metadata_complete", false) || !manifest.contains("pixel"))
         throw std::runtime_error("complete pixel compiler inputs required");
@@ -429,17 +530,20 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       options.user_data = user_data; options.user_data_base = user_base;
       options.shader_hash = HexValue(manifest.at("shader_hash"));
       options.input_info.pixel = &info;
+      options.back_code = back_code;
       const bool dump_pixel_ir = std::getenv("KYTY_SHADER_AUDIT_DUMP_IR") != nullptr;
       options.dump_ir = dump_pixel_ir;
       options.early_dump = dump_pixel_ir;
       ShaderRecompiler::Capture::ReadHostProfileMetadata(manifest.at("host_profile"), options.host_profile);
       if (manifest.contains("compute_workgroup_limits"))
         ShaderRecompiler::Capture::ReadWorkgroupLimitsMetadata(manifest.at("compute_workgroup_limits"), options.compute_workgroup_limits);
-      // Early local schema2 PS captures predate the device-limits field. The
-      // pixel frontend does not consume native_subgroup_size; no GPU is replayed.
+      // Legacy frontend-only captures can omit limits. Backend emission needs
+      // the actual native subgroup size for graphics wave64 lowering.
+      if (emit_spirv && !manifest.contains("compute_workgroup_limits"))
+        throw std::runtime_error("SPIR-V audit requires captured compiler device limits");
+      if (emit_spirv && options.compute_workgroup_limits.native_subgroup_size == 0u)
+        throw std::runtime_error("SPIR-V audit requires captured nonzero native subgroup size");
       result["compiler_device_limits_captured"] = manifest.contains("compute_workgroup_limits");
-      if (manifest.value("back_code_size_bytes", 0u) != 0u)
-        throw std::runtime_error("pixel back-code replay pending; refusing incomplete input");
       phase = "translate_resources"; Progress(phase);
       auto translated = ShaderRecompiler::TranslateProgram(code, options);
       if (dump_pixel_ir) {
@@ -447,6 +551,7 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
                     ShaderRecompiler::IR::ProgramToString(translated.program).c_str());
         std::fflush(stdout);
       }
+      phase = "resource_plan"; Progress(phase);
       const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
       if (dump_pixel_ir) {
         Json images = Json::array();
@@ -480,7 +585,7 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       result["checked_through"] = "pixel_translate_resources";
       result["runtime_resources_captured"] = manifest.value("runtime_resources_captured", false);
       result["tracked_images"] = plan.info.images.size();
-      result["instructions"] = decoded.instructions.size();
+      result["instructions"] = preflight_instructions;
       if (snapshot_mode) {
         phase = "input";
         result["texture_wave_tables"] = DescribeCapturedTextureRows(plan, manifest.at("runtime"));
@@ -534,7 +639,12 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
         result["checked_through"] = "pixel_materialize_resources";
         result["status"] = ok ? "passed" : "failed";
         result["materialization_error"] = reason;
+        if (emit_spirv && ok) EmitCapturedProgram(std::move(translated), options, specialization, result, phase, push_data_start_dword);
+      } else if (emit_spirv) {
+        phase = "input";
+        throw std::runtime_error("SPIR-V audit requires captured runtime resource callbacks");
       }
+      result["phase"] = phase;
       std::printf("KYTY_SHADER_AUDIT_RESULT %s\n", result.dump().c_str());
       return result.at("status") == "passed" ? 0 : 1;
     }
@@ -588,14 +698,13 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       options.dump_ir = dump_ir;
       options.early_dump = dump_ir;
       options.input_info.compute = &info;
+      options.back_code = back_code;
       if (capture_schema == 2u) {
         ShaderRecompiler::Capture::ReadHostProfileMetadata(manifest.at("host_profile"), options.host_profile);
         ShaderRecompiler::Capture::ReadWorkgroupLimitsMetadata(manifest.at("compute_workgroup_limits"), options.compute_workgroup_limits);
-        if (manifest.value("back_code_size_bytes", 0u) != 0u)
-          throw std::runtime_error("compute back-code replay pending; refusing incomplete input");
-        if (manifest.contains("runtime"))
-          throw std::runtime_error("compute runtime replay pending; use complete pixel replay for materialization");
       }
+      if (emit_spirv && options.compute_workgroup_limits.native_subgroup_size == 0u)
+        throw std::runtime_error("SPIR-V audit requires captured nonzero native subgroup size");
       Json profiles = Json::array();
       const bool initial_barriers = info.needs_lds_barriers;
       Json precheck_errors = Json::array();
@@ -610,6 +719,7 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
                       ShaderRecompiler::IR::ProgramToString(translated.program).c_str());
           std::fflush(stdout);
         }
+        phase = "resource_plan"; Progress(phase);
         const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
         if (dump_ir) {
           std::printf("KYTY_SHADER_AUDIT_TRACKED_IR_BEGIN barriers=%u\n%sKYTY_SHADER_AUDIT_TRACKED_IR_END\n",
@@ -690,8 +800,31 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
           profile["compute_execution_precheck"] = std::move(precheck);
         }
         profiles.push_back(std::move(profile));
+        if (emit_spirv) {
+          phase = "input";
+          if (!manifest.contains("runtime")) throw std::runtime_error("SPIR-V audit requires captured runtime resource callbacks");
+          ShaderRecompiler::IR::SrtRuntime runtime;
+          runtime.user_data = user_data;
+          auto events = ShaderRecompiler::Capture::ReadResourceReadMetadata(manifest.at("runtime"), runtime);
+          ShaderRecompiler::Capture::ResourceReadReplay replay(runtime, std::move(events));
+          ShaderRecompiler::IR::ResourceSnapshot snapshot;
+          ShaderRecompiler::IR::ResourceSpecialization specialization;
+          phase = "materialize_resources"; Progress(phase);
+          const bool ok = ShaderRecompiler::IR::MaterializeResources(plan, replay.Runtime(), snapshot, specialization);
+          const auto reason = ShaderRecompiler::IR::LastResourceSpecializationError();
+          if (!replay.Error().empty() || !replay.Consumed()) {
+            phase = "input";
+            throw std::runtime_error(replay.Error().empty() ? "unconsumed resource callbacks" : replay.Error());
+          }
+          result["runtime_replay"] = "ordered_callbacks";
+          result["resource_materialization_checked"] = true;
+          result["materialization_error"] = reason;
+          result["status"] = ok ? "passed" : "failed";
+          result["checked_through"] = "compute_materialize_resources";
+          if (ok) EmitCapturedProgram(std::move(translated), options, specialization, result, phase, push_data_start_dword);
+        }
       }
-      result["checked_through"] = host_limits ? "compute_execution_precheck" : "resource_tracking";
+      if (!emit_spirv) result["checked_through"] = host_limits ? "compute_execution_precheck" : "resource_tracking";
       if (host_limits) {
         result["compute_execution_precheck"] = {
             {"status", precheck_errors.empty() ? "not_rejected" : "rejected"},
@@ -714,6 +847,10 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
         result["profile_assumptions"] = manifest.value("profile_assumptions", Json::object());
       }
     } else {
+        if (!back_code.empty()) {
+          phase = "input";
+          throw std::runtime_error("fused capture requires complete pixel or compute inputs; CFG-only fusion replay is unsupported");
+        }
         phase = "cfg";
         Progress(phase);
         auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
@@ -740,6 +877,7 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
               : "non-compute stage; only CFG checked";
         }
     }
+    result["phase"] = phase;
     std::printf("KYTY_SHADER_AUDIT_RESULT %s\n", result.dump().c_str());
     std::fflush(stdout);
     return result.at("status") == "passed" ? 0 : 1;

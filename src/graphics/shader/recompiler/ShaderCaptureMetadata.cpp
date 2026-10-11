@@ -1,18 +1,136 @@
 #include "ShaderCaptureMetadata.h"
 
+#include <algorithm>
 #include <bit>
+#include <chrono>
 #include <fmt/format.h>
+#include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <xxhash.h>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 namespace Libs::Graphics::ShaderRecompiler::Capture {
+namespace {
+const char* CaptureStage(ShaderType stage) {
+    switch (stage) {
+        case ShaderType::Compute: return "compute";
+        case ShaderType::Vertex: return "vertex";
+        case ShaderType::Pixel: return "pixel";
+        case ShaderType::Mesh: return "mesh";
+        case ShaderType::Local: return "local";
+        case ShaderType::TessellationControl: return "tessellation_control";
+        case ShaderType::TessellationEvaluation: return "tessellation_evaluation";
+        default: return "unknown";
+    }
+}
+bool VertexCaptureStage(ShaderType stage) {
+    return stage == ShaderType::Vertex || stage == ShaderType::Mesh || stage == ShaderType::Local ||
+           stage == ShaderType::TessellationControl || stage == ShaderType::TessellationEvaluation;
+}
+int64_t CaptureTime() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+bool WriteCaptureFile(const std::filesystem::path& path, const void* data, size_t size) {
+    if (size > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) return false;
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) return false;
+    file.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    file.flush();
+    return file.good();
+}
+bool WriteCaptureManifest(const CompileCaptureAttempt& attempt) {
+    const auto text = attempt.metadata.dump(2) + '\n';
+    auto temporary = attempt.manifest;
+    temporary += ".tmp";
+    if (!WriteCaptureFile(temporary, text.data(), text.size())) return false;
+#if defined(_WIN32)
+    return MoveFileExW(temporary.c_str(), attempt.manifest.c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::error_code error;
+    std::filesystem::rename(temporary, attempt.manifest, error);
+    return !error;
+#endif
+}
+} // namespace
+
+std::optional<CompileCaptureAttempt> CompileCaptureArchive::Begin(
+    const std::filesystem::path& directory, const ShaderParams& params,
+    const CompileOptions& options, std::span<const uint32_t> static_state,
+    std::optional<std::array<uint32_t, 3>> guest_workgroups,
+    std::string_view revision, std::string_view worktree,
+    const nlohmann::ordered_json* runtime_capture,
+    const nlohmann::ordered_json* compile_policy,
+    uint32_t push_data_start_dword) {
+    auto metadata = BuildCompileMetadata(params, options, static_state, guest_workgroups);
+    metadata["push_data_start_dword"] = push_data_start_dword;
+    if (compile_policy) metadata["captured_compile_policy"] = *compile_policy;
+    if (runtime_capture) {
+        metadata["runtime"] = *runtime_capture;
+        metadata["runtime_resources_captured"] = runtime_capture->at("complete");
+    }
+    const auto identity = metadata.dump();
+    // Hashes label files; exact metadata AND binary comparisons decide reuse.
+    for (const auto& entry : entries) {
+        if (entry.directory == directory && entry.identity == identity &&
+            std::ranges::equal(entry.code, params.code) &&
+            std::ranges::equal(entry.back_code, options.back_code)) return entry.attempt;
+    }
+    // Include formatted metadata and phase-state headroom in the archive disk budget.
+    if (params.code.size_bytes() > max_bytes || options.back_code.size_bytes() > max_bytes ||
+        identity.size() > max_bytes) return {};
+    const uint64_t size = params.code.size_bytes() + options.back_code.size_bytes() +
+                          metadata.dump(2).size() + 16384u;
+    if (entries.size() >= max_inputs || size > max_bytes - bytes) return {};
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error) return {};
+    const auto stem = fmt::format("{}_{:016x}_attempt_{:04}_{:016x}_{}", CaptureStage(options.stage),
+        options.shader_hash, entries.size(), XXH3_64bits(identity.data(), identity.size()), CaptureTime());
+    // A reused capture directory must never replace artifacts from another run.
+    if (std::filesystem::exists(directory / (stem + ".json"), error) || error ||
+        std::filesystem::exists(directory / (stem + ".bin"), error) || error) return {};
+    metadata["code_file"] = stem + ".bin";
+    if (!options.back_code.empty()) metadata["back_code_file"] = stem + "_back.bin";
+    metadata["capture_attempt"] = {
+        {"input_id", stem}, {"phase", "requested"}, {"phase_status", "pending"}, {"reason", ""},
+        {"source_revision", revision}, {"source_worktree_fingerprint", worktree},
+        {"captured_unix_ms", CaptureTime()}, {"updated_unix_ms", CaptureTime()},
+    };
+    CompileCaptureAttempt attempt {directory / (stem + ".json"), std::move(metadata)};
+    // Publish the manifest last; it never references a not-yet-written input.
+    if (!WriteCaptureFile(directory / (stem + ".bin"), params.code.data(), params.code.size_bytes()) ||
+        (!options.back_code.empty() && !WriteCaptureFile(directory / (stem + "_back.bin"),
+            options.back_code.data(), options.back_code.size_bytes())) || !WriteCaptureManifest(attempt))
+        return {};
+    entries.push_back({directory, identity, {params.code.begin(), params.code.end()},
+                       {options.back_code.begin(), options.back_code.end()}, attempt});
+    bytes += size;
+    return attempt;
+}
+
+bool CompileCaptureArchive::Update(CompileCaptureAttempt& attempt, std::string_view phase,
+                                  std::string_view phase_status, std::string_view reason) {
+    if (phase_status != "pending" && phase_status != "completed" && phase_status != "failed") return false;
+    auto& state = attempt.metadata.at("capture_attempt");
+    state["phase"] = phase;
+    state["phase_status"] = phase_status;
+    state["reason"] = reason.substr(0u, 8192u);
+    state["updated_unix_ms"] = CaptureTime();
+    return WriteCaptureManifest(attempt);
+}
+
 nlohmann::ordered_json
 BuildCompileMetadata(const ShaderParams& params, const CompileOptions& options,
                      std::span<const uint32_t>              static_state,
                      std::optional<std::array<uint32_t, 3>> guest_workgroups) {
-	const char* stage        = options.stage == ShaderType::Compute  ? "compute"
-	                           : options.stage == ShaderType::Vertex ? "vertex"
-	                           : options.stage == ShaderType::Pixel  ? "pixel"
-	                                                                 : "unknown";
+	const char* stage        = CaptureStage(options.stage);
 	const auto  content_hash = XXH3_64bits(params.code.data(), params.code.size_bytes());
 	const auto  state_hash   = XXH3_64bits(static_state.data(), static_state.size_bytes());
 	const auto  stem = fmt::format("{}_{:016x}_{:016x}", stage, options.shader_hash, state_hash);
@@ -35,7 +153,7 @@ BuildCompileMetadata(const ShaderParams& params, const CompileOptions& options,
 	                           ? options.input_info.compute->scratch_size_dwords
 	                       : options.stage == ShaderType::Pixel && options.input_info.pixel
 	                           ? options.input_info.pixel->scratch_size_dwords
-	                       : options.stage == ShaderType::Vertex && options.input_info.vertex
+	                       : VertexCaptureStage(options.stage) && options.input_info.vertex
 	                           ? options.input_info.vertex->scratch_size_dwords
 	                           : 0u},
 	    {"metadata_complete", false},
@@ -136,7 +254,7 @@ BuildCompileMetadata(const ShaderParams& params, const CompileOptions& options,
 		metadata["pixel"]             = std::move(pixel);
 		metadata["metadata_complete"] = true;
 	}
-	if (options.stage == ShaderType::Vertex && options.input_info.vertex != nullptr) {
+	if (VertexCaptureStage(options.stage) && options.input_info.vertex != nullptr) {
 		const auto& input = *options.input_info.vertex;
 		if (input.resources_num < 0 || input.resources_num > ShaderVertexInputInfo::RES_MAX ||
 		    input.buffers_num < 0 || input.buffers_num > ShaderVertexInputInfo::RES_MAX ||

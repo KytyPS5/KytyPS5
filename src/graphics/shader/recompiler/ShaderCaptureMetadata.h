@@ -4,7 +4,41 @@
 #include "graphics/shader/recompiler/ResourceReadCapture.h"
 
 #include <nlohmann/json.hpp>
+#include <filesystem>
 namespace Libs::Graphics::ShaderRecompiler::Capture {
+// A pending phase records an attempted operation, never a proven compiler failure.
+struct CompileCaptureAttempt {
+    std::filesystem::path manifest;
+    nlohmann::ordered_json metadata;
+};
+class CompileCaptureArchive {
+public:
+    explicit CompileCaptureArchive(size_t max_inputs = 4096u,
+                                   uint64_t max_bytes = 256u * 1024u * 1024u)
+        : max_inputs(max_inputs), max_bytes(max_bytes) {}
+    std::optional<CompileCaptureAttempt> Begin(
+        const std::filesystem::path& directory, const ShaderParams& params,
+        const CompileOptions& options, std::span<const uint32_t> static_state,
+        std::optional<std::array<uint32_t, 3>> guest_workgroups,
+        std::string_view revision = {}, std::string_view worktree = {},
+        const nlohmann::ordered_json* runtime_capture = nullptr,
+        const nlohmann::ordered_json* compile_policy = nullptr,
+        uint32_t push_data_start_dword = 0u);
+    static bool Update(CompileCaptureAttempt& attempt, std::string_view phase,
+                       std::string_view phase_status, std::string_view reason = {});
+    [[nodiscard]] size_t Inputs() const { return entries.size(); }
+    [[nodiscard]] uint64_t Bytes() const { return bytes; }
+private:
+    struct Entry {
+        std::filesystem::path directory;
+        std::string identity;
+        std::vector<uint32_t> code, back_code;
+        CompileCaptureAttempt attempt;
+    };
+    size_t max_inputs;
+    uint64_t max_bytes, bytes = 0u;
+    std::vector<Entry> entries;
+};
 nlohmann::ordered_json
      BuildCompileMetadata(const ShaderParams& params, const CompileOptions& options,
                           std::span<const uint32_t>              static_state,

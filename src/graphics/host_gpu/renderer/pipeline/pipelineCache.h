@@ -212,6 +212,7 @@ public:
 		// layout.
 		bool     uses_push_descriptors = false;
 		bool     uses_image_heap       = false;
+		uint64_t layout_signature      = 0;
 	};
 
 	struct GraphicsPrograms {

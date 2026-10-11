@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bindingEpoch.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -176,6 +177,7 @@ void RecordStencilExportReplay(vk::CommandBuffer command, const StencilExportRep
 			continue;
 		}
 		EXIT_IF(pipelines[bit] == nullptr);
+		DisturbGraphicsBindings();
 		command.bindPipeline(vk::PipelineBindPoint::eGraphics, pipelines[bit]);
 #if !defined(__APPLE__)
 		if (color_attachments != 0) {

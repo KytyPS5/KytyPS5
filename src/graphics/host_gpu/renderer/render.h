@@ -304,6 +304,27 @@ private:
 	PreparedBindings                     m_compute_bindings;
 	DispatchAccess                        m_dispatch_access;
 	std::vector<ImageId>                  m_bound_images;
+	struct LastGraphicsBindings {
+		VkCommandBuffer       command          = nullptr;
+		uint64_t              tick             = 0;
+		uint64_t              epoch            = 0;
+		VkPipelineLayout      layout           = nullptr;
+		uint64_t              layout_signature = 0;
+		VkPipeline            pipeline         = nullptr;
+		bool                  pixel_set_bound  = false;
+		// Binding the heap set below a bound pixel set disturbs it unless a heap set was bound.
+		bool                  heap_set_bound = false;
+		std::vector<uint64_t> pixel_content;
+	};
+	LastGraphicsBindings  m_last_graphics;
+	std::vector<uint64_t> m_pixel_content_scratch;
+	[[nodiscard]] bool    LastGraphicsBindingsValid(vk::CommandBuffer command);
+	// Scratch for CommitBindings: the ranges this op writes, checked against captured reads.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
+	// Where the scheduler's DynamicState was last committed: command buffer and binding epoch.
+	VkCommandBuffer                       m_dynamic_state_command = nullptr;
+	uint64_t                              m_dynamic_state_epoch   = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::unique_ptr<ThreadDispatcher>     m_thread_dispatch;

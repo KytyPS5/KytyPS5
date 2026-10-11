@@ -1069,6 +1069,18 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	if (span > MaxPeekBytes) {
 		return false;
 	}
+	// Both record layouts lead with the element count and the instance count.
+	const auto record_empty = [](std::span<const uint32_t> record) {
+		return record[0] == 0 || record[1] == 0;
+	};
+	// Almost every draw draws: decide on the first record before copying the rest.
+	std::array<uint32_t, 2> head {};
+	if (!clean_read(records.address, head) || !record_empty(head)) {
+		return false;
+	}
+	if (count == 1) {
+		return true;
+	}
 	static thread_local std::vector<uint32_t> words;
 	words.resize(static_cast<size_t>(span / sizeof(uint32_t)));
 	if (!clean_read(records.address, words)) {
@@ -1076,6 +1088,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	}
 	for (uint32_t record = 0; record < count; record++) {
 		const auto first = static_cast<size_t>(record) * records.stride / sizeof(uint32_t);
+		if (!record_empty(std::span<const uint32_t>(words).subspan(first, 2))) {
 			return false;
 		}
 	}
@@ -1455,7 +1468,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		buffer.MarkIndirectArgsBarrier();
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	if (!LastGraphicsBindingsValid(vk_buffer) ||
+	    m_last_graphics.pipeline != static_cast<VkPipeline>(pipeline.pipeline)) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		m_last_graphics.pipeline = static_cast<VkPipeline>(pipeline.pipeline);
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

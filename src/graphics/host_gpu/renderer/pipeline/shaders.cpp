@@ -342,13 +342,41 @@ CreateGraphicsDescriptorLayouts(GraphicContext& graphics, PipelineCache::Pipelin
 	}
 }
 
+static uint64_t PipelineLayoutSignature(const vk::PipelineLayoutCreateInfo&             info,
+                                        std::span<const vk::DescriptorSetLayoutBinding> set0,
+                                        bool                                            set0_push,
                                         std::span<const vk::DescriptorSetLayoutBinding> pixel,
                                         bool                                            has_pixel) {
+	uint64_t   hash         = 0xcbf29ce484222325ull;
+	const auto mix          = [&](uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
+	const auto mix_bindings = [&](std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+		mix(bindings.size());
+		for (const auto& binding: bindings) {
+			mix(binding.binding);
+			mix(static_cast<uint64_t>(binding.descriptorType));
+			mix(binding.descriptorCount);
+			mix(static_cast<uint64_t>(static_cast<VkShaderStageFlags>(binding.stageFlags)));
+			mix(binding.pImmutableSamplers != nullptr ? 1u : 0u);
+		}
+	};
+	mix(static_cast<uint64_t>(static_cast<VkPipelineLayoutCreateFlags>(info.flags)));
+	mix(info.setLayoutCount);
+	mix(set0_push ? 1u : 0u);
+	mix_bindings(set0);
 	mix(has_pixel ? 1u : 0u);
 	mix_bindings(pixel);
 	// The other sets are shared layouts, such as the image heap's.
 	for (uint32_t set = 1; set < info.setLayoutCount; set++) {
 		if (set == ShaderRecompiler::IR::NativeDescriptorSet(ShaderType::Pixel)) continue;
+		mix(reinterpret_cast<uint64_t>(static_cast<VkDescriptorSetLayout>(info.pSetLayouts[set])));
+	}
+	for (uint32_t range = 0; range < info.pushConstantRangeCount; range++) {
+		const auto& push = info.pPushConstantRanges[range];
+		mix(static_cast<uint64_t>(static_cast<VkShaderStageFlags>(push.stageFlags)));
+		mix(push.offset);
+		mix(push.size);
+	}
+	return hash | 1u;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -632,6 +660,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+	pipeline.layout_signature = PipelineLayoutSignature(
+	    pipeline_layout_info, vertex_bindings, pipeline.uses_push_descriptors, pixel_bindings,
+	    pipeline.pixel_descriptor_set_layout != nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 

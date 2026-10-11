@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/renderer/bindingEpoch.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -33,12 +34,14 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -629,6 +632,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto    image_layers = layered ? depth : 1u;
 	auto          view_base    = static_cast<uint32_t>(base_level);
 	if (multisampled) {
+		const auto    bytes = Prospero::NumBytesPerElement(format);
+		const auto    pitch = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
+		                                 : TileGetRenderTargetPitch(width, bytes, last_level);
+		TileSizeAlign size {};
 		if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
 		    size.size > UINT32_MAX / image_layers) {
 			char repeat[32] = "";
@@ -671,6 +678,23 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
+	const auto layout_supported = [&](uint32_t probe_levels) {
+		ImageInfo probe        = desc.info;
+		probe.resources.levels = probe_levels;
+		return probe.TryUpdateSize();
+	};
+	const bool in_place = levels <= physical_levels;
+	if (!(in_place ? desc.info.TryUpdateSize() : layout_supported(levels)) ||
+	    (levels > physical_levels && !layout_supported(physical_levels))) {
+		char repeat[32] = "";
+		if (ShouldReportTextureRefusal(address, 0, TextureRefusal::SurfaceSize, repeat)) {
+			LOGF("unsupported texture surface layout: addr=0x%016" PRIx64
+			     " extent=%ux%ux%u levels=%u layers=%u tile=%u format=%u%s\n",
+			     address, width, height, depth, levels, image_layers, static_cast<uint32_t>(tile),
+			     static_cast<uint32_t>(format), repeat);
+		}
+		return bind_null();
+	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
@@ -684,14 +708,24 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.UpdateSize();
 	}
 	const auto alignment = desc.info.DataAlignment();
-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+	if (desc.info.data.size == 0 || alignment == 0 ||
+	    (address & (static_cast<uint64_t>(alignment) - 1u)) != 0) {
+		char repeat[32] = "";
+		if (ShouldReportTextureRefusal(address, desc.info.data.size, TextureRefusal::SurfaceSize,
+		                               repeat)) {
+			LOGF("unsupported texture surface layout: addr=0x%016" PRIx64 " size=0x%" PRIx64
+			     " align=0x%x extent=%ux%ux%u levels=%u layers=%u tile=%u format=%u%s\n",
+			     address, desc.info.data.size, alignment, width, height, depth, levels,
+			     image_layers, static_cast<uint32_t>(tile), static_cast<uint32_t>(format), repeat);
+		}
+		return bind_null();
+	}
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
-	if (storage) {
-		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
+	if (storage && !ValidateStorageTexture(resource, descriptor, desc.info.data.size)) {
+		return bind_null();
 	}
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
@@ -786,6 +820,32 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {buffer.Handle(), offset, data.size_bytes()};
+}
+
+static vk::DescriptorBufferInfo NativeUploadShared(RenderContext&            context,
+                                                   std::span<const uint32_t> data) {
+	struct Entry {
+		uint64_t                 tick   = 0;
+		VkBuffer                 buffer = nullptr;
+		std::vector<uint32_t>    words;
+		vk::DescriptorBufferInfo info;
+	};
+	static thread_local std::array<Entry, 64> entries;
+	const auto                                tick   = context.GetCommandScheduler().CurrentTick();
+	const auto                                stream = static_cast<VkBuffer>(
+	    context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream).Handle());
+	const auto hash  = XXH3_64bits(data.data(), data.size_bytes());
+	auto&      entry = entries[hash % entries.size()];
+	if (entry.tick == tick && entry.buffer == stream && entry.words.size() == data.size() &&
+	    std::equal(data.begin(), data.end(), entry.words.begin())) {
+		return entry.info;
+	}
+	const auto info = NativeUpload(context, data);
+	entry.tick      = tick;
+	entry.buffer    = static_cast<VkBuffer>(info.buffer);
+	entry.words.assign(data.begin(), data.end());
+	entry.info = info;
+	return info;
 }
 
 
@@ -957,6 +1017,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					    (graphics.StorageMinAlignment() - 1);
 							     reader->runtime->resources->ScalarReads()) {
 			if (size == 0) {
+				source = {};
 				continue;
 			}
 			source = {address, size, cache.FindBuffer(address, size)};
@@ -990,9 +1051,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		pack_memory_offset(index, buffer_offset);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
+		prepared.flattened_srt = NativeUploadShared(m_context, snapshot.flattened_srt);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
-		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		prepared.shader_data_buffer = NativeUploadShared(m_context, prepared.shader_data);
 	}
 }
 
@@ -1146,7 +1208,119 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
-void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+bool RenderExecutor::LastGraphicsBindingsValid(vk::CommandBuffer command) {
+	auto& last = m_last_graphics;
+	return last.command == static_cast<VkCommandBuffer>(command) &&
+	       last.tick == m_context.GetCommandScheduler().CurrentTick() &&
+	       last.epoch == GraphicsBindingEpoch();
+}
+
+static bool SameGraphicsLayout(VkPipelineLayout last, uint64_t last_signature,
+                               const PipelineCache::Pipeline& pipeline) {
+	if (last == static_cast<VkPipelineLayout>(pipeline.pipeline_layout)) {
+		return true;
+	}
+	return last_signature != 0 && last_signature == pipeline.layout_signature;
+}
+
+static void AppendWriteContent(std::vector<uint64_t>& out, const vk::WriteDescriptorSet& write) {
+	out.push_back((uint64_t {write.dstBinding} << 32u) |
+	              static_cast<uint32_t>(write.descriptorType));
+	out.push_back(write.descriptorCount);
+	for (uint32_t i = 0; i < write.descriptorCount; i++) {
+		if (write.pBufferInfo != nullptr) {
+			const auto& info = write.pBufferInfo[i];
+			out.push_back(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(info.buffer)));
+			out.push_back(info.offset);
+			out.push_back(info.range);
+		}
+		if (write.pImageInfo != nullptr) {
+			const auto& info = write.pImageInfo[i];
+			out.push_back(reinterpret_cast<uint64_t>(static_cast<VkSampler>(info.sampler)));
+			out.push_back(reinterpret_cast<uint64_t>(static_cast<VkImageView>(info.imageView)));
+			out.push_back(static_cast<uint64_t>(info.imageLayout));
+		}
+	}
+}
+
+const char*
+RenderExecutor::ScalarReadConflict(std::span<PreparedBindings* const> prepared_bindings) {
+	const bool any_reads = std::ranges::any_of(prepared_bindings, [](const PreparedBindings* p) {
+		return !p->runtime->resources->ScalarReads().empty();
+	});
+	if (!any_reads) {
+		return nullptr;
+	}
+	for (const auto* writer: prepared_bindings) {
+		if (writer->runtime->program->has_address_writes) {
+			return "scalar resource reads cannot be proven disjoint from shader address writes";
+		}
+	}
+	auto& written_images  = m_written_image_ranges;
+	auto& written_buffers = m_written_buffer_ranges;
+	written_images.clear();
+	written_buffers.clear();
+	for (const auto id: m_bound_images) {
+		const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+		if (image == nullptr || !image->binding.is_target) {
+			continue;
+		}
+		for (const auto written:
+		     {image->info.data, image->info.stencil, image->info.metadata.range}) {
+			if (written.size != 0) {
+				written_images.emplace_back(written.address, written.size);
+			}
+		}
+	}
+	for (const auto* writer: prepared_bindings) {
+		const auto& program = *writer->runtime->program;
+		for (size_t index = 0; index < program.info.images.size(); index++) {
+			if (program.info.images[index].written && index < writer->images.size()) {
+			}
+		}
+	}
+	for (const auto* writer: prepared_bindings) {
+		const auto& program = *writer->runtime->program;
+		for (const auto& resource: program.info.buffers) {
+			if (!resource.written || resource.descriptor_index == UINT32_MAX) {
+				continue;
+			}
+			const auto& written = writer->buffer_sources[resource.descriptor_index];
+			// ADD_TID and swizzle move fixed-offset writes past write_extent.
+			const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
+			const auto written_size =
+			    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
+			if (written_size != 0) {
+				written_buffers.emplace_back(written.address, written_size);
+			}
+		}
+	}
+	for (const auto* reader: prepared_bindings) {
+		for (const auto [address, size]: reader->runtime->resources->ScalarReads()) {
+			for (const auto [written_address, written_size]: written_images) {
+				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+					return "scalar resource reads overlap an image or attachment write";
+				}
+			}
+			for (const auto [written_address, written_size]: written_buffers) {
+				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+					return "scalar resource reads overlap a shader buffer write";
+				}
+			}
+		}
+	}
+	return nullptr;
+}
+static void ReportScalarReadConflict(std::span<PreparedBindings* const> stages,
+                                     const char*                        conflict) {
+	static RefusalReporter reports;
+	const auto             hash = stages.front()->runtime->program->shader_hash;
+	if (reports.Observe(hash, reinterpret_cast<uintptr_t>(conflict), 0) == 1) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("shader resources unavailable, skipping this draw: hash=0x{:016x} {}\n",
+		                hash, conflict));
+	}
+}
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
@@ -1182,33 +1356,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
-	for (const auto* reader: prepared_bindings) {
-		const auto& reads = reader->runtime->resources->specialization_reads;
-		if (reads.empty()) continue;
-		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->program->has_address_writes) {
-			}
-		}
-		for (const auto [address, size]: reads) {
-			for (const auto id: m_bound_images) {
-				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
-						EXIT("scalar resource reads overlap an image or attachment write\n");
-					}
-				}
-			}
-			for (const auto* writer: prepared_bindings) {
-				const auto& program = *writer->runtime->program;
-					// ADD_TID and swizzle move fixed-offset writes past write_extent.
-					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
-					const auto written_size =
-					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
-					if (written_size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written_size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
-					}
-				}
-			}
-		}
+	if (const char* conflict = ScalarReadConflict(prepared_bindings)) {
+		ReportScalarReadConflict(prepared_bindings, conflict);
+		return false;
 	}
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
@@ -1361,6 +1511,30 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	const bool graphics_point = pipeline_bind_point == vk::PipelineBindPoint::eGraphics;
+	if (graphics_point) {
+		if (!LastGraphicsBindingsValid(vk_buffer) ||
+		    !SameGraphicsLayout(m_last_graphics.layout, m_last_graphics.layout_signature,
+		                        pipeline)) {
+			m_last_graphics.pixel_set_bound = false;
+			m_last_graphics.heap_set_bound  = false;
+			m_last_graphics.pixel_content.clear();
+			if (!LastGraphicsBindingsValid(vk_buffer)) {
+				m_last_graphics.pipeline = nullptr;
+			}
+		}
+		if (pipeline.uses_image_heap) {
+			if (!m_last_graphics.heap_set_bound) {
+				m_last_graphics.pixel_set_bound = false;
+			}
+			m_last_graphics.heap_set_bound = true;
+		}
+		m_last_graphics.command          = static_cast<VkCommandBuffer>(vk_buffer);
+		m_last_graphics.tick             = m_context.GetCommandScheduler().CurrentTick();
+		m_last_graphics.epoch            = GraphicsBindingEpoch();
+		m_last_graphics.layout           = static_cast<VkPipelineLayout>(pipeline.pipeline_layout);
+		m_last_graphics.layout_signature = pipeline.layout_signature;
+	}
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
@@ -1398,9 +1572,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 		if (pixel_count != 0) {
+			auto& content = m_pixel_content_scratch;
+			content.clear();
 			for (uint32_t i = 0; i < pixel_count; i++) {
+				AppendWriteContent(content, pixel_begin[i]);
 			}
-			                             0, nullptr);
+			const bool reuse = graphics_point && m_last_graphics.pixel_set_bound &&
+			                   content == m_last_graphics.pixel_content;
+			if (!reuse) {
+				const auto set = heap.Commit(pipeline.pixel_descriptor_set_layout);
+				for (uint32_t i = 0; i < pixel_count; i++) {
+					pixel_begin[i].dstSet = set;
+				}
+				m_context.GetGraphics().device.updateDescriptorSets(pixel_count, &*pixel_begin, 0,
+				                                                    nullptr);
+				vk_buffer.bindDescriptorSets(
+				    pipeline_bind_point, pipeline.pipeline_layout,
+				    ShaderRecompiler::IR::NativeDescriptorSet(ShaderType::Pixel), 1, &set, 0,
+				    nullptr);
+				m_last_graphics.pixel_set_bound = true;
+				m_last_graphics.pixel_content.swap(content);
+			}
 		}
 	}
 	return true;

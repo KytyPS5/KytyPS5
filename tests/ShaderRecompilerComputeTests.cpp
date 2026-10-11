@@ -2374,6 +2374,88 @@ public:
             "shutdown lost reentrant or concurrent deferred work");
     std::printf("[host]    %-32s ok\n", "SchedulerTimeline");
   }
+  /// Checks BDA uploads after registration, clean passes, CPU rewrites, and remapping.
+  void CheckBdaDirtyWorklist() {
+    constexpr const char* name = "BdaDirtyWorklist";
+    constexpr uint64_t base = 0x0000000205800000ull;
+    constexpr uint64_t size = 0x8000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto& scheduler = context.GetCommandScheduler();
+    auto& cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "allocation", LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x4000,
+                0, &direct_offset) == 0, "direct allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "mapping", LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, 0x4000) == 0,
+            "direct mapping failed");
+    context.MapMemory(base, size);
+    const auto write = [&](uint64_t address, uint32_t value) {
+      cache.InvalidateMemory(address, sizeof(value));
+      Require(name, "backing write", LibKernel::Memory::TryWriteBacking(
+                  address, &value, sizeof(value)), "backing write failed");
+    };
+    const auto read_native = [&](const Libs::Graphics::Buffer& buffer, uint64_t address) {
+      auto probe = CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {0});
+      const vk::BufferCopy copy{buffer.Offset(address), 0, 4};
+      scheduler.Current().Handle().copyBuffer(buffer.Handle(), probe.buffer, 1, &copy);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = probe.buffer;
+      barrier.size = 4;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+      scheduler.Finish();
+      const auto value = ReadBuffer(name, probe, 1)[0];
+      DestroyBuffer(&probe);
+      return value;
+    };
+    write(base, 0x12345678u);
+    write(base + 0x1000, 0x87654321u);
+    // Consume hints before registration: the new native buffer must requeue its full span.
+    context.PrepareBda();
+    const auto id = cache.FindBuffer(base, 4);
+    context.PrepareBda();
+    Require(name, "new buffer and untouched neighbor",
+            read_native(cache.GetBuffer(id), base) == 0x12345678u &&
+                read_native(cache.GetBuffer(id), base + 0x1000) == 0x87654321u,
+            "BDA registration lost initial CPU-owned bytes");
+    context.PrepareBda();
+    context.PrepareBda();
+    const auto clean_tick = scheduler.CurrentTick();
+    context.PrepareBda();
+    Require(name, "clean preparation", scheduler.CurrentTick() == clean_tick,
+            "clean BDA preparation submitted work");
+    write(base, 0xaabbccddu);
+    context.PrepareBda();
+    Require(name, "CPU rewrite", read_native(cache.GetBuffer(id), base) == 0xaabbccddu,
+            "BDA preparation lost a CPU rewrite after a clean pass");
+    context.UnmapMemory(base, size);
+    write(base, 0x11223344u);
+    context.PrepareBda();
+    context.MapMemory(base, size);
+    context.PrepareBda();
+    Require(name, "remap after consumed hint",
+            read_native(cache.GetBuffer(id), base) == 0x11223344u,
+            "remapped CPU-owned bytes were not uploaded");
+    context.UnmapMemory(base, size);
+    context.ShutdownGpu();
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "guest unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, size) == 0, "direct release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
 
   void CheckGpuMappedRangeLifecycle() {
     EnsureRuntimeContext();
@@ -42991,6 +43073,7 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+/// Runs the selected standalone shader/GPU regression case or the complete harness.
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -43511,6 +43594,11 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-dirty-worklist-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaDirtyWorklist();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mapped-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuMappedRangeLifecycle();
@@ -43994,6 +44082,7 @@ int main(int argc, char **argv) {
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();
+  vulkan.CheckBdaDirtyWorklist();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();

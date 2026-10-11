@@ -29,7 +29,17 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Single GPU-thread consumer. Hints do not replace the locked page ownership checks.
+	/// Drains coarse hints into regions on the single GPU consumer; preserves dirty bits.
+	/// Call outside upload callbacks and use locked ownership checks before copying.
+	void TakeCpuDirtyRegions(std::vector<GuestRange>& regions);
+	// A new/expanded native buffer also needs its untouched CPU-owned pages examined.
+	/// Queues a valid nonempty range without modifying its page ownership.
+	/// Safe for concurrent producers, including buffer registration and remapping.
+	void QueueCpuDirtyRange(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
+	/// Makes tracked bytes CPU-writable, flushing GPU-owned data through on_flush.
+	/// The callback must perform the CPU ownership transition after publishing the data.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
@@ -45,6 +55,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				QueueCpuDirtyRegion(manager->GetCpuAddr() / TRACKER_REGION_SIZE);
 				return false;
 			}();
 			if (should_flush) {
@@ -62,6 +73,7 @@ public:
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
 
+	/// Visits GPU-dirty spans under region locks and optionally clears their ownership.
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
@@ -76,6 +88,8 @@ public:
 		});
 	}
 
+	/// Visits CPU-dirty spans and records uploads while preserving required write ordering.
+	/// Upload callbacks must not re-enter this tracker.
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
@@ -104,15 +118,19 @@ public:
 	}
 
 private:
-	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t REGION_COUNT      = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t DIRTY_WORD_COUNT  = (REGION_COUNT + 63) / 64;
+	static constexpr size_t DIRTY_GROUP_COUNT = (DIRTY_WORD_COUNT + 63) / 64;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
+	/// Rejects reentrant tracker use from its current thread upload callback.
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}
 
+	/// Visits intersecting tracker regions, optionally creating them and allowing early exit.
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {
 		ValidateRange(vaddr, size);
@@ -145,8 +163,13 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
+	/// Publishes one region index into the fixed atomic hierarchy without allocation.
+	void QueueCpuDirtyRegion(uint64_t index) noexcept;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_dirty_words;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_dirty_groups;
+	std::atomic<bool>                              m_cpu_dirty_pending {false};
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

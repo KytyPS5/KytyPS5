@@ -802,7 +802,98 @@ private:
 	bool m_grounded = false;
 };
 
+const Inst* Operation(Value value, ValueOpcode opcode) {
+	const auto* inst = value.Resolve().TryInstruction();
+	return inst != nullptr && inst->GetOpcode() == opcode ? inst : nullptr;
+}
+
+bool U32Is(Value value, uint32_t expected) {
+	value = value.Resolve();
+	return IsImmediate(value, Type::U32) && value.U32() == expected;
+}
+
+const Inst* CountedBallot(Value value, uint32_t component) {
+	const auto* count = Operation(value, ValueOpcode::BitCount32);
+	if (count == nullptr) return nullptr;
+	const auto* extract = Operation(Arg(*count, 0), ValueOpcode::CompositeExtractU32x4);
+	if (extract == nullptr || !U32Is(Arg(*extract, 1), component)) return nullptr;
+	return Operation(Arg(*extract, 0), ValueOpcode::Ballot);
+}
+
+bool InitialVertexCount(Value value, const Program& program) {
+	const Inst* ballot = nullptr;
+	if (program.wave_size == 64u) {
+		const auto* sum = Operation(value, ValueOpcode::IAdd32);
+		if (sum == nullptr) return false;
+		ballot = CountedBallot(Arg(*sum, 0), 0);
+		if (ballot == nullptr || CountedBallot(Arg(*sum, 1), 1) != ballot) return false;
+	} else if (program.wave_size == 32u) {
+		ballot = CountedBallot(value, 0);
+	}
+	return ballot != nullptr && ballot->Parent() == program.blocks.front() &&
+	       Arg(*ballot, 0) == Value(true);
+}
+
+int VertexLaunchField(Value value, const Program& program) {
+	const Inst* field = Operation(value, ValueOpcode::BitwiseAnd32);
+	int kind = 1;
+	if (field == nullptr || !U32Is(Arg(*field, 1), 0xffu)) {
+		field = Operation(value, ValueOpcode::BitFieldUExtract);
+		if (field == nullptr || !U32Is(Arg(*field, 1), 8u) ||
+		    !U32Is(Arg(*field, 2), 8u)) return 0;
+		kind = 2;
+	}
+	const auto* packed = Operation(Arg(*field, 0), ValueOpcode::BitwiseOr32);
+	return packed != nullptr && U32Is(Arg(*packed, 1), 1u << 28u) &&
+	               InitialVertexCount(Arg(*packed, 0), program)
+	           ? kind : 0;
+}
+
+int VertexLaunchPredicate(const Inst& inst, const Program& program) {
+	if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !U32Is(Arg(inst, 1), 0u)) return 0;
+	const auto* bit = Operation(Arg(inst, 0), ValueOpcode::BitwiseAnd32);
+	if (bit == nullptr || !U32Is(Arg(*bit, 1), 1u)) return 0;
+	const auto* read = Operation(Arg(*bit, 0), ValueOpcode::ShiftRightLogical32);
+	if (read == nullptr) return 0;
+	const auto* index = Operation(Arg(*read, 1), ValueOpcode::BitwiseAnd32);
+	if (index == nullptr || !U32Is(Arg(*index, 1), 31u) ||
+	    Operation(Arg(*index, 0), ValueOpcode::LaneId) == nullptr) return 0;
+	auto word = Arg(*read, 0);
+	const Inst* high = nullptr;
+	if (program.wave_size == 64u) {
+		const auto* select = Operation(word, ValueOpcode::SelectU32);
+		if (select == nullptr) return 0;
+		const auto* half = Operation(Arg(*select, 0), ValueOpcode::ULessThan32);
+		if (half == nullptr || Arg(*half, 0) != Arg(*index, 0) ||
+		    !U32Is(Arg(*half, 1), 32u)) return 0;
+		word = Arg(*select, 1);
+		high = Operation(Arg(*select, 2), ValueOpcode::CompositeExtractU64);
+		if (high == nullptr || !U32Is(Arg(*high, 1), 1u)) return 0;
+	}
+	const auto* low = Operation(word, ValueOpcode::CompositeExtractU64);
+	if (low == nullptr || !U32Is(Arg(*low, 1), 0u) ||
+	    (high != nullptr && Arg(*high, 0) != Arg(*low, 0))) return 0;
+	const auto* mask = Operation(Arg(*low, 0), ValueOpcode::ShiftRightLogical64);
+	if (mask == nullptr || Arg(*mask, 0) != Value(UINT64_MAX)) return 0;
+	const auto* shift = Operation(Arg(*mask, 1), ValueOpcode::ISub32);
+	if (shift == nullptr || !U32Is(Arg(*shift, 0), 64u)) return 0;
+	return VertexLaunchField(Arg(*shift, 1), program);
+}
+
 } // namespace
+
+// Vulkan invokes this stage only for valid input vertices; the synthetic NGG
+// launch state has no primitive-export invocations. Fold only the corresponding
+// lane-validity predicates, preserving the ballot count and all other consumers.
+void LowerVertexLaunchMaskPass(Program& program) {
+	if (program.stage != ShaderType::Vertex || program.blocks.empty()) return;
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			const auto field = VertexLaunchPredicate(inst, program);
+			if (field != 0) Replace(inst, Value(field == 1));
+		}
+	}
+}
 
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	std::unordered_set<Inst*> lowered_ancillary;

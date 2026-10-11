@@ -763,6 +763,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 	add_test(NAME buffer_cache_bda_store
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-bda-only)
+	add_test(NAME buffer_cache_ring_image_head
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-ring-image-head-only)
 
 	add_test(NAME texture_cache_image_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)

@@ -552,6 +552,8 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
+	} else if (size != 0) {
+		image.MarkMaybeCpuDirty();
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(begin, size);
@@ -570,6 +572,8 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
+	} else if (size != 0) {
+		image.MarkMaybeCpuDirty();
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);

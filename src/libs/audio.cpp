@@ -9,6 +9,7 @@
 #include "libs/controller.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
+#include "libs/hapticsRumble.h"
 #include "libs/libs.h"
 
 #include <SDL3/SDL.h>
@@ -129,6 +130,10 @@ private:
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
+
+		// Haptics -> rumble conversion for non-Sony pads (vibration port only).
+		Controller::HapticsRumble::Envelope rumble_env;
+		bool                                rumble_active = false;
 	};
 
 	struct PortIn {
@@ -481,6 +486,10 @@ bool Audio::AudioOutClose(Id handle) {
 		auto& port = m_out_ports[handle.GetId()];
 
 		CloseSdlDevice(&port);
+		if (port.rumble_active) {
+			// Lock order: Audio::m_mutex -> Controller mutex (same as the haptics Queue call).
+			Controller::SubmitHapticsRumble(0.0f, 0.0f);
+		}
 		port = {};
 
 		return true;
@@ -557,6 +566,28 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		    : port.type == AUDIO_OUT_PORT_TYPE_VIBRATION
 		        ? Controller::GetSettingScale(Controller::Setting::VibrationIntensity)
 		        : 1.0f;
+
+		if (port.type == Controller::HapticsRumble::HAPTICS_RUMBLE_PORT_TYPE &&
+		    Config::ControllerHapticsRumbleEnabled()) {
+			// Runs outside Audio::m_mutex; Controller::SubmitHapticsRumble only takes the
+			// controller mutex and never calls back into Audio.
+			if (Controller::IsActivePadNonSony() && FormatIsFloat(port.format)) {
+				const auto levels = port.rumble_env.Process(
+				    static_cast<const float*>(params[i].data), port.samples_num,
+				    static_cast<uint32_t>(port.channels_num), port.freq);
+				const bool nonzero = levels.low > 0.0f || levels.high > 0.0f;
+				if (nonzero || port.rumble_active) {
+					// Zeros are sent once to stop; after that silence costs nothing.
+					Controller::SubmitHapticsRumble(levels.low, levels.high);
+				}
+				port.rumble_active = nonzero;
+			} else if (port.rumble_active) {
+				// The pad changed or became a Sony pad: stop what we started.
+				port.rumble_env.Reset();
+				Controller::SubmitHapticsRumble(0.0f, 0.0f);
+				port.rumble_active = false;
+			}
+		}
 
 		uint64_t controller_queued_us = 0;
 		bool controller_uses_bluetooth = false;

@@ -1,12 +1,17 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include "common/abi.h"
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+
+#include <xbyak/xbyak.h>
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -358,6 +363,131 @@ private:
 
 
 } // namespace
+
+void CompileSrtWalker(ResourcePlan& program) {
+	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
+	    program.capture_specialization_reads || !program.control_flow.empty() ||
+	    program.srt_reads.empty()) return;
+
+	using Reads = std::map<int32_t, const SrtRead*>;
+	std::map<uint32_t, Reads> roots;
+	std::unordered_map<const Inst*, Reads> pointer_uses;
+	std::unordered_map<const Inst*, int32_t> offsets;
+	for (const auto& read: program.srt_reads) {
+		const auto* inst = read.value.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+		    inst->NumArgs() < 2 || !IsRawRead(program, *inst) ||
+		    read.flat_offset >= program.srt_reads.size()) return;
+		const auto offset = inst->Arg(1).Resolve();
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
+		const auto& memory = program.memory_info[inst->Flags<SrtReadFlags>().index];
+		const auto relative =
+		    (static_cast<int64_t>(static_cast<int32_t>(memory.offset)) & ~int64_t {3}) +
+		    static_cast<int64_t>(offset.U32() & ~3u);
+		if (relative < INT32_MIN || relative > INT32_MAX ||
+		    !offsets.emplace(inst, static_cast<int32_t>(relative)).second) return;
+	}
+	uint32_t user_data_count = 0;
+	for (const auto& read: program.srt_reads) {
+		const auto* inst = read.value.ResolveInstruction();
+		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2) return;
+		const auto* low = handle->Arg(0).Resolve().TryInstruction();
+		const auto* high = handle->Arg(1).Resolve().TryInstruction();
+		if (low == nullptr || high == nullptr) return;
+		Reads* uses = nullptr;
+		if (low->GetOpcode() == ValueOpcode::GetUserData &&
+		    high->GetOpcode() == ValueOpcode::GetUserData && low->NumArgs() == 1 &&
+		    high->NumArgs() == 1 && low->Arg(0).GetType() == Type::ScalarReg &&
+		    high->Arg(0).GetType() == Type::ScalarReg) {
+			const auto reg = RegIndex(low->Arg(0).ScalarRegister());
+			if (reg < program.user_data_base ||
+			    RegIndex(high->Arg(0).ScalarRegister()) != reg + 1u) return;
+			const auto base = reg - program.user_data_base;
+			user_data_count = std::max(user_data_count, base + 2u);
+			uses = &roots[base];
+		} else {
+			const auto lo = offsets.find(low);
+			const auto hi = offsets.find(high);
+			if (lo == offsets.end() || hi == offsets.end() ||
+			    static_cast<int64_t>(lo->second) + 4 != hi->second ||
+			    !EquivalentValue(program, low->Arg(0), high->Arg(0))) return;
+			uses = &pointer_uses[low];
+		}
+		if (!uses->emplace(offsets.at(inst), &read).second) return;
+	}
+	std::unordered_set<const Inst*> visited;
+	const auto reachable = [&](auto&& self, const Reads& reads) -> bool {
+		for (const auto& [offset, read]: reads) {
+			const auto* inst = read->value.ResolveInstruction();
+			const auto child = pointer_uses.find(inst);
+			if (child != pointer_uses.end() &&
+			    (!visited.insert(inst).second || !self(self, child->second))) return false;
+		}
+		return true;
+	};
+	for (const auto& [reg, reads]: roots) {
+		if (!reachable(reachable, reads)) return;
+	}
+	if (visited.size() != pointer_uses.size()) return;
+
+	program.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+	auto& code = *program.srt_code;
+	Xbyak::Label failed, finished;
+	code.push(code.rbp);
+	code.mov(code.rbp, code.rsp);
+	code.cmp(code.r8, user_data_count);
+	code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+	code.mov(code.r9, AddressMask & ~uint64_t {3});
+	// Follow shadPS4's VisitPointer: copy one table level in offset order, then
+	// descend through its child pointers. Seed the descriptor evaluator's memo.
+	const auto visit = [&](auto&& self, int32_t pointer_offset, const Reads& reads) -> void {
+		code.push(code.rdi);
+		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
+		code.and_(code.rdi, code.r9);
+		const auto first = reads.begin()->first;
+		const auto last = reads.rbegin()->first;
+		if (first < 0) {
+			code.mov(code.r10, -static_cast<int64_t>(first));
+			code.cmp(code.rdi, code.r10);
+			code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+		}
+		if (last > 0) {
+			code.mov(code.r10, AddressMask - last);
+			code.cmp(code.rdi, code.r10);
+			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
+			using Entry = ResourcePlan::EvaluationContext::Entry;
+			const auto slot = code.rdx + index * sizeof(Entry);
+			code.mov(code.r10d, code.dword[code.rdi + offset]);
+			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], code.r10d);
+			code.mov(code.qword[slot + offsetof(Entry, value)], code.r10);
+			code.mov(code.qword[slot + offsetof(Entry, generation)], code.rcx);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto child = pointer_uses.find(read->value.ResolveInstruction());
+			if (child == pointer_uses.end()) continue;
+			self(self, offset, child->second);
+		}
+		code.pop(code.rdi);
+	};
+	for (const auto& [reg, reads]: roots) {
+		visit(visit, reg * sizeof(uint32_t), reads);
+	}
+	code.mov(code.eax, 1);
+	code.jmp(finished, Xbyak::CodeGenerator::T_NEAR);
+	code.L(failed);
+	code.xor_(code.eax, code.eax);
+	code.L(finished);
+	code.mov(code.rsp, code.rbp);
+	code.pop(code.rbp);
+	code.ret();
+	code.readyRE();
+	EXIT_IF(Xbyak::GetError() != 0);
+}
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator, Value active_mask)
@@ -954,6 +1084,15 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
+	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
+		flat.resize(m_program.srt_reads.size());
+		m_program.active_sources.clear();
+		m_context.values.resize(m_program.evaluation_value_count);
+		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
+		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
+		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
+		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];

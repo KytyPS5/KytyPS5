@@ -168,6 +168,117 @@ void TestMappedSrtUsesDirectReaderByDefault() {
         "cache rematerialization did not use the direct reader by default");
 }
 
+void TestNativeNestedSrtRefresh() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  std::array<uint32_t, 3> first{0u, 0x12345678u, 0xabcdef01u};
+  std::array<uint32_t, 3> second{0u, 0x87654321u, 0x10fedcbau};
+  const auto pointer_words = [](const void *pointer) {
+    const auto address = reinterpret_cast<uint64_t>(pointer);
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address) | 3u,
+                                  static_cast<uint32_t>(address >> 32u) | 0xabcd0000u};
+  };
+  auto table = pointer_words(first.data());
+  const auto user_data = pointer_words(table.data());
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 2;
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto low = emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))});
+  const auto high = emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))});
+  const auto root = emit(ValueOpcode::GetAddressResource, {low, high});
+  const auto read = [&](Value address, uint32_t offset) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {address, Value(offset), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+    return value;
+  };
+  const auto pointer_low = read(root, 0u);
+  const auto pointer_high = read(root, 4u);
+  auto *leaf = program.srt_reads[0].value.Instruction();
+  leaf->Arg(0).Instruction()->SetArg(0, pointer_low);
+  leaf->Arg(0).Instruction()->SetArg(1, pointer_high);
+  leaf->SetArg(1, Value(7u));
+  read(leaf->Arg(0), 11u);
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_code != nullptr, "nested user-data tree did not compile an x86 walker");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{.user_data = user_data};
+  {
+    SrtWalker walker(plan, runtime);
+    Check(walker.RefreshFlatBuffer(snapshot.flattened_srt),
+          "native SRT refresh failed");
+    const auto loaded = first[1];
+    first[1] ^= 0xffffffffu;
+    uint32_t value = 0;
+    Check(walker.Evaluate(plan.srt_reads[0].value, value) && value == loaded,
+          "descriptor evaluation reloaded a value already copied by the native walker");
+    first[1] = loaded;
+  }
+  for (const auto *data : {&first, &second}) {
+    table = pointer_words(data->data());
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt ==
+                  std::vector<uint32_t>{(*data)[1], table[0], table[1], (*data)[2]},
+          "native SRT refresh lost pointer masking, alignment, or current values");
+  }
+  Check(!MaterializeResources(plan, {.user_data = std::span(user_data).first(1)},
+                              snapshot, specialization),
+        "native SRT walk accepted truncated user data");
+  const std::array<uint32_t, 2> fake_user_data{0x1003u, 0xabcd0000u};
+  uint32_t reads = 0;
+  const SrtRuntime callback_runtime{
+      .user_data = fake_user_data,
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++*static_cast<uint32_t *>(data);
+        switch (address) {
+          case 0x1000u: words[0] = 0x2003u; break;
+          case 0x1004u: words[0] = 0xabcd0000u; break;
+          case 0x2004u: words[0] = 0x1234u; break;
+          case 0x2008u: words[0] = 0x5678u; break;
+          default: return false;
+        }
+        return true;
+      },
+      .userdata = &reads};
+  Check(MaterializeResources(plan, callback_runtime, snapshot, specialization) && reads == 4 &&
+            snapshot.flattened_srt ==
+                std::vector<uint32_t>{0x1234u, 0x2003u, 0xabcd0000u, 0x5678u},
+        "native-eligible SRT bypassed its callback or repeated nested pointer reads");
+  leaf->SetArg(0, root);
+  leaf->SetArg(1, Value(0u));
+  program.srt_reads.resize(1);
+  for (const int32_t offset : {-1, 7}) {
+    program.memory_info[0].offset = static_cast<uint32_t>(offset);
+    auto bounded = ExtractResourcePlan(program);
+    auto base = pointer_words(second.data() + 1);
+    Check(bounded.srt_code != nullptr &&
+              MaterializeResources(bounded, {.user_data = base}, snapshot, specialization) &&
+              snapshot.flattened_srt[0] == second[offset < 0 ? 0 : 2],
+          "native SRT applied a signed immediate offset incorrectly");
+    base = offset < 0 ? std::array<uint32_t, 2>{0u, 0u}
+                      : std::array<uint32_t, 2>{0xfffffffcu, 0xffffu};
+    Check(!MaterializeResources(bounded, {.user_data = base}, snapshot, specialization),
+          "native SRT accepted address underflow or 48-bit overflow");
+  }
+  high.Instruction()->SetArg(0, Value(ScalarReg(6)));
+  Check(ExtractResourcePlan(program).srt_code == nullptr,
+        "native SRT accepted nonadjacent user-data pointer words");
+  high.Instruction()->SetArg(0, Value(ScalarReg(5)));
+  program.memory_info[0].offset = 0;
+  program.srt_reads.push_back({pointer_low, 1});
+  program.srt_reads.push_back({pointer_high, 2});
+  leaf->SetArg(0, emit(ValueOpcode::GetAddressResource, {pointer_low, pointer_high}));
+  pointer_high.Instruction()->SetArg(1, Value(8u));
+  Check(ExtractResourcePlan(program).srt_code == nullptr,
+        "native SRT accepted nonadjacent nested pointer words");
+}
+
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtProgram(0x10000);
@@ -256,6 +367,8 @@ void TestSrtAliasesRetainReadPolicy() {
             plan.srt_reads[1].value.Instruction()->Flags<SrtReadFlags>().clean == 0u &&
             plan.srt_reads[2].value.Instruction()->Flags<SrtReadFlags>().clean == 1u,
         "alias normalization lost read identity or retained discarded EXEC provenance");
+  Check(plan.srt_code == nullptr,
+        "captured strict reads compiled an unused x86 walker");
   struct Reads { uint32_t strict = 0; uint32_t ordinary = 0; bool dirty = false; } reads;
   const SrtRuntime runtime{
       .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
@@ -671,6 +784,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
+  TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();

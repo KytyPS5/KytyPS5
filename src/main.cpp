@@ -300,6 +300,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--guest-exec") {
+			options.elf = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+			options.config.guest_arguments.assign(argv + i + 1, argv + argc);
+			break;
 		} else if (arg == "--game-patch") {
 			if (!options.game_patch.empty()) {
 				::printf("--game-patch can only be specified once\n");

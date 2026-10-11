@@ -16,6 +16,7 @@ struct RunOptions {
 };
 
 void Run(const RunOptions& options);
+int LoadExec(const char* path, const char* const argv[]);
 
 } // namespace Emulator
 

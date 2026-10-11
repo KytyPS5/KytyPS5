@@ -360,10 +360,12 @@ void PlayGo::Open(const std::filesystem::path& file_name) {
 	}
 
 	uint32_t magic1 = 0;
+	constexpr uint32_t PLGO_MAGIC = 0x6f676c70;
+	constexpr uint32_t PLGX_MAGIC = 0x78676c70;
 
 	m_f.Read(&magic1, 4);
 
-	if (magic1 != 0x6f676c70) {
+	if (magic1 != PLGO_MAGIC && magic1 != PLGX_MAGIC) {
 		LOGF("invalid file: magic1 = %08" PRIx32 "\n", magic1);
 		return;
 	}

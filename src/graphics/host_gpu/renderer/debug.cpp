@@ -394,24 +394,18 @@ static void RcPrint(const char* func, const HW::RenderControl& c) {
 
 	LOGF("\t depth_clear_enable       = %s\n"
 	     "\t stencil_clear_enable     = %s\n"
+	     "\t copy_depth_to_color      = %s\n"
+	     "\t copy_stencil_to_color    = %s\n"
 	     "\t resummarize_enable       = %s\n"
 	     "\t stencil_compress_disable = %s\n"
 	     "\t depth_compress_disable   = %s\n"
 	     "\t copy_centroid            = %s\n"
 	     "\t copy_sample              = %" PRIu8 "\n",
 	     c.depth_clear_enable ? "true" : "false", c.stencil_clear_enable ? "true" : "false",
+	     c.copy_depth_to_color ? "true" : "false", c.copy_stencil_to_color ? "true" : "false",
 	     c.resummarize_enable ? "true" : "false", c.stencil_compress_disable ? "true" : "false",
 	     c.depth_compress_disable ? "true" : "false", c.copy_centroid ? "true" : "false",
 	     c.copy_sample);
-}
-
-static void RcCheck(const HW::RenderControl& c) {
-	// EXIT_NOT_IMPLEMENTED(c.depth_clear_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.stencil_clear_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.stencil_compress_disable != false);
-	// EXIT_NOT_IMPLEMENTED(c.depth_compress_disable != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_centroid != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_sample != 0);
 }
 
 static void McPrint(const char* func, const HW::ModeControl& c) {
@@ -869,9 +863,6 @@ void hw_check(const CommandBuffer& buffer) {
 	VpCheck(vp, smc);
 	log_phase("clip");
 	ClipCheck(c);
-	log_phase("rc");
-	RcCheck(rc);
-	log_phase("depth");
 	log_phase("mode");
 	McCheck(mc);
 	log_phase("blend");

@@ -17925,9 +17925,9 @@ public:
                   captured.mip_layout[0].pitch == 512 &&
                   captured.mip_layout[0].height == 512,
               "R64 BC1 texture lost its compressed blocks or array stride");
-      const auto small_image =
+      const auto small_array =
           MakeTilingImage(format, 67, 51, 1, layers, tile, 0, false);
-      check_round_trip("R64 BC1 array", small_image.data.size, small_image);
+      check_round_trip("R64 BC1 array", small_array.data.size, small_array);
     }
 
     {
@@ -42002,7 +42002,7 @@ void CheckAgcSystemTable(RenderContext &renderer) {
   Require(name, "early driver reservation", Gen5Driver::Initialize() == 0,
           "driver memory was not reserved before guest allocation");
   Require(name, "guest budget excludes driver",
-          LibKernel::Memory::KernelGetDirectMemorySize() == direct_size - 0x200000,
+          LibKernel::Memory::KernelGetDirectMemorySize() == direct_size - (direct_size % 0x200000) - 0x200000,
           "guest memory size still includes the reserved driver block");
   std::vector<std::pair<int64_t, size_t>> guest_allocations;
   for (size_t i = 0; i < 64; ++i) {
@@ -43546,6 +43546,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--agc-unaligned-pool-only") == 0) {
+    LibKernel::Memory::SetFlexibleMemorySize((1ull << 30) + 0x4000);
+    VulkanHarness vulkan;
+    CheckAgcSystemTable(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--agc-system-table-only") == 0) {

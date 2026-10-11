@@ -54,11 +54,7 @@ struct CContext {
 	std::list<atexit_func_t> atexit;
 };
 
-struct InitEnvParams {
-	int         argc;
-	uint32_t    pad;
-	const char* argv[3];
-};
+using InitEnvParams = Loader::EntryParams;
 
 static int                g_argc = 0;
 static const char* const* g_argv = nullptr;
@@ -271,9 +267,7 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 		return;
 	}
 
-	constexpr int argv_capacity = static_cast<int>(sizeof(params->argv) / sizeof(params->argv[0]));
-
-	EXIT_NOT_IMPLEMENTED(params->argc < 0 || params->argc >= argv_capacity);
+	EXIT_NOT_IMPLEMENTED(params->argc < 0);
 
 	g_argc = params->argc;
 	g_argv = params->argv;

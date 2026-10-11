@@ -83,6 +83,7 @@ struct ConfigOptions {
 	bool red_zone_protection_enabled = false;
 #endif
 	Keymap keymap;
+	std::vector<std::string> guest_arguments;
 };
 
 void Load(const ConfigOptions& cfg);
@@ -136,6 +137,7 @@ bool RedZoneProtectionEnabled();
 #endif
 
 const Keymap& GetKeymap();
+const std::vector<std::string>& GetGuestArguments();
 
 } // namespace Config
 

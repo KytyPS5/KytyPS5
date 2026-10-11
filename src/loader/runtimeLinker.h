@@ -14,6 +14,12 @@
 
 namespace Loader {
 
+struct EntryParams {
+	int         argc;
+	uint32_t    pad;
+	const char* argv[1];
+};
+
 class Elf64;
 struct Elf64_Sym;
 struct Elf64_Rela;

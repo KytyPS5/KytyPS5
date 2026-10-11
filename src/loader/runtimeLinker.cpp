@@ -1217,6 +1217,26 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	return program;
 }
 
+std::vector<Program*> RuntimeLinker::LoadImportedBundledModules(
+    const std::filesystem::path& folder) {
+	std::vector<Program*> modules;
+
+	const auto main = std::find_if(m_programs.begin(), m_programs.end(),
+	                               [](const Program* p) { return !p->elf->IsShared(); });
+	if (main == m_programs.end()) {
+		return modules;
+	}
+	// A bundled PRX is named after the module it exports, e.g. libSceNpCppWebApi.prx.
+	for (const auto& imported: (*main)->dynamic_info->import_modules) {
+		const auto path = folder / (imported.name + ".prx");
+		if (Common::File::IsFileExisting(path) && FindProgramByFileName(path) == nullptr) {
+			modules.push_back(LoadProgram(path));
+		}
+	}
+
+	return modules;
+}
+
 void RuntimeLinker::SaveMainProgram(const std::filesystem::path& elf_name) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
@@ -1265,9 +1285,11 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 #endif
 
-	// The runtime automatically loads libc; other PRXs are requested by the application.
+	// The runtime automatically loads libc and the bundled PRXs the executable imports modules
+	// from; other PRXs are requested by the application.
 	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
 	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
+	const auto bundled_modules = LoadImportedBundledModules(libc_path.parent_path());
 	RelocateAll();
 
 	if (!game_patch.empty()) {
@@ -1278,6 +1300,11 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
+	}
+	for (auto* module: bundled_modules) {
+		if (module->dynamic_info->init_vaddr != 0) {
+			StartModule(module, 0, nullptr, nullptr);
+		}
 	}
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");

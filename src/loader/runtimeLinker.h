@@ -178,6 +178,8 @@ public:
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 
 private:
+	std::vector<Program*> LoadImportedBundledModules(const std::filesystem::path& folder);
+
 	static void LoadProgramToMemory(Program* program);
 	static void ParseProgramDynamicInfo(Program* program);
 	static void CreateSymbolDatabase(Program* program);

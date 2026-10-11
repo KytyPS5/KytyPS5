@@ -291,6 +291,7 @@ public:
 		// Whether set 0 is pushed rather than allocated. Set 1 never is: Vulkan allows one
 		// push-descriptor set layout per pipeline layout.
 		bool uses_push_descriptors = false;
+		uint64_t layout_signature      = 0;
 	};
 
 	struct GraphicsPrograms {

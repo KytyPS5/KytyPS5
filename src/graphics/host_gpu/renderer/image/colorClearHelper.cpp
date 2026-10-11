@@ -7,6 +7,7 @@
 #include "gpu_blit_shaders/gpu_color_clear_spv.h"
 #include "gpu_blit_shaders/gpu_color_clear_uint_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bindingEpoch.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -278,6 +279,7 @@ void ColorClearHelper::Draw(vk::CommandBuffer command, vk::ImageView view, vk::F
 	write.descriptorCount = 1;
 	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
 	write.pBufferInfo     = &info;
+	DisturbGraphicsBindings();
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, GetDrawPipeline({samples, format}));
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_draw_pipeline_layout, 0, 1,
 	                             &write);

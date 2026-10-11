@@ -350,6 +350,8 @@ bool HashShaderGuestBlock(void*, uint64_t address, uint64_t size, uint64_t* hash
 	return true;
 }
 
+thread_local bool t_stage_reads_shared = false;
+
 Libs::Graphics::ShaderGuestReadCache& ShaderReadCache() {
 	static thread_local Libs::Graphics::ShaderGuestReadCache cache;
 	return cache;
@@ -969,7 +971,9 @@ struct PipelineCache::ProgramCache {
 		// with the proof in hand.
 		std::vector<uint32_t> reported_unfoldable;
 		auto&                 read_cache = ShaderReadCache();
-		read_cache.Reset();
+		if (!t_stage_reads_shared) {
+			read_cache.Reset();
+		}
 		static const bool no_read_cache = EnvSwitch("KYTY_NO_SHADER_READ_CACHE");
 		static const bool no_heap_hash  = EnvSwitch("KYTY_NO_HEAP_HASH_IN_PLACE");
 		static const bool                no_gpu_owned  = EnvSwitch("KYTY_NO_GPU_OWNED_NATIVE");
@@ -1661,6 +1665,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	for (auto& stage: vertex_info) {
 		stage.param_duplicate_mask = 0;
 	}
+	static const bool share_reads = !EnvSwitch("KYTY_NO_SHARED_STAGE_READS");
+	ShaderReadCache().Reset();
+	t_stage_reads_shared = share_reads;
+	struct ShareEnd {
+		~ShareEnd() { t_stage_reads_shared = false; }
+	} share_end;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);

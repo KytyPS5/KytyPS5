@@ -233,7 +233,7 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
-	                    uint64_t indirect_args_addr = 0);
+	                    bool async_compute, uint64_t indirect_args_addr = 0);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
@@ -272,6 +272,8 @@ private:
 	                              uint8_t stencil_export_bits = 0);
 	[[nodiscard]] bool        DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] static bool IsDepthStencilCopy(const CommandBuffer& buffer);
+	[[nodiscard]] bool        CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                           const DrawEmitInfo& emit, DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          uint32_t         render_target_slice_offset,
 	                                          DrawRenderState& state);
@@ -313,9 +315,28 @@ private:
 	PreparedBindings                      m_compute_bindings;
 	DispatchAccess                        m_dispatch_access;
 	std::vector<ImageId>                  m_bound_images;
+	struct LastGraphicsBindings {
+		VkCommandBuffer       command          = nullptr;
+		uint64_t              tick             = 0;
+		uint64_t              epoch            = 0;
+		VkPipelineLayout      layout           = nullptr;
+		uint64_t              layout_signature = 0;
+		VkPipeline            pipeline         = nullptr;
+		bool                  pixel_set_bound  = false;
+		std::vector<uint64_t> pixel_content;
+	};
+	LastGraphicsBindings  m_last_graphics;
+	std::vector<uint64_t> m_pixel_content_scratch;
+	[[nodiscard]] bool    LastGraphicsBindingsValid(vk::CommandBuffer command);
+	// Scratch for CommitBindings: the ranges this op writes, checked against captured reads.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
+	// The command buffer and graphics-binding epoch the scheduler's DynamicState was last
+	// committed under. Helpers that bind their own pipelines bump the epoch.
+	VkCommandBuffer                       m_dynamic_state_command = nullptr;
+	uint64_t                              m_dynamic_state_epoch   = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<uint32_t>                 m_image_occurrences;
 	std::unique_ptr<BindlessImageHeap>    m_bindless;
 	std::unique_ptr<ThreadDispatcher>     m_thread_dispatch;
 

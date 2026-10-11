@@ -7,8 +7,11 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <unordered_map>
@@ -673,12 +676,15 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			return false;
+			// A scalar buffer read past the end returns zero (PS5 ISA, scalar buffer addressing),
+			// as the shader's own load does (EmitReadConstBuffer). Failing skipped the draw.
+			result = 0;
+			return true;
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		const auto relative =
+		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
 			return false;
 		}
@@ -687,6 +693,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
+			// A plan without control flow cannot tell a guarded read from an active one: a failed
+			// read through a null base there reads zero. With control flow, the reachability walk
+			// skips guarded reads and a null read in a reachable block fails.
+			if (base == 0 && m_program.control_flow.empty()) {
+				result = 0;
+				return true;
+			}
 			return false;
 		}
 	} else {

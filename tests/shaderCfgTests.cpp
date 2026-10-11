@@ -194,6 +194,34 @@ CfgInstructionCoverage(const ShaderRecompiler::CFG::Graph &graph,
   return coverage;
 }
 
+// SplitOneSelectionMerge gives each selection its own copy of a shared early
+// return, so instructions of a return block may be covered more than once.
+// Everything else must keep its coverage, and nothing may be dropped.
+bool CoverageMatchesAllowingReturnCopies(
+    const ShaderRecompiler::CFG::Graph &graph, size_t instruction_count,
+    const std::vector<uint32_t> &original) {
+  const auto coverage = CfgInstructionCoverage(graph, instruction_count);
+  if (coverage.size() != original.size()) {
+    return false;
+  }
+  for (size_t index = 0; index < coverage.size(); index++) {
+    if (coverage[index] == original[index]) {
+      continue;
+    }
+    const bool in_return = std::ranges::any_of(
+        graph.blocks, [&](const ShaderRecompiler::CFG::BasicBlock &block) {
+          return block.inst_begin <= index && index < block.inst_end &&
+                 block.terminator.kind ==
+                     ShaderRecompiler::CFG::TerminatorKind::Return &&
+                 block.successors.empty();
+        });
+    if (coverage[index] < original[index] || !in_return) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string messages;
@@ -1693,6 +1721,41 @@ void TestNewShaderRecompilerSMovB32() {
   Check(SpirvContainsExecutionMode(result.spirv, 4461),
         "SPIR-V binary does not enable signed-zero/Inf/NaN preservation");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+// S_MEMREALTIME reads the device clock shifted toward the guest's 100 MHz: by 3 for a 1 GHz
+// clock (NVIDIA), not at all for a 100 MHz one (AMD), where shifting made the game's GPU frame
+// pacer wait 8x its interval (DEBUGGING.md, 2026-10-01).
+void TestMemRealtimeClockShift() {
+  const uint32_t shader[] = {
+      0xf4940500u, 0xfa000000u, // s_memrealtime s[20:21]
+      0xbf8cc07fu,              // s_waitcnt lgkmcnt(0)
+      EncodeVop1(0x01, 0, 20),  // v_mov_b32 v0, s20
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(0, 12, 0),
+      EncodeVop1(0x01, 1, 21),  // v_mov_b32 v1, s21
+      EncodeMubuf0(0x1c, 4, false),
+      EncodeMubuf1(1, 12, 0),
+      0xbf810000u,
+  };
+  const auto shifts = [&](uint32_t shift) {
+    ShaderRecompiler::Spirv::SetDeviceClockShift(shift);
+    const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpReadClockKHR") != std::string::npos,
+          "S_MEMREALTIME did not read the device clock");
+    size_t found = 0;
+    for (auto at = source.find("OpShiftRightLogical"); at != std::string::npos;
+         at = source.find("OpShiftRightLogical", at + 1)) {
+      found++;
+    }
+    return found;
+  };
+  const size_t shifted   = shifts(3);
+  const size_t unshifted = shifts(0);
+  ShaderRecompiler::Spirv::SetDeviceClockShift(3);
+  Check(shifted == unshifted + 2, "a clock shift of 0 still shifts the clock");
 }
 
 void TestShaderStageBarriers() {
@@ -8165,6 +8228,69 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// Captured CS 0x637ad82dbee9dfa9: a binary search whose loop has several exits. One conditional
+// leaves through an exit block that is not the loop's merge, which produced invalid SPIR-V
+// ("Selection must be structured").
+void TestCapturedLoopExitThroughNonMergeBlock() {
+  const uint32_t shader[] = {
+      0xbfa00003u, 0xf4201a84u, 0xfa000004u, 0xbf8cc07fu, 0xbf096a10u, 0xbf85011fu,
+      0xf4200284u, 0xfa000000u, 0xbf8cc07fu, 0xbf0a0a02u, 0xbf840001u, 0xbf920001u,
+      0xbeeb0380u, 0xbf086b0au, 0xbf850003u, 0xbf920001u, 0xbe8b0380u, 0xbf820015u,
+      0x816a6b0au, 0x900b816au, 0x936a8c0bu, 0xf4240200u, 0xd4000000u, 0xbf8cc07fu,
+      0x816a0908u, 0xbf0a0810u, 0xbf800000u, 0x8509807eu, 0xbf096a10u, 0xbf800000u,
+      0x856a807eu, 0x886a096au, 0xbf860006u, 0x816a810bu, 0xbf0a0810u, 0xbf800000u,
+      0x856b6a6bu, 0x850a0a0bu, 0xbf82ffe6u, 0x936a8c0bu, 0xf4280206u, 0xfa000620u,
+      0xf4200440u, 0xd4000008u, 0xf4201a80u, 0xd4000000u, 0xbf8cc07fu, 0x8f6b8611u,
+      0x81906a10u, 0xf4200484u, 0xd6000014u, 0xbf8cc07fu, 0x97ea1210u, 0xf4280006u,
+      0xfa0005a0u, 0xbf8cc07fu, 0xf4200500u, 0xd4000000u, 0xbf8cc07fu, 0x93eaff14u,
+      0x00070011u, 0x816a816au, 0x7d8600f9u, 0x0686eb6au, 0xbeea076bu, 0xbefe036au,
+      0xbf8800e2u, 0x7e020280u, 0xbe93446bu, 0xbf880017u, 0x34000081u, 0x8f6a8414u,
+      0x8f6b8611u, 0x8715ff6au, 0x001ffff0u, 0x906a9814u, 0xf4201ac4u, 0xd6000018u,
+      0x976a156au, 0xbf8cc07fu, 0x9314986bu, 0x816b826au, 0x816a1412u, 0xd76d0001u,
+      0x0400d66au, 0x360002c4u, 0x34020283u, 0xe0301000u, 0x80000000u, 0x36020298u,
+      0xbf8c3f70u, 0xd5480001u, 0x02420300u, 0x8f6b8611u, 0xbefe0313u, 0xf4201a84u,
+      0xd6000000u, 0xbf8cc07fu, 0xd7470000u, 0x0206026au, 0xf4280006u, 0xfa0002e0u,
+      0xf4201a84u, 0xd600001cu, 0xbf8cc07fu, 0xbf0d846au, 0xe00c2000u, 0x80000000u,
+      0xbf8c3f70u, 0xd5480003u, 0x02110b03u, 0x34000103u, 0x34080303u, 0x34060503u,
+      0xbf840010u, 0x8f008611u, 0xf4241a84u, 0x00000020u, 0xbf8cc07fu, 0x8f6a906au,
+      0x8f6b906bu, 0x916a886au, 0x916b886bu, 0x4a00006au, 0xf4201a84u, 0x00000028u,
+      0xbf8cc07fu, 0x8f6a906au, 0x4a08086bu, 0x916a886au, 0x4a06066au, 0x7e020b00u,
+      0x8f6a8611u, 0x7e040b04u, 0xf4240004u, 0xd4000038u, 0x7e000b03u, 0xbf8cc07fu,
+      0x10080201u, 0x81081000u, 0x100a0401u, 0x10060001u, 0xbeea407eu, 0x021008ffu,
+      0x7f800000u, 0x1e1010fau, 0xff011108u, 0x1e1010fau, 0xff011208u, 0x1e1010fau,
+      0xff011408u, 0x1e1010fau, 0xff011808u, 0xbefe036au, 0xd7600002u, 0x00011f08u,
+      0xd7600003u, 0x00013f08u, 0x1e0c06f9u, 0x86860602u, 0xbeea406au, 0x021208ffu,
+      0xff800000u, 0x02180affu, 0xff800000u, 0x201212fau, 0xff011109u, 0x201818fau,
+      0xff01110cu, 0x201212fau, 0xff011209u, 0x201818fau, 0xff01120cu, 0x201212fau,
+      0xff011409u, 0x201818fau, 0xff01140cu, 0x201212fau, 0xff011809u, 0x201818fau,
+      0xff01180cu, 0xbefe036au, 0xd760000au, 0x00011f09u, 0xd760000bu, 0x00013f09u,
+      0xd760000cu, 0x00011f0cu, 0xd760000du, 0x00013f0cu, 0x201416f9u, 0x8686060au,
+      0x20161af9u, 0x8686060cu, 0x060c14f9u, 0x0606c606u, 0xbeea406au, 0x021e06ffu,
+      0xff800000u, 0x201e1efau, 0xff01110fu, 0x201e1efau, 0xff01120fu, 0x201e1efau,
+      0xff01140fu, 0x201e1efau, 0xff01180fu, 0xbefe036au, 0xd760000eu, 0x00011f0fu,
+      0xd760000fu, 0x00013f0fu, 0x201c1ef9u, 0x8686060eu, 0xbeea406au, 0x02220affu,
+      0x7f800000u, 0x022606ffu, 0x7f800000u, 0x1e2222fau, 0xff011111u, 0x1e2626fau,
+      0xff011113u, 0x1e2222fau, 0xff011211u, 0x1e2626fau, 0xff011213u, 0x1e2222fau,
+      0xff011411u, 0x1e2626fau, 0xff011413u, 0x1e2222fau, 0xff011811u, 0x1e2626fau,
+      0xff011813u, 0xbefe036au, 0x7e040506u, 0xd7600010u, 0x00011f11u, 0xd7600011u,
+      0x00013f11u, 0xd7600012u, 0x00011f13u, 0xd7600013u, 0x00013f13u, 0xd5410001u,
+      0x800a0201u, 0x1e0a22f9u, 0x86860610u, 0x1e0626f9u, 0x86860612u, 0x10020301u,
+      0x060816f9u, 0x0606c605u, 0x06061cf9u, 0x0606c603u, 0x7e060504u, 0x7ed60503u,
+      0xd5410002u, 0x800e0401u, 0xd5410000u, 0x81ae0001u, 0x3e020502u, 0x3e020100u,
+      0xbeea406au, 0xbf048008u, 0x020402ffu, 0xff800000u, 0x200404fau, 0xff011102u,
+      0x200404fau, 0xff011202u, 0x200404fau, 0xff011402u, 0x200404fau, 0xff011802u,
+      0xbefe036au, 0xd7600000u, 0x00011f02u, 0xd7600001u, 0x00013f02u, 0x200002f9u,
+      0x86860600u, 0xbf840001u, 0xbf920001u, 0x877e7e81u, 0x7e080208u, 0x7e066700u,
+      0x7e000202u, 0x7e020203u, 0x7e04026bu, 0xe0782000u, 0x80010004u, 0xbf810000u,
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+}
+
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(124, 129), // m0 = one counter
@@ -8189,8 +8315,8 @@ void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   Check(graph.natural_loops.size() == 1u, "DS loop was not preserved");
   Check(graph.blocks.size() == original_block_count + 1u,
         "DS loop structurization did not add exactly one empty header");
-  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
-            original_coverage,
+  Check(CoverageMatchesAllowingReturnCopies(graph, decoded.instructions.size(),
+            original_coverage),
         "DS loop canonicalization duplicated semantic instructions");
   const auto *loop_header = graph.FindBlock(graph.natural_loops.front().header);
   Check(loop_header != nullptr &&
@@ -9760,8 +9886,8 @@ void TestNewShaderRecompilerCfgSharedTerminalEarlyExit() {
   graph = ShaderRecompiler::CFG::Structurize(graph);
   Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(
-      CfgInstructionCoverage(graph, decoded.instructions.size()) ==
-          original_coverage,
+      CoverageMatchesAllowingReturnCopies(graph, decoded.instructions.size(),
+          original_coverage),
       "shared-terminal structurization changed semantic instruction coverage");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
@@ -10335,6 +10461,105 @@ void TestCapturedBufferAtomicsX2() {
           "GLC=1 64-bit MUBUF atomic did not return both dwords");
     CheckSpirvBinaryValidates(glc_result.spirv);
   }
+}
+
+// DS_ADD_U64 (one engine compute shader) runs as two 32-bit LDS adds: the low dword's, then the
+// high dword's with the low one's carry.
+void TestDsAddU64() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x40, 8), EncodeDs1(0, 2, 1), // ds_add_u64 v1, v[2:3] offset:8
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  const auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("DS_ADD_U64") != std::string::npos,
+        "new decoder did not decode DS_ADD_U64");
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(SpirvInstructionOpcodeCount(result.spirv, 234u) == 2u,
+        "DS_ADD_U64 did not become two 32-bit LDS atomic adds");
+}
+
+// A wave reduction as compilers write it for RDNA: with every lane enabled, v_max_u32 over a DPP
+// row_shr scan (1, 2, 4, 8) of each row of 16 lanes, then v_readlane of each row's last lane
+// (wave32: lanes 15 and 31), or, after V_PERMLANEX16 adds the other row's last lane, of each row
+// pair's last lane (wave64: lanes 31 and 63). A partly filled host subgroup lacks lanes the scan
+// and v_readlane would read, so each read becomes a native subgroup reduction; the same code with
+// a different last shift stays a scan.
+void TestWaveRowReduction() {
+  const auto native_reductions = [](uint32_t last_control, bool row_pairs) {
+    std::vector<uint32_t> shader = {
+        row_pairs ? EncodeSop1(0x04, 126, 193) : EncodeSMovB32(126, 193), // s_mov_b64 exec, -1
+        EncodeVop2(0x14, 1, 250, 0), EncodeVop2Dpp(0, 0x111), // v_max_u32 v1, v0 row_shr:1, v0
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x112), // v_max_u32 v1, v1 row_shr:2, v1
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x114),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, last_control),
+    };
+    const uint32_t lanes[2] = {row_pairs ? 31u : 15u, row_pairs ? 63u : 31u};
+    if (row_pairs) {
+      shader.insert(shader.end(), {
+          EncodeVop3Word0(0x378, 2), EncodeVop3Word1(256 + 1, 193, 193), // v_permlanex16_b32 v2, v1, -1, -1
+          EncodeVop2(0x14, 1, 256 + 1, 2),                              // v_max_u32 v1, v1, v2
+      });
+    }
+    shader.insert(shader.end(), {
+        EncodeVop3Word0(0x360, 2), EncodeVop3Word1(256 + 1, 128 + lanes[0], 0), // v_readlane_b32 s2
+        EncodeVop3Word0(0x360, 3), EncodeVop3Word1(256 + 1, 128 + lanes[1], 0), // v_readlane_b32 s3
+        EncodeSop2(0x09, 4, 2, 3),                    // s_max_u32 s4, s2, s3
+        EncodeVop1(0x01, 2, 4),                       // v_mov_b32 v2, s4
+        EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2), // exp mrt0
+        0xbf810000u,
+    });
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.wave_size = row_pairs ? 64 : 32;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t found = 0;
+    for (auto at = source.find("OpGroupNonUniformUMax"); at != std::string::npos;
+         at = source.find("OpGroupNonUniformUMax", at + 1)) {
+      found++;
+    }
+    return found;
+  };
+  Check(native_reductions(0x118, false) == 2,
+        "a DPP row scan read at lanes 15 and 31 did not become two row reductions");
+  Check(native_reductions(0x118, true) == 2,
+        "a DPP row scan with V_PERMLANEX16 read at lanes 31 and 63 did not become two reductions");
+  Check(native_reductions(0x117, false) == 0 && native_reductions(0x117, true) == 0,
+        "a scan with the wrong last shift was taken for a lane reduction");
+}
+
+// V_ADD_F64 and the f64 compares of two engine shaders (V_CMP_LE_F64, V_CMPX_LE_F64,
+// V_CMPX_GE_F64), with the source modifiers they use.
+void TestFloat64AddAndCompares() {
+  const uint32_t shader[] = {
+      EncodeVop3Word0(0x164, 0),
+      EncodeVop3Word1(256 + 2, 256 + 4, 0) | (1u << 30u), // v_add_f64 v[0:1], v[2:3], -v[4:5]
+      EncodeVopc(0x23, 256 + 0, 2),                       // v_cmp_le_f64 vcc, v[0:1], v[2:3]
+      EncodeVop1(0x01, 8, 242),                           // v_mov_b32 v8, 1.0
+      EncodeVop2(0x01, 6, 128, 8),                        // v_cndmask_b32 v6, 0, v8, vcc
+      EncodeVop3Word0(0x36, 0, 0, 1),
+      EncodeVop3Word1(256 + 0, 256 + 2, 0),               // v_cmpx_ge_f64 |v[0:1]|, v[2:3]
+      EncodeVopc(0x33, 256 + 2, 0),                       // v_cmpx_le_f64 v[2:3], v[0:1]
+      EncodeExp0(0x00, 0xf), EncodeExp1(6, 0, 1, 6),      // exp mrt0
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  const auto result = RecompileForTest(shader, options);
+  for (const char *name : {"V_ADD_F64", "V_CMP_LE_F64", "V_CMPX_GE_F64", "V_CMPX_LE_F64"}) {
+    Check(result.decoded_dump.find(name) != std::string::npos,
+          "an f64 add or compare was not decoded");
+  }
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("OpFAdd %double") != std::string::npos &&
+            source.find("OpFNegate") == std::string::npos,
+        "V_ADD_F64 did not become a 64-bit OpFAdd with a sign-bit negate");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 188u) == 2u &&
+            SpirvInstructionOpcodeCount(result.spirv, 190u) == 1u,
+        "f64 compares did not become ordered 64-bit comparisons");
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {
@@ -13082,6 +13307,9 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 
   ShaderPixelInputInfo uint16_info;
   uint16_info.target_output_mode[0] = 7;
+  // The output type follows the render target's channel type, which GetGraphicsPrograms
+  // passes as target_uint_mask; the export format only describes the packing.
+  uint16_info.target_uint_mask = 1u;
   options.input_info.pixel = &uint16_info;
   auto uint16_result = RecompileForTest(shader, options);
   const auto uint16_source = DisassembleSpirvBinary(uint16_result.spirv);
@@ -13123,6 +13351,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 
   ShaderPixelInputInfo uint_info;
   uint_info.target_output_mode[0] = 7;
+  uint_info.target_uint_mask = 1u; // a UINT render target
   options.input_info.pixel = &uint_info;
   auto partial_uint_result =
       RecompileForTest(partial_shader, options);
@@ -14466,9 +14695,12 @@ void TestSrtWalkerRealSBufferTranslation() {
             std::equal(flat.begin(), flat.end(), table.begin()),
         "real S_BUFFER_LOAD walk did not align offset components independently");
 
+  // Past num_records a dword reads as zero (PS5 ISA, scalar buffer addressing).
   user_data[10] = 3 * sizeof(uint32_t);
   const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(plan, runtime).RefreshFlatBuffer(flat);
-  Check(!bounds_walked, "real S_BUFFER_LOAD walk ignored descriptor bounds");
+  Check(bounds_walked && flat.size() == 4 &&
+            std::equal(flat.begin(), flat.begin() + 3, table.begin()) && flat[3] == 0u,
+        "real S_BUFFER_LOAD walk did not read zero past the descriptor bounds");
   CheckFlattenedReadSlots(
       ir, 4, "real S_BUFFER_LOAD patch used the wrong flat offsets");
 
@@ -15580,6 +15812,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestMemRealtimeClockShift();
   TestShaderStageBarriers();
   TestVertexBufferGrouping();
   TestNggVertexEntryState();
@@ -15631,6 +15864,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
+  TestCapturedLoopExitThroughNonMergeBlock();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
@@ -15679,6 +15913,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestDisabledDebugBranches();
+  TestWaveRowReduction();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();

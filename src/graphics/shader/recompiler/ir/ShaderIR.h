@@ -473,6 +473,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	bool                            uses_shader_clock             = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
@@ -482,6 +483,7 @@ struct ShaderInfo {
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_barrier              = false;
 	bool                            subgroup_shuffle              = false;
+	bool                            subgroup_arithmetic           = false;
 	bool                            subgroup_local_invocation_id  = false;
 	bool                            compute_derivatives           = false;
 	bool                            image_gather_extended         = false;
@@ -535,6 +537,20 @@ struct SrtRead {
 	uint32_t flat_offset = 0;
 
 	bool operator==(const SrtRead& other) const = default;
+};
+
+// A store or atomic on a written buffer whose address operands the host can bound: immediates,
+// values it evaluates, compute invocation IDs, and a few integer operations on them.
+struct BufferWrite {
+	uint32_t buffer    = 0;
+	uint32_t immediate = 0;
+	Value    index;
+	Value    offset;
+	Value    soffset;
+	// The store's lane predicate: a select on it takes the stored lanes' operand.
+	Value    predicate;
+
+	bool operator==(const BufferWrite& other) const = default;
 };
 
 struct ResourceBlock {
@@ -594,6 +610,9 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	// Per buffer of info.buffers: every store to it is in buffer_writes (bounded write extent).
+	std::vector<uint8_t>                buffer_writes_bounded;
+	std::vector<BufferWrite>            buffer_writes;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

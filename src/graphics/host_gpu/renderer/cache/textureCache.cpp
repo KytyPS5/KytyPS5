@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -217,7 +218,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
-	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_id     = m_lru_cache.Insert(id, LruClock());
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -276,11 +277,19 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
-	} else {
-		m_slot_images.erase(id);
+	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
+	// earlier may still be sampling the image on the GPU.
+	m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+}
+
+void TextureCache::ReleaseImage(ImageId id) {
+	const auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && !m_scheduler.IsFree(image->tick_accessed_last)) {
+		// Used after it was dropped, in a tick the GPU has not finished: keep it until then.
+		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+		return;
 	}
+	m_slot_images.erase(id);
 }
 
 void TextureCache::FreeImage(ImageId id) {
@@ -293,7 +302,7 @@ void TextureCache::FreeImage(ImageId id) {
 
 void TextureCache::TouchImage(Image& image) {
 	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+		m_lru_cache.Touch(image.lru_id, LruClock());
 	}
 }
 
@@ -458,14 +467,14 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
-	const auto format = desc.info.pixel_format;
-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
+	const auto key = std::pair {desc.info.pixel_format, desc.info.type};
+	if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = desc.info.type;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
@@ -474,7 +483,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
+	m_null_images.emplace(key, id);
 	return id;
 }
 
@@ -1546,7 +1555,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		view.layer_count = range.layerCount;
 		view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
-		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Recorder());
 		vk::RenderingAttachmentInfo attachment {};
 		attachment.imageView   = image.FindView(view);
 		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
@@ -1560,23 +1569,23 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		rendering.layerCount           = range.layerCount;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;
-		command.Handle().beginRendering(&rendering);
-		command.Handle().endRendering();
+		command.Recorder().beginRendering(&rendering);
+		command.Recorder().endRendering();
 		CommitGpuWrite(image);
 		return;
 	}
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-	              command.Handle());
+	              command.Recorder());
 	auto native_range = range;
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		command.Recorder().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                                 &clear.color, 1, &native_range);
 	} else {
-		command.Handle().clearDepthStencilImage(image.backing.image,
+		command.Recorder().clearDepthStencilImage(image.backing.image,
 		                                        vk::ImageLayout::eTransferDstOptimal,
 		                                        &clear.depthStencil, 1, &native_range);
 	}
@@ -1752,7 +1761,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
@@ -1871,40 +1880,69 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+uint64_t TextureCache::LruClock() const noexcept {
+	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
+	m_gc_tick++;
+	const uint64_t clock = LruClock();
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	if (m_gc_budget_frame != clock) {
+		m_gc_budget_frame       = clock;
+		m_gc_freed_bytes_frame  = 0;
+		m_gc_freed_images_frame = 0;
+		m_gc_written_back_bytes_frame = 0;
+	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		bool pressured  = m_total_used_memory >= m_pressure_gc_memory;
+		bool aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		constexpr uint64_t MiB             = 1024 * 1024;
+		constexpr size_t   MaxFreesInFrame = 1024;
+		uint64_t           byte_budget     = 0;
+		size_t             deletions       = 10;
+		if (pressured || aggressive) {
+			const auto threshold = aggressive ? m_critical_gc_memory : m_pressure_gc_memory;
+			const auto excess    = m_total_used_memory - threshold;
+			byte_budget = aggressive ? std::max<uint64_t>(64 * MiB, excess / 4)
+			                         : std::max<uint64_t>(16 * MiB, excess / 8);
+			if (m_gc_freed_bytes_frame >= byte_budget ||
+			    m_gc_freed_images_frame >= MaxFreesInFrame) {
+				return;
+			}
+			deletions = MaxFreesInFrame - m_gc_freed_images_frame;
+		}
+		const size_t         visit_limit = pressured || aggressive ? deletions * 4 : deletions;
 		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
+		candidates.reserve(std::min<size_t>(visit_limit, 4096));
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+		m_lru_cache.ForEachItemBelow(clock - age, [&](ImageId id) {
 			candidates.push_back(id);
-			return candidates.size() == deletions;
+			return candidates.size() >= visit_limit || candidates.size() >= 4096;
 		});
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
 			}
-			--deletions;
+			if (!(pressured || aggressive)) {
+				--deletions;
+			}
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
-				if (safe && owner->info.IsTiled()) {
+				constexpr uint64_t WriteBackPerFrame = 256 * MiB;
+				if (safe && owner->info.IsTiled() &&
+				    (!(pressured || aggressive) ||
+				     (m_gc_written_back_bytes_frame != 0 &&
+				      m_gc_written_back_bytes_frame + owner->info.data.size > WriteBackPerFrame))) {
 					continue;
 				}
 				if (safe && !pressured) {
@@ -1913,8 +1951,20 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !DownloadImageMemory(id)) {
 					continue;
 				}
+				if (safe && owner->info.IsTiled()) {
+					m_gc_written_back_bytes_frame += owner->info.data.size;
+				}
 			}
+			const auto freed = owner->AccountedSize();
 			FreeImage(id);
+			if (pressured || aggressive) {
+				--deletions;
+				m_gc_freed_images_frame++;
+				m_gc_freed_bytes_frame += freed;
+				if (m_gc_freed_bytes_frame >= byte_budget) {
+					break;
+				}
+			}
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

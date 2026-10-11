@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -18,6 +19,13 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// Accept image atomics on k32Float descriptors: upstream's float atomics, and integer atomics
+	// run as uint atomics on the raw bits. On by default, as in the emulator; the emulator passes
+	// --no-float-image-atomics through here.
+	bool                      float_image_atomics        = true;
+	// Compute: the workgroup size, with workgroup_counts, bounds the invocation IDs in buffer write
+	// extents.
+	std::array<uint32_t, 3>   workgroup_size             = {};
 };
 
 class SrtReadCapture {

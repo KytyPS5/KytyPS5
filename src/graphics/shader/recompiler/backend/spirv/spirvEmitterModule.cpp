@@ -660,12 +660,15 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
+				const bool mrt = binding.kind == IR::StageOutputKind::Mrt &&
+				                 state.program.stage == ShaderType::Pixel;
 				const bool uint_output =
-				    binding.kind == IR::StageOutputKind::Mrt &&
-				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
-				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				    mrt && (state.input_info.pixel->target_uint_mask & (1u << binding.index)) != 0;
+				const bool sint_output =
+				    mrt && (state.input_info.pixel->target_sint_mask & (1u << binding.index)) != 0;
+				const auto type     = uint_output   ? TypeU32Vector(state, 4)
+				                      : sint_output ? TypeI32Vector(state, 4)
+				                                    : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
@@ -744,6 +747,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
 		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);
 	}
+	if (state.program.info.uses_shader_clock) {
+		state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
+		state.builder.RequireExtension("SPV_KHR_shader_clock");
+	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
 	}
@@ -774,6 +781,9 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.program.info.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
+	if (state.program.info.subgroup_arithmetic) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);

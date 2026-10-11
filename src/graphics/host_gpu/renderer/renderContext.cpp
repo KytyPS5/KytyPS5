@@ -7,6 +7,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -17,6 +19,10 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Command buffers are recorded and submitted in order on a recording thread, which also holds the
+	// queue lock that present takes. Frames reach the presenter only after their flip tick completed,
+	// and the presenter's own scheduler stays synchronous.
+	m_command_scheduler.EnableRecordingThread();
 }
 
 RenderContext::~RenderContext() {

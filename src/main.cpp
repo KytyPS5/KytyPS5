@@ -94,6 +94,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
 	    "                                      Default: false.\n");
+	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
+	         "                                       float images (they run by default).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -253,6 +255,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--profile") {
 			options.config.profiler_enabled = true;
+			continue;
+		}
+		if (arg == "--float-image-atomics" || arg == "--no-float-image-atomics") {
+			options.config.float_image_atomics_enabled = arg == "--float-image-atomics";
 			continue;
 		}
 

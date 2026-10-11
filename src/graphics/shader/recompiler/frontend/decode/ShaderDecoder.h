@@ -748,6 +748,9 @@ enum class OperandKind {
 	PrivateBase,
 	Null,
 	Vgpr,
+	// A special register the recompiler does not model;
+	// DecodeInstruction turns the instruction into UNSUPPORTED, so the shader gives up.
+	Unsupported,
 };
 
 enum ImageSampleFlag : uint32_t {

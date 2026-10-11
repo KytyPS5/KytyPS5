@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 
@@ -691,11 +692,13 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 }
 
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+	const Frontend::TranslationNonFatalScope non_fatal_scope(options.non_fatal);
 	auto source = PrepareShaderSource(code, options);
 	return TranslateProgram(source.decoded, options);
 }
 
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
+	const Frontend::TranslationNonFatalScope non_fatal_scope(options.non_fatal);
 	EXIT_IF(decoded.instructions.empty());
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
@@ -730,6 +733,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	auto native_cfg = CFG::BuildGraph(decoded);
 	CFG::Graph structured_cfg;
 	auto* selected_cfg = &native_cfg;
+	if (options.non_fatal && native_cfg.unsupported && !native_cfg.irreducible) {
+		LOGF("%s gave up hash=0x%016" PRIx64 ": %s\n", GetDumpLabel(options), options.shader_hash,
+		     native_cfg.unsupported_reason.c_str());
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -784,6 +794,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	if (options.non_fatal && Frontend::TranslationUnsupported()) {
+		LOGF("%s gave up hash=0x%016" PRIx64 ": no IR translation for an instruction\n",
+		     GetDumpLabel(options), options.shader_hash);
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -808,7 +825,15 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			for (const auto& inst: *block)
 				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
 	}
-	LowerTessellationMemory(ir, options);
+	if (!LowerTessellationMemory(ir, options)) {
+		if (!options.non_fatal) {
+			EXIT("%s failed hash=0x%016" PRIx64 ": unsupported tessellation memory shape\n",
+			     GetDumpLabel(options), options.shader_hash);
+		}
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	std::string cfg_dump;
 	if (options.dump_ir) {
 		cfg_dump = CFG::GraphToString(cfg);
@@ -817,7 +842,14 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg);
+	if (!IR::TrackResources(ir, decoded, native_cfg) && options.non_fatal) {
+		LOGF("%s gave up hash=0x%016" PRIx64 ": resource tracking failed\n", GetDumpLabel(options),
+		     options.shader_hash);
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		unsupported_result.decoded_dump = std::move(decoded_dump);
+		return unsupported_result;
+	}
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

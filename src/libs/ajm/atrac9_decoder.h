@@ -60,6 +60,19 @@ static bool AjmFourCcEquals(const uint8_t* data, char a, char b, char c, char d)
 	       data[2] == static_cast<uint8_t>(c) && data[3] == static_cast<uint8_t>(d);
 }
 
+// LibAtrac9 checks the header byte and the validation bit, then indexes its six-entry
+// channel-configuration table with the 3-bit field unchecked: 6 and 7 read past the table,
+// and InitFrame writes that many blocks past the handle (a host access violation).
+// Channel configs 0-5 are LibAtrac9's; 6 and 7 are the SDK's vibration mono and vibration dual
+// mono (ajm/at9_decoder.h), ATRAC9 streams the console routes to the controller's haptics.
+static bool AjmAt9ConfigDataValid(const uint8_t* config_data) {
+	return config_data[0] == 0xfeu && (config_data[1] & 1u) == 0;
+}
+
+[[nodiscard]] static bool AjmAt9IsVibrationConfig(const uint8_t* config_data) {
+	return ((config_data[1] >> 1u) & 7u) >= 6u;
+}
+
 class AjmAt9Decoder final: public AjmDecoder {
 public:
 	AjmAt9Decoder(uint32_t channels, uint32_t sample_rate, AjmSampleEncoding encoding,
@@ -87,6 +100,7 @@ public:
 		if (!InitializeConfig(params->config_data, &result)) {
 			return result;
 		}
+		m_pending.clear();
 
 		return MakeResult();
 	}
@@ -98,6 +112,7 @@ public:
 		m_handle                = Atrac9GetHandle();
 		m_num_frames            = 0;
 		m_total_decoded_samples = 0;
+		m_pending.clear();
 		m_superframe_bytes_remain =
 		    (m_is_initialized ? static_cast<uint32_t>(m_codec_info.superframeSize) : 0);
 
@@ -116,25 +131,49 @@ public:
 			return result;
 		}
 
+		const size_t pending_size = m_pending.size();
+		if (pending_size != 0) {
+			m_pending.insert(m_pending.end(), static_cast<const uint8_t*>(input),
+			                 static_cast<const uint8_t*>(input) + input_size);
+			input      = m_pending.data();
+			input_size = m_pending.size();
+		}
+		const auto  finish = [&](AjmDecodeResult& done, size_t consumed, bool stash_tail) {
+			if (stash_tail && consumed < input_size) {
+				std::vector<uint8_t> tail(static_cast<const uint8_t*>(input) + consumed,
+				                          static_cast<const uint8_t*>(input) + input_size);
+				m_pending = std::move(tail);
+				consumed  = input_size;
+			} else if (consumed < pending_size) {
+				std::vector<uint8_t> tail(static_cast<const uint8_t*>(input) + consumed,
+				                          static_cast<const uint8_t*>(input) + pending_size);
+				m_pending = std::move(tail);
+			} else {
+				m_pending.clear();
+			}
+			done.input_consumed = consumed > pending_size ? consumed - pending_size : 0;
+			return done;
+		};
+
 		const auto* input_bytes  = static_cast<const uint8_t*>(input);
 		auto*       output_bytes = static_cast<uint8_t*>(output);
 		size_t      input_offset = 0;
+		bool        stash_tail   = false;
 
 		if (m_parse_riff_header && input_size >= 12 &&
 		    AjmFourCcEquals(input_bytes, 'R', 'I', 'F', 'F')) {
 			if (!ParseRiffHeader(input_bytes, input_size, &input_offset, gapless, &result)) {
-				return result;
+				return finish(result, 0, result.result == AJM_RESULT_PARTIAL_INPUT);
 			}
 			if (input_offset >= input_size) {
-				result.input_consumed = input_offset;
-				result.result         = AJM_RESULT_PARTIAL_INPUT;
-				return result;
+				result.result = AJM_RESULT_PARTIAL_INPUT;
+				return finish(result, input_offset, false);
 			}
 		}
 
 		if (!m_is_initialized) {
 			result.result = AJM_RESULT_NOT_INITIALIZED;
-			return result;
+			return finish(result, 0, false);
 		}
 
 		for (;;) {
@@ -150,6 +189,7 @@ public:
 				if (result.frames == 0) {
 					result.result = AJM_RESULT_PARTIAL_INPUT;
 				}
+				stash_tail = true;
 				break;
 			}
 
@@ -200,7 +240,7 @@ public:
 
 		result.total_decoded_samples = m_total_decoded_samples;
 		result.format                = GetFormat();
-		return result;
+		return finish(result, input_offset, stash_tail);
 	}
 
 	void WriteCodecInfo(void* output, size_t output_size,
@@ -287,9 +327,21 @@ private:
 			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 			return false;
 		}
+		if (!AjmAt9ConfigDataValid(config_data)) {
+			LOGF("AJM ATRAC9: invalid config data %02x %02x %02x %02x\n", config_data[0],
+			     config_data[1], config_data[2], config_data[3]);
+			m_is_initialized = false;
+			result->result   = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
+			return false;
+		}
 
 		std::memcpy(m_config_data, config_data, ATRAC9_CONFIG_DATA_SIZE);
 		m_has_config = true;
+		if (AjmAt9IsVibrationConfig(config_data)) {
+			LOGF("AJM ATRAC9: vibration config %02x %02x %02x %02x decoded as %s\n", config_data[0],
+			     config_data[1], config_data[2], config_data[3],
+			     (config_data[1] & 0x02u) != 0 ? "dual mono" : "mono");
+		}
 
 		const int init_ret = AjmAt9InitDecoder(m_handle, m_config_data);
 		if (init_ret != 0) {
@@ -541,6 +593,7 @@ private:
 	uint32_t             m_num_frames              = 0;
 	Atrac9CodecInfo      m_codec_info {};
 	std::vector<uint8_t> m_pcm_buffer;
+	std::vector<uint8_t> m_pending;
 };
 
 } // namespace Libs::Audio::Ajm

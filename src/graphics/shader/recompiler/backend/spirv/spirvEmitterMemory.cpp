@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -324,6 +325,9 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
 	                              resource.memory_access);
+	if (resource.memory_access != spv::MemoryAccessMaskNone && GetCoherentLoadAcquire()) {
+		EmitAtomicMemoryBarrier(ctx.state, IR::ResourceKind::Buffer);
+	}
 	return value;
 }
 
@@ -1372,8 +1376,17 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		           const auto pointer = EmitMemoryElementPointer(state, access, element);
+		           if (!mem.coherent) {
+			           return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+		           }
+		           const auto value = state.builder.AllocateId();
+		           state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                                     spv::MemoryAccessVolatileMask);
+		           if (GetCoherentLoadAcquire()) {
+			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Buffer);
+		           }
+		           return value;
 	           }));
 }
 

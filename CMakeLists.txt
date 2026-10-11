@@ -403,7 +403,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(scalar_provenance_tests fmt::fmt common xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -483,8 +483,9 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(resource_tracking_tests fmt::fmt common xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
@@ -600,6 +601,12 @@ if(NOT KYTY_CLANG_CL)
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
+	# Resource tracking gives a shader up by throwing (Fail, caught in TrackResources); utils.cmake
+	# turns exceptions off for clang and GCC, while clang-cl builds have them on (/EHsc). Every
+	# target that compiles the file, the emulator included, needs them on.
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
 endif()
 
 if(BUILD_TESTING)

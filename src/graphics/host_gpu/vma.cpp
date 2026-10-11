@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 
 namespace Libs::Graphics {
@@ -136,9 +137,23 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	auto             result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (result != vk::Result::eSuccess) {
+		alloc_info.requiredFlags  = 0;
+		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+		result                    = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+            &alloc_info, &native_image, &image.allocation, nullptr));
+		static std::atomic<uint32_t> spill_count {0};
+		if (const auto seen = spill_count.fetch_add(1, std::memory_order_relaxed); seen < 32) {
+			LOGF("Image spilled to host memory (%u): %ux%ux%u layers=%u levels=%u format=%d -> %s\n",
+			     seen + 1, image_info.extent.width, image_info.extent.height,
+			     image_info.extent.depth, image_info.arrayLayers, image_info.mipLevels,
+			     static_cast<int>(image_info.format), vk::to_string(result).c_str());
+		}
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();

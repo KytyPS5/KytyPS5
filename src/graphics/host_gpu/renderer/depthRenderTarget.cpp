@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <array>
@@ -390,7 +391,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
-	const auto command = scheduler.Current().Handle();
+	const auto command = scheduler.Current().Recorder();
 	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
 	                                  read_desc.view_info.base_layer,
 	                                  read_desc.view_info.layer_count};

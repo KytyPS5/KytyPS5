@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -110,11 +111,12 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource&    resource,
+                    const ShaderRecompiler::IR::BufferWriteExtent* extent, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
-	if (address == 0 || size == 0) {
+	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();
@@ -122,9 +124,17 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	const bool bounded_write = resource.written && extent != nullptr && extent->valid;
+	const auto written_begin = bounded_write ? std::min(extent->begin, size) : 0u;
+	const auto written_end   = bounded_write ? std::min(extent->end, size) : size;
+	const bool sync_image    = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+	auto [buffer, offset] =
+	    bounded_write
+	        ? context.GetBufferCache().ObtainBufferWritten(address, size, address + written_begin,
+	                                                       written_end - std::min(written_begin,
+	                                                                              written_end),
+	                                                       id)
+	        : context.GetBufferCache().ObtainBuffer(address, size, resource.written, sync_image, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -133,8 +143,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	if (resource.written && written_end > written_begin) {
+		context.GetTextureCache().InvalidateMemoryFromGPU(address + written_begin,
+		                                                  written_end - written_begin);
 	}
 	return result;
 }
@@ -311,10 +322,12 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
-	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
-	                              resource.atomic && !resource.atomic64;
+	const bool raw_atomic_storage = resource.atomic && !resource.atomic64 && uint_resource &&
+	                                (format == Prospero::BufferFormat::k32UInt ||
+	                                 format == Prospero::BufferFormat::k32SInt ||
+	                                 format == Prospero::BufferFormat::k32Float);
 	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
+	    raw_sint_storage || raw_atomic_storage ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -371,7 +384,25 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
+	// Indirect-image tables specialize null entries to their accessed dimension.
+	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+	switch (resource.dimension) {
+		case Dimension::Dim1D:
+		case Dimension::Dim1DArray:
+			desc.info.type = Prospero::ImageType::kColor1D;
+			desc.view_info.type = resource.dimension == Dimension::Dim1D
+			                          ? vk::ImageViewType::e1D : vk::ImageViewType::e1DArray;
+			break;
+		case Dimension::Dim3D:
+			desc.info.type = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case Dimension::Dim2DArray:
+		case Dimension::Dim2DMsaaArray:
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		default: desc.view_info.type = vk::ImageViewType::e2D; break;
+	}
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
@@ -768,7 +799,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
-			if (address == 0 || size == 0) {
+			if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 				source = {};
 				continue;
 			}
@@ -792,7 +823,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			size = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+			if (size == 0) {
+				// Nothing is mapped at the base yet: an unbacked region reads zero and drops writes on
+				// the hardware, so bind null.
+				source = {};
+				continue;
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}
@@ -819,8 +856,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		const auto resource_index = static_cast<size_t>(&resource - program.info.buffers.data());
+		prepared.buffers[index] = NativeStorageBuffer(
+		    m_context, prepared.buffer_sources[index], resource,
+		    resource_index < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource_index]
+		                                                          : nullptr,
+		    buffer_offset);
 		pack_memory_offset(index, buffer_offset);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
@@ -917,7 +958,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
+	const auto vk_buffer    = buffer.Recorder();
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -971,12 +1012,37 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
-				for (const auto& resource: program.info.buffers) {
+				const auto& extents = writer->runtime->resources->buffer_write_extents;
+				for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
+					const auto& resource = program.info.buffers[index];
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					// The bytes the dispatch can store to, when its stores are bounded: a
+					// heap-wide descriptor alone does not count as an overlap.
+					auto written_address = written.address;
+					auto written_size    = written.size;
+					if (index < extents.size() && extents[index].valid) {
+						written_address += extents[index].begin;
+						written_size = extents[index].end > extents[index].begin
+						                   ? extents[index].end - extents[index].begin
+						                   : 0;
+					}
+					if (written_size != 0 &&
+					    ImageRangeOverlaps(address, size, written_address, written_size)) {
+						// The host evaluates these inputs from the state before the dispatch.
+						// Reported once per shader pair; the dispatch goes on.
+						static std::mutex                   reported_mutex;
+						static std::unordered_set<uint64_t> reported;
+						const auto reader_hash = reader->runtime->program->shader_hash;
+						std::scoped_lock lock(reported_mutex);
+						if (reported.insert(reader_hash ^ (program.shader_hash << 1u)).second) {
+							LOGF("Warning: scalar resource reads overlap a shader buffer write: "
+							     "reader 0x%016" PRIx64 " reads 0x%" PRIx64 "+0x%" PRIx64
+							     ", writer 0x%016" PRIx64 " buffer %u writes 0x%" PRIx64
+							     "+0x%" PRIx64 "\n",
+							     reader_hash, address, size, program.shader_hash, index,
+							     written_address, written_size);
+						}
 					}
 				}
 			}
@@ -1151,11 +1217,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
+			// The update moves to the recording thread with the bind: the set is fresh.
+			vk_buffer.updateAndBindDescriptorSet(
+			    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
+			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data());
 		}
 	}
 }

@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -490,7 +491,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.Transit(layout, image.binding.attachment_access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
-		              buffer.Handle());
+		              buffer.Recorder());
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
@@ -535,9 +536,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                                         native->info);
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
-		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
@@ -553,7 +551,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
-		              buffer.Handle());
+		              buffer.Recorder());
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
@@ -693,8 +691,15 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(i, vs_input_info);
-		sizes[i]           = size;
+		// A buffer only constant-only embedded fetches refer to is never read: bind the null
+		// buffer instead of acquiring whatever its unconsumed descriptor names.
+		bool fetched = false;
+		for (int a = 0; a < vs_input_info.resources_num && !fetched; a++) {
+			fetched = vs_input_info.resources_dst[a].buffer_index == i &&
+			          VertexAttributeFetched(vs_input_info, a);
+		}
+		const auto size = fetched ? VertexBufferDescriptorSize(i, vs_input_info) : 0;
+		sizes[i]        = size;
 		if (size == 0) {
 			continue;
 		}
@@ -899,6 +904,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -954,7 +962,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+static void CommitVertexBuffers(const CommandRecorder&       vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
@@ -966,7 +974,8 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(const CommandRecorder&     vk_buffer,
+                              const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
@@ -992,7 +1001,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandRecorder& vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
@@ -1158,10 +1167,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
+	// A draw that writes no memory may be skipped while its new pipeline compiles in the
+	// background; its render targets are not touched. One that writes buffers or storage images
+	// waits for the pipeline, as others may read what it writes.
+	const auto writes_memory = [](const ShaderStageRuntime& runtime) {
+		return HasShaderBufferWrites(runtime) ||
+		       std::ranges::any_of(runtime.program->info.images, [](const auto& image) {
+			       return image.written &&
+			              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+		       });
+	};
+	bool may_defer = !(state.ps_active && writes_memory(state.ps_input_info.stage));
+	for (const auto& stage: vertex_stages) {
+		may_defer = may_defer && !writes_memory(stage.stage);
+	}
+	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.programs, may_defer);
+	if (deferred_pipeline == nullptr) {
+		return;
+	}
+	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1169,8 +1196,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
-	// memory.
-	auto vk_buffer = buffer.Handle();
+	// memory. Recorded through the recording thread when it runs.
+	const auto vk_buffer = buffer.Recorder();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);

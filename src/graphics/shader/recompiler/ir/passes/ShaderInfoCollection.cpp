@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -502,6 +503,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
+		case ValueOpcode::ReadClockRealtime64: info.uses_shader_clock = true; break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_ballot |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
@@ -513,6 +515,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.subgroup_ballot  = true;
 			info.subgroup_shuffle = true;
 			if (inst.GetOpcode() == ValueOpcode::DppMoveU32) {
+				info.subgroup_local_invocation_id = true;
+			}
+			if (inst.GetOpcode() == ValueOpcode::ReadLane &&
+			    MatchLaneReduction(inst, program.wave_size)) {
+				info.subgroup_arithmetic          = true;
 				info.subgroup_local_invocation_id = true;
 			}
 			break;

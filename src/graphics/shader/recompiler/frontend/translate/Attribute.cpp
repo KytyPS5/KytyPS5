@@ -57,7 +57,12 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 			source = Format::ResolveFormattedSource(
 			    format, GetDstSel(resource.DstSelXYZW(), component));
 			if (source.kind == Format::FormattedSourceKind::Invalid) {
-				EXIT("invalid formatted vertex input %u at pc 0x%08x", attribute, inst.pc);
+				EXIT("invalid formatted vertex input %u at pc 0x%08x: component=%u format=%u "
+				     "selector=%u descriptor=%08x,%08x,%08x,%08x",
+				     attribute, inst.pc, component, static_cast<unsigned>(resource.RawFormat()),
+				     static_cast<unsigned>(GetDstSel(resource.DstSelXYZW(), component)),
+				     resource.fields[0],
+				     resource.fields[1], resource.fields[2], resource.fields[3]);
 			}
 		}
 		IR::Value value;

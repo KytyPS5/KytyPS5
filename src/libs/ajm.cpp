@@ -155,6 +155,9 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	if (config_data == nullptr || config_info == nullptr) {
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
+	if (!AjmAt9ConfigDataValid(static_cast<const uint8_t*>(config_data))) {
+		return AJM_ERROR_INVALID_PARAMETER;
+	}
 
 	auto* handle = Atrac9GetHandle();
 	if (handle == nullptr) {

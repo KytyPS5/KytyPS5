@@ -69,11 +69,25 @@ void CheckStream(FileStreamer& stream, const std::vector<uint8_t>& data) {
 	          std::equal(bytes.begin(), bytes.end(), data.begin() + 123), "FFmpeg seeks reset buffered reads");
 }
 
+struct GuestHeap {
+	std::vector<std::pair<uint8_t*, uint32_t>> live;
+	unsigned allocations = 0;
+	bool Owns(const uint8_t* buffer, uint32_t size) const {
+		return std::any_of(live.begin(), live.end(), [&](const auto& block) {
+			return buffer >= block.first && buffer + size <= block.first + block.second;
+		});
+	}
+};
+
 struct Callbacks {
 	const std::vector<uint8_t>& data;
 	unsigned opens = 0;
 	unsigned closes = 0;
 	bool premature_eof = false;
+	// When set, every read must land in a buffer from this allocator: the game's callback may
+	// read through AMPR, which accepts only guest memory (Astro Bot's intro video).
+	const GuestHeap* heap = nullptr;
+	bool foreign_buffer = false;
 };
 int KYTY_SYSV_ABI Open(void* object, const char*) {
 	++static_cast<Callbacks*>(object)->opens;
@@ -85,6 +99,9 @@ int KYTY_SYSV_ABI Close(void* object) {
 }
 int KYTY_SYSV_ABI Read(void* object, uint8_t* buffer, uint64_t offset, uint32_t size) {
 	auto& state = *static_cast<Callbacks*>(object);
+	if (state.heap != nullptr && !state.heap->Owns(buffer, size)) {
+		state.foreign_buffer = true;
+	}
 	if (state.premature_eof) {
 		return 0;
 	}
@@ -163,6 +180,21 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
 	      "stop releases all video buffers");
 }
+void* KYTY_SYSV_ABI HeapAllocate(void* object, uint32_t, uint32_t size) {
+	auto& heap = *static_cast<GuestHeap*>(object);
+	auto* block = new uint8_t[size];
+	heap.live.emplace_back(block, size);
+	++heap.allocations;
+	return block;
+}
+void KYTY_SYSV_ABI HeapDeallocate(void* object, void* memory) {
+	auto& live = static_cast<GuestHeap*>(object)->live;
+	const auto it = std::find_if(live.begin(), live.end(),
+	                             [&](const auto& block) { return block.first == memory; });
+	Check(it != live.end(), "deallocate a block of this allocator");
+	delete[] it->first;
+	live.erase(it);
+}
 }
 
 int main() {
@@ -181,20 +213,20 @@ int main() {
 	Check(ArchiveTests::CreateArchive(root / "game.zar", payload), "create archive fixture");
 	content_root = root;
 	{
-		FileStreamer native({});
+		FileStreamer native({}, {});
 		Check(native.Init("/app0/movie.bin"), "open native stream");
 		CheckStream(native, payload);
 	}
 	content_root = Common::MakeArchivePath(root / "game.zar");
 	{
-		FileStreamer archive({});
+		FileStreamer archive({}, {});
 		Check(archive.Init("/app0/assets/subdir/data.bin"), "open archived stream");
 		CheckStream(archive, payload);
 	}
 	Callbacks callbacks {payload};
 	const AvPlayerFileReplacement replacement {&callbacks, Open, Close, Read, Size};
 	{
-		FileStreamer callback(replacement);
+		FileStreamer callback(replacement, {});
 		Check(callback.Init("callback"), "open guest callback stream");
 		CheckStream(callback, payload);
 		callbacks.premature_eof = true;
@@ -205,7 +237,21 @@ int main() {
 	}
 	Check(callbacks.opens == 1 && callbacks.closes == 1, "close callback exactly once");
 	{
-		FileStreamer missing({});
+		GuestHeap heap;
+		Callbacks guest {payload};
+		guest.heap = &heap;
+		const AvPlayerFileReplacement guest_files {&guest, Open, Close, Read, Size};
+		const AvPlayerMemAllocator    guest_memory {&heap, HeapAllocate, HeapDeallocate, nullptr, nullptr};
+		{
+			FileStreamer callback(guest_files, guest_memory);
+			Check(callback.Init("callback"), "open guest callback stream with a guest allocator");
+			CheckStream(callback, payload);
+		}
+		Check(!guest.foreign_buffer, "the read callback got a buffer outside the guest allocator");
+		Check(heap.allocations > 0 && heap.live.empty(), "free every guest read buffer");
+	}
+	{
+		FileStreamer missing({}, {});
 		Check(!missing.Init("/unmounted/movie.bin"), "reject unmapped media");
 	}
 	content_root = root;

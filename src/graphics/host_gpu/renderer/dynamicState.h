@@ -13,6 +13,8 @@
 
 namespace Libs::Graphics {
 
+class CommandRecorder;
+
 struct GraphicContext;
 
 struct StencilOps {
@@ -93,7 +95,7 @@ struct DynamicState {
 	vk::ImageAspectFlags                               feedback_loop_aspects {};
 
 	/// Commits the dynamic state to the provided command buffer.
-	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
+	void Commit(const GraphicContext& graphics, const CommandRecorder& cmdbuf);
 
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
 	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }

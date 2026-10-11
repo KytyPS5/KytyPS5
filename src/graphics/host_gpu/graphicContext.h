@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -18,6 +19,23 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+struct DiagnosticCheckpoint {
+	uint32_t op        = 0;
+	uint64_t submit_id = 0;
+	uint32_t arg0      = 0;
+	uint32_t arg1      = 0;
+	uint32_t arg2      = 0;
+	uint32_t arg3      = 0;
+	uint64_t arg4      = 0;
+	uint64_t sequence  = 0;
+};
+
+struct GraphicContext;
+
+[[nodiscard]] const DiagnosticCheckpoint*
+RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
+void DumpDeviceLossDiagnostics(GraphicContext& graphics);
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -27,7 +45,12 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               diagnostic_checkpoints_enabled        = false;
+	bool                               device_fault_enabled                  = false;
+	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// subgroupSizeControl is enabled: the device has more than one subgroup size.
+	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
@@ -45,6 +68,7 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	std::atomic<uint64_t>              presented_frames {0};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -86,6 +110,20 @@ struct GraphicContext {
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+	}
+
+	// The subgroup size a graphics stage must require so that one host subgroup is one guest
+	// wave, or 0 when the default already is or the device cannot require it for the stage. On
+	// AMD the default is 64; a wave32 pixel or mesh shader would otherwise share a subgroup with
+	// another wave, and its ballots, lane reads and reductions would mix the two.
+	[[nodiscard]] uint32_t GraphicsSubgroupSize(vk::ShaderStageFlagBits stage,
+	                                            uint32_t                wave_size) const noexcept {
+		if (!subgroup_size_control_enabled || wave_size == subgroup_size ||
+		    !(required_subgroup_size_stages & stage) || wave_size < min_subgroup_size ||
+		    wave_size > max_subgroup_size) {
+			return 0;
+		}
+		return wave_size;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

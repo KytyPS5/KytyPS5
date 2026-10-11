@@ -570,6 +570,14 @@ void TextureCache::TouchImage(Image& image) {
 	}
 }
 
+// A store beside the image unwatches its edge page; later stores into it there never fault.
+void TextureCache::MarkEdgeMaybeDirty(Image& image) {
+	image.MarkMaybeCpuDirty();
+	if (image.NeedsMaybeCpuHash()) {
+		image.SetMaybeCpuHash(image.HashGuestEdges());
+	}
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	image.MarkMaybeCpuDirty();
 	if (image.NeedsMaybeCpuHash()) {
@@ -662,6 +670,8 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	image.track_addr   = address;
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
+	} else if (size != 0) {
+		MarkEdgeMaybeDirty(image);
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(begin, size);
@@ -679,6 +689,8 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	image.track_addr_end = address;
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
+	} else if (size != 0) {
+		MarkEdgeMaybeDirty(image);
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);

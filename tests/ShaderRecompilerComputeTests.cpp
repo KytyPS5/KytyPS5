@@ -164,6 +164,12 @@ static_assert(!HasPolicyTileImageBacking<TileManager>);
 static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
+static std::string RingHex(uint64_t value) {
+  char text[32];
+  std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(value));
+  return text;
+}
+
 struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
@@ -5057,6 +5063,152 @@ public:
             "precise-write direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
+
+  // A store beside an image untracks only its head page; a later store into the image's head
+  // bytes must still stop a raw read from writing the stale image back.
+  void CheckBufferCacheRingImageHead() {
+    constexpr const char *name = "BufferCacheRingImageHead";
+    constexpr uintptr_t base = 0x0000000238000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = 0x1000;
+    constexpr uint64_t head_page = 0x10000;
+    constexpr uint64_t image_offset = head_page + 0x800;
+    constexpr uint64_t image_bytes = 0x4000;
+    constexpr uint64_t beside_offset = head_page + 0x100;
+    constexpr uint64_t inside_offset = image_offset + 0x10;
+    constexpr uint32_t old_word = 0x01d01d00u;
+    constexpr uint32_t new_word = 0x0e0e0e0eu;
+    constexpr uint32_t beside_word = 0xbe51de00u;
+
+    for (const bool painted : {false, true}) {
+      int64_t direct_offset = -1;
+      Require(name, "direct allocation",
+              Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                  allocation_alignment, 0, &direct_offset) == 0,
+              "image-head direct-memory allocation failed");
+      void *mapped = reinterpret_cast<void *>(base);
+      Require(name, "direct mapping",
+              Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                             direct_offset,
+                                                             allocation_alignment) == 0 &&
+                  mapped == reinterpret_cast<void *>(base),
+              "image-head fixed direct-memory mapping failed");
+      auto *memory = static_cast<uint8_t *>(mapped);
+      for (uint64_t offset = 0; offset < allocation_size; offset += sizeof(uint32_t)) {
+        std::memcpy(memory + offset, &old_word, sizeof(old_word));
+      }
+
+      EnsureRuntimeContext();
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      ImageDesc desc{};
+      desc.type = BindingType::Texture;
+      desc.info.data = {base + image_offset, image_bytes};
+      desc.info.pixel_format = vk::Format::eR32Uint;
+      desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = {64, 64, 1};
+      desc.info.resources = {1, 1};
+      desc.info.pitch = 64;
+      desc.info.bytes_per_block = sizeof(uint32_t);
+      desc.info.samples = 1;
+      desc.info.tile_mode = Prospero::TileMode::kLinear;
+      desc.info.mip_layout[0] = {0, image_bytes, 64, 64};
+      desc.view_info.format = vk::Format::eR32Uint;
+      desc.view_info.type = vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.level_count = 1;
+      desc.view_info.layer_count = 1;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      ImageId image{};
+      context.GetGpu().SendCommandSync([&] {
+        scheduler.Begin(registers, user_config, shaders);
+        context.MapMemory(base, allocation_size);
+        (void)cache.ObtainBuffer(base + head_page, 0x8000, false);
+        image = textures.FindImage(desc);
+        (void)textures.FindTexture(image, desc);
+        if (painted) {
+          vk::ClearValue paint{};
+          paint.color.uint32 = std::array{0xc0de0001u, 0u, 0u, 0u};
+          TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), image,
+                                             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, paint);
+        }
+        textures.MarkGpuWritten(image);
+        scheduler.Finish();
+      });
+      std::memcpy(memory + beside_offset, &beside_word, sizeof(beside_word));
+      std::memcpy(memory + inside_offset, &new_word, sizeof(new_word));
+      bool image_dirty = false;
+      context.GetGpu().SendCommandSync([&] {
+        image_dirty = textures.GetImage(image).IsCpuDirty();
+        (void)cache.ObtainBuffer(base + image_offset, 2 * image_bytes, false, false, BufferId{},
+                                 true);
+        scheduler.Finish();
+      });
+      uint32_t gpu_word = 0;
+      std::string state;
+      context.GetGpu().SendCommandSync([&] {
+        auto &owner = cache.GetBuffer(BufferCacheTestAccess::PageOwner(cache, base + inside_offset));
+        auto readback =
+            CreateHostBuffer(name, sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {0});
+        state = std::string("cpu=") +
+                (cache.IsRegionCpuModified(base + head_page, page) ? "1" : "0") +
+                " gpu=" + (cache.IsRegionGpuModified(base + head_page, page) ? "1" : "0") +
+                " gd=" + (cache.HasGpuDirtyBytes(base + head_page, page) ? "1" : "0");
+        const vk::BufferCopy copy{owner.Offset(base + inside_offset), 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(owner.Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                     nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        gpu_word = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      uint32_t guest_word = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base + inside_offset, &guest_word,
+                                              sizeof(guest_word));
+      std::printf("[gpu]     %s painted=%d: image cpu-dirty after stores=%d, head page %s, "
+                  "gpu copy=0x%08x guest=0x%08x\n",
+                  name, painted ? 1 : 0, image_dirty ? 1 : 0, state.c_str(), gpu_word,
+                  guest_word);
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+      Require(name, "unmap direct backing",
+              Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+              "image-head mapping release failed");
+      Require(name, "release direct backing",
+              Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                  0,
+              "image-head allocation release failed");
+      Require(name, painted ? "painted image keeps the newer guest store"
+                            : "stale image keeps the newer guest store",
+              guest_word == new_word && gpu_word == new_word,
+              std::string("a guest store into the image head was overwritten on the GPU by the "
+                          "image's older bytes while the page reads clean (") +
+                  state + ", gpu=" + RingHex(gpu_word) + " guest=" + RingHex(guest_word) + ")");
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
 
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
@@ -52930,6 +53082,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheOrderedWrite();
     vulkan.CheckBufferCachePreciseWrites();
     vulkan.CheckTextureCacheCollectorProgress();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-ring-image-head-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCacheRingImageHead();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {

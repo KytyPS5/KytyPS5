@@ -1,5 +1,31 @@
 # Emulator regression test debt
 
+## Finite inline selectors and exact optimizer cache (2026-10-11)
+
+Completed local selector fix257189e5: RED101934 retains unreachable inter-record
+R8 descriptors; GREEN102546 removes them. Source index is a bounded U32 constant
+union through Phi/Select, with nonempty ReadFirstLane proof. Unknown/undef,
+unsupported arithmetic, cycles and empty lane scope retain conservative handling.
+GREEN103311 additionally proves the legitimate wrapped value0x03c3c3c4 keeps
+key32/R8; filtering by descriptor format or NumRecords is not permitted.
+Full resources102940 and GPUAV wave contracts/neighbors/readback1029473/3 pass.
+
+Actual fresh capture from original094820/4f6fffda/EXE9f8dc68d reproduces the
+same row64 failure (natural32110:06:35/no guards/minRAM15.48GiB). It contains
+1146 events and successful first texture ownership/read. New CPU snapshot102832
+proves input images0/1 selector{0,1,2,3,UINTMAX}, excludes unreachable keys32/168
+and reaches second RGBA input. The latter ownership event was not captured:
+explicit input_error at0x80811c0000/1183744; it is not permission to invent proof.
+Original retry on the corrected selector remains required.
+
+Optimizer cache3391a9fd: native production RED101547 has no requested artifact;
+unchanged GREEN102614 emits miss/hit/repair and byte-identical uncached oracle.
+Independent real-SPIR-V helper102610 covers exact inputs/state, corruption,
+collision, recipe changes and size/path bounds. Generated identity hashes linked
+libraries plus exact recipe after their build. Cache is opt-in, atomic, bounded
+2GiB/2048 records and preserves validation/fallback. A prior1464-call trace would
+need~0.735GiB; actual cold population and warm runtime speed remain unmeasured.
+
 ## Sparse texture wave-row regression (2026-10-11, in progress)
 
 Source4f6fffda: final corrected fixture RED092613 -> unchanged GREEN092803;

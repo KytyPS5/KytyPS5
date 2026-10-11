@@ -1,5 +1,56 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-11 10:39 UTC** (finite selectors/cache; original retry active):
+
+- Local selector correction257189e5: RED101934 -> GREEN102546; reachable
+  wrapped R8 key32 and boundary cases103311 pass. Full resources102940 and
+  GPUAV wave contracts/neighbors/readback1029473/3 pass.
+- Actual fresh snapshot102832 proves input images0/1 use selector set
+  {0,1,2,3,UINTMAX}; it reaches the second RGBA input and explicitly reports
+  missing ownership range0x80811c0000/1183744. No missing proof was invented.
+- Optional optimizer cache3391a9fd: production RED101547 -> GREEN102614
+  miss/hit/repair with byte-identical real optimizer oracle; helper102610
+  validates state/input/corruption/collision/bounds. Identity06624525 hashes
+  actual linked libraries plus unchanged recipe. Runtime warm benefit pending.
+- Native build103519 passed. Private EXE SHA256
+  `33bb84e5d691b047ac48bd73fa871c56e895a32fa62bf0ee40e34268460369a9`.
+  Installed454656/eboot5178/user SaveData intact; prior private9f8d backed up.
+- ACTIVE `_Build/runs/game-20261011-103831-finite-selector-cache-cold`,
+  PID40376/supervisor81189, source3391a9fd frozen, original Performance1280x720/
+  redzone,1800s32GiB8GiB reserve. Compatible driver cache warm; optimizer cache
+  initially empty at private texture-wave-domain-20261011T092503Z/optimizer-cache.
+  Target success/all resource failures/ownership results captured. Await outcome
+  before further native tests/builds/source edits. Menu/gameplay still pending;
+  no push or new issue108 milestone.
+
+Checkpoint **2026-10-11 10:16 UTC** (native retry finalized; next finite selector RED):
+
+- Original retry094820/source4f6fffda/EXE9f8dc68d naturally exits321 at
+  **10:06:35.6779005 UTC**; no timeout, guard or forced cleanup. Minimum free
+  RAM15.48GiB. PID7500 and supervisor71820 completed/drained; native slot idle
+  until the new bounded regression build. No new visible pixels/menu/gameplay.
+- Same PS617c/pc8b4 row64 remains. Fresh capture now has1146 ordered events,
+  complete ownership metadata, one **successful** range proof and one successful
+  full1,183,744-byte texture read. This rules out a dirty-read/attachment rejection
+  for the first input. The earlier assumption of a failed payload read was wrong.
+- The next rejected input is a valid R8UInt descriptor at wrapped key32 (and168),
+  belonging to neighboring record fields. Inline stride136 with unknown selector
+  enumerates multiples8; the diagnostic supplement only reported supported RGBA8
+  at keys0/136, and did not prove the complete candidate domain.
+- Exact IR input selector199 is a finite Select/Phi union{0,1,2,3,UINTMAX}.
+  The needed shared correction is a bounded static selector proof with proper
+  nonempty ReadFirstLane scope, preserving U32 scaling and scalar OOB-null.
+  Synthetic `--finite-inline-selector-only` is being run against unchanged
+  production before activation; reachable/unknown/wrap negatives still required.
+- Warm native driver cache worked; the partial245 pipeline creations total
+  0.885s, while268 optimizer calls total87.582s. Exact-input optimizer cache has
+  independent native missing-artifact RED101547 and is now being integrated;
+  draft identity hashes actual libraries/recipe after build. Cold population
+  and measured warm benefit remain pending, not a claimed game speedup.
+- Artifacts: run094820/resource-capture, private iteration-profile-partial.json
+  and opt-cache-draft under `_Build/analysis/texture-wave-domain-20261011T092503Z`.
+  Original installed454656/eboot5178/SaveData preserved; no push/issue post.
+
 Checkpoint **2026-10-11 09:50 UTC** (packed RGB correction; original retry active):
 
 - Local source **4f6fffda** implements a conditional IR proof for initialized

@@ -134,7 +134,17 @@ public:
 	void MarkBufferModified(uint64_t epoch) noexcept {
 		m_buffer_modified    = true;
 		m_buffer_write_epoch = epoch;
+		m_superseded.clear();
 		HeapChanged();
+	}
+	// Guest bytes a later GPU buffer write replaced; never written back from this image.
+	bool               Supersede(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsSuperseded() const noexcept { return !m_superseded.empty(); }
+	[[nodiscard]] std::span<const std::pair<uint64_t, uint64_t>> SupersededRanges() const noexcept {
+		return m_superseded;
+	}
+	[[nodiscard]] bool SupersededAfterLastGpuWrite() const noexcept {
+		return IsSuperseded() && m_superseded_epoch > m_gpu_write_epoch;
 	}
 	void ClearBufferModified() noexcept { m_buffer_modified = false; }
 
@@ -211,15 +221,19 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext&   m_graphics;
-	CommandScheduler& m_scheduler;
-	uint64_t          m_maybe_cpu_hash  = 0;
-	bool              m_cpu_dirty       = false;
-	bool              m_maybe_cpu_dirty = false;
-	bool              m_gpu_modified    = false;
-	bool              m_buffer_modified = false;
+	GraphicContext&                            m_graphics;
+	CommandScheduler&                          m_scheduler;
+	uint64_t                                   m_maybe_cpu_hash     = 0;
+	bool                                       m_cpu_dirty          = false;
+	bool                                       m_maybe_cpu_dirty    = false;
+	uint64_t                                   m_gpu_write_serial   = 0;
 	uint64_t                                   m_gpu_write_epoch    = 0;
 	uint64_t                                   m_buffer_write_epoch = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> m_superseded;
+	uint64_t                                   m_superseded_epoch = 0;
+	bool                                       m_gpu_modified     = false;
+	bool                                       m_buffer_modified  = false;
+	bool                                       m_backing_failed   = false;
 };
 
 namespace ImageOps {

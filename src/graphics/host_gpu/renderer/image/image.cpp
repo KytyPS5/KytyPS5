@@ -897,6 +897,37 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	                     info.resources.levels, info.resources.layers, info.samples);
 }
 
+bool Image::Supersede(uint64_t address, uint64_t size) {
+	constexpr size_t MaxRanges   = 64;
+	const uint64_t   image_begin = info.data.address;
+	const uint64_t   image_end   = image_begin + info.data.size;
+	const uint64_t   begin       = std::max(address, image_begin);
+	const uint64_t   end         = size > image_end - std::min(address, image_end)
+	                                   ? image_end
+	                                   : std::min(address + size, image_end);
+	if (begin >= end) {
+		return false;
+	}
+	m_superseded.emplace_back(begin, end);
+	m_superseded_epoch = NextImageWriteEpoch();
+	std::ranges::sort(m_superseded);
+	size_t merged = 0;
+	for (size_t i = 1; i < m_superseded.size(); i++) {
+		if (m_superseded[i].first <= m_superseded[merged].second) {
+			m_superseded[merged].second =
+			    std::max(m_superseded[merged].second, m_superseded[i].second);
+		} else {
+			m_superseded[++merged] = m_superseded[i];
+		}
+	}
+	m_superseded.resize(merged + 1);
+	if (m_superseded.size() > MaxRanges) {
+		m_superseded = {{m_superseded.front().first, m_superseded.back().second}};
+	}
+	return m_superseded.size() == 1 && m_superseded.front().first == image_begin &&
+	       m_superseded.front().second == image_end;
+}
+
 }
 
 uint64_t Image::HashGuestEdges() const {

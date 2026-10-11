@@ -495,6 +495,13 @@ void GameController::CheckActive() {
 	if (!m_connected && new_connected) {
 		m_connected_count++;
 	}
+	if (m_haptics_rumble_active && m_active_id >= 0 && m_active_id != HOST_INPUT_CONTROLLER_ID) {
+		// Stop the previous pad's haptics rumble; it may already be gone (null pad).
+		if (auto* old_pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+		    old_pad != nullptr) {
+			(void)SDL_RumbleGamepad(old_pad, 0, 0, 0);
+		}
+	}
 	m_active_id     = new_active_id;
 	m_connected     = new_connected;
 	m_state         = {};

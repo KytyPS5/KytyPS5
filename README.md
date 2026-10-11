@@ -244,25 +244,17 @@ inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
 
 ### Building on Fedora and Fedora Atomic (Bazzite, Bluefin, Silverblue)
 
-On regular Fedora Workstation, install the packages below directly on the host. On image-based
-Fedora variants such as Bazzite, Bluefin and Silverblue, build inside a Distrobox (preinstalled on
-Bazzite and Bluefin) so the read-only base image stays untouched:
+On regular Fedora, install dependencies on the host. On Fedora Atomic variants such as Bazzite,
+Bluefin and Silverblue, use [Distrobox](https://distrobox.it/) and run the install and build steps
+inside the container. Keep the checkout in your home directory so it is shared with the container.
+Add `--nvidia` to the create command for hosts using the proprietary NVIDIA driver:
 
 ```bash
 distrobox create --name kyty-build --image registry.fedoraproject.org/fedora:latest
 distrobox enter kyty-build
 ```
 
-On systems using the proprietary NVIDIA driver, add `--nvidia` to the `distrobox create` command.
-Without it the container cannot see the NVIDIA GPU and Vulkan falls back to integrated graphics
-or a software renderer:
-
-```bash
-distrobox create --nvidia --name kyty-build --image registry.fedoraproject.org/fedora:latest
-```
-
-Install the toolchain, Qt 6 and the libraries the bundled SDL3 needs. These are the Fedora
-equivalents of the Debian/Ubuntu packages listed above:
+Install the toolchain, Qt 6 and SDL3 dependencies:
 
 ```bash
 sudo dnf install -y \
@@ -273,32 +265,19 @@ sudo dnf install -y \
   wayland-devel wayland-protocols-devel qt6-qtbase-devel
 ```
 
-Configure and build as on other distributions. Fedora's Qt 6 is found automatically, so
-`CMAKE_PREFIX_PATH` is not needed:
+From the repository root, follow the launcher configure, build and install steps in
+[Building on Linux](#building-on-linux), omitting `-DCMAKE_PREFIX_PATH="$Qt6_DIR"`; CMake finds
+Fedora's packaged Qt 6 automatically.
 
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-
-cmake --build _Build/linux --target launcher --parallel
-cmake --install _Build/linux --prefix _Build/linux/install
-```
-
-The install step bundles the Qt libraries next to the binaries, so on Fedora Atomic the result runs
-directly on the host, outside the container:
-
-```bash
-./_Build/linux/install/launcher
-```
-
-If the host is missing a library, run it through the container instead, which shares the host's
-display, audio, gamepads and GPU driver (on NVIDIA, only if it was created with `--nvidia`):
+Run `./_Build/linux/install/launcher` on regular Fedora or inside the container. To launch a
+container build from the host, leave the container with `exit`, then run from the repository root:
 
 ```bash
 distrobox enter kyty-build -- ./_Build/linux/install/launcher
 ```
+
+Qt libraries and plugins are bundled. You can also launch directly on a Fedora Atomic host
+if its other system libraries are compatible with the container build.
 
 ### Building on macOS
 

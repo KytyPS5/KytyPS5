@@ -73,7 +73,7 @@ public:
 	void RunGarbageCollector();
 
 private:
-	bool EvictForAllocation();
+	bool EvictForAllocation(ImageId keep);
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
@@ -107,7 +107,8 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	// keep: an image the caller still uses after the insert; eviction leaves it alone.
+	[[nodiscard]] ImageId            InsertImage(const ImageInfo& info, ImageId keep = {});
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);

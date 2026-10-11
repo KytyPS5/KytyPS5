@@ -194,11 +194,11 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
+ImageId TextureCache::InsertImage(const ImageInfo& info, ImageId keep) {
 	auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	for (int attempt = 0; m_slot_images[id].allocation_failed; attempt++) {
 		m_slot_images.erase(id);
-		if (attempt == 3 || !EvictForAllocation()) {
+		if (attempt == 3 || !EvictForAllocation(keep)) {
 			EXIT("failed to create image: extent=%ux%ux%u format=%u layers=%u levels=%u\n",
 			     info.extent.width, info.extent.height, info.extent.depth,
 			     static_cast<uint32_t>(info.pixel_format), info.resources.layers,
@@ -726,7 +726,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.first_tail_level    = cached.info.first_tail_level;
 	}
 	info.htile_clear_mask     = 0;
-	const auto replacement_id = InsertImage(info);
+	const auto replacement_id = InsertImage(info, cached_id);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
@@ -885,7 +885,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
-	const auto expanded_id = InsertImage(info);
+	const auto expanded_id = InsertImage(info, source_id);
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
@@ -1133,7 +1133,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		ImageInfo info {};
 		info.data   = stencil;
 		info.extent = depth.info.extent;
-		association = InsertImage(info);
+		association = InsertImage(info, depth_id);
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
@@ -1934,10 +1934,11 @@ void TextureCache::RunGarbageCollector() {
 
 // An image could not be allocated because device memory is full, which the regular collector
 // does not prevent when the working set grows quickly (scene transitions on 4-6 GB GPUs). Evict
-// images the current draw has not touched, downloading GPU-written ones like the collector does,
-// then finish the GPU work so their deferred destruction actually returns the memory before the
-// caller retries. Caller holds m_lock; none of the scheduler's deferred operations take it.
-bool TextureCache::EvictForAllocation() {
+// images that are neither bound for the draw being prepared, recently used, nor the caller's
+// source image, downloading GPU-written ones like the collector does, then finish the GPU work so
+// their deferred destruction actually returns the memory before the caller retries. Caller holds
+// m_lock; none of the scheduler's deferred operations take it.
+bool TextureCache::EvictForAllocation(ImageId keep) {
 	constexpr uint64_t EVICT_TARGET    = 256ull << 20u;
 	constexpr uint64_t DOWNLOAD_BUDGET = 32ull << 20u;
 	if (!m_scheduler.Active() || m_gc_tick < 2) {
@@ -1948,7 +1949,8 @@ bool TextureCache::EvictForAllocation() {
 	uint64_t             downloaded = 0;
 	m_lru_cache.ForEachItemBelow(m_gc_tick - 2, [&](ImageId id) {
 		const auto* image = m_slot_images.try_get(id);
-		if (image == nullptr || !image->registered || image->depth_id) {
+		if (image == nullptr || !image->registered || image->depth_id || id == keep ||
+		    image->binding.is_bound || image->binding.is_target) {
 			return false;
 		}
 		if (image->IsGpuModified() && image->SafeToDownload()) {

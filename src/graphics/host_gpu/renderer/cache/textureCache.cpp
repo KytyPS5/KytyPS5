@@ -1599,7 +1599,7 @@ Headroom::CollectorImageFacts TextureCache::CollectorFacts(const Image& image,
 	facts.registered       = image.registered;
 	facts.depth_associated = static_cast<bool>(image.depth_id);
 	facts.video_out        = image.usage.video_out;
-	facts.gpu_modified     = image.IsGpuModified();
+	facts.gpu_modified     = image.IsGpuModified() && !image.IsSuperseded();
 	facts.tiled            = image.info.IsTiled();
 	facts.stencil_plane    = image.info.HasStencil() && image.GpuWriteSerial() != 0;
 	if (!facts.gpu_modified) {
@@ -2022,7 +2022,39 @@ std::atomic<int> g_stencil_plane_redirect_override {-1};
 	return enabled;
 }
 
+std::atomic<int> g_supersede_reconcile_override {-1};
+std::atomic<int> g_supersede_at_base_override {-1};
+
+[[nodiscard]] bool SupersedeReconcileEnabled() {
+	const int forced = g_supersede_reconcile_override.load(std::memory_order_relaxed);
+	if (forced >= 0) {
+		return forced != 0;
+	}
+	static const bool enabled = !EnvFlag("KYTY_NO_SUPERSEDE_RECONCILE");
+	return enabled;
+}
+
+[[nodiscard]] bool SupersedeAtBaseEnabled() {
+	if (!SupersedeReconcileEnabled()) {
+		return false;
+	}
+	const int forced = g_supersede_at_base_override.load(std::memory_order_relaxed);
+	if (forced >= 0) {
+		return forced != 0;
+	}
+	static const bool enabled = EnvFlag("KYTY_SUPERSEDE_AT_BASE");
+	return enabled;
+}
+
 } // namespace
+
+void TextureCache::OverrideSupersedeReconcile(std::optional<bool> enabled,
+                                              std::optional<bool> at_base) {
+	g_supersede_reconcile_override.store(enabled ? (*enabled ? 1 : 0) : -1,
+	                                     std::memory_order_relaxed);
+	g_supersede_at_base_override.store(at_base ? (*at_base ? 1 : 0) : -1,
+	                                   std::memory_order_relaxed);
+}
 
 void TextureCache::OverrideStencilPlaneRedirect(std::optional<bool> enabled) {
 	g_stencil_plane_redirect_override.store(enabled ? (*enabled ? 1 : 0) : -1,
@@ -2183,7 +2215,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
-				inserted.MarkBufferModified();
+				inserted.MarkBufferModified(
+				    BufferWriteEpochOf(inserted.info.data.address, inserted.info.data.size));
 			}
 		}
 		SyncLayoutAlias(result, candidates);
@@ -2197,6 +2230,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		image.tick_accessed_last  = m_scheduler.CurrentTick();
 		image.frame_accessed_last = m_frame_index.load(std::memory_order_relaxed);
 		TouchImage(image);
+	}
+	if (SupersedeReconcileEnabled()) {
+		bool superseded = false;
+		{
+			std::scoped_lock lock {m_lock};
+			const auto&      image = m_slot_images[result];
+			superseded             = image.IsSuperseded() && !image.depth_id;
+		}
+		if (superseded) {
+			m_buffer_cache.ReconcileSupersededImage(result);
+		}
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
@@ -2756,15 +2800,51 @@ void TextureCache::DownloadDepthRegions(Image& image, std::vector<vk::BufferImag
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                              bool whole_image) {
-	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
-	if (!selected) {
-		return false;
+	if (!SupersedeReconcileEnabled()) {
+		const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
+		if (!selected) {
+			return false;
+		}
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		return WriteBackImage(buffer, selected, size, whole_image);
 	}
 
 	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto&            image = m_texture_cache.m_slot_images[selected];
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	std::vector<ImageId> owners;
+	for (const auto id: m_texture_cache.FindImagesInRegion(vaddr, size, false)) {
+		const auto owner = m_texture_cache.m_slot_images.try_get(id);
+		if (owner == nullptr || owner->depth_id || owner->info.data.address != vaddr ||
+		    !owner->SafeToDownload()) {
+			continue;
+		}
+		owners.push_back(id);
+	}
+	std::ranges::sort(owners, [&](ImageId a, ImageId b) {
+		return m_texture_cache.m_slot_images[a].GpuWriteEpoch() <
+		       m_texture_cache.m_slot_images[b].GpuWriteEpoch();
+	});
+	bool written = false;
+	for (size_t index = 0; index < owners.size(); index++) {
+		const auto& image   = m_texture_cache.m_slot_images[owners[index]];
+		const bool  covered = std::any_of(
+		    owners.begin() + static_cast<ptrdiff_t>(index) + 1, owners.end(), [&](ImageId newer) {
+			    return m_texture_cache.m_slot_images[newer].info.data.size >= image.info.data.size;
+		    });
+		if (!covered) {
+			written |= WriteBackImage(buffer, owners[index], size, whole_image);
+		}
+	}
+	return written;
+}
+
+bool BufferCache::WriteBackImage(Buffer& buffer, Common::SlotId id, uint64_t size,
+                                 bool whole_image) {
+	auto& image = m_texture_cache.m_slot_images[id];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!image.SafeToDownload()) {
+	if (!image.SafeToDownload() || (image.IsSuperseded() && !SupersedeReconcileEnabled())) {
 		return false;
 	}
 	if (whole_image && size < image.info.data.size) {
@@ -2821,8 +2901,79 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	MarkGpuWrite(image.info.data.address, copy_size);
+	if (!image.SupersededAfterLastGpuWrite()) {
+		image.ClearSuperseded();
+		m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
+		return true;
+	}
+	struct Span {
+		uint64_t offset = 0;
+		uint64_t size   = 0;
+	};
+	std::vector<Span> spans;
+	uint64_t          saved = 0;
+	for (const auto& [begin, end]: image.SupersededRanges()) {
+		const auto first = std::max(begin, image.info.data.address);
+		const auto last  = std::min(end, image.info.data.address + copy_size);
+		if (first < last) {
+			spans.push_back({first - image.info.data.address, last - first});
+			saved += last - first;
+		}
+	}
+	if (saved == 0) {
+		m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
+		return true;
+	}
+	auto stash = std::make_unique<Buffer>(
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, saved);
+	auto&    command = m_scheduler.Current();
+	uint64_t at      = 0;
+	for (const auto& span: spans) {
+		stash->CopyFrom(command, buffer, buf_offset + span.offset, at, span.size);
+		at += span.size;
+	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
+	at = 0;
+	for (const auto& span: spans) {
+		buffer.CopyFrom(m_scheduler.Current(), *stash, at, buf_offset + span.offset, span.size);
+		at += span.size;
+	}
+	m_scheduler.DeferOperation([owner = std::move(stash)]() mutable { owner.reset(); });
 	return true;
+}
+
+void BufferCache::ReconcileSupersededImage(Common::SlotId id) {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		auto*            image = m_texture_cache.m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id || !image->IsSuperseded()) {
+			return;
+		}
+		if (!image->SupersededAfterLastGpuWrite()) {
+			image->ClearSuperseded();
+			return;
+		}
+		if (!image->SafeToDownload() || image->backing.image == nullptr) {
+			return;
+		}
+		address = image->info.data.address;
+		size    = image->info.data.size;
+	}
+	auto [buffer, offset] = ObtainBuffer(address, size, true, false);
+	(void)offset;
+	std::scoped_lock lock {m_texture_cache.m_lock};
+	auto*            image = m_texture_cache.m_slot_images.try_get(id);
+	if (image == nullptr || buffer == nullptr || !image->SupersededAfterLastGpuWrite()) {
+		return;
+	}
+	const bool written = WriteBackImage(*buffer, id, size, true);
+	if (written) {
+		image->ClearGpuModified();
+		image->MarkBufferModified();
+	}
 }
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
@@ -2917,13 +3068,49 @@ bool TextureCache::DownloadImageBatch(Image& image, ImageDownload& transfer,
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
+	std::vector<std::pair<uint64_t, uint64_t>> kept;
+	uint64_t                                   cursor = range.address;
+	const bool                                 honour_superseded =
+	    !SupersedeReconcileEnabled() || image.SupersededAfterLastGpuWrite();
+	for (const auto& [begin, end]: honour_superseded
+	                                   ? image.SupersededRanges()
+	                                   : std::span<const std::pair<uint64_t, uint64_t>> {}) {
+		const auto first = std::max(begin, range.address);
+		const auto last  = std::min(end, range.address + range.size);
+		if (first >= last) {
+			continue;
+		}
+		if (first > cursor) {
+			kept.emplace_back(cursor, first);
+		}
+		cursor = std::max(cursor, last);
+	}
+	if (cursor < range.address + range.size) {
+		kept.emplace_back(cursor, range.address + range.size);
+	}
 	m_scheduler.DeferPriorityOperation(
-	    [&download, range, mapped, offset] {
+	    [&download, range, mapped, offset, kept = std::move(kept)] {
 		    download.Invalidate(offset, range.size);
-		    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		    for (const auto& [begin, end]: kept) {
+			    LibKernel::Memory::WriteBacking(
+			        begin, static_cast<const uint8_t*>(mapped) + (begin - range.address),
+			        end - begin);
+		    }
 	    },
 	    range.address, range.size);
 	return true;
+}
+
+uint64_t TextureCache::BufferWriteEpochOf(uint64_t address, uint64_t size) const {
+	constexpr uint64_t PageBits = 16;
+	uint64_t           epoch    = 0;
+	for (auto page = address >> PageBits; page <= (address + size - 1) >> PageBits; page++) {
+		if (const auto found = m_buffer_write_epochs.find(page);
+		    found != m_buffer_write_epochs.end()) {
+			epoch = std::max(epoch, found->second);
+		}
+	}
+	return epoch != 0 ? epoch : NextImageWriteEpoch();
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
@@ -2931,9 +3118,20 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	{
+		constexpr uint64_t PageBits = 16;
+		const auto         epoch    = NextImageWriteEpoch();
+		for (auto page = address >> PageBits; page <= (address + size - 1) >> PageBits; page++) {
+			m_buffer_write_epochs[page] = epoch;
+		}
+	}
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.info.data.address != address) {
+		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		if ((image.info.data.address != address || SupersedeAtBaseEnabled()) &&
+		    image.IsGpuModified() && !image.Supersede(address, size)) {
 			continue;
 		}
 		if (image.IsGpuModified()) {
@@ -3127,6 +3325,9 @@ bool TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	for (auto page = address >> 16; page <= (address + size - 1) >> 16; page++) {
+		m_buffer_write_epochs.erase(page);
+	}
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {

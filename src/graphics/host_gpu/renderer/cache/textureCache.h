@@ -101,6 +101,8 @@ public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	static void OverrideStencilPlaneRedirect(std::optional<bool> enabled);
+	static void OverrideSupersedeReconcile(std::optional<bool> enabled,
+	                                       std::optional<bool> at_base = std::nullopt);
 
 	struct ImageDesc {
 		ImageInfo     info;
@@ -222,6 +224,7 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	static void               MarkEdgeMaybeDirty(Image& image);
+	[[nodiscard]] uint64_t    BufferWriteEpochOf(uint64_t address, uint64_t size) const;
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameGuestLayout(const ImageInfo& cached, const ImageInfo& requested);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -317,6 +320,8 @@ private:
 	std::unordered_map<ImageId, uint64_t>  m_evict_pending;
 	std::unordered_map<ImageId, uint64_t>  m_evict_backoff;
 	std::unordered_map<uint64_t, uint64_t> m_evicted_addresses;
+	// Image write epoch of the last GPU buffer write to each 64 KB page.
+	std::unordered_map<uint64_t, uint64_t> m_buffer_write_epochs;
 	std::mutex                             m_evict_published_lock;
 	std::vector<ImageId>                   m_evict_published;
 	std::map<uint64_t, MetaDataInfo>       m_surface_metas;

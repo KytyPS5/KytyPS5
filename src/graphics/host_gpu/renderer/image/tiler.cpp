@@ -2,6 +2,8 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
@@ -13,7 +15,6 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard4_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -254,18 +255,90 @@ vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
 	return pipeline;
 }
 
-void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
-                         vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
-                         const Tiling& tiling, bool clear_target) {
+TileManager::Result TileManager::StageTiled(uint64_t offset, uint64_t capacity) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_descriptor_offset = Common::AlignDown(source_offset, descriptor_alignment);
-	const uint64_t target_descriptor_offset = Common::AlignDown(target_offset, descriptor_alignment);
-	const uint64_t source_base              = source_offset - source_descriptor_offset;
-	const uint64_t target_base              = target_offset - target_descriptor_offset;
-	const uint64_t source_range             = Common::AlignUp(source_base + source_capacity, 4);
-	const uint64_t target_range             = Common::AlignUp(target_base + target_capacity, 4);
+	const uint64_t base = offset & (descriptor_alignment - 1);
+	const uint64_t size = Common::AlignUp(base + capacity, 4);
+	m_scratch_used_tick = m_scheduler.CurrentTick();
+	if (!m_tiled_scratch || m_tiled_scratch->Size() < size) {
+		if (m_tiled_scratch) {
+			m_scheduler.DeferOperation(
+			    [old = std::move(m_tiled_scratch)]() mutable { old.reset(); });
+		}
+		m_tiled_scratch = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+		        vk::BufferUsageFlagBits::eTransferDst,
+		    size);
+	}
+	return {m_tiled_scratch->Handle(), base, capacity};
+}
+
+void TileManager::Record(bool device_local, vk::Buffer source, uint64_t source_offset,
+                         uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
+                         uint64_t target_capacity, const Tiling& tiling, bool clear_target) {
+	const bool tile         = !clear_target;
+	const auto tiled_offset = tile ? target_offset : source_offset;
+	const auto tiled_bytes  = tile ? target_capacity : source_capacity;
+	const auto tiled_buffer = tile ? target : source;
+	if (device_local) {
+		RecordPasses(source, source_offset, source_capacity, target, target_offset, target_capacity,
+		             tiling);
+		return;
+	}
+	const auto staged = StageTiled(tiled_offset, tiled_bytes);
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eMemoryRead |
+	                       vk::AccessFlagBits::eHostWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	    vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0, nullptr);
+	// Tiling preserves the bytes no element covers, so the guest copy seeds the scratch too.
+	const vk::BufferCopy copy_in {tiled_offset, staged.offset, tiled_bytes};
+	command.copyBuffer(tiled_buffer, staged.buffer, 1, &copy_in);
+	if (tile) {
+		RecordPasses(source, source_offset, source_capacity, staged.buffer, staged.offset,
+		             target_capacity, tiling);
+		command = m_scheduler.Current().Handle();
+		const vk::BufferCopy copy_out {staged.offset, target_offset, target_capacity};
+		command.copyBuffer(staged.buffer, target, 1, &copy_out);
+		vk::BufferMemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.buffer              = target;
+		after.offset              = target_offset;
+		after.size                = target_capacity;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &after,
+		                        0, nullptr);
+		return;
+	}
+	RecordPasses(staged.buffer, staged.offset, source_capacity, target, target_offset,
+	             target_capacity, tiling);
+}
+
+void TileManager::RecordPasses(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+                               vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
+                               const Tiling& tiling) {
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t source_descriptor_offset =
+	    Common::AlignDown(source_offset, descriptor_alignment);
+	const uint64_t target_descriptor_offset =
+	    Common::AlignDown(target_offset, descriptor_alignment);
+	const uint64_t source_base  = source_offset - source_descriptor_offset;
+	const uint64_t target_base  = target_offset - target_descriptor_offset;
+	const uint64_t source_range = Common::AlignUp(source_base + source_capacity, 4);
+	const uint64_t target_range = Common::AlignUp(target_base + target_capacity, 4);
 	EXIT_NOT_IMPLEMENTED(source_range > limits.maxStorageBufferRange ||
 	                     target_range > limits.maxStorageBufferRange || target_offset % 4 != 0 ||
 	                     target_capacity % 4 != 0);
@@ -281,9 +354,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	barriers[0].offset              = source_offset;
 	barriers[0].size                = source_capacity;
 	barriers[1]                     = barriers[0];
-	barriers[1].dstAccessMask =
-	    clear_target ? vk::AccessFlagBits::eTransferWrite
-	                 : vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	barriers[1].buffer        = target;
 	barriers[1].offset        = target_offset;
 	barriers[1].size          = target_capacity;
@@ -297,15 +368,6 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
 	    nullptr, 3, barriers, 0, nullptr);
-	if (clear_target) {
-		command.fillBuffer(target, target_offset, target_capacity, 0);
-		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		barriers[1].dstAccessMask =
-		    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                        vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1,
-		                        &barriers[1], 0, nullptr);
-	}
 
 	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
 	const vk::DescriptorBufferInfo target_info {target, target_descriptor_offset, target_range};
@@ -338,7 +400,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 }
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
-                                        const ImageInfo& info) {
+                                        const ImageInfo& info, bool device_local) {
 	if (!info.IsTiled()) {
 		const Result source {tiled, tiled_offset, info.data.size};
 		return info.GetColorTransform() == ColorTransform::None
@@ -350,27 +412,32 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	const uint64_t source_base     = tiled_offset & (descriptor_alignment - 1);
 	const auto     linear_capacity = info.LinearSize();
+	StreamHold     hold(m_stream_buffer);
 	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, source_base, 0);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
-	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
+	Record(device_local, tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size,
+	       tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                       const ImageInfo& info, uint32_t levels) {
+                       const ImageInfo& info, uint32_t levels, bool device_local) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	const uint64_t source_base = linear_offset & (descriptor_alignment - 1);
 	const uint64_t target_base = tiled_offset & (descriptor_alignment - 1);
+	StreamHold     hold(m_stream_buffer);
 	const auto     tiling =
 	    Prepare(true, tiled_capacity, linear_capacity, info, levels, source_base, target_base);
+	Record(device_local, linear, linear_offset, linear_capacity, tiled, tiled_offset,
+	       tiled_capacity, tiling, false);
 }
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                            uint32_t levels) {
+                            uint32_t levels, bool device_local) {
 	EXIT_IF(regions.empty());
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
@@ -378,17 +445,36 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	const uint64_t target_base     = tiled_offset & (descriptor_alignment - 1);
 	const auto     linear_capacity = image.info.LinearSize(levels);
 	// Reserve stream parameters before recording the image download.
+	StreamHold hold(m_stream_buffer);
 	const auto tiling =
 	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, target_base);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
-	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling, false);
+	Record(device_local, linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity,
+	       tiling, false);
+}
+
+void TileManager::ReleaseScratch() {
+	constexpr uint64_t IdleSubmissions = 256;
+	if (m_scheduler.CurrentTick() - std::min(m_scheduler.CurrentTick(), m_scratch_used_tick) <
+	    IdleSubmissions) {
+		return;
+	}
+	for (auto& buffer: m_scratch) {
+		if (buffer) {
+			m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });
+		}
+	}
+	if (m_tiled_scratch) {
+		m_scheduler.DeferOperation([old = std::move(m_tiled_scratch)]() mutable { old.reset(); });
+	}
 }
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
 	EXIT_IF(size == 0);
-	size = Common::AlignUp(size, 4);
-	auto& buffer = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
+	m_scratch_used_tick = m_scheduler.CurrentTick();
+	size                = Common::AlignUp(size, 4);
+	auto& buffer        = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
 	if (!buffer || buffer->Size() < size) {
 		if (buffer) {
 			m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });

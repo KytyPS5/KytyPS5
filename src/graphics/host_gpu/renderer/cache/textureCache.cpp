@@ -2898,6 +2898,9 @@ void TextureCache::RunGarbageCollector(bool per_frame) {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	if (m_total_used_memory >= m_pressure_gc_memory) {
+		m_tiler.ReleaseScratch();
+	}
 	const uint64_t frame       = m_frame_index.load(std::memory_order_relaxed);
 	uint32_t       evictions   = 0;
 	const auto     budget      = m_graphics.GetMemoryBudget();

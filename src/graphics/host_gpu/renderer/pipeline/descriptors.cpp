@@ -1012,12 +1012,37 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
-				for (const auto& resource: program.info.buffers) {
+				const auto& extents = writer->runtime->resources->buffer_write_extents;
+				for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
+					const auto& resource = program.info.buffers[index];
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					// The bytes the dispatch can store to, when its stores are bounded: a
+					// heap-wide descriptor alone does not count as an overlap.
+					auto written_address = written.address;
+					auto written_size    = written.size;
+					if (index < extents.size() && extents[index].valid) {
+						written_address += extents[index].begin;
+						written_size = extents[index].end > extents[index].begin
+						                   ? extents[index].end - extents[index].begin
+						                   : 0;
+					}
+					if (written_size != 0 &&
+					    ImageRangeOverlaps(address, size, written_address, written_size)) {
+						// The host evaluates these inputs from the state before the dispatch.
+						// Reported once per shader pair; the dispatch goes on.
+						static std::mutex                   reported_mutex;
+						static std::unordered_set<uint64_t> reported;
+						const auto reader_hash = reader->runtime->program->shader_hash;
+						std::scoped_lock lock(reported_mutex);
+						if (reported.insert(reader_hash ^ (program.shader_hash << 1u)).second) {
+							LOGF("Warning: scalar resource reads overlap a shader buffer write: "
+							     "reader 0x%016" PRIx64 " reads 0x%" PRIx64 "+0x%" PRIx64
+							     ", writer 0x%016" PRIx64 " buffer %u writes 0x%" PRIx64
+							     "+0x%" PRIx64 "\n",
+							     reader_hash, address, size, program.shader_hash, index,
+							     written_address, written_size);
+						}
 					}
 				}
 			}

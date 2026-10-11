@@ -66,6 +66,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes);
 int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, int64_t offset);
+int64_t KYTY_SYSV_ABI KernelWritev(int d, const KernelIovec* iov, int iovcnt);
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence);
 int KYTY_SYSV_ABI     KernelStat(const char* path, FileStat* sb);
 int KYTY_SYSV_ABI     KernelFstat(int d, FileStat* sb);

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
 
 #include <chrono>
 #include <csignal>
@@ -1691,6 +1692,59 @@ void CheckSocketWakeup() {
         "closed descriptor fails without clearing input fd_set");
 }
 
+void TestWritev(const std::filesystem::path &root) {
+  using Libs::LibKernel::FileSystem::KernelIovec;
+  FileSystem::Mount(root, "/app0");
+  const int fd = FileSystem::KernelOpen("/app0/writev.bin", 0x0202, 0666);
+  Check(fd >= 3, "create writev fixture");
+
+  char first[] = "Hello, ";
+  char second[] = "iovec";
+  char third[] = " world";
+  const KernelIovec vectors[] = {{first, 7}, {nullptr, 0}, {second, 5}, {third, 6}};
+  Check(FileSystem::KernelWritev(fd, vectors, 4) == 18, "writev returns the total byte count");
+  Check(FileSystem::KernelLseek(fd, 0, 1) == 18, "writev advances the descriptor position");
+  Check(FileSystem::KernelWritev(fd, vectors, 0) == 0, "writev with no vectors writes nothing");
+
+  std::array<char, 18> readback{};
+  Check(FileSystem::KernelPread(fd, readback.data(), readback.size(), 0) == 18 &&
+            std::memcmp(readback.data(), "Hello, iovec world", 18) == 0,
+        "writev gathers vectors in order");
+
+  const KernelIovec tail[] = {{second, 5}};
+  Check(FileSystem::KernelWritev(fd, tail, 1) == 5 && FileSystem::KernelLseek(fd, 0, 1) == 23,
+        "writev continues at the current position");
+
+  Check(FileSystem::KernelWritev(fd, nullptr, 1) == Libs::LibKernel::KERNEL_ERROR_EFAULT,
+        "writev rejects a null vector array");
+  const KernelIovec null_base[] = {{nullptr, 4}};
+  Check(FileSystem::KernelWritev(fd, null_base, 1) == Libs::LibKernel::KERNEL_ERROR_EFAULT,
+        "writev rejects a null base with a non-zero length");
+  Check(FileSystem::KernelWritev(fd, vectors, -1) == Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelWritev(fd, vectors, 1025) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+        "writev rejects iovcnt outside 0..1024");
+  const KernelIovec overflow[] = {{first, static_cast<size_t>(INT_MAX)}, {first, 1}};
+  Check(FileSystem::KernelWritev(fd, overflow, 2) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+        "writev rejects a total length that overflows");
+  Check(FileSystem::KernelWritev(-1, vectors, 1) == Libs::LibKernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelWritev(4000, vectors, 1) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "writev rejects invalid descriptors");
+  Check(FileSystem::KernelClose(fd) == OK, "close writev fixture");
+
+  const int read_only = FileSystem::KernelOpen("/app0/writev.bin", 0, 0);
+  Check(read_only >= 3 &&
+            FileSystem::KernelWritev(read_only, vectors, 1) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "writev rejects a read-only descriptor");
+  Check(FileSystem::KernelClose(read_only) == OK, "close read-only writev fixture");
+
+  const int append = FileSystem::KernelOpen("/app0/writev.bin", 0x0009, 0);
+  Check(append >= 3 && FileSystem::KernelWritev(append, tail, 1) == 5,
+        "writev on an append descriptor");
+  Check(FileSystem::KernelClose(append) == OK, "close append writev fixture");
+  const auto host = root / "writev.bin";
+  Check(Common::File::Size(host) == 28, "append writev lands at the end of the file");
+}
+
 } // namespace
 
 int main(int, char**) {
@@ -1716,6 +1770,7 @@ int main(int, char**) {
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
   TestRandomDevices();
+  TestWritev(temporary.Path());
   TestFileDescriptorFlags();
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());

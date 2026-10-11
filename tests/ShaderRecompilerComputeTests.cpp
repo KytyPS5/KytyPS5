@@ -1971,6 +1971,9 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+// Set from the harness device: the emulator enables VK_EXT_robustness2 whenever the device has it.
+bool g_robust_buffer_access2 = false;
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
                            ShaderRecompiler::IR::ImageHeapSource *image_heap = nullptr) {
   auto user_data =
@@ -1992,6 +1995,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.profile = test.profile;
+  options.robust_buffer_access2 = g_robust_buffer_access2;
   options.dump_ir = true;
   options.emit_debug_info = true; // Checks find variables and functions by OpName.
   auto compute_info = test.compute_info;
@@ -2198,6 +2202,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
   options.profile = &Maintenance8Profile;
+  options.robust_buffer_access2 = g_robust_buffer_access2;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -27833,6 +27838,7 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_draw_indirect_supported = false;
+  bool m_robust_buffer_access2 = false;
   bool m_sparse_residency_supported = false;
   u32   m_skipped_cases          = 0;
 
@@ -28077,6 +28083,12 @@ private:
             "shader device clock is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_robustness2.robustBufferAccess2 == true,
+            "robustBufferAccess2 is not supported, so the emulator's buffer bounds model cannot "
+            "be tested");
+    m_robust_buffer_access2 = available_robustness2.robustBufferAccess2 == true;
+    g_robust_buffer_access2 = m_robust_buffer_access2;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.drawIndirectFirstInstance &&
@@ -28154,6 +28166,8 @@ private:
       provoking_vertex.pNext = &feedback_dynamic;
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
+    robustness2.robustBufferAccess2 = m_robust_buffer_access2;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
     min_lod.minLod = true;
     min_lod.pNext = m_rasterization_supported
@@ -28165,7 +28179,6 @@ private:
     shader_clock.shaderDeviceClock = true;
     shader_clock.pNext = &min_lod;
     maintenance8.pNext = &shader_clock;
-    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
     robustness2.pNext = &maintenance8;
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
@@ -40907,6 +40920,73 @@ TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
   return test;
 }
 
+// Every width must still read zero past the bound range and leave that memory untouched.
+TestCase BufferSubwordOutOfRangeZeroesAndDrops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 20);
+  code.push_back(EncodeMubuf0(0x08u, 0, false, true)); // BUFFER_LOAD_UBYTE
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  code.push_back(EncodeMubuf0(0x0au, 0, false, true)); // BUFFER_LOAD_USHORT
+  code.push_back(EncodeMubuf1(1, 0, 20));
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMubuf0(0x08u, 0, false, true)); // in range: byte 1 of dword 0
+  code.push_back(EncodeMubuf1(2, 0, 21));
+  AppendVMovLiteral(&code, 10, 0xabu);
+  code.push_back(EncodeMubuf0(0x18u, 0, false, true)); // BUFFER_STORE_BYTE, out of range
+  code.push_back(EncodeMubuf1(10, 0, 20));
+  AppendVMovLiteral(&code, 11, 0xcdcdu);
+  AppendVMovU32(&code, 22, 22);
+  code.push_back(EncodeMubuf0(0x1au, 0, false, true)); // BUFFER_STORE_SHORT, out of range
+  code.push_back(EncodeMubuf1(11, 0, 22));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendStoreVgpr(&code, 2, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferSubwordOutOfRangeZeroesAndDrops";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+                  0x55555555u, 0x66666666u};
+  test.expected = {0u, 0u, 0x11u, 0x44444444u, 0x55555555u, 0x66666666u};
+  test.storage_buffer_range_bytes = 16;
+  test.opcodes = {O::V_MOV_B32,          O::BUFFER_LOAD_UBYTE,
+                  O::BUFFER_LOAD_USHORT, O::BUFFER_STORE_BYTE,
+                  O::BUFFER_STORE_SHORT, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferWideOutOfRangeZeroesAndDrops(bool glc) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 16);
+  code.push_back(EncodeMubuf0(0x0du, 0, false, true, glc)); // BUFFER_LOAD_DWORDX2
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendVMovLiteral(&code, 10, 0xaaaaaaaau);
+  AppendVMovLiteral(&code, 11, 0xbbbbbbbbu);
+  code.push_back(EncodeMubuf0(0x1du, 0, false, true, glc)); // BUFFER_STORE_DWORDX2
+  code.push_back(EncodeMubuf1(10, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = glc ? "BufferWideGlcOutOfRangeZeroesAndDrops"
+                  : "BufferWideOutOfRangeZeroesAndDrops";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+                  0x55555555u, 0x66666666u};
+  test.expected = {0u, 0u, 0x33333333u, 0x44444444u, 0x55555555u, 0x66666666u};
+  test.storage_buffer_range_bytes = 16;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX2, O::BUFFER_STORE_DWORDX2,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferLoadFormatXyzwRejectsPartialRecord() {
   using O = ShaderOpcode;
 
@@ -52870,6 +52950,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
+  AddCase(BufferSubwordOutOfRangeZeroesAndDrops);
+  cases.push_back(BufferWideOutOfRangeZeroesAndDrops(false));
+  cases.push_back(BufferWideOutOfRangeZeroesAndDrops(true));
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
@@ -52901,6 +52984,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
+  AddCase(BufferStoreFormatXyzwResource8888SnormQuantizesFloats);
+  AddCase(BufferStoreFormatXyzwResource16161616SnormQuantizesFloats);
+  AddCase(BufferStoreFormatXyzwResource8888UnormQuantizesFloats);
+  AddCase(BufferStoreFormatXyResource1616FloatPacksHalf);
+  AddCase(BufferStoreFormatXResource16FloatPreservesUpperHalfword);
+  AddCase(BufferStoreFormatXyzwResource1010102UnormPacksBitfields);
   AddCase(BufferStoreFormatXyzResource111110FloatPacksSmallFloats);
   AddCase(BufferStoreFormatXyzResource111110FloatSaturatesSpecials);
   AddCase(BufferStoreFormatXyzResource111110FloatRoundsSubnormalAndNan);

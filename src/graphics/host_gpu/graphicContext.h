@@ -33,6 +33,8 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// VK_EXT_robustness2: an out-of-range buffer read returns zero and a write is discarded.
+	bool                               robust_buffer_access2_enabled         = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;

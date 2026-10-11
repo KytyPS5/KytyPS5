@@ -634,6 +634,7 @@ struct PipelineCache::ProgramCache {
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.host_subgroup_size = host_subgroup_size;
+		options.robust_buffer_access2 = robust_buffer_access2;
 		options.unfoldable_pcs        = proven.pcs;
 		const bool channel_rebuild    = !options.unfoldable_pcs.empty();
 
@@ -761,6 +762,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<uint64_t>                                call_stubbed_shaders;
 	ProgramKey                                                  lookup_key;
 	uint32_t                                                    host_subgroup_size    = 64;
+	bool                                                        robust_buffer_access2 = false;
 	GraphicContext&                                             graphics;
 	ShaderRecompiler::IR::ImageHeapSource*                      image_heap;
 	const ShaderRecompiler::Spirv::Profile                      profile;

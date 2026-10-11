@@ -756,6 +756,7 @@ struct ResourcePlan {
 	// On the plan because the host walk re-executes a readfirstlane once per lane.
 	uint32_t wave_size          = 64;
 	uint32_t host_subgroup_size = 64;
+	// The guest wave is wider than the lanes the emitted module can activate.
 	bool                                                   upper_lane_half_is_ghost = false;
 	bool                                                   robust_buffer_access2    = false;
 	std::list<Inst>                     value_storage;

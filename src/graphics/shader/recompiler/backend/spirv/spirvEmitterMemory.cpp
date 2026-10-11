@@ -403,9 +403,18 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
 }
 
+// With robustBufferAccess2 the device applies the binding's range to a bound storage buffer.
+bool DeviceBoundsChecked(const EmitterState& state, const MemoryResourceAccess& resource) {
+	return state.program.robust_buffer_access2 && (resource.kind == IR::ResourceKind::Buffer ||
+	                                               resource.kind == IR::ResourceKind::ScalarBuffer);
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	if (DeviceBoundsChecked(ctx.state, resource)) {
+		return LoadWordInBounds(ctx, resource, index, mem.glc);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
@@ -658,8 +667,11 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
                        const MemoryResourceAccess& resource, uint32_t data) {
 	if (resource.object_pointer == 0u) return;
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
-	const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
-	    EmitMemoryElementInBounds(ctx.state, resource, index));
+	const auto in_bounds =
+	    BufferIndexInBounds(ctx, inst, mem, resource,
+	                        DeviceBoundsChecked(ctx.state, resource)
+	                            ? ConstantBool(ctx.state, true)
+	                            : EmitMemoryElementInBounds(ctx.state, resource, index));
 	EmitIfCondition(ctx.state, in_bounds, [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
@@ -1736,6 +1748,14 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
+	if (DeviceBoundsChecked(state, access)) {
+		// The cap keeps the byte address inside 32 bits, so a huge offset cannot wrap into range.
+		const auto capped = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(
+		    state, element, ConstantU32(state, 0x3fffffffu));
+		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(
+		                     state, EmitMemoryElementPointer(state, access, capped)));
+		return;
+	}
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(

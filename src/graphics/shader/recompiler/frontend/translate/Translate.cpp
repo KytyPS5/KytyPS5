@@ -1018,6 +1018,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
 	result.host_subgroup_size  = options.host_subgroup_size;
+	// Only a workgroup stage splits wave64 over a 32-wide subgroup; elsewhere lanes 32+ are absent.
 	result.upper_lane_half_is_ghost =
 	    options.wave_size == 64u && options.host_subgroup_size == 32u &&
 	    ShaderWorkgroupInput(options.stage, options.input_info) == nullptr;

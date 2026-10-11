@@ -743,6 +743,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	robustness2.nullDescriptor      = VK_TRUE;
+	graphics.robust_buffer_access2_enabled = robustness2.robustBufferAccess2 == VK_TRUE;
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 	features13.pNext = &robustness2;

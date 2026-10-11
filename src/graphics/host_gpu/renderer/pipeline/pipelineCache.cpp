@@ -1096,6 +1096,7 @@ struct PipelineCache::ProgramCache {
 		options.input_info     = stage_input;
 		options.unfoldable_pcs = proven.pcs;
 		options.host_subgroup_size = host_subgroup_size;
+		options.robust_buffer_access2 = robust_buffer_access2;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -1260,8 +1261,9 @@ struct PipelineCache::ProgramCache {
 		std::printf("%s\n", line.c_str());
 	}
 
-	explicit ProgramCache(vk::Device device, uint32_t subgroup_size)
-	    : host_subgroup_size(subgroup_size == 0u ? 64u : subgroup_size), device(device) {
+	explicit ProgramCache(vk::Device device, uint32_t subgroup_size, bool robust_buffer_access2)
+	    : host_subgroup_size(subgroup_size == 0u ? 64u : subgroup_size),
+	      robust_buffer_access2(robust_buffer_access2), device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -1306,6 +1308,8 @@ struct PipelineCache::ProgramCache {
 	// A vertex or pixel stage has no workgroup input to carry the host subgroup width, and the
 	// translator needs it to know whether a wave64 guest mask has an upper half at all.
 	uint32_t   host_subgroup_size = 64;
+	// See CompileOptions::robust_buffer_access2.
+	bool       robust_buffer_access2 = false;
 	vk::Device device;
 	uint64_t   next_shader_id = 0;
 };
@@ -1396,7 +1400,8 @@ template class PipelineLibraryCache<PreRasterLibraryKey, PreRasterLibraryKeyHash
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
-      m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.subgroup_size)) {
+      m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.subgroup_size,
+                                                     graphics.robust_buffer_access2_enabled)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EnsurePipelineStallWatchdog();
 	InitializeDriverCache();

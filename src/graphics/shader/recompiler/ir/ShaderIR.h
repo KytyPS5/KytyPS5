@@ -823,6 +823,7 @@ struct ResourcePlan {
 	// all: a wave64 program on a 32-wide subgroup that is not emitted as two halves has no lane
 	// 32..63 any ballot can set, so a mask bit up there is one nothing can clear.
 	uint32_t host_subgroup_size = 64;
+	bool     robust_buffer_access2 = false;
 	// True when the guest wave is wider than the lanes the emitted module can activate; see
 	// `Translator::ClampGhostLanes`.
 	bool                          upper_lane_half_is_ghost = false;

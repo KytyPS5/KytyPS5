@@ -20,6 +20,8 @@ struct CompileOptions {
 	uint32_t                    wave_size       = 64;
 	// See IR::ResourcePlan::host_subgroup_size.
 	uint32_t                    host_subgroup_size = 64;
+	// VK_EXT_robustness2 on the device: buffer accesses then need no range test of their own.
+	bool                        robust_buffer_access2      = false;
 	uint32_t                    user_data_base  = 0;
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;

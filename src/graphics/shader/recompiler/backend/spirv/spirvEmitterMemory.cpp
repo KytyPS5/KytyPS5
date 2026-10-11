@@ -414,9 +414,17 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
 
+bool DeviceBoundsChecked(const EmitterState& state, const MemoryResourceAccess& resource) {
+	return state.program.robust_buffer_access2 && (resource.kind == IR::ResourceKind::Buffer ||
+	                                               resource.kind == IR::ResourceKind::ScalarBuffer);
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem);
+	if (DeviceBoundsChecked(ctx.state, resource)) {
+		return LoadWordInBounds(ctx, resource, index, mem.glc);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
@@ -687,6 +695,10 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = DwordIndex(ctx, inst, mem);
+	if (DeviceBoundsChecked(ctx.state, resource)) {
+		StoreWordInBounds(ctx, resource, index, data);
+		return;
+	}
 	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
@@ -1549,6 +1561,15 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                          state.flattened_srt_variable, ConstantU32(state, 0),
 	                          ctx.Arg(inst, 1));
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+}
+
+// KYTY_NO_SCALAR_BOUNDS_CAP=1 keeps the explicit test and select on every scalar buffer read.
+bool ClampScalarBufferBounds() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_SCALAR_BOUNDS_CAP");
+		return text == nullptr || text[0] == '\0' || text[0] == '0';
+	}();
+	return enabled;
 }
 
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {

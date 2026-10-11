@@ -26,6 +26,8 @@ struct TranslateOptions {
 	uint32_t                      wave_size           = 64;
 	// See IR::ResourcePlan::host_subgroup_size.
 	uint32_t                      host_subgroup_size  = 64;
+	// See CompileOptions::robust_buffer_access2.
+	bool                          robust_buffer_access2 = false;
 	uint64_t                      shader_hash         = 0;
 	uint32_t                      user_data_base      = 0;
 	uint32_t                      user_data_count     = 64;

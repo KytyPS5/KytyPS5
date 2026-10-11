@@ -1037,6 +1037,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
 	result.host_subgroup_size  = options.host_subgroup_size;
+	result.robust_buffer_access2 = options.robust_buffer_access2;
 	// The backend splits the wave into two halves only for a workgroup stage running wave64 on a
 	// 32-wide subgroup, so elsewhere guest lanes 32..63 do not exist at all.
 	result.upper_lane_half_is_ghost =

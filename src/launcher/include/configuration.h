@@ -48,11 +48,13 @@ struct ControllerSettings {
 	QString color;
 	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
+	bool    haptics_rumble      = true;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
+		s->setValue("controller_haptics_rumble", haptics_rumble);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -65,6 +67,7 @@ struct ControllerSettings {
 		};
 		speaker_volume      = read_percent("controller_speaker_volume", 50);
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
+		haptics_rumble      = s->value("controller_haptics_rumble", true).toBool();
 	}
 };
 

@@ -134,6 +134,13 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	// Images are created and evicted in arbitrary order, which leaves shared VMA blocks full of
+	// holes later images do not fit in. A dedicated allocation goes back to the driver whole on
+	// destruction. Only where the driver allows many allocations: Windows drivers commonly cap
+	// them at 4096.
+	if (physical_device_properties.limits.maxMemoryAllocationCount >= 65536u) {
+		alloc_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	}
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(

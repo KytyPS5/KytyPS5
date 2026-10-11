@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(__linux__)
 #include <linux/close_range.h>
 #include <unistd.h>
 #endif
@@ -24,7 +24,7 @@ int LoadExec(const char* path, const char* const argv[]) {
 	    !Common::File::IsFileExisting(Libs::LibKernel::FileSystem::GetRealFilename(path))) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(__linux__)
 	std::ifstream command("/proc/self/cmdline", std::ios::binary);
 	std::vector<std::string> arguments;
 	for (std::string argument; std::getline(command, argument, '\0') && argument != "--guest-exec";) {

@@ -19776,7 +19776,8 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  if (argc > 1 && std::strcmp(argv[1], "--audit-shader") == 0) {
+  if (argc > 1 && (std::strcmp(argv[1], "--audit-shader") == 0 ||
+                   std::strcmp(argv[1], "--audit-shader-snapshot") == 0)) {
     return RunShaderBatchAudit(argc, argv);
   }
 

@@ -875,8 +875,80 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+struct DrawSpecializationReadProof {
+	const CommandBuffer& buffer;
+	uint32_t color_output_mask;
+	uint32_t render_target_slice_offset;
+	std::vector<GuestRange> attachment_ranges;
+	bool described = false;
+	bool complete = true;
+	bool rejection_reported = false;
+
+	bool Reject(const char* reason, uint64_t address, uint64_t size) {
+		if (!rejection_reported && std::getenv("KYTY_SPECIALIZATION_RANGE_TRACE")) {
+			std::fprintf(stderr, "SpecializationRangeProof: rejected reason=%s address=0x%012" PRIx64
+			             " bytes=%" PRIu64 "\n", reason, address, size);
+			std::fflush(stderr);
+			rejection_reported = true;
+		}
+		return false;
+	}
+
+	void Add(const GuestRange& range) {
+		if (range.Empty()) return;
+		if (!range.Valid()) { complete = false; return; }
+		attachment_ranges.push_back(range);
+	}
+
+	void Describe() {
+		if (described) return;
+		described = true;
+		const auto& context = buffer.GetRegisters();
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; ++slot) {
+			if ((color_output_mask & (1u << slot)) == 0) continue;
+			const auto& regs = context.GetRenderTarget(slot);
+			const auto target = DescribeRenderColorTarget(context, render_target_slice_offset, slot);
+			Add(target.desc.info.data);
+			Add(target.desc.info.stencil);
+			Add(target.desc.info.metadata.range);
+			if (target.desc.info.metadata.kind != ImageMetadataKind::None &&
+			    !target.desc.info.metadata.range.Valid()) complete = false;
+			// FMASK footprints and unrelated metadata planes have no exact layout
+			// in the target description. They cannot establish immutability.
+			if (regs.fmask.addr != 0 ||
+			    (regs.cmask.addr != 0 &&
+			     target.desc.info.metadata.range.address != regs.cmask.addr) ||
+			    (regs.dcc_addr.addr != 0 &&
+			     target.desc.info.metadata.range.address != regs.dcc_addr.addr)) complete = false;
+		}
+		const auto depth = DescribeRenderDepthTarget(buffer);
+		Add(depth.desc.info.data);
+		Add(depth.desc.info.stencil);
+		Add(depth.desc.info.metadata.range);
+		if (depth.desc.info.metadata.kind != ImageMetadataKind::None &&
+		    !depth.desc.info.metadata.range.Valid()) complete = false;
+	}
+
+	static bool ReadOnly(void* userdata, uint64_t address, uint64_t size) {
+		if (userdata == nullptr) return false;
+		auto& self = *static_cast<DrawSpecializationReadProof*>(userdata);
+		if (!GuestRange {address, size}.Valid()) return self.Reject("invalid-range", address, size);
+		if (!LibKernel::Memory::IsBackingRangeExclusivelyMapped(address, size))
+			return self.Reject("backing-not-exclusive-or-unmapped", address, size);
+		self.Describe();
+		if (!self.complete) return self.Reject("unrepresented-attachment-metadata", address, size);
+		for (const auto& attachment : self.attachment_ranges) {
+			if (!LibKernel::Memory::AreBackingRangesDisjoint(
+			        address, size, attachment.address, attachment.size))
+				return self.Reject("attachment-overlap-or-unknown-backing", address, size);
+		}
+		return true;
+	}
+};
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
+                           uint32_t color_output_mask, uint32_t render_target_slice_offset,
+                           DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -935,9 +1007,11 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	DrawSpecializationReadProof read_proof {buffer, color_output_mask, render_target_slice_offset};
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
+	    DrawSpecializationReadProof::ReadOnly, &read_proof);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -948,7 +1022,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	RefreshShaders(buffer, draw, color_output_mask, render_target_slice_offset, state);
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {

@@ -170,6 +170,7 @@ nlohmann::ordered_json BuildResourceReadMetadata(const IR::SrtRuntime& runtime,
         {"read_memory", runtime.read_memory != nullptr},
         {"read_specialization_memory", runtime.read_specialization_memory != nullptr},
         {"clamp_memory_range", runtime.clamp_memory_range != nullptr},
+        {"specialization_range_read_only", runtime.specialization_range_read_only != nullptr},
         {"compute_workgroups_trusted", runtime.compute_workgroups_trusted},
         {"max_dense_buffers", runtime.max_dense_buffers},
         {"max_native_samplers", runtime.max_native_samplers},
@@ -213,15 +214,19 @@ std::vector<ReadEvent> ReadResourceReadMetadata(const nlohmann::ordered_json& in
     };
     triple("compute_workgroups", parsed.compute_workgroups);
     triple("evaluation_workgroup_id", parsed.evaluation_workgroup_id);
-    bool normal, strict, clamp;
+    bool normal, strict, clamp, read_only_range = false;
     Scalar(input.at("read_memory"), normal);
     Scalar(input.at("read_specialization_memory"), strict);
     Scalar(input.at("clamp_memory_range"), clamp);
+    if (input.contains("specialization_range_read_only"))
+        Scalar(input.at("specialization_range_read_only"), read_only_range);
     // These placeholders describe presence only. ResourceReadReplay replaces them.
     const auto unavailable = +[](void*, uint64_t, std::span<uint32_t>) { return false; };
     parsed.read_memory = normal ? unavailable : nullptr;
     parsed.read_specialization_memory = strict ? unavailable : nullptr;
     parsed.clamp_memory_range = clamp ? +[](void*, uint64_t, uint64_t) -> uint64_t { return 0; } : nullptr;
+    parsed.specialization_range_read_only = read_only_range
+        ? +[](void*, uint64_t, uint64_t) { return false; } : nullptr;
     const auto& entries = input.at("events");
     if (!entries.is_array() || entries.size() > 131072u)
         throw std::runtime_error("capture event count exceeds bound");
@@ -240,6 +245,9 @@ std::vector<ReadEvent> ReadResourceReadMetadata(const nlohmann::ordered_json& in
         if (event.kind == ReadKind::Clamp) {
             if (!clamp || !event.succeeded || !words.empty() || event.clamped_bytes > event.requested_bytes)
                 throw std::runtime_error("invalid captured clamp");
+        } else if (event.kind == ReadKind::ReadOnlyRange) {
+            if (!read_only_range || !words.empty() || event.clamped_bytes != 0)
+                throw std::runtime_error("invalid captured read-only range query");
         } else if (event.kind == ReadKind::Normal || event.kind == ReadKind::Strict) {
             if (!(event.kind == ReadKind::Normal ? normal : strict) ||
                 event.requested_bytes % 4u ||

@@ -7,7 +7,7 @@
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Capture {
-enum class ReadKind : uint8_t { Normal, Strict, Clamp };
+enum class ReadKind : uint8_t { Normal = 0, Strict = 1, Clamp = 2, ReadOnlyRange = 3 };
 struct ReadEvent {
 	ReadKind              kind;
 	uint64_t              address;
@@ -28,6 +28,7 @@ public:
 		if (original.read_memory) result.read_memory = Normal;
 		if (original.read_specialization_memory) result.read_specialization_memory = Strict;
 		if (original.clamp_memory_range) result.clamp_memory_range = Clamp;
+		if (original.specialization_range_read_only) result.specialization_range_read_only = ReadOnlyRange;
 		return result;
 	}
 	const std::vector<ReadEvent>& Events() const { return events; }
@@ -86,6 +87,19 @@ private:
 		} catch (...) {
 			capture.complete = false;
 		}
+#endif
+		return actual;
+	}
+	static bool ReadOnlyRange(void* data, uint64_t address, uint64_t bytes) {
+		auto& capture = *static_cast<ResourceReadCapture*>(data);
+		const bool actual = capture.original.specialization_range_read_only(capture.original.userdata, address, bytes);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+		try {
+#endif
+			if (capture.events.size() >= capture.event_limit) capture.complete = false;
+			else capture.events.push_back({ReadKind::ReadOnlyRange, address, bytes, actual});
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+		} catch (...) { capture.complete = false; }
 #endif
 		return actual;
 	}

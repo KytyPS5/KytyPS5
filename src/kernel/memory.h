@@ -114,6 +114,14 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// True only when both ranges are fully backed and their canonical backing
+// intervals do not intersect. Missing/private mappings and invalid ranges
+// cannot prove disjointness, even when guest virtual addresses differ.
+[[nodiscard]] bool AreBackingRangesDisjoint(uint64_t left, uint64_t left_size,
+                                             uint64_t right, uint64_t right_size);
+// A clean-cache query by virtual address is sufficient only when none of the
+// selected backing bytes have another live guest virtual mapping.
+[[nodiscard]] bool IsBackingRangeExclusivelyMapped(uint64_t address, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // Like TryReadGpuCleanBacking, but drains GPU-dirty buffer bytes on the GPU
 // thread before reading. Texture-modified ranges remain rejected.

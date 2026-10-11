@@ -876,6 +876,20 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+bool AreBackingRangesDisjoint(uint64_t left, uint64_t left_size,
+                              uint64_t right, uint64_t right_size) {
+	// Mapping mutation takes this lock before publishing backing-map metadata.
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->AreBackingRangesDisjoint(left, left_size, right, right_size);
+}
+
+bool IsBackingRangeExclusivelyMapped(uint64_t address, uint64_t size) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->IsBackingRangeExclusivelyMapped(address, size);
+}
+
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||

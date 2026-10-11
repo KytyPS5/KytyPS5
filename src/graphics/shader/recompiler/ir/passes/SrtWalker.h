@@ -16,6 +16,7 @@ class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 using SrtMemoryRangeClamper = uint64_t (*)(void* userdata, uint64_t address, uint64_t size);
+using SrtReadOnlyRangeProof = bool (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -49,6 +50,9 @@ struct SrtRuntime {
 	// Explicit caller proof for graphics pipelines; a compute test/dispatch has
 	// no neighboring shader stages. Unknown graphics ownership remains false.
 	bool neighboring_stages_read_only = false;
+	// Per-draw proof against attachment writes and physical aliases. Coherent
+	// reads alone cannot establish immutability during shader execution.
+	SrtReadOnlyRangeProof specialization_range_read_only = nullptr;
 };
 
 // A raw scalar read bounded by a loop guard or one actual dispatch axis.

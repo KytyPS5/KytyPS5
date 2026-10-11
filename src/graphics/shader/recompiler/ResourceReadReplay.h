@@ -17,6 +17,7 @@ public:
         if (original.read_memory) result.read_memory = Normal;
         if (original.read_specialization_memory) result.read_specialization_memory = Strict;
         if (original.clamp_memory_range) result.clamp_memory_range = Clamp;
+        if (original.specialization_range_read_only) result.specialization_range_read_only = ReadOnlyRange;
         return result;
     }
     bool Consumed() const { return error.empty() && cursor == events.size(); }
@@ -59,6 +60,10 @@ private:
     static uint64_t Clamp(void* data, uint64_t address, uint64_t bytes) {
         const auto* event = static_cast<ResourceReadReplay*>(data)->Next(ReadKind::Clamp, address, bytes);
         return event ? event->clamped_bytes : 0;
+    }
+    static bool ReadOnlyRange(void* data, uint64_t address, uint64_t bytes) {
+        const auto* event = static_cast<ResourceReadReplay*>(data)->Next(ReadKind::ReadOnlyRange, address, bytes);
+        return event && event->succeeded;
     }
 };
 } // namespace Libs::Graphics::ShaderRecompiler::Capture

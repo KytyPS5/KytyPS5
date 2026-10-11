@@ -395,6 +395,11 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 target_sources(shader_cfg_tests PRIVATE "${KYTY_TESTS_DIR}/ShaderBatchAudit.cpp")
 add_kyty_full_emulator_test(shader_capture_tests "${KYTY_TESTS_DIR}/ShaderCaptureTests.cpp")
 
+add_executable(resource_read_snapshot_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ResourceReadSnapshotTests.cpp")
+target_include_directories(resource_read_snapshot_tests PRIVATE ${inc_headers})
+target_link_libraries(resource_read_snapshot_tests fmt::fmt Vulkan::Headers)
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -488,6 +493,7 @@ target_include_directories(resource_materialization_tests PRIVATE ${inc_headers}
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/tile.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
@@ -497,7 +503,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt Vulkan::Headers)
+target_link_libraries(resource_tracking_tests fmt::fmt Vulkan::Headers common)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
@@ -741,6 +747,18 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking_uniform_wave_row
 		COMMAND $<TARGET_FILE:resource_tracking_tests> --wave-address-uniform-row-only)
 	set_tests_properties(resource_tracking_uniform_wave_row PROPERTIES TIMEOUT 60)
+	add_test(NAME resource_tracking_texture_wave_row
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --wave-address-texture-row-only)
+	set_tests_properties(resource_tracking_texture_wave_row PROPERTIES TIMEOUT 60)
+	add_test(NAME resource_tracking_packed_texture_row_proof
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --packed-texture-row-proof-only)
+	set_tests_properties(resource_tracking_packed_texture_row_proof PROPERTIES TIMEOUT 60)
+	add_test(NAME resource_read_snapshot
+		COMMAND $<TARGET_FILE:resource_read_snapshot_tests>)
+	set_tests_properties(resource_read_snapshot PROPERTIES TIMEOUT 30)
+	add_test(NAME virtual_memory_backing_disjoint
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --backing-disjoint-only)
+	set_tests_properties(virtual_memory_backing_disjoint PROPERTIES TIMEOUT 60)
 	add_test(NAME shader_performance_optimization_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --performance-optimization-readback-only)
 	add_test(NAME raw_buffer_runtime_stride

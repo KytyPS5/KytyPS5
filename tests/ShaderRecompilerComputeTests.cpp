@@ -51459,6 +51459,11 @@ if (argc == 1) {
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--rt1d-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorColorDiscovery();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();

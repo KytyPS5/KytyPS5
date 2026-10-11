@@ -511,6 +511,66 @@ public:
 		return true;
 	}
 
+	bool AreRangesDisjoint(uint64_t left, uint64_t left_size,
+	                       uint64_t right, uint64_t right_size) {
+		if (!IsAvailable() || left == 0 || right == 0 || left_size == 0 || right_size == 0 ||
+		    left_size > UINT64_MAX - left || right_size > UINT64_MAX - right) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		using Interval = std::pair<uint64_t, uint64_t>;
+		const auto intervals = [&](uint64_t address, uint64_t size,
+		                           std::vector<Interval>& result) {
+			const auto end = address + size;
+			while (address < end) {
+				MapEntry entry {};
+				if (!FindContainingUnlocked(address, 1, &entry)) return false;
+				const auto bytes = std::min(end, entry.vaddr + entry.size) - address;
+				const auto offset = entry.backing_offset + address - entry.vaddr;
+				if (!RangeOk(offset, bytes)) return false;
+				result.emplace_back(offset, offset + bytes);
+				address += bytes;
+			}
+			std::ranges::sort(result);
+			return true;
+		};
+		std::vector<Interval> a;
+		std::vector<Interval> b;
+		if (!intervals(left, left_size, a) || !intervals(right, right_size, b)) return false;
+		// Sorting canonical intervals also handles aliases inside either input.
+		size_t i = 0;
+		size_t j = 0;
+		while (i < a.size() && j < b.size()) {
+			if (a[i].first < b[j].second && b[j].first < a[i].second) return false;
+			if (a[i].second <= b[j].first) ++i;
+			else ++j;
+		}
+		return true;
+	}
+
+	bool IsRangeExclusivelyMapped(uint64_t address, uint64_t size) {
+		if (!IsAvailable() || address == 0 || size == 0 || size > UINT64_MAX - address)
+			return false;
+		std::shared_lock lock(m_mutex);
+		const auto end = address + size;
+		while (address < end) {
+			MapEntry source {};
+			if (!FindContainingUnlocked(address, 1, &source)) return false;
+			const auto bytes = std::min(end, source.vaddr + source.size) - address;
+			const auto offset = source.backing_offset + address - source.vaddr;
+			if (!RangeOk(offset, bytes)) return false;
+			for (const auto& [_, mapping] : m_maps) {
+				const auto overlap = std::max(offset, mapping.backing_offset);
+				if (overlap >= std::min(offset + bytes, mapping.backing_offset + mapping.size))
+					continue;
+				if (address + overlap - offset !=
+				    mapping.vaddr + overlap - mapping.backing_offset) return false;
+			}
+			address += bytes;
+		}
+		return true;
+	}
+
 private:
 	struct MapEntry {
 		uint64_t            vaddr          = 0;
@@ -792,6 +852,15 @@ public:
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+
+	bool AreBackingRangesDisjoint(uint64_t left, uint64_t left_size,
+	                              uint64_t right, uint64_t right_size) {
+		return m_backing->AreRangesDisjoint(left, left_size, right, right_size);
+	}
+
+	bool IsBackingRangeExclusivelyMapped(uint64_t address, uint64_t size) {
+		return m_backing->IsRangeExclusivelyMapped(address, size);
+	}
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {

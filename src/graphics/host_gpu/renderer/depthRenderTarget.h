@@ -11,6 +11,8 @@
 
 namespace Libs::Graphics {
 
+class CommandBuffer;
+
 // Without a stencil plane, Hi-Stencil fields are inactive. An active plane is compatible when
 // Hi-Stencil is disabled or HTile backing is present.
 inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
@@ -49,6 +51,9 @@ struct RenderDepthInfo {
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };
+
+// Preserve target validation while leaving cache registration/binding to discovery.
+RenderDepthInfo DescribeRenderDepthTarget(const CommandBuffer& buffer);
 
 inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,
                                                  const ImageViewInfo& target,

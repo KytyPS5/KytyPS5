@@ -11,6 +11,8 @@
 
 namespace Libs::Graphics {
 
+namespace HW { class Context; }
+
 struct RenderColorInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc         desc;
@@ -25,6 +27,12 @@ struct RenderColorInfo {
 		        std::max(desc.info.extent.height >> guest_mip_level, 1u)};
 	}
 };
+
+// Describe the exact guest footprint without registering or binding cache images.
+RenderColorInfo DescribeRenderColorTarget(const HW::Context& context,
+                                          uint32_t render_target_slice_offset,
+                                          uint32_t slot, bool ignore_target_mask = false,
+                                          bool exact_format = false);
 
 } // namespace Libs::Graphics
 

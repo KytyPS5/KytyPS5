@@ -1998,6 +1998,80 @@ void TestNonzeroDirectOffsetAliasesSharedBacking() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestBackingRangeDisjointness() {
+	const char* test = "BackingRangeDisjointness";
+	namespace Memory = Libs::LibKernel::Memory;
+	constexpr uint64_t size = 3u * SceKernelPageSize;
+	int64_t physical = 0;
+	CheckOk(test, Memory::KernelAllocateDirectMemory(
+	                  0, Memory::KernelGetDirectMemorySize(), 2u * size, SceKernelPageSize,
+	                  SceKernelMtypeC, &physical), "allocate disjointness fixture");
+	std::array<void*, 3> mappings {};
+	for (uint32_t i = 0; i < mappings.size(); ++i) {
+		CheckOk(test, Memory::KernelMapNamedDirectMemory(
+		                  &mappings[i], size, SceKernelProtCpuRw, 0,
+		                  physical + (i == 2 ? size : 0u), SceKernelPageSize,
+		                  "backing_disjointness"), "map disjointness fixture");
+	}
+	const auto a = reinterpret_cast<uint64_t>(mappings[0]);
+	const auto b = reinterpret_cast<uint64_t>(mappings[1]);
+	const auto c = reinterpret_cast<uint64_t>(mappings[2]);
+	Check(test, a != b && a != c && b != c, "fixture virtual mappings coincide");
+	const uint32_t word = 0x12345678u;
+	Check(test, Memory::TryWriteBacking(a + SceKernelPageSize, &word, sizeof(word)),
+	      "write canonical alias oracle");
+	uint32_t observed = 0;
+	Check(test, Memory::TryReadBacking(b + SceKernelPageSize, &observed, sizeof(observed)) &&
+	                observed == word, "fixture physical aliases do not share bytes");
+	Check(test, !Memory::AreBackingRangesDisjoint(a, size, b, size),
+	      "distinct virtual addresses hid a physical alias");
+	Check(test, !Memory::IsBackingRangeExclusivelyMapped(a, size) &&
+	                !Memory::IsBackingRangeExclusivelyMapped(b, size) &&
+	                Memory::IsBackingRangeExclusivelyMapped(c, size),
+	      "exclusive backing query ignored physical aliases or rejected unique bytes");
+	Check(test, Memory::AreBackingRangesDisjoint(a, size, c, size),
+	      "adjacent independent backing intervals were not proved disjoint");
+	Check(test, !Memory::AreBackingRangesDisjoint(a + 7u, 8u, b + 14u, 2u),
+	      "last-byte alias escaped disjointness guard");
+	Check(test, Memory::AreBackingRangesDisjoint(a + 7u, 8u, b + 15u, 1u),
+	      "exact-end canonical intervals were treated as overlapping");
+	Check(test, Memory::AreBackingRangesDisjoint(a, SceKernelPageSize,
+	                                             a + SceKernelPageSize, SceKernelPageSize),
+	      "disjoint subranges in one mapping were rejected");
+	for (const auto [address, bytes] :
+	     std::array<std::pair<uint64_t, uint64_t>, 4> {{{0u, 1u}, {a, 0u},
+	                                                   {UINT64_MAX - 3u, 8u},
+	                                                   {UINT64_MAX - 4096u, 1u}}}) {
+		Check(test, !Memory::AreBackingRangesDisjoint(address, bytes, a, 1u) &&
+		                !Memory::AreBackingRangesDisjoint(a, 1u, address, bytes),
+		      "invalid or unknown input was accepted as disjoint");
+		Check(test, !Memory::IsBackingRangeExclusivelyMapped(address, bytes),
+		      "invalid or unknown input was accepted as exclusively mapped");
+	}
+	CheckOk(test, Memory::KernelMunmap(a + SceKernelPageSize, SceKernelPageSize),
+	        "unmap interior backing page");
+	Check(test, !Memory::AreBackingRangesDisjoint(a, size, c, size),
+	      "partially mapped input was accepted as disjoint");
+	Check(test, !Memory::IsBackingRangeExclusivelyMapped(a, size) &&
+	                Memory::IsBackingRangeExclusivelyMapped(b + SceKernelPageSize,
+	                                                        SceKernelPageSize),
+	      "exclusive query ignored holes or retained an unmapped alias");
+	Check(test, Memory::AreBackingRangesDisjoint(a, SceKernelPageSize, c, size) &&
+	                Memory::AreBackingRangesDisjoint(a + 2u * SceKernelPageSize,
+	                                                 SceKernelPageSize, c, size),
+	      "surviving backing fragments lost their canonical identity");
+	CheckOk(test, Memory::KernelMunmap(a, SceKernelPageSize), "unmap first fragment");
+	CheckOk(test, Memory::KernelMunmap(a + 2u * SceKernelPageSize, SceKernelPageSize),
+	        "unmap last fragment");
+	for (uint32_t i = 1; i < mappings.size(); ++i) {
+		CheckOk(test, Memory::KernelMunmap(reinterpret_cast<uint64_t>(mappings[i]), size),
+		        "unmap disjointness fixture");
+	}
+	CheckOk(test, Memory::KernelReleaseDirectMemory(physical, 2u * size),
+	        "release disjointness fixture");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestDirectMapAcrossContiguousAllocations() {
 	const char* test   = "DirectMapAcrossContiguousAllocations";
 	const auto  end    = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
@@ -4658,6 +4732,10 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--backing-disjoint-only") == 0) {
+		RunTest(TestBackingRangeDisjointness);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--gpu-executable-protection-only") == 0) {
     RunTest(TestGpuTrackingPreservesExecutablePages);
@@ -4748,6 +4826,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
+	RunTest(TestBackingRangeDisjointness);
 	RunTest(TestDirectMapAcrossContiguousAllocations);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);

@@ -52,6 +52,26 @@ int main(int argc, char **argv) {
       pixels.pop_back();
       Check(!Capture::CollectCapturedTextureBytes(texture, pixels, 7u, values) && values.empty(),
             "truncated texture accepted as complete byte domain");
+      ShaderTextureResource across_blocks;
+      across_blocks.fields[1] = 60u << 20u;
+      across_blocks.fields[2] = 8u | (1u << 14u); // 33x2, two 32x32 RGBA8 blocks.
+      across_blocks.fields[3] = (9u << 28u) | (5u << 20u) | 0xfacu;
+      std::vector<uint32_t> block_pixels(2048u, 0x40404040u);
+      std::fill_n(block_pixels.begin(), 1024u, 0x01010101u);
+      // Independent block-local offsets: x32/y0 starts block1; y1 adds16.
+      // x31/y1 in block0 has Standard4KB offset0xa9c. Other block1 texels are padding.
+      block_pixels[0xa9cu / 4u] = 0x41ffffffu;
+      block_pixels[4096u / 4u] = 0x42070401u;
+      block_pixels[(4096u + 16u) / 4u] = 0x43040107u;
+      Check(Capture::CollectCapturedTextureBytes(across_blocks, block_pixels, 7u, values) &&
+                values == std::vector<uint32_t>{1u,4u,7u,255u},
+            "logical RGB collection fails across tiled block boundary");
+      across_blocks.fields[1] |= 1u << 30u;
+      across_blocks.fields[2] = 32u << 14u; // 2x33, second block row.
+      block_pixels[(4096u + 4u) / 4u] = 0x43ffffffu;
+      Check(Capture::CollectCapturedTextureBytes(across_blocks, block_pixels, 7u, values) &&
+                values == std::vector<uint32_t>{1u,4u,7u,255u},
+            "logical RGB collection fails across tiled block rows");
       IR::ResourcePlan plan;
       IR::DescriptorSource buffer;
       buffer.dword_count = 4;
@@ -100,7 +120,7 @@ int main(int argc, char **argv) {
             "written image admitted for diagnostic snapshot");
     } else if (argc == 2 && std::string_view(argv[1]) == "--read-capture-only") {
       struct State {
-        uint32_t normal = 0, strict = 0, clamp = 0;
+        uint32_t normal = 0, strict = 0, clamp = 0, read_only_range = 0;
       } state;
       IR::SrtRuntime original;
       original.userdata = &state;
@@ -127,6 +147,10 @@ int main(int argc, char **argv) {
         ++static_cast<State *>(ctx)->clamp;
         return bytes > 12u ? 12u : bytes;
       };
+      original.specialization_range_read_only = +[](void *ctx, uint64_t address, uint64_t bytes) {
+        ++static_cast<State *>(ctx)->read_only_range;
+        return address == 0x100u && bytes == 16u;
+      };
       Capture::ResourceReadCapture capture(original, 2u, 8u);
       auto runtime = capture.Runtime();
       std::array<uint32_t, 1> words{};
@@ -142,10 +166,14 @@ int main(int argc, char **argv) {
             "captured failed callback result changed");
       Check(runtime.clamp_memory_range(runtime.userdata, 0x100u, 20u) == 12u,
             "captured clamp result changed");
-      Check(state.normal == 2u && state.strict == 1u && state.clamp == 1u,
+      Check(runtime.specialization_range_read_only(runtime.userdata, 0x100u, 16u) &&
+                !runtime.specialization_range_read_only(runtime.userdata, 0x104u, 16u),
+            "captured ownership query result changed");
+      Check(state.normal == 2u && state.strict == 1u && state.clamp == 1u && state.read_only_range == 2u,
             "capture added or dropped callbacks");
-      Check(capture.Complete() && capture.Events().size() == 4u &&
-                capture.Events()[2].words.empty(),
+      Check(capture.Complete() && capture.Events().size() == 6u &&
+                capture.Events()[2].words.empty() && capture.Events()[4].words.empty() &&
+                capture.Events()[4].succeeded && !capture.Events()[5].succeeded,
             "capture recorded undefined failed-read output");
       Check(runtime.max_dense_images == 97u &&
                 runtime.neighboring_stages_read_only,
@@ -162,9 +190,11 @@ int main(int argc, char **argv) {
       words[0] = 77u;
       Check(!offline.read_memory(offline.userdata, 0x200u, words) && words[0] == 77u,
             "failed replay fabricated output");
-      Check(offline.clamp_memory_range(offline.userdata, 0x100u, 20u) == 12u && replay.Consumed(),
+      Check(offline.clamp_memory_range(offline.userdata, 0x100u, 20u) == 12u &&
+                offline.specialization_range_read_only(offline.userdata, 0x100u, 16u) &&
+                !offline.specialization_range_read_only(offline.userdata, 0x104u, 16u) && replay.Consumed(),
             "ordered replay did not consume exact callbacks");
-      Check(state.normal == 2u && state.strict == 1u && state.clamp == 1u,
+      Check(state.normal == 2u && state.strict == 1u && state.clamp == 1u && state.read_only_range == 2u,
             "offline replay accessed live backing");
       Capture::ResourceReadReplay changed(parsed, events);
       auto different = changed.Runtime();
@@ -177,6 +207,28 @@ int main(int argc, char **argv) {
       try { Capture::ReadResourceReadMetadata(corrupt, parsed); }
       catch (const std::exception&) { rejected = true; }
       Check(rejected, "resource payload integer truncation accepted");
+      corrupt = recorded;
+      corrupt["specialization_range_read_only"] = false;
+      rejected = false;
+      try { Capture::ReadResourceReadMetadata(corrupt, parsed); }
+      catch (const std::exception&) { rejected = true; }
+      Check(rejected, "ownership query accepted when callback presence was false");
+      corrupt = recorded;
+      corrupt["events"][4]["clamped_bytes"] = 1u;
+      rejected = false;
+      try { Capture::ReadResourceReadMetadata(corrupt, parsed); }
+      catch (const std::exception&) { rejected = true; }
+      Check(rejected, "ownership query accepted a clamp payload");
+      auto legacy = recorded;
+      legacy.erase("specialization_range_read_only");
+      legacy["events"].erase(legacy["events"].begin() + 4, legacy["events"].end());
+      auto legacy_events = Capture::ReadResourceReadMetadata(legacy, parsed);
+      Check(parsed.specialization_range_read_only == nullptr && legacy_events.size() == 4u,
+            "legacy capture invented an ownership callback");
+      Capture::ResourceReadReplay ownership_mismatch(original, {{Capture::ReadKind::ReadOnlyRange, 0x100u, 16u, true}});
+      auto mismatched = ownership_mismatch.Runtime();
+      Check(!mismatched.specialization_range_read_only(mismatched.userdata, 0x104u, 16u) &&
+                !ownership_mismatch.Error().empty(), "changed ownership query accepted");
       Check(runtime.read_memory(runtime.userdata, 0x100u, words) &&
                 words[0] == 0x12345678u && !capture.Complete(),
             "capture overflow altered resource read");
@@ -185,7 +237,8 @@ int main(int argc, char **argv) {
       Capture::ResourceReadCapture absent(empty);
       Check(absent.Runtime().read_memory == nullptr &&
                 absent.Runtime().read_specialization_memory == nullptr &&
-                absent.Runtime().clamp_memory_range == nullptr,
+                absent.Runtime().clamp_memory_range == nullptr &&
+                absent.Runtime().specialization_range_read_only == nullptr,
             "capture invented absent callback");
     } else if (argc == 2 &&
                std::string_view(argv[1]) == "--pixel-metadata-only") {

@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ShaderCaptureMetadata.h"
 #include "graphics/shader/recompiler/ResourceReadReplay.h"
+#include "graphics/shader/recompiler/ResourceReadSnapshot.h"
 #include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <stdexcept>
@@ -140,16 +142,190 @@ Json PrecheckComputeExecution(ShaderRecompiler::IR::Program& program,
           {"unknown_requirements", unknown}, {"input_phase", "pre_specialization"},
           {"post_specialization_checked", false}, {"spirv_emitted", false}};
 }
+
+uint64_t SnapshotUnsigned(const Json& value, uint64_t limit) {
+  uint64_t result;
+  if (value.is_number_unsigned()) result = value.get<uint64_t>();
+  else if (value.is_number_integer() && value.get<int64_t>() >= 0)
+    result = static_cast<uint64_t>(value.get<int64_t>());
+  else throw std::runtime_error("snapshot metadata requires an unsigned integer");
+  if (result > limit) throw std::runtime_error("snapshot metadata integer exceeds range");
+  return result;
+}
+
+bool SnapshotBoolean(const Json& value) {
+  if (!value.is_boolean()) throw std::runtime_error("snapshot metadata requires a boolean");
+  return value.get<bool>();
+}
+
+Json ImportTextureSnapshot(const Json& runtime, const ShaderRecompiler::IR::ResourcePlan& plan,
+                          ShaderRecompiler::Capture::ResourceReadSnapshot& snapshot) {
+  Json result{{"supplemental_texture_entries", 0}, {"supplemental_texture_entries_skipped", 0},
+              {"ownership_proof_from_texture_capture", false}};
+  if (!runtime.contains("additional_texture_inputs")) return result;
+  const auto& input = runtime.at("additional_texture_inputs");
+  if (!input.is_object() || input.at("kind") != "diagnostic_texture_inputs")
+    throw std::runtime_error("unsupported supplemental texture snapshot");
+  result["capture_claims_specialization_proof"] = SnapshotBoolean(input.at("specialization_proof"));
+  const auto logical = SnapshotUnsigned(input.at("logical_image"), UINT32_MAX);
+  if (logical >= plan.info.images.size()) throw std::runtime_error("snapshot logical image is unavailable");
+  const auto source_index = plan.info.images[static_cast<size_t>(logical)].source;
+  if (source_index >= plan.descriptor_sources.size()) throw std::runtime_error("snapshot descriptor source is unavailable");
+  const auto& source = plan.descriptor_sources[source_index];
+  if (!source.inline_descriptor || source.inline_descriptor->image_table || source.inline_descriptor->address_table)
+    throw std::runtime_error("snapshot requires a direct inline image descriptor");
+  const auto descriptor_words = source.inline_descriptor->descriptor_dwords;
+  if (descriptor_words != 4u && descriptor_words != 8u)
+    throw std::runtime_error("snapshot image descriptor width is unsupported");
+  const auto& entries = input.at("entries");
+  if (!entries.is_array() || entries.size() > 4096u)
+    throw std::runtime_error("snapshot texture entry count exceeds bound");
+  size_t imported = 0, skipped = 0;
+  for (const auto& entry : entries) {
+    const bool captured = SnapshotBoolean(entry.at("payload_captured"));
+    const bool stable = SnapshotBoolean(entry.at("descriptor_stable"));
+    if (!captured || !stable) { ++skipped; continue; }
+    const auto address = SnapshotUnsigned(entry.at("address"), UINT64_MAX);
+    const auto byte_count = SnapshotUnsigned(entry.at("bytes"), ShaderRecompiler::Capture::ResourceReadSnapshot::ByteLimit);
+    const auto descriptor_address = SnapshotUnsigned(entry.at("descriptor_address"), UINT64_MAX);
+    const auto& descriptor = entry.at("descriptor");
+    const auto& payload = entry.at("words");
+    if (!descriptor.is_array() || descriptor.size() != 8u || !payload.is_array() ||
+        byte_count % 4u || payload.size() != byte_count / 4u)
+      throw std::runtime_error("invalid supplemental snapshot payload");
+    ShaderTextureResource texture;
+    for (size_t word = 0; word < 8u; ++word)
+      texture.fields[word] = static_cast<uint32_t>(SnapshotUnsigned(descriptor.at(word), UINT32_MAX));
+    if (texture.Base40() != address) throw std::runtime_error("snapshot texture address differs from descriptor");
+    std::vector<uint32_t> words(payload.size());
+    for (size_t word = 0; word < words.size(); ++word)
+      words[word] = static_cast<uint32_t>(SnapshotUnsigned(payload.at(word), UINT32_MAX));
+    // Compact image SRDs have only four captured words. The remaining array
+    // entries are diagnostic defaults, never evidence of additional memory.
+    snapshot.AddStrictWords(descriptor_address, std::span(texture.fields).first(descriptor_words));
+    snapshot.AddStrictWords(address, words);
+    ++imported;
+  }
+  result["supplemental_texture_entries"] = imported;
+  result["supplemental_texture_entries_skipped"] = skipped;
+  return result;
+}
+
+Json TextureRowProofMetadata(const ShaderRecompiler::IR::DescriptorSource::InlineDescriptor::AddressTable& table) {
+  if (!table.texture_row_domain) return nullptr;
+  Json origins = Json::array();
+  for (const auto& origin : table.texture_row_domain->images)
+    origins.push_back({{"logical_image", origin.image}, {"channel_mask", origin.channels}});
+  return {{"images", std::move(origins)}, {"constants", table.texture_row_domain->constants}};
+}
+
+Json DescribeCapturedTextureRows(const ShaderRecompiler::IR::ResourcePlan& plan, const Json& runtime) {
+  struct ObservedTexture {
+    uint32_t image, selector;
+    ShaderTextureResource texture;
+    std::vector<uint32_t> words;
+  };
+  std::vector<ObservedTexture> textures;
+  if (runtime.contains("additional_texture_inputs")) {
+    const auto& input = runtime.at("additional_texture_inputs");
+    if (input.at("kind") != "diagnostic_texture_inputs")
+      throw std::runtime_error("unsupported texture row diagnostic capture");
+    const auto logical = static_cast<uint32_t>(SnapshotUnsigned(input.at("logical_image"), UINT32_MAX));
+    const auto& entries = input.at("entries");
+    if (!entries.is_array() || entries.size() > 4096u)
+      throw std::runtime_error("texture row diagnostic entry count exceeds bound");
+    size_t remaining_bytes = ShaderRecompiler::Capture::ResourceReadSnapshot::ByteLimit;
+    for (const auto& entry : entries) {
+      if (!SnapshotBoolean(entry.at("payload_captured")) || !SnapshotBoolean(entry.at("descriptor_stable"))) continue;
+      const auto& descriptor = entry.at("descriptor");
+      const auto& words = entry.at("words");
+      const auto byte_count = SnapshotUnsigned(entry.at("bytes"), remaining_bytes);
+      if (!descriptor.is_array() || descriptor.size() != 8u || !words.is_array() ||
+          byte_count % 4u || words.size() != byte_count / 4u)
+        throw std::runtime_error("invalid texture row diagnostic payload");
+      remaining_bytes -= static_cast<size_t>(byte_count);
+      ObservedTexture observed{};
+      observed.image = logical;
+      observed.selector = static_cast<uint32_t>(SnapshotUnsigned(entry.at("selector_key"), UINT32_MAX));
+      for (size_t word = 0; word < 8u; ++word)
+        observed.texture.fields[word] = static_cast<uint32_t>(SnapshotUnsigned(descriptor.at(word), UINT32_MAX));
+      if (observed.texture.Base40() != SnapshotUnsigned(entry.at("address"), UINT64_MAX))
+        throw std::runtime_error("texture row diagnostic address differs from descriptor");
+      observed.words.resize(words.size());
+      for (size_t word = 0; word < words.size(); ++word)
+        observed.words[word] = static_cast<uint32_t>(SnapshotUnsigned(words.at(word), UINT32_MAX));
+      textures.push_back(std::move(observed));
+    }
+  }
+  // Repeated wave-table offsets share the same captured byte-domain analysis.
+  // A union describes observations only; it does not grant runtime ownership
+  // or imply that uncaptured descriptor candidates have matching contents.
+  std::map<std::pair<uint32_t, uint32_t>, Json> domains;
+  Json tables = Json::array();
+  for (uint32_t logical = 0; logical < plan.info.images.size(); ++logical) {
+    const auto& image = plan.info.images[logical];
+    if (image.source >= plan.descriptor_sources.size()) continue;
+    const auto& source = plan.descriptor_sources[image.source];
+    if (!source.inline_descriptor || !source.inline_descriptor->address_table) continue;
+    const auto& table = *source.inline_descriptor;
+    const auto& address = *table.address_table;
+    Json item{{"logical_image", logical}, {"source", image.source}, {"pc", image.first_use_pc},
+              {"descriptor_offset", table.descriptor_offset}, {"pointer_offset", address.pointer_offset},
+              {"row_stride", address.row_stride}, {"row_limit", address.row_limit},
+              {"texture_row_domain", TextureRowProofMetadata(address)},
+              {"specialization_proof", false}, {"ownership_verified", false},
+              {"observation_scope", "captured_texture_entries_only"}};
+    if (address.texture_row_domain) {
+      Json contents = Json::array();
+      std::vector<uint32_t> rows = address.texture_row_domain->constants;
+      for (const auto& origin : address.texture_row_domain->images) {
+        const auto key = std::pair{origin.image, origin.channels};
+        auto found = domains.find(key);
+        if (found == domains.end()) {
+          Json entries = Json::array();
+          std::vector<uint32_t> values;
+          for (const auto& observed : textures) {
+            if (observed.image != origin.image) continue;
+            std::vector<uint32_t> entry_values;
+            const bool valid = ShaderRecompiler::Capture::CollectCapturedTextureBytes(
+                observed.texture, observed.words, origin.channels, entry_values);
+            entries.push_back({{"selector_key", observed.selector}, {"layout_and_channels_supported", valid},
+                               {"observed_values", entry_values}});
+            if (valid) values.insert(values.end(), entry_values.begin(), entry_values.end());
+          }
+          std::ranges::sort(values);
+          values.erase(std::unique(values.begin(), values.end()), values.end());
+          found = domains.emplace(key, Json{{"logical_image", origin.image}, {"channel_mask", origin.channels},
+              {"captured_entries", std::move(entries)}, {"observed_union", values}}).first;
+        }
+        contents.push_back(found->second);
+        const auto values = found->second.at("observed_union").get<std::vector<uint32_t>>();
+        rows.insert(rows.end(), values.begin(), values.end());
+      }
+      std::ranges::sort(rows);
+      rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+      item["captured_content_domains"] = std::move(contents);
+      item["observed_rows_with_constants"] = rows;
+      std::erase_if(rows, [&](uint32_t row) { return row >= address.row_limit; });
+      item["observed_rows_below_guard"] = std::move(rows);
+    }
+    tables.push_back(std::move(item));
+  }
+  return tables;
+}
 } // namespace
 
 // One manifest per process: production fatal exits and timeouts stay isolated.
 // This worker never reads captured guest addresses or executes guest GPU code.
 int RunShaderBatchAudit(int argc, char* argv[]) {
   const char* phase = "input";
+  const bool snapshot_mode = argc > 1 && std::string_view(argv[1]) == "--audit-shader-snapshot";
+  Json snapshot_diagnostics = Json::object();
   try {
     if (argc != 3 && !(argc == 5 && std::string_view(argv[3]) == "--compute-host-profile")) {
-      throw std::runtime_error("usage: shader_cfg_tests --audit-shader <manifest.json> [--compute-host-profile <host.json>]");
+      throw std::runtime_error("usage: shader_cfg_tests --audit-shader <manifest.json> [--compute-host-profile <host.json>] or --audit-shader-snapshot <pixel-manifest.json>");
     }
+    if (snapshot_mode && argc != 3) throw std::runtime_error("snapshot replay requires an exact pixel capture");
     std::optional<ShaderRecompiler::ComputeWorkgroupLimits> host_limits;
     Json host_profile;
     if (argc == 5) {
@@ -197,6 +373,8 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     ShaderInit();
 
     const auto stage = manifest.at("stage").get<std::string>();
+    if (snapshot_mode && (capture_schema != 2u || (stage != "pixel" && stage != "ps") || !manifest.contains("runtime")))
+      throw std::runtime_error("snapshot replay requires schema2 pixel runtime inputs");
     Json result{{"status", "passed"}, {"stage", stage}, {"code_bytes", size},
                 {"gpu_execution_checked", false}, {"resource_materialization_checked", false}};
     if (host_limits) {
@@ -286,7 +464,8 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
                 const auto& address = *table.address_table;
                 item["address_table"] = {{"pointer_offset", address.pointer_offset},
                     {"row_stride", address.row_stride}, {"row_limit", address.row_limit},
-                    {"row_key_arg", address.row_key_arg}};
+                    {"row_key_arg", address.row_key_arg},
+                    {"texture_row_domain", TextureRowProofMetadata(address)}};
               }
             }
           }
@@ -300,27 +479,59 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       result["runtime_resources_captured"] = manifest.value("runtime_resources_captured", false);
       result["tracked_images"] = plan.info.images.size();
       result["instructions"] = decoded.instructions.size();
+      if (snapshot_mode) {
+        phase = "input";
+        result["texture_wave_tables"] = DescribeCapturedTextureRows(plan, manifest.at("runtime"));
+        snapshot_diagnostics["texture_wave_tables"] = result.at("texture_wave_tables");
+        std::printf("KYTY_SHADER_AUDIT_TEXTURE_WAVE_TABLES %s\n", result.at("texture_wave_tables").dump().c_str());
+        std::fflush(stdout);
+      }
       if (manifest.contains("runtime")) {
         phase = "input";
         ShaderRecompiler::IR::SrtRuntime runtime;
         runtime.user_data = user_data;
         auto events = ShaderRecompiler::Capture::ReadResourceReadMetadata(manifest.at("runtime"), runtime);
-        ShaderRecompiler::Capture::ResourceReadReplay replay(runtime, std::move(events));
         ShaderRecompiler::IR::ResourceSnapshot snapshot;
         ShaderRecompiler::IR::ResourceSpecialization specialization;
-        phase = "materialize_resources"; Progress(phase);
-        const bool ok = ShaderRecompiler::IR::MaterializeResources(plan, replay.Runtime(), snapshot, specialization);
-        const std::string reason(ShaderRecompiler::IR::LastResourceSpecializationError());
-        if (!replay.Error().empty() || !replay.Consumed()) {
-          phase = "input";
-          throw std::runtime_error(replay.Error().empty() ? "unconsumed resource callbacks" : replay.Error());
+        bool ok;
+        std::string reason;
+        if (snapshot_mode) {
+          ShaderRecompiler::Capture::ResourceReadSnapshot memory(runtime, events);
+          snapshot_diagnostics.update(ImportTextureSnapshot(manifest.at("runtime"), plan, memory));
+          snapshot_diagnostics["ordinary_bytes"] = memory.CapturedBytes(ShaderRecompiler::Capture::ReadKind::Normal);
+          snapshot_diagnostics["strict_bytes"] = memory.CapturedBytes(ShaderRecompiler::Capture::ReadKind::Strict);
+          snapshot_diagnostics["read_only_range_callback_captured"] = runtime.specialization_range_read_only != nullptr;
+          snapshot_diagnostics["ownership_query_count"] = std::count_if(events.begin(), events.end(), [](const auto& event) {
+            return event.kind == ShaderRecompiler::Capture::ReadKind::ReadOnlyRange;
+          });
+          phase = "materialize_resources"; Progress(phase);
+          ok = ShaderRecompiler::IR::MaterializeResources(plan, memory.Runtime(), snapshot, specialization);
+          reason = ShaderRecompiler::IR::LastResourceSpecializationError();
+          snapshot_diagnostics["requests"] = memory.Requests();
+          snapshot_diagnostics["missing_requests"] = memory.MissingRequests();
+          result["snapshot_diagnostics"] = snapshot_diagnostics;
+          result["runtime_replay"] = "diagnostic_immutable_address_snapshot";
+          result["captured_outcome_reproduced"] = false;
+          if (!memory.Error().empty()) {
+            phase = "input";
+            throw std::runtime_error(memory.Error());
+          }
+        } else {
+          ShaderRecompiler::Capture::ResourceReadReplay replay(runtime, std::move(events));
+          phase = "materialize_resources"; Progress(phase);
+          ok = ShaderRecompiler::IR::MaterializeResources(plan, replay.Runtime(), snapshot, specialization);
+          reason = ShaderRecompiler::IR::LastResourceSpecializationError();
+          if (!replay.Error().empty() || !replay.Consumed()) {
+            phase = "input";
+            throw std::runtime_error(replay.Error().empty() ? "unconsumed resource callbacks" : replay.Error());
+          }
+          result["captured_outcome_reproduced"] = ok == manifest.at("runtime").at("materialization_succeeded").get<bool>() &&
+              (ok || reason == manifest.at("runtime").at("materialization_error").get<std::string>());
         }
         result["resource_materialization_checked"] = true;
         result["checked_through"] = "pixel_materialize_resources";
         result["status"] = ok ? "passed" : "failed";
         result["materialization_error"] = reason;
-        result["captured_outcome_reproduced"] = ok == manifest.at("runtime").at("materialization_succeeded").get<bool>() &&
-            (ok || reason == manifest.at("runtime").at("materialization_error").get<std::string>());
       }
       std::printf("KYTY_SHADER_AUDIT_RESULT %s\n", result.dump().c_str());
       return result.at("status") == "passed" ? 0 : 1;
@@ -531,8 +742,13 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     std::fflush(stdout);
     return result.at("status") == "passed" ? 0 : 1;
   } catch (const std::exception& error) {
-    const Json result{{"status", std::string_view(phase) == "input" ? "input_error" : "failed"},
+    Json result{{"status", std::string_view(phase) == "input" ? "input_error" : "failed"},
                        {"phase", phase}, {"error", error.what()}};
+    if (snapshot_mode) {
+      result["runtime_replay"] = "diagnostic_immutable_address_snapshot";
+      result["snapshot_diagnostics"] = snapshot_diagnostics;
+      result["gpu_execution_checked"] = false;
+    }
     std::printf("KYTY_SHADER_AUDIT_RESULT %s\n", result.dump().c_str());
     return 2;
   }

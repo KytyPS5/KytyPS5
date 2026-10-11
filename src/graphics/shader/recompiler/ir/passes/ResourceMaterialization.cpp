@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/TextureByteDomain.h"
+#include "graphics/shader/recompiler/ir/passes/PackedTextureRowProof.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -205,6 +207,16 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;
+}
+
+uint64_t CaptureClampRange(void* userdata, uint64_t address, uint64_t bytes) {
+	const auto& capture = *static_cast<ReadCapture*>(userdata);
+	return capture.source.clamp_memory_range(capture.source.userdata, address, bytes);
+}
+
+bool CaptureReadOnlyRange(void* userdata, uint64_t address, uint64_t bytes) {
+	const auto& capture = *static_cast<ReadCapture*>(userdata);
+	return capture.source.specialization_range_read_only(capture.source.userdata, address, bytes);
 }
 
 bool WrittenBuffersDisjoint(const ResourcePlan& program, const ResourceSnapshot& snapshot,
@@ -580,10 +592,71 @@ bool PureUserDataIntegerExpression(Value value, std::unordered_set<const Inst*>&
     return ok;
 }
 
+struct TextureDomainCache {
+	struct Entry {
+		DescriptorValue descriptor;
+		uint32_t channels;
+		bool valid = false;
+		std::vector<uint32_t> values;
+	};
+	std::vector<Entry> entries;
+	uint64_t work_bytes = 0;
+};
+
+std::optional<std::vector<uint32_t>> TextureWaveRows(
+	const ResourcePlan& program, const DescriptorSource::InlineDescriptor::AddressTable& table,
+	uint32_t owner_image, const MaterializedSnapshot& snapshot, const SrtRuntime& runtime,
+	const SrtRuntime& proof_runtime, TextureDomainCache& cache) {
+	if (!table.texture_row_domain || !runtime.read_specialization_memory ||
+	    !proof_runtime.specialization_range_read_only || !runtime.neighboring_stages_read_only ||
+	    program.has_address_writes || program.info.writes_dma ||
+	    std::ranges::any_of(program.info.buffers, &BufferResource::written) ||
+	    std::ranges::any_of(program.info.images, [](const auto& image) { return image.written || image.atomic; }))
+		return {};
+	std::vector<uint32_t> rows = table.texture_row_domain->constants;
+	for (const auto origin : table.texture_row_domain->images) {
+		if (origin.image >= owner_image || origin.image >= snapshot.resources.images.size() ||
+		    !program.info.images[origin.image].read) return {};
+		std::vector<DescriptorValue> descriptors {snapshot.resources.images[origin.image]};
+		for (const auto& input : snapshot.indirect_images)
+			if (input.resource == origin.image) descriptors = input.descriptors;
+		for (const auto& descriptor : descriptors) {
+			if (NullImageDescriptor(descriptor)) { rows.push_back(0u); continue; }
+			auto found = std::ranges::find_if(cache.entries, [&](const auto& entry) {
+				return entry.descriptor == descriptor && entry.channels == origin.channels;
+			});
+			if (found == cache.entries.end()) {
+				found = cache.entries.insert(cache.entries.end(), {descriptor, origin.channels});
+				ShaderTextureResource texture;
+				std::copy_n(descriptor.dwords.begin(), 8u, texture.fields);
+				TileSurfaceLayout layout;
+				constexpr uint64_t byte_limit = 8u * 1024u * 1024u;
+				if (!GetTextureByteLayout(texture, layout) || layout.total_size % 4u ||
+				    layout.total_size > byte_limit - cache.work_bytes || texture.Base40() > AddressMask ||
+				    layout.total_size > AddressMask - texture.Base40() + 1u ||
+				    !proof_runtime.specialization_range_read_only(proof_runtime.userdata,
+				        texture.Base40(), layout.total_size)) return {};
+				cache.work_bytes += layout.total_size;
+				std::vector<uint32_t> words(static_cast<size_t>(layout.total_size / 4u));
+				if (!runtime.read_specialization_memory(runtime.userdata, texture.Base40(), words) ||
+				    !CollectTextureByteDomain(texture, words, origin.channels, found->values)) return {};
+				found->valid = true;
+			}
+			if (!found->valid) return {};
+			rows.insert(rows.end(), found->values.begin(), found->values.end());
+		}
+	}
+	std::erase_if(rows, [&](uint32_t row) { return row >= table.row_limit; });
+	std::ranges::sort(rows);
+	rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+	return rows.empty() ? std::nullopt : std::optional(std::move(rows));
+}
+
 bool MaterializeWaveAddressImage(const ResourcePlan& program,
                                  const DescriptorSource::InlineDescriptor& image,
                                  const DescriptorValue& buffer_value, uint32_t pc,
-                                 const SrtRuntime& runtime, IndirectImage& result) {
+                                 const SrtRuntime& runtime, IndirectImage& result,
+                                 const std::vector<uint32_t>* proved_rows = nullptr) {
 	if (!image.address_table || image.descriptor_dwords != 8u || image.image_table)
 		return SpecializationFail("wave address image table has incompatible descriptor metadata");
 	const auto& table = *image.address_table;
@@ -595,7 +668,7 @@ bool MaterializeWaveAddressImage(const ResourcePlan& program,
 		uint32_t row = 0;
 		if (evaluator.Evaluate(table.row_value, row) && row < table.row_limit) uniform_row = row;
 	}
-	const uint32_t row_count = uniform_row ? 1u : table.row_limit;
+	const uint32_t row_count = uniform_row ? 1u : proved_rows ? static_cast<uint32_t>(proved_rows->size()) : table.row_limit;
 	ShaderBufferResource buffer;
 	if (!DecodeBufferDescriptor(buffer_value, buffer) || buffer.Stride() == 0u ||
 	    buffer.SwizzleEnabled() || buffer.AddTid() || buffer.IndexStride() != 0u ||
@@ -621,7 +694,7 @@ bool MaterializeWaveAddressImage(const ResourcePlan& program,
 		if (base == 0u || (base & 3u) != 0u)
 			return SpecializationFail("wave address image table has a null or unaligned pointer");
 		for (uint32_t ordinal = 0; ordinal < row_count; ++ordinal) {
-			const uint32_t row = uniform_row ? *uniform_row : ordinal;
+			const uint32_t row = uniform_row ? *uniform_row : proved_rows ? (*proved_rows)[ordinal] : ordinal;
 			// Scalar offset multiplication is guest U32 arithmetic; the immediate
 			// is added afterwards to the canonical full 48-bit address.
 			const auto relative = uint64_t{static_cast<uint32_t>(uint64_t{row} * table.row_stride)} +
@@ -1890,7 +1963,14 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 		return SpecializationFail(
 		    "protected indirect image conflicts with address or image writes");
 	}
-	const bool capture_reads = program.capture_specialization_reads;
+	const bool texture_proof = input_runtime.specialization_range_read_only &&
+	    std::ranges::any_of(program.descriptor_sources, [](const auto& source) {
+		    return source.inline_descriptor && source.inline_descriptor->address_table &&
+		           source.inline_descriptor->address_table->texture_row_domain;
+	    });
+	const bool capture_reads = program.capture_specialization_reads || texture_proof;
+	bool texture_rows_used = false;
+	TextureDomainCache texture_domains;
 
 	SnapshotReader reader {input_runtime};
 	auto&        reads = program.specialization_reads;
@@ -1903,6 +1983,8 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 		if (runtime.read_memory != nullptr) {
 			runtime.read_memory = CaptureOrdinaryRead;
 		}
+		if (runtime.clamp_memory_range) runtime.clamp_memory_range = CaptureClampRange;
+		if (runtime.specialization_range_read_only) runtime.specialization_range_read_only = CaptureReadOnlyRange;
 	} else if (!program.bounded_srt_reads.empty()) {
 		runtime.userdata = &reader;
 		runtime.read_memory = SnapshotReader::Ordinary;
@@ -2126,8 +2208,15 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 				tables.push_back(value);
 			}
 			IndirectImage table;
+			std::optional<std::vector<uint32_t>> texture_rows;
+			if (source->inline_descriptor->address_table) {
+				texture_rows = TextureWaveRows(program, *source->inline_descriptor->address_table,
+				    image_index, snapshot, runtime, input_runtime, texture_domains);
+				texture_rows_used |= texture_rows.has_value();
+			}
 			if (!(source->inline_descriptor->address_table
-			          ? MaterializeWaveAddressImage(program, *source->inline_descriptor, tables[0], image.first_use_pc, runtime, table)
+			          ? MaterializeWaveAddressImage(program, *source->inline_descriptor, tables[0], image.first_use_pc, runtime, table,
+			              texture_rows ? &*texture_rows : nullptr)
 			          : MaterializeInlineImage(*source->inline_descriptor, independent ? nullptr : inline_sampler,
 			                            tables[0], source->inline_descriptor->image_table ? &tables[1] : nullptr,
 			                            image.first_use_pc, runtime, table,
@@ -2240,6 +2329,11 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	if (capture_reads && !WrittenBuffersDisjoint(program, next, reads)) {
 		return SpecializationFail(
 		    "written buffer aliases protected image specialization reads");
+	}
+	if (texture_rows_used) {
+		for (const auto [address, bytes] : reads)
+			if (!input_runtime.specialization_range_read_only(input_runtime.userdata, address, bytes))
+				return SpecializationFail("texture row specialization input aliases a current-draw writer or unknown backing");
 	}
 	next.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return true;
@@ -3183,8 +3277,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			target.indirect_image->selector_mask = Clone(target.indirect_image->selector_mask);
 		}
 		target.inline_descriptor = source.inline_descriptor;
-		if (target.inline_descriptor && target.inline_descriptor->address_table)
-			target.inline_descriptor->address_table->row_value = Clone(target.inline_descriptor->address_table->row_value);
+		if (target.inline_descriptor && target.inline_descriptor->address_table) {
+			auto& table = *target.inline_descriptor->address_table;
+			table.texture_row_domain = ProveTextureWaveRowDomain(program, table.row_value);
+			table.row_value = Clone(table.row_value);
+		}
 		target.bounded_buffer = source.bounded_buffer;
 		if (target.bounded_buffer.has_value())
 			target.bounded_buffer->selector = Clone(target.bounded_buffer->selector);

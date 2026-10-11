@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "PackedTextureRowProofTests.h"
 
 #include <array>
 #include <bit>
@@ -6597,7 +6598,7 @@ void TestSharedInlineImageCandidates(bool pair_domain_regression = false) {
 
 }
 
-void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = false, bool grow_mask = false, bool preceding_cycle = false, bool uniform_row = false, bool invalid_row = false, bool wrapping_row = false) {
+void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = false, bool grow_mask = false, bool preceding_cycle = false, bool uniform_row = false, bool invalid_row = false, bool wrapping_row = false, bool texture_row = false) {
   Fixture fixture;
   auto* entry = fixture.block;
   auto* gate = fixture.AddBlock();
@@ -6605,8 +6606,22 @@ void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = 
   auto* body = fixture.AddBlock();
   auto* exit = fixture.AddBlock();
   const auto active = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(8u), Value(0u)});
-  const auto row = wrapping_row ? fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(9u), Value(2u)}) : fixture.UserData(9u);
-  const auto bounded = fixture.Emit(ValueOpcode::ULessThan32, {row, Value(uniform_row ? 255u : 2u)});
+  auto row = wrapping_row ? fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(9u), Value(2u)}) : fixture.UserData(9u);
+  if (texture_row) {
+    const auto input = fixture.Image({Value(0x4000u), Value((60u << 20u) | (1u << 30u)),
+        Value(1u << 14u), Value((9u << 28u) | (5u << 20u) | 0xfacu),
+        Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo load; load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto texel = fixture.Emit(ValueOpcode::ImageRead,
+        {input, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(load, 4u));
+    std::array<Value, 3> rgb;
+    for (uint32_t component = 0; component < 3u; ++component)
+      rgb[component] = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(component)});
+    const auto minimum = fixture.Emit(ValueOpcode::UMinTri32, {rgb[0], rgb[1], rgb[2]});
+    row = fixture.Emit(ValueOpcode::ReadFirstLane, {minimum, Value(true)});
+  }
+  const auto bounded = fixture.Emit(ValueOpcode::ULessThan32, {row, Value(uniform_row || texture_row ? 255u : 2u)});
   std::array<Value, 4> words;
   for (uint32_t word = 0; word < 4u; ++word) words[word] = fixture.UserData(word);
   const auto buffer = fixture.Buffer(words);
@@ -6714,22 +6729,48 @@ void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = 
     return;
   }
   fixture.PlanAndTrack();
-  Check(fixture.program.info.images.size() == 1u &&
-      fixture.program.descriptor_sources.at(fixture.program.info.images[0].source).inline_descriptor->address_table.has_value(),
+  const auto wave_image = texture_row ? 1u : 0u;
+  Check(fixture.program.info.images.size() == wave_image + 1u &&
+      fixture.program.descriptor_sources.at(fixture.program.info.images[wave_image].source).inline_descriptor->address_table.has_value(),
       "shrinking mask lost paired pointer ancestry");
-  if (uniform_row) {
+  if (uniform_row || texture_row) {
+    struct TextureState {
+      bool invalid = false;
+      bool dirty = false;
+      bool payload_alias = false;
+      bool descriptor_alias = false;
+      uint32_t payload_reads = 0;
+    } state;
     std::array<uint32_t, 12> user_data{};
     user_data[0] = 0x100000u; user_data[1] = 136u << 16u;
     user_data[2] = 2u; user_data[3] = 0x5204u;
     user_data[8] = 1u; user_data[9] = wrapping_row ? UINT32_MAX : invalid_row ? 64u : 1u;
     SrtRuntime runtime;
     runtime.user_data = user_data;
+    runtime.userdata = &state;
     runtime.neighboring_stages_read_only = true;
-    runtime.read_memory = runtime.read_specialization_memory = +[](void*, uint64_t address, std::span<uint32_t> words) {
+    if (texture_row) runtime.specialization_range_read_only = +[](void* data, uint64_t address, uint64_t bytes) {
+      const auto& state = *static_cast<TextureState*>(data);
+      if ((state.payload_alias && address == 0x400000u) ||
+          (state.descriptor_alias && address == 0x100078u)) return false;
+      // The fixture owns distinct immutable allocations for input and tables.
+      return bytes != 0u && address >= 0x100000u && address < 0x401000u &&
+             bytes <= 0x401000u - address;
+    };
+    runtime.read_memory = runtime.read_specialization_memory = +[](void* data, uint64_t address, std::span<uint32_t> words) {
+      auto& state = *static_cast<TextureState*>(data);
+      if (address == 0x400000u && words.size() == 1024u) {
+        ++state.payload_reads;
+        if (state.dirty) return false;
+        std::fill(words.begin(), words.end(), 0x40404040u); // Padding must not supply row64.
+        words[0] = state.invalid ? 0x40404040u : 0x40070401u; words[1] = 0x41010704u;
+        words[4] = 0x42040107u; words[5] = 0x43ffffffu;
+        return true;
+      }
       if (words.size() != 1u) return false;
       if (address == 0x100078u || address == 0x100100u) { words[0] = 0x200000u; return true; }
       if (address == 0x10007cu || address == 0x100104u) { words[0] = 0u; return true; }
-      for (const auto row : {1u,64u}) {
+      for (const auto row : {0u,1u,4u,7u,64u}) {
         const uint64_t base = 0x200000u + uint64_t{row} * 368u + 64u;
         if (address < base || address >= base + 32u || (address - base) % 4u) continue;
         const uint32_t descriptor[8]{0x3000u, 60u << 20u, 0u,
@@ -6745,7 +6786,46 @@ void TestWaveAddressShrinkingMask(bool merge_paths = false, bool empty_bypass = 
     if (invalid_row) {
       Check(!ok && LastResourceSpecializationError().find("unsupported image descriptor") != std::string_view::npos,
             "selected invalid uniform row was accepted");
-    } else Check(ok, "uniform wave row probes unselected descriptor rows");
+    } else Check(ok, texture_row ? "texture-derived wave row probes unselected descriptor rows" :
+                                  "uniform wave row probes unselected descriptor rows");
+    if (texture_row) {
+      Check(state.payload_reads == 1u, "texture-domain refresh reread the same immutable payload");
+      const auto previous = snapshot;
+      const auto previous_specialization = specialization;
+      const auto reject = [&](const char* message, const char* expected_error = nullptr) {
+        Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+              message);
+        if (expected_error) Check(LastResourceSpecializationError().find(expected_error) != std::string_view::npos,
+                                 "texture-domain rejection lost its specific error");
+      };
+      state.invalid = true;
+      reject("reachable invalid texture row was accepted", "unsupported image descriptor");
+      state.invalid = false;
+      state.dirty = true;
+      reject("dirty texture contents became a sparse-domain proof");
+      state.dirty = false;
+      state.payload_alias = true;
+      const auto before_alias = state.payload_reads;
+      reject("attachment alias became a texture-domain proof");
+      Check(state.payload_reads == before_alias, "aliased texture payload was read before ownership proof");
+      state.payload_alias = false;
+      state.descriptor_alias = true;
+      reject("descriptor attachment alias committed a sparse table", "aliases a current-draw writer");
+      state.descriptor_alias = false;
+      const auto proof_callback = runtime.specialization_range_read_only;
+      runtime.specialization_range_read_only = nullptr;
+      reject("missing draw ownership admitted a sparse domain");
+      runtime.specialization_range_read_only = proof_callback;
+      auto& input_source = plan.descriptor_sources.at(plan.info.images[0].source);
+      const auto original_format = input_source.dwords[1];
+      input_source.dwords[1] = Value((61u << 20u) | (1u << 30u));
+      reject("unsupported texture numeric class became an unsigned-byte proof");
+      input_source.dwords[1] = original_format;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                SameResourceSnapshot(snapshot, previous) && specialization == previous_specialization,
+            "restored texture inputs did not recover the sparse mapping");
+    }
   }
 }
 
@@ -9510,6 +9590,14 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ADDRESS_BACKED_INDIRECT_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--wave-address-texture-row-only") == 0) {
+      TestWaveAddressShrinkingMask(false, false, false, false, false, false, false, true);
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--packed-texture-row-proof-only") == 0) {
+      PackedTextureRowProofTests::Run();
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--wave-address-uniform-row-only") == 0) {
       TestWaveAddressShrinkingMask(false, false, false, false, true);
       TestWaveAddressShrinkingMask(false, false, false, false, true, true);
@@ -9803,6 +9891,8 @@ int main(int argc, char** argv) {
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
     Run("independent inline sampled sources", TestIndependentInlineSampledSources);
     Run("shrinking wave mask", [] { TestWaveAddressShrinkingMask(); });
+    Run("texture wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, false, false, false, true); });
+    Run("packed texture row proof", [] { PackedTextureRowProofTests::Run(); });
     Run("uniform wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, true); });
     Run("invalid uniform wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, true, true); });
     Run("wrapping uniform wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, true, false, true); });

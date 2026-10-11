@@ -607,6 +607,18 @@ struct DescriptorSource {
 
 	struct InlineDescriptor {
 		struct AddressTable {
+			struct TextureRowChannel {
+				uint32_t image = 0;
+				uint32_t channels = 0;
+				bool operator==(const TextureRowChannel&) const = default;
+			};
+			// Conditional byte-domain proof. Runtime materialization must establish
+			// RGBA8_UINT input contents and draw-time ownership for every image.
+			struct TextureRowDomain {
+				std::vector<TextureRowChannel> images;
+				std::vector<uint32_t> constants;
+				bool operator==(const TextureRowDomain&) const = default;
+			};
 			uint32_t pointer_offset = 0;
 			uint32_t row_stride = 0;
 			uint32_t row_limit = 0;
@@ -614,6 +626,7 @@ struct DescriptorSource {
 			// Retained expression permits independent CPU-uniform proofs. An
 			// unknown/vector/memory-dependent row keeps the guarded full domain.
 			Value row_value;
+			std::optional<TextureRowDomain> texture_row_domain;
 			bool operator==(const AddressTable&) const = default;
 		};
 		struct ImageTable {

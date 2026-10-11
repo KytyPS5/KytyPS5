@@ -729,7 +729,9 @@ struct PipelineCache::ProgramCache {
 	                  uint32_t& push_data_cursor,
  std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt,
  bool compute_workgroups_trusted = true, uint64_t indirect_args_addr = 0,
- bool neighboring_stages_read_only = false) {
+ bool neighboring_stages_read_only = false,
+ bool (*specialization_range_read_only)(void*, uint64_t, uint64_t) = nullptr,
+ void* range_userdata = nullptr) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -797,6 +799,7 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderBacking,
+		    .userdata                   = range_userdata,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .compute_workgroups         = guest_workgroups,
 		    .compute_workgroups_trusted = compute_workgroups_trusted,
@@ -806,6 +809,7 @@ struct PipelineCache::ProgramCache {
 		    .max_dense_images           = dense_image_capacity,
 		    .capture_scalar_selector_values = stage == ShaderType::Compute,
 		    .neighboring_stages_read_only = stage == ShaderType::Compute || neighboring_stages_read_only,
+		    .specialization_range_read_only = specialization_range_read_only,
 		};
 		const auto refresh_indirect_grid = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
 			if (runtime.compute_workgroups_trusted || indirect_args_addr == 0 ||
@@ -828,13 +832,15 @@ struct PipelineCache::ProgramCache {
 			const auto capture_hash = filter ? std::strtoull(filter, &end, 16) : 0;
 			const bool selected = directory && *directory && filter && *filter && end &&
 			                      *end == '\0' && capture_hash == params.hash;
-			if (!selected)
+			const bool all_failures = directory && *directory &&
+			    std::getenv("KYTY_RESOURCE_CAPTURE_ALL_FAILURES");
+			if (!selected && !all_failures)
 				return ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization);
 			ShaderRecompiler::Capture::ResourceReadCapture capture(runtime);
 			const auto observed = capture.Runtime();
 			const bool ok = ShaderRecompiler::IR::MaterializeResources(plan, observed, resources, specialization);
 			// Save before the caller's fatal error. No extra guest reads are made.
-			if (!ok || std::getenv("KYTY_RESOURCE_CAPTURE_SUCCESS")) {
+			if (!ok || (selected && std::getenv("KYTY_RESOURCE_CAPTURE_SUCCESS"))) {
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 				try {
 #endif
@@ -1436,7 +1442,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    bool (*specialization_range_read_only)(void*, uint64_t, uint64_t), void* range_userdata) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -1536,7 +1543,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		const bool producers_read_only = std::all_of(vertex_read_only.begin(),
 		    vertex_read_only.begin() + vertex_count, [](bool value) { return value; });
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor,
-		    std::nullopt, true, 0u, producers_read_only);
+		    std::nullopt, true, 0u, producers_read_only,
+		    specialization_range_read_only, range_userdata);
 		std::vector<uint32_t> active_inputs;
 		for (const auto& input: pixel_info.stage.program->info.inputs) {
 			if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter) {
@@ -1571,7 +1579,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		for (uint32_t other = 0; other < vertex_count; ++other)
 			if (other != i) neighbors_read_only &= vertex_read_only[other];
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor,
-		    std::nullopt, true, 0u, neighbors_read_only);
+		    std::nullopt, true, 0u, neighbors_read_only,
+		    specialization_range_read_only, range_userdata);
 	}
 	return result;
 }

@@ -268,8 +268,9 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+RenderDepthInfo DescribeRenderDepthTarget(const CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
+	RenderDepthInfo r {};
 	const auto& hw          = buffer.GetRegisters();
 	const auto& z           = hw.GetDepthRenderTarget();
 	const auto& rc          = hw.GetRenderControl();
@@ -282,7 +283,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
 	if (!depth_active && !stencil_active) {
-		return;
+		return r;
 	}
 	const bool attachment_unbound =
 	    z.z_info.format == Prospero::DepthFormat::kInvalid &&
@@ -306,7 +307,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
 			LOGF("DepthTarget: ignoring enabled depth/stencil state without a bound attachment\n");
 		}
-		return;
+		return r;
 	}
 	if (rc.copy_depth_to_color || rc.copy_stencil_to_color || rc.copy_centroid ||
 	    rc.copy_sample != 0 || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
@@ -355,8 +356,13 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	return r;
+}
+
+void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+	r = DescribeRenderDepthTarget(buffer);
+	if (r.desc.info.data.Empty()) return;
+	r.image_id = m_context.GetTextureCache().FindImage(r.desc);
 	BindRenderTarget(r.image_id);
 }
 

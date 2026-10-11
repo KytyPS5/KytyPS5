@@ -271,11 +271,19 @@ void TextureCache::DeleteImage(ImageId id) {
 		m_surface_metas.erase(image.info.metadata.range.address);
 	}
 	UnregisterImage(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
-	} else {
-		m_slot_images.erase(id);
+	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
+	// earlier may still be sampling the image on the GPU.
+	m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+}
+
+void TextureCache::ReleaseImage(ImageId id) {
+	const auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && !m_scheduler.IsFree(image->tick_accessed_last)) {
+		// Used after it was dropped, in a tick the GPU has not finished: keep it until then.
+		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+		return;
 	}
+	m_slot_images.erase(id);
 }
 
 void TextureCache::FreeImage(ImageId id) {

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/FiniteSelectorValues.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
@@ -2927,6 +2928,18 @@ private:
 		return true;
 	}
 
+	std::optional<std::vector<uint32_t>> StaticInlineSelectors(Value selector) const {
+		selector = selector.Resolve();
+		const auto* lane = selector.TryInstruction();
+		if (lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadFirstLane && lane->NumArgs() == 2u) {
+			const auto mask = lane->Arg(1).Resolve();
+			const bool full = mask.IsImmediate() && mask.GetType() == Type::U1 && mask.U1();
+			if (!full && !HasActiveLane(mask, lane->Parent())) return {};
+			selector = lane->Arg(0);
+		}
+		return ProveFiniteConstantSelectors(m_program, selector);
+	}
+
 	bool TryMakeInlineDescriptor(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan,
 	                             bool compact_image = true) {
 		const bool image           = handle.GetOpcode() == ValueOpcode::GetImageResource;
@@ -2992,6 +3005,7 @@ private:
 		source.inline_descriptor->descriptor_dwords = descriptor_dwords;
 		source.inline_descriptor->selector_limit =
 		    DominatingSelectorLimit(selector, handle.Parent());
+		source.inline_descriptor->selector_static_values = StaticInlineSelectors(selector);
 		if (!buffer_resource && source.inline_descriptor->selector_limit == 0u) {
 			const auto* read = selector.Resolve().TryInstruction();
 			uint32_t memory_index = 0;
@@ -3139,6 +3153,7 @@ private:
 		    DescriptorSource::InlineDescriptor::ImageTable {InternSource(address_source), table_offset, index_shift, index_mask}};
 		source.inline_descriptor->selector_limit =
 		    DominatingSelectorLimit(selector, handle.Parent());
+		source.inline_descriptor->selector_static_values = StaticInlineSelectors(selector);
 		plan.handle = &handle;
 		plan.source = InternSource(source);
 		plan.root_count = 6u;

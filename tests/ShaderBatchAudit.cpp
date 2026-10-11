@@ -460,6 +460,8 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
               item["inline"] = {{"buffer_source", table.buffer_source}, {"stride", table.selector_stride},
                                  {"offset", table.descriptor_offset}, {"limit", table.selector_limit},
                                  {"dwords", table.descriptor_dwords}};
+              item["inline"]["static_selector_values"] = table.selector_static_values
+                  ? Json(*table.selector_static_values) : Json(nullptr);
               if (table.address_table) {
                 const auto& address = *table.address_table;
                 item["address_table"] = {{"pointer_offset", address.pointer_offset},

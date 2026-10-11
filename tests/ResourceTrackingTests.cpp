@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/FiniteSelectorValues.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -5907,6 +5908,151 @@ void TestInlineDescriptorPairs() {
   }
 }
 
+std::unique_ptr<Fixture> MakeFiniteInlineSelectorFixture(uint32_t third_value = 3u, bool runtime_third = false) {
+  auto storage = std::make_unique<Fixture>();
+  auto& fixture = *storage;
+  std::array<Value, 4> material_words;
+  for (uint32_t word = 0; word < 4u; ++word) material_words[word] = fixture.UserData(word);
+  const auto material = fixture.Buffer(material_words);
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto one = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
+  const auto three = runtime_third
+      ? fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(4u), Value(0u)})
+      : fixture.Emit(ValueOpcode::IEqual32, {lane, Value(3u)});
+  const auto sentinel = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(63u)});
+  auto local = fixture.Emit(ValueOpcode::SelectU32, {one, Value(1u), Value(0u)});
+  local = fixture.Emit(ValueOpcode::SelectU32, {three, Value(third_value), local});
+  local = fixture.Emit(ValueOpcode::SelectU32, {sentinel, Value(UINT32_MAX), local});
+  const auto selector = fixture.Emit(ValueOpcode::ReadFirstLane, {local, Value(true)});
+  const auto offset = fixture.Emit(ValueOpcode::IMul32, {selector, Value(136u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t word = 0; word < 4u; ++word) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer; scalar.offset = 16u + word * 4u;
+    scalar.component_count = 4u; scalar.component_index = word;
+    image_words[word] = fixture.Emit(ValueOpcode::ReadConstBuffer, {material, offset},
+        fixture.AddMemory(scalar, 0x100u));
+    image_words[word + 4u] = Value(0u);
+  }
+  const auto image = fixture.Image(image_words);
+  MemoryInfo fetch;
+  fetch.kind = ResourceKind::Image; fetch.image_r128 = true;
+  fetch.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto loaded = fixture.Emit(ValueOpcode::ImageRead,
+      {image, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(fetch, 0x120u));
+  const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {loaded, Value(0u)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {component});
+  return storage;
+}
+
+void TestFiniteInlineSelectorDomain() {
+  auto storage = MakeFiniteInlineSelectorFixture();
+  auto& fixture = *storage;
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 1u, "finite inline fixture lost its logical image");
+  auto plan = ExtractResourcePlan(fixture.program);
+  LinearTestMemory memory;
+  using Format = Libs::Graphics::Prospero::BufferFormat;
+  const auto descriptor = [](uint32_t base, Format format) {
+    return std::array<uint32_t, 4>{base, static_cast<uint32_t>(format) << 20u, 0u,
+        (9u << 28u) | (5u << 20u) | Libs::Graphics::DstSel(4, 5, 6, 7)};
+  };
+  for (uint32_t record = 0; record < 2u; ++record) {
+    const auto rgba = descriptor(0x3000u + record * 0x1000u, Format::k8_8_8_8UInt);
+    const auto unrelated = descriptor(0x6000u + record * 0x1000u, Format::k8UInt);
+    std::copy(rgba.begin(), rgba.end(), memory.words.begin() + (record * 136u + 16u) / 4u);
+    std::copy(unrelated.begin(), unrelated.end(), memory.words.begin() + (record * 136u + 48u) / 4u);
+  }
+  const std::array<uint32_t, 4> user_data{0x1000u, 136u << 16u, 2u, 0x5204u};
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory,
+      .neighboring_stages_read_only = true};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite inline selector fixture did not materialize");
+  Check(snapshot.images.size() == 3u && std::ranges::all_of(snapshot.images, [](const auto& value) {
+      return value.dwords[0] == 0u || ((value.dwords[1] >> 20u) & 0x1ffu) == static_cast<uint32_t>(Format::k8_8_8_8UInt);
+    }), "finite inline selector retains unreachable wrapped R8 images");
+  for (const uint32_t key: {0u, 136u}) {
+    const auto candidate = InlineCandidateForKey(snapshot, specialization, key);
+    Check(candidate != 0u && snapshot.images[candidate].dwords[0] == 0x3000u + (key / 136u) * 0x1000u,
+          "finite inline selector changed a reachable RGBA descriptor");
+  }
+  static_assert(static_cast<uint32_t>(uint64_t{UINT32_MAX} * 136u) == 0xffffff78u);
+  for (const uint32_t key: {408u, 0xffffff78u})
+    Check(InlineCandidateForKey(snapshot, specialization, key) == 0u,
+          "finite inline selector changed wrapped out-of-bounds behavior");
+}
+
+void TestFiniteInlineSelectorKeepsWrappedAlias() {
+  constexpr uint32_t wraps_to_r8 = 0x03c3c3c4u;
+  static_assert(static_cast<uint32_t>(uint64_t{wraps_to_r8} * 136u) == 32u);
+  auto fixture = MakeFiniteInlineSelectorFixture(wraps_to_r8, true);
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  LinearTestMemory memory;
+  using Format = Libs::Graphics::Prospero::BufferFormat;
+  const auto store = [&](uint32_t offset, uint32_t base, Format format) {
+    const std::array<uint32_t, 4> descriptor{base, static_cast<uint32_t>(format) << 20u, 0u,
+        (9u << 28u) | (5u << 20u) | Libs::Graphics::DstSel(4, 5, 6, 7)};
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + offset / 4u);
+  };
+  for (uint32_t record = 0; record < 2u; ++record) {
+    store(record * 136u + 16u, 0x3000u + record * 0x1000u, Format::k8_8_8_8UInt);
+    store(record * 136u + 48u, 0x6000u + record * 0x1000u, Format::k8UInt);
+  }
+  // The runtime predicate selects the wrapping arm for the first active lane.
+  const std::array<uint32_t, 5> user_data{0x1000u, 136u << 16u, 2u, 0x5204u, 1u};
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory,
+      .neighboring_stages_read_only = true};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "known wrapped inline selector did not materialize");
+  const auto candidate = InlineCandidateForKey(snapshot, specialization, 32u);
+  Check(snapshot.images.size() == 4u && candidate != 0u &&
+      snapshot.images[candidate].dwords[0] == 0x6000u &&
+      ((snapshot.images[candidate].dwords[1] >> 20u) & 0x1ffu) == static_cast<uint32_t>(Format::k8UInt),
+      "finite inline selector discarded a reachable wrapped R8 descriptor");
+  Check(InlineCandidateForKey(snapshot, specialization, 168u) == 0u,
+        "finite inline selector retained an unrelated second wrapped alias");
+}
+
+void TestFiniteSelectorProofBoundaries() {
+  Fixture fixture;
+  const auto predicate = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(4u), Value(0u)});
+  const auto pair = fixture.Emit(ValueOpcode::SelectU32, {predicate, Value(0u), Value(1u)});
+  auto& merged = fixture.block->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  merged.AddPhiOperand(nullptr, pair);
+  merged.AddPhiOperand(nullptr, Value(3u));
+  const auto selector = fixture.Emit(ValueOpcode::SelectU32, {predicate, Value(UINT32_MAX), Value(&merged)});
+  const auto values = ProveFiniteConstantSelectors(fixture.program, selector);
+  Check(values && *values == std::vector<uint32_t>({0u, 1u, 3u, UINT32_MAX}),
+        "finite selector proof lost Phi/Select alternatives or unsigned sentinel");
+  const auto memory_value = fixture.UserData(5u);
+  const auto unknown = fixture.Emit(ValueOpcode::SelectU32, {predicate, Value(0u), memory_value});
+  Check(!ProveFiniteConstantSelectors(fixture.program, unknown),
+        "finite selector proof trusted a runtime value as a constant");
+  const auto undefined = fixture.Emit(ValueOpcode::UndefU32);
+  const auto partial = fixture.Emit(ValueOpcode::SelectU32, {predicate, Value(0u), undefined});
+  Check(!ProveFiniteConstantSelectors(fixture.program, partial),
+        "finite selector proof trusted an uninitialized alternative");
+  auto& changing = fixture.block->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  changing.AddPhiOperand(nullptr, Value(0u));
+  changing.AddPhiOperand(nullptr, fixture.Emit(ValueOpcode::IAdd32, {Value(&changing), Value(1u)}));
+  Check(!ProveFiniteConstantSelectors(fixture.program, Value(&changing)),
+        "finite selector proof bounded an arithmetic loop by its first value");
+  auto& unanchored = fixture.block->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  unanchored.AddPhiOperand(nullptr, Value(&unanchored));
+  Check(!ProveFiniteConstantSelectors(fixture.program, Value(&unanchored)),
+        "finite selector proof trusted an unanchored Phi cycle");
+  const auto empty_lane = fixture.Emit(ValueOpcode::ReadFirstLane, {selector, Value(false)});
+  Check(!ProveFiniteConstantSelectors(fixture.program, empty_lane),
+        "finite constant helper bypassed the nonempty lane-selection proof");
+}
+
 void TestCoherentInlineSelectorValues() {
   namespace Prospero = Libs::Graphics::Prospero;
   auto fixture = MakeInlineDescriptorFixture();
@@ -9554,6 +9700,13 @@ void TestGpuSelectedRawBufferAdmission() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--finite-inline-selector-only") == 0) {
+      TestFiniteInlineSelectorDomain();
+      TestFiniteInlineSelectorKeepsWrappedAlias();
+      TestFiniteSelectorProofBoundaries();
+      std::cout << "KYTY_FINITE_INLINE_SELECTOR_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-formatted-wide-only") == 0) {
       TestGpuSelectedFormattedWideAdmission();
       return 0;
@@ -9892,6 +10045,7 @@ int main(int argc, char** argv) {
     Run("independent inline sampled sources", TestIndependentInlineSampledSources);
     Run("shrinking wave mask", [] { TestWaveAddressShrinkingMask(); });
     Run("texture wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, false, false, false, true); });
+    Run("finite inline constant selector", TestFiniteInlineSelectorDomain);
     Run("packed texture row proof", [] { PackedTextureRowProofTests::Run(); });
     Run("uniform wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, true); });
     Run("invalid uniform wave row", [] { TestWaveAddressShrinkingMask(false, false, false, false, true, true); });

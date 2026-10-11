@@ -2047,6 +2047,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	uint64_t selector_work_bytes = 0;
 	const auto selector_values = [&](const DescriptorSource::InlineDescriptor& table)
 	    -> const std::vector<uint32_t>* {
+		if (table.selector_static_values) return &*table.selector_static_values;
 		if (!input_runtime.capture_scalar_selector_values || program.stage != ShaderType::Compute ||
 		    program.has_address_writes || program.info.writes_dma || table.selector_limit != 0u ||
 		    table.selector_buffer_source == UINT32_MAX || input_runtime.read_specialization_memory == nullptr) {

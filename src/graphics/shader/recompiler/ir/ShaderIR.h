@@ -655,6 +655,9 @@ struct DescriptorSource {
 		// byte offset divisible by four, with zero immediate offset.
 		uint32_t selector_buffer_source = UINT32_MAX;
 		bool independent_sampler = false;
+		// Exact finite overestimate from immutable Phi/Select constant leaves.
+		// Values remain selectors; materialization applies guest U32 wrapping.
+		std::optional<std::vector<uint32_t>> selector_static_values;
 
 		bool operator==(const InlineDescriptor& other) const = default;
 	};

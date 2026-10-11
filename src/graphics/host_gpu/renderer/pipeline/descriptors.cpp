@@ -970,6 +970,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
+				// A compute dispatch reading a buffer it writes itself through scalar loads is racy
+				// on hardware: the scalar cache is not coherent with the dispatch's own vector
+				// writes, so the value captured at dispatch start is a valid result. The next
+				// dispatch re-materializes its specialization from memory, so the writes are still
+				// observed from then on.
+				if (writer == reader && program.stage == ShaderType::Compute) continue;
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];

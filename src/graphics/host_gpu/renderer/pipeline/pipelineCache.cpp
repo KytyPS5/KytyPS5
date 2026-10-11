@@ -110,6 +110,15 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+bool ReadShaderScalarMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	// The walk evaluates loads the shader may never execute, e.g. through a null SRT pointer, so
+	// unmapped guest memory reads as zeros instead of faulting the host.
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+		std::ranges::fill(values, 0u);
+	}
+	return true;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -340,6 +349,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderScalarMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {

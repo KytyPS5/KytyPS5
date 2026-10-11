@@ -16439,6 +16439,60 @@ public:
               wave_ids[0] != wave_ids[1] && wave_keys[0] != wave_keys[1],
               "wave32 and wave64 pixel programs shared a cache key");
 
+      static const auto waterfall_vertex = [&] {
+        std::vector<u32> code;
+        AppendVMovU32(&code, 9, 0);
+        // d3e1ae284c4dea3b reconstructs EXEC twice from packed NGG s3.
+        code.insert(code.end(), {0xbefe04c1u, 0x906a8803u, 0x81ea6a80u,
+                                 0x90fe6ac1u, 0x81ea0380u, 0x90fe6ac1u,
+                                 EncodeSop1(0x04, 10, 126)});
+        const auto loop = code.size();
+        code.push_back(EncodeSop1(0x14, 4, 10));
+        AppendVop3(&code, 0x360, 6, Vgpr(5), 4);
+        code.push_back(EncodeVopc(0xc2, 6, 5));
+        code.push_back(EncodeSop1(0x24, 18, 106));
+        AppendVMovLiteral(&code, 9, 0x3f800000u);
+        code.push_back(EncodeSop2(0x15, 10, 10, 106));
+        code.push_back(EncodeSop1(0x04, 126, 18));
+        code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+        const auto base = code.size();
+        code.insert(code.end(), native_vertex.begin(), native_vertex.end());
+        const auto position = std::find(code.begin() + base, code.end(), EncodeExp0(0x0c, 0xf));
+        // Unprocessed vertices keep W=0, making waterfall progress observable.
+        *(position + 1) = EncodeExp1(3, 4, 0, 9);
+        return code;
+      }();
+      native_vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(waterfall_vertex.data());
+      ShaderMapUserData(native_vertex_regs.es_regs.data_addr,
+          {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+           .code_size_bytes = static_cast<u32>(waterfall_vertex.size() * sizeof(u32))});
+      registers.SetPsInControl(0x8008);
+      const auto saved_stages = registers.GetShaderStages();
+      for (const u32 wave : {32u, 64u}) {
+        registers.SetShaderStages((saved_stages & ~0x00400000u) |
+                                   (wave == 32u ? 0x00400000u : 0u));
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
+        Require(name, "native NGG waterfall wave",
+                vertex.stage.program->stage == ShaderType::Vertex &&
+                    vertex.stage.program->wave_size == wave,
+                "NGG waterfall bypassed the native vertex path or lost its guest wave width");
+        for (const u32 count : {3u, 6u, 33u}) {
+          draw(pipeline(true, 2, 2), count);
+          const auto pixels = read_color();
+          for (size_t component = 0; component < pixels.size(); ++component)
+            Require(name, "NGG partial-wave waterfall output",
+                    pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "native vertex waterfall did not terminate with every input vertex processed");
+        }
+      }
+      registers.SetShaderStages(saved_stages);
+      native_vertex_regs.es_regs.data_addr = vertex_address;
+
       // Reversed RGBA targets must use logical Sa for RGB, with a separate
       // zero or unit source factor for separate alpha attenuation or accumulation.
       static const auto blend_pixel = [] {
@@ -17744,39 +17798,47 @@ public:
     }
 
     // Exercise the real texture-layout/info-building seam for every format
-    // admitted by each standard tile mode.  Formats sharing a byte/block width
+    // admitted by each texture tile mode.  Formats sharing a byte/block width
     // intentionally share a shader, but this loop still validates their
     // texel-to-element conversion (notably every BCn format).
-    struct StandardMode {
+    struct TextureMode {
       Prospero::TileMode tile;
       TileBlockFamily family;
     };
-    constexpr StandardMode standard_modes[] = {
+    constexpr TextureMode texture_modes[] = {
         {Prospero::TileMode::kStandard256B, TileBlockFamily::Standard256B},
         {Prospero::TileMode::kStandard4KB, TileBlockFamily::Standard4KB},
         {Prospero::TileMode::kStandard64KB, TileBlockFamily::Standard64KB},
         {Prospero::TileMode::kPrt, TileBlockFamily::Prt64KB},
+        {Prospero::TileMode::kRenderTarget, TileBlockFamily::RenderTarget64KB},
+        {Prospero::TileMode::kDepth, TileBlockFamily::Depth64KB},
     };
-    struct RenderTargetFormatCase {
+    struct TextureTileFormatCase {
       Prospero::BufferFormat format;
       u32 bytes_per_element;
+      bool depth_supported;
     };
-    constexpr RenderTargetFormatCase render_target_formats[] = {
-        {Prospero::BufferFormat::k8Srgb, 1},
-        {Prospero::BufferFormat::k8_8Srgb, 2},
-        {Prospero::BufferFormat::k9_9_9_5Float, 0},
+    constexpr TextureTileFormatCase texture_tile_formats[] = {
+        {Prospero::BufferFormat::k8Srgb, 1, true},
+        {Prospero::BufferFormat::k8_8Srgb, 2, true},
+        {Prospero::BufferFormat::k9_9_9_5Float, 4, true},
+        {Prospero::BufferFormat::kBc1Srgb, 8, false},
+        {Prospero::BufferFormat::kBc7Srgb, 16, false},
+        {Prospero::BufferFormat::k32_32_32_32Float, 16, false},
     };
-    for (const auto &test : render_target_formats) {
+    for (const auto &test : texture_tile_formats) {
       for (const auto tile :
            {Prospero::TileMode::kDepth, Prospero::TileMode::kRenderTarget}) {
         TileTextureBlockLayout texture{};
         const bool supported =
             TileGetTextureBlockLayout(test.format, tile, false, texture);
-        Require(name, "RT format policy",
-                supported == (test.bytes_per_element != 0) &&
+        const bool expected = tile == Prospero::TileMode::kRenderTarget ||
+                              test.depth_supported;
+        Require(name, "texture tile format policy",
+                supported == expected &&
                     (!supported || texture.block.bytes_per_element ==
                                        test.bytes_per_element),
-                "RT/depth tile format support or element size is incorrect");
+                "texture tile policy used attachment format restrictions");
       }
     }
     {
@@ -17809,7 +17871,7 @@ public:
       if (Prospero::IsFmaskTextureFormat(format)) {
         continue;
       }
-      for (const auto &mode : standard_modes) {
+      for (const auto &mode : texture_modes) {
         TileTextureBlockLayout texture{};
         if (!TileGetTextureBlockLayout(format, mode.tile, false, texture)) {
           continue;
@@ -17846,7 +17908,27 @@ public:
       }
     }
     Require(name, "format coverage", format_cases != 0,
-            "no CPU-supported standard formats were tested");
+            "no CPU-supported texture formats were tested");
+
+    {
+      constexpr auto format = Prospero::BufferFormat::kBc1Srgb;
+      constexpr auto tile = Prospero::TileMode::kRenderTarget;
+      constexpr u32 layers = 8;
+      const auto captured =
+          MakeTilingImage(format, 2048, 2048, 1, layers, tile, 0, false);
+      Require(name, "PPSA19577 BC1 array footprint",
+              captured.data.size == 0x1000000 &&
+                  captured.tiled_slice_stride == 0x200000 &&
+                  captured.first_tail_level == 1 &&
+                  captured.tiling.block.block_width == 128 &&
+                  captured.tiling.block.block_height == 64 &&
+                  captured.mip_layout[0].pitch == 512 &&
+                  captured.mip_layout[0].height == 512,
+              "R64 BC1 texture lost its compressed blocks or array stride");
+      const auto small_image =
+          MakeTilingImage(format, 67, 51, 1, layers, tile, 0, false);
+      check_round_trip("R64 BC1 array", small_image.data.size, small_image);
+    }
 
     {
       constexpr auto format = Prospero::BufferFormat::k11_11_10UInt;
@@ -17949,7 +18031,7 @@ public:
       check_round_trip("array", total.size, layout);
     }
 
-    for (const auto &mode : standard_modes) {
+    for (const auto &mode : texture_modes) {
       constexpr auto format = Prospero::BufferFormat::k32Float;
       constexpr u32 levels = 2;
       TileBlockLayout block{};
@@ -34142,10 +34224,11 @@ TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   return test;
 }
 
-template <bool rg> TestCase ImageSampleUScaled8() {
+template <bool rg, bool snorm = false> TestCase ImageSamplePacked8() {
   using O = ShaderOpcode;
   TestCase test;
-  test.name = rg ? "ImageSampleRG8UScaled" : "ImageSampleR8UScaled";
+  test.name = snorm ? "ImageSampleR8SNorm"
+                   : rg ? "ImageSampleRG8UScaled" : "ImageSampleR8UScaled";
   AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(0.375f));
   AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.375f));
   test.code.push_back(EncodeMimg0(0x20, 0xf));
@@ -34158,26 +34241,37 @@ template <bool rg> TestCase ImageSampleUScaled8() {
     AppendStoreVgpr(&test.code, component, component);
   }
   AppendEnd(&test.code);
-  // R varies horizontally; G varies vertically in the opposite direction.
-  // Bilinear samples must retain fractions despite host UNorm filter precision.
   test.image_width = test.image_height = 2;
-  test.sampled_image_rgba = rg ? std::vector<u32>{0xffffff00u, 0x00ff0000u}
-                               : std::vector<u32>{0xff00ff00u};
-  test.sampled_image_format = rg ? vk::Format::eR8G8Unorm : vk::Format::eR8Unorm;
+  test.sampled_image_rgba =
+      snorm ? std::vector<u32>{0x7fc08180u}
+            : rg ? std::vector<u32>{0xffffff00u, 0x00ff0000u}
+                 : std::vector<u32>{0xff00ff00u};
+  test.sampled_image_format =
+      snorm ? vk::Format::eR8Snorm
+            : rg ? vk::Format::eR8G8Unorm : vk::Format::eR8Unorm;
   test.sampled_image_dwords_per_pixel = 1;
-  test.sampler_filter = vk::Filter::eLinear;
-  test.expected_float_tolerance = 0.01f;
-  test.user_data = MakeSampledTextureData(rg ? Prospero::BufferFormat::k8_8UScaled
-                                            : Prospero::BufferFormat::k8UScaled);
+  test.sampler_filter = snorm ? vk::Filter::eNearest : vk::Filter::eLinear;
+  test.expected_float_tolerance = snorm ? 0.00002f : 0.01f;
+  test.user_data = MakeSampledTextureData(
+      snorm ? Prospero::BufferFormat::k8SNorm
+            : rg ? Prospero::BufferFormat::k8_8UScaled
+                 : Prospero::BufferFormat::k8UScaled);
   test.user_data[1] |= 1u << 30u;
   test.user_data[2] = 1u << 14u;
   test.user_data[50] = 12u * sizeof(u32);
   test.user_data[51] = 3u << 28u;
   test.has_user_data = true;
-  test.image_descriptor_swizzle = DstSel(rg ? 5 : 4, 4, 0, 1);
-  for (float value : {rg ? 191.25f : 63.75f, 63.75f, 0.0f, 1.0f,
-                      0.0f, rg ? 0.0f : 255.0f, 255.0f, rg ? 255.0f : 0.0f,
-                      1.0f, 1.0f, 1.0f, 1.0f}) {
+  test.image_descriptor_swizzle = snorm ? DstSel(4, 5, 6, 7)
+                                      : DstSel(rg ? 5 : 4, 4, 0, 1);
+  constexpr float midpoint = -64.0f / 127.0f;
+  const std::array<float, 12> expected = snorm
+      // -128 and -127 both clamp to -1; the interior signed value normalizes by 127.
+      ? std::array<float, 12>{-1, 0, 0, 1, midpoint, 1, -1, -1, 1, 1, 1, 1}
+      // R varies horizontally; G varies vertically in the opposite direction.
+      : std::array<float, 12>{rg ? 191.25f : 63.75f, 63.75f, 0.0f, 1.0f,
+                             0.0f, rg ? 0.0f : 255.0f, 255.0f, rg ? 255.0f : 0.0f,
+                             1.0f, 1.0f, 1.0f, 1.0f};
+  for (float value : expected) {
     test.expected.push_back(std::bit_cast<u32>(value));
   }
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
@@ -37537,8 +37631,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
-  AddCase(ImageSampleUScaled8<false>);
-  AddCase(ImageSampleUScaled8<true>);
+  AddCase(ImageSamplePacked8<false>);
+  AddCase(ImageSamplePacked8<true>);
+  AddCase(ImageSamplePacked8<false, true>);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
@@ -41904,7 +41999,7 @@ void CheckAgcSystemTable(RenderContext &renderer) {
       0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e};
   LibKernel::Memory::InstallGpuResources(&renderer);
   const auto direct_size = LibKernel::Memory::KernelGetDirectMemorySize();
-  Require(name, "early driver reservation", ReserveAgcDriverMemory() == 0,
+  Require(name, "early driver reservation", Gen5Driver::Initialize() == 0,
           "driver memory was not reserved before guest allocation");
   Require(name, "guest budget excludes driver",
           LibKernel::Memory::KernelGetDirectMemorySize() == direct_size - 0x200000,
@@ -41965,7 +42060,8 @@ void CheckAgcSystemTable(RenderContext &renderer) {
   Require(name, "default instrumentation", *instrumentation == 0,
           "unused vertex validation was enabled at startup");
   *instrumentation = 0x12340000u;
-  Require(name, "repeat startup", Gen5::AgcInit(nullptr, 13) == 0 &&
+  Require(name, "repeat startup", Gen5Driver::Initialize() == 0 &&
+              Gen5::AgcInit(nullptr, 13) == 0 &&
               *instrumentation == 0x12340000u,
           "repeat Agc initialization reset existing system state");
   *instrumentation = 0;
@@ -42549,6 +42645,43 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
           Gen5::AgcCbNop(reinterpret_cast<Gen5::CommandBuffer*>(&payload_dcb), 3) == payload.data() &&
               payload == std::array<uint32_t, 3>{0xc0011000u, 0x12345678u, 0x9abcdef0u},
           "NOP emitter overwrote the caller's reserved payload");
+  alignas(8) uint64_t released = 0;
+  std::array<uint32_t, 20> disabled_commands{};
+  const auto disabled_write = write(&returned, 99);
+  std::copy(disabled_write.begin(), disabled_write.end(), disabled_commands.begin());
+  disabled_commands[5] = KYTY_PM4(2, Pm4::IT_NUM_INSTANCES, 0);
+  disabled_commands[6] = 0x68750123u;
+  CommandBufferLayout release_dcb{disabled_commands.data() + 7, disabled_commands.data() + 15,
+      disabled_commands.data() + 7, disabled_commands.data() + 15, nullptr, nullptr, 0};
+  auto* release = Gen5::AgcCbReleaseMem(
+      reinterpret_cast<Gen5::CommandBuffer*>(&release_dcb), 0x28, 0, 0, 0,
+      reinterpret_cast<const volatile Gen5::Label*>(&released), 2, 77, 0, 0, 0, 0);
+  const auto enabled_write = write(&selected, 88);
+  std::copy(enabled_write.begin(), enabled_write.end(), disabled_commands.begin() + 15);
+  const auto unpatched_commands = disabled_commands;
+  Require(name, "SetNop packets",
+          release == disabled_commands.data() + 7 &&
+              Gen5::AgcSetNop(disabled_commands.data()) == 0 &&
+              Gen5::AgcSetNop(disabled_commands.data() + 5) == 0 && Gen5::AgcSetNop(release) == 0 &&
+              disabled_commands[0] == ((disabled_write[0] & 0xffff00ffu) | (Pm4::IT_NOP << 8u)) &&
+              disabled_commands[5] == KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO) &&
+              disabled_commands[6] == 0x123u &&
+              release[0] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ZERO) &&
+              unpatched_commands[7] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM) &&
+              Gen5::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
+              Gen5::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
+              Gen5::AgcGetPacketSize(release) == 8 &&
+              std::equal(disabled_commands.begin() + 1, disabled_commands.begin() + 5,
+                         unpatched_commands.begin() + 1) &&
+              std::equal(disabled_commands.begin() + 8, disabled_commands.end(),
+                         unpatched_commands.begin() + 8),
+          "SetNop changed a packet length, kept its operation or marker, or touched its payload");
+  selected = returned = 0;
+  Pm4Execution disabled_execution;
+  Require(name, "SetNop execution",
+          processor.Process(disabled_execution, disabled_commands) == Pm4ProcessResult::Complete &&
+              returned == 0 && released == 0 && selected == 88,
+          "a disabled packet still executed or hid the packet after it");
   const auto then_commands = write(&selected, 11);
   const auto else_commands = write(&selected, 33);
   const auto branch_suffix = write(&selected, 44);
@@ -43122,8 +43255,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--scaled-texture-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ImageSampleUScaled8<false>());
-    RunCase(&vulkan, ImageSampleUScaled8<true>());
+    RunCase(&vulkan, ImageSamplePacked8<false>());
+    RunCase(&vulkan, ImageSamplePacked8<true>());
+    RunCase(&vulkan, ImageSamplePacked8<false, true>());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {

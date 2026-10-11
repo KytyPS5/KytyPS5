@@ -22,7 +22,6 @@ struct MemoryRange {
 
 void Initialize();
 void Shutdown();
-int  ReserveAgcDriverMemory();
 
 struct Lifecycle {
 	static constexpr const char* name       = "Graphics";
@@ -270,6 +269,7 @@ uint32_t KYTY_SYSV_ABI  AgcGetPacketSize(uint32_t* packet);
 int KYTY_SYSV_ABI       AgcSetPacketPredication(uint32_t* packet, uint32_t predication);
 int KYTY_SYSV_ABI       AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
                                                uint32_t predication);
+int KYTY_SYSV_ABI       AgcSetNop(uint32_t* packet);
 int KYTY_SYSV_ABI       AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetCommandAddress(uint32_t*                cmd,
@@ -306,6 +306,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 } // namespace Gen5
 
 namespace Gen5Driver {
+
+int Initialize();
 
 struct Packet {
 	uint32_t* addr;

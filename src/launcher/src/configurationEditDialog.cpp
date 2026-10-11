@@ -463,6 +463,14 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 }
 
 void ConfigurationEditDialog::save() {
+	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
+	                   m_ui->lineEdit_cmd_dump_folder}) {
+		if (field->isEnabled() && field->text().isEmpty()) {
+			m_ui->settings_tabs->setCurrentWidget(m_ui->debug_tab);
+			field->setFocus();
+			break;
+		}
+	}
 	if (MandatoryLineEdit::FindEmpty(this)) {
 		QMessageBox::critical(this, tr("Save failed"), tr("Please fill all mandatory fields"));
 		return;

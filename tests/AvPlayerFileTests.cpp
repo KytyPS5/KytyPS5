@@ -4,16 +4,27 @@
 
 #include <array>
 #include <chrono>
+#include <new>
+#include <thread>
 
 namespace {
 std::filesystem::path content_root;
 }
 
 namespace Libs::LibKernel {
-int KYTY_SYSV_ABI PthreadCreate(Pthread*, const PthreadAttr*, pthread_entry_func_t, void*, const char*) {
-	std::abort();
+struct PthreadPrivate {
+	std::thread thread;
+};
+int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr*, pthread_entry_func_t entry,
+                              void* arg, const char*) {
+	*thread = new PthreadPrivate {std::thread([=] { entry(arg); })};
+	return 0;
 }
-int KYTY_SYSV_ABI PthreadJoin(Pthread, void**) { std::abort(); }
+int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void**) {
+	thread->thread.join();
+	delete thread;
+	return 0;
+}
 namespace FileSystem {
 std::filesystem::path GetRealFilename(const std::string& path) {
 	return path.starts_with("/app0/") ? content_root / path.substr(6) : std::filesystem::path {};
@@ -82,6 +93,76 @@ int KYTY_SYSV_ABI Read(void* object, uint8_t* buffer, uint64_t offset, uint32_t 
 	return static_cast<int>(bytes);
 }
 uint64_t KYTY_SYSV_ABI Size(void* object) { return static_cast<Callbacks*>(object)->data.size(); }
+
+struct VideoMemory {
+	unsigned allocations        = 0;
+	unsigned deallocations      = 0;
+	void*    protected_buffer   = nullptr;
+	bool     released_protected = false;
+};
+void* KYTY_SYSV_ABI Allocate(void* object, uint32_t alignment, uint32_t size) {
+	Check(alignment == 0x100, "video allocation alignment");
+	++static_cast<VideoMemory*>(object)->allocations;
+	return ::operator new(size, std::align_val_t(alignment), std::nothrow);
+}
+void KYTY_SYSV_ABI Deallocate(void* object, void* data) {
+	auto& memory = *static_cast<VideoMemory*>(object);
+	++memory.deallocations;
+	memory.released_protected |= data == memory.protected_buffer;
+	::operator delete(data, std::align_val_t(0x100));
+}
+
+void CheckVideoReadAhead(const std::filesystem::path& root) {
+	// A 16x16 red MPEG-4 intra frame at 30 Hz; repeat it with increasing VOP times.
+	std::array<uint8_t, 50> frame {
+	    0x00, 0x00, 0x01, 0xb0, 0x01, 0x00, 0x00, 0x01, 0xb5, 0x89,
+	    0x13, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00,
+	    0xc4, 0x8d, 0x88, 0x00, 0xf5, 0x00, 0x84, 0x02, 0x14, 0x63,
+	    0x00, 0x00, 0x01, 0xb3, 0x00, 0x10, 0x07, 0x00, 0x00, 0x01,
+	    0xb6, 0x10, 0x60, 0x51, 0x85, 0x06, 0xd8, 0x2c, 0x81, 0xe0};
+	{
+		Common::File output;
+		Check(output.Create(root / "movie.m4v"), "create video fixture");
+		for (unsigned i = 0; i < 24; ++i) {
+			frame[41] = static_cast<uint8_t>(0x10 + i / 2);
+			frame[42] = i % 2 == 0 ? 0x60 : 0xe0;
+			output.Write(frame.data(), frame.size());
+		}
+	}
+	VideoMemory memory;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	Source source(allocator, {}, {}, 6, false, 0);
+	Check(source.Init("/app0/movie.m4v", AvPlayerSourceFileMp4) == 0, "open video fixture");
+	source.SetSync(1);
+	Check(source.Start() == 0, "start video workers");
+	AvPlayerFrameInfoEx info {};
+	for (unsigned i = 0; i < 8; ++i) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+		while (!source.Video(&info)) {
+			Check(std::chrono::steady_clock::now() < deadline, "decode steady-state video");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
+	// Let the producer refill, then model the game's immediate late-frame retries.
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	for (unsigned i = 0; i < 5; ++i) {
+		const auto previous = info.time_stamp;
+		Check(source.Video(&info), "six output buffers keep five video frames ready");
+		Check(info.time_stamp > previous, "video retries return successive frames");
+	}
+	Check(source.Pause() == 0, "pause video");
+	memory.protected_buffer = info.data;
+	std::array<uint8_t, 256> current {};
+	std::memcpy(current.data(), info.data, current.size());
+	Check(!source.Video(&info) && info.data == memory.protected_buffer,
+	      "failed video get preserves output");
+	Check(source.Start() == 0, "restart video with retained current output");
+	Check(!memory.released_protected &&
+	          std::memcmp(current.data(), memory.protected_buffer, current.size()) == 0,
+	      "restart preserves output until the next successful video get");
+	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
+	      "stop releases all video buffers");
+}
 }
 
 int main() {
@@ -127,6 +208,8 @@ int main() {
 		FileStreamer missing({});
 		Check(!missing.Init("/unmounted/movie.bin"), "reject unmapped media");
 	}
+	content_root = root;
+	CheckVideoReadAhead(root);
 	std::error_code error;
 	std::filesystem::remove_all(root, error);
 	Check(!error, "release all archive handles");

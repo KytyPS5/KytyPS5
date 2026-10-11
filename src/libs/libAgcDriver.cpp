@@ -143,6 +143,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("Lkf86B98qPc", Gen5::AgcGetPacketSize);
 	LIB_FUNC("w6Dj1VJt5qY", Gen5::AgcSetPacketPredication);
 	LIB_FUNC("n8vgpaQg6dA", Gen5::AgcSetRangePredication);
+	LIB_FUNC("K2mciNVxUCE", Gen5::AgcSetNop);
 	LIB_FUNC("i1jyy49AjXU", Gen5::AgcDcbWriteData);
 	LIB_FUNC("p9tI+yTvx68", Gen5::AgcDcbWriteDataGetSize);
 	LIB_FUNC("vuSXe69VILM", Gen5::AgcDcbGetLodStats);

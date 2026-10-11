@@ -10,9 +10,9 @@ namespace {
 
 struct FormatInfo {
 	BufferFormat       format;
-	uint32_t           bytes_per_element;
-	uint32_t           block_compressed_bytes_per_block;
-	uint32_t           render_target_bytes_per_element;
+	uint8_t            bytes_per_element;
+	uint8_t            block_compressed_bytes_per_block;
+	uint8_t            render_target_bytes_per_element;
 	bool               sampled_texture;
 	bool               uint_texture;
 	bool               sint_texture = false;
@@ -21,7 +21,7 @@ struct FormatInfo {
 constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k8UNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8UScaled, 1, 0, 0, true, false},
-	{BufferFormat::k8SNorm, 1, 0, 1, false, false},
+	{BufferFormat::k8SNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8UInt, 1, 0, 1, true, true},
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16SNorm, 2, 0, 2, true, false},

@@ -60,6 +60,22 @@ bool WriteCaptureManifest(const CompileCaptureAttempt& attempt) {
 }
 } // namespace
 
+nlohmann::ordered_json BuildCompileCaptureMetadata(
+    const ShaderParams& params, const CompileOptions& options,
+    std::span<const uint32_t> static_state,
+    std::optional<std::array<uint32_t, 3>> guest_workgroups,
+    const nlohmann::ordered_json* runtime_capture,
+    const nlohmann::ordered_json& compile_policy, uint32_t push_data_start_dword) {
+    auto metadata = BuildCompileMetadata(params, options, static_state, guest_workgroups);
+    metadata["push_data_start_dword"] = push_data_start_dword;
+    if (!compile_policy.is_null()) metadata["captured_compile_policy"] = compile_policy;
+    if (runtime_capture) {
+        metadata["runtime"] = *runtime_capture;
+        metadata["runtime_resources_captured"] = runtime_capture->at("complete");
+    }
+    return metadata;
+}
+
 std::optional<CompileCaptureAttempt> CompileCaptureArchive::Begin(
     const std::filesystem::path& directory, const ShaderParams& params,
     const CompileOptions& options, std::span<const uint32_t> static_state,
@@ -68,13 +84,8 @@ std::optional<CompileCaptureAttempt> CompileCaptureArchive::Begin(
     const nlohmann::ordered_json* runtime_capture,
     const nlohmann::ordered_json* compile_policy,
     uint32_t push_data_start_dword) {
-    auto metadata = BuildCompileMetadata(params, options, static_state, guest_workgroups);
-    metadata["push_data_start_dword"] = push_data_start_dword;
-    if (compile_policy) metadata["captured_compile_policy"] = *compile_policy;
-    if (runtime_capture) {
-        metadata["runtime"] = *runtime_capture;
-        metadata["runtime_resources_captured"] = runtime_capture->at("complete");
-    }
+    auto metadata = BuildCompileCaptureMetadata(params, options, static_state, guest_workgroups,
+        runtime_capture, compile_policy ? *compile_policy : nlohmann::ordered_json(nullptr), push_data_start_dword);
     const auto identity = metadata.dump();
     // Hashes label files; exact metadata AND binary comparisons decide reuse.
     for (const auto& entry : entries) {
@@ -124,6 +135,45 @@ bool CompileCaptureArchive::Update(CompileCaptureAttempt& attempt, std::string_v
     state["reason"] = reason.substr(0u, 8192u);
     state["updated_unix_ms"] = CaptureTime();
     return WriteCaptureManifest(attempt);
+}
+
+std::optional<CompileCaptureAttempt> CompileCaptureCoordinator::Capture(
+    CompileCaptureEvent event, const std::filesystem::path& directory,
+    const ShaderParams& params, const CompileOptions& options,
+    std::span<const uint32_t> static_state,
+    std::optional<std::array<uint32_t, 3>> guest_workgroups,
+    std::string_view revision, std::string_view worktree,
+    const nlohmann::ordered_json* runtime_capture,
+    const nlohmann::ordered_json& compile_policy, uint32_t push_data_start_dword) {
+    if (event == CompileCaptureEvent::CachedReuse) { ++cached_reuses; return {}; }
+    if (event == CompileCaptureEvent::MaterializationFailure) {
+        ++failure_requests;
+        auto failed = failures.Begin(directory, params, options, static_state, guest_workgroups,
+            revision, worktree, runtime_capture, &compile_policy, push_data_start_dword);
+        if (!failed) ++failure_incomplete;
+        return failed;
+    }
+    if (event == CompileCaptureEvent::Translate) ++translate_requests; else ++emit_requests;
+    auto input = compiler.Begin(directory, params, options, static_state, guest_workgroups,
+        revision, worktree, nullptr, &compile_policy, push_data_start_dword);
+    if (!input) ++compiler_incomplete;
+    if (!runtime_capture) return input;
+    auto observed = runtime.Begin(directory, params, options, static_state, guest_workgroups,
+        revision, worktree, runtime_capture, &compile_policy, push_data_start_dword);
+    if (!observed) { ++runtime_incomplete; return input; }
+    if (input) observed->metadata["capture_attempt"]["compiler_input_id"] =
+        input->metadata.at("capture_attempt").at("input_id");
+    return observed;
+}
+
+nlohmann::ordered_json CompileCaptureCoordinator::Summary() const {
+    return {{"translate_requests", translate_requests}, {"emit_requests", emit_requests},
+        {"cached_reuses_omitted", cached_reuses}, {"failure_requests", failure_requests},
+        {"compiler_inputs", compiler.Inputs()}, {"compiler_bytes", compiler.Bytes()},
+        {"runtime_inputs", runtime.Inputs()}, {"runtime_bytes", runtime.Bytes()},
+        {"failure_inputs", failures.Inputs()}, {"failure_bytes", failures.Bytes()},
+        {"compiler_incomplete", compiler_incomplete}, {"runtime_incomplete", runtime_incomplete},
+        {"failure_incomplete", failure_incomplete}};
 }
 
 nlohmann::ordered_json

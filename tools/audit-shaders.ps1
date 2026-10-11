@@ -322,7 +322,7 @@ $manifests = $queue.ToArray()
 $sessionId = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 6)
 $totalInputs = $inventory.Count
 $totalManifests = @($inventory | ForEach-Object { $_.Manifests.Count } | Measure-Object -Sum).Sum
-Write-Output ('Inventory: {0} manifests, {1} complete inputs, {2} reused, {3} queued.' -f $totalManifests, $totalInputs, @($results | Where-Object reused).Count, $queue.Count)
+Write-Output ('Inventory: {0} manifests, {1} distinct inputs, {2} reused, {3} queued.' -f $totalManifests, $totalInputs, @($results | Where-Object reused).Count, $queue.Count)
 $next = 0
 $started = [DateTime]::UtcNow
 $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -460,7 +460,7 @@ try {
             $null = $pending.Remove($job)
             if ($results.Count % 25 -eq 0 -or $results.Count -eq $totalInputs) {
                 Write-AtomicText (Join-Path $OutputDirectory 'checkpoint.json') ($results.ToArray() | ConvertTo-Json -Depth 100)
-                Write-Output ('Audited {0}/{1} complete inputs' -f $results.Count, $totalInputs)
+                Write-Output ('Audited {0}/{1} distinct inputs' -f $results.Count, $totalInputs)
             }
         }
         if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 25 }
@@ -584,7 +584,7 @@ $report = [ordered]@{
     coverage = $coverage; error_groups = $groups
     compute_host_profile = $profileSnapshot; compute_host_profile_sha256 = $profileHash
     compute_execution_precheck_coverage = $precheckCoverage
-    limitations = @('Coverage is recorded per result; decode/CFG/resource planning is not SPIR-V or GPU proof.', 'Missing replay inputs are input_error, not an emulator semantic failure.', 'EmitSpirv uses captured inputs for isolated-stage unoptimized emission and production SPIR-V validation; no driver pipeline or GPU work is run.', 'Optional compute_execution_precheck is before specialization; possible_errors are conditional and are not proven rejects.', 'Error groups overlap; do not sum group counts to obtain failed complete-input count.', 'Counts distinguish capture manifests, complete compiler inputs and distinct code binaries; shader hash alone is never a dedup key.', 'A captured pending phase means the call did not return; it is not a proven failure cause. Offline results supply the classification.')
+    limitations = @('Coverage is recorded per result; decode/CFG/resource planning is not SPIR-V or GPU proof.', 'Missing replay inputs are input_error, not an emulator semantic failure.', 'EmitSpirv uses captured inputs for isolated-stage unoptimized emission and production SPIR-V validation; no driver pipeline or GPU work is run.', 'Optional compute_execution_precheck is before specialization; possible_errors are conditional and are not proven rejects.', 'Error groups overlap; do not sum group counts to obtain the number of failed distinct inputs.', 'Counts distinguish capture manifests, distinct inputs and distinct code binaries; shader hash alone is never a dedup key. Distinct inputs identify captured variants and do not imply complete runtime captures.', 'A captured pending phase means the call did not return; it is not a proven failure cause. Offline results supply the classification.')
     results = $results.ToArray()
 }
 Write-AtomicText (Join-Path $OutputDirectory 'report.json') ($report | ConvertTo-Json -Depth 100)
@@ -592,7 +592,7 @@ $markdown = New-Object 'System.Collections.Generic.List[string]'
 $markdown.Add('# Shader batch audit')
 $markdown.Add('')
 $markdown.Add(('Checked {0}; passed {1}; failed {2}; elapsed {3}s.' -f $report.total, $report.passed, $report.failed, $report.elapsed_seconds))
-$markdown.Add(('Captures {0}; complete inputs {1}; reused {2}; executed {3}; input errors {4}.' -f $totalManifests, $totalInputs, $report.reused, $report.executed, $report.input_errors))
+$markdown.Add(('Captures {0}; distinct inputs {1}; reused {2}; executed {3}; input errors {4}.' -f $totalManifests, $totalInputs, $report.reused, $report.executed, $report.input_errors))
 $markdown.Add('')
 $markdown.Add('Coverage is explicit per result. Missing capture inputs are input_error. No driver pipeline, GPU execution or visible game outcome is checked. Cause groups overlap and their counts must not be summed.')
 $markdown.Add('')
@@ -610,7 +610,7 @@ foreach ($group in $groups) {
     $markdown.Add('```')
     $markdown.Add('')
     $markdown.Add(('Example: {0}' -f $group.manifests[0]))
-    $markdown.Add(('Complete inputs: {0}; capture manifests: {1}.' -f $group.distinct_compile_inputs, $group.captured_manifest_count))
+    $markdown.Add(('Distinct inputs: {0}; capture manifests: {1}.' -f $group.distinct_compile_inputs, $group.captured_manifest_count))
     foreach ($command in $group.replay_commands) { $markdown.Add('```powershell'); $markdown.Add($command); $markdown.Add('```') }
     foreach ($example in @($group.pc_examples)) {
         if ($null -ne $example) { $markdown.Add(('- {0}: {1} {2}' -f $example.manifest, $example.pc, $example.instruction)) }

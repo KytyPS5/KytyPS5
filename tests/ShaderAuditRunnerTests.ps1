@@ -147,7 +147,7 @@ function Invoke-FixtureAudit {
 }
 
 $first = Invoke-FixtureAudit 'first'
-Assert-True ($first.captured_manifests -eq 12 -and $first.distinct_compile_inputs -eq 11) 'Hash-only dedup merged different complete inputs or failed to merge a renamed observation-only alias.'
+Assert-True ($first.captured_manifests -eq 12 -and $first.distinct_compile_inputs -eq 11) 'Hash-only dedup merged distinct inputs or failed to merge a renamed observation-only alias.'
 Assert-True ($first.passed -eq 5 -and $first.failed -eq 6 -and $first.input_errors -eq 1) 'Worker/input statuses were mixed.'
 Assert-True (@($first.results | Where-Object { $_.phase -eq 'materialize_resources' -and $_.category -eq 'materialize' }).Count -eq 2) 'Materialization error wording overrode its explicit phase.'
 Assert-True (@($first.error_groups | Where-Object { $_.reason -like 'materialize:*' }).Count -eq 2) 'Materialization causes were mixed with resource planning.'
@@ -179,4 +179,4 @@ Assert-True ($fourth.executed -eq 1 -and $fourth.reused -eq 9) 'Changed userdata
 [IO.File]::AppendAllText((Join-Path $audit 'results.jsonl'), '{"audit_key":')
 $fifth = Invoke-FixtureAudit 'interrupted-journal' '-Resume'
 Assert-True ($fifth.executed -eq 0 -and @(Get-ChildItem -LiteralPath $audit -Filter 'journal-tail-*.txt').Count -eq 1) 'Interrupted journal tail was not preserved and recovered.'
-Write-Output ('PASS: complete-input dedup, policy/runtime/back inputs, resume/retry, timeout/output cleanup, non-shader inventory, explicit materialization phase, overlapping causes, journal recovery. Evidence: ' + $OutputDirectory)
+Write-Output ('PASS: dedup of distinct inputs, policy/runtime/back inputs, resume/retry, timeout/output cleanup, non-shader inventory, explicit materialization phase, overlapping causes, journal recovery. Evidence: ' + $OutputDirectory)

@@ -149,7 +149,7 @@ pwsh.exe -NoProfile -File .\tools\audit-shaders.ps1 `
 
 Completed results are reused only with identical input, auditor bytes, runner version, arguments, host profile, mode, budgets and compiler environment identity. A changed auditor reruns the inputs against that implementation. Add `-RetryFailed` to rerun failed/timed-out workers without repeating passes from the same auditor. Missing or malformed inputs are checked again. An interrupted final journal line is preserved separately; earlier corrupt records stop reuse.
 
-Each distinct complete input runs in a separate worker process, with up to `-Jobs` workers active. Workers create no console windows and both output streams drain asynchronously into files. `-TimeoutSeconds` bounds each worker, and `-MaxOutputMegabytes` bounds combined stdout/stderr with a small polling overshoot. A failure, timeout or output-limit termination is recorded and the batch continues. PowerShell7 stops the owned process tree directly; Windows PowerShell5 uses hidden `taskkill /PID <owned-worker> /T /F` with bounded, drained helper execution. Completion and script cleanup drain output, confirm termination and dispose worker handles. Forcibly terminating the PowerShell host can bypass script cleanup.
+Each distinct input runs in a separate worker process, with up to `-Jobs` workers active. Workers create no console windows and both output streams drain asynchronously into files. `-TimeoutSeconds` bounds each worker, and `-MaxOutputMegabytes` bounds combined stdout/stderr with a small polling overshoot. A failure, timeout or output-limit termination is recorded and the batch continues. PowerShell7 stops the owned process tree directly; Windows PowerShell5 uses hidden `taskkill /PID <owned-worker> /T /F` with bounded, drained helper execution. Completion and script cleanup drain output, confirm termination and dispose worker handles. Forcibly terminating the PowerShell host can bypass script cleanup.
 
 The runner writes:
 
@@ -160,7 +160,7 @@ The runner writes:
 - `replay-failed.ps1`: sequential replay commands using preserved inputs and host profile.
 - Unique job directories: each worker's frozen inputs, `stdout.txt`, `stderr.txt` and optional `shader.spv`.
 
-The runner exits with code1 if any input fails, is incomplete or times out, and0 if all pass. Reports distinguish capture-manifest count, complete-input count, distinct main binaries, executed/reused entries and input errors. Failures are classified as decode, translate, resource_plan, materialize, emit, validation, driver or worker_error; missing inputs remain input_error. The CPU auditor never creates driver pipelines. Cause groups count complete inputs and capture aliases; unsupported instructions and independent planner reasons can overlap, so group memberships must not be summed into the failed-input total. A captured pending phase is an unfinished call, not a proven failure cause.
+The runner exits with code1 if any input fails, reports input_error or times out, and0 if all pass. Reports distinguish capture-manifest count, number of distinct inputs, distinct main binaries, executed/reused entries and input errors. The JSON field `distinct_compile_inputs` counts distinct captured variants; it does not imply complete runtime captures. Coverage is explicit per result, including partial schema1 header profiles. Failures are classified as decode, translate, resource_plan, materialize, emit, validation, driver or worker_error; missing inputs remain input_error. The CPU auditor never creates driver pipelines. Cause groups count distinct inputs and capture aliases; unsupported instructions and independent planner reasons can overlap, so group memberships must not be summed into the failed-input total. A captured pending phase is an unfinished call, not a proven failure cause.
 
 ### Replay generation through SPIR-V validation
 
@@ -178,7 +178,7 @@ Run the script-only workflow fixtures without launching an emulator or GPU test:
 pwsh.exe -NoProfile -File .\tests\ShaderAuditRunnerTests.ps1
 ```
 
-These use a synthetic PowerShell worker to check complete-input dedup, policy/runtime/back-code differences, resume/retry, simultaneous output draining and limits, timeout cleanup, overlapping causes and interrupted journals. They do not validate native compiler semantics. `-AuditorArgumentPrefix` supports explicit wrapper arguments and is included in audit identity; normal native audits need no prefix.
+These use a synthetic PowerShell worker to check dedup of distinct inputs, policy/runtime/back-code differences, resume/retry, simultaneous output draining and limits, timeout cleanup, overlapping causes and interrupted journals. They do not validate native compiler semantics. `-AuditorArgumentPrefix` supports explicit wrapper arguments and is included in audit identity; normal native audits need no prefix.
 
 ### Check compute execution planning for a host
 

@@ -148,6 +148,80 @@ int main(int argc, char **argv) {
       Check(compiler_pool.Begin(directory / "compiler-pool", params, options, {}, std::nullopt).has_value(),
             "exhausted runtime reservation blocked an independent compiler input");
 
+      // Exercise the same admission coordinator as ProgramCache, not merely
+      // archive dedup: changed userdata on cached reuse must not crowd generation.
+      Capture::CompileCaptureLimits tiny;
+      tiny.compiler_inputs = 2u; tiny.runtime_inputs = 1u; tiny.failure_inputs = 1u;
+      tiny.compiler_bytes = tiny.runtime_bytes = tiny.failure_bytes = 1024u * 1024u;
+      Capture::CompileCaptureCoordinator coordinator(tiny);
+      const auto admit = [&](Capture::CompileCaptureEvent event, const nlohmann::ordered_json* callbacks = nullptr) {
+        return coordinator.Capture(event, directory / "admission", params, options, static_state,
+            std::array<uint32_t,3>{3u,5u,7u}, "test-revision", "test-worktree", callbacks, policy, 16u);
+      };
+      auto generation_a = admit(Capture::CompileCaptureEvent::Translate, &reads);
+      Check(generation_a.has_value(), "first real generation was not captured before translation");
+      for (uint32_t request = 0; request < 64u; ++request) {
+        params.user_data[0] = 100u + request;
+        std::array<uint32_t,1> callback_word{};
+        Capture::ResourceReadCapture cached_recorder(runtime);
+        auto cached_observed = cached_recorder.Runtime();
+        Check(cached_observed.read_memory(cached_observed.userdata, 0x1000u, callback_word) && callback_word[0] == 0x12345678u,
+              "cached observation changed original callback result");
+        auto cached_reads = Capture::BuildResourceReadMetadata(runtime, cached_recorder, true, "");
+        Check(!admit(Capture::CompileCaptureEvent::CachedReuse, &cached_reads), "cached success consumed a persistent generation record");
+      }
+      params.user_data[0] = 200u;
+      auto generation_b = admit(Capture::CompileCaptureEvent::Translate, &reads);
+      Check(generation_b && std::filesystem::exists(generation_b->manifest) &&
+            generation_b->metadata.at("user_data").at(0) == 200u && coordinator.Summary().at("compiler_inputs") == 2u,
+            "cached traffic crowded the late real generation before backend entry");
+      Check(generation_b->metadata.at("capture_attempt").at("phase_status") == "pending",
+            "a pending backend attempt was mislabeled as failure");
+      // An existing plan with a permutation miss is a real generation: retain
+      // the locally held original transcript before both translation and Emit.
+      tiny.runtime_inputs = 2u;
+      Capture::CompileCaptureCoordinator miss_coordinator(tiny);
+      auto held_reads = reads;
+      held_reads["events"][0]["words"][0] = 0x12345678u;
+      auto miss_before_translate = miss_coordinator.Capture(Capture::CompileCaptureEvent::Translate,
+          directory / "cached-plan-miss", params, options, static_state, std::nullopt,
+          "test-revision", "test-worktree", &held_reads, policy, 16u);
+      auto miss_before_emit = miss_coordinator.Capture(Capture::CompileCaptureEvent::Emit,
+          directory / "cached-plan-miss", params, options, static_state, std::nullopt,
+          "test-revision", "test-worktree", &held_reads, policy, 16u);
+      Check(miss_before_translate && miss_before_emit && miss_before_translate->metadata.at("runtime") == held_reads &&
+            miss_before_emit->manifest == miss_before_translate->manifest && miss_coordinator.Summary().at("compiler_inputs") == 1u,
+            "cached-plan generation lost callbacks or duplicated an identical emission input");
+      // A regular pool can be full; a cached materialization failure still has
+      // exact policy/push/back/callback inputs in the protected reservation.
+      params.user_data[0] = 201u;
+      auto failed_reads = reads;
+      failed_reads["materialization_succeeded"] = false;
+      failed_reads["materialization_error"] = "synthetic cached materialization rejection";
+      auto cached_failure = admit(Capture::CompileCaptureEvent::MaterializationFailure, &failed_reads);
+      Check(cached_failure && cached_failure->metadata.at("runtime") == failed_reads &&
+            cached_failure->metadata.at("captured_compile_policy") == policy &&
+            cached_failure->metadata.at("push_data_start_dword") == 16u &&
+            cached_failure->metadata.at("back_code_size_bytes") == back.size() * sizeof(uint32_t),
+            "regular pool exhaustion lost complete cached failure inputs");
+      params.user_data[0] = 202u;
+      Check(!admit(Capture::CompileCaptureEvent::MaterializationFailure, &failed_reads) &&
+            coordinator.Summary().at("failure_incomplete") == 1u, "protected failure reservation did not report exhaustion");
+      const auto fallback = Capture::BuildCompileCaptureMetadata(params, options, static_state,
+          std::array<uint32_t,3>{3u,5u,7u}, &failed_reads, policy, 16u);
+      Check(fallback.at("runtime") == failed_reads && fallback.at("captured_compile_policy") == policy &&
+            fallback.at("push_data_start_dword") == 16u && fallback.at("back_code_hash_xxh3_64") == first->metadata.at("back_code_hash_xxh3_64"),
+            "independent failure fallback omitted full compiler identity");
+      Capture::ResourceCaptureAdmission legacy_reserve;
+      Check(legacy_reserve.Acquire(false) == 0u, "selected positive reservation missing");
+      for (uint32_t request = 0; request < 64u; ++request)
+        Check(!legacy_reserve.Acquire(false), "positive traffic consumed failure reservation");
+      for (uint32_t failure = 1; failure <= 7u; ++failure)
+        Check(legacy_reserve.Acquire(true) == failure, "positive traffic crowded a fatal snapshot");
+      Check(!legacy_reserve.Acquire(true) && legacy_reserve.Summary().at("failures") == 7u,
+            "independent snapshot reservation exceeded eight total slots");
+      params.user_data[0] = 17u;
+
       // Independent ISA fixtures for the real offline Emit/validator runner.
       // SOP1 encoding matches EncodeSop1 in shaderCfgTests: front SETPC s[6:7]
       // is required by DecodeFrontProgram whenever a back body is present.

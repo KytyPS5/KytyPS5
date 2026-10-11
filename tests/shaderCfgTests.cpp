@@ -15991,6 +15991,25 @@ void TestSpirvConditionVotes() {
   }
 }
 
+// A VS that writes host location 31 (the one that carries the instance index) is still emitted and the
+// location is recorded; the interface check, not the emitter, keeps such a pair off the VS-store path.
+void TestPvVsStoreLocation31() {
+  using namespace ShaderRecompiler;
+  const uint32_t vs_code[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
+                              EncodeExp0(0x3f, 0xf), EncodeExp1(4, 5, 6, 7),
+                              EncodeSopp(0x01)};
+  const auto vs_options = MakeCompileOptions(ShaderType::Vertex);
+  auto vs = RecompileForTest(vs_code, vs_options);
+  uint32_t mask = 0;
+  Spirv::PvStoreInfo info;
+  info.role = Spirv::PvStoreInfo::Role::Vertex;
+  info.location_mask = &mask;
+  (void)Spirv::EmitProgram(vs.program, vs_options.input_info, 0, false, false, &info);
+  Check(mask == (1u << 31), "VS-store VS does not record host location 31");
+  Check(ClassifyPvVsStoreInterface(mask, 1u) == PvVsStoreInterfaceVerdict::Param31,
+        "a pair that uses host location 31 is not rejected");
+}
+
 // VS-store: the VS writes its PerVertex parameters to the cap buffer, the PS reads the
 // three corners of its primitive from it instead of PerVertexKHR.
 void TestPvVsStoreEmission() {
@@ -16485,6 +16504,7 @@ int main() {
   EnsureConfigInitialized();
   TestRayTracingInstructions();
   TestPvVsStoreEmission();
+  TestPvVsStoreLocation31();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

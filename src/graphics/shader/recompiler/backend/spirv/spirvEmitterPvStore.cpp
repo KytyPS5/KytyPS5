@@ -72,8 +72,10 @@ uint32_t CapComponentPointer(EmitterState& state, uint32_t record, uint32_t slot
 
 uint32_t SlotOf(const EmitterState& state, uint32_t host_location) {
 	if (state.pv_store->record_stride_vec4 == 0) {
-		// Dynamic stride: slot == host location (location 31 carries the instance index).
-		EXIT_IF(host_location >= kPvVsStoreInstanceLocation);
+		// Dynamic stride: slot == host location. Location 31 carries the instance index: a stage
+		// that uses it is still emitted (the location is recorded) and ClassifyPvVsStoreInterface
+		// rejects the pair.
+		EXIT_IF(host_location > kPvVsStoreInstanceLocation);
 		if (state.pv_store->location_mask != nullptr)
 			*state.pv_store->location_mask |= 1u << host_location;
 		return host_location;

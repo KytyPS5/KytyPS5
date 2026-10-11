@@ -641,6 +641,8 @@ if(BUILD_TESTING)
 		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_first_third_tests> 2>&1 | grep -q 'first/third swapped'")
 		add_test(NAME shader_cfg_pv_vsstore_mutant_stride_dword
 		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_stride_dword_tests> 2>&1 | grep -q 'not read from push dword 7'")
+		add_test(NAME shader_cfg_pv_vsstore_mutant_location31_exit
+		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_location31_exit_tests> 2>&1 | grep -q 'spirvEmitterPvStore.cpp'")
 	endif()
 	add_test(NAME per_vertex_vsstore COMMAND $<TARGET_FILE:per_vertex_vsstore_tests>)
 	foreach(mutant IN LISTS KYTY_PV_HEADER_MUTANTS)
@@ -731,6 +733,7 @@ if(BUILD_TESTING)
 		shader_cfg_tests
 		shader_cfg_pv_vsstore_mutant_first_third_tests
 		shader_cfg_pv_vsstore_mutant_stride_dword_tests
+		shader_cfg_pv_vsstore_mutant_location31_exit_tests
 		per_vertex_vsstore_tests
 		per_vertex_vsstore_test_mutant_no_clamp_tests
 		per_vertex_vsstore_test_mutant_no_tail_check_tests

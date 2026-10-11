@@ -1497,9 +1497,9 @@ void TestWindowsBackingViewPermissions() {
 #if defined(__linux__)
 // Host memory the guest backing holds, in KiB, resident or swapped: the backing is a memfd.
 uint64_t GuestBackingKiB() {
-	for (const auto& entry: std::filesystem::directory_iterator("/proc/self/fd")) {
-		std::error_code ec;
-		const auto      target = std::filesystem::read_symlink(entry.path(), ec);
+	std::error_code ec;
+	for (const auto& entry: std::filesystem::directory_iterator("/proc/self/fd", ec)) {
+		const auto target = std::filesystem::read_symlink(entry.path(), ec);
 		if (ec || target.string().find("KytyDirectMemory") == std::string::npos) {
 			continue;
 		}

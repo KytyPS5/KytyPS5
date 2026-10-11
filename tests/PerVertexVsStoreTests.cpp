@@ -406,6 +406,48 @@ void TestDecision() {
 	Check(asked == 0, "no region is reserved for a rejected draw");
 }
 
+void TestCapability() {
+	using S = PvVsStoreSwitch;
+	Check(PvVsStoreEnabledFor(false, true, S::Auto), "MoltenVK without PerVertexKHR uses the VS store");
+	Check(!PvVsStoreEnabledFor(true, true, S::Auto), "a device with fragmentShaderBarycentric keeps PerVertexKHR");
+	Check(!PvVsStoreEnabledFor(false, false, S::Auto), "another driver is not switched");
+	Check(!PvVsStoreEnabledFor(false, true, S::Off), "KYTY_PV_VSSTORE=0 turns it off");
+	Check(PvVsStoreEnabledFor(true, false, S::On), "KYTY_PV_VSSTORE=1 forces it on");
+	Check(ParsePvVsStoreSwitch(nullptr) == S::Auto, "unset is auto");
+	Check(ParsePvVsStoreSwitch("") == S::Auto, "empty is auto");
+	Check(ParsePvVsStoreSwitch("0") == S::Off, "0 is off");
+	Check(ParsePvVsStoreSwitch("1") == S::On, "1 is on");
+	Check(ParsePvVsStoreSwitch("10") == S::Auto, "10 is not a switch value");
+	Check(ParsePvVsStoreSwitch("x") == S::Auto, "x is not a switch value");
+}
+
+void TestScanRange() {
+	const uint16_t i16[] = {5, 7, 6, 7, 9, 8};
+	auto           r     = ScanPvVsStoreVertexRange(i16, 2, 6, 0);
+	Check(r.known && !r.dropped && r.first == 5 && r.end == 10, "16-bit range [5, 10)");
+	r = ScanPvVsStoreVertexRange(i16, 2, 6, 100);
+	Check(r.known && r.first == 105 && r.end == 110, "positive vertex_offset shifts the range");
+	r = ScanPvVsStoreVertexRange(i16, 2, 6, -5);
+	Check(r.known && !r.dropped && r.first == 0 && r.end == 5, "negative vertex_offset down to vertex 0");
+	r = ScanPvVsStoreVertexRange(i16, 2, 6, -6);
+	Check(r.known && r.dropped && r.first == 0 && r.end == 4, "a corner on vertex -1 is dropped, the rest is the range");
+	// 32-bit indices read from an odd address (the guest does not align them).
+	uint8_t raw[1 + 3 * 4] = {};
+	const uint32_t i32[]   = {30, 12, 21};
+	std::memcpy(raw + 1, i32, sizeof(i32));
+	r = ScanPvVsStoreVertexRange(raw + 1, 4, 3, 0);
+	Check(r.known && r.first == 12 && r.end == 31, "32-bit range from an unaligned source");
+	r = ScanPvVsStoreVertexRange(i16, 2, 0, 0);
+	Check(r.known && !r.dropped && r.first == r.end, "no indices, no vertex");
+	const uint32_t big[] = {0x7fffffffu};
+	r = ScanPvVsStoreVertexRange(big, 4, 1, 1);
+	Check(!r.known, "a vertex number past 32-bit signed math is not derivable");
+	r = ScanPvVsStoreVertexRange(big, 4, 1, 0);
+	Check(r.known && r.first == 0x7fffffffu && r.end == 0x80000000ull, "the largest representable vertex");
+	Check(!ScanPvVsStoreVertexRange(nullptr, 2, 1, 0).known, "no data");
+	Check(!ScanPvVsStoreVertexRange(i16, 1, 1, 0).known, "1-byte indices are widened before this point");
+}
+
 } // namespace
 
 int main() {
@@ -423,6 +465,8 @@ int main() {
 	TestFallbackClass();
 	TestDecision();
 	TestPushRange();
+	TestCapability();
+	TestScanRange();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "per_vertex_vsstore_tests: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

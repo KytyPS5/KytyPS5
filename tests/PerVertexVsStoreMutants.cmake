@@ -48,7 +48,16 @@ set(KYTY_PV_HEADER_MUTANTS
 	align_ignored
 	ring_ignored
 	stride_zero_ok
-	records_wrap_ok)
+	records_wrap_ok
+	cap_barycentric_ignored
+	cap_moltenvk_ignored
+	cap_off_ignored
+	cap_on_ignored
+	parse_trailing
+	scan_no_offset
+	scan_drop_ok
+	scan_end_inclusive
+	scan_overflow_ok)
 set(KYTY_PV_FROM_first_third "\treturn k;\n}\n\n// Record written")
 set(KYTY_PV_TO_first_third "\treturn k == 0 ? 2u : (k == 2 ? 0u : k);\n}\n\n// Record written")
 set(KYTY_PV_FROM_no_instance "return base + (instance - first_instance) * span + (vertex_index - first);")
@@ -89,6 +98,24 @@ set(KYTY_PV_FROM_stride_zero_ok "request.range_end <= request.range_first || req
 set(KYTY_PV_TO_stride_zero_ok "request.range_end <= request.range_first)")
 set(KYTY_PV_FROM_records_wrap_ok "request.range_end > 0xffffffffull || records > 0xffffffffull ||")
 set(KYTY_PV_TO_records_wrap_ok "request.range_end > 0xffffffffull ||")
+set(KYTY_PV_FROM_cap_barycentric_ignored "return !fragment_shader_barycentric && moltenvk;")
+set(KYTY_PV_TO_cap_barycentric_ignored "return moltenvk;")
+set(KYTY_PV_FROM_cap_moltenvk_ignored "return !fragment_shader_barycentric && moltenvk;")
+set(KYTY_PV_TO_cap_moltenvk_ignored "return !fragment_shader_barycentric;")
+set(KYTY_PV_FROM_cap_off_ignored "if (mode == PvVsStoreSwitch::Off) return false;")
+set(KYTY_PV_TO_cap_off_ignored "")
+set(KYTY_PV_FROM_cap_on_ignored "if (mode == PvVsStoreSwitch::On) return true;")
+set(KYTY_PV_TO_cap_on_ignored "")
+set(KYTY_PV_FROM_parse_trailing "if (value == nullptr || value[0] == '\\0' || value[1] != '\\0') return PvVsStoreSwitch::Auto;")
+set(KYTY_PV_TO_parse_trailing "if (value == nullptr || value[0] == '\\0') return PvVsStoreSwitch::Auto;")
+set(KYTY_PV_FROM_scan_no_offset "static_cast<int64_t>(raw) + vertex_offset;")
+set(KYTY_PV_TO_scan_no_offset "static_cast<int64_t>(raw);")
+set(KYTY_PV_FROM_scan_drop_ok "\t\t\tdropped = true;\n\t\t\tcontinue;")
+set(KYTY_PV_TO_scan_drop_ok "\t\t\tcontinue;")
+set(KYTY_PV_FROM_scan_end_inclusive "range.end   = static_cast<uint64_t>(hi) + 1;")
+set(KYTY_PV_TO_scan_end_inclusive "range.end   = static_cast<uint64_t>(hi);")
+set(KYTY_PV_FROM_scan_overflow_ok "if (adjusted > INT32_MAX) return {};")
+set(KYTY_PV_TO_scan_overflow_ok "")
 
 foreach(mutant IN LISTS KYTY_PV_HEADER_MUTANTS)
 	kyty_pv_make_mutant(${mutant} "${KYTY_PV_HEADER_REL}" "${KYTY_PV_FROM_${mutant}}" "${KYTY_PV_TO_${mutant}}")

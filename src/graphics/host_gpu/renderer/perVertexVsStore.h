@@ -11,7 +11,9 @@
 
 #include <array>
 #include <bit>
+#include <climits>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <span>
 #include <vector>
@@ -441,6 +443,70 @@ PvVsStoreDecision DecidePvVsStore(PvVsStoreInterfaceVerdict interface_verdict,
 	}
 	decision.use = true;
 	return decision;
+}
+
+// Whether a device uses the VS-store path. By default it does when the device cannot run
+// PerVertexKHR (fragmentShaderBarycentric not enabled) and the driver is MoltenVK, the only driver
+// the scheme has been checked on (it relies on the vertex work of a render pass finishing before
+// its fragment work). KYTY_PV_VSSTORE=0 turns it off, KYTY_PV_VSSTORE=1 forces it on (A/B runs and
+// the GPU harness).
+enum class PvVsStoreSwitch : uint32_t { Auto, Off, On };
+
+constexpr PvVsStoreSwitch ParsePvVsStoreSwitch(const char* value) {
+	if (value == nullptr || value[0] == '\0' || value[1] != '\0') return PvVsStoreSwitch::Auto;
+	return value[0] == '0' ? PvVsStoreSwitch::Off
+	                       : (value[0] == '1' ? PvVsStoreSwitch::On : PvVsStoreSwitch::Auto);
+}
+
+constexpr const char* PvVsStoreSwitchName(PvVsStoreSwitch mode) {
+	return mode == PvVsStoreSwitch::Off ? "0" : (mode == PvVsStoreSwitch::On ? "1" : "auto");
+}
+
+constexpr bool PvVsStoreEnabledFor(bool fragment_shader_barycentric, bool moltenvk,
+                                   PvVsStoreSwitch mode) {
+	if (mode == PvVsStoreSwitch::Off) return false;
+	if (mode == PvVsStoreSwitch::On) return true;
+	return !fragment_shader_barycentric && moltenvk;
+}
+
+// Vertex numbers (index + vertex_offset, what the host VS sees as gl_VertexIndex) a draw reads.
+// `known` is false when they cannot be derived with certainty (unsupported index size, a number the
+// 32-bit shader math cannot hold). `dropped`: some index lands on a negative vertex number, which
+// no record can hold, so the draw is not eligible.
+struct PvVsStoreVertexRange {
+	uint64_t first   = 0;
+	uint64_t end     = 0; // first == end: no valid vertex
+	bool     known   = false;
+	bool     dropped = false;
+};
+
+inline PvVsStoreVertexRange ScanPvVsStoreVertexRange(const void* data, uint32_t element_size,
+                                                     uint32_t count, int32_t vertex_offset) {
+	if (data == nullptr || (element_size != 2 && element_size != 4)) return {};
+	const auto* bytes   = static_cast<const uint8_t*>(data);
+	int64_t     lo      = INT64_MAX;
+	int64_t     hi      = INT64_MIN;
+	bool        dropped = false;
+	for (uint32_t i = 0; i < count; ++i) {
+		uint32_t raw = 0; // little endian; the source may not be aligned
+		std::memcpy(&raw, bytes + static_cast<size_t>(i) * element_size, element_size);
+		const int64_t adjusted = static_cast<int64_t>(raw) + vertex_offset;
+		if (adjusted < 0) {
+			dropped = true;
+			continue;
+		}
+		if (adjusted > INT32_MAX) return {};
+		lo = adjusted < lo ? adjusted : lo;
+		hi = adjusted > hi ? adjusted : hi;
+	}
+	PvVsStoreVertexRange range;
+	range.known   = true;
+	range.dropped = dropped;
+	if (lo <= hi) {
+		range.first = static_cast<uint64_t>(lo);
+		range.end   = static_cast<uint64_t>(hi) + 1;
+	}
+	return range;
 }
 
 } // namespace Libs::Graphics

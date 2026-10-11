@@ -43,16 +43,21 @@ public:
 	KYTY_CLASS_NO_COPY(TileManager);
 
 	// Consume scratch results before the next acquisition, or pass their buffer as input.
-	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info);
+	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info,
+	                            bool device_local = false);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
-	          uint32_t levels = 0);
+	          uint32_t levels = 0, bool device_local = false);
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
-	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0);
-	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
+	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0,
+	               bool device_local = false);
+	[[nodiscard]] Result      GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
+	[[nodiscard]] static bool TilerStagingForced();
+	[[nodiscard]] static bool DetileFillSkipped();
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
+	void                 ReleaseScratch();
 	void TransformColor(Result input, Result output, ColorTransform transform, bool to_host);
 
 private:
@@ -113,15 +118,21 @@ private:
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	                             const ImageInfo& info, uint32_t levels, uint64_t source_base,
 	                             uint64_t target_base);
-	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
-	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
-	                            const Tiling& tiling, bool clear_target);
+	void Record(bool device_local, vk::Buffer source, uint64_t source_offset,
+	            uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
+	            uint64_t target_capacity, const Tiling& tiling, bool clear_target);
+	void RecordPasses(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+	                  vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
+	                  const Tiling& tiling, bool clear_target);
+	[[nodiscard]] Result       StageTiled(uint64_t offset, uint64_t capacity);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
 
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
 	StreamBuffer&                           m_stream_buffer;
 	std::array<std::unique_ptr<Buffer>, 2>   m_scratch;
+	std::unique_ptr<Buffer>                  m_tiled_scratch;
+	uint64_t                                 m_scratch_used_tick = 0;
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};

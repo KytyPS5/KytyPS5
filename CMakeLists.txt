@@ -713,6 +713,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	add_test(NAME gpu_tiler_detile_zero_fill
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	set_tests_properties(gpu_tiler_detile_zero_fill
+		PROPERTIES ENVIRONMENT "KYTY_NO_DETILE_FILL_SKIP=1")
 	add_test(NAME dispatch_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
 	add_test(NAME dispatch_overlap_kill_switch

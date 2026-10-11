@@ -22792,6 +22792,100 @@ public:
     return pixel;
   }
 
+  void CheckGpuTilerVolumeRoundTrip() {
+    constexpr const char *name = "GpuTilerVolumeRoundTrip";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    StreamBuffer parameters(m_runtime_context, scheduler, MemoryUsage::Stream, 1u << 20);
+    TileManager tile_manager(m_runtime_context, scheduler, parameters);
+    struct Case {
+      Prospero::BufferFormat format;
+      uint32_t width;
+      uint32_t height;
+      uint32_t depth;
+    };
+    constexpr std::array cases{
+        Case{Prospero::BufferFormat::k8UNorm, 1024, 64, 8},
+        Case{Prospero::BufferFormat::k8UNorm, 1002, 37, 5},
+        Case{Prospero::BufferFormat::k16Float, 514, 33, 4},
+    };
+    for (const auto &test : cases) {
+      const auto element = Prospero::NumBytesPerElement(test.format);
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(test.format, test.width, test.height, test.depth, 1,
+                              Prospero::TileMode::kRenderTarget, true, total);
+      const uint64_t tiled_size = total.size;
+      const auto layout = TextureCalcUploadLayout(test.format, test.width, test.height, 1,
+                                                  test.depth, Prospero::TileMode::kRenderTarget,
+                                                  tiled_size, true, name);
+      const auto regions = TextureBuildImageCopies(layout);
+      std::vector<GpuTileInfo> tiles;
+      Require(name, "tile plan",
+              TextureBuildGpuTileInfos(tiled_size, regions, layout, 1, tiles) && !tiles.empty(),
+              "no GPU tile plan for the volume");
+      uint64_t linear_size = 0;
+      for (const auto &tile : tiles) {
+        linear_size = std::max(linear_size, tile.linear_offset + tile.linear_size);
+      }
+      const uint64_t linear_words = (linear_size + 3u) / 4u;
+      const uint64_t tiled_words = (tiled_size + 3u) / 4u;
+      std::vector<u32> linear(static_cast<size_t>(linear_words));
+      for (size_t i = 0; i < linear.size(); i++) {
+        linear[i] = static_cast<u32>(i * 2654435761u) ^ 0x5a5a5a5au;
+      }
+      auto source = CreateHostBuffer(name, linear_words * 4u, AllFlags, linear);
+      auto tiled = CreateHostBuffer(name, tiled_words * 4u, AllFlags,
+                                    std::vector<u32>(static_cast<size_t>(tiled_words), 0u));
+      auto output = CreateHostBuffer(name, linear_words * 4u, AllFlags,
+                                     std::vector<u32>(static_cast<size_t>(linear_words), 0u));
+      // In place on device memory, and through the staged copy a host buffer takes.
+      const bool device_local = (&test - cases.data()) % 2 == 0;
+      tile_manager.Tile(source.buffer, 0, linear_words * 4u, tiled.buffer, 0, tiled_words * 4u,
+                        tiles, device_local);
+      const auto result =
+          tile_manager.Detile(tiled.buffer, 0, tiled_words * 4u, linear_words * 4u, tiles,
+                              ColorTransform::None, !device_local);
+      const vk::BufferCopy copy{result.offset, 0, linear_words * 4u};
+      scheduler.Current().Handle().copyBuffer(result.buffer, output.buffer, 1, &copy);
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                   vk::PipelineStageFlagBits::eHost, {}, 1,
+                                                   &barrier, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, output, static_cast<size_t>(linear_words));
+      const auto *expected = reinterpret_cast<const uint8_t *>(linear.data());
+      const auto *actual = reinterpret_cast<const uint8_t *>(words.data());
+      uint64_t mismatches = 0;
+      for (const auto &tile : tiles) {
+        const uint64_t row_bytes = uint64_t{tile.pitch} * tile.bytes_per_element;
+        const uint64_t slice_bytes =
+            tile.linear_slice_stride != 0 ? tile.linear_slice_stride : row_bytes * tile.height;
+        for (uint32_t z = 0; z < tile.depth; z++) {
+          for (uint32_t y = 0; y < tile.height; y++) {
+            const uint64_t row = tile.linear_offset + z * slice_bytes + y * row_bytes;
+            for (uint64_t x = 0; x < uint64_t{tile.width} * tile.bytes_per_element; x++) {
+              mismatches += expected[row + x] != actual[row + x] ? 1u : 0u;
+            }
+          }
+        }
+      }
+      DestroyBuffer(&output);
+      DestroyBuffer(&tiled);
+      DestroyBuffer(&source);
+      Require(name, "round trip", mismatches == 0,
+              std::to_string(mismatches) + " bytes differ for " + std::to_string(test.width) +
+                  "x" + std::to_string(test.height) + "x" + std::to_string(test.depth) +
+                  " element " + std::to_string(element));
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckGpuTilerCpuParity() {
     constexpr const char *name = "GpuTilerCpuParity";
     EnsureRuntimeContext();
@@ -23231,6 +23325,26 @@ public:
               "the reverse-packed small-block mip layout changed");
     }
 
+    auto compare_detile = [&](const char *stage, const std::vector<uint8_t> &expected,
+                              const std::vector<uint8_t> &actual, uint64_t tiled_size,
+                              std::span<const GpuTileInfo> infos) {
+      if (!TileManager::DetileFillSkipped()) {
+        compare(stage, expected, actual);
+        return;
+      }
+      std::vector<uint8_t> covered(expected.size(), 0);
+      const std::vector<uint8_t> ones(tiled_size, 0xff);
+      for (const auto &info : infos) {
+        convert_reference(false, &covered, ones, info);
+      }
+      for (size_t i = 0; i < expected.size(); i++) {
+        if (covered[i] != 0 && expected[i] != actual[i]) {
+          std::ostringstream out;
+          out << "first element mismatch at " << i << " of " << expected.size();
+          Fail(name, stage, out.str());
+        }
+      }
+    };
     u32 case_index = 0;
     auto check_round_trip = [&](const char *stage, uint64_t tiled_size,
                                 const ImageInfo &info,
@@ -23243,8 +23357,10 @@ public:
       for (uint32_t level = 0; level < info.resources.levels; ++level) {
         convert_reference(false, &cpu, tiled, info, level);
       }
-      gpu_detile(tiled, &gpu, tiled_size, linear_size, info, manager);
-      compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
+      gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
+      compare_detile((std::string(stage) + " detile bytes").c_str(), cpu, gpu, tiled_size,
+                     infos);
+
       std::vector<uint8_t> linear(linear_size);
       std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
       std::vector<uint8_t> gpu_tiled(tiled_size, 0xab);
@@ -23404,7 +23520,8 @@ public:
               << " bpe=" << bpe;
           return out.str();
         };
-        compare(family_label("detile bytes").c_str(), cpu, gpu);
+        compare_detile(family_label("detile bytes").c_str(), cpu, gpu, storage_size,
+                       std::span<const GpuTileInfo>(&info, 1));
 
         {
           std::vector<uint8_t> linear(storage_size);
@@ -23522,9 +23639,9 @@ public:
         std::vector<uint8_t> cpu(total.size, 0);
         std::vector<uint8_t> gpu(total.size, 0xab);
         fill(&tiled, ++case_index);
-        convert_reference(false, &cpu, tiled, layout);
-        gpu_detile(tiled, &gpu, total.size, total.size, layout);
-        compare("format bytes", cpu, gpu);
+        convert_reference(false, &cpu, tiled, infos[0]);
+        gpu_detile(tiled, &gpu, total.size, total.size, infos);
+        compare_detile("format bytes", cpu, gpu, total.size, infos);
         ++format_cases;
       }
     }
@@ -23937,8 +24054,10 @@ public:
                 ? 2
                 : 0;
         convert_reference(false, &cpu, tiled, info);
-        gpu_detile(tiled, &gpu, block.block_size, linear_size, info);
-        compare("tail bytes", cpu, gpu);
+        gpu_detile(tiled, &gpu, block.block_size, linear_size,
+                   std::span<const GpuTileInfo>(&info, 1));
+        compare_detile("tail bytes", cpu, gpu, block.block_size,
+                       std::span<const GpuTileInfo>(&info, 1));
 
         std::vector<uint8_t> linear(linear_size);
         std::vector<uint8_t> cpu_tiled(block.block_size, 0xab);
@@ -23962,13 +24081,17 @@ public:
                                   small_input.size());
     convert_reference(false, &small_expected, small_input, small_info);
     gpu_detile(small_input, &small_output, small_input.size(),
-               small_output.size(), small_info);
-    compare("small detile", small_expected, small_output);
+               small_output.size(),
+               std::span<const GpuTileInfo>(&small_info, 1));
+    compare_detile("small detile", small_expected, small_output, small_input.size(),
+                   std::span<const GpuTileInfo>(&small_info, 1));
 
     std::fill(small_output.begin(), small_output.end(), 0xab);
     gpu_detile(small_input, &small_output, small_input.size(),
-               small_output.size(), small_info);
-    compare("scheduler-owned reuse", small_expected, small_output);
+               small_output.size(),
+               std::span<const GpuTileInfo>(&small_info, 1));
+    compare_detile("scheduler-owned reuse", small_expected, small_output, small_input.size(),
+                   std::span<const GpuTileInfo>(&small_info, 1));
 
     constexpr auto volume_format = Prospero::BufferFormat::k32UInt;
     constexpr auto volume_tile = Prospero::TileMode::kLinear;
@@ -53505,6 +53628,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
+    vulkan.CheckGpuTilerVolumeRoundTrip();
     vulkan.CheckGpuTilerCpuParity();
     return 0;
   }
@@ -54077,6 +54201,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckGpuTilerVolumeRoundTrip();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   vulkan.CheckDispatchOverlap();

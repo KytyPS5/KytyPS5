@@ -297,6 +297,22 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		                                      .module = pixel_program.module,
 		                                      .pName  = "main"};
 	}
+	// One guest wave per host subgroup where the device lets the stage require it (mesh and
+	// pixel shaders on AMD); GraphicsSubgroupSize and the mesh's host_subgroup_size agree.
+	for (uint32_t index = 0; index < shader_stage_count; index++) {
+		auto&      stage   = build.stages[index];
+		const bool is_mesh = stage.stage == vk::ShaderStageFlagBits::eMeshEXT;
+		if (!is_mesh && stage.stage != vk::ShaderStageFlagBits::eFragment) {
+			continue;
+		}
+		const auto wave_size = is_mesh ? vs_input_info.mesh.wave_size
+		                               : ps_input_info->stage.program->wave_size;
+		const auto required  = graphics.GraphicsSubgroupSize(stage.stage, wave_size);
+		if (required != 0) {
+			build.subgroup_sizes[index].requiredSubgroupSize = required;
+			stage.pNext = &build.subgroup_sizes[index];
+		}
+	}
 
 	auto& input_attr = build.input_attr;
 	auto& input_desc = build.input_desc;
@@ -511,8 +527,8 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	    vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
-	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
-	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
+	build.dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+	build.dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		build.dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}

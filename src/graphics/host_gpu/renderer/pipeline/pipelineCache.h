@@ -113,6 +113,7 @@ struct GraphicsPipelineBuild {
 	vk::ShaderModule                                                      tess_control = nullptr;
 	vk::ShaderModule                                                      tess_eval    = nullptr;
 	std::array<vk::PipelineShaderStageCreateInfo, 4>                      stages {};
+	std::array<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo, 4>  subgroup_sizes {};
 	std::array<vk::VertexInputAttributeDescription, ShaderVertexInputInfo::RES_MAX> input_attr {};
 	std::array<vk::VertexInputBindingDescription, ShaderVertexInputInfo::RES_MAX>   input_desc {};
 	vk::PipelineVertexInputStateCreateInfo                                vertex_input_info {};

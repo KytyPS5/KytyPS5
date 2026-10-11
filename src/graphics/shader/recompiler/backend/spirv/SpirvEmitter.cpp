@@ -7,6 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <bit>
+#include <optional>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -195,7 +201,63 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 }
 
+// The scope of the barriers that keep one guest wave's LDS accesses in order (EmitBlock). The
+// guest's lanes run in lockstep and its LDS accesses complete in program order; host invocations
+// need a barrier. It can be issued wherever the guest wave's control flow is uniform across the
+// barrier's scope, which holds everywhere at block level (divergence is emulated with EXEC):
+// - a single-wave workgroup gets the workgroup scope (on NVIDIA a subgroup-scope barrier did not
+//   make one lane's LDS writes visible to the others, as AnyPS5 found);
+// - otherwise the host subgroup scope, when one host subgroup holds exactly one guest wave;
+// - otherwise none (a barrier that other waves of the scope may not reach could hang).
+// Compute shaders that write LDS only.
+uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo* workgroup,
+                      uint32_t lane_count) {
+	if (program.stage != ShaderType::Compute || workgroup == nullptr) {
+		return 0;
+	}
+	bool writes = false;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto access = IR::SharedAccessOf(inst.GetOpcode());
+			writes |= access != IR::SharedAccess::None && access != IR::SharedAccess::Read;
+		}
+	}
+	if (!writes) {
+		return 0;
+	}
+	const auto threads = std::max(workgroup->threads_num[0], 1u) *
+	                     std::max(workgroup->threads_num[1], 1u) *
+	                     std::max(workgroup->threads_num[2], 1u);
+	if (threads <= program.wave_size) {
+		return spv::ScopeWorkgroup;
+	}
+	if (lane_count == 2u || (program.wave_size == workgroup->host_subgroup_size &&
+	                         workgroup->host_subgroup_size <= 32u)) {
+		return spv::ScopeSubgroup;
+	}
+	return 0;
+}
+
+std::atomic_uint32_t g_device_clock_shift {3};
+std::atomic_bool     g_coherent_load_acquire {false};
+
 } // namespace
+
+void SetCoherentLoadAcquire(bool enabled) {
+	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
+}
+
+bool GetCoherentLoadAcquire() {
+	return g_coherent_load_acquire.load(std::memory_order_relaxed);
+}
+
+void SetDeviceClockShift(uint32_t shift) {
+	g_device_clock_shift.store(shift, std::memory_order_relaxed);
+}
+
+uint32_t GetDeviceClockShift() {
+	return g_device_clock_shift.load(std::memory_order_relaxed);
+}
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword) {

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -324,6 +325,9 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
 	                              resource.memory_access);
+	if (resource.memory_access != spv::MemoryAccessMaskNone && GetCoherentLoadAcquire()) {
+		EmitAtomicMemoryBarrier(ctx.state, IR::ResourceKind::Buffer);
+	}
 	return value;
 }
 
@@ -1379,6 +1383,9 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		           const auto value = state.builder.AllocateId();
 		           state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
 		                                     spv::MemoryAccessVolatileMask);
+		           if (GetCoherentLoadAcquire()) {
+			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Buffer);
+		           }
 		           return value;
 	           }));
 }

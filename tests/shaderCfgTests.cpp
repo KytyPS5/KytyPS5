@@ -1723,6 +1723,41 @@ void TestNewShaderRecompilerSMovB32() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// S_MEMREALTIME reads the device clock shifted toward the guest's 100 MHz: by 3 for a 1 GHz
+// clock (NVIDIA), not at all for a 100 MHz one (AMD), where shifting made the game's GPU frame
+// pacer wait 8x its interval (DEBUGGING.md, 2026-10-01).
+void TestMemRealtimeClockShift() {
+  const uint32_t shader[] = {
+      0xf4940500u, 0xfa000000u, // s_memrealtime s[20:21]
+      0xbf8cc07fu,              // s_waitcnt lgkmcnt(0)
+      EncodeVop1(0x01, 0, 20),  // v_mov_b32 v0, s20
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(0, 12, 0),
+      EncodeVop1(0x01, 1, 21),  // v_mov_b32 v1, s21
+      EncodeMubuf0(0x1c, 4, false),
+      EncodeMubuf1(1, 12, 0),
+      0xbf810000u,
+  };
+  const auto shifts = [&](uint32_t shift) {
+    ShaderRecompiler::Spirv::SetDeviceClockShift(shift);
+    const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpReadClockKHR") != std::string::npos,
+          "S_MEMREALTIME did not read the device clock");
+    size_t found = 0;
+    for (auto at = source.find("OpShiftRightLogical"); at != std::string::npos;
+         at = source.find("OpShiftRightLogical", at + 1)) {
+      found++;
+    }
+    return found;
+  };
+  const size_t shifted   = shifts(3);
+  const size_t unshifted = shifts(0);
+  ShaderRecompiler::Spirv::SetDeviceClockShift(3);
+  Check(shifted == unshifted + 2, "a clock shift of 0 still shifts the clock");
+}
+
 void TestShaderStageBarriers() {
   const uint32_t shader[] = {
       EncodeSopp(0x0a, 0),    // s_barrier
@@ -15777,6 +15812,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestMemRealtimeClockShift();
   TestShaderStageBarriers();
   TestVertexBufferGrouping();
   TestNggVertexEntryState();

@@ -19,6 +19,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -553,6 +554,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_size_control.minSubgroupSize <= 64 &&
 	    subgroup_size_control.maxSubgroupSize >= 64;
+	graphics.subgroup_size_control_enabled =
+	    graphics.compute_subgroup_size_control_enabled ||
+	    (supported_features13.subgroupSizeControl == VK_TRUE &&
+	     subgroup_size_control.minSubgroupSize < subgroup_size_control.maxSubgroupSize);
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
@@ -636,8 +641,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                           : static_cast<void*>(&fragment_barycentric);
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
-	features13.subgroupSizeControl =
-	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	features13.subgroupSizeControl = graphics.subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -688,6 +692,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			graphics.shader_device_clock_enabled = true;
 		}
 	}
+	if (graphics.shader_device_clock_enabled) {
+		// Vulkan does not report the device clock's rate. On NVIDIA it counts nanoseconds and on
+		// AMD it is the 100 MHz reference clock, in both cases the rate of timestamp queries, so
+		// take that rate and the shift that brings it nearest the guest's 100 MHz.
+		const double period_ns = properties2.properties.limits.timestampPeriod;
+		const double rate_hz   = period_ns > 0.0 ? 1e9 / period_ns : 1e9;
+		uint32_t     shift     = 0;
+		while (shift < 8 && rate_hz / static_cast<double>(1u << (shift + 1)) >= 100e6 / 1.5) {
+			shift++;
+		}
+		ShaderRecompiler::Spirv::SetDeviceClockShift(shift);
+	}
+	// NVIDIA reloads coherent loads without a barrier; AMD's drivers need one (SpirvEmitter.h).
+	ShaderRecompiler::Spirv::SetCoherentLoadAcquire(properties2.properties.vendorID != 0x10deu);
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
 	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};

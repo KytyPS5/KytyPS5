@@ -49,6 +49,8 @@ struct GraphicContext {
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// subgroupSizeControl is enabled: the device has more than one subgroup size.
+	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
@@ -108,6 +110,20 @@ struct GraphicContext {
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+	}
+
+	// The subgroup size a graphics stage must require so that one host subgroup is one guest
+	// wave, or 0 when the default already is or the device cannot require it for the stage. On
+	// AMD the default is 64; a wave32 pixel or mesh shader would otherwise share a subgroup with
+	// another wave, and its ballots, lane reads and reductions would mix the two.
+	[[nodiscard]] uint32_t GraphicsSubgroupSize(vk::ShaderStageFlagBits stage,
+	                                            uint32_t                wave_size) const noexcept {
+		if (!subgroup_size_control_enabled || wave_size == subgroup_size ||
+		    !(required_subgroup_size_stages & stage) || wave_size < min_subgroup_size ||
+		    wave_size > max_subgroup_size) {
+			return 0;
+		}
+		return wave_size;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

@@ -127,25 +127,12 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 	return false;
 }
 
-// Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
-// mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
-// whatever address a descriptor chain produced, including 0 on a path the shader never takes.
+// Ordinary (raw) SRT reads: only memory the guest has committed. Without a reader the walker
+// dereferenced whatever address a descriptor chain produced, including 0 on a path the shader
+// never takes.
 bool ReadShaderGuestMemoryRaw(void*, uint64_t address, std::span<uint32_t> values) {
-	if (values.empty()) {
-		return false;
-	}
-	// Bytes the GPU has not written are current in the backing store. Reading them there skips
-	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
-	// wrote: constants that share a page with GPU-written arguments cost a drain per dispatch.
-	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
-	                                                    values.size_bytes())) {
-		return true;
-	}
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
-		return false;
-	}
-	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
-	return true;
+	return !values.empty() &&
+	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
 // Research: a subroutine's code for inlining, in 1 KiB steps while the guest has it committed.
@@ -168,37 +155,6 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
-}
-
-// --skip-shaders and KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of
-// these guest shaders, the same way a shader that fails to compile is skipped. To see what one
-// shader contributes, to step past one that loses the device, or to leave out work nothing can
-// use (the ray-tracing BVH updates whose only consumer gives up).
-bool SkipShaderRequested(uint64_t shader_hash) {
-	static const std::vector<uint64_t> hashes = [] {
-		std::vector<uint64_t> result;
-		const auto parse = [&result](std::string_view list) {
-			size_t start = 0;
-			while (start < list.size()) {
-				const auto end = std::min(list.find(',', start), list.size());
-				if (end > start) {
-					result.push_back(
-					    std::strtoull(std::string(list.substr(start, end - start)).c_str(), nullptr, 16));
-				}
-				start = end + 1;
-			}
-		};
-		parse(Config::GetSkipShaderHashes());
-		if (const char* value = std::getenv("KYTY_SKIP_SHADER_HASHES"); value != nullptr) {
-			parse(value);
-		}
-		for (const auto hash: result) {
-			LOGF("ProgramCache: skipping the draws and dispatches of shader 0x%016" PRIx64 "\n",
-			     hash);
-		}
-		return result;
-	}();
-	return std::ranges::find(hashes, shader_hash) != hashes.end();
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -514,21 +470,12 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
-		if (SkipShaderRequested(params.hash)) {
-			return ShaderProgram {};
-		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		// Research: a program with inlined calls is valid only for the same call targets.
-		if (const auto found = call_targets.find(params.hash); found != call_targets.end()) {
-			for (const auto index: found->second) {
-				lookup_key.static_state.push_back(index < user_data.size() ? user_data[index] : 0u);
-			}
-		}
 		// Research: ShaderFunctions expands calls first; the calls it refuses reach the
 		// recompiler's own inliner.
 		lookup_key.function_code.clear();
@@ -566,8 +513,7 @@ struct PipelineCache::ProgramCache {
 			if (cached.materialization_failed) {
 				cached.materialization_failed = false;
 				if (!ShaderFailureNonFatal()) {
-					EXIT("shader resource materialization failed
-");
+					EXIT("shader resource materialization failed\n");
 				}
 				return ShaderProgram {};
 			}
@@ -634,11 +580,6 @@ struct PipelineCache::ProgramCache {
 			}
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		}
-		if (translated.skip_dispatch) {
-			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}, nullptr).first;
-			entry->second.skip_dispatch = true;
-			return {};
 		}
 		if (translated.unsupported) {
 			unsupported.insert(lookup_key);
@@ -944,7 +885,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
+		// The pipeline requires the wave size where it can (PrepareGraphicsPipeline).
+		const auto required =
+		    m_graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT, mesh.wave_size);
+		mesh.host_subgroup_size = required != 0 ? required : m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
 		const auto  logical_threads =
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];

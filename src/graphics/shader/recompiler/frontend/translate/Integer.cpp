@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include <cstdlib>
 
 #include <array>
 
@@ -334,7 +335,15 @@ void Translator::V_BCNT_U32_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low) {
-	const auto lane  = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	// A wave32 vertex shader is one NGG wave per host subgroup only when the subgroup is 32 wide.
+	// On a 64-wide one (AMD) invocations 32..63 would count as lanes of a second half, get
+	// v_mbcnt_lo = 32 + base, fail the shader's own `exec = lane < vertex count` test and never
+	// export a position (strand geometry exploded). Wrapping the lane index at 32 keeps them
+	// all active; on a 32-wide subgroup it changes nothing.
+	auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	if (program.stage == ShaderType::Vertex && program.wave_size == 32u) {
+		lane = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
+	}
 	const auto local = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
 	const auto below =
 	    ir.ISub(ir.ShiftLeftLogical(IR::U32(IR::Value(1u)), local), IR::U32(IR::Value(1u)));

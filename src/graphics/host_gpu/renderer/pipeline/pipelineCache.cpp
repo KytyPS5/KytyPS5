@@ -1,5 +1,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/DescriptorBudget.h"
+#include "graphics/host_gpu/renderer/pipeline/SpirvOptimizationCache.h"
+#include "graphics/host_gpu/renderer/pipeline/SpirvOptimizationRecipe.h"
+#include "spirvOptimizationCacheIdentity.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -35,6 +38,8 @@
 #include <exception>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <nlohmann/json.hpp>
 #include <span>
@@ -411,44 +416,44 @@ std::vector<uint32_t> OptimizeShaderSpirv(
 		return spirv;
 	}
 
-	spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
-	std::string         messages;
-	optimizer.SetMessageConsumer([&messages](spv_message_level_t, const char*,
-	                                         const spv_position_t& position,
-	                                         const char* message) {
-		messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
-		                        static_cast<int>(position.column),
-		                        static_cast<int>(position.index), message);
-	});
-	// The stock -O/-Os recipes include exhaustive inlining, scalar replacement and forced loop
-	// unrolling. Generated dispatcher/cooperative modules can contain hundreds of thousands of
-	// words, making those passes super-linear and stalling first launch for minutes. Cooperative
-	// schedulers also make global redundancy analysis super-linear; keep their measured bounded
-	// recipe to local simplification and block merging. Ordinary structured modules retain the
-	// wider bounded recipe.
-	if (cooperative_wave64) {
-		optimizer.RegisterPass(spvtools::CreateSimplificationPass())
-		    .RegisterPass(spvtools::CreateLocalRedundancyEliminationPass())
-		    .RegisterPass(spvtools::CreateBlockMergePass())
-		    .RegisterPass(spvtools::CreateCompactIdsPass());
-	} else {
-		optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
-		    .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
-		    .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
-		    .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
-		    .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-		    .RegisterPass(spvtools::CreateSimplificationPass())
-		    .RegisterPass(spvtools::CreateRedundancyEliminationPass())
-		    .RegisterPass(spvtools::CreateBlockMergePass());
+	std::shared_ptr<SpirvOptimizationCache> cache;
+	if (const auto* directory = std::getenv("KYTY_SPIRV_OPTIMIZATION_CACHE_DIR"); directory && *directory) {
+		static std::mutex cache_mutex;
+		static std::shared_ptr<SpirvOptimizationCache> configured_cache;
+		static std::string configured_directory;
+		try {
+			const std::lock_guard guard(cache_mutex);
+			if (!configured_cache || configured_directory != directory) {
+				configured_cache = std::make_shared<SpirvOptimizationCache>(std::filesystem::u8path(directory));
+				configured_directory = directory;
+			}
+			cache = configured_cache;
+		} catch (...) { /* Cache unavailability preserves ordinary compilation. */ }
 	}
-	if (optimization == Config::ShaderOptimizationType::Size) {
-		optimizer.RegisterPass(spvtools::CreateStripDebugInfoPass());
-	}
-
+	const SpirvOptimizationCache::State state{KYTY_SPIRV_OPTIMIZER_IDENTITY,
+	    static_cast<uint32_t>(optimization), SPV_ENV_VULKAN_1_3, cooperative_wave64};
 	std::vector<uint32_t> optimized;
-	if (!optimizer.Run(spirv.data(), spirv.size(), &optimized) || optimized.empty()) {
+	if (cache && cache->Load(spirv, state, optimized)) {
+		if (std::getenv("KYTY_SPIRV_OPTIMIZATION_TRACE")) {
+			std::printf("SpirvOptimizationCache: outcome=hit input_words=%zu output_words=%zu\n",
+			            spirv.size(), optimized.size());
+			std::fflush(stdout);
+		}
+		return optimized;
+	}
+	std::string         messages;
+	if (!RunSpirvOptimizationRecipe(spirv, static_cast<uint32_t>(optimization),
+	                                cooperative_wave64, optimized, messages)) {
 		LOGF("SPIR-V optimization failed; using generated module:\n%s", messages.c_str());
 		return spirv;
+	}
+	if (cache) {
+		const bool stored = cache->Store(spirv, state, optimized);
+		if (std::getenv("KYTY_SPIRV_OPTIMIZATION_TRACE")) {
+			std::printf("SpirvOptimizationCache: outcome=miss stored=%u input_words=%zu output_words=%zu\n",
+			            stored ? 1u : 0u, spirv.size(), optimized.size());
+			std::fflush(stdout);
+		}
 	}
 	return optimized;
 }

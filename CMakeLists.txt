@@ -328,6 +328,24 @@ list(APPEND kyty_emulator_src
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
+# Use the recipe and the actual linked optimizer binaries, rather than a game
+# hash or emulator revision, to identify persistent optimization results.
+set(spirv_opt_identity "${CMAKE_BINARY_DIR}/generated/spirvOptimizationCacheIdentity.h")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+add_custom_command(OUTPUT "${spirv_opt_identity}"
+	COMMAND "${CMAKE_COMMAND}"
+		"-DOPT_LIBRARY=$<TARGET_FILE:spirv-tools-opt>"
+		"-DCORE_LIBRARY=$<TARGET_FILE:spirv-tools>"
+		"-DRECIPE=${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/SpirvOptimizationRecipe.h"
+		"-DOUTPUT=${spirv_opt_identity}"
+		-P "${PROJECT_SOURCE_DIR}/tools/GenerateOptimizationCacheIdentity.cmake"
+	DEPENDS SPIRV-Tools-opt SPIRV-Tools-static
+		"$<TARGET_FILE:spirv-tools-opt>" "$<TARGET_FILE:spirv-tools>"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/SpirvOptimizationRecipe.h"
+		"${PROJECT_SOURCE_DIR}/tools/GenerateOptimizationCacheIdentity.cmake"
+	VERBATIM)
+add_custom_target(spirv_optimizer_cache_identity DEPENDS "${spirv_opt_identity}")
+
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
@@ -342,6 +360,7 @@ endif()
 
 set(inc_headers
 	${KYTY_SOURCE_DIR}
+	${CMAKE_BINARY_DIR}/generated
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
@@ -365,6 +384,7 @@ list(APPEND check_headers
 
 function(add_kyty_full_emulator_test target source)
 	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
+	add_dependencies(${target} spirv_optimizer_cache_identity)
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
@@ -399,6 +419,11 @@ add_executable(resource_read_snapshot_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceReadSnapshotTests.cpp")
 target_include_directories(resource_read_snapshot_tests PRIVATE ${inc_headers})
 target_link_libraries(resource_read_snapshot_tests fmt::fmt Vulkan::Headers)
+
+add_executable(spirv_optimization_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SpirvOptimizationCacheTests.cpp")
+target_include_directories(spirv_optimization_cache_tests PRIVATE ${inc_headers})
+target_link_libraries(spirv_optimization_cache_tests spirv-tools-opt spirv-tools xxhash)
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -753,6 +778,15 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking_packed_texture_row_proof
 		COMMAND $<TARGET_FILE:resource_tracking_tests> --packed-texture-row-proof-only)
 	set_tests_properties(resource_tracking_packed_texture_row_proof PROPERTIES TIMEOUT 60)
+	add_test(NAME resource_tracking_finite_inline_selector
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --finite-inline-selector-only)
+	set_tests_properties(resource_tracking_finite_inline_selector PROPERTIES TIMEOUT 60)
+	add_test(NAME spirv_optimization_cache
+		COMMAND $<TARGET_FILE:spirv_optimization_cache_tests>)
+	set_tests_properties(spirv_optimization_cache PROPERTIES TIMEOUT 30 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+	add_test(NAME shader_optimizer_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --optimizer-cache-only)
+	set_tests_properties(shader_optimizer_cache PROPERTIES TIMEOUT 60)
 	add_test(NAME resource_read_snapshot
 		COMMAND $<TARGET_FILE:resource_read_snapshot_tests>)
 	set_tests_properties(resource_read_snapshot PROPERTIES TIMEOUT 30)
@@ -1079,6 +1113,7 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+add_dependencies(kyty_emulator spirv_optimizer_cache_identity)
 configure_macos_guest_address_space(kyty_emulator)
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")

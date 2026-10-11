@@ -89,6 +89,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -50219,10 +50221,74 @@ void CheckAjmAt9Multistream() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckOptimizerCachePersistence() {
+  using Libs::Graphics::Require;
+  constexpr const char* name = "SpirvOptimizerCachePersistence";
+  const auto environment = [](const char* key, const std::string& value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    return _putenv_s(key, value.c_str()) == 0;
+#else
+    return setenv(key, value.c_str(), 1) == 0;
+#endif
+  };
+  Require(name, "uncached oracle environment", environment("KYTY_SPIRV_OPTIMIZATION_CACHE_DIR", ""),
+          "cannot disable optimizer cache for independent oracle");
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+  std::vector<uint32_t> input;
+  Require(name, "synthetic SPIR-V", tools.Assemble(R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%one = OpConstant %uint 1
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%unused = OpIAdd %uint %one %one
+OpReturn
+OpFunctionEnd
+)", &input) && tools.Validate(input), "independent optimizer fixture is invalid");
+  const auto oracle = Libs::Graphics::OptimizeShaderSpirvForTest(input, Config::ShaderOptimizationType::Performance, false);
+  Require(name, "uncached oracle", !oracle.empty() && tools.Validate(oracle), "uncached optimizer result is invalid");
+  const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto directory = std::filesystem::absolute(std::filesystem::path("_Build") /
+      ("optimizer-cache-regression-" + std::to_string(suffix)));
+  std::filesystem::create_directories(directory.parent_path());
+  Require(name, "private cache directory", std::filesystem::create_directory(directory), "private cache directory already exists");
+  std::printf("KYTY_OPTIMIZER_CACHE_DIRECTORY %s\n", directory.string().c_str());
+  Require(name, "cache environment", environment("KYTY_SPIRV_OPTIMIZATION_CACHE_DIR", directory.string()) &&
+          environment("KYTY_SPIRV_OPTIMIZATION_TRACE", "1"), "cannot enable optimizer cache");
+  const auto cold = Libs::Graphics::OptimizeShaderSpirvForTest(input, Config::ShaderOptimizationType::Performance, false);
+  Require(name, "cold output", cold == oracle && tools.Validate(cold), "cold cache changes optimization result");
+  std::vector<std::filesystem::path> records;
+  for (const auto& entry : std::filesystem::directory_iterator(directory))
+    if (entry.is_regular_file() && entry.path().extension() == ".bin") records.push_back(entry.path());
+  Require(name, "persistent artifact", records.size() == 1u, "optimizer cache artifact absent");
+  const auto write_time = std::filesystem::last_write_time(records.front());
+  const auto size = std::filesystem::file_size(records.front());
+  const auto warm = Libs::Graphics::OptimizeShaderSpirvForTest(input, Config::ShaderOptimizationType::Performance, false);
+  Require(name, "warm output", warm == oracle && tools.Validate(warm), "warm cache changes optimization result");
+  Require(name, "warm cache read", std::filesystem::last_write_time(records.front()) == write_time &&
+          std::filesystem::file_size(records.front()) == size, "warm cache entry was rewritten");
+  { std::ofstream corrupt(records.front(), std::ios::binary | std::ios::trunc); corrupt << "short"; }
+  const auto repaired = Libs::Graphics::OptimizeShaderSpirvForTest(input, Config::ShaderOptimizationType::Performance, false);
+  Require(name, "corruption fallback", repaired == oracle && tools.Validate(repaired) &&
+          std::filesystem::file_size(records.front()) == size, "cache corruption bypasses optimizer or changes its result");
+  Require(name, "restore cache environment", environment("KYTY_SPIRV_OPTIMIZATION_CACHE_DIR", ""), "cannot clear test cache environment");
+  std::printf("KYTY_OPTIMIZER_CACHE_PASS\n");
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--optimizer-cache-only") == 0) {
+    EnsureConfigInitialized(false);
+    CheckOptimizerCachePersistence();
+    return 0;
+  }
   const bool admission_parent=argc==2 &&
       (std::strcmp(argv[1],"--immutable-srt-binding-admission-only")==0 ||
        std::strcmp(argv[1],"--scalar-selector-write-admission-only")==0 ||

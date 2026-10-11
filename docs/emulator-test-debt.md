@@ -1,5 +1,38 @@
 # Emulator regression test debt
 
+## Sparse texture wave-row regression (2026-10-11, in progress)
+
+Source4f6fffda: final corrected fixture RED092613 -> unchanged GREEN092803;
+neighbor negatives plus packed initialization/empty mask/CFG checks093228 and
+full resource093852 pass. Independent cross-block collector RED093541 ->
+unchanged GREEN093700 (all5 capture tests), including33x2 and2x33 boundary cases.
+Physical backing alias/partial mapping093046 and snapshot reader093042 pass.
+GPUAV wave contracts/neighbors/readback093907 pass3/3. Actual617c snapshot093838
+proves14 tables use image1/RGB7 and observed21 rows below255, excluding64.
+The old capture does not contain ownership proofs, so materialization remains
+unsupported there; original-game retry and GPU texture-origin integration are
+still required. All checks are native Windows and artifact names live under
+`_Build/checks/20261011-*`. No cross-game runtime claim.
+
+Neighbor GPU check094134 reproduced the already-recorded sampled HTile
+uniform-fill assertion and an absent `--rt1d-only` test selector. The selector
+now calls existing color target discovery;094337 passes. Layered-image and
+sampled HTile-array cases pass; unrelated HTile fill debt remains open.
+
+Minimal independent resource fixture: a logical RGBA8UInt Standard4KB 2x2
+input supplies RGB values {1,4,7,255}; alpha and tiled padding contain64.
+An ImageRead/UMinTri/ReadFirstLane row is guarded below255 and selects a
+wave-address descriptor table with only rows {0,1,4,7} valid. The current
+materializer scans unselected rows; the new direct harness mode is
+`resource_tracking_tests --wave-address-texture-row-only`. Save the native
+intended RED before activating any texture-domain specialization.
+
+This base case must be followed by packed-byte shift-loop/waterfall active-lane
+initialization coverage, divergent texture candidates, reachable invalid rows,
+unsupported/dirty input, and current-draw writer/physical alias negatives.
+Coherent memory and captured RGB sets alone do not prove draw immutability.
+No new game/menu outcome follows from these CPU checks.
+
 ## CPU-uniform wave-address row overscan (2026-10-10)
 
 Finalized runtime17:36UTC: original171740/7cd25729/EXEc1563fc0 naturally exits321

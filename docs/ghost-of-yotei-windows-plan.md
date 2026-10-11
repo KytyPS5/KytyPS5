@@ -1,5 +1,43 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-11 09:50 UTC** (packed RGB correction; original retry active):
+
+- Local source **4f6fffda** implements a conditional IR proof for initialized
+  ImageRead bytes, packed shift-by8 loops and full-wave minimum reduction.
+  Materialization uses coherent RGBA8UInt Standard4KB contents only with
+  explicit current-draw ownership, exclusive backing and attachment-disjoint
+  proofs; unsupported/dirty/unknown inputs retain conservative behavior.
+- Native final-fixture RED092613 fails on an unreadable unselected row; the
+  unchanged positive case passes GREEN092803. Reachable invalid64, dirty data,
+  attachment/descriptor aliases, missing proof and unsupported numeric class
+  remain failures without partially committing a resource snapshot. Packed
+  initialization/empty-mask/CFG safety cases pass093228; full resource suite
+  passes093852 (3.93s). No game-specific admission branch or guessed row bound.
+- Tiled byte collection had an independent cross-block bug: native33x2 RED
+  093541 -> unchanged GREEN093700. The five capture cases also cover2x33,
+  padding/alpha/swizzle/constant channels and truncated input. Snapshot reader
+  093042 and physical alias/partial mapping test093046 pass.
+- Actual617c diagnostic snapshot093838 (0.593s) proves **all14 wave tables**
+  derive from logical image1/RGB7. Both captured513x513 texture domains match
+  the independent Python results:22 RGB values including255, **21 rows below
+  guard255**, no64. Old capture has no draw ownership events, so it deliberately
+  still reproduces row64; contents plus IR proof are not a live runtime result.
+- Native GPUAV wave contracts/neighbors/numerical lookup093907 pass3/3.
+  Layered images and sampled HTile arrays pass094134; color target discovery
+  passes094337 after restoring its missing CTest harness selector. Older
+  sampled HTile clear-import still fails at the previously recorded uniform
+  dword-pattern fill assertion; the full GPU suite is not green.
+- Native emulator build094537 passed. Private EXE SHA256
+  `9f8dc68da18350b6831de48e893c15faa61a1fcced7bf48044e7909cdaad5d1f`;
+  installed EXE454656 and user SaveData preserved.
+- ACTIVE `_Build/runs/game-20261011-094820-packed-texture-row-retry`, PID7500,
+  supervisor/session71820, source4f6fffda frozen, original5178, Performance
+  1280x720/redzone,1800s/32GiB/8GiB reserve. Compatible warm driver cache from
+  the previous private runtime. Target success and all resource failures are
+  captured; rejection trace distinguishes unknown ownership from bad rows.
+  Initial owned-window capture094909 is black, so no new pixels/menu/gameplay
+  milestone yet. Await outcome before another native build/test or fix.
+
 Checkpoint **2026-10-10 17:36 UTC** (uniform-row native retry finalized):
 
 - Source7cd25729/EXEc1563fc0, original5178, private Performance1280x720/

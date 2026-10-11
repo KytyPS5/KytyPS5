@@ -131,6 +131,7 @@ void Buffer::EnsureResident(uint64_t offset, uint64_t size) {
 	const auto                        first = offset / m_sparse_chunk_size;
 	const auto                        last  = (offset + size - 1) / m_sparse_chunk_size;
 	std::vector<vk::SparseMemoryBind> binds;
+	std::vector<VmaAllocation>        fresh;
 	for (auto chunk = first; chunk <= last; chunk++) {
 		if (m_sparse_chunks[chunk] != nullptr) {
 			continue;
@@ -147,31 +148,65 @@ void Buffer::EnsureResident(uint64_t offset, uint64_t size) {
 		                          &m_sparse_chunks[chunk], &info) != VK_SUCCESS);
 		const auto bind_size = std::min(m_sparse_chunk_size, m_size - chunk * m_sparse_chunk_size);
 		binds.emplace_back(chunk * m_sparse_chunk_size, bind_size, info.deviceMemory, info.offset);
+		fresh.push_back(m_sparse_chunks[chunk]);
 	}
 	if (binds.empty()) {
 		return;
 	}
+	// Work already recorded or in flight may read entries in these chunks and must keep seeing
+	// zero, so clear the memory before it becomes part of the table: through a temporary buffer,
+	// in a submission of its own. Binds happen the first few times the guest maps memory in a
+	// new part of its address space.
+	auto&                     device = m_graphics->device;
+	std::vector<vk::Buffer>   scratch;
+	vk::CommandPoolCreateInfo pool_info {};
+	pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient;
+	pool_info.queueFamilyIndex = m_graphics->queue_family;
+	const auto pool            = device.createCommandPool(pool_info);
+	EXIT_IF(pool.result != vk::Result::eSuccess);
+	vk::CommandBufferAllocateInfo command_info {};
+	command_info.commandPool        = pool.value;
+	command_info.level              = vk::CommandBufferLevel::ePrimary;
+	command_info.commandBufferCount = 1;
+	vk::CommandBuffer command;
+	EXIT_IF(device.allocateCommandBuffers(&command_info, &command) != vk::Result::eSuccess);
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_IF(command.begin(begin) != vk::Result::eSuccess);
+	for (size_t i = 0; i < binds.size(); i++) {
+		vk::BufferCreateInfo buffer_info {};
+		buffer_info.size  = m_sparse_chunk_size;
+		buffer_info.usage = vk::BufferUsageFlagBits::eTransferDst;
+		const auto buffer = device.createBuffer(buffer_info);
+		EXIT_IF(buffer.result != vk::Result::eSuccess);
+		EXIT_IF(vmaBindBufferMemory(m_graphics->allocator, fresh[i], buffer.value) != VK_SUCCESS);
+		command.fillBuffer(buffer.value, 0, VK_WHOLE_SIZE, 0);
+		scratch.push_back(buffer.value);
+	}
+	EXIT_IF(command.end() != vk::Result::eSuccess);
+	const auto fence = device.createFence({});
+	EXIT_IF(fence.result != vk::Result::eSuccess);
 	{
-		// Shaders may be reading neighbouring entries. Until the fill below runs, freshly bound
-		// memory holds garbage, so let in-flight work finish before binding. This happens a few
-		// times per run, when the guest first maps memory in a new part of its address space.
 		Common::LockGuard lock(m_graphics->queue_mutex);
-		EXIT_IF(m_graphics->queue.waitIdle() != vk::Result::eSuccess);
+		vk::SubmitInfo    submit {};
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers    = &command;
+		EXIT_IF(m_graphics->queue.submit(1, &submit, fence.value) != vk::Result::eSuccess);
+		EXIT_IF(device.waitForFences(1, &fence.value, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
+		EXIT_IF(device.resetFences(1, &fence.value) != vk::Result::eSuccess);
 		const vk::SparseBufferMemoryBindInfo buffer_bind {
 		    m_buffer, static_cast<uint32_t>(binds.size()), binds.data()};
 		vk::BindSparseInfo bind_info {};
 		bind_info.bufferBindCount = 1;
 		bind_info.pBufferBinds    = &buffer_bind;
-		const auto fence          = m_graphics->device.createFence({});
-		EXIT_IF(fence.result != vk::Result::eSuccess);
 		EXIT_IF(m_graphics->queue.bindSparse(1, &bind_info, fence.value) != vk::Result::eSuccess);
-		EXIT_IF(m_graphics->device.waitForFences(1, &fence.value, VK_TRUE, UINT64_MAX) !=
-		        vk::Result::eSuccess);
-		m_graphics->device.destroyFence(fence.value);
+		EXIT_IF(device.waitForFences(1, &fence.value, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
 	}
-	for (const auto& bind: binds) {
-		Fill(bind.resourceOffset, Common::AlignDown(bind.size, 4), 0);
+	device.destroyFence(fence.value);
+	for (const auto buffer: scratch) {
+		device.destroyBuffer(buffer);
 	}
+	device.destroyCommandPool(pool.value);
 }
 
 Buffer::~Buffer() {

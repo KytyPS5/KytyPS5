@@ -1,5 +1,26 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-11 15:24 UTC** (saved branches; capture admission verified):
+
+- Primary integration `yotei-integration-native` is separately committed with
+  resume plan/AGENTS/skill/test debt; engine code remains tested6d041035.
+  Previous branch/source85494f56, artifacts, logs/caches and user data preserved.
+- Admission follow-up **ea9225c4**: cache reuse consumes no permanent generation
+  input slots; actual Translate/Emit retains exact inputs and successful bounded
+  callbacks. Known cached failure keeps policy/push/back in protected64MiB/7
+  pool; legacy snapshot cap stays8 total (1positive/7failures). Total broad
+  budget remains256MiB. Quota/error output is visible with Silent logging.
+- Native capture152027 passes6/6 (including64cached-input flood, late generation,
+  cached-plan miss, failure capacity and exact metadata); static review passes.
+  Original follow-up retry remains pending. Private975b is the OLD85494 artifact.
+- The next phase, explicitly requested after the plan: bring compatible capture/
+  replay to the new base, gather batches with diagnostic fallback preserving
+  original errors/inputs, then independently validate shared corrections.
+  Fork already has FP64 literal support; reassess old groups on the new base.
+- No active native processes, no push or issue comment at this checkpoint.
+  [Resume instructions](yotei-session-resume.md) and newest shared handoff are
+  the entry points for both native Windows and WSL agents.
+
 Checkpoint **2026-10-11 15:15 UTC** (primary base changed; session persistence):
 
 - User requests a saved plan, separate branch, progress shared across sessions;

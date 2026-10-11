@@ -1,5 +1,20 @@
 # Emulator regression test debt
 
+## Generation capture admission follow-up (2026-10-11)
+
+Actual run142826/85494f56 filled4096compiler slots with cached userdata requests,
+then failed to archive late actual generation143514. Sourceea9225c4 moves
+persistent admission to real Translate/Emit, defers cached-success transcripts,
+protects known failures within unchanged256MiB and keeps full policy/push/back.
+Native capture1520276/6 and static review pass; new original retry remains
+pending. Genuine-generation quota exhaustion is still an explicit finite limit.
+This is a diagnostic correction; no new shader semantic/gameplay claim.
+
+Primary integration is nowyotei-integration-native/code6d041035, with its own
+plan/test debt. Old FP64 draft is unapplied; fork already contains literal support.
+Batch diagnostic fallback comes after the saved plan and must retain original
+errors/full inputs and distinguish fallback collection from correctness proof.
+
 ## Pre-generation capture and batch replay (2026-10-11, validation pending)
 
 Native progress: capture140927 passes all6 CTest modes; cfg141157/shared

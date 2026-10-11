@@ -60,16 +60,18 @@ Previous native capture run:
   equal-interval performance comparison still need proof.
 -5215 captures:4096 compiler requests +1119 runtime variants. Cached user-data
   changes exhausted the compiler quota before late real generation143514.
-  Source capture-admission follow-up is UNVALIDATED WIP in the previous branch:
+  Admission follow-up is now committed as ea9225c43dce9651a293bbb338b6c5b87235877c:
   archive actual Translate/Emit attempts, defer successful cached transcripts,
   protect failure capacity and preserve exact policy/push/back metadata.
-  Inspect the newest handoff/status/diff before applying, building or committing it.
+  Native capture152027 passed6/6 with cache-flood/late-generation/reserve cases.
+  Static review passed; the new original game retry remains pending. The old
+  private EXE975b belongs to85494f56 and does not contain this follow-up.
 
 ## Next actions
 
-1. Save/review the pending capture-admission delta and its exact validation state.
-   Run its meaningful CPU coordinator/reserve tests on the previous branch before
-   treating it as a completed fix. Transfer compatible diagnostic pieces as small
+1. Review the completed capture-admission commits and their exact validation state.
+   Native CPU coordinator/reserve tests have passed; original retry is pending before
+   claiming recovered late runtime captures. Transfer compatible diagnostics as small
    reviewed ports to the primary branch; keep original engine behavior unchanged.
 2. Retry the primary native artifact with warm cache and bounded lifetime; verify
    mouse/touchpad input in the interactive introduction, then actual character

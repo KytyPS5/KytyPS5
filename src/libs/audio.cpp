@@ -569,12 +569,27 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 
 		if (port.type == Controller::HapticsRumble::HAPTICS_RUMBLE_PORT_TYPE &&
 		    Config::ControllerHapticsRumbleEnabled()) {
-			// Runs outside Audio::m_mutex; Controller::SubmitHapticsRumble only takes the
-			// controller mutex and never calls back into Audio.
-			if (Controller::IsActivePadNonSony() && FormatIsFloat(port.format)) {
-				const auto levels = port.rumble_env.Process(
+			// AudioOutClose resets the port under m_mutex, so take it for the envelope state.
+			// Lock order Audio::m_mutex -> controller mutex, same as the haptics Queue call below;
+			// the controller never calls into Audio, and its mutex is only held briefly (SDL
+			// rumble is non-blocking).
+			Common::LockGuard lock(m_mutex);
+			if (port.used && Controller::IsActivePadNonSony() && FormatIsFloat(port.format)) {
+				auto levels = port.rumble_env.Process(
 				    static_cast<const float*>(params[i].data), port.samples_num,
 				    static_cast<uint32_t>(port.channels_num), port.freq);
+				// Honor the port volume and per-call gains like the audio path does, for the two
+				// channels the envelope mixes. The vibration intensity setting is applied by the
+				// controller, so it is not part of this scale.
+				const int rumble_channels = std::min(port.channels_num, 2);
+				float     rumble_scale    = 0.0f;
+				for (int ch = 0; ch < rumble_channels; ch++) {
+					rumble_scale += (static_cast<float>(port.volume[ch]) / 32768.0f) *
+					                (params[i].gains != nullptr ? params[i].gains[ch] : 1.0f);
+				}
+				rumble_scale = rumble_channels > 0 ? rumble_scale / static_cast<float>(rumble_channels) : 0.0f;
+				levels.low   = std::clamp(levels.low * rumble_scale, 0.0f, 1.0f);
+				levels.high  = std::clamp(levels.high * rumble_scale, 0.0f, 1.0f);
 				const bool nonzero = levels.low > 0.0f || levels.high > 0.0f;
 				if (nonzero || port.rumble_active) {
 					// Zeros are sent once to stop; after that silence costs nothing.

@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
@@ -77,6 +78,7 @@ ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
 	layout.coord = cursor;
 	cursor += info.coordinate_components;
 	if (HasFlag(mem, Decoder::ImageSampleFlagLod)) layout.lod = cursor++;
+	if (HasFlag(mem, Decoder::ImageSampleFlagLodClamp)) layout.clamp = cursor++;
 	return layout;
 }
 
@@ -886,7 +888,16 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		std::array<uint32_t, 4> operands {};
+		// IMAGE_SAMPLE*_CL: the last address component is a minimum LOD. Implicit and gradient
+		// samples take it as the MinLod operand; explicit-LOD forms raise their LOD to it.
+		uint32_t lod_clamp = 0;
+		if (layout.clamp != NoImageComponent && mem.image_address_components > layout.clamp) {
+			lod_clamp = AddressF32(ctx, mem, *address, layout.clamp);
+		}
+		const bool min_lod_op = lod_clamp != 0u &&
+		                        (HasFlag(mem, Decoder::ImageSampleFlagDerivative) || !explicit_lod) &&
+		                        GetHostImageFeatures().min_lod;
+		std::array<uint32_t, 5> operands {};
 		size_t operand_count = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operands[0] = spv::ImageOperandsGradMask;
@@ -897,6 +908,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto lod = ZeroF32(state);
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
 				lod = AddressF32(ctx, mem, *address, layout.lod);
+			}
+			if (lod_clamp != 0u) {
+				const auto clamped = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+				                          GLSLstd450FMax, lod, lod_clamp);
+				lod = clamped;
 			}
 			operands[0] = spv::ImageOperandsLodMask;
 			operands[1] = lod;
@@ -929,6 +946,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operand_count = std::max(size_t{1}, sample_operand_count);
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);
+			}
+			if (min_lod_op) {
+				// MinLod follows the other operands in mask-bit order.
+				state.builder.RequireCapability(spv::CapabilityMinLod);
+				sample_operand_count = std::max(size_t {1}, sample_operand_count);
+				sample_operands[0] |= spv::ImageOperandsMinLodMask;
+				sample_operands[sample_operand_count++] = lod_clamp;
 			}
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,

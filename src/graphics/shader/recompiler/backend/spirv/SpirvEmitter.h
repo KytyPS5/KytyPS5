@@ -17,6 +17,15 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 // scope) and shifts it right by this many bits to approach that rate. The device layer sets it
 // from the device's clock rate: 3 for a 1 GHz clock (NVIDIA, the default), 0 for a 100 MHz one
 // (AMD).
+// Optional image features of the device, set once by the device layer.
+struct HostImageFeatures {
+	// shaderResourceMinLod: the MinLod image operand, used for IMAGE_SAMPLE*_CL.
+	bool min_lod = false;
+};
+
+void              SetHostImageFeatures(const HostImageFeatures& features);
+HostImageFeatures GetHostImageFeatures();
+
 void     SetDeviceClockShift(uint32_t shift);
 uint32_t GetDeviceClockShift();
 

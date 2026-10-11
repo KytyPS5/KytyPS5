@@ -238,10 +238,19 @@ uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo
 	return 0;
 }
 
+std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint32_t g_device_clock_shift {3};
 std::atomic_bool     g_coherent_load_acquire {false};
 
 } // namespace
+
+void SetHostImageFeatures(const HostImageFeatures& features) {
+	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+}
+
+HostImageFeatures GetHostImageFeatures() {
+	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
+}
 
 void SetCoherentLoadAcquire(bool enabled) {
 	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);

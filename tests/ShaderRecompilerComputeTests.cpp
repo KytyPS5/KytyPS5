@@ -18900,6 +18900,9 @@ private:
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
+    device_features.shaderResourceMinLod = available_features.shaderResourceMinLod;
+    ShaderRecompiler::Spirv::SetHostImageFeatures(
+        {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.shaderFloat64 = available_features.shaderFloat64;

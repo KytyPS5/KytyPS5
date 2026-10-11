@@ -4175,26 +4175,25 @@ int Initialize() {
 		uint32_t user_data[2];
 	};
 	static_assert(sizeof(FunctionShaderBindings) == 16);
-	// Ordered-count queue validator, including its return to the caller.
-	static constexpr std::array<uint32_t, 16> validator {
-	    0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a, 0xbf800000, 0x8590807e,
-	    0xb96a0a18, 0xbf066a80, 0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
-	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
-	};
-	const auto base           = DriverDmemBase + AgcDmemOffset;
-	const auto function_table = base + 0x60;
-	const auto code_address   = base + 0x100; // Shader code requires 256-byte alignment.
-	std::array<FunctionShaderBindings, 8> functions {};
-	functions[2].code = code_address;
-	const std::array<uint32_t, 4> descriptor {
-	    static_cast<uint32_t>(function_table),
-	    static_cast<uint32_t>(function_table >> 32u) | 0x00100000u,
-	    static_cast<uint32_t>(functions.size()),
-	    0x5204u,
-	};
-	std::memcpy(reinterpret_cast<void*>(function_table), functions.data(), sizeof(functions));
-	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
-	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
+	int64_t    physical_offset = -1;
+	const auto reported_end    = LibKernel::Memory::KernelGetDirectMemorySize();
+	const auto end             = Common::AlignDown(reported_end, DriverDmemSize);
+	const auto start           = end - DriverDmemSize;
+	auto       result          = LibKernel::Memory::KernelAllocateDirectMemory(
+	    start, end, DriverDmemSize, DriverDmemSize, 12, &physical_offset);
+	if (result != OK) {
+		return result;
+	}
+	void* address = reinterpret_cast<void*>(DriverDmemBase);
+	result        = LibKernel::Memory::KernelMapNamedDirectMemory(
+	    &address, DriverDmemSize, 0x33, 0, physical_offset, DriverDmemSize, "SceAgcDriver");
+	if (result != OK) {
+		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset,
+		                                                            DriverDmemSize) != OK);
+		return result;
+	}
+	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
+	std::memset(address, 0, DriverDmemSize);
 	g_driver_dmem.physical_offset = physical_offset;
 	LibKernel::Memory::SetSystemDirectMemoryReserve(end - start);
 	return OK;

@@ -17925,9 +17925,9 @@ public:
                   captured.mip_layout[0].pitch == 512 &&
                   captured.mip_layout[0].height == 512,
               "R64 BC1 texture lost its compressed blocks or array stride");
-      const auto small =
+      const auto small_array =
           MakeTilingImage(format, 67, 51, 1, layers, tile, 0, false);
-      check_round_trip("R64 BC1 array", small.data.size, small);
+      check_round_trip("R64 BC1 array", small_array.data.size, small_array);
     }
 
     {

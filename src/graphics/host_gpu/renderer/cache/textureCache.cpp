@@ -1248,6 +1248,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.type != cached.info.type) {
 			return {merged_id};
 		}
+		// A view of the wider image would stretch normalized coordinates over its extent.
+		const auto blocks = [](const ImageInfo& info, uint32_t texels) {
+			return info.IsBlock() ? (texels + 3u) / 4u : texels;
+		};
+		if ((binding == BindingType::Texture || binding == BindingType::Storage) &&
+		    (blocks(requested, requested.extent.width) <
+		         blocks(cached.info, cached.info.extent.width) ||
+		     blocks(requested, requested.extent.height) <
+		         blocks(cached.info, cached.info.extent.height))) {
+			return {merged_id};
+		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;

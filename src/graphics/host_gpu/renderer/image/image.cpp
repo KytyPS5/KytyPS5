@@ -641,9 +641,11 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	const uint32_t base_width  = std::min(source.backing.extent.width, backing.extent.width);
+	const uint32_t base_height = std::min(source.backing.extent.height, backing.extent.height);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		const auto width             = std::max(base_width >> level, 1u);
+		const auto height            = std::max(base_height >> level, 1u);
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;

@@ -18413,6 +18413,138 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A narrow read at a wider surface's address gets its own image holding the shared corner.
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr auto tile = Prospero::TileMode::kStandard64KB;
+    constexpr vk::Extent3D wide_extent{120, 33, 1};
+    constexpr vk::Extent3D narrow_extent{60, 33, 1};
+    constexpr uint32_t guest_bytes = 0xdeadbeefu;
+    constexpr uint32_t wide_bits = 0x11111111u;
+    constexpr uint32_t narrow_bits = 0x22222222u;
+    EnsureRuntimeContext();
+
+    TileSizeAlign total{};
+    TileGetTextureTotalSize(Prospero::BufferFormat::k32UInt, wide_extent.width,
+                            wide_extent.height, 1, 1, tile, false, total);
+    TileSizeOffset offsets[16]{};
+    TilePaddedSize padded[16]{};
+    TileGetTextureSize(Prospero::BufferFormat::k32UInt, wide_extent.width, wide_extent.height, 1,
+                       tile, nullptr, offsets, padded);
+    const auto make_desc = [&](vk::Extent3D extent) {
+      ImageDesc desc{};
+      desc.type = BindingType::Texture;
+      desc.info.data = {base, total.size};
+      desc.info.pixel_format = vk::Format::eR32Uint;
+      desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = extent;
+      desc.info.resources = {1, 1};
+      desc.info.pitch =
+          TileGetTexturePitch(Prospero::BufferFormat::k32UInt, wide_extent.width, tile);
+      desc.info.bytes_per_block = sizeof(uint32_t);
+      desc.info.tile_mode = tile;
+      desc.info.mip_layout[0] = {
+          offsets[0].src_size != 0 ? offsets[0].src_offset : offsets[0].offset,
+          offsets[0].src_size != 0 ? offsets[0].src_size : offsets[0].size, padded[0].width,
+          padded[0].height};
+      desc.view_info.format = vk::Format::eR32Uint;
+      desc.view_info.type = vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.level_count = 1;
+      desc.view_info.layer_count = 1;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      return desc;
+    };
+    auto wide = make_desc(wide_extent);
+    auto narrow = make_desc(narrow_extent);
+    Require(name, "fixture",
+            total.size <= allocation_size &&
+                wide.info.BlockExtent() == narrow.info.BlockExtent(),
+            "the two descriptions do not share one guest layout");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "alias allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "alias mapping failed");
+    std::fill_n(static_cast<uint32_t *>(mapped), allocation_size / sizeof(uint32_t),
+                guest_bytes);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+
+      const auto fill = [&](ImageId id, uint32_t bits) {
+        auto &image = cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                      vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        const auto value = vk::ClearColorValue{}.setUint32({bits, 0, 0, 0});
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &value, 1, &range);
+        cache.MarkGpuWritten(id);
+      };
+      const auto expect = [&](const char *check, ImageId id, vk::Extent3D extent,
+                              uint32_t split, uint32_t left, uint32_t right) {
+        const auto pixels = ReadCachedTexel(name, context, id, {}, extent);
+        for (uint32_t texel = 0; texel < pixels.size(); ++texel) {
+          const auto wanted = texel % extent.width < split ? left : right;
+          if (pixels[texel] == wanted) {
+            continue;
+          }
+          char detail[112];
+          std::snprintf(detail, sizeof(detail), "texel %u (x=%u) holds 0x%08x, expected 0x%08x",
+                        texel, texel % extent.width, pixels[texel], wanted);
+          Require(name, check, false, detail);
+        }
+      };
+
+      const auto wide_id = cache.FindImage(wide);
+      (void)cache.FindTexture(wide_id, wide);
+      fill(wide_id, wide_bits);
+
+      const auto narrow_id = cache.FindImage(narrow);
+      (void)cache.FindTexture(narrow_id, narrow);
+      Require(name, "separate narrow image",
+              narrow_id != wide_id &&
+                  cache.GetImage(narrow_id).backing.extent.width == narrow_extent.width,
+              "the 60x33 lookup returned the 120x33 image");
+      expect("narrow image holds the shared corner", narrow_id, narrow_extent,
+             narrow_extent.width, wide_bits, wide_bits);
+
+      fill(narrow_id, narrow_bits);
+      Require(name, "wide identity", cache.FindImage(wide) == wide_id,
+              "the wide surface lost its image");
+      expect("wide image keeps its right half", wide_id, wide_extent, narrow_extent.width,
+             narrow_bits, wide_bits);
+      Require(name, "narrow identity", cache.FindImage(narrow) == narrow_id,
+              "the narrow surface lost its image");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "alias backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // RESIDENT EVIL 2 reads a GPU-written render target's tiled bytes as a raw buffer.
   void CheckRawImageRead() {
     constexpr const char *name = "RawImageRead";
@@ -59051,6 +59183,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--layout-alias-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLayoutAliasSync();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--layout-alias-narrow-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLayoutAliasNarrowWidth();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--raw-image-read-only") == 0) {

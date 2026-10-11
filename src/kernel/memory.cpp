@@ -1829,6 +1829,8 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 		const auto overlap_end   = std::min(end, block_end);
 		const auto overlap_size  = overlap_end - overlap_start;
 		AddFreeRange(block.backing_offset + overlap_start - block.map_vaddr, overlap_size);
+		(void)g_guest_address_space->DiscardBacking(
+		    block.backing_offset + overlap_start - block.map_vaddr, overlap_size);
 		removed += overlap_size;
 
 		if (block.map_vaddr < overlap_start) {
@@ -2926,6 +2928,9 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 		GpuAccessMode unused_gpu   = GpuAccessMode::NoAccess;
 		EXIT_IF(!g_physical_memory->Release(block.start_addr, block.size, &unused_vaddr,
 		                                    &unused_size, &unused_gpu));
+		// Physical addresses are backing offsets. Without this the host keeps every page the
+		// game ever wrote, even after the game hands the memory back.
+		(void)g_guest_address_space->DiscardBacking(block.start_addr, block.size);
 	}
 
 	if (g_free_callback != nullptr) {

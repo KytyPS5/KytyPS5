@@ -30,6 +30,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/stat.h>
+#endif
+
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <csignal>
 #include <immintrin.h>
@@ -1486,6 +1490,61 @@ void TestWindowsBackingViewPermissions() {
 	const char* test = "WindowsBackingViewPermissions";
 	Check(test, Libs::LibKernel::Memory::TestWindowsBackingViewModes(),
 	      "backing view permissions differ from the requested mode");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
+#if defined(__linux__)
+// Host memory the guest backing holds, in KiB, resident or swapped: the backing is a memfd.
+uint64_t GuestBackingKiB() {
+	std::error_code ec;
+	for (const auto& entry: std::filesystem::directory_iterator("/proc/self/fd", ec)) {
+		const auto target = std::filesystem::read_symlink(entry.path(), ec);
+		if (ec || target.string().find("KytyDirectMemory") == std::string::npos) {
+			continue;
+		}
+		struct stat info {};
+		if (::stat(entry.path().c_str(), &info) == 0) {
+			return static_cast<uint64_t>(info.st_blocks) * 512 / 1024;
+		}
+	}
+	return 0;
+}
+
+void TestReleasedMemoryReturnsToHost() {
+	using namespace Libs::LibKernel::Memory;
+	const char*    test = "ReleasedMemoryReturnsToHost";
+	constexpr auto size = 64ull * 1024 * 1024;
+	constexpr auto kib  = size / 1024;
+
+	int64_t physical = -1;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), size, SceKernelPageSize,
+	                                         SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* direct = nullptr;
+	CheckOk(test, KernelMapDirectMemory(&direct, size, SceKernelProtCpuRw, 0, physical,
+	                                    SceKernelPageSize),
+	        "KernelMapDirectMemory");
+	std::memset(direct, 0x5a, size);
+	const auto written = GuestBackingKiB();
+	CheckOk(test, KernelReleaseDirectMemory(physical, size), "KernelReleaseDirectMemory");
+	Check(test, GuestBackingKiB() + kib * 9 / 10 <= written,
+	      "released direct memory stayed resident on the host");
+
+	// Mapping flexible memory zeroes it; that must not commit the whole range up front.
+	const auto before   = GuestBackingKiB();
+	void*      flexible = nullptr;
+	CheckOk(test, KernelMapFlexibleMemory(&flexible, size, SceKernelProtCpuRw, 0),
+	        "KernelMapFlexibleMemory");
+	Check(test, GuestBackingKiB() < before + kib / 10,
+	      "mapping flexible memory committed host memory");
+	Check(test, static_cast<const volatile uint8_t*>(flexible)[size - 1] == 0,
+	      "flexible memory does not read as zero");
+	std::memset(flexible, 0x5a, size);
+	const auto touched = GuestBackingKiB();
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(flexible), size), "KernelMunmap");
+	Check(test, GuestBackingKiB() + kib * 9 / 10 <= touched,
+	      "unmapped flexible memory stayed resident on the host");
 	std::printf("[host]    %-48s ok\n", test);
 }
 #endif
@@ -4518,6 +4577,9 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMapUnmapReusesHostAddress);
 #if defined(__linux__)
 	RunTest(TestFixedDirectReplacementPreservesAccess);
+#endif
+#if defined(__linux__)
+	RunTest(TestReleasedMemoryReturnsToHost);
 #endif
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);

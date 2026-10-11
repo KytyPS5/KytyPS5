@@ -54,6 +54,28 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
+void PrefetchRelativeStores(RenderContext& context, uint64_t pointer,
+                            const ShaderRecompiler::IR::DmaPointer& recipe) {
+	constexpr uint64_t MaxSpan = 16ull * 1024 * 1024;
+	context.PrefetchBda(pointer, false);
+	uint64_t offset = 0;
+	if (!LibKernel::Memory::TryReadBacking(pointer + recipe.relative_offset, &offset,
+	                                       sizeof(offset))) {
+		return;
+	}
+	uint32_t records = recipe.records;
+	if (recipe.records_offset != UINT32_MAX &&
+	    !LibKernel::Memory::TryReadBacking(pointer + recipe.records_offset, &records,
+	                                       sizeof(records))) {
+		records = 0;
+	}
+	const auto base   = (pointer + offset) & 0x0000ffffffffffffull;
+	const auto high   = static_cast<uint32_t>(base >> 32u) | recipe.high_mask;
+	const auto stride = (high >> 16u) & 0x3fffu;
+	const auto span   = stride != 0u ? uint64_t {stride} * records : uint64_t {records};
+	context.PrefetchBdaRange(base, std::clamp<uint64_t>(span, 1u, MaxSpan), true);
+}
+
 } // namespace
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
@@ -1034,8 +1056,12 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				lo = snapshot.flattened_srt[pointer.lo];
 				hi = snapshot.flattened_srt[pointer.hi];
 			}
-			m_context.PrefetchBda(static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u),
-			                      pointer.store);
+			const auto address = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u);
+			if (pointer.relative_offset != UINT32_MAX) {
+				PrefetchRelativeStores(m_context, address, pointer);
+				continue;
+			}
+			m_context.PrefetchBda(address, pointer.store);
 		}
 
 		prepared.buffer_sources.clear();

@@ -1952,7 +1952,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
-	plan.srt_read_order = OrderSrtReadsAgainstWrites(program);
+	plan.data_flat_slots = program.data_flat_slots;
+	plan.srt_read_order  = OrderSrtReadsAgainstWrites(program);
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	CyclicPhiEntryCache                   cyclic_entries {.program = &program};

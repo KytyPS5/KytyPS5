@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <span>
 #include <string>
@@ -38,6 +39,7 @@ struct SrtRuntime {
 	SrtReadRefusalDescriber   describe_read_refusal      = nullptr;
 	SrtBlockReader            read_specialization_block  = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	SrtOwnershipQuery         gpu_owned = nullptr;
 };
 
 // Records every guest range a walk reads, so a caller can revalidate them later.
@@ -116,6 +118,7 @@ enum class RawReadReject : uint8_t {
 	OutsideDescriptorBounds,
 	AddressOverflow,
 	ReadRefused,
+	GpuOwned,
 };
 
 [[nodiscard]] std::string_view RawReadRejectName(RawReadReject reason);
@@ -162,6 +165,7 @@ struct FlatRefreshFailure {
 	PhiReject           phi               = PhiReject::None;
 	const char*         raw_read_operand  = nullptr;
 	RuntimeValueFailure raw_read_operand_failure;
+	std::vector<uint32_t> gpu_owned_slots;
 };
 
 [[nodiscard]] std::string DescribeFlatRefreshFailure(const FlatRefreshFailure& failure);
@@ -176,6 +180,11 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
 uint32_t CurrentSrtReadSlot();
+
+[[nodiscard]] RawReadReject RawReadAddress(const ResourcePlan& program, const Inst& inst,
+                                           uint32_t                       component_bytes,
+                                           const std::array<uint64_t, 5>& operands,
+                                           uint64_t&                      address);
 
 // One pass of the per-lane sweep a readfirstlane runs. `dependent` stays clear for an operand
 // that never asks for the lane, which is every shader that does not go through the mask model,

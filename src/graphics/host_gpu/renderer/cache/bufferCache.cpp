@@ -1307,7 +1307,7 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 	});
 }
 
-void BufferCache::PrefetchBda(uint64_t vaddr, uint64_t size, bool store) {
+void BufferCache::PrefetchBda(uint64_t vaddr, uint64_t size, bool store, uint64_t store_window) {
 	const auto begin = vaddr & ~(CACHING_PAGESIZE - 1);
 	const auto end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
 	if (begin >= end || !GuestRange {begin, end - begin}.Valid()) {
@@ -1327,8 +1327,7 @@ void BufferCache::PrefetchBda(uint64_t vaddr, uint64_t size, bool store) {
 	if (!store) {
 		return;
 	}
-	constexpr uint64_t StoreWindow = 64 * 1024;
-	const auto         tracked_end = std::min(end, begin + StoreWindow);
+	const auto tracked_end = end - begin > store_window ? begin + store_window : end;
 	for (auto page = begin; page < tracked_end; page += CACHING_PAGESIZE) {
 		if (!m_bda_tracked_ranges.Contains(page, CACHING_PAGESIZE)) {
 			ResolveBdaFault(page, CACHING_PAGESIZE);

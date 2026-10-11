@@ -1208,6 +1208,66 @@ bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint6
 	return false;
 }
 
+RawReadReject RawReadAddress(const ResourcePlan& program, const Inst& inst,
+                             uint32_t component_bytes, const std::array<uint64_t, 5>& operands,
+                             uint64_t& address) {
+	const auto flags = inst.Flags<MemoryFlags>();
+	if (flags.index >= program.memory_info.size()) {
+		return RawReadReject::MemoryIndexOutOfRange;
+	}
+	const auto& mem      = program.memory_info[flags.index];
+	const auto  low      = operands[0];
+	const auto  high     = operands[1];
+	const auto  offset   = operands[2];
+	const auto  base     = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset)) + component_bytes;
+	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
+	    inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
+	    DescriptorLoadDwords(inst.GetOpcode()) != 0u) {
+		const auto records = operands[3];
+		const auto word3   = operands[4];
+		if (immediate < 0) {
+			return RawReadReject::NegativeImmediate;
+		}
+		const bool vector_load = inst.GetOpcode() != ValueOpcode::ReadConstBuffer;
+		const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		// A vector load adds the thread ID to its index when V# asks, so no one value holds.
+		if (vector_load && ((static_cast<uint32_t>(word3) >> 23u) & 1u) != 0u) {
+			return RawReadReject::AddTidIndexing;
+		}
+		if (vector_load && stride != 0u && (static_cast<uint32_t>(high) >> 31u) != 0u) {
+			const auto element = static_cast<uint64_t>(immediate);
+			if (static_cast<uint32_t>(records) == 0u || element + sizeof(uint32_t) > stride) {
+				return RawReadReject::SwizzledElementOutOfStride;
+			}
+			const auto index_stride = uint64_t {8} << ((static_cast<uint32_t>(word3) >> 21u) & 3u);
+			const auto byte_offset  = (element & ~uint64_t {3}) * index_stride + (element & 3u) +
+			                          static_cast<uint32_t>(offset);
+			address                 = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+		} else {
+			const auto byte_offset = (static_cast<uint64_t>(immediate) & ~uint64_t {3}) +
+			                         (static_cast<uint32_t>(offset) & ~3u);
+			const auto size = stride == 0u
+			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+			// A descriptor chain that reads past its own descriptor is not trustworthy, so the
+			// walk refuses rather than substituting hardware's zero. shader_cfg_tests asserts
+			// this: "real S_BUFFER_LOAD walk ignored descriptor bounds".
+			if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+				return RawReadReject::OutsideDescriptorBounds;
+			}
+			address = (base & ~uint64_t {3}) + byte_offset;
+		}
+	} else {
+		const auto relative =
+		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+			return RawReadReject::AddressOverflow;
+		}
+	}
+	return RawReadReject::None;
+}
+
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes) {
 	const auto RefuseRawRead = [&](RawReadReject reason) {
 		if (m_raw_read_reject == RawReadReject::None) {
@@ -1219,8 +1279,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t com
 	if (flags.index >= m_program.memory_info.size()) {
 		return RefuseRawRead(RawReadReject::MemoryIndexOutOfRange);
 	}
-	const auto& mem    = m_program.memory_info[flags.index];
-	const bool  vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
+	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
 	                    DescriptorLoadDwords(inst.GetOpcode()) != 0u;
 	// A vector load under a literal false EXEC touches no memory and leaves zero.
 	if (const auto guard = inst.Arg(inst.NumArgs() - 1u).Resolve();
@@ -1253,55 +1312,25 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t com
 	if (!Arg(inst, offset_arg, offset)) {
 		return refuse_operand("offset", inst.Arg(offset_arg));
 	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset)) + component_bytes;
-	uint64_t   address   = 0;
+	std::array<uint64_t, 5> operands {low, high, offset, 0u, 0u};
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
 	    inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
 	    DescriptorLoadDwords(inst.GetOpcode()) != 0u) {
-		uint64_t records = 0;
-		uint64_t word3   = 0;
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
+		if (handle->NumArgs() != 4u || !Arg(*handle, 2, operands[3]) ||
+		    !Arg(*handle, 3, operands[4])) {
 			return RefuseRawRead(RawReadReject::DescriptorOperandUnavailable);
 		}
-		if (immediate < 0) {
-			return RefuseRawRead(RawReadReject::NegativeImmediate);
-		}
-		const bool vector_load = inst.GetOpcode() != ValueOpcode::ReadConstBuffer;
-		const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		// A vector load adds the thread ID to its index when V# asks, so no one value holds.
-		if (vector_load && ((static_cast<uint32_t>(word3) >> 23u) & 1u) != 0u) {
-			return RefuseRawRead(RawReadReject::AddTidIndexing);
-		}
-		if (vector_load && stride != 0u && (static_cast<uint32_t>(high) >> 31u) != 0u) {
-			const auto element = static_cast<uint64_t>(immediate);
-			if (static_cast<uint32_t>(records) == 0u || element + sizeof(uint32_t) > stride) {
-				return RefuseRawRead(RawReadReject::SwizzledElementOutOfStride);
-			}
-			const auto index_stride = uint64_t {8} << ((static_cast<uint32_t>(word3) >> 21u) & 3u);
-			const auto byte_offset  = (element & ~uint64_t {3}) * index_stride + (element & 3u) +
-			                          static_cast<uint32_t>(offset);
-			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
-		} else {
-			const auto byte_offset = (static_cast<uint64_t>(immediate) & ~uint64_t {3}) +
-			                         (static_cast<uint32_t>(offset) & ~3u);
-			const auto size = stride == 0u
-			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-			// A descriptor chain that reads past its own descriptor is not trustworthy, so the
-			// walk refuses rather than substituting hardware's zero. shader_cfg_tests asserts
-			// this: "real S_BUFFER_LOAD walk ignored descriptor bounds".
-			if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-				return RefuseRawRead(RawReadReject::OutsideDescriptorBounds);
-			}
-			address = (base & ~uint64_t {3}) + byte_offset;
-		}
-	} else {
-		const auto relative =
-		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return RefuseRawRead(RawReadReject::AddressOverflow);
-		}
+	}
+	uint64_t address = 0;
+	if (const auto reject = RawReadAddress(m_program, inst, component_bytes, operands, address);
+	    reject != RawReadReject::None) {
+		return RefuseRawRead(reject);
+	}
+	if (m_runtime.gpu_owned != nullptr && g_srt_read_slot < m_program.data_flat_slots.size() &&
+	    m_program.data_flat_slots[g_srt_read_slot] != 0u &&
+	    m_program.srt_reads[g_srt_read_slot].value.Resolve().TryInstruction() == &inst &&
+	    m_runtime.gpu_owned(m_runtime.userdata, address, sizeof(uint32_t))) {
+		return RefuseRawRead(RawReadReject::GpuOwned);
 	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
@@ -2268,6 +2297,14 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 		}
 		const SrtReadSlotScope scope(slot);
 		if (!evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+			if (failure != nullptr && evaluator.m_raw_read_reject == RawReadReject::GpuOwned) {
+				failure->gpu_owned_slots.push_back(slot);
+				flat[read.flat_offset]        = 0u;
+				evaluator.m_raw_read_reject   = RawReadReject::None;
+				evaluator.m_raw_read_operand  = nullptr;
+				evaluator.m_has_first_refusal = false;
+				return true;
+			}
 			if (failure != nullptr) {
 				failure->value_is_expressible = ValidateRuntimeValue(
 				    m_program, read.value, RuntimeValueType::Any, &failure->value);
@@ -2290,6 +2327,14 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 		}
 		return true;
 	};
+	const auto finish = [&] {
+		if (failure == nullptr || failure->gpu_owned_slots.empty()) {
+			return true;
+		}
+		failure->raw_read = RawReadReject::GpuOwned;
+		return refuse(FlatRefreshFailure::Stage::ValueUnevaluable,
+		              m_program.srt_reads[failure->gpu_owned_slots.front()].flat_offset);
+	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {
 		active.clear();
@@ -2297,7 +2342,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
 			if (!refresh(slot)) return false;
 		}
-		return true;
+		return finish();
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
 	active.assign(m_program.descriptor_sources.size(), 1u);
@@ -2332,7 +2377,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
 	}
-	return true;
+	return finish();
 }
 
 std::string_view PhiRejectName(PhiReject reason) {
@@ -2365,6 +2410,7 @@ std::string_view RawReadRejectName(RawReadReject reason) {
 			return "the read lies outside the descriptor bounds";
 		case RawReadReject::AddressOverflow: return "the address computation overflowed";
 		case RawReadReject::ReadRefused: return "the guest read refused";
+		case RawReadReject::GpuOwned: return "the GPU owns the data, which can stay a native load";
 	}
 	return "unknown reason";
 }

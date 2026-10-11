@@ -206,6 +206,25 @@ void RenderContext::PrefetchBda(uint64_t address, bool store) {
 	});
 }
 
+void RenderContext::PrefetchBdaRange(uint64_t address, uint64_t size, bool store) {
+	if (address == 0 || size == 0) {
+		return;
+	}
+	const auto begin = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+	const auto last  = address + size - 1;
+	if (last < address) {
+		return;
+	}
+	const auto end = (last | (BufferCache::CACHING_PAGESIZE - 1)) + 1;
+	if (end <= begin) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+		m_buffer_cache.PrefetchBda(start, finish - start, store, finish - start);
+	});
+}
+
 void RenderContext::RunGarbageCollector() {
 	static const bool per_frame_texture_gc = [] {
 		const char* text = std::getenv("KYTY_NO_PER_FRAME_TEXTURE_GC");

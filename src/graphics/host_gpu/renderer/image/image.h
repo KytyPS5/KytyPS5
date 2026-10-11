@@ -72,6 +72,8 @@ public:
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
+	// Copies these regions of a size-compatible colour image, leaving the rest of this one as is.
+	void CopyRegions(Image& source, std::span<const vk::ImageCopy> regions);
 	void CopyLayers(Image& source, uint32_t base_layer, uint32_t layer_count);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);

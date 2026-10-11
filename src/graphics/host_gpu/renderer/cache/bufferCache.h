@@ -89,6 +89,7 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void ReconcileSupersededImage(Common::SlotId id);
+	[[nodiscard]] bool CopyImageForBufferCopy(uint64_t source, uint64_t destination, uint64_t size);
 	// Repeats a pattern of `words` dwords over the range; size is a multiple of the pattern.
 	void FillBufferPattern(uint64_t vaddr, uint64_t size, const uint32_t* pattern, uint32_t words);
 	void WriteMemory(uint64_t vaddr, const void* data, uint64_t size);

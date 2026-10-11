@@ -499,6 +499,23 @@ void Image::CopyImage(Image& source) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
+void Image::CopyRegions(Image& source, std::span<const vk::ImageCopy> regions) {
+	EXIT_IF(source.backing.samples != backing.samples || &source == this);
+	if (regions.empty()) {
+		return;
+	}
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(regions.size()),
+	                  regions.data());
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+}
+
 void Image::CopyLayers(Image& source, uint32_t base_layer, uint32_t layer_count) {
 	EXIT_IF(source.backing.samples != backing.samples ||
 	        source.backing.image_type != vk::ImageType::e2D ||

@@ -855,6 +855,7 @@ struct ResourcePlan {
 	std::vector<uint32_t> unfoldable_pcs;
 	ShaderInfo            info;
 	UniformFillPlan       uniform_fill;
+	BufferCopy            buffer_copy;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                      evaluation_value_count = 0;

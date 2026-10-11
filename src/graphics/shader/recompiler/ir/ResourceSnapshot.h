@@ -19,6 +19,20 @@ struct DescriptorValue {
 
 enum class UniformFillKind { None, Buffer, Image };
 
+struct BufferCopy {
+	static constexpr uint32_t MaxPairs = 8;
+
+	bool                           valid        = false;
+	uint32_t                       src          = 0;
+	uint32_t                       dst          = 0;
+	uint32_t                       words        = 0;
+	uint32_t                       pairs        = 0;
+	uint32_t                       group_stride = 0;
+	std::array<uint32_t, MaxPairs> offsets {};
+
+	bool operator==(const BufferCopy&) const = default;
+};
+
 struct UniformFill {
 	UniformFillKind         kind     = UniformFillKind::None;
 	uint32_t                resource = 0;
@@ -66,6 +80,7 @@ struct ResourceSnapshot {
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	std::vector<uint32_t>                      specialization_read_slots;
 	UniformFill                                uniform_fill;
+	BufferCopy                                 buffer_copy;
 	std::vector<IndirectKeyFeedback>           key_feedback;
 	std::vector<BindlessImageTable>            bindless_tables;
 };

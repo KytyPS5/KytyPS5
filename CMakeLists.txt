@@ -717,6 +717,20 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 	set_tests_properties(gpu_tiler_detile_zero_fill
 		PROPERTIES ENVIRONMENT "KYTY_NO_DETILE_FILL_SKIP=1")
+	add_test(NAME compute_image_copy
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-image-copy-only)
+	add_test(NAME compute_image_copy_kill_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-image-copy-only)
+	set_tests_properties(compute_image_copy_kill_switch
+		PROPERTIES ENVIRONMENT "KYTY_NO_COMPUTE_IMAGE_COPY=1")
+	add_test(NAME compute_image_copy_aliased_kill_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-image-copy-only)
+	set_tests_properties(compute_image_copy_aliased_kill_switch
+		PROPERTIES ENVIRONMENT "KYTY_NO_ALIASED_IMAGE_COPY=1")
+	add_test(NAME compute_image_copy_create_kill_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-image-copy-only)
+	set_tests_properties(compute_image_copy_create_kill_switch
+		PROPERTIES ENVIRONMENT "KYTY_NO_COPY_DESTINATION_CREATE=1")
 	add_test(NAME dispatch_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
 	add_test(NAME dispatch_overlap_kill_switch

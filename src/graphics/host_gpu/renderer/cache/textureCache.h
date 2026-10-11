@@ -169,9 +169,6 @@ private:
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
-	// The stencil association images of each depth image (see AssociateStencil()); entries may be
-	// stale, users check the association's depth_id.
-	std::unordered_map<ImageId, std::vector<ImageId>> m_stencil_associations;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
@@ -180,6 +177,9 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// The stencil association images of each depth image (see AssociateStencil()); entries may be
+	// stale, users check the association's depth_id.
+	std::unordered_map<ImageId, std::vector<ImageId>> m_stencil_associations;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

@@ -56,7 +56,7 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
-	::printf("  --controller-haptics-rumble <t|f>   Rumble non-Sony pads from haptics. Default: true.\n");
+	::printf("  --controller-haptics-rumble <true|false> Rumble non-Sony pads from haptics. Default: true.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(

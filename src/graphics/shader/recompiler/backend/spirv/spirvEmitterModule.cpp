@@ -184,6 +184,18 @@ uint32_t PushConstantArrayType(EmitterState& state) {
 }
 
 uint32_t PushConstantBlockType(EmitterState& state) {
+	if (state.pv_store != nullptr) {
+		const auto fused = state.builder.DecoratedType(
+		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}},
+		    TypeU32(state), ConstantU32(state, kPvVsStorePushDwords));
+		return state.builder.DecoratedType(
+		    spv::OpTypeStruct,
+		    {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+		     {spv::OpMemberDecorate,
+		      {1, spv::DecorationOffset, IR::PushData::DwordCount * sizeof(uint32_t)}},
+		     {spv::OpDecorate, {spv::DecorationBlock}}},
+		    PushConstantArrayType(state), fused);
+	}
 	return state.builder.DecoratedType(spv::OpTypeStruct,
 	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
 	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
@@ -244,7 +256,7 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    state.object_primitive_id_variable != 0) {
+	    state.object_primitive_id_variable != 0 || state.pv_store != nullptr) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -484,6 +496,14 @@ void DefineInputs(EmitterState& state) {
 			state.inputs.push_back({{kind, 0, components, name}});
 		}
 	};
+	if (state.pv_store != nullptr) {
+		if (state.pv_store->role == PvStoreInfo::Role::Vertex) {
+			add_builtin(IR::StageInputKind::VertexIndex, 1, "gl_VertexIndex");
+			add_builtin(IR::StageInputKind::InstanceIndex, 1, "gl_InstanceIndex");
+		} else {
+			add_builtin(IR::StageInputKind::PrimitiveId, 1, "gl_PrimitiveID");
+		}
+	}
 	if (state.program.info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
@@ -509,6 +529,12 @@ void DefineInputs(EmitterState& state) {
 				input.variable_id = alias->variable_id;
 				continue;
 			}
+		}
+		// VS-store: the PerVertex values come from the cap buffer, not from a PerVertexKHR
+		// variable.
+		if (state.pv_store != nullptr && state.pv_store->role == PvStoreInfo::Role::Pixel &&
+		    input.kind == IR::StageInputKind::Parameter && input.per_vertex) {
+			continue;
 		}
 		uint32_t type = TypeU32(state);
 		switch (input.kind) {
@@ -707,6 +733,7 @@ void DefineModule(EmitterState& state) {
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
+	if (state.pv_store != nullptr) DefinePvStore(state);
 	if (state.program.info.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}

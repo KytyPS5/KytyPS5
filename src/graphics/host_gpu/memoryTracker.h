@@ -29,6 +29,10 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Single GPU-thread consumer. Hints do not replace the locked page ownership checks.
+	void TakeCpuDirtyRegions(std::vector<GuestRange>& regions);
+	// A new/expanded native buffer also needs its untouched CPU-owned pages examined.
+	void QueueCpuDirtyRange(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -45,6 +49,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				QueueCpuDirtyRegion(manager->GetCpuAddr() / TRACKER_REGION_SIZE);
 				return false;
 			}();
 			if (should_flush) {
@@ -104,7 +109,9 @@ public:
 	}
 
 private:
-	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t REGION_COUNT      = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t DIRTY_WORD_COUNT  = (REGION_COUNT + 63) / 64;
+	static constexpr size_t DIRTY_GROUP_COUNT = (DIRTY_WORD_COUNT + 63) / 64;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {
@@ -145,8 +152,12 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
+	void           QueueCpuDirtyRegion(uint64_t index) noexcept;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_dirty_words;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_dirty_groups;
+	std::atomic<bool>                              m_cpu_dirty_pending {false};
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

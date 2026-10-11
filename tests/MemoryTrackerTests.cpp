@@ -458,6 +458,46 @@ void TestCleanUploadPreservesOwnership() {
   Release(memory);
 }
 
+void TestCpuDirtyWorklist() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto& tracker = harness.tracker;
+  auto* memory = AllocateFixedGuestRange(region_size * 2, region_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, region_size * 2, false,
+                            [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  std::vector<GuestRange> regions;
+  tracker.TakeCpuDirtyRegions(regions);
+  Check(regions.size() == 2, "new tracker regions did not publish dirty hints");
+  tracker.TakeCpuDirtyRegions(regions);
+  Check(regions.empty(), "clean worklist repeated consumed hints");
+  tracker.QueueCpuDirtyRange(address + page_size, page_size);
+  tracker.TakeCpuDirtyRegions(regions);
+  Check(regions.size() == 1 && regions[0].address == address &&
+            !tracker.IsRegionCpuModified(address, page_size),
+        "native-buffer registration hint changed ownership or was lost");
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.MarkRegionAsCpuModified(address + page_size, page_size);
+  tracker.TakeCpuDirtyRegions(regions);
+  Check(regions.size() == 1 && regions[0].address == address &&
+            tracker.IsRegionCpuModified(address, page_size),
+        "dirty hints were duplicated or consumption cleared page ownership");
+  // A write after the consumer takes a snapshot must survive for the next pass.
+  tracker.MarkRegionAsCpuModified(address + region_size, page_size);
+  tracker.TakeCpuDirtyRegions(regions);
+  Check(regions.size() == 1 && regions[0].address == address + region_size,
+        "post-snapshot CPU write lost its dirty hint");
+  tracker.InvalidateRegion(address, page_size, []() noexcept {});
+  tracker.TakeCpuDirtyRegions(regions);
+  Check(regions.size() == 1 && regions[0].address == address,
+        "memory invalidation did not publish a dirty hint");
+  tracker.UntrackMemory(address, region_size * 2);
+  tracker.TakeCpuDirtyRegions(regions);
+  Check(regions.size() == 2, "untracking did not republish dirty regions");
+  Release(memory);
+}
+
 void BenchmarkCleanUploads() {
   constexpr uint64_t size = 256ull * 1024 * 1024;
   TrackerHarness harness;
@@ -497,6 +537,22 @@ void BenchmarkCleanUploads() {
                 static_cast<double>(elapsed.count()) / sweeps,
                 static_cast<double>(elapsed.count()) / completions);
   }
+  std::vector<GuestRange> dirty_regions;
+  tracker.TakeCpuDirtyRegions(dirty_regions);
+  uint64_t passes = 0;
+  const auto worklist_start = std::chrono::steady_clock::now();
+  std::chrono::nanoseconds worklist_elapsed{};
+  do {
+    for (uint32_t i = 0; i < 10000; ++i) {
+      tracker.TakeCpuDirtyRegions(dirty_regions);
+      Check(dirty_regions.empty(), "clean dirty-region worklist returned work");
+    }
+    passes += 10000;
+    worklist_elapsed = std::chrono::steady_clock::now() - worklist_start;
+  } while (worklist_elapsed < std::chrono::milliseconds(250));
+  std::printf("clean_dirty_worklist: %.2f ns/pass (%llu passes)\n",
+              static_cast<double>(worklist_elapsed.count()) / passes,
+              static_cast<unsigned long long>(passes));
   tracker.UntrackMemory(address, size);
   Release(memory);
 }
@@ -1203,6 +1259,7 @@ int main(int argc, char **argv) {
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
+  TestCpuDirtyWorklist();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();

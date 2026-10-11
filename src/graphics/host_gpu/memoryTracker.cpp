@@ -3,15 +3,55 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 
+#include <bit>
+
 namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
-	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_regions          = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_cpu_dirty_words  = std::make_unique<std::atomic<uint64_t>[]>(DIRTY_WORD_COUNT);
+	m_cpu_dirty_groups = std::make_unique<std::atomic<uint64_t>[]>(DIRTY_GROUP_COUNT);
 }
 
 MemoryTracker::~MemoryTracker() = default;
+
+void MemoryTracker::QueueCpuDirtyRegion(uint64_t index) noexcept {
+	const auto word = index / 64;
+	m_cpu_dirty_words[word].fetch_or(uint64_t {1} << (index % 64), std::memory_order_release);
+	m_cpu_dirty_groups[word / 64].fetch_or(uint64_t {1} << (word % 64), std::memory_order_release);
+	m_cpu_dirty_pending.store(true, std::memory_order_release);
+}
+
+void MemoryTracker::QueueCpuDirtyRange(uint64_t vaddr, uint64_t size) {
+	ValidateRange(vaddr, size);
+	const auto end = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+	for (auto index = vaddr / TRACKER_REGION_SIZE; index <= end; ++index) {
+		QueueCpuDirtyRegion(index);
+	}
+}
+
+void MemoryTracker::TakeCpuDirtyRegions(std::vector<GuestRange>& regions) {
+	CheckNotInUploadCallback();
+	regions.clear();
+	if (!m_cpu_dirty_pending.exchange(false, std::memory_order_acquire)) return;
+	// Consume before processing: concurrent writes publish a new hint for the next pass.
+	// A producer interrupted between levels can cause an extra pass, never a lost write.
+	for (size_t group = 0; group < DIRTY_GROUP_COUNT; ++group) {
+		auto words = m_cpu_dirty_groups[group].exchange(0, std::memory_order_acquire);
+		while (words != 0) {
+			const auto word = group * 64 + std::countr_zero(words);
+			words &= words - 1;
+			auto bits = m_cpu_dirty_words[word].exchange(0, std::memory_order_acquire);
+			while (bits != 0) {
+				const auto index = word * 64 + std::countr_zero(bits);
+				bits &= bits - 1;
+				regions.push_back({index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE});
+			}
+		}
+	}
+}
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -63,6 +103,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	QueueCpuDirtyRegion(index);
 	return ptr;
 }
 
@@ -84,9 +125,10 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		QueueCpuDirtyRegion(manager->GetCpuAddr() / TRACKER_REGION_SIZE);
 	});
 }
 
@@ -125,8 +167,9 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	    })) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
-	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<false>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		QueueCpuDirtyRegion(manager->GetCpuAddr() / TRACKER_REGION_SIZE);
 	});
 }
 

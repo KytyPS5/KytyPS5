@@ -17,6 +17,9 @@ using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uin
 // Bytes readable from address, capped at size.
 using SrtExtentQuery = uint64_t (*)(void* userdata, uint64_t address, uint64_t size);
 using SrtBlockReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
+// XXH3-64 of a contiguous block, false wherever the strict reader's first read would refuse.
+using SrtBlockHasher    = bool (*)(void* userdata, uint64_t address, uint64_t size, uint64_t* hash);
+using SrtOwnershipQuery = bool (*)(void* userdata, uint64_t address, uint64_t size);
 
 // Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
 // root selects by GPU-computed byte offset. The host keeps them resident instead of
@@ -54,9 +57,16 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	SrtOwnershipQuery         gpu_owned             = nullptr;
+	// Reads a branch condition's memory without draining the GPU; a refusal visits both arms.
+	SrtMemoryReader read_condition_memory     = nullptr;
 	SrtExtentQuery  readable_extent           = nullptr;
 	SrtBlockReader  read_specialization_block = nullptr;
 	SrtBlockHasher  hash_specialization_block = nullptr;
+	// Told when a materialization throws its walk away and walks again without pruning.
+	void (*walk_restarted)(void* userdata) = nullptr;
+	// Told when a raw read lies outside its descriptor and reads as zero (CurrentRawReadEvent).
+	void (*zero_read)(void* userdata) = nullptr;
+	ImageHeapSource* image_heap       = nullptr;
 };
 
 class SrtReadCapture {
@@ -111,6 +121,28 @@ enum class SrtRefusal : uint8_t {
 // The flat SRT slot whose walk is reading now; UINT32_MAX outside one.
 uint32_t CurrentSrtReadSlot();
 
+struct RawReadEvent {
+	const Inst*             inst            = nullptr;
+	uint32_t                component_bytes = 0;
+	std::array<uint64_t, 5> operands {}; // base low, base high, offset, num_records, word3
+	// Out of the descriptor's bounds, so the read produced 0 rather than memory.
+	bool zero = false;
+};
+[[nodiscard]] const RawReadEvent* CurrentRawReadEvent();
+
+// The raw-read address rule, shared with replays of a recorded walk.
+struct RawReadShape {
+	enum class Kind : uint8_t { Address, ConstBuffer, VectorBuffer, VectorDescriptor };
+	Kind    kind      = Kind::Address;
+	int64_t immediate = 0;
+};
+[[nodiscard]] size_t RawReadOffsetArgument(ValueOpcode op);
+[[nodiscard]] bool   RawReadShapeOf(const ResourcePlan& program, const Inst& inst,
+                                    uint32_t component_bytes, RawReadShape& shape);
+// None with `zero` set: the read lies outside its descriptor and reads as zero.
+[[nodiscard]] SrtRefusal RawReadAddressFrom(const RawReadShape&            shape,
+                                            const std::array<uint64_t, 5>& operands,
+                                            uint64_t& address, bool& zero);
 
 // The lane a per-lane sweep is on; `dependent` is set once a walk asks for it.
 struct LaneScope {
@@ -220,8 +252,22 @@ public:
 	// A GPU-owned data slot reads 0, is listed in `gpu_owned_slots`, and the refresh refuses.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune = true,
 	                       SrtWalker*             conditions      = nullptr,
+	                       std::vector<uint32_t>* gpu_owned_slots = nullptr);
+	// Why the last refused Evaluate, EvaluateDescriptor or RefreshFlatBuffer refused.
+	[[nodiscard]] SrtRefusal Refusal() const { return m_refusal; }
 
 private:
+	// Shared by a walker and every walker it starts.
+	struct WalkState {
+		SrtRefusal last     = SrtRefusal::None;
+		uint64_t   refusals = 0;
+		// GPU-owned reads: never remembered, and nothing that saw one is.
+		uint64_t volatile_refusals = 0;
+		// Visit order of in-progress values, and the earliest one a cycle reached.
+		uint64_t visits     = 0;
+		uint64_t cycle_root = UINT64_MAX;
+	};
+	struct Visit {
 		uint64_t   order;
 		uint64_t   volatile_refusals;
 		uint64_t   outer_cycle_root;

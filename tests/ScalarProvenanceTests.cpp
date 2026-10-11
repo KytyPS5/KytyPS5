@@ -837,6 +837,577 @@ void TestUndefinedRuntimeValueFails() {
         "undefined typed descriptor source was accepted");
 }
 
+// SRT walker port (U1). Deep enough to overflow a natively recursive walk or validator.
+void TestDeepUniformValueChain() {
+  constexpr uint32_t kDepth = 50000;
+  Fixture fixture;
+  const auto step = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(3))});
+  auto chain = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+  for (uint32_t i = 0; i < kDepth; ++i) {
+    chain = fixture.Emit(ValueOpcode::IAdd32, {chain, step});
+  }
+  Check(ValidateRuntimeValue(fixture.program, chain, RuntimeValueType::Integer),
+        "a deep uniform chain was not accepted as a runtime value");
+  const std::array<uint32_t, 2> user_data{0x1000u, 3u};
+  uint32_t value = 0;
+  Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(chain, value) &&
+            value == 0x1000u + kDepth * 3u,
+        "a deep uniform chain did not evaluate");
+  fixture.program.descriptor_sources.push_back({.dwords = {chain}, .dword_count = 1});
+  DescriptorValue descriptor;
+  Check(SrtWalker(fixture.program, {.user_data = user_data}).EvaluateDescriptor(0, descriptor) &&
+            descriptor.dwords[0] == 0x1000u + kDepth * 3u,
+        "a deep uniform descriptor dword did not evaluate");
+}
+
+Value UserData(Fixture &fixture, uint32_t index) {
+  return fixture.Emit(ValueOpcode::GetUserData,
+                      {Value(static_cast<ScalarReg>(fixture.program.user_data_base + index))});
+}
+
+uint32_t PushDescriptor(Fixture &fixture, std::array<Value, 4> words) {
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {words[0], words[1], words[2], words[3]}, .dword_count = 4});
+  return static_cast<uint32_t>(fixture.program.descriptor_sources.size() - 1u);
+}
+
+// The materializer's pairing: a walker whose selects and clean reads go through a clean one.
+bool EvaluateWithClean(const ResourcePlan &plan, uint32_t source, const SrtRuntime &runtime,
+                       DescriptorValue &descriptor, SrtRefusal *refusal = nullptr) {
+  SrtWalker clean(plan, CleanRuntime(runtime));
+  SrtWalker walker(plan, runtime, &clean);
+  const bool evaluated = walker.EvaluateDescriptor(source, descriptor);
+  if (refusal != nullptr) *refusal = walker.Refusal();
+  return evaluated;
+}
+
+// Translator::ThreadBit: bit N of a 64-bit scalar mask, for lane N.
+Value ThreadBit(Fixture &fixture, Value low, Value high) {
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto word = fixture.Emit(
+      ValueOpcode::SelectU32,
+      {fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)}), low, high});
+  const auto shifted = fixture.Emit(
+      ValueOpcode::ShiftRightLogical32,
+      {word, fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(31u)})});
+  return fixture.Emit(
+      ValueOpcode::INotEqual32,
+      {fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}), Value(0u)});
+}
+
+// A loop phi stands for one descriptor only when every iteration reproduces the entry value.
+void TestAdvancingLoopPhi() {
+  for (const uint32_t step : {4u, 0u}) {
+    Fixture fixture(2);
+    auto &phi = fixture.BlockAt(1).AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    const auto entry = UserData(fixture, 0);
+    const auto carried =
+        fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(step)}, 0, 1);
+    phi.AddPhiOperand(&fixture.BlockAt(0), entry);
+    phi.AddPhiOperand(&fixture.BlockAt(1), carried);
+    PushDescriptor(fixture, {Value(&phi), Value(0u), Value(16u), Value(0u)});
+    const std::array<uint32_t, 1> user_data{0x12345678u};
+    SrtWalker walker(fixture.program, {.user_data = user_data});
+    DescriptorValue descriptor;
+    const bool evaluated = walker.EvaluateDescriptor(0, descriptor);
+    if (step != 0u) {
+      Check(!evaluated && walker.Refusal() == SrtRefusal::VaryingPhi,
+            "an advancing descriptor phi was evaluated to its entry value");
+    } else {
+      Check(evaluated && descriptor.dwords[0] == user_data[0],
+            "a loop phi every iteration leaves unchanged was refused");
+    }
+  }
+
+  // Nothing enters the web, or two different values do: no host binding stands for either.
+  for (const bool merge : {false, true}) {
+    Fixture fixture(3);
+    auto &phi = fixture.BlockAt(2).AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    const auto carried =
+        fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(4u)}, 0, 2);
+    if (merge) {
+      phi.AddPhiOperand(&fixture.BlockAt(0), UserData(fixture, 0));
+      phi.AddPhiOperand(&fixture.BlockAt(1),
+                        fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                     {UserData(fixture, 1), Value(0xffu)}, 0, 1));
+    } else {
+      phi.AddPhiOperand(&fixture.BlockAt(0),
+                        fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(8u)}));
+    }
+    phi.AddPhiOperand(&fixture.BlockAt(2), carried);
+    PushDescriptor(fixture, {Value(&phi), Value(0u), Value(16u), Value(0u)});
+    Check(!ValidateRuntimeValue(fixture.program, Value(&phi)),
+          "a loop phi without one entry value was accepted");
+    const std::array<uint32_t, 2> user_data{1u, 2u};
+    SrtWalker walker(fixture.program, {.user_data = user_data});
+    DescriptorValue descriptor;
+    Check(!walker.EvaluateDescriptor(0, descriptor) &&
+              walker.Refusal() == (merge ? SrtRefusal::PhiMerge : SrtRefusal::PhiNoEntry),
+          "a loop phi without one entry value was not named as such");
+  }
+}
+
+// A cached cyclic-phi answer equals the walk's, on the first lookup and on every hit.
+void TestCyclicPhiEntryCacheAnswersLikeTheWalk() {
+  Fixture fixture;
+  auto &block = fixture.BlockAt();
+  auto &entry = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+  auto &loop = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto &step = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&loop), Value(1u)});
+  loop.AddPhiOperand(&block, Value(&entry));
+  loop.AddPhiOperand(&block, Value(&step));
+  auto &merge = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  merge.AddPhiOperand(&block, Value(1u));
+  merge.AddPhiOperand(&block, Value(2u));
+  auto &closed = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto &closed_step = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&closed), Value(1u)});
+  closed.AddPhiOperand(&block, Value(&closed_step));
+
+  const auto &program = fixture.program;
+  CyclicPhiEntryCache cache{.program = &program};
+  for (const auto *phi : {&loop, &merge, &closed}) {
+    const Value root(const_cast<Inst *>(phi));
+    std::vector<const Inst *> plain_web{&step};
+    CyclicPhiFailure plain_reject;
+    const auto plain = ResolveCyclicPhiEntry(program, root, &plain_web, &plain_reject);
+    for (int pass = 0; pass < 2; pass++) {
+      std::vector<const Inst *> web{&step};
+      CyclicPhiFailure reject;
+      const auto cached = ResolveCyclicPhiEntry(program, root, &web, &reject, &cache);
+      Check(cached == plain && web == plain_web && reject.reason == plain_reject.reason &&
+                reject.entry == plain_reject.entry && reject.other == plain_reject.other,
+            "a cached loop entry differed from the walk it stands for");
+    }
+  }
+  Check(ResolveCyclicPhiEntry(program, Value(&loop)) == Value(&entry),
+        "the loop entry was not the value the loop is entered with");
+  Check(cache.answers.size() == 3u, "the cache did not hold one answer per phi asked about");
+}
+
+// A frozen plan's cached phi resolution must accept, refuse and carry as the walk does.
+void TestFrozenPhiPlansWalkLikeTheProgram() {
+  for (const uint32_t stride : {0u, 1u}) {
+    Fixture fixture;
+    auto &block = fixture.BlockAt();
+    const auto entry = UserData(fixture, 0);
+    auto &loop = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &step = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&loop), Value(stride)});
+    loop.AddPhiOperand(&block, entry);
+    loop.AddPhiOperand(&block, Value(&step));
+    PushDescriptor(fixture, {Value(&loop), Value(0u), Value(4u), Value(0u)});
+    auto plan = ExtractResourcePlan(fixture.program);
+    plan.frozen_values = true;
+    for (const uint32_t value : {0x10u, 0x20u, 0x10u}) {
+      const std::array<uint32_t, 1> user_data{value};
+      DescriptorValue frozen;
+      DescriptorValue walked;
+      const bool frozen_ok = SrtWalker(plan, {.user_data = user_data}).EvaluateDescriptor(0, frozen);
+      const bool walked_ok =
+          SrtWalker(fixture.program, {.user_data = user_data}).EvaluateDescriptor(0, walked);
+      Check(frozen_ok == walked_ok && frozen_ok == (stride == 0u),
+            "a frozen phi plan accepted or refused a loop the walk did not");
+      Check(!frozen_ok || (frozen.dwords == walked.dwords && frozen.dwords[0] == value),
+            "a frozen phi plan carried another value than the loop does");
+    }
+    Check(plan.phi_plans.size() == 1u, "a phi was resolved more than once on a frozen plan");
+  }
+}
+
+// Each layer of `c = c | c` over a refused loop phi doubled the walk while refusals were retried.
+void TestBallotDescriptorDword() {
+  const auto build = [](Fixture &fixture, bool lane_predicate, uint32_t wave_size) {
+    fixture.program.wave_size = wave_size;
+    const auto predicate =
+        lane_predicate
+            ? fixture.Emit(ValueOpcode::ULessThan32, {fixture.Emit(ValueOpcode::LaneId), Value(3u)})
+            : fixture.Emit(ValueOpcode::ULessThan32, {UserData(fixture, 0), Value(0x100u)});
+    const auto ballot = fixture.Emit(ValueOpcode::Ballot, {predicate});
+    const auto low = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+    const auto high = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+    const auto spare = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(3u)});
+    const auto base = UserData(fixture, 0);
+    const auto records = fixture.Emit(ValueOpcode::IAdd32, {UserData(fixture, 1), spare});
+    const auto source = PushDescriptor(fixture, {base, records, low, high});
+    for (uint32_t dword = 0; dword < 4; dword++) {
+      Check(ValidateRuntimeValue(fixture.program,
+                                 fixture.program.descriptor_sources[source].dwords[dword]),
+            "a ballot descriptor dword was rejected");
+    }
+    return source;
+  };
+  const auto evaluate = [](const Fixture &fixture, uint32_t source, uint32_t word0,
+                           DescriptorValue &descriptor) {
+    const std::array<uint32_t, 2> user_data{word0, 64u};
+    return EvaluateWithClean(fixture.program, source, {.user_data = user_data}, descriptor);
+  };
+  DescriptorValue descriptor;
+  {
+    Fixture uniform;
+    const auto source = build(uniform, false, 64u);
+    Check(evaluate(uniform, source, 0x20u, descriptor) && descriptor.dwords[0] == 0x20u &&
+              descriptor.dwords[1] == 64u && descriptor.dwords[2] == 0xffffffffu &&
+              descriptor.dwords[3] == 0xffffffffu,
+          "a ballot true on every lane did not fill both mask words");
+    Check(evaluate(uniform, source, 0x200u, descriptor) && descriptor.dwords[0] == 0x200u &&
+              descriptor.dwords[2] == 0u && descriptor.dwords[3] == 0u,
+          "a ballot false on every lane did not clear both mask words");
+  }
+  {
+    Fixture narrow;
+    const auto source = build(narrow, false, 32u);
+    Check(evaluate(narrow, source, 0x20u, descriptor) && descriptor.dwords[0] == 0x20u &&
+              descriptor.dwords[2] == 0xffffffffu && descriptor.dwords[3] == 0u,
+          "a wave32 ballot set lanes the wave does not have");
+  }
+  {
+    Fixture lanes;
+    const auto source = build(lanes, true, 64u);
+    Check(evaluate(lanes, source, 0x1234u, descriptor) && descriptor.dwords[0] == 0x1234u &&
+              descriptor.dwords[1] == 64u && descriptor.dwords[2] == 0x7u &&
+              descriptor.dwords[3] == 0u,
+          "a lane-indexed ballot did not re-execute its predicate per lane");
+  }
+}
+
+// Only a ballot re-executes its predicate per lane; a readfirstlane lane index is the tracker's.
+void TestLaneIndexOutsideBallot() {
+  for (const bool lift : {true, false}) {
+    Fixture fixture;
+    const auto selected = fixture.Emit(
+        ValueOpcode::SelectU32,
+        {ThreadBit(fixture, Value(0xffffffffu), Value(0xffffffffu)), Value(0x400u), Value(0x800u)});
+    const auto records =
+        lift ? fixture.Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)}) : selected;
+    const auto source = PushDescriptor(fixture, {UserData(fixture, 0), UserData(fixture, 1),
+                                                 records, UserData(fixture, 3)});
+    Check(!ValidateRuntimeValue(fixture.program, records),
+          "a lane index outside a ballot was accepted as a host value");
+    const std::array<uint32_t, 4> user_data{0x2000u, 0u, 0u, 0u};
+    DescriptorValue descriptor;
+    SrtRefusal refusal = SrtRefusal::None;
+    Check(!EvaluateWithClean(fixture.program, source, {.user_data = user_data}, descriptor,
+                             &refusal) &&
+              refusal == SrtRefusal::VaryingLane,
+          "a lane index outside a ballot evaluated on the host");
+  }
+}
+
+void TestBallotLaneSweepForgetsLaneValues() {
+  Fixture fixture;
+  fixture.program.wave_size = 64u;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
+  const auto loaded =
+      RawRead(fixture, Address(fixture, UserData(fixture, 0), UserData(fixture, 1)), Value(0u),
+              memory);
+  const auto shared = fixture.Emit(ValueOpcode::IAdd32, {loaded, UserData(fixture, 2)});
+  const auto lane_sum =
+      fixture.Emit(ValueOpcode::IAdd32, {fixture.Emit(ValueOpcode::LaneId), shared});
+  const auto odd = fixture.Emit(ValueOpcode::BitwiseAnd32, {lane_sum, Value(1u)});
+  const auto half = fixture.Emit(ValueOpcode::ShiftRightLogical32, {lane_sum, Value(1u)});
+  const auto mixed = fixture.Emit(
+      ValueOpcode::IAdd32, {half, fixture.Emit(ValueOpcode::IMul32, {odd, Value(100u)})});
+  const auto selected = fixture.Emit(
+      ValueOpcode::SelectU32,
+      {fixture.Emit(ValueOpcode::IEqual32, {UserData(fixture, 5), Value(0u)}), mixed, shared});
+  const auto predicate = fixture.Emit(
+      ValueOpcode::LogicalNot,
+      {fixture.Emit(ValueOpcode::UGreaterThanEqual32, {selected, UserData(fixture, 3)})});
+  const auto ballot = fixture.Emit(ValueOpcode::Ballot, {predicate});
+  const auto low = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+  const auto high = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+  const auto source = PushDescriptor(fixture, {UserData(fixture, 4), Value(64u), low, high});
+
+  const auto expected = [](uint32_t word, uint32_t addend, uint32_t limit) {
+    uint64_t mask = 0;
+    for (uint32_t lane = 0; lane < 64u; lane++) {
+      const uint32_t sum = lane + word + addend;
+      const uint32_t chosen = (sum >> 1u) + (sum & 1u) * 100u;
+      if (chosen < limit) mask |= uint64_t{1} << lane;
+    }
+    return mask;
+  };
+  const auto check = [&](uint32_t word, uint32_t addend, uint32_t limit) {
+    TestMemory memory_image{{{0x1000u, word}}};
+    const std::array<uint32_t, 6> user_data{0x1000u, 0u, addend, limit, 0x5000u, 0u};
+    const SrtRuntime runtime{.user_data = user_data,
+                             .read_memory = ReadMemory,
+                             .userdata = &memory_image,
+                             .read_specialization_memory = ReadMemory};
+    DescriptorValue descriptor;
+    const auto mask = expected(word, addend, limit);
+    Check(EvaluateWithClean(fixture.program, source, runtime, descriptor) &&
+              descriptor.dwords[0] == 0x5000u &&
+              descriptor.dwords[2] == static_cast<uint32_t>(mask) &&
+              descriptor.dwords[3] == static_cast<uint32_t>(mask >> 32u),
+          "a ballot sweep reused a lane-dependent value in a later lane");
+    return memory_image.reads;
+  };
+  Check(expected(6u, 4u, 20u) != ~uint64_t{0} && expected(6u, 4u, 20u) != 0u,
+        "lane sweep fixture does not separate the lanes");
+  Check(check(6u, 4u, 20u) < 64u, "a ballot sweep re-read a lane-free value on every lane");
+  check(7u, 0u, 9u);
+  check(0u, 0u, 64u);
+}
+
+void TestClosedBallotCache() {
+  const auto build = [](Fixture &fixture, bool reads_user_data) {
+    fixture.program.wave_size = 64u;
+    const auto lane = fixture.Emit(ValueOpcode::LaneId);
+    const auto exec = fixture.Emit(ValueOpcode::Ballot, {Value(true)});
+    const auto active = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::BitCount32,
+                      {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {exec, Value(0u)})}),
+         fixture.Emit(ValueOpcode::BitCount32,
+                      {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {exec, Value(1u)})})});
+    const auto limit =
+        reads_user_data ? fixture.Emit(ValueOpcode::UMin32, {UserData(fixture, 1), active})
+                        : fixture.Emit(ValueOpcode::ShiftRightLogical32, {active, Value(2u)});
+    const auto rank = fixture.Emit(
+        ValueOpcode::SelectU32, {fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)}), lane,
+                                 fixture.Emit(ValueOpcode::ISub32, {lane, Value(1u)})});
+    const auto ballot =
+        fixture.Emit(ValueOpcode::Ballot, {fixture.Emit(ValueOpcode::ULessThan32, {rank, limit})});
+    const auto low = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+    const auto high = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+    PushDescriptor(fixture, {UserData(fixture, 0), Value(64u), low, high});
+  };
+  const auto expected = [](uint32_t limit) {
+    uint64_t mask = 0;
+    for (uint32_t lane = 0; lane < 64u; lane++) {
+      if ((lane < 32u ? lane : lane - 1u) < limit) mask |= uint64_t{1} << lane;
+    }
+    return mask;
+  };
+  const auto walk = [](const ResourcePlan &plan, uint32_t limit, bool with_clean,
+                       DescriptorValue &descriptor) {
+    const std::array<uint32_t, 2> user_data{0x3000u, limit};
+    const SrtRuntime runtime{.user_data = user_data};
+    if (with_clean) return EvaluateWithClean(plan, 0, runtime, descriptor);
+    return SrtWalker(plan, runtime).EvaluateDescriptor(0, descriptor);
+  };
+  const auto matches = [](const DescriptorValue &descriptor, uint64_t mask) {
+    return descriptor.dwords[0] == 0x3000u &&
+           descriptor.dwords[2] == static_cast<uint32_t>(mask) &&
+           descriptor.dwords[3] == static_cast<uint32_t>(mask >> 32u);
+  };
+  const auto known = [](const ResourcePlan &plan) {
+    return std::ranges::count_if(plan.closed_ballots, [](const auto &entry) {
+      return entry.state == ResourcePlan::ClosedBallot::Known;
+    });
+  };
+  DescriptorValue descriptor;
+
+  Fixture closed;
+  build(closed, false);
+  auto plan = ExtractResourcePlan(closed.program);
+  plan.frozen_values = true;
+  for (int pass = 0; pass < 3; pass++) {
+    Check(walk(plan, 0u, pass == 1, descriptor) && matches(descriptor, expected(16u)),
+          "a closed ballot did not keep its per-lane mask");
+  }
+  Check(known(plan) == 2, "a closed ballot and the exec ballot inside it were not both kept");
+  Check(walk(closed.program, 0u, false, descriptor) && matches(descriptor, expected(16u)) &&
+            known(closed.program) == 0,
+        "a Program kept a closed ballot");
+
+  Fixture open;
+  build(open, true);
+  auto open_plan = ExtractResourcePlan(open.program);
+  open_plan.frozen_values = true;
+  for (const uint32_t limit : {5u, 40u, 0u, 64u, 5u}) {
+    Check(walk(open_plan, limit, false, descriptor) && matches(descriptor, expected(limit)),
+          "a ballot over user data was served a mask from another draw");
+  }
+  Check(known(open_plan) == 1, "only the exec ballot of a user-data predicate is closed");
+}
+
+// A DWORDX4 vector load of a V# stored in a buffer, split into its four descriptor dwords.
+void TestUniformDwordX4DescriptorLoad() {
+  struct Built {
+    uint32_t source;
+    Value word0;
+  };
+  const auto build = [](Fixture &fixture, uint32_t table_bytes, bool indexed) {
+    const auto table = fixture.Emit(ValueOpcode::GetBufferResource,
+                                    {UserData(fixture, 0), UserData(fixture, 1),
+                                     Value(table_bytes), Value(4u << 12u)});
+    MemoryInfo wide;
+    wide.kind = ResourceKind::Buffer;
+    wide.offset = 8;
+    wide.data_dwords = 4;
+    wide.component_count = 4;
+    wide.idxen = indexed;
+    fixture.program.memory_info.push_back(wide);
+    const auto loaded = fixture.EmitMemory(
+        ValueOpcode::LoadBufferU32x4,
+        {table, indexed ? UserData(fixture, 3) : Value(0u), Value(0u), UserData(fixture, 2),
+         Value(true)},
+        static_cast<uint32_t>(fixture.program.memory_info.size() - 1u));
+    std::array<Value, 4> words;
+    for (uint32_t index = 0; index < words.size(); index++) {
+      words[index] = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {loaded, Value(index)});
+    }
+    return Built{PushDescriptor(fixture, words), words[0]};
+  };
+  const std::array<uint32_t, 4> user_data{0x1000u, 0u, 4u, 0u};
+  TestMemory memory_image{{{0x100cu, 0xa0a0a0a0u},
+                           {0x1010u, 0xa1a1a1a1u},
+                           {0x1014u, 0xa2a2a2a2u},
+                           {0x1018u, 0xa3a3a3a3u}}};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = ReadMemory,
+                           .userdata = &memory_image,
+                           .read_specialization_memory = ReadMemory,
+                           .zero_read = [](void *userdata) {
+                             // Counts zero reads in word 0, which no read address uses.
+                             static_cast<TestMemory *>(userdata)->words[0] += 1u;
+                           }};
+  DescriptorValue descriptor;
+  {
+    Fixture fixture;
+    const auto built = build(fixture, 64u, false);
+    Check(ValidateRuntimeValue(fixture.program, built.word0, RuntimeValueType::Integer),
+          "a uniform DWORDX4 descriptor load was rejected");
+    Check(EvaluateWithClean(fixture.program, built.source, runtime, descriptor) &&
+              descriptor.dwords[0] == 0xa0a0a0a0u && descriptor.dwords[1] == 0xa1a1a1a1u &&
+              descriptor.dwords[2] == 0xa2a2a2a2u && descriptor.dwords[3] == 0xa3a3a3a3u,
+          "DWORDX4 descriptor components were not read at base + soffset + imm + 4k");
+  }
+  {
+    // Sixteen bytes hold only the first component; the rest lie outside the V# and read zero.
+    Fixture fixture;
+    const auto built = build(fixture, 16u, false);
+    memory_image.words[0] = 0u;
+    Check(EvaluateWithClean(fixture.program, built.source, runtime, descriptor) &&
+              descriptor.dwords[0] == 0xa0a0a0a0u && descriptor.dwords[1] == 0u &&
+              descriptor.dwords[2] == 0u && descriptor.dwords[3] == 0u &&
+              memory_image.words[0] == 3u,
+          "DWORDX4 components past the table did not read zero through the zero-read hook");
+  }
+  {
+    // An indexed load names a record per lane: no host descriptor stands for it.
+    Fixture fixture;
+    const auto built = build(fixture, 64u, true);
+    Check(!ValidateRuntimeValue(fixture.program, built.word0),
+          "an indexed DWORDX4 load reached a host descriptor");
+  }
+}
+
+// Flat refresh hooks see a read's slot and raw operands; a GPU-owned data slot reads 0 and fails.
+void TestFlatRefreshReadHooks() {
+  Fixture fixture;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x20);
+  const auto first = RawRead(fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
+  const auto second = RawRead(fixture, Address(fixture, Value(0x2000u), Value(0u)), Value(0u), memory);
+  LoadBuffer(fixture, {first, second, Value(16u), Value(0u)});
+  fixture.Plan();
+  Check(fixture.program.srt_reads.size() == 2, "the fixture did not plan two flat slots");
+  auto plan = ExtractResourcePlan(fixture.program);
+
+  struct Observed {
+    TestMemory memory{{{0x1020u, 0x11u}, {0x2020u, 0x22u}}};
+    std::vector<std::pair<uint32_t, uint64_t>> slots;
+    bool events = true;
+    uint64_t owned = 0;
+  } observed;
+  const SrtRuntime runtime{
+      .read_memory =
+          [](void *userdata, uint64_t address, std::span<uint32_t> values) {
+            auto &observed = *static_cast<Observed *>(userdata);
+            const auto *event = CurrentRawReadEvent();
+            observed.events &= event != nullptr && !event->zero &&
+                               ((event->operands[0] & ~uint64_t{0xfff}) | 0x20u) == address;
+            observed.slots.emplace_back(CurrentSrtReadSlot(), address);
+            return ReadMemory(&observed.memory, address, values);
+          },
+      .userdata = &observed,
+      .gpu_owned = [](void *userdata, uint64_t address, uint64_t) {
+        return static_cast<Observed *>(userdata)->owned == address;
+      }};
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(plan, runtime).RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0x11u, 0x22u} && observed.events &&
+            observed.slots == std::vector<std::pair<uint32_t, uint64_t>>{{0, 0x1020u}, {1, 0x2020u}} &&
+            CurrentSrtReadSlot() == UINT32_MAX && CurrentRawReadEvent() == nullptr,
+        "a flat refresh did not publish its slot and raw-read operands to the reader");
+
+  plan.data_flat_slots.assign(2, 0u);
+  plan.data_flat_slots[1] = 1u;
+  observed.owned = 0x2020u;
+  observed.slots.clear();
+  std::vector<uint32_t> owned_slots;
+  SrtWalker walker(plan, runtime);
+  Check(!walker.RefreshFlatBuffer(flat, true, nullptr, &owned_slots) &&
+            owned_slots == std::vector<uint32_t>{1u} && flat[0] == 0x11u && flat[1] == 0u &&
+            walker.Refusal() == SrtRefusal::GpuOwned,
+        "a GPU-owned data slot was read on the host or not reported");
+  Check(walker.RefreshFlatBuffer(flat, true, nullptr, &owned_slots) == false &&
+            owned_slots.size() == 2u,
+        "a GPU-owned refusal was remembered instead of asked again");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  std::vector<uint32_t> refused;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization, &refused) &&
+            refused == std::vector<uint32_t>{0x80u},
+        "a GPU-owned data slot did not name its read for the rebuild");
+  observed.owned = 0x1020u;
+  Check(SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+        "a GPU-owned address outside the data slots refused the refresh");
+}
+
+// The SRT walk evaluates the scalar ALU a descriptor chain is built from, signed and float alike.
+void TestWalkerOpcodes() {
+  Fixture fixture;
+  const auto u0 = UserData(fixture, 0);
+  const auto u1 = UserData(fixture, 1);
+  const auto f = [&](ValueOpcode op, std::initializer_list<Value> args) {
+    return fixture.Emit(op, args);
+  };
+  const std::array<std::pair<Value, uint32_t>, 15> cases{{
+      {f(ValueOpcode::SMin32, {u0, u1}), 0xfffffff0u},
+      {f(ValueOpcode::SMax32, {u0, u1}), 7u},
+      {f(ValueOpcode::SMulHi, {u0, u1}), 0xffffffffu},
+      {f(ValueOpcode::SLessThan32, {u0, u1}), 1u},
+      {f(ValueOpcode::UGreaterThanEqual32, {u0, u1}), 1u},
+      {f(ValueOpcode::BitCount32, {u1}), 3u},
+      {f(ValueOpcode::FindUMsb32, {u0}), 31u},
+      {f(ValueOpcode::FindILsb32, {u0}), 4u},
+      {f(ValueOpcode::BitReverse32, {u1}), 0xe0000000u},
+      {f(ValueOpcode::CompositeExtractU64,
+         {f(ValueOpcode::WqmU64, {f(ValueOpcode::CompositeConstructU64, {u1, Value(0x10u)})}),
+          Value(1u)}),
+       0xf0u},
+      {f(ValueOpcode::ConvertU32F32,
+         {f(ValueOpcode::FPFloor32, {f(ValueOpcode::FPAdd32, {Value::F32(2.5f), Value::F32(1.25f)})})}),
+       3u},
+      {f(ValueOpcode::FPOrdLessThan32, {Value::F32(1.0f), Value::F32(2.0f)}), 1u},
+      {f(ValueOpcode::ConvertU32F32,
+         {f(ValueOpcode::FPMedTri32, {Value::F32(1.0f), Value::F32(9.0f), Value::F32(4.0f)})}),
+       4u},
+      {f(ValueOpcode::ULessThan64, {f(ValueOpcode::CompositeConstructU64, {u0, Value(0u)}),
+                                    f(ValueOpcode::CompositeConstructU64, {u1, Value(1u)})}),
+       1u},
+      {f(ValueOpcode::DispatchThreadInRange, {}), 1u},
+  }};
+  const std::array<uint32_t, 2> user_data{0xfffffff0u, 7u};
+  SrtWalker walker(fixture.program, {.user_data = user_data});
+  for (const auto &[value, expected] : cases) {
+    uint32_t result = 0;
+    Check(ValidateRuntimeValue(fixture.program, value) && walker.Evaluate(value, result) &&
+              result == expected,
+          "the SRT walk evaluated a scalar opcode incorrectly");
+  }
+  uint32_t result = 0;
+  const auto unknown = f(ValueOpcode::IAbs32, {u0});
+  Check(!walker.Evaluate(unknown, result) && walker.Refusal() == SrtRefusal::UnsupportedOpcode,
+        "an opcode the walk has no rule for was not named as unsupported");
+  Check(SrtRefusalName(SrtRefusal::UnsupportedOpcode) == "unsupported opcode",
+        "a refusal was not named");
+}
+
 } // namespace
 
 namespace Common {
@@ -878,6 +1449,17 @@ int main() {
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();
+    TestDeepUniformValueChain();
+    TestAdvancingLoopPhi();
+    TestCyclicPhiEntryCacheAnswersLikeTheWalk();
+    TestFrozenPhiPlansWalkLikeTheProgram();
+    TestBallotDescriptorDword();
+    TestLaneIndexOutsideBallot();
+    TestBallotLaneSweepForgetsLaneValues();
+    TestClosedBallotCache();
+    TestUniformDwordX4DescriptorLoad();
+    TestFlatRefreshReadHooks();
+    TestWalkerOpcodes();
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {

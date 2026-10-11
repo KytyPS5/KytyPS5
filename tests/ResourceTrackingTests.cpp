@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -566,6 +567,268 @@ void TestImageHeapKinds() {
   root.depth_compare = true;
   Check(kind_of(Format::k32UInt, Type::kColor2DArray) == 0u,
         "depth comparison accepted an integer heap entry");
+}
+
+// Counts acquisitions and serves a settable slot buffer and set of kinds.
+struct CountingImageHeap final : ImageHeapSource {
+  bool accept = true;
+  uint64_t slots = 0x123456789abcull;
+  std::vector<DescriptorValue> kinds;
+  std::vector<ImageHeapRequest> requests;
+  bool Acquire(const ImageHeapRequest &request, ImageHeapView &view) override {
+    requests.push_back(request);
+    if (!accept) return false;
+    view = {.slots = slots, .slot_count = 36u, .kinds = kinds};
+    return true;
+  }
+};
+
+// TestResidentImageHeap's guest state: a 144-byte heap of 48-byte records at 0x2000.
+struct ResidentHeapInputs {
+  std::array<uint32_t, 8> descriptor{};
+  std::array<uint32_t, 8> cube{};
+  std::array<uint32_t, 16> data{0x3000u, 4u << 16u, 0x100000u, 0u, 0x2000u, 48u << 16u, 3u, 0u};
+  LinearTestMemory memory;
+
+  ResidentHeapInputs() {
+    descriptor[0] = 0x20u;
+    descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    descriptor[2] = 3u | (3u << 14u);
+    descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    cube = descriptor;
+    cube[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube) << 28u);
+    memory.fail_address = 0x3000u;
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x1010u / 4u);
+  }
+};
+
+// A heap table is a read dependency, never a scalar read: written buffers over it, or address
+// writes in another stage, must not drop the draw (ScalarReadConflict reads ScalarReads()).
+void TestHeapReadIsNoScalarRead() {
+  ResourceSnapshot manual;
+  manual.specialization_reads = {{0x100u, 4u}};
+  manual.specialization_read_slots = {0u};
+  manual.AddHeapRead(0x2000u, 144u);
+  Check(manual.specialization_read_slots.size() == 2u && !manual.HeapRead(0u) &&
+            manual.HeapRead(1u) &&
+            std::ranges::equal(manual.ScalarReads(),
+                               std::vector<std::pair<uint64_t, uint64_t>>{{0x100u, 4u}}),
+        "a heap table read was listed as a scalar read");
+
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+  const auto written = fixture->Buffer({fixture->UserData(8u), fixture->UserData(9u),
+                                        fixture->UserData(10u), fixture->UserData(11u)}, 0x1100);
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture->Emit(ValueOpcode::StoreBufferU32,
+                {written, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+                fixture->AddMemory(store, 0x1100));
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  Check(std::ranges::any_of(plan.info.buffers, &BufferResource::written),
+        "the heap fixture lost its written buffer");
+  ResidentHeapInputs inputs;
+  inputs.data[8] = 0x2000u;
+  inputs.data[10] = 0x1000u;
+  CountingImageHeap heap;
+  heap.kinds = {{inputs.descriptor, 8u}, {inputs.cube, 8u}};
+  SrtRuntime runtime{.user_data = inputs.data, .read_memory = ReadLinearTestMemory,
+                     .userdata = &inputs.memory,
+                     .read_specialization_memory = ReadLinearTestMemory, .image_heap = &heap};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization.images[0].heap && ReadOverlapsWrittenBuffer(plan, snapshot, 0x2000u, 144u),
+        "a heap table under a written buffer did not materialize");
+  const auto read = std::ranges::find(snapshot.specialization_reads,
+                                      std::pair<uint64_t, uint64_t>{0x2000u, 144u});
+  Check(read != snapshot.specialization_reads.end() &&
+            snapshot.specialization_read_slots.size() == snapshot.specialization_reads.size() &&
+            snapshot.HeapRead(static_cast<size_t>(read - snapshot.specialization_reads.begin())) &&
+            snapshot.ScalarReads().empty(),
+        "a heap table read lost its dependency or its read slot, or became a scalar read");
+}
+
+// A memoized heap root replays by acquiring its table again, like a walk would.
+void TestMemoReplaysResidentImageHeap() {
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  ResidentHeapInputs inputs;
+  CountingImageHeap heap;
+  heap.kinds = {{inputs.descriptor, 8u}, {inputs.cube, 8u}};
+  SrtRuntime runtime{.user_data = inputs.data, .read_memory = ReadLinearTestMemory,
+                     .userdata = &inputs.memory,
+                     .read_specialization_memory = ReadLinearTestMemory, .image_heap = &heap};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  MaterializeMemo memo;
+  Check(MaterializeMemo::Supports(plan) &&
+            MaterializeResources(plan, memo.Record(runtime), snapshot, specialization) &&
+            specialization.images[0].heap && heap.requests.size() == 1u,
+        "the memo-recorded heap walk failed");
+  memo.Commit(plan, snapshot, specialization);
+  Check(memo.Valid(), "a resident heap root was not memoized");
+  // A replay must leave exactly what a fresh walk of the same inputs produces.
+  const auto same_as_walk = [&] {
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    return MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+           fresh.flattened_srt == snapshot.flattened_srt && fresh.images == snapshot.images &&
+           fresh.buffers == snapshot.buffers &&
+           fresh.specialization_reads == snapshot.specialization_reads &&
+           fresh.specialization_read_slots == snapshot.specialization_read_slots &&
+           fresh_specialization == specialization;
+  };
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto same_request = [&](const ImageHeapRequest &request) {
+    const auto &first = heap.requests[0];
+    return request.base == first.base && request.size == first.size &&
+           request.step == first.step && request.first == first.first &&
+           request.count == first.count && request.root == first.root;
+  };
+  // The view's slot buffer moved: the replay maps the new one.
+  heap.slots = 0xfedcba987650ull;
+  Check(memo.Replay(plan, runtime, snapshot, &specialization) && heap.requests.size() == 2u &&
+            same_request(heap.requests[1]) && snapshot.flattened_srt[mapping] == 36u &&
+            snapshot.flattened_srt[mapping + 1u] == 0xba987650u &&
+            snapshot.flattened_srt[mapping + 2u] == 0xfedcu,
+        "a heap replay did not acquire its table once or map its slots");
+  Check(same_as_walk() && heap.requests.size() == 3u, "a heap replay differs from a walk");
+  Check(memo.Replay(plan, runtime, snapshot, &specialization) && heap.requests.size() == 4u,
+        "a second heap replay did not acquire its table once");
+  // A plain descriptor beside the heap moves: the patch keeps the heap root and its kinds.
+  inputs.data[0] = 0x3100u;
+  Check(memo.Replay(plan, runtime, snapshot, &specialization) && heap.requests.size() == 5u &&
+            std::ranges::any_of(snapshot.buffers,
+                                [](const DescriptorValue &buffer) {
+                                  return buffer.dwords[0] == 0x3100u;
+                                }) &&
+            specialization.images[0].heap && same_as_walk(),
+        "a patched descriptor beside a heap root did not replay like a walk");
+  // The view met a new kind: the module changes, so only a walk may serve it.
+  auto uint_kind = inputs.descriptor;
+  uint_kind[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32UInt) << 20u;
+  heap.kinds.push_back({uint_kind, 8u});
+  Check(!memo.Replay(plan, runtime, snapshot, &specialization),
+        "a heap replay kept stale kinds");
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 4u && snapshot.images[3].dwords == uint_kind,
+        "the walk after a refused heap replay lost the new kind");
+  heap.kinds.pop_back();
+  heap.accept = false;
+  Check(!memo.Replay(plan, runtime, snapshot, &specialization),
+        "a heap replay ignored a declined table");
+  heap.accept = true;
+  auto unbacked = runtime;
+  unbacked.image_heap = nullptr;
+  Check(!memo.Replay(plan, unbacked, snapshot, &specialization),
+        "a heap replay ran without an image heap");
+  // A declined walk enumerates the table, which the memo cannot replay.
+  heap.accept = false;
+  MaterializeMemo enumerated;
+  Check(MaterializeResources(plan, enumerated.Record(runtime), snapshot, specialization) &&
+            !specialization.images[0].heap,
+        "the declined heap walk failed");
+  enumerated.Commit(plan, snapshot, specialization);
+  Check(!enumerated.Valid(), "an enumerated table was memoized");
+}
+
+// The resident-heap fixture with its heap V# read through a user-data pointer, as an SRT holds it.
+std::unique_ptr<Fixture> MakePointedHeapFixture() {
+  auto fixture = std::make_unique<Fixture>();
+  std::array<Value, 4> material_words;
+  for (uint32_t dword = 0; dword < 4; dword++) material_words[dword] = fixture->UserData(dword);
+  const auto material = fixture->Buffer(material_words, 0x10d8);
+  const auto pointer = fixture->Address(fixture->UserData(4u), fixture->UserData(5u), 0x10c0);
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    MemoryInfo srt;
+    srt.kind = ResourceKind::ScalarAddress;
+    srt.offset = dword * sizeof(uint32_t);
+    heap_words[dword] = fixture->Emit(ValueOpcode::LoadAddressU32,
+                                      {pointer, Value(0u), Value(0u), Value(true)},
+                                      fixture->AddMemory(srt, 0x10c0 + dword * 4u));
+  }
+  const auto heap = fixture->Buffer(heap_words, 0x10d8);
+  const auto invocation = fixture->Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto selector = fixture->Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+  const auto member = fixture->Emit(ValueOpcode::IMul32, {selector, Value(224u)});
+  MemoryInfo material_scalar;
+  material_scalar.kind = ResourceKind::ScalarBuffer;
+  material_scalar.offset = 4u;
+  const auto key = fixture->Emit(ValueOpcode::ReadConstBuffer, {material, member},
+                                 fixture->AddMemory(material_scalar, 0x10d8));
+  const auto record = fixture->Emit(ValueOpcode::IMul32, {key, Value(48u)});
+  const auto heap_offset = fixture->Emit(ValueOpcode::IAdd32, {record, Value(16u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    MemoryInfo component;
+    component.kind = ResourceKind::ScalarBuffer;
+    component.offset = dword * sizeof(uint32_t);
+    image_words[dword] = fixture->Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
+                                       fixture->AddMemory(component, 0x10d8));
+  }
+  const auto image = fixture->Image(image_words, 0x10f0);
+  const auto sampler = fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto address = fixture->ImageAddress();
+  auto result = fixture->Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address, Value(true)},
+                              fixture->AddMemory(sample, 0x10f0));
+  if (result.GetType() == Type::U32x4)
+    result = fixture->Emit(ValueOpcode::CompositeExtractU32x4, {result, Value(0u)});
+  fixture->Emit(ValueOpcode::ReferenceU32, {result});
+  return fixture;
+}
+
+// A heap replay relocates the captured reads of its moved V# around the heap's own read.
+void TestMemoRelocatesPointedImageHeap() {
+  auto fixture = MakePointedHeapFixture();
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  ResidentHeapInputs inputs;
+  const std::array<uint32_t, 4> table{0x2000u, 48u << 16u, 3u, 0u};
+  std::copy(table.begin(), table.end(), inputs.memory.words.begin() + (0x1100u - 0x1000u) / 4u);
+  std::copy(table.begin(), table.end(), inputs.memory.words.begin() + (0x1200u - 0x1000u) / 4u);
+  inputs.data[4] = 0x1100u;
+  inputs.data[5] = 0u;
+  CountingImageHeap heap;
+  heap.kinds = {{inputs.descriptor, 8u}, {inputs.cube, 8u}};
+  SrtRuntime runtime{.user_data = inputs.data, .read_memory = ReadLinearTestMemory,
+                     .userdata = &inputs.memory,
+                     .read_specialization_memory = ReadLinearTestMemory, .image_heap = &heap};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  MaterializeMemo memo;
+  Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization) &&
+            specialization.images[0].heap && heap.requests.size() == 1u &&
+            heap.requests[0].base == 0x2000u && heap.requests[0].size == 144u,
+        "the pointed heap fixture did not serve its table from the heap");
+  const auto scalar_reads = [&](uint64_t base) {
+    std::vector<std::pair<uint64_t, uint64_t>> expected;
+    for (uint32_t dword = 0; dword < 4u; dword++) expected.emplace_back(base + dword * 4u, 4u);
+    return std::ranges::equal(snapshot.ScalarReads(), expected) &&
+           std::ranges::count(snapshot.specialization_reads,
+                              std::pair<uint64_t, uint64_t>{0x2000u, 144u}) == 1;
+  };
+  Check(scalar_reads(0x1100u), "the pointed heap fixture lost its V# reads or its heap read");
+  memo.Commit(plan, snapshot, specialization);
+  Check(memo.Valid(), "a pointed heap root was not memoized");
+  inputs.data[4] = 0x1200u;
+  ResourceSnapshot fresh;
+  ResourceSpecialization fresh_specialization;
+  Check(memo.Replay(plan, runtime, snapshot, &specialization) && heap.requests.size() == 2u &&
+            scalar_reads(0x1200u) &&
+            MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+            fresh.specialization_reads == snapshot.specialization_reads &&
+            fresh.flattened_srt == snapshot.flattened_srt && fresh_specialization == specialization,
+        "a moved heap V# did not relocate its captured reads like a walk");
 }
 
 void TestBoundedImageViewEligibility() {
@@ -9807,6 +10070,9 @@ int main() {
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);
     Run("image heap kinds", TestImageHeapKinds);
+    Run("heap read is no scalar read", TestHeapReadIsNoScalarRead);
+    Run("memo replays resident image heap", TestMemoReplaysResidentImageHeap);
+    Run("memo relocates pointed image heap", TestMemoRelocatesPointedImageHeap);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
     Run("waterfall image table", TestWaterfallImageTable);

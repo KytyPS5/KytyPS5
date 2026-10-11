@@ -8,17 +8,21 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderReadCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/unfoldableSet.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -178,6 +182,43 @@ bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t
 	return true;
 }
 
+Libs::Graphics::ShaderGuestReadCache& ShaderReadCache() {
+	static thread_local Libs::Graphics::ShaderGuestReadCache cache;
+	return cache;
+}
+
+bool ReadShaderLine(uint64_t address, void* data, uint64_t size) {
+	return Libs::Graphics::GuestRange {address, size}.Valid() &&
+	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size);
+}
+
+bool ReadShaderCleanWords(uint64_t address, std::span<uint32_t> values, bool&) {
+	return !values.empty() && Libs::LibKernel::Memory::TryReadGpuCleanBacking(
+	                              address, values.data(), values.size_bytes());
+}
+
+template <bool Permissive>
+bool ReadShaderGuestMemoryCached(void*, uint64_t address, std::span<uint32_t> values) {
+	return ShaderReadCache().Read(
+	    address, values, ReadShaderLine,
+	    [](uint64_t word_address, std::span<uint32_t> words, bool& drained) {
+		    if (ReadShaderCleanWords(word_address, words, drained)) {
+			    return true;
+		    }
+		    drained = Libs::Graphics::GuestRange {word_address, words.size_bytes()}.Valid() &&
+		              Libs::Graphics::GuestGpu::IsGpuThread();
+		    return Permissive ? ReadShaderGuestMemoryPermissive(nullptr, word_address, words)
+		                      : ReadShaderGuestMemory(nullptr, word_address, words);
+	    });
+}
+
+bool ReadShaderConditionMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	return ShaderReadCache().Read(address, values, ReadShaderLine, ReadShaderCleanWords);
+}
+
+bool ShaderReadGpuOwned(void*, uint64_t address, uint64_t size) {
+	return !ShaderReadCache().CleanCovered(address, size, ReadShaderLine) &&
+	       Libs::LibKernel::Memory::HasGpuOwnedBytes(address, size);
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -348,6 +389,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                        permutations;
+		bool                                            skip_dispatch = false;
 	};
 
 	static const char* StageShortName(ShaderType stage) {
@@ -532,20 +574,25 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
-		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_memory                = ReadShaderGuestMemoryCached<true>,
+		    .read_specialization_memory = ReadShaderGuestMemoryCached<false>,
+		    .gpu_owned                  = ShaderReadGpuOwned,
+		    .read_condition_memory      = ReadShaderConditionMemory,
 		    .image_heap                 = image_heap,
 		};
+		EXIT_IF(runtime.read_memory == nullptr);
+		ShaderReadCache().Reset();
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
-		bool source_changed = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
 			} else {
+				                                             permutation, refused);
 			}
 			}
 			if (permutation != nullptr) {

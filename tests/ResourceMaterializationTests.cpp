@@ -1,9 +1,14 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderReadCache.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.h"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
@@ -1635,6 +1640,867 @@ void TestRefusalKeepsSpecialization() {
         "a specialization from another tracking was applied");
 }
 
+void TestShaderReadCache() {
+  using Libs::Graphics::ShaderGuestReadCache;
+  constexpr uint64_t base = 0x10000;
+  std::vector<uint32_t> memory(1024);
+  for (uint32_t i = 0; i < memory.size(); i++) {
+    memory[i] = 0x1000u + i;
+  }
+  uint64_t dirty_begin = UINT64_MAX;
+  uint64_t dirty_end = UINT64_MAX;
+  bool drain = false;
+  uint32_t line_reads = 0;
+  uint32_t word_reads = 0;
+  const auto inside = [&](uint64_t address, uint64_t size) {
+    return address >= base && address + size <= base + memory.size() * 4u;
+  };
+  const auto clean = [&](uint64_t address, uint64_t size) {
+    return inside(address, size) &&
+           (address + size <= dirty_begin || address >= dirty_end);
+  };
+  const auto copy = [&](uint64_t address, void *data, uint64_t size) {
+    std::memcpy(data,
+                reinterpret_cast<const uint8_t *>(memory.data()) +
+                    (address - base),
+                size);
+  };
+  const auto clean_line = [&](uint64_t address, void *data, uint64_t size) {
+    line_reads++;
+    if (!clean(address, size)) {
+      return false;
+    }
+    copy(address, data, size);
+    return true;
+  };
+  const auto reader = [&](uint64_t address, std::span<uint32_t> words,
+                          bool &drained) {
+    word_reads++;
+    if (words.empty() || !inside(address, words.size_bytes())) {
+      return false;
+    }
+    drained = drain && !clean(address, words.size_bytes());
+    copy(address, words.data(), words.size_bytes());
+    return true;
+  };
+  ShaderGuestReadCache cache;
+  cache.Reset();
+  uint32_t word = 0;
+  const auto read = [&](uint64_t address) {
+    return cache.Read(address, {&word, 1}, clean_line, reader);
+  };
+
+  bool served = true;
+  for (uint32_t i = 0; i < 64; i++) {
+    served = served && read(base + i * 4u) && word == 0x1000u + i;
+  }
+  Check(served && line_reads == 1 && word_reads == 0,
+        "a clean line was not read once for every word in it");
+  std::array<uint32_t, 8> descriptor{};
+  Check(cache.Read(base + 256 + 32, descriptor, clean_line, reader) &&
+            descriptor[0] == 0x1000u + 72 && descriptor[7] == 0x1000u + 79 &&
+            line_reads == 2 && word_reads == 0,
+        "a descriptor inside one line was not served from it");
+  std::array<uint32_t, 2> straddle{};
+  Check(cache.Read(base + 252, straddle, clean_line, reader) &&
+            straddle[0] == 0x1000u + 63 && straddle[1] == 0x1000u + 64 &&
+            word_reads == 1 && line_reads == 2,
+        "a read across two lines did not go to the reader");
+
+  memory[0] = 0xdeadu;
+  Check(read(base) && word == 0x1000u && line_reads == 2,
+        "a walk did not see the line it had already read");
+  cache.Reset();
+  Check(read(base) && word == 0xdeadu && line_reads == 3,
+        "a reset cache served a line read before it");
+
+  dirty_begin = base + 512 + 8;
+  dirty_end = dirty_begin + 4;
+  const auto words_before = word_reads;
+  served = true;
+  for (uint32_t i = 0; i < 4; i++) {
+    served = served && read(base + 512 + i * 4u) && word == 0x1000u + 128 + i;
+  }
+  Check(served && word_reads == words_before + 4 && line_reads == 4,
+        "a line with one dirty word was not read word by word, or was "
+        "re-checked per word");
+
+  drain = true;
+  Check(read(base + 512 + 8) && read(base) && line_reads == 5,
+        "the cache kept its lines across a reader that may have drained");
+  Check(!read(base - 4) && !cache.Read(base, {}, clean_line, reader),
+        "the cache accepted a read the reader refuses");
+
+  // Ownership asks the same line the read is about to load, so a clean line answers both.
+  drain = false;
+  dirty_begin = base + 512 + 8;
+  dirty_end = dirty_begin + 4;
+  cache.Reset();
+  const auto lines_before = line_reads;
+  Check(cache.CleanCovered(base + 8, 4, clean_line) && line_reads == lines_before + 1 &&
+            read(base + 8) && word == 0x1000u + 2u &&
+            line_reads == lines_before + 1,
+        "a clean line did not answer ownership, or was loaded twice");
+  Check(!cache.CleanCovered(base + 512, 4, clean_line) &&
+            !cache.CleanCovered(base + 252, 8, clean_line) &&
+            !cache.CleanCovered(base - 256, 4, clean_line),
+        "a dirty, straddling or unreadable range was reported clean");
+}
+
+struct MemoMemory {
+  std::array<uint32_t, 4> table_a{};
+  std::array<uint32_t, 4> table_b{};
+  bool dirty = false;
+};
+
+MemoMemory g_memo_memory;
+
+bool MemoRead(void *, uint64_t address, std::span<uint32_t> values) {
+  if (g_memo_memory.dirty) {
+    return false;
+  }
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+  return true;
+}
+
+uint32_t Low(uint64_t address) { return static_cast<uint32_t>(address); }
+uint32_t High(uint64_t address) { return static_cast<uint32_t>(address >> 32u); }
+
+// Shifted rebuilds the pointer through 32-bit integer operations; Opaque hides it behind an XOR.
+enum class MemoBase { Immediate, UserData, ShiftedUserData, OpaqueUserData };
+
+// One flat SRT slot read through a pointer; `structural` also feeds it to a descriptor.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MemoPlan(MemoBase base, uint64_t address,
+                                                            bool structural) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarAddress;
+  memory.planning_only = true;
+  memory.offset = 4;
+  program.memory_info.push_back(memory);
+  Value low = Value(Low(address));
+  Value high = Value(High(address));
+  if (base != MemoBase::Immediate) {
+    auto &lo = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+    auto &hi = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))});
+    low = Value(&lo);
+    high = Value(&hi);
+    if (base == MemoBase::ShiftedUserData) {
+      auto &down = block.AppendNewInst(ValueOpcode::ShiftRightLogical32, {low, Value(4u)});
+      auto &up = block.AppendNewInst(ValueOpcode::ShiftLeftLogical32, {Value(&down), Value(4u)});
+      auto &rest = block.AppendNewInst(ValueOpcode::BitwiseAnd32, {low, Value(0xfu)});
+      auto &whole = block.AppendNewInst(ValueOpcode::BitwiseOr32, {Value(&up), Value(&rest)});
+      auto &scaled = block.AppendNewInst(ValueOpcode::IMul32, {Value(&whole), Value(1u)});
+      low = Value(&block.AppendNewInst(ValueOpcode::ISub32, {Value(&scaled), Value(0u)}));
+    }
+    if (base == MemoBase::OpaqueUserData) {
+      low = Value(&block.AppendNewInst(ValueOpcode::BitwiseXor32, {low, Value(0u)}));
+    }
+  }
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {low, high});
+  auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                  {Value(&handle), Value(0u), Value(0u), Value(true)});
+  raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+  program.srt_reads.push_back({Value(&raw), 0});
+  if (structural) {
+    auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+    auto &flat = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(0u)});
+    DescriptorSource source;
+    source.dwords[0] = Value(&flat);
+    source.dwords[1] = Value(0u);
+    source.dword_count = 2;
+    program.descriptor_sources.push_back(source);
+  }
+  return ExtractResourcePlan(program);
+}
+
+void TestMaterializeMemo() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto &memory = g_memo_memory;
+  memory.table_a = {1, 0x1111, 2, 3};
+  memory.table_b = {4, 0x2222, 5, 6};
+  const auto a = reinterpret_cast<uint64_t>(memory.table_a.data());
+  const auto b = reinterpret_cast<uint64_t>(memory.table_b.data());
+  std::array<uint32_t, 2> user_data{Low(a), High(a)};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = MemoRead,
+                           .read_specialization_memory = MemoRead};
+  const auto point = [&](uint64_t address) { user_data = {Low(address), High(address)}; };
+  // A replay must leave exactly what a fresh walk of the same inputs produces.
+  const auto same_as_walk = [&](const ResourcePlan &plan, const ResourceSnapshot &replayed) {
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    return MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+           fresh.flattened_srt == replayed.flattened_srt && fresh.buffers == replayed.buffers &&
+           fresh.user_data == replayed.user_data;
+  };
+  struct Stage {
+    ResourcePlan plan;
+    MaterializeMemo memo;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+  };
+  const auto walk = [&](Stage &stage) {
+    Check(MaterializeResources(stage.plan, stage.memo.Record(runtime), stage.snapshot,
+                               stage.specialization),
+          "memo-recorded materialization failed");
+    stage.memo.Commit(stage.plan, stage.snapshot, stage.specialization);
+  };
+
+  {
+    Stage leaf{MemoPlan(MemoBase::Immediate, a, false)};
+    Check(!leaf.memo.Replay(leaf.plan, runtime, leaf.snapshot), "an empty memo replayed");
+    walk(leaf);
+    Check(leaf.memo.Valid() && leaf.snapshot.flattened_srt == std::vector<uint32_t>{0x1111},
+          "a fixed-address flat slot was not memoized");
+    Check(leaf.memo.Replay(leaf.plan, runtime, leaf.snapshot), "an unchanged walk missed");
+    memory.table_a[1] = 0x1212;
+    Check(leaf.memo.Replay(leaf.plan, runtime, leaf.snapshot) &&
+              leaf.snapshot.flattened_srt == std::vector<uint32_t>{0x1212} &&
+              same_as_walk(leaf.plan, leaf.snapshot),
+          "a guest write to a flat-only word was not refreshed in place");
+    memory.dirty = true;
+    Check(!leaf.memo.Replay(leaf.plan, runtime, leaf.snapshot),
+          "a read the walk would refuse (GPU-owned) replayed");
+    memory.dirty = false;
+    memory.table_a[1] = 0x1111;
+  }
+
+  {
+    Stage relocated{MemoPlan(MemoBase::UserData, 0, false)};
+    point(a);
+    walk(relocated);
+    Check(relocated.snapshot.flattened_srt == std::vector<uint32_t>{0x1111},
+          "the pointer plan read the wrong word");
+    point(b);
+    Check(relocated.memo.Replay(relocated.plan, runtime, relocated.snapshot) &&
+              relocated.snapshot.flattened_srt == std::vector<uint32_t>{0x2222} &&
+              relocated.snapshot.user_data[0] == Low(b) &&
+              same_as_walk(relocated.plan, relocated.snapshot),
+          "a moved per-draw pointer did not relocate the replay");
+    point(a);
+  }
+
+  {
+    Stage pinned{MemoPlan(MemoBase::OpaqueUserData, 0, false)};
+    point(a);
+    walk(pinned);
+    Check(pinned.memo.Replay(pinned.plan, runtime, pinned.snapshot),
+          "an unchanged pointer behind an underived operand missed");
+    point(b);
+    Check(!pinned.memo.Replay(pinned.plan, runtime, pinned.snapshot),
+          "user data behind an operand the replay cannot re-derive was allowed to change");
+    point(a);
+  }
+
+  {
+    Stage structural{MemoPlan(MemoBase::UserData, 0, true)};
+    point(a);
+    walk(structural);
+    Check(structural.memo.Replay(structural.plan, runtime, structural.snapshot),
+          "an unchanged descriptor walk missed");
+    memory.table_a[1] = 0x3333;
+    Check(!structural.memo.Replay(structural.plan, runtime, structural.snapshot),
+          "a word that feeds a descriptor changed without a walk");
+    memory.table_a[1] = 0x1111;
+    point(b);
+    Check(!structural.memo.Replay(structural.plan, runtime, structural.snapshot),
+          "a relocated descriptor word that differs replayed");
+    memory.table_b[1] = 0x1111;
+    Check(structural.memo.Replay(structural.plan, runtime, structural.snapshot) &&
+              same_as_walk(structural.plan, structural.snapshot),
+          "a relocated table with the same descriptor word missed");
+    memory.table_b[1] = 0x2222;
+    point(a);
+  }
+
+  {
+    Stage buffer{UserDataBufferPlan()};
+    std::array<uint32_t, 1> words{7};
+    const SrtRuntime direct{.user_data = words,
+                            .read_memory = MemoRead,
+                            .read_specialization_memory = MemoRead};
+    Check(MaterializeResources(buffer.plan, buffer.memo.Record(direct), buffer.snapshot,
+                               buffer.specialization),
+          "user-data descriptor materialization failed");
+    buffer.memo.Commit(buffer.plan, buffer.snapshot, buffer.specialization);
+    Check(buffer.memo.Replay(buffer.plan, direct, buffer.snapshot, &buffer.specialization),
+          "an unchanged user-data descriptor missed");
+    words[0] = 9;
+    Check(!buffer.memo.Replay(buffer.plan, direct, buffer.snapshot),
+          "a moved descriptor word replayed without a specialization to refresh");
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    Check(buffer.memo.Replay(buffer.plan, direct, buffer.snapshot, &buffer.specialization) &&
+              MaterializeResources(buffer.plan, direct, fresh, fresh_specialization) &&
+              buffer.snapshot.buffers == fresh.buffers &&
+              buffer.snapshot.buffers[0].dwords[0] == 9u &&
+              buffer.specialization == fresh_specialization &&
+              buffer.specialization.unbound_buffers == fresh_specialization.unbound_buffers,
+          "a moved user-data descriptor dword was not patched like a walk");
+  }
+
+  {
+    Stage indirect{MemoPlan(MemoBase::Immediate, a, false)};
+    indirect.plan.descriptor_sources.emplace_back().indirect_descriptor.emplace();
+    Check(!MaterializeMemo::Supports(indirect.plan),
+          "a plan with an enumerated table was memoizable");
+    const SrtRuntime unreadable{.user_data = user_data, .read_memory = MemoRead};
+    Stage blind{MemoPlan(MemoBase::Immediate, a, false)};
+    Check(MaterializeResources(blind.plan, blind.memo.Record(unreadable), blind.snapshot,
+                               blind.specialization),
+          "materialization without a strict reader failed");
+    blind.memo.Commit(blind.plan, blind.snapshot, blind.specialization);
+    Check(!blind.memo.Valid(), "a walk whose refusals the memo cannot see was committed");
+  }
+}
+
+// A pointer-relative flat slot, optionally beside a branch on the same table.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan
+MemoBranchPlan(bool condition, bool self_compare = false,
+               bool capture = false) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.capture_specialization_reads = capture;
+  auto &block = AddValueBlock(program);
+  for (const uint32_t offset : {4u, 8u}) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.planning_only = true;
+    memory.offset = offset;
+    program.memory_info.push_back(memory);
+  }
+  auto &lo = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  auto &hi = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(&lo), Value(&hi)});
+  auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                  {Value(&handle), Value(0u), Value(0u), Value(true)});
+  raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+  program.srt_reads.push_back({Value(&raw), 0});
+  if (condition) {
+    auto &word = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                     {Value(&handle), Value(0u), Value(0u), Value(true)});
+    word.SetFlags(MemoryFlags{.index = 1, .pc = 0x44});
+    auto &test = block.AppendNewInst(
+        ValueOpcode::IEqual32, {Value(&word), self_compare ? Value(&word) : Value(2u)});
+    AddValueBlock(program);
+    AddValueBlock(program);
+    program.blocks[0]->condition = Value(&test);
+    program.blocks[0]->terminator.kind =
+        Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    program.blocks[0]->terminator.false_block = program.blocks[2];
+    for (uint32_t index : {1u, 2u}) {
+      program.blocks[index]->id = index;
+      program.blocks[index]->terminator.kind =
+          Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+    }
+  }
+  return ExtractResourcePlan(program);
+}
+
+struct MemoConditionMemory {
+  uint64_t refused = 0;
+};
+
+MemoConditionMemory g_memo_condition;
+
+bool MemoConditionRead(void *data, uint64_t address, std::span<uint32_t> values) {
+  return address != g_memo_condition.refused && MemoRead(data, address, values);
+}
+
+// The extensions keep the one rule: a replay leaves exactly what a fresh walk would.
+void TestMaterializeMemoExtensions() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto &memory = g_memo_memory;
+  memory.table_a = {1, 0x1111, 2, 3};
+  memory.table_b = {4, 0x2222, 5, 6};
+  const auto a = reinterpret_cast<uint64_t>(memory.table_a.data());
+  const auto b = reinterpret_cast<uint64_t>(memory.table_b.data());
+  std::array<uint32_t, 2> user_data{};
+  std::array<uint32_t, 3> groups{4, 1, 1};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = MemoConditionRead,
+                           .read_specialization_memory = MemoConditionRead,
+                           .workgroup_counts = groups};
+  const auto point = [&](uint64_t address) { user_data = {Low(address), High(address)}; };
+  const auto same_as_walk = [&](const ResourcePlan &plan, const ResourceSnapshot &replayed,
+                                const ResourceSpecialization &specialization) {
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    return MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+           fresh.flattened_srt == replayed.flattened_srt && fresh.buffers == replayed.buffers &&
+           fresh.images == replayed.images && fresh.user_data == replayed.user_data &&
+           fresh.specialization_reads == replayed.specialization_reads &&
+           fresh_specialization == specialization;
+  };
+  struct Stage {
+    ResourcePlan plan;
+    MaterializeMemoWays memo;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+  };
+  const auto walk = [&](Stage &stage) {
+    Check(MaterializeResources(stage.plan, stage.memo.Record(runtime), stage.snapshot,
+                               stage.specialization),
+          "memo-recorded materialization failed");
+    stage.memo.Commit(stage.plan, stage.snapshot, stage.specialization);
+  };
+  const auto replay = [&](Stage &stage) {
+    return stage.memo.Replay(stage.plan, runtime, stage.snapshot, stage.specialization);
+  };
+
+  // Ways: a stage alternating between two descriptor words replays both after one walk each.
+  {
+    Stage stage{MemoPlan(MemoBase::UserData, 0, true)};
+    point(a);
+    walk(stage);
+    point(b);
+    Check(!replay(stage), "a changed descriptor word replayed");
+    walk(stage);
+    point(a);
+    Check(replay(stage) && same_as_walk(stage.plan, stage.snapshot, stage.specialization),
+          "an earlier binding did not replay from its own way");
+    point(b);
+    Check(replay(stage), "a second way did not replay");
+    point(a);
+  }
+
+  // Dispatch size: no memoizable plan reads it.
+  {
+    Stage stage{MemoPlan(MemoBase::Immediate, a, false)};
+    walk(stage);
+    groups = {8, 2, 1};
+    Check(replay(stage) && same_as_walk(stage.plan, stage.snapshot, stage.specialization),
+          "a dispatch size change missed a plan that never reads it");
+    groups = {4, 1, 1};
+  }
+
+  // Refusals: a branch read that refused replays only while it still refuses.
+  {
+    Stage stage{MemoBranchPlan(true)};
+    point(a);
+    g_memo_condition.refused = a + 8u;
+    walk(stage);
+    Check(stage.memo.Valid(), "a walk with a refused branch read was not memoized");
+    Check(replay(stage) && same_as_walk(stage.plan, stage.snapshot, stage.specialization),
+          "a still-refused branch read missed");
+    g_memo_condition.refused = 0;
+    Check(!replay(stage),
+          "a branch read that answers now replayed the walk that saw it refuse");
+  }
+
+  // Captured ranges: a relocated branch read moves its captured range with it.
+  {
+    Stage stage{MemoBranchPlan(true, false, true)};
+    point(a);
+    walk(stage);
+    Check(stage.memo.Valid() && !stage.snapshot.specialization_reads.empty(),
+          "the branch plan captured no read ranges");
+    memory.table_b[2] = memory.table_a[2];
+    point(b);
+    Check(replay(stage) && same_as_walk(stage.plan, stage.snapshot, stage.specialization),
+          "a relocated captured read did not move its range");
+    memory.table_b[2] = 5;
+    Check(!replay(stage),
+          "a relocated branch word that differs replayed");
+    point(a);
+  }
+
+  // Integer operations: a pointer rebuilt with shifts, masks and a multiply still relocates.
+  {
+    Stage stage{MemoPlan(MemoBase::ShiftedUserData, 0, false)};
+    point(a);
+    walk(stage);
+    point(b);
+    Check(replay(stage) && same_as_walk(stage.plan, stage.snapshot, stage.specialization),
+          "a pointer built with integer operations did not relocate");
+    point(a);
+  }
+
+  // Self comparison: a branch on x == x reads x, but no value of x changes the branch.
+  {
+    Stage stage{MemoBranchPlan(true, true)};
+    point(a);
+    walk(stage);
+    memory.table_a[2] = 0x1212;
+    Check(replay(stage) && same_as_walk(stage.plan, stage.snapshot, stage.specialization),
+          "a word compared only with itself counted as structure");
+    memory.table_a[2] = 2;
+  }
+
+}
+
+struct OwnedMemory {
+  bool owned = false;
+  uint32_t reads = 0;
+};
+
+OwnedMemory g_owned_memory;
+
+bool OwnedRead(void *, uint64_t address, std::span<uint32_t> values) {
+  g_owned_memory.reads++;
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+  return true;
+}
+
+bool OwnedQuery(void *, uint64_t, uint64_t) { return g_owned_memory.owned; }
+
+// A data slot the GPU comes to own after recording misses the memo before any read.
+void TestMaterializeMemoGpuOwnedDataSlot() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto &memory = g_memo_memory;
+  memory.table_a = {1, 0x1111, 2, 3};
+  const auto a = reinterpret_cast<uint64_t>(memory.table_a.data());
+  auto plan = MemoPlan(MemoBase::Immediate, a, false);
+  plan.data_flat_slots = {1u};
+  std::array<uint32_t, 2> user_data{};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = OwnedRead,
+                           .read_specialization_memory = OwnedRead,
+                           .gpu_owned = OwnedQuery};
+  MaterializeMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  g_owned_memory = {};
+  Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0x1111},
+        "a clean data slot did not materialize");
+  memo.Commit(plan, snapshot, specialization);
+  Check(memo.Valid() && memo.Replay(plan, runtime, snapshot),
+        "a clean data slot missed the memo");
+  g_owned_memory.owned = true;
+  g_owned_memory.reads = 0;
+  Check(!memo.Replay(plan, runtime, snapshot) && g_owned_memory.reads == 0,
+        "a GPU-owned data slot replayed, or read the bytes the walk refuses");
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            g_owned_memory.reads == 0,
+        "the walk read a GPU-owned data slot instead of refusing it");
+}
+
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MemoDescriptorPlan() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &lo = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  auto &hi = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(&lo), Value(&hi)});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  DescriptorSource source;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.planning_only = true;
+    memory.offset = dword * 4u;
+    program.memory_info.push_back(memory);
+    auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                    {Value(&handle), Value(0u), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = dword, .pc = 0x40u + dword * 4u});
+    program.srt_reads.push_back({Value(&raw), dword});
+    auto &flat = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(dword)});
+    source.dwords[dword] = Value(&flat);
+  }
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  return ExtractResourcePlan(program);
+}
+
+void TestMaterializeMemoDescriptorPatch() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Base 0x1000_0000, stride 16 (dword1 bits 16..29), 64 records, dst_sel + formats in dword3.
+  std::array<uint32_t, 4> table_a{0x10000000u, 16u << 16u, 64u, 0x00027fac};
+  std::array<uint32_t, 4> table_b{0x20000000u, 32u << 16u, 128u, 0x00027fac};
+  std::array<uint32_t, 4> table_c{0x30000000u, 16u << 16u, 64u, 0x00027fac};
+  const auto address = [](const auto &table) { return reinterpret_cast<uint64_t>(table.data()); };
+  std::array<uint32_t, 2> user_data{};
+  const auto point = [&](uint64_t where) { user_data = {Low(where), High(where)}; };
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = MemoRead,
+                           .read_specialization_memory = MemoRead};
+  const auto plan = MemoDescriptorPlan();
+  MaterializeMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  point(address(table_a));
+  Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization),
+        "the descriptor plan did not materialize");
+  memo.Commit(plan, snapshot, specialization);
+  Check(memo.Valid(), "the descriptor plan was not memoized");
+  const auto same_as_walk = [&] {
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    return MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+           fresh.buffers == snapshot.buffers && fresh.flattened_srt == snapshot.flattened_srt &&
+           fresh.user_data == snapshot.user_data && fresh_specialization == specialization &&
+           fresh_specialization.unbound_buffers == specialization.unbound_buffers;
+  };
+  for (const auto *table : {&table_b, &table_c, &table_a, &table_b}) {
+    point(address(*table));
+    Check(memo.Replay(plan, runtime, snapshot, &specialization) && same_as_walk() &&
+              snapshot.buffers[0].dwords[0] == (*table)[0],
+          "a moved V# bound as a buffer did not replay like a walk");
+  }
+  table_b[2] = 0;
+  Check(memo.Replay(plan, runtime, snapshot, &specialization) && same_as_walk() &&
+            specialization.unbound_buffers[0],
+        "a V# that became unbound did not refresh the specialization");
+  table_b[2] = 128u;
+}
+
+void TestMaterializeMemoBackoff() {
+  using Backoff = Libs::Graphics::ShaderRecompiler::IR::MaterializeMemoBackoff;
+  Backoff backoff;
+  const auto skipped = [&](uint32_t calls) {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < calls; i++) {
+      count += backoff.Skip() ? 1u : 0u;
+    }
+    return count;
+  };
+  for (uint32_t i = 0; i < Backoff::Threshold; i++) {
+    Check(!backoff.Skip(), "the memo backed off before the miss threshold");
+    backoff.OnMiss();
+  }
+  Check(!backoff.Skip(), "the memo backed off before trying to replay a fresh recording");
+  backoff.OnMiss();
+  Check(skipped(Backoff::InitialWindow) == Backoff::InitialWindow && !backoff.Skip(),
+        "the first back-off window has the wrong length");
+  backoff.OnMiss();
+  Check(!backoff.Skip(), "the memo skipped the call that replays a fresh recording");
+  backoff.OnMiss();
+  Check(skipped(2 * Backoff::InitialWindow) == 2 * Backoff::InitialWindow && !backoff.Skip(),
+        "the back-off window did not double");
+  backoff.OnHit();
+  for (uint32_t i = 0; i + 1 < Backoff::Threshold; i++) {
+    backoff.OnMiss();
+  }
+  Check(!backoff.Skip(), "a hit did not reset the miss run");
+  backoff.OnMiss();
+  backoff.OnMiss();
+  Check(skipped(Backoff::InitialWindow) == Backoff::InitialWindow && !backoff.Skip(),
+        "a hit did not reset the back-off window");
+  for (uint32_t round = 0; round < 16; round++) {
+    backoff.OnMiss();
+    backoff.OnMiss();
+    skipped(Backoff::MaxWindow);
+  }
+  backoff.OnMiss();
+  backoff.OnMiss();
+  Check(skipped(Backoff::MaxWindow + 1) == Backoff::MaxWindow,
+        "the back-off window grew past its cap");
+}
+
+// A 64-bit pointer add as IAdd32 halves with a ULessThan32 carry; `guarded` pins the pointer.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MemoCarryPlan(bool guarded) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const auto user = [&](uint32_t reg) {
+    return Value(
+        &block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(reg))}));
+  };
+  const auto base_lo = user(0);
+  const auto base_hi = user(1);
+  const auto offset = user(2);
+  auto low = Value(&block.AppendNewInst(ValueOpcode::IAdd32, {base_lo, offset}));
+  const auto carry = Value(&block.AppendNewInst(ValueOpcode::ULessThan32, {low, base_lo}));
+  const auto carried =
+      Value(&block.AppendNewInst(ValueOpcode::SelectU32, {carry, Value(1u), Value(0u)}));
+  const auto high_sum = Value(&block.AppendNewInst(ValueOpcode::IAdd32, {base_hi, Value(0u)}));
+  const auto high = Value(&block.AppendNewInst(ValueOpcode::IAdd32, {high_sum, carried}));
+  if (guarded) {
+    const auto guard =
+        Value(&block.AppendNewInst(ValueOpcode::ULessThanEqual32, {user(3), Value(5u)}));
+    low = Value(&block.AppendNewInst(ValueOpcode::SelectU32, {guard, low, low}));
+  }
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarAddress;
+  memory.planning_only = true;
+  memory.offset = 4;
+  program.memory_info.push_back(memory);
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {low, high});
+  auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                  {Value(&handle), Value(0u), Value(0u), Value(true)});
+  raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+  program.srt_reads.push_back({Value(&raw), 0});
+  return ExtractResourcePlan(program);
+}
+
+// The carry form re-derives on replay, including a carry that flips, so the pointer never pins.
+void TestMaterializeMemoCarryAddress() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto &memory = g_memo_memory;
+  memory.table_a = {1, 0x1111, 2, 3};
+  memory.table_b = {4, 0x2222, 5, 6};
+  const auto a = reinterpret_cast<uint64_t>(memory.table_a.data());
+  const auto b = reinterpret_cast<uint64_t>(memory.table_b.data());
+  Check(Low(a) >= 0x10u && Low(b) <= 0xffffffefu,
+        "the carry test needs table addresses away from a 4 GiB boundary");
+  std::array<uint32_t, 4> user_data{};
+  // No carry: a = (hi, lo - 0x10) + 0x10. Carry: b = (hi - 1, lo + 0x10) + 0xfffffff0.
+  const auto plain = [&](uint64_t address) {
+    user_data = {Low(address) - 0x10u, High(address), 0x10u, user_data[3]};
+  };
+  const auto carrying = [&](uint64_t address) {
+    user_data = {Low(address) + 0x10u, High(address) - 1u, 0xfffffff0u, user_data[3]};
+  };
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = MemoRead,
+                           .read_specialization_memory = MemoRead};
+  const auto same_as_walk = [&](const ResourcePlan &plan, const ResourceSnapshot &replayed) {
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    return MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+           fresh.flattened_srt == replayed.flattened_srt && fresh.user_data == replayed.user_data;
+  };
+  {
+    const auto plan = MemoCarryPlan(false);
+    MaterializeMemo memo;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    plain(a);
+    Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{0x1111},
+          "the carry-form pointer read the wrong word");
+    memo.Commit(plan, snapshot, specialization);
+    Check(memo.Valid(), "the carry-form plan was not memoized");
+    carrying(b);
+    Check(memo.Replay(plan, runtime, snapshot) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{0x2222} &&
+              same_as_walk(plan, snapshot),
+          "a carry-form pointer whose carry flips pinned or replayed wrong");
+    plain(b);
+    Check(memo.Replay(plan, runtime, snapshot) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{0x2222} &&
+              same_as_walk(plan, snapshot),
+          "a carry-form pointer without a carry did not relocate");
+    carrying(a);
+    Check(memo.Replay(plan, runtime, snapshot) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{0x1111} &&
+              same_as_walk(plan, snapshot),
+          "a carry-form pointer moved back did not relocate");
+  }
+  // A pinned predicate costs only a miss: the next walk records and replays like the first.
+  {
+    const auto plan = MemoCarryPlan(true);
+    MaterializeMemo memo;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    user_data[3] = 1u;
+    plain(a);
+    Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization),
+          "the guarded carry plan did not materialize");
+    memo.Commit(plan, snapshot, specialization);
+    Check(memo.Valid() && memo.Replay(plan, runtime, snapshot),
+          "an unchanged guarded pointer missed");
+    carrying(b);
+    Check(!memo.Replay(plan, runtime, snapshot),
+          "a pointer behind a pinned predicate replayed after it moved");
+    Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{0x2222},
+          "the guarded carry plan did not walk after a miss");
+    memo.Commit(plan, snapshot, specialization);
+    Check(memo.Valid() && memo.Replay(plan, runtime, snapshot) && same_as_walk(plan, snapshot),
+          "a re-recorded guarded pointer did not replay like a walk");
+    user_data[3] = 0u;
+  }
+}
+
+// One scalar constant-buffer read at byte 8 of the V# s[0:3]; s2 is its size in bytes.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MemoBoundedReadPlan() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  std::array<Value, 4> words;
+  for (uint32_t i = 0; i < 4; i++) {
+    words[i] = Value(
+        &block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(i))}));
+  }
+  auto &handle = block.AppendNewInst(ValueOpcode::GetBufferResource,
+                                     {words[0], words[1], words[2], words[3]});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarBuffer;
+  memory.planning_only = true;
+  memory.offset = 8;
+  program.memory_info.push_back(memory);
+  auto &raw = block.AppendNewInst(ValueOpcode::ReadConstBuffer, {Value(&handle), Value(0u)});
+  raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+  program.srt_reads.push_back({Value(&raw), 0});
+  return ExtractResourcePlan(program);
+}
+
+// A read past its descriptor reads 0; a replay that moves inside or out of it misses.
+void TestMaterializeMemoZeroRead() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto &memory = g_memo_memory;
+  memory.table_a = {1, 0x1111, 0x7777, 3};
+  memory.table_b = {4, 0x2222, 0x8888, 6};
+  const auto a = reinterpret_cast<uint64_t>(memory.table_a.data());
+  const auto b = reinterpret_cast<uint64_t>(memory.table_b.data());
+  std::array<uint32_t, 4> user_data{};
+  const auto bind = [&](uint64_t address, uint32_t bytes) {
+    user_data = {Low(address), High(address) & 0xffffu, bytes, 0u};
+  };
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = MemoRead,
+                           .read_specialization_memory = MemoRead};
+  const auto same_as_walk = [&](const ResourcePlan &plan, const ResourceSnapshot &replayed) {
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    return MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+           fresh.flattened_srt == replayed.flattened_srt && fresh.user_data == replayed.user_data;
+  };
+  const auto plan = MemoBoundedReadPlan();
+  MaterializeMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto record = [&] {
+    Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization),
+          "the bounded read did not materialize");
+    memo.Commit(plan, snapshot, specialization);
+    Check(memo.Valid(), "the bounded read was not memoized");
+  };
+  bind(a, 8u);
+  record();
+  Check(snapshot.flattened_srt == std::vector<uint32_t>{0u}, "a read past its V# did not read 0");
+  bind(b, 4u);
+  Check(memo.Replay(plan, runtime, snapshot) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0u} && same_as_walk(plan, snapshot),
+        "a read that stays outside its moved V# did not replay as 0");
+  bind(b, 16u);
+  Check(!memo.Replay(plan, runtime, snapshot),
+        "a read that moved inside its V# replayed the 0 it read outside");
+  record();
+  Check(snapshot.flattened_srt == std::vector<uint32_t>{0x8888u},
+        "an in-range bounded read read the wrong word");
+  bind(a, 12u);
+  Check(memo.Replay(plan, runtime, snapshot) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0x7777u} &&
+            same_as_walk(plan, snapshot),
+        "an in-range read in a moved V# did not relocate");
+  bind(a, 11u);
+  Check(!memo.Replay(plan, runtime, snapshot),
+        "a read that left its V# replayed a word instead of 0");
+}
+
 } // namespace
 
 namespace Common {
@@ -1675,8 +2541,17 @@ int main() {
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestUnboundBufferSpecialization();
   TestUnboundImageSpecialization();
+  TestFrozenPhiPlansWalkLikeTheProgram();
   TestDeepChainPlanExtraction();
   TestRefusalKeepsSpecialization();
+  TestShaderReadCache();
+  TestMaterializeMemo();
+  TestMaterializeMemoGpuOwnedDataSlot();
+  TestMaterializeMemoExtensions();
+  TestMaterializeMemoBackoff();
+  TestMaterializeMemoDescriptorPatch();
+  TestMaterializeMemoCarryAddress();
+  TestMaterializeMemoZeroRead();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

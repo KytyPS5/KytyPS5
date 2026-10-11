@@ -67,6 +67,11 @@ std::string_view LastMaterializeFailure();
 // Refreshes cached resources and specialization. A refusal leaves the specialization untouched.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+bool               RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                          ResourceSpecialization& specialization);
+[[nodiscard]] bool ReadOverlapsWrittenBuffer(const ResourcePlan&     program,
+                                             const ResourceSnapshot& snapshot, uint64_t address,
+                                             uint64_t bytes);
 [[nodiscard]] bool SpecializationServes(const ResourceSpecialization& built,
                                         const ResourceSpecialization& wanted);
 void               InheritUnboundShapes(std::span<const ResourceSpecialization* const> donors,

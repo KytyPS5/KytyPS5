@@ -68,6 +68,29 @@ private:
 	uint32_t m_saved;
 };
 
+class RawReadEventScope {
+public:
+	explicit RawReadEventScope(const RawReadEvent& event): m_saved(g_raw_read_event) {
+		g_raw_read_event = &event;
+	}
+	~RawReadEventScope() { g_raw_read_event = m_saved; }
+	RawReadEventScope(const RawReadEventScope&)            = delete;
+	RawReadEventScope& operator=(const RawReadEventScope&) = delete;
+
+private:
+	const RawReadEvent* m_saved;
+};
+
+} // namespace
+
+uint32_t CurrentSrtReadSlot() {
+	return g_srt_read_slot;
+}
+
+const RawReadEvent* CurrentRawReadEvent() {
+	return g_raw_read_event;
+}
+
 std::string_view SrtRefusalName(SrtRefusal reason) {
 	switch (reason) {
 		case SrtRefusal::None: return "no recorded reason";
@@ -1333,6 +1356,8 @@ bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint6
 		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
 	}
 	return Refuse(SrtRefusal::UnsupportedOperand);
+}
+
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes) {
 	RawReadShape shape;
 	if (!RawReadShapeOf(m_program, inst, component_bytes, shape)) {
@@ -1364,9 +1389,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t com
 		if (!Arg(*handle, 2, operands[3]) || !Arg(*handle, 3, operands[4])) return false;
 	}
 	uint64_t address = 0;
+	if (const auto refusal = RawReadAddressFrom(shape, operands, address, event.zero);
 	    refusal != SrtRefusal::None) {
 		return Refuse(refusal);
 	}
+	const RawReadEventScope event_scope(event);
 	if (event.zero) {
 		if (m_runtime.zero_read != nullptr) m_runtime.zero_read(m_runtime.userdata);
 		result = 0u;
@@ -2104,6 +2131,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWalker* conditions,
                                   std::vector<uint32_t>* gpu_owned_slots) {
+	m_refusal = SrtRefusal::None;
 	if (!m_program.srt_plan_complete) return false;
 	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
 		flat.resize(m_program.srt_reads.size());
@@ -2171,7 +2199,6 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWa
 			if (reachable.at(index)) continue;
 			reachable[index] = 1u;
 			const auto& block = m_program.control_flow[index];
-			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 			uint32_t    condition = 0;
 			if (!block.condition.IsEmpty() &&
 			    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&

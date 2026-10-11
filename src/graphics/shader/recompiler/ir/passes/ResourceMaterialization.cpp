@@ -1797,16 +1797,25 @@ static BufferCopy AnalyzeBufferCopy(const Program& program) {
 	return plan;
 }
 
-	auto& reads = snapshot.specialization_reads;
-	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
-	SrtWalker clean(program, CleanRuntime(observed));
 std::string_view LastMaterializeFailure() {
 	return MaterializeFailure();
 }
 
+bool ReadOverlapsWrittenBuffer(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                               uint64_t address, uint64_t bytes) {
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); ++i) {
+		if (!program.info.buffers[i].written) continue;
+		ShaderBufferResource buffer;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) continue;
+		const auto base = buffer.Base48();
+		const auto size = buffer.GetSize();
+		if (size != 0u && bytes != 0u && address < base + size && base < address + bytes) {
+			return true;
 		}
 	}
+	return false;
+}
+
 // Drops captured reads no write can precede; true when a refusable branch condition read remains.
 static bool CapturedReadsOverlapWrites(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                        std::vector<uint8_t>& conditions) {
@@ -1938,7 +1947,12 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 	SpecializationReadCapture capture {runtime, snapshot, conditions};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	SrtWalker clean(program, CleanRuntime(observed));
+	SrtWalker walker(program, observed,
+	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	static thread_local std::vector<uint32_t> gpu_owned_slots;
+	gpu_owned_slots.clear();
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, true, nullptr,
+	                              refused_tables != nullptr ? &gpu_owned_slots : nullptr)) {
 	std::array<uint32_t, 3> workgroup_counts {};
 	if (runtime.indirect_args_address != 0u) {
 		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
@@ -2107,24 +2121,57 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return true;
 }
 
+bool RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                            ResourceSpecialization& specialization) {
+	if (snapshot.buffers.size() != program.info.buffers.size() ||
 	    snapshot.images.size() < program.info.images.size() ||
 	    specialization.images.size() != snapshot.images.size() ||
+	    snapshot.samplers.size() != program.info.samplers.size()) {
+		return false;
+	}
+	specialization.buffers.assign(program.info.buffers.size(), {});
+	if (!SpecializeBuffers(program, snapshot, specialization)) return false;
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& image  = program.info.images[i];
+		const auto* source = Source(program, image.source);
+		if (source == nullptr) return false;
 		// Indirect tables are not replayed; a heap root keeps its kinds, which its replay acquires.
 		const bool indirect = source->indirect_descriptor.has_value();
 		const bool heap     = indirect && specialization.images[i].heap;
 		const auto mapping  = specialization.images[i].indirect_mapping_offset;
 		if (indirect && !heap) return false;
+		specialization.images[i] = {
+		    .numeric_class              = image.numeric_class,
+		    .dimension                  = image.dimension,
+		    .mip_count                  = image.mip_count,
+		    .conversion_format          = image.conversion_format,
+		    .shader_swizzle             = image.shader_swizzle,
+		    .indirect_root              = image.indirect_root,
+		    .indirect_mapping_offset    = image.indirect_mapping_offset,
+		    .indirect_search_iterations = image.indirect_search_iterations,
+		    .cube                       = image.cube,
+		};
 		if (heap) {
 			// As the heap hook leaves it before BuildResourceSpecialization.
 			specialization.images[i].indirect_root           = i;
 			specialization.images[i].indirect_mapping_offset = mapping;
 			specialization.images[i].heap                    = true;
 		}
+		if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+			snapshot.images[i].dwords.fill(0);
+		}
+	}
 	for (size_t i = program.info.images.size(); i < specialization.images.size(); ++i) {
 		const auto root = specialization.images[i].indirect_root;
 		if (root >= program.info.images.size() || !specialization.images[root].heap) return false;
 		specialization.images[i] = specialization.images[root];
 	}
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+		if (program.info.samplers[i].gather_lod && !ValidGatherLodSampler(snapshot.samplers[i])) {
+			return false;
+		}
+	}
+	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
 namespace {

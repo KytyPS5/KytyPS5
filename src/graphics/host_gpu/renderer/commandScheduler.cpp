@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/cpuAffinity.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -543,6 +544,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 
 void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
+	Common::PreferPerformanceCores("Vulkan recording thread");
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
 	// recycled only after the next two have run.
 	std::deque<std::unique_ptr<Chunk>> retained;

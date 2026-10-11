@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/cpuAffinity.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -531,6 +532,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::PreferPerformanceCores("GPU thread");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 

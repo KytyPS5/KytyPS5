@@ -30,10 +30,16 @@ public:
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Single GPU-thread consumer. Hints do not replace the locked page ownership checks.
+	/// Drains coarse hints into regions on the single GPU consumer; preserves dirty bits.
+	/// Call outside upload callbacks and use locked ownership checks before copying.
 	void TakeCpuDirtyRegions(std::vector<GuestRange>& regions);
 	// A new/expanded native buffer also needs its untouched CPU-owned pages examined.
+	/// Queues a valid nonempty range without modifying its page ownership.
+	/// Safe for concurrent producers, including buffer registration and remapping.
 	void QueueCpuDirtyRange(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
+	/// Makes tracked bytes CPU-writable, flushing GPU-owned data through on_flush.
+	/// The callback must perform the CPU ownership transition after publishing the data.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
@@ -152,7 +158,8 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
-	void           QueueCpuDirtyRegion(uint64_t index) noexcept;
+	/// Publishes one region index into the fixed atomic hierarchy without allocation.
+	void QueueCpuDirtyRegion(uint64_t index) noexcept;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_dirty_words;

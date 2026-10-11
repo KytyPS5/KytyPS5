@@ -29,6 +29,7 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 } // namespace
 
+/// Copies CPU source data into a device buffer using staging storage and barriers.
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
 	auto* bytes = static_cast<const uint8_t*>(source);
@@ -70,6 +71,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
+/// Indexes a native buffer and queues its full span for initial CPU-data inspection.
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
 	const auto& buffer = m_slot_buffers[id];
@@ -80,6 +82,7 @@ void BufferCache::Unregister(BufferId id) {
 	ChangeRegister<false>(id);
 }
 
+/// Adds or removes the buffer from guest-address, page, and BDA lookup structures.
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto&                buffer = m_slot_buffers[id];
@@ -138,6 +141,9 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+/// Records copies of GPU-owned bytes to host storage and publishes their backing data.
+/// Synchronous calls finish before returning; asynchronous callers must wait before
+/// reusing the downloaded data. Returns false when there are no dirty bytes to copy.
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
@@ -312,6 +318,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
+/// Finds buffers to merge and expands the allocation bounds for growing streams.
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
 	static constexpr int      StreamLeapThreshold = 16;
 	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
@@ -379,6 +386,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	DeleteBuffer(overlap_id);
 }
 
+/// Allocates the resolved guest span, merges overlapping buffers, and registers it.
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end     = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
@@ -401,6 +409,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+/// Uploads CPU-dirty bytes with transfer barriers and tracks requested GPU writes.
+/// Read-only texel buffers may also synchronize from images; the return value
+/// reports image synchronization rather than whether a CPU upload was recorded.
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	std::vector<vk::BufferCopy> copies;
@@ -445,6 +456,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+/// Stages the selected guest bytes and updates copy offsets to the staging allocation.
+/// Returns no handle for an empty copy list; temporary storage survives GPU completion.
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
@@ -508,6 +521,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+/// Returns coherent buffer storage and offset for an image source.
+/// Reuses a cached owner when available, otherwise stages mapped sparse backing.
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -561,6 +576,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+/// Records an ordered copy between guest or GDS ranges and tracks destination writes.
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	const bool dst_memory = !dst_gds;
@@ -621,6 +637,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+/// Retires aged buffers under memory pressure, downloading dirty data before release.
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -680,6 +697,9 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+/// Consumes region hints and uploads only their intersections with mapped ranges.
+/// Requires GPU-thread serialization and a stable mapped-range view from the caller.
+/// Hints are advisory: SynchronizeBuffer still checks authoritative page ownership.
 void BufferCache::SynchronizeCpuDirtyBuffers(const RangeSet& mapped_ranges) {
 	m_memory_tracker.TakeCpuDirtyRegions(m_bda_dirty_regions);
 	for (const auto& region: m_bda_dirty_regions) {

@@ -458,6 +458,7 @@ void TestCleanUploadPreservesOwnership() {
   Release(memory);
 }
 
+/// Checks dirty-hint publication, deduplication, draining, and preserved page ownership.
 void TestCpuDirtyWorklist() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -498,6 +499,7 @@ void TestCpuDirtyWorklist() {
   Release(memory);
 }
 
+/// Compares clean upload scanning with empty dirty-worklist consumption; not an FPS test.
 void BenchmarkCleanUploads() {
   constexpr uint64_t size = 256ull * 1024 * 1024;
   TrackerHarness harness;
@@ -1245,6 +1247,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 } // namespace Libs::LibKernel::Memory
 
+/// Runs memory-tracker regression cases or the requested clean-upload microbenchmark.
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);

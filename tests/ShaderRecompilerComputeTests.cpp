@@ -2374,6 +2374,7 @@ public:
             "shutdown lost reentrant or concurrent deferred work");
     std::printf("[host]    %-32s ok\n", "SchedulerTimeline");
   }
+  /// Checks BDA uploads after registration, clean passes, CPU rewrites, and remapping.
   void CheckBdaDirtyWorklist() {
     constexpr const char* name = "BdaDirtyWorklist";
     constexpr uint64_t base = 0x0000000205800000ull;
@@ -42921,6 +42922,7 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+/// Runs the selected standalone shader/GPU regression case or the complete harness.
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 

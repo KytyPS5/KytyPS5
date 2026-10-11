@@ -87,12 +87,15 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+/// Publishes mapped guest bytes and requeues them for BDA inspection under the map lock.
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	m_buffer_cache.QueueMappedRange(vaddr, size);
 }
 
+/// Drains conflicting GPU work, invalidates caches, and removes mapped guest bytes.
+/// Runs cache ownership transitions on the GPU command lane when it is active.
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
@@ -123,6 +126,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+/// Uploads queued CPU-owned buffer regions before BDA shader access.
+/// Holds the mapped-range read lock and schedules fault processing for cleanup.
 void RenderContext::PrepareBda() {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");

@@ -9,6 +9,7 @@ namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
+/// Initializes region ownership tracking and the fixed CPU-dirty hint bitmaps.
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions          = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	m_cpu_dirty_words  = std::make_unique<std::atomic<uint64_t>[]>(DIRTY_WORD_COUNT);
@@ -17,6 +18,9 @@ MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_man
 
 MemoryTracker::~MemoryTracker() = default;
 
+/// Publishes a region hint without allocating or changing page ownership.
+/// Producers publish leaf bits before summary bits and the pending flag; a racing
+/// consumer may perform an extra pass, while late publication remains discoverable.
 void MemoryTracker::QueueCpuDirtyRegion(uint64_t index) noexcept {
 	const auto word = index / 64;
 	m_cpu_dirty_words[word].fetch_or(uint64_t {1} << (index % 64), std::memory_order_release);
@@ -24,6 +28,8 @@ void MemoryTracker::QueueCpuDirtyRegion(uint64_t index) noexcept {
 	m_cpu_dirty_pending.store(true, std::memory_order_release);
 }
 
+/// Queues every tracker region intersecting a valid, nonempty guest range.
+/// Concurrent producers may use this to request inspection of newly available data.
 void MemoryTracker::QueueCpuDirtyRange(uint64_t vaddr, uint64_t size) {
 	ValidateRange(vaddr, size);
 	const auto end = (vaddr + size - 1) / TRACKER_REGION_SIZE;
@@ -32,6 +38,10 @@ void MemoryTracker::QueueCpuDirtyRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+/// Replaces regions with the queued coarse ranges for the single GPU-thread consumer.
+/// Exchanges consume hints before uploads; concurrent producers can publish another
+/// pass. Locked page ownership checks remain authoritative and are not cleared here.
+/// Must not be called from an upload callback or concurrently by multiple consumers.
 void MemoryTracker::TakeCpuDirtyRegions(std::vector<GuestRange>& regions) {
 	CheckNotInUploadCallback();
 	regions.clear();
@@ -91,6 +101,7 @@ void MemoryTracker::ValidateRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+/// Publishes a new region under the creation mutex and queues its initial CPU data.
 RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
 		return manager;
@@ -123,6 +134,7 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+/// Marks pages CPU-owned under their region locks and publishes dirty-region hints.
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -148,6 +160,8 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+/// Releases tracked page protection after checking that no GPU-owned data remains.
+/// Queues the released CPU-owned regions so later BDA preparation can inspect them.
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::vector<RegionManager*> managers;

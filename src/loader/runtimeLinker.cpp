@@ -1281,6 +1281,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
 		    ~static_cast<uintptr_t>(0x0f));
 		std::memset(params, 0, params_size);
+		// Titles expect main() to receive the program name in argv[0], as on hardware, and
+		// some shift argv[1..argc) when merging extra arguments, so argc must never be 0.
+		params->argv[params->argc++] = "KytyEmu";
 		for (const auto& argument: arguments) {
 			params->argv[params->argc++] = argument.c_str();
 		}

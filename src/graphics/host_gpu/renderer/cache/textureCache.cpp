@@ -130,6 +130,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
+	m_initial_pressure_gc_memory = m_pressure_gc_memory;
+	m_initial_critical_gc_memory = m_critical_gc_memory;
 }
 
 TextureCache::~TextureCache() {
@@ -1867,6 +1869,15 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		// The startup thresholds never go below 1.5 and 3 GiB, which on a 4 GB GPU is at or
+		// above the whole budget: the aggressive pass would only start after allocations fail.
+		// The budget also moves at run time with other processes, so keep both thresholds
+		// within the current one.
+		const auto         budget = m_graphics.GetTotalMemoryBudget();
+		constexpr uint64_t step   = 512ull * 1024 * 1024;
+		m_critical_gc_memory      = std::min(m_initial_critical_gc_memory, budget);
+		m_pressure_gc_memory =
+		    std::min(m_initial_pressure_gc_memory, budget > 2 * step ? budget - step : budget / 2);
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

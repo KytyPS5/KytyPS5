@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/perVertexVsStoreRuntime.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -644,6 +645,8 @@ struct DrawIndexBufferSource {
 struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
 	vk::DeviceSize offset = 0;
+	vk::DeviceSize size =
+	    0; // bytes of `buffer` (the descriptor of the VS-store draw must stay inside)
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
@@ -950,13 +953,22 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	prepared.type = source.type;
 	if (source.host_data != nullptr) {
 		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		prepared.offset = stream.Copy(source.host_data, source.size, 16);
+		// Reserved to a whole word (the VS-store PS reads uint32 words); the pad is zeroed.
+		const uint64_t reserved = (source.size + 3u) & ~uint64_t {3};
+		auto [mapped, offset]   = stream.Map(reserved, 16);
+		EXIT_IF(mapped == nullptr);
+		std::memcpy(mapped, source.host_data, static_cast<size_t>(source.size));
+		std::memset(mapped + source.size, 0, static_cast<size_t>(reserved - source.size));
+		stream.Commit();
+		prepared.offset = offset;
 		prepared.buffer = stream.Handle();
+		prepared.size   = stream.Size();
 	} else {
 		auto [buffer_ptr, offset] =
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
+		prepared.size   = buffer_ptr->Size();
 	}
 	return prepared;
 }
@@ -1092,6 +1104,135 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// ---- VS-store path (PerVertexKHR emulation, see perVertexVsStore.h) ----
+bool RenderExecutor::TryPvVsStoreDraw(const DrawCallInfo& draw, const DrawRenderState& state,
+                                      vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                      const DrawEmitInfo&          emit,
+                                      const DrawIndexBufferSource& index_source,
+                                      PvVsStoreDrawSetup&          setup) {
+	if (!state.ps_active || state.vertex_info[0].logical_stage != ShaderType::Vertex ||
+	    state.vertex_info[0].stage.program->stage == ShaderType::Mesh)
+		return false;
+	auto&       graphics = m_context.GetGraphics();
+	const auto* programs = GetPvVsStorePrograms(graphics, state.programs);
+	if (programs == nullptr) return false; // not a per-vertex pair the store knows
+	if (programs->verdict != PvVsStoreInterfaceVerdict::Use) {
+		// A PS whose per-vertex inputs are never read (NoPerVertex) is not a fallback: nothing to
+		// count.
+		if (const auto fallback = ClassifyPvVsStoreFallback(programs->verdict);
+		    fallback != PvVsStoreFallback::None)
+			CountPvVsStoreDraw(fallback);
+		return false;
+	}
+	const uint32_t element_size =
+	    index_source.host_data != nullptr ? sizeof(uint16_t) : index_source.guest_element_size;
+
+	PvVsStoreRequest request;
+	request.enabled            = true;
+	request.triangle_list      = topology == vk::PrimitiveTopology::eTriangleList;
+	request.indexed            = draw.IsIndexed();
+	request.primitive_restart  = primitive_restart_enable;
+	request.index_size         = draw.IsIndexed() ? element_size : 0;
+	request.index_count        = draw.index_count;
+	request.instance_count     = draw.instance_count;
+	request.record_stride_vec4 = programs->stride_vec4;
+	const bool scannable = request.triangle_list && request.indexed && !primitive_restart_enable &&
+	                       (element_size == 2 || element_size == 4) && index_source.size != 0 &&
+	                       index_source.size >= uint64_t {draw.index_count} * element_size;
+	if (scannable) {
+		const void* idx_bytes = index_source.host_data != nullptr
+		                            ? index_source.host_data
+		                            : reinterpret_cast<const void*>(index_source.address);
+		const auto  range =
+		    ScanPvVsStoreVertexRange(idx_bytes, element_size, draw.index_count, emit.vertex_offset);
+		PvVsStoreStatsRef().scanned_indices.fetch_add(draw.index_count, std::memory_order_relaxed);
+		request.range_known   = range.known;
+		request.range_dropped = range.dropped;
+		request.range_first   = range.first;
+		request.range_end     = range.end;
+	}
+	// A storage descriptor is bound from an aligned offset and the difference becomes first_index;
+	// the guest address decides the offset modulo the element size, so an odd one stays on
+	// PerVertexKHR.
+	const bool index_aligned = element_size == 0 || index_source.host_data != nullptr ||
+	                           index_source.address % element_size == 0;
+	// The descriptor of the index buffer must stay inside the buffer the cache hands out (its end
+	// is not ours to choose): obtain the binding now (the draw obtains the same range again) and
+	// ask whether the last word the PS reads fits. A host copy is padded to a whole word in
+	// PrepareIndexBuffer.
+	bool index_tail_fits = true;
+	if (index_aligned && scannable && index_source.host_data == nullptr) {
+		const auto [index_buffer, index_offset] =
+		    m_context.GetBufferCache().ObtainBuffer(index_source.address, index_source.size, false);
+		index_tail_fits =
+		    PvVsStoreIndexDescriptorFor(index_offset, element_size, graphics.StorageMinAlignment(),
+		                                index_source.size, index_buffer->Size())
+		        .tail_fits;
+	}
+	if (!m_pv_vsstore)
+		m_pv_vsstore =
+		    std::make_shared<PvVsStoreRuntime>(graphics, m_context.GetCommandScheduler());
+	PvVsStoreRuntime::Region region;
+	const auto               decision = DecidePvVsStore(
+	    programs->verdict, request, index_aligned,
+	    [&](const PvVsStorePlan& plan) {
+		    region = m_pv_vsstore->Place(plan.records, programs->stride_vec4);
+		    return region.ok;
+	    },
+	    index_tail_fits);
+	CountPvVsStoreDraw(decision.fallback);
+	if (!decision.use) return false;
+	const auto& plan = decision.plan;
+	PvVsStoreStatsRef().records.fetch_add(plan.records, std::memory_order_relaxed);
+	if (draw.instance_count > 1)
+		PvVsStoreStatsRef().instanced_draws.fetch_add(1, std::memory_order_relaxed);
+	setup.programs            = programs;
+	setup.index_element_size  = element_size;
+	setup.region              = region;
+	setup.draw.base           = region.base_record;
+	setup.draw.span           = plan.span;
+	setup.draw.first          = plan.first;
+	setup.draw.first_instance = emit.first_instance;
+	setup.draw.first_index    = 0; // set once the index buffer is bound (alignment)
+	setup.draw.vertex_offset  = emit.vertex_offset;
+	setup.draw.index32        = element_size == 4;
+	return true;
+}
+
+// Binds set 1 (cap slab + index buffer) and pushes the VS-store block; the pipeline of the draw is
+// the one made from setup.programs, so its layout has both.
+static void BindPvVsStore(RenderContext& context, vk::CommandBuffer vk_buffer,
+                          const PipelineCache::Pipeline& pipeline, PvVsStoreDrawSetup& setup,
+                          const PreparedIndexBuffer&   index_binding,
+                          const DrawIndexBufferSource& index_source) {
+	auto&      graphics = context.GetGraphics();
+	const auto desc = PvVsStoreIndexDescriptorFor(index_binding.offset, setup.index_element_size,
+	                                              graphics.StorageMinAlignment(), index_source.size,
+	                                              index_binding.size);
+	EXIT_IF(!desc.ok || index_binding.buffer == nullptr);
+	setup.draw.first_index = desc.first_index;
+	const vk::DescriptorBufferInfo infos[] {
+	    {setup.region.buffer, 0, setup.region.buffer_size},
+	    {index_binding.buffer, desc.offset, desc.range},
+	};
+	const auto             set = context.GetDescriptorHeap().Commit(PvVsStoreSetLayout(graphics));
+	vk::WriteDescriptorSet writes[2] {};
+	for (uint32_t i = 0; i < 2; ++i) {
+		writes[i].dstSet          = set;
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[i].pBufferInfo     = &infos[i];
+	}
+	graphics.device.updateDescriptorSets(2, writes, 0, nullptr);
+	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 1, 1,
+	                             &set, 0, nullptr);
+	const auto block = PvVsStorePushBlock(setup.draw, setup.programs->stride_vec4);
+	vk_buffer.pushConstants(pipeline.pipeline_layout,
+	                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+	                        PvVsStorePushOffset(), sizeof(block), block.data());
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1140,6 +1281,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	PvVsStoreDrawSetup pv_store;
+	const bool use_pv_store = !mesh_active && PvVsStoreEnabled() &&
+	                          TryPvVsStoreDraw(draw, state, topology, primitive_restart_enable,
+	                                           emit, index_source, pv_store);
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1168,7 +1313,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    use_pv_store ? pv_store.programs->graphics : state.programs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1188,6 +1333,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
+		if (use_pv_store) {
+			m_pv_vsstore->Touch(pv_store.region);
+			BindPvVsStore(m_context, vk_buffer, pipeline, pv_store, index_binding, index_source);
+		}
 	}
 	const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, state.ps_input_info.object_primitive_id);

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -31,6 +32,8 @@ struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
+class PvVsStoreRuntime;
+struct PvVsStoreDrawSetup;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -190,6 +193,13 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	// True when the draw takes the VS-store path (fills `setup`); counts the fallback reason
+	// otherwise.
+	[[nodiscard]] bool TryPvVsStoreDraw(const DrawCallInfo& draw, const DrawRenderState& state,
+	                                    vk::PrimitiveTopology topology,
+	                                    bool primitive_restart_enable, const DrawEmitInfo& emit,
+	                                    const DrawIndexBufferSource& index_source,
+	                                    PvVsStoreDrawSetup&          setup);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -209,6 +219,7 @@ private:
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
+	std::shared_ptr<PvVsStoreRuntime>     m_pv_vsstore; // created on the first VS-store draw
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

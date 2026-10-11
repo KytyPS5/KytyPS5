@@ -193,6 +193,28 @@ struct BufferCacheTestAccess {
     return cache.m_download_buffer;
   }
 
+  static void SetGuestRetryAsync(BufferCache &cache, bool enabled) {
+    cache.m_guest_retry_async = enabled;
+  }
+
+  using GuestDownload = BufferCache::GuestDownload;
+
+  static bool BeginGuestDownload(BufferCache &cache, uint64_t address, uint64_t size,
+                                 GuestDownload &download) {
+    auto &buffer = cache.m_slot_buffers[cache.FindBuffer(address, size)];
+    return cache.BeginGuestDownload(buffer, address, size, download);
+  }
+
+  static void NoteGuestFault(BufferCache &cache, uint64_t address, uint64_t size) {
+    cache.NoteGuestFault(address, size);
+  }
+
+  static void FinishGuestDownload(BufferCache &cache, GuestDownload &download,
+                                  uint64_t address, uint64_t size) {
+    cache.m_scheduler.WaitDetached({download.slot, download.fence});
+    cache.FinishGuestDownload(download, address, size, false);
+  }
+
   static void SetUnusedStagingBufferSize(BufferCache &cache, uint64_t size) {
     // Called immediately after cache construction, before any staging reservation.
     std::destroy_at(&cache.m_staging_buffer);
@@ -5018,10 +5040,14 @@ public:
     constexpr uint64_t submitted_offset = 0x1000;
     constexpr uint64_t recording_offset = 0x2000;
     constexpr uint64_t joined_offset = 0x40100;
+    constexpr uint64_t guest_offset = 0x80000;
+    constexpr uint64_t hot_offset = 0xc0000;
+    constexpr uint32_t hot_value = 0x2468ace0u;
     constexpr uint32_t stale = 0x0badf00du;
     constexpr uint32_t submitted_value = 0x11223344u;
     constexpr uint32_t recording_value = 0x55667788u;
     constexpr uint32_t joined_value = 0x99aabbccu;
+    constexpr uint32_t guest_value = 0x13572468u;
 
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -5045,6 +5071,8 @@ public:
                 allocation_alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
             "detached-download fixed direct-memory mapping failed");
+    for (const auto offset :
+         {submitted_offset, recording_offset, joined_offset, guest_offset, hot_offset}) {
       std::memcpy(static_cast<uint8_t *>(mapped) + offset, &stale, sizeof(stale));
     }
     {
@@ -5098,6 +5126,112 @@ public:
       Require(name, "joined owner drains",
               backing(joined_offset) == joined_value && scheduler.CurrentTick() > joined,
               "a buffer joined in the recording in progress was downloaded before the join");
+
+      // A guest fault's copy is waited for off the GPU thread and published by it afterwards.
+      write_on_gpu(guest_offset, guest_value);
+      scheduler.Flush();
+      const auto guest_recording = scheduler.CurrentTick();
+      BufferCacheTestAccess::GuestDownload guest_download;
+      Require(name, "guest download submits",
+              BufferCacheTestAccess::BeginGuestDownload(cache, base + guest_offset,
+                                                        sizeof(guest_value), guest_download),
+              "a page a submitted batch wrote was not downloaded detached");
+      BufferCacheTestAccess::FinishGuestDownload(cache, guest_download, base + guest_offset,
+                                                 sizeof(guest_value));
+      Require(name, "guest download publishes",
+              backing(guest_offset) == guest_value &&
+                  scheduler.CurrentTick() == guest_recording &&
+                  !cache.HasGpuDirtyBytes(base + guest_offset, sizeof(guest_value)),
+              "a guest download did not publish its page or drained the recording");
+
+      // Written again while the copy was in flight: the older bytes must not land.
+      write_on_gpu(guest_offset, guest_value + 1u);
+      scheduler.Flush();
+      BufferCacheTestAccess::GuestDownload overtaken;
+      Require(name, "overtaken download submits",
+              BufferCacheTestAccess::BeginGuestDownload(cache, base + guest_offset,
+                                                        sizeof(guest_value), overtaken),
+              "a rewritten page was not downloaded detached");
+      write_on_gpu(guest_offset, guest_value + 2u);
+      BufferCacheTestAccess::FinishGuestDownload(cache, overtaken, base + guest_offset,
+                                                 sizeof(guest_value));
+      Require(name, "overtaken download keeps GPU ownership",
+              backing(guest_offset) == guest_value &&
+                  cache.HasGpuDirtyBytes(base + guest_offset, sizeof(guest_value)),
+              "a copy older than the newest GPU write was published over it");
+      cache.ReadMemory(base + guest_offset, sizeof(guest_value));
+      Require(name, "overtaken page drains",
+              backing(guest_offset) == guest_value + 2u &&
+                  !cache.HasGpuDirtyBytes(base + guest_offset, sizeof(guest_value)),
+              "the rewritten page did not read back its newest bytes");
+
+      write_on_gpu(guest_offset, guest_value + 3u);
+      scheduler.Flush();
+      BufferCacheTestAccess::GuestDownload late;
+      BufferCacheTestAccess::GuestDownload early;
+      Require(name, "racing downloads submit",
+              BufferCacheTestAccess::BeginGuestDownload(cache, base + guest_offset,
+                                                        sizeof(guest_value), late) &&
+                  BufferCacheTestAccess::BeginGuestDownload(cache, base + guest_offset,
+                                                            sizeof(guest_value), early),
+              "two faults on one GPU-written page were not both downloaded detached");
+      BufferCacheTestAccess::FinishGuestDownload(cache, early, base + guest_offset,
+                                                 sizeof(guest_value));
+      constexpr uint32_t guest_write = 0x600dc0deu;
+      Libs::LibKernel::Memory::WriteBacking(base + guest_offset, &guest_write,
+                                            sizeof(guest_write));
+      BufferCacheTestAccess::FinishGuestDownload(cache, late, base + guest_offset,
+                                                 sizeof(guest_value));
+      Require(name, "late download keeps the guest write",
+              backing(guest_offset) == guest_write,
+              "a second fault's older copy was published over a guest write");
+
+      const auto settle = [&] {
+        const auto tick = scheduler.CurrentTick();
+        scheduler.Flush();
+        scheduler.GetMasterSemaphore().Wait(tick);
+        scheduler.PopPendingOperations();
+      };
+      write_on_gpu(hot_offset, hot_value);
+      scheduler.Flush();
+      cache.ReadMemory(base + hot_offset, sizeof(hot_value));
+      BufferCacheTestAccess::NoteGuestFault(cache, base + hot_offset, sizeof(hot_value));
+      write_on_gpu(hot_offset, hot_value + 1u);
+      settle();
+      Require(name, "hot page settles without a fault",
+              backing(hot_offset) == hot_value + 1u &&
+                  !cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)) &&
+                  !cache.IsRegionGpuModified(base + hot_offset, sizeof(hot_value)),
+              "a GPU write to a page the guest faulted on was not published at completion");
+
+      // Written again before the copy completed: the older copy must not land.
+      write_on_gpu(hot_offset, hot_value + 2u);
+      scheduler.Flush();
+      const auto overtaken_tick = scheduler.CurrentTick() - 1u;
+      write_on_gpu(hot_offset, hot_value + 3u);
+      scheduler.GetMasterSemaphore().Wait(overtaken_tick);
+      scheduler.PopPendingOperations();
+      Require(name, "overtaken hot copy stays unpublished",
+              backing(hot_offset) == hot_value + 1u &&
+                  cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)),
+              "a hot-page copy older than the newest GPU write was published");
+      settle();
+      Require(name, "overtaken hot page settles",
+              backing(hot_offset) == hot_value + 3u &&
+                  !cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)),
+              "the rewritten hot page did not publish its newest bytes");
+
+      write_on_gpu(hot_offset, hot_value + 4u);
+      scheduler.Flush();
+      const auto joined_tick = scheduler.CurrentTick() - 1u;
+      (void)cache.FindBuffer(base + hot_offset - 0x8100, 0x20000);
+      scheduler.GetMasterSemaphore().Wait(joined_tick);
+      scheduler.PopPendingOperations();
+      settle();
+      Require(name, "join-overtaken hot page settles",
+              backing(hot_offset) == hot_value + 4u &&
+                  !cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)),
+              "a hot page overtaken by a join was not copied again");
 
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -5802,10 +5936,12 @@ public:
       cache.FillBuffer(base + ring_fault_second_offset,
                        sizeof(ring_fault_second_value), ring_fault_second_value,
                        false);
+      BufferCacheTestAccess::SetGuestRetryAsync(cache, false);
       Require(name, "fault-ring wrapped batch",
               resources.HandleFault(PageFaultAccess::Read,
                                     base + ring_fault_first_offset),
               "fault readback could not wrap a live download-ring tick");
+      BufferCacheTestAccess::SetGuestRetryAsync(cache, true);
       // Both disjoint writes on the faulting page share one wrapped batch.
       uint64_t expected_packing_offset = 2 * 64;
       uint64_t expected_packing_alignment = 1;

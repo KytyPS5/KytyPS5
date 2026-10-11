@@ -16,7 +16,9 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <set>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -166,6 +168,43 @@ private:
 	void                   PruneGpuWriteMarks();
 	// Downloads without submitting the recording in progress; false leaves all state unchanged.
 	[[nodiscard]] bool TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	struct GuestDownload {
+		int                         slot  = -1;
+		vk::Fence                   fence = nullptr;
+		std::unique_ptr<Buffer>     staging;
+		std::vector<vk::BufferCopy> copies;
+		RangeSet                    pages;
+		uint64_t                    buffer_address = 0;
+		uint64_t                    wait           = 0;
+		size_t                      writes_start   = 0;
+	};
+	[[nodiscard]] bool BeginGuestDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                      GuestDownload& download);
+	void               NoteGuestFault(uint64_t vaddr, uint64_t size);
+	void               NoteHotWrite(uint64_t vaddr, uint64_t size);
+	void               RecordHotWriteBacks();
+	// One copied range of a hot write-back: guest address, offset in the staging buffer, bytes.
+	struct HotCopy {
+		uint64_t address = 0;
+		uint64_t staging = 0;
+		uint64_t size    = 0;
+	};
+	void PublishHotWriteBack(const std::vector<HotCopy>& copies, const uint8_t* mapped,
+	                         size_t writes_start);
+	// One submit's hot write-back, published once its recording has completed.
+	struct HotBatch {
+		uint64_t                tick = 0;
+		std::vector<HotCopy>    copies;
+		std::unique_ptr<Buffer> staging;
+		uint64_t                size         = 0;
+		size_t                  writes_start = 0;
+	};
+	void PublishCompletedHotWriteBacks(uint64_t max_tick = UINT64_MAX);
+	[[nodiscard]] size_t   OpenWriteLog();
+	[[nodiscard]] bool     WrittenSince(size_t start, uint64_t begin, uint64_t end) const;
+	void                   CloseWriteLog(size_t start);
+	void FinishGuestDownload(GuestDownload& download, uint64_t vaddr, uint64_t size, bool is_write);
+	[[nodiscard]] uint64_t PrepareDetachedDownload(uint64_t vaddr, uint64_t size);
 
 	struct PreciseWrite {
 		uint64_t                begin      = 0;
@@ -204,6 +243,16 @@ private:
 	RangeSet m_bda_pinned_ranges;
 	// Disjoint; a mark whose tick has completed no longer constrains anything and is pruned.
 	std::map<uint64_t, GpuWriteMark>          m_gpu_write_marks;
+	std::deque<std::pair<uint64_t, uint64_t>> m_guest_download_writes;
+	// Absolute index of the log's first entry, and the starts of every open user.
+	size_t                m_write_log_base = 0;
+	std::multiset<size_t> m_write_log_users;
+	bool                  m_guest_retry_async = true;
+	// Tracker page -> garbage-collection tick of the last guest fault on it.
+	std::unordered_map<uint64_t, uint64_t> m_guest_hot_pages;
+	// Hot pages the recording in progress wrote.
+	RangeSet             m_hot_written;
+	std::deque<HotBatch> m_hot_batches;
 	// A BDA store can reach any page, including ones no mark names yet.
 	uint64_t      m_bda_store_tick = 0;
 	MemoryTracker m_memory_tracker;

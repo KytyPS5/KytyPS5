@@ -53,6 +53,16 @@ public:
 	void WaitGuestWrites(uint64_t address, uint64_t size);
 	// Records into its own command buffer that waits only for `wait_tick`, already submitted.
 	void RunDetached(uint64_t wait_tick, Common::UniqueFunction<void, vk::CommandBuffer>&& record);
+	// Runs at the end of every recording, before it is submitted; it may record more commands.
+	void SetBeforeSubmit(Common::UniqueFunction<void>&& hook) { m_before_submit = std::move(hook); }
+	struct DetachedTicket {
+		int       slot  = -1;
+		vk::Fence fence = nullptr;
+	};
+	[[nodiscard]] DetachedTicket
+	SubmitDetached(uint64_t wait_tick, Common::UniqueFunction<void, vk::CommandBuffer>&& record);
+	void                      WaitDetached(const DetachedTicket& ticket);
+	void                      ReleaseDetached(const DetachedTicket& ticket);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -125,6 +135,14 @@ private:
 	vk::CommandPool                       m_detached_pool         = nullptr;
 	vk::CommandBuffer                     m_detached_buffer       = nullptr;
 	vk::Fence                             m_detached_fence        = nullptr;
+	Common::UniqueFunction<void>          m_before_submit;
+	bool                                  m_in_before_submit = false;
+	struct DetachedSlot {
+		vk::CommandBuffer command = nullptr;
+		vk::Fence         fence   = nullptr;
+		bool              busy    = false;
+	};
+	std::vector<DetachedSlot>  m_detached_slots;
 	OperationState             m_operation_state = OperationState::Open;
 	std::mutex                 m_stream_buffer_mutex;
 	std::vector<StreamBuffer*> m_stream_buffers;

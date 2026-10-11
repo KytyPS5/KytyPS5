@@ -102,6 +102,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	for (const auto& slot: m_detached_slots) {
+		m_graphics.device.destroyFence(slot.fence, nullptr);
+	}
 	if (m_detached_fence != nullptr) {
 		m_graphics.device.destroyFence(m_detached_fence, nullptr);
 	}
@@ -409,6 +412,96 @@ void CommandScheduler::RunDetached(uint64_t                                     
 	m_master.Refresh();
 }
 
+CommandScheduler::DetachedTicket
+CommandScheduler::SubmitDetached(uint64_t                                          wait_tick,
+                                 Common::UniqueFunction<void, vk::CommandBuffer>&& record) {
+	constexpr size_t MaxSlots = 8;
+	EXIT_IF(wait_tick >= CurrentTick() || !record);
+	auto& device = m_graphics.device;
+	if (m_detached_pool == nullptr) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.queueFamilyIndex = m_graphics.queue_family;
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                             vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		EXIT_NOT_IMPLEMENTED(device.createCommandPool(&pool_info, nullptr, &m_detached_pool) !=
+		                     vk::Result::eSuccess);
+	}
+	int index = -1;
+	for (size_t i = 0; i < m_detached_slots.size(); i++) {
+		if (!m_detached_slots[i].busy) {
+			index = static_cast<int>(i);
+			break;
+		}
+	}
+	if (index < 0) {
+		if (m_detached_slots.size() >= MaxSlots) {
+			return {};
+		}
+		m_detached_slots.reserve(MaxSlots);
+		DetachedSlot                  slot;
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_detached_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		EXIT_NOT_IMPLEMENTED(device.allocateCommandBuffers(&allocate, &slot.command) !=
+		                     vk::Result::eSuccess);
+		vk::FenceCreateInfo fence_info {};
+		EXIT_NOT_IMPLEMENTED(device.createFence(&fence_info, nullptr, &slot.fence) !=
+		                     vk::Result::eSuccess);
+		m_detached_slots.push_back(slot);
+		index = static_cast<int>(m_detached_slots.size() - 1);
+	}
+	auto&      slot = m_detached_slots[static_cast<size_t>(index)];
+	const auto queue =
+	    m_graphics.readback_queue != nullptr ? m_graphics.readback_queue : m_graphics.queue;
+
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_NOT_IMPLEMENTED(slot.command.begin(&begin) != vk::Result::eSuccess);
+	record(slot.command);
+	EXIT_NOT_IMPLEMENTED(slot.command.end() != vk::Result::eSuccess);
+
+	const auto                      semaphore = m_master.Handle();
+	const vk::PipelineStageFlags    stage     = vk::PipelineStageFlagBits::eAllCommands;
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount = 1;
+	timeline_info.pWaitSemaphoreValues    = &wait_tick;
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext              = &timeline_info;
+	submit_info.waitSemaphoreCount = 1;
+	submit_info.pWaitSemaphores    = &semaphore;
+	submit_info.pWaitDstStageMask  = &stage;
+	submit_info.commandBufferCount = 1;
+	submit_info.pCommandBuffers    = &slot.command;
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		result = queue.submit(1, &submit_info, slot.fence);
+	}
+	if (result != vk::Result::eSuccess) {
+		ReportVulkanFatal("detached submission", result, wait_tick, 0, 0, 0, 0, 0, 0, 0);
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	slot.busy = true;
+	return {index, slot.fence};
+}
+
+void CommandScheduler::WaitDetached(const DetachedTicket& ticket) {
+	// The fence stays alive until the GPU thread releases the slot, after this wait.
+	const auto result = m_graphics.device.waitForFences(1, &ticket.fence, VK_TRUE, UINT64_MAX);
+	if (result != vk::Result::eSuccess) {
+		ReportVulkanFatal("detached wait", result, 0, 0, 0, 0, 0, 0, 0, 0);
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
+void CommandScheduler::ReleaseDetached(const DetachedTicket& ticket) {
+	auto& entry = m_detached_slots[static_cast<size_t>(ticket.slot)];
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.resetFences(1, &entry.fence) != vk::Result::eSuccess);
+	entry.busy = false;
+	m_master.Refresh();
+}
+
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	auto* previous                = g_deferred_callback_scheduler;
 	g_deferred_callback_scheduler = this;
@@ -451,6 +544,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_before_submit && !m_in_before_submit) {
+		m_in_before_submit = true;
+		m_before_submit();
+		m_in_before_submit = false;
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

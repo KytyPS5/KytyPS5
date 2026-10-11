@@ -210,8 +210,8 @@ private:
 		if (yes == 1u && no == 0u) return condition;
 		const std::array key {condition, yes, no};
 		if (const auto found = m_choices.find(key); found != m_choices.end()) return found->second;
-		const auto variable = std::min({m_nodes[condition].variable, m_nodes[yes].variable,
-		                                m_nodes[no].variable});
+		const auto variable =
+		    (std::min)({m_nodes[condition].variable, m_nodes[yes].variable, m_nodes[no].variable});
 		const auto arm = [&](uint32_t value, bool high) {
 			const auto node = m_nodes[value];
 			return node.variable == variable ? (high ? node.high : node.low) : value;

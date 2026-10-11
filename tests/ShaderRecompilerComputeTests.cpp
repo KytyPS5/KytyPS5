@@ -43549,7 +43549,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--agc-unaligned-pool-only") == 0) {
-    LibKernel::Memory::SetFlexibleMemorySize((1ull << 30) + 0x4000);
+    Libs::LibKernel::Memory::SetFlexibleMemorySize((1ull << 30) + 0x4000);
     VulkanHarness vulkan;
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     return 0;

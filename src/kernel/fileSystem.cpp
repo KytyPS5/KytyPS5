@@ -1022,6 +1022,102 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 	return bytes_written;
 }
 
+int64_t KYTY_SYSV_ABI KernelWritev(int d, const KernelIovec* iov, int iovcnt) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, 0, &buffers, &total);
+	if (error != OK) {
+		return error;
+	}
+
+	if (d == 1 || d == 2) {
+		auto*   out     = (d == 1 ? stdout : stderr);
+		int64_t written = 0;
+		bool    ok      = true;
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len == 0) {
+				continue;
+			}
+			const auto count = std::fwrite(buffer.iov_base, 1, buffer.iov_len, out);
+			written += static_cast<int64_t>(count);
+			if (count != buffer.iov_len) {
+				ok = false;
+				break;
+			}
+		}
+		ok = (std::fflush(out) == 0) && ok;
+		return (ok ? written : KERNEL_ERROR_EIO);
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		// A datagram socket sends one message per call, so gather the vectors and send them together.
+		std::vector<uint8_t> gathered;
+		gathered.reserve(total);
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len == 0) {
+				continue;
+			}
+			const auto* bytes = static_cast<const uint8_t*>(buffer.iov_base);
+			gathered.insert(gathered.end(), bytes, bytes + buffer.iov_len);
+		}
+		if (gathered.empty()) {
+			return 0;
+		}
+		const auto result = ::Libs::Network::Net::Send(d, gathered.data(), gathered.size(), 0);
+		return (result < 0 ? PosixToKernel(*Posix::GetErrorAddr()) : static_cast<int64_t>(result));
+	}
+
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened || !file->writable) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	Common::LockGuard lock(file->mutex);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	if (file->f.IsInvalid()) {
+		LOGF("\tfile is invalid\n");
+		return KERNEL_ERROR_EIO;
+	}
+
+	if (file->append && !file->f.Seek(file->f.Size())) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	int64_t bytes_written = 0;
+	for (const auto& buffer: buffers) {
+		if (buffer.iov_len == 0) {
+			continue;
+		}
+		uint32_t bytes = 0;
+		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		bytes_written += bytes;
+		if (bytes < buffer.iov_len) {
+			break;
+		}
+	}
+	if (file->sync_writes && !file->f.Flush()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tWritev %" PRId64 " bytes (iovcnt = %d) to: %s\n", bytes_written, iovcnt,
+	     Common::PathToString(file->real_name).c_str());
+	return bytes_written;
+}
+
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 

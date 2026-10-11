@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <cstring>
 #include <numeric>
@@ -177,7 +178,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	const auto native = command.Handle();
+	const auto native = command.Recorder();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
@@ -203,7 +204,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
-	const auto native = command.Handle();
+	const auto native = command.Recorder();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);

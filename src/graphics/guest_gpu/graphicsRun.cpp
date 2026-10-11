@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -989,7 +990,8 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
-	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
+	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed,
+	                  Pm4::SH_NOP);
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -1396,7 +1398,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	CurrentBuffer().Recorder().pipelineBarrier2(dependency);
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

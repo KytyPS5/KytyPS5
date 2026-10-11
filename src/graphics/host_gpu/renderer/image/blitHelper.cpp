@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <array>

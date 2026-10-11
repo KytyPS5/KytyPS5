@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -1546,7 +1547,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		view.layer_count = range.layerCount;
 		view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
-		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Recorder());
 		vk::RenderingAttachmentInfo attachment {};
 		attachment.imageView   = image.FindView(view);
 		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
@@ -1560,23 +1561,23 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		rendering.layerCount           = range.layerCount;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;
-		command.Handle().beginRendering(&rendering);
-		command.Handle().endRendering();
+		command.Recorder().beginRendering(&rendering);
+		command.Recorder().endRendering();
 		CommitGpuWrite(image);
 		return;
 	}
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-	              command.Handle());
+	              command.Recorder());
 	auto native_range = range;
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		command.Recorder().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                                 &clear.color, 1, &native_range);
 	} else {
-		command.Handle().clearDepthStencilImage(image.backing.image,
+		command.Recorder().clearDepthStencilImage(image.backing.image,
 		                                        vk::ImageLayout::eTransferDstOptimal,
 		                                        &clear.depthStencil, 1, &native_range);
 	}
@@ -1752,7 +1753,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {

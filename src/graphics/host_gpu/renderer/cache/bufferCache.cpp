@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -425,7 +426,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
-		const auto native = command.Handle();
+		const auto native = command.Recorder();
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 		                       vk::AccessFlagBits::eTransferRead |
@@ -554,7 +555,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 }
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
-	std::unique_lock lock(m_dirty_ranges_mutex);
 	m_gpu_modified_ranges.Add(vaddr, size);
 }
 

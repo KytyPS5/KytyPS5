@@ -19,6 +19,7 @@ namespace Libs::Graphics {
 class Buffer;
 class CommandScheduler;
 class TileManager;
+class CommandRecorder;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
@@ -58,8 +59,10 @@ public:
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
 	                                   std::optional<ImageSubresourceRange> range);
+	// Records through the recording thread when given a threaded CommandBuffer::Recorder(); a raw
+	// command buffer converts.
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	             std::optional<ImageSubresourceRange> range, const CommandRecorder& command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

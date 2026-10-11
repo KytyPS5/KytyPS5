@@ -14,6 +14,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <array>

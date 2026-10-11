@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -123,26 +124,17 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-<<<<<<< HEAD
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
-||||||| parent of 0250ea14 (graphics: mark only the bytes a dispatch's stores can reach as GPU-written)
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                              resource.formatted, id);
-=======
 	const bool bounded_write = resource.written && extent != nullptr && extent->valid;
 	const auto written_begin = bounded_write ? std::min(extent->begin, size) : 0u;
 	const auto written_end   = bounded_write ? std::min(extent->end, size) : size;
+	const bool sync_image    = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
 	auto [buffer, offset] =
 	    bounded_write
 	        ? context.GetBufferCache().ObtainBufferWritten(address, size, address + written_begin,
 	                                                       written_end - std::min(written_begin,
 	                                                                              written_end),
 	                                                       id)
-	        : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                resource.formatted, id);
->>>>>>> 0250ea14 (graphics: mark only the bytes a dispatch's stores can reach as GPU-written)
+	        : context.GetBufferCache().ObtainBuffer(address, size, resource.written, sync_image, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -864,37 +856,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
-<<<<<<< HEAD
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		const auto resource_index = static_cast<size_t>(&resource - program.info.buffers.data());
+		prepared.buffers[index] = NativeStorageBuffer(
+		    m_context, prepared.buffer_sources[index], resource,
+		    resource_index < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource_index]
+		                                                          : nullptr,
+		    buffer_offset);
 		pack_memory_offset(index, buffer_offset);
-||||||| parent of 0250ea14 (graphics: mark only the bytes a dispatch's stores can reach as GPU-written)
-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[resource],
-		                                               buffer_offset));
-		pack_memory_offset(i, buffer_offset);
-		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
-		// buffer still has no accessible elements. In particular, never let a null store
-		// modify the shared fallback and affect subsequent null reads.
-		prepared.shader_data[layout.BufferLengthDword() + i] =
-		    prepared.buffer_sources[i].size == 0
-		        ? 0u
-		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
-=======
-		prepared.buffers.push_back(NativeStorageBuffer(
-		    m_context, prepared.buffer_sources[i], program.info.buffers[resource],
-		    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
-		                                                    : nullptr,
-		    buffer_offset));
-		pack_memory_offset(i, buffer_offset);
-		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
-		// buffer still has no accessible elements. In particular, never let a null store
-		// modify the shared fallback and affect subsequent null reads.
-		prepared.shader_data[layout.BufferLengthDword() + i] =
-		    prepared.buffer_sources[i].size == 0
-		        ? 0u
-		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
->>>>>>> 0250ea14 (graphics: mark only the bytes a dispatch's stores can reach as GPU-written)
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -990,7 +958,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
+	const auto vk_buffer    = buffer.Recorder();
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -1224,11 +1192,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
+			// The update moves to the recording thread with the bind: the set is fresh.
+			vk_buffer.updateAndBindDescriptorSet(
+			    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
+			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data());
 		}
 	}
 }

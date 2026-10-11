@@ -2,9 +2,11 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <optional>
 
@@ -59,12 +61,12 @@ size_t CommandScheduler::CommandPool::Grow() {
 	return first;
 }
 
-vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+vk::CommandBuffer CommandScheduler::CommandPool::Commit(uint64_t tick) {
 	auto       gpu_tick = m_master.KnownGpuTick();
-	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+	const auto search = [this, &gpu_tick, tick](size_t begin, size_t end) -> std::optional<size_t> {
 		for (size_t index = begin; index < end; ++index) {
 			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
+				m_ticks[index] = tick;
 				return index;
 			}
 		}
@@ -82,7 +84,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	}
 	if (!found) {
 		found           = Grow();
-		m_ticks[*found] = m_master.CurrentTick();
+		m_ticks[*found] = tick;
 	}
 
 	m_hint = (*found + 1) % m_ticks.size();
@@ -133,6 +135,10 @@ void CommandScheduler::Shutdown() {
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
+	// Every tick was waited on above, so the queue and recording threads have nothing left to
+	// submit.
+	StopRecordingThread();
+	StopSubmitThread();
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
@@ -332,7 +338,21 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	m_command.m_buffer = m_command_pool.Commit();
+	m_command.m_open = true;
+	// Ticks are allocated in submit order, so this command buffer will be submitted with the
+	// current one.
+	const auto tick = m_master.CurrentTick();
+	if (m_threaded) {
+		m_command.m_buffer = nullptr;
+		Record([this, tick](vk::CommandBuffer) {
+			m_worker_buffer = m_command_pool.Commit(tick);
+			vk::CommandBufferBeginInfo begin_info {};
+			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			EXIT_NOT_IMPLEMENTED(m_worker_buffer.begin(&begin_info) != vk::Result::eSuccess);
+		});
+		return m_command;
+	}
+	m_command.m_buffer = m_command_pool.Commit(tick);
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
 	return m_command;
@@ -344,16 +364,62 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	EXIT_IF(m_graphics.queue == nullptr);
 
+	SubmitJob job {
+	    .buffer       = m_command.m_buffer,
+	    .submit       = submit,
+	    .debug_op     = m_command.m_debug_op,
+	    .debug_submit = m_command.m_debug_submit_id,
+	    .debug_arg0   = m_command.m_debug_arg0,
+	    .debug_arg1   = m_command.m_debug_arg1,
+	    .debug_arg2   = m_command.m_debug_arg2,
+	    .debug_arg3   = m_command.m_debug_arg3,
+	    .debug_arg4   = m_command.m_debug_arg4,
+	};
+	m_command.m_buffer = nullptr;
+	m_command.m_open   = false;
+
+	if (m_threaded) {
+		// The tick is allocated now, in order; the recording thread ends the command buffer and
+		// submits it once it has recorded everything queued before.
+		job.tick = m_master.NextTick();
+		job.submit.AddSignal(m_master.Handle(), job.tick);
+		Record([this, job](vk::CommandBuffer command) mutable {
+			EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
+			job.buffer = command;
+			QueueSubmit(job);
+			m_worker_buffer = nullptr;
+		});
+		DispatchChunk();
+		return job.tick;
+	}
+	if (!m_async_submit) {
+		QueueSubmit(job);
+		return job.tick;
+	}
+	{
+		// Ticks are allocated in queue order and the queue thread submits in that order, so the
+		// timeline is signaled in order.
+		std::lock_guard lock(m_submit_mutex);
+		job.tick = m_master.NextTick();
+		job.submit.AddSignal(m_master.Handle(), job.tick);
+		m_submit_jobs.push_back(job);
+	}
+	m_submit_available.notify_one();
+	return job.tick;
+}
+
+void CommandScheduler::QueueSubmit(SubmitJob& job) {
+	auto&      graphics = m_graphics;
 	vk::Result result;
-	uint64_t   tick;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
+		if (!m_async_submit) {
+			job.tick = m_master.NextTick();
+			job.submit.AddSignal(m_master.Handle(), job.tick);
+		}
+		const auto& submit = job.submit;
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
@@ -367,7 +433,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
 		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.pCommandBuffers      = &job.buffer;
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
@@ -378,15 +444,153 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		DumpDeviceLossDiagnostics(graphics);
 	}
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit,
+		                  job.debug_arg0, job.debug_arg1, job.debug_arg2, job.debug_arg3,
+		                  job.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
 
-	m_command.m_buffer = nullptr;
-	return tick;
+void CommandScheduler::EnableAsyncSubmit() {
+	// The owner enables it while constructing, before any other thread can submit.
+	EXIT_IF(m_async_submit);
+	m_async_submit  = true;
+	m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+}
+
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("GpuQueueSubmit");
+	for (;;) {
+		SubmitJob job;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			// A stop request still submits the queued jobs: their ticks may already be waited on.
+			if (!m_submit_available.wait(lock, stop, [this] { return !m_submit_jobs.empty(); })) {
+				return;
+			}
+			job = m_submit_jobs.front();
+			m_submit_jobs.pop_front();
+		}
+		QueueSubmit(job);
+	}
+}
+
+void CommandScheduler::StopSubmitThread() {
+	if (m_submit_thread.joinable()) {
+		m_submit_thread.request_stop();
+		m_submit_thread.join();
+	}
+	std::lock_guard lock(m_submit_mutex);
+	EXIT_IF(!m_submit_jobs.empty());
+}
+
+void CommandScheduler::EnableRecordingThread() {
+	// The owner enables it while constructing, before the first command buffer.
+	EXIT_IF(m_record_thread.joinable() || m_async_submit || !m_command.IsInvalid());
+	// QueueSubmit then takes the tick Submit() allocated, as for the queue thread.
+	m_async_submit  = true;
+	m_threaded      = true;
+	m_record_thread = std::jthread([this](std::stop_token stop) { RecordingThread(stop); });
+}
+
+void* CommandScheduler::Allocate(size_t size, size_t alignment) {
+	EXIT_IF(!m_threaded || size > Chunk::Size);
+	const auto take = [this] {
+		std::lock_guard lock(m_record_mutex);
+		if (m_free_chunks.empty()) {
+			return std::make_unique<Chunk>();
+		}
+		auto chunk = std::move(m_free_chunks.back());
+		m_free_chunks.pop_back();
+		return chunk;
+	};
+	if (m_chunk == nullptr) {
+		m_chunk = take();
+	}
+	auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
+	if (offset + size > Chunk::Size) {
+		DispatchChunk();
+		m_chunk = take();
+		offset  = 0;
+	}
+	m_chunk->used = offset + size;
+	return m_chunk->storage + offset;
+}
+
+void CommandScheduler::DispatchChunk() {
+	if (m_chunk == nullptr || m_chunk->first == nullptr) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_record_mutex);
+		m_record_queue.push_back(std::move(m_chunk));
+		m_chunks_dispatched++;
+	}
+	m_record_available.notify_one();
+}
+
+vk::CommandBuffer CommandScheduler::DrainRecording() {
+	if (!m_threaded) {
+		return m_command.m_buffer;
+	}
+	KYTY_PROFILER_FUNCTION();
+	DispatchChunk();
+	std::unique_lock lock(m_record_mutex);
+	m_drains++;
+	m_record_executed.wait(lock, [this] { return m_chunks_executed == m_chunks_dispatched; });
+	return m_worker_buffer;
+}
+
+void CommandScheduler::RecordingThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("GpuRecord");
+	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
+	// recycled only after the next two have run.
+	std::deque<std::unique_ptr<Chunk>> retained;
+	for (;;) {
+		std::unique_ptr<Chunk> chunk;
+		{
+			std::unique_lock lock(m_record_mutex);
+			// A stop request still runs the queued chunks: their ticks may already be waited on.
+			if (!m_record_available.wait(lock, stop, [this] { return !m_record_queue.empty(); })) {
+				return;
+			}
+			chunk = std::move(m_record_queue.front());
+			m_record_queue.pop_front();
+		}
+		for (auto* command = chunk->first; command != nullptr;) {
+			auto* next = command->next;
+			command->Execute(m_worker_buffer);
+			command->~RecordedCommand();
+			command = next;
+		}
+		chunk->first = nullptr;
+		chunk->last  = nullptr;
+		chunk->used  = 0;
+		retained.push_back(std::move(chunk));
+		std::unique_ptr<Chunk> recycled;
+		if (retained.size() > 2) {
+			recycled = std::move(retained.front());
+			retained.pop_front();
+		}
+		{
+			std::lock_guard lock(m_record_mutex);
+			if (recycled != nullptr) {
+				m_free_chunks.push_back(std::move(recycled));
+			}
+			m_chunks_executed++;
+		}
+		m_record_executed.notify_all();
+	}
+}
+
+void CommandScheduler::StopRecordingThread() {
+	if (!m_record_thread.joinable()) {
+		return;
+	}
+	(void)DrainRecording();
+	m_record_thread.request_stop();
+	m_record_available.notify_all();
+	m_record_thread.join();
 }
 
 void CommandScheduler::BeginNext() {

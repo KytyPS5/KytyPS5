@@ -4,6 +4,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -17,15 +18,24 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()), m_scheduler(scheduler) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return m_buffer == nullptr;
+	return !m_open;
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	if (m_scheduler.Threaded()) {
+		// Recording directly: the recording thread must have run everything queued first.
+		return m_scheduler.DrainRecording();
+	}
 	return m_buffer;
+}
+
+CommandRecorder CommandBuffer::Recorder() const {
+	EXIT_IF(IsInvalid());
+	return m_scheduler.Threaded() ? CommandRecorder(m_scheduler, nullptr) : CommandRecorder(m_buffer);
 }
 
 void CommandBuffer::Begin() {
@@ -42,6 +52,10 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
+	if (m_scheduler.Threaded()) {
+		// The recording thread ends it before submitting (CommandScheduler::Submit).
+		return;
+	}
 	auto buffer = Handle();
 
 	auto result = buffer.end();
@@ -58,7 +72,7 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
-	if (m_graphics.diagnostic_checkpoints_enabled && m_buffer) {
+	if (m_graphics.diagnostic_checkpoints_enabled && !IsInvalid()) {
 		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
 		                                                 .submit_id = submit_id,
 		                                                 .arg0      = arg0,
@@ -67,7 +81,7 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 		                                                 .arg3      = arg3,
 		                                                 .arg4      = arg4});
 		if (marker != nullptr) {
-			Handle().setCheckpointNV(marker);
+			Recorder().setCheckpointNV(marker);
 		}
 	}
 }
@@ -115,7 +129,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	Recorder().beginRendering(rendering);
 	m_render_state = state;
 	m_rendering    = true;
 }
@@ -124,7 +138,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	Recorder().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
 }

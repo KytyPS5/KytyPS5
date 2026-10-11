@@ -401,6 +401,7 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 include("${KYTY_TESTS_DIR}/PerVertexVsStoreMutants.cmake")
+include("${KYTY_TESTS_DIR}/PerVertexVsStoreGpu.cmake")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"

@@ -60,6 +60,10 @@ uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
 }
 
+bool ControllerHapticsRumbleEnabled() {
+	return g_config->controller_haptics_rumble;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }

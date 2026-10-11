@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <span>
 #include <string_view>
@@ -53,6 +54,9 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	SrtOwnershipQuery         gpu_owned             = nullptr;
+	SrtExtentQuery  readable_extent           = nullptr;
+	SrtBlockReader  read_specialization_block = nullptr;
+	SrtBlockHasher  hash_specialization_block = nullptr;
 };
 
 class SrtReadCapture {
@@ -106,6 +110,7 @@ enum class SrtRefusal : uint8_t {
 
 // The flat SRT slot whose walk is reading now; UINT32_MAX outside one.
 uint32_t CurrentSrtReadSlot();
+
 
 // The lane a per-lane sweep is on; `dependent` is set once a walk asks for it.
 struct LaneScope {

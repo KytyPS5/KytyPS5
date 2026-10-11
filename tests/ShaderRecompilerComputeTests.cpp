@@ -1689,6 +1689,15 @@ std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
   return data;
 }
 
+const std::vector<std::pair<uint64_t, uint64_t>> *g_gpu_owned_ranges = nullptr;
+
+bool TestGpuOwned(void *, uint64_t address, uint64_t size) {
+  return g_gpu_owned_ranges != nullptr &&
+         std::ranges::any_of(*g_gpu_owned_ranges, [&](const auto &range) {
+           return address < range.first + range.second && range.first < address + size;
+         });
+}
+
 bool ReadTestMemory(void *userdata, uint64_t address, std::span<u32> values) {
   const auto *data = static_cast<const std::vector<u32> *>(userdata);
   if (data == nullptr || address % 4u != 0 || values.size() > data->size() ||
@@ -1985,6 +1994,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
       .read_specialization_memory = ReadTestMemory,
       .workgroup_counts = workgroup_counts,
+      .gpu_owned = test.gpu_owned_ranges.empty() ? nullptr : TestGpuOwned,
       .image_heap = image_heap,
   };
   Require(test.name, "resource materialization", materialized,
@@ -42532,6 +42542,100 @@ TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
           {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// RE3 cs 0x9ff42d53da1c03e7: a GPU-owned record's count and V# are read in the shader.
+TestCase GpuOwnedRecordDecodedInShader() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x00000001e0000000ull;
+  constexpr u32 DataDword = 64u;
+  constexpr u32 Count = 5u;
+  const uint64_t data_base = GuestBase + DataDword * 4u;
+
+  TestCase test;
+  test.initial = std::vector<u32>(128, 0);
+  test.initial[144 / 4] = Count;
+  test.initial[168 / 4 + 0] = static_cast<u32>(data_base);
+  test.initial[168 / 4 + 1] = static_cast<u32>((data_base >> 32u) & 0xffffu) | (4u << 16u);
+  test.initial[168 / 4 + 2] = 8u;
+  test.initial[168 / 4 + 3] = RangeDescriptorWord3(3);
+  for (u32 lane = 0; lane < 8u; lane++) {
+    test.initial[DataDword + lane] = 0x100u * (lane + 1u);
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < Count; lane++) {
+    test.expected[DataDword + lane] += 1u;
+  }
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 8, static_cast<u32>(GuestBase));
+  AppendSMovLiteral(&code, 9, static_cast<u32>(GuestBase >> 32u));
+  AppendSMovLiteral(&code, 10, 0);
+  code.push_back(EncodeSmem0(0x00, 12, 4)); // s_load_dword s12, s[8:9], 144
+  code.push_back(EncodeSmem1(144, 10));
+  code.push_back(EncodeSmem0(0x02, 16, 4)); // s_load_dwordx4 s[16:19], s[8:9], 168
+  code.push_back(EncodeSmem1(168, 10));
+  code.push_back(EncodeVopc(0xd4, 12, 0));  // v_cmpx_gt_u32 exec, s12, v0
+  const size_t skip = code.size();
+  code.push_back(0);                        // s_cbranch_execz
+  code.push_back(EncodeMubuf0(0x0c, 0, true, false)); // buffer_load_dword v1, v0, s[16:19] idxen
+  code.push_back(EncodeMubuf1(1, 4, 0));
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 1)); // v_add_nc_u32 v1, 1, v1
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0)); // v_lshlrev_b32 v2, 2, v0
+  code.push_back(EncodeMubuf0(0x1c, DataDword * 4u));   // buffer_store_dword v1, v2, s[48:51] offen
+  code.push_back(EncodeMubuf1(1, 12, 2));
+  code[skip] = EncodeSopp(0x08, static_cast<u32>(code.size() - skip - 1));
+  AppendEnd(&code);
+
+  test.name = "GpuOwnedRecordDecodedInShader";
+  test.code = std::move(code);
+  test.bda_mappings = {{GuestBase, 0, true}};
+  test.expected_bda_fault_word0 = 0u;
+  test.gpu_owned_ranges = {{GuestBase, 0x100}};
+  test.forbidden_spirv = {"flattened_srt"};
+  test.opcodes = {O::S_MOV_B32,       O::S_LOAD_DWORD,      O::S_LOAD_DWORDX4,
+                  O::V_CMPX_GT_U32,   O::S_CBRANCH_EXECZ,   O::BUFFER_LOAD_DWORD,
+                  O::V_ADD_NC_U32,    O::V_LSHLREV_B32,     O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
+// RE3 reads a GPU-written bounds record through the BDA page table.
+TestCase ScalarDataGpuOwnedStaysNative() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x10000;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 8, GuestBase);
+  AppendSMovLiteral(&code, 9, 0);
+  AppendSMovLiteral(&code, 10, 0);
+  code.push_back(EncodeSmem0(0x01, 12, 4)); // s_load_dwordx2 s[12:13], s[8:9], 8
+  code.push_back(EncodeSmem1(8, 10));
+  AppendStoreSgpr(&code, 12, 0);
+  AppendStoreSgpr(&code, 13, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarDataGpuOwnedStaysNative";
+  test.code = std::move(code);
+  test.initial.resize(20);
+  test.initial[18] = 0x3f800000u;
+  test.initial[19] = 0xbf000000u;
+  test.expected = test.initial;
+  test.expected[0] = test.initial[18];
+  test.expected[1] = test.initial[19];
+  test.bda_mappings = {{GuestBase, 64}};
+  test.gpu_owned_ranges = {{GuestBase, 0x100}};
+  test.required_spirv = {"get_bda_pointer"};
+  test.forbidden_spirv = {"flattened_srt"};
+  test.opcodes = {O::S_MOV_B32, O::S_LOAD_DWORDX2, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase ScalarLoadAlignsDynamicBase() {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x10000;
@@ -51938,6 +52042,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
+  cases.push_back(BdaMissLoop(false));
+  cases.push_back(BdaMissLoop(true));
   AddCase(SharedReturnKeepsSelectedValues);
   AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);
@@ -51956,6 +52062,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(ScalarLoadAlignsDynamicBase);
+  AddCase(ScalarDataGpuOwnedStaysNative);
+  AddCase(GpuOwnedRecordDecodedInShader);
   cases.push_back(ScalarBufferFromLoopReadlane(32));
   cases.push_back(ScalarBufferFromLoopReadlane(64));
   AddCase(BufferLoadStore);

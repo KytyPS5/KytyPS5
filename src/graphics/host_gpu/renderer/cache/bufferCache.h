@@ -95,6 +95,8 @@ public:
 	void               ProcessFaultBuffer();
 	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
 	void ResolveBdaFault(uint64_t vaddr, uint64_t size);
+	// A store prefetch tracks the first `store_window` bytes, so its pages are owned up front.
+	void PrefetchBda(uint64_t vaddr, uint64_t size, bool store, uint64_t store_window = 64 * 1024);
 	void ForgetBdaResidency(uint64_t vaddr, uint64_t size);
 	void SynchronizeBda(const RangeSet& mapped);
 	void QueueBdaSync(uint64_t vaddr, uint64_t size) { m_memory_tracker.QueueBdaSync(vaddr, size); }

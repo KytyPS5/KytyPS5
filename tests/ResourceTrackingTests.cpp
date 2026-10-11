@@ -9131,9 +9131,15 @@ void TestOrderedScalarReadOverWrittenBuffer() {
     entry->AddBranch(later);
     entry->AddBranch(done);
     later->AddBranch(done);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = later,
+                         .false_block = done};
+    later->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = done};
+    done->terminator.kind = CFG::TerminatorKind::Return;
     if (order == Order::WriteInLoop) {
       done->AddBranch(entry);
       done->AddBranch(later);
+      done->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = entry,
+                          .false_block = later};
     }
     // A uniform branch condition read from memory makes the plan capture its scalar reads.
     const auto control = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
@@ -9143,7 +9149,9 @@ void TestOrderedScalarReadOverWrittenBuffer() {
     scalar.offset = 28;
     const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(0u)},
                                    fixture.AddMemory(scalar, 4));
+    entry->condition = fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
     if (order == Order::WriteInLoop) {
+      done->condition = fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)}, 0, done);
     }
     const auto root = fixture.Address(fixture.UserData(4), Value(0u));
     MemoryInfo address;
@@ -9216,8 +9224,242 @@ void TestOrderedScalarReadOverWrittenBuffer() {
   }
 }
 
+// A GPU-written record's count and V# named unfoldable stay native; the V# decodes in the shader.
+void TestGpuOwnedScalarDataStaysNative() {
+  constexpr uint32_t count_pc = 8;
+  constexpr uint32_t descriptor_pc = 12;
+  constexpr uint32_t image_word_pc = 16;
+  struct Shape {
+    std::unique_ptr<Fixture> fixture;
+    Value count;
+    std::array<Value, 4> descriptor;
+    Value image_word;
+    uint32_t buffer_memory = 0;
+  };
+  const auto build = [](std::vector<uint32_t> unfoldable) {
+    Shape shape;
+    shape.fixture = std::make_unique<Fixture>();
+    auto &fixture = *shape.fixture;
+    fixture.program.unfoldable_pcs = std::move(unfoldable);
+    const auto record = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+    const auto scalar = [&](uint32_t offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = offset;
+      return fixture.Emit(ValueOpcode::LoadAddressU32, {record, Value(0u), Value(0u), Value(true)},
+                          fixture.AddMemory(memory, pc));
+    };
+    shape.count = scalar(144, count_pc);
+    for (uint32_t word = 0; word < 4; ++word) shape.descriptor[word] = scalar(168 + word * 4u, descriptor_pc);
+    shape.image_word = scalar(200, image_word_pc);
+    fixture.program.blocks[0]->condition =
+        fixture.Emit(ValueOpcode::SGreaterThan32, {shape.count, Value(3u)});
+    fixture.Emit(ValueOpcode::IAdd32, {shape.count, Value(1u)});
+    MemoryInfo buffer;
+    buffer.kind = ResourceKind::Buffer;
+    shape.buffer_memory = static_cast<uint32_t>(fixture.program.memory_info.size());
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+                 {fixture.Buffer(shape.descriptor, 20), Value(0u), Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(buffer, 20));
+    std::array<Value, 8> image_words{shape.image_word};
+    for (uint32_t word = 1; word < image_words.size(); ++word) image_words[word] = fixture.UserData(word + 1u);
+    MemoryInfo image;
+    image.kind = ResourceKind::Image;
+    image.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+                 {fixture.Image(image_words, 24),
+                  fixture.Sampler({Value(0u), Value(1u), Value(2u), Value(0x1111u)}, 24),
+                  fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(image, 24));
+    fixture.PlanAndTrack();
+    return shape;
+  };
 
+  auto shape = build({});
+  const auto &program = shape.fixture->program;
+  Check(program.data_flat_slots.size() == program.srt_reads.size() &&
+            FlatSlotKind(program, shape.count) == 1 && FlatSlotKind(program, shape.image_word) == 0,
+        "the count was not forwarded data or the image word was not the host's");
+  for (const auto &word : shape.descriptor)
+    Check(FlatSlotKind(program, word) == 2, "a V# word was not classified decodable");
 
+  auto rebuilt = build({count_pc, descriptor_pc});
+  const auto &rebuilt_program = rebuilt.fixture->program;
+  Check(FlatSlotKind(rebuilt_program, rebuilt.count) == -1 &&
+            FlatSlotKind(rebuilt_program, rebuilt.descriptor[0]) == -1 &&
+            FlatSlotKind(rebuilt_program, rebuilt.image_word) == 0,
+        "the rebuild still flattened a refused read, or lost the image word");
+  Check(rebuilt_program.memory_info[rebuilt.buffer_memory].kind == ResourceKind::IndirectBuffer &&
+            rebuilt_program.info.uses_dma,
+        "the buffer whose V# the GPU owned was not decoded in the shader");
+}
+
+// A V# written through from a GPU-written record stays strict.
+void TestGpuOwnedWrittenHandleStaysOnHost() {
+  Fixture fixture;
+  const auto record = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  const auto descriptor = [&](uint32_t offset, uint32_t pc) {
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = offset + word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {record, Value(0u), Value(0u), Value(true)},
+                                 fixture.AddMemory(memory, pc));
+    }
+    return words;
+  };
+  const auto read_words = descriptor(64, 8);
+  const auto written_words = descriptor(96, 12);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  const auto loaded = fixture.Emit(
+      ValueOpcode::LoadBufferU32,
+      {fixture.Buffer(read_words, 20), Value(0u), Value(0u), Value(0u), Value(true)},
+      fixture.AddMemory(buffer, 20));
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {fixture.Buffer(written_words, 24), Value(0u), Value(0u), Value(0u), loaded,
+                Value(true)},
+               fixture.AddMemory(buffer, 24));
+  fixture.PlanAndTrack();
+  for (uint32_t word = 0; word < 4; ++word) {
+    Check(FlatSlotKind(fixture.program, read_words[word]) == 2,
+          "a V# the shader only reads was not decodable");
+    Check(FlatSlotKind(fixture.program, written_words[word]) == 0,
+          "a V# the shader writes through left the host");
+  }
+}
+
+// A written V# built from a user pointer is decodable and its store span is named for prefetch.
+void TestGpuOwnedRelativeWrittenHandleDecodes() {
+  constexpr uint32_t offset_pc = 8;
+  constexpr uint32_t records_pc = 12;
+  struct Shape {
+    std::unique_ptr<Fixture> fixture;
+    std::array<Value, 3> words;
+    uint32_t buffer_memory = 0;
+  };
+  const auto build = [](std::vector<uint32_t> unfoldable, bool foreign) {
+    Shape shape;
+    shape.fixture = std::make_unique<Fixture>();
+    auto &fixture = *shape.fixture;
+    fixture.program.unfoldable_pcs = std::move(unfoldable);
+    const auto base_lo = fixture.UserData(2);
+    const auto base_hi = fixture.UserData(3);
+    const auto record = fixture.Address(base_lo, base_hi, 4);
+    const auto other = fixture.Address(fixture.UserData(4), fixture.UserData(5), 4);
+    const auto scalar = [&](Value handle, uint32_t offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = offset;
+      return fixture.Emit(ValueOpcode::LoadAddressU32, {handle, Value(0u), Value(0u), Value(true)},
+                          fixture.AddMemory(memory, pc));
+    };
+    shape.words[0] = scalar(foreign ? other : record, 40, offset_pc);
+    shape.words[1] = scalar(foreign ? other : record, 44, offset_pc);
+    shape.words[2] = scalar(record, 116, records_pc);
+    const auto low = fixture.Emit(ValueOpcode::IAdd32, {base_lo, shape.words[0]});
+    const auto high = fixture.Emit(
+        ValueOpcode::BitwiseOr32,
+        {fixture.Emit(ValueOpcode::IAdd32, {base_hi, shape.words[1]}), Value(0x00800000u)});
+    MemoryInfo buffer;
+    buffer.kind = ResourceKind::Buffer;
+    shape.buffer_memory = static_cast<uint32_t>(fixture.program.memory_info.size());
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {fixture.Buffer({low, high, shape.words[2], Value(0x00016204u)}, 20), Value(0u),
+                  Value(0u), Value(0u), Value(7u), Value(true)},
+                 fixture.AddMemory(buffer, 20));
+    fixture.PlanAndTrack();
+    return shape;
+  };
+  auto foreign = build({}, true);
+  for (const auto &word : foreign.words)
+    Check(FlatSlotKind(foreign.fixture->program, word) == 0,
+          "a written V# offset read through another pointer left the host");
+  auto shape = build({}, false);
+  for (const auto &word : shape.words)
+    Check(FlatSlotKind(shape.fixture->program, word) == 2,
+          "a written V# relative to its record pointer was not decodable");
+
+  auto rebuilt = build({offset_pc, records_pc}, false);
+  const auto &program = rebuilt.fixture->program;
+  Check(program.memory_info[rebuilt.buffer_memory].kind == ResourceKind::IndirectBuffer &&
+            program.info.writes_dma && program.has_address_writes,
+        "the relative written V# was not decoded in the shader");
+  DmaPointer expected{.user_data = true, .store = true, .lo = 2, .hi = 3};
+  expected.relative_offset = 40;
+  expected.records_offset = 116;
+  expected.high_mask = 0x00800000u;
+  Check(std::ranges::find(program.info.dma_pointers, expected) != program.info.dma_pointers.end(),
+        "the host was not told where the relative stores land");
+}
+
+// One scalar load feeds a read V# and a written V#. Learning the load unfoldable decodes the read
+// V# in the shader but keeps the written one bound: a decoded store whose span the host cannot
+// name is dropped on a BDA miss (SILENT HILL 2's BVH key generation).
+void TestUnfoldableLoadKeepsWrittenHandleBound() {
+  constexpr uint32_t shared_pc = 0x7cu;
+  constexpr uint32_t tail_pc = 0xb0u;
+  constexpr uint32_t records_pc = 0xbcu;
+  struct Shape {
+    std::unique_ptr<Fixture> fixture;
+    uint32_t read_memory = 0;
+    uint32_t store_memory = 0;
+  };
+  const auto build = [](std::vector<uint32_t> unfoldable) {
+    Shape shape;
+    shape.fixture = std::make_unique<Fixture>();
+    auto &fixture = *shape.fixture;
+    fixture.program.unfoldable_pcs = std::move(unfoldable);
+    const auto record = fixture.Address(fixture.UserData(4), fixture.UserData(5), 4);
+    const auto scalar = [&](uint32_t offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = offset;
+      return fixture.Emit(ValueOpcode::LoadAddressU32, {record, Value(0u), Value(0u), Value(true)},
+                          fixture.AddMemory(memory, pc));
+    };
+    // s_load_dwordx4 s[44:47], s[4:5], 0xa0: s[44:45] base the store, s[46:47] the read V#.
+    const auto store_lo = scalar(0xa0, shared_pc);
+    const auto store_hi = scalar(0xa4, shared_pc);
+    const auto read_lo = scalar(0xa8, shared_pc);
+    const auto read_hi = scalar(0xac, shared_pc);
+    const auto read_records = scalar(0xb0, tail_pc);
+    const auto read_word3 = scalar(0xb4, tail_pc);
+    const auto store_records = scalar(0x78, records_pc);
+    MemoryInfo buffer;
+    buffer.kind = ResourceKind::Buffer;
+    shape.read_memory = static_cast<uint32_t>(fixture.program.memory_info.size());
+    const auto loaded = fixture.Emit(
+        ValueOpcode::LoadBufferU32,
+        {fixture.Buffer({read_lo, read_hi, read_records, read_word3}, 16), Value(0u), Value(0u),
+         Value(0u), Value(true)},
+        fixture.AddMemory(buffer, 0x200));
+    shape.store_memory = static_cast<uint32_t>(fixture.program.memory_info.size());
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {fixture.Buffer({store_lo,
+                                  fixture.Emit(ValueOpcode::BitwiseOr32,
+                                               {store_hi, Value(0x00100000u)}),
+                                  store_records, Value(0x00016204u)},
+                                 20),
+                  Value(0u), Value(0u), Value(0u), loaded, Value(true)},
+                 fixture.AddMemory(buffer, 0x430));
+    fixture.PlanAndTrack();
+    return shape;
+  };
+  auto planned = build({});
+  Check(planned.fixture->program.memory_info[planned.store_memory].kind == ResourceKind::Buffer,
+        "the written V# was not bound");
+
+  auto rebuilt = build({shared_pc, tail_pc, records_pc});
+  const auto &program = rebuilt.fixture->program;
+  Check(program.memory_info[rebuilt.read_memory].kind == ResourceKind::IndirectBuffer,
+        "the read V# over an unfoldable load was not decoded in the shader");
+  Check(program.memory_info[rebuilt.store_memory].kind == ResourceKind::Buffer &&
+            !program.info.writes_dma && !program.has_address_writes,
+        "a written V# sharing an unfoldable load was decoded in the shader");
+}
 
 
 // A store through a V# that does not come from memory has nothing a shader decode could read.
@@ -9299,12 +9541,16 @@ ResourcePlan DecodedBufferPlan(uint32_t raw_resource) {
   Fixture fixture;
   auto *decoded = fixture.AddBlock();
   auto *tracked = fixture.AddBlock();
+  fixture.block->AddBranch(decoded);
   fixture.block->AddBranch(tracked);
+  fixture.block->terminator = {.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch,
                                .true_block = decoded, .false_block = tracked};
   const auto control = fixture.Buffer({Value(0x2000u), Value(0u), Value(200u), Value(0u)});
   MemoryInfo scalar;
   scalar.kind = ResourceKind::ScalarBuffer;
   const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(196u)},
+                                 fixture.AddMemory(scalar, 0x10));
+  fixture.program.blocks[0]->condition =
       fixture.Emit(ValueOpcode::SGreaterThanEqual32, {flag, Value(0u)});
   const auto record = fixture.Emit(ValueOpcode::GetAddressResource,
                                    {fixture.UserData(0), fixture.UserData(1)},
@@ -9621,6 +9867,10 @@ int main() {
     Run("deep uniform value chain", TestDeepUniformValueChain);
     Run("carried descriptor read is not flattened", TestCarriedDescriptorReadIsNotFlattened);
     Run("ordered scalar read over a written buffer", TestOrderedScalarReadOverWrittenBuffer);
+    Run("GPU-owned scalar data stays native", TestGpuOwnedScalarDataStaysNative);
+    Run("GPU-owned written handle stays on host", TestGpuOwnedWrittenHandleStaysOnHost);
+    Run("GPU-owned relative written handle decodes", TestGpuOwnedRelativeWrittenHandleDecodes);
+    Run("unfoldable load keeps written handle bound", TestUnfoldableLoadKeepsWrittenHandleBound);
     Run("loop phi store descriptor is refused", TestLoopPhiStoreDescriptorIsRefused);
     Run("lane mask descriptor dword", TestLaneMaskDescriptorDword);
     Run("written descriptor sized by GPU count", TestWrittenDescriptorSizedByGpuCount);

@@ -560,6 +560,10 @@ struct DmaPointer {
 	bool     store           = false;
 	uint32_t lo              = 0;
 	uint32_t hi              = 0;
+	uint32_t relative_offset = UINT32_MAX;
+	uint32_t records_offset  = UINT32_MAX;
+	uint32_t records         = 0;
+	uint32_t high_mask       = 0;
 
 	bool operator==(const DmaPointer& other) const = default;
 };
@@ -762,6 +766,9 @@ struct ResourcePlan {
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<SrtReadWriteOrder>                         srt_read_order;
+	std::vector<uint8_t>                                   data_flat_slots;
+	// The guest pc of each `srt_reads` slot (a plan's cloned reads keep only SrtReadFlags).
+	std::vector<uint32_t>                      srt_read_pcs;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

@@ -1316,7 +1316,6 @@ bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint6
 	if (source == nullptr || component >= 4u) {
 		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
-	const auto& mem    = m_program.memory_info[flags.index];
 	if (source->GetOpcode() == ValueOpcode::Ballot) {
 		// The ballot packs lanes 0-31 and 32-63 into the low two dwords; the upper two are zero.
 		uint64_t mask = 0;
@@ -1361,20 +1360,24 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t com
 		return false;
 	}
 	if (shape.kind != RawReadShape::Kind::Address) {
+		if (handle->NumArgs() != 4u) return Refuse(SrtRefusal::UnsupportedOperand);
+		if (!Arg(*handle, 2, operands[3]) || !Arg(*handle, 3, operands[4])) return false;
 	}
-		uint64_t records = 0;
-		uint64_t word3   = 0;
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-		}
-		if (immediate < 0) {
-		}
-			}
-		}
-			result = 0u;
-			return true;
-	} else {
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-		}
+	uint64_t address = 0;
+	    refusal != SrtRefusal::None) {
+		return Refuse(refusal);
+	}
+	if (event.zero) {
+		if (m_runtime.zero_read != nullptr) m_runtime.zero_read(m_runtime.userdata);
+		result = 0u;
+		return true;
+	}
+	if (const auto slot = g_srt_read_slot;
+	    m_runtime.gpu_owned != nullptr && slot < m_program.data_flat_slots.size() &&
+	    m_program.data_flat_slots[slot] != 0u &&
+	    m_program.srt_reads[slot].value.Resolve().TryInstruction() == &inst &&
+	    m_runtime.gpu_owned(m_runtime.userdata, address, sizeof(uint32_t))) {
+		return RefuseVolatile(SrtRefusal::GpuOwned);
 	}
 	uint32_t word = 0;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
@@ -2128,6 +2131,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWa
 		const SrtReadSlotScope scope(slot);
 		if (evaluator.Evaluate(read.value, flat[read.flat_offset])) return true;
 		if (gpu_owned_slots != nullptr && evaluator.m_refusal == SrtRefusal::GpuOwned) {
+			// A data slot the GPU owns stays a native load; the caller learns every such slot.
+			gpu_owned_slots->push_back(slot);
+			flat[read.flat_offset] = 0u;
+			owned                  = true;
+			return true;
+		}
 		return fail(evaluator.m_refusal);
 	};
 	auto& active = m_program.active_sources;
@@ -2137,19 +2146,22 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWa
 		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
 			if (!refresh(slot)) return false;
 		}
-		return true;
+		return !owned || fail(SrtRefusal::GpuOwned);
 	}
 	auto& visited = m_program.visited_blocks;
 	auto& reachable = m_program.reachable_blocks;
 	auto& pending = m_program.pending_blocks;
 	visited.assign(m_program.control_flow.size(), 1u);
-	ResetUnknowns();
-	m_reachable_blocks = &visited;
-	if (m_clean_evaluator != nullptr) {
-		m_clean_evaluator->ResetUnknowns();
-		m_clean_evaluator->m_reachable_blocks = &visited;
+	auto& predicate = conditions != nullptr          ? *conditions
+	                  : m_clean_evaluator != nullptr ? *m_clean_evaluator
+	                                                 : *this;
+	for (auto* walker: {this, m_clean_evaluator, conditions}) {
+		if (walker == nullptr) continue;
+		walker->ResetUnknowns();
+		walker->m_reachable_blocks = &visited;
 	}
-	for (;;) {
+	// Without pruning every block counts as reachable and no branch condition is read.
+	while (prune) {
 		reachable.assign(m_program.control_flow.size(), 0u);
 		pending.clear();
 		pending.push_back(0u);
@@ -2159,8 +2171,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWa
 			if (reachable.at(index)) continue;
 			reachable[index] = 1u;
 			const auto& block = m_program.control_flow[index];
-			uint32_t condition = 0;
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+			uint32_t    condition = 0;
 			if (!block.condition.IsEmpty() &&
 			    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
 			    predicate.Evaluate(block.condition, condition)) {
@@ -2174,8 +2186,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWa
 		if (m_program.control_phi_predecessors.empty()) break;
 		// Only unknown values need another evaluation: successful Phi facts remain
 		// true as their possible predecessors shrink. Keep uniform-read memos stable.
-		ResetUnknowns();
-		if (m_clean_evaluator != nullptr) m_clean_evaluator->ResetUnknowns();
+		for (auto* walker: {this, m_clean_evaluator, conditions})
+			if (walker != nullptr) walker->ResetUnknowns();
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
 	active.assign(m_program.descriptor_sources.size(), 1u);
@@ -2188,7 +2200,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWa
 		for (const auto slot: block.srt_reads)
 			if (!refresh(slot)) return false;
 	}
-	return true;
+	return !owned || fail(SrtRefusal::GpuOwned);
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {

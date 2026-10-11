@@ -32344,6 +32344,64 @@ TestCase VectorReadlaneSelectsTwoKeysWithinWave() {
   return test;
 }
 
+TestCase VectorReadlaneSelectBeyondWave32() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 5, 1);
+  code.push_back(EncodeVop2(0x1a, 1, Vgpr(0), 5));         // v1 = 1 << lane
+  AppendVop3(&code, 0x360, 20, Vgpr(1), InlineU32(63));    // v_readlane_b32 s20, v1, 63
+  AppendVop3(&code, 0x360, 21, Vgpr(1), InlineU32(31));    // v_readlane_b32 s21, v1, 31
+  code.push_back(EncodeVop1(0x01, 2, 20));
+  code.push_back(EncodeVop2(0x1c, 2, 21, 2));               // v2 = s21 | s20
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorReadlaneSelectBeyondWave32";
+  test.code = std::move(code);
+  test.expected = std::vector<u32>(32, 0x80000000u);
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_READLANE_B32, O::V_OR_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_READLANE_B32", 2}};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorReadlaneFromCulledLane() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 0));   // v1 = lane + 1
+  code.push_back(EncodeVop2(0x25, 3, InlineU32(1), 1));   // v3 = lane + 2
+  code.push_back(EncodeVop2(0x0b, 2, Vgpr(1), 3));        // v2 = (lane + 1) * (lane + 2)
+  code.push_back(EncodeVop2(0x16, 2, InlineU32(1), 2));   // v2 = 1 + 2 + .. + (lane + 1)
+  AppendVop3(&code, 0x360, 20, Vgpr(2), InlineU32(31));   // v_readlane_b32 s20, v2, 31
+  code.push_back(EncodeVop1(0x01, 4, 20));
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorReadlaneFromCulledLane";
+  test.code = std::move(code);
+  test.expected = std::vector<u32>(28, 28u * 29u / 2u);
+  test.opcodes = {O::V_ADD_NC_U32, O::V_MUL_U32_U24, O::V_LSHRREV_B32, O::V_READLANE_B32,
+                  O::V_MOV_B32,    O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_READLANE_B32", 1}};
+  test.compute_info.threads_num[0] = 28;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorPermlanex16() {
   using O = ShaderOpcode;
 
@@ -41439,7 +41497,8 @@ void CheckWave64WholeWaveResults() {
           tools.Disassemble(native.spirv, &native_text) &&
               tools.Disassemble(emulated.spirv, &emulated_text),
           "failed to disassemble whole-wave operations");
-  const auto ballots = CountText(native_text, "OpGroupNonUniformBallot ");
+  const auto ballots = CountText(native_text, "OpGroupNonUniformBallot ") -
+                       CountText(native_text, "FindUMsb") / 2;
   Require(test.name, "whole-wave ballot reuse",
           ballots != 0 &&
               CountText(emulated_text, "OpGroupNonUniformBallot ") == ballots * 2,
@@ -52514,6 +52573,7 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 
 
 
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -52537,6 +52597,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--readlane-select-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorReadlaneSelectBeyondWave32());
+    RunCase(&vulkan, VectorReadlaneFromCulledLane());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
@@ -53511,6 +53577,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    RunCase(&vulkan, VectorReadlaneSelectBeyondWave32());
+    RunCase(&vulkan, VectorReadlaneFromCulledLane());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--rt1d-only") == 0) {

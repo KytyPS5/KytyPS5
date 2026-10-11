@@ -693,30 +693,40 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	return ballot;
 }
 
+// The lane a wave-wide read takes its value from.
+//
+// v_readfirstlane_b32 writes its scalar destination whatever EXEC is, and RDNA 2 names lane 0 when
+// no lane is active. Neither operation underneath says that: OpGroupNonUniformBallotFindLSB is
+// undefined on an empty ballot, and GLSL.std.450 FindILsb answers -1, which the `+ 32` below turns
+// into lane 31. Name lane 0 for the empty ballot instead of inheriting either answer.
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	// A subgroup here is never wider than 64 lanes, so those two words hold every lane.
+	const auto any_active =
+	    Binary(state, spv::OpINotEqual, TypeBool(state),
+	           Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high), ConstantU32(state, 0));
 	if (other_half == nullptr) {
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
+		const auto found = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), found,
 		                          ConstantU32(state, spv::ScopeSubgroup), ballot);
-		return result;
+		return Select(state, TypeU32(state), any_active, found, ConstantU32(state, 0));
 	}
-	const auto low        = state.builder.AllocateId();
-	const auto high       = state.builder.AllocateId();
 	const auto low_first  = state.builder.AllocateId();
 	const auto high_first = state.builder.AllocateId();
 	const auto low_active = state.builder.AllocateId();
-	const auto result     = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
 	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), low_first, GlslStd450(state),
 	                          GLSLstd450FindILsb, low);
 	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), high_first, GlslStd450(state),
 	                          GLSLstd450FindILsb, high);
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), low_active, low,
 	                          ConstantU32(state, 0));
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, low_active, low_first,
-	                          EmitAddU32(state, high_first, ConstantU32(state, 32)));
-	return result;
+	const auto upper =
+	    Select(state, TypeU32(state), any_active,
+	           EmitAddU32(state, high_first, ConstantU32(state, 32)), ConstantU32(state, 0));
+	return Select(state, TypeU32(state), low_active, low_first, upper);
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {

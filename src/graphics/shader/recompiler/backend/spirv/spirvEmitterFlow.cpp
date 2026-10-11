@@ -906,8 +906,62 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, lane);
 }
 
+static bool ReadLaneActiveFallbackDisabled() {
+	static const bool disabled = [] {
+		const char* text = std::getenv("KYTY_NO_READLANE_ACTIVE_FALLBACK");
+		return text != nullptr && text[0] != '\0' && text[0] != '0';
+	}();
+	return disabled;
+}
+
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	if (ctx.other_half != nullptr || ReadLaneActiveFallbackDisabled()) {
+		return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	}
+	auto&      state = ctx.state;
+	const auto u32   = TypeU32(state);
+	const auto bool_ = TypeBool(state);
+	// RDNA 2 takes the lane from SSRC1[5:0] in wave64 and SSRC1[4:0] in wave32.
+	const auto lane = EmitBinaryU32(state, spv::OpBitwiseAnd, ctx.Arg(inst, 1),
+	                                ConstantU32(state, state.program.wave_size == 32u ? 31u : 63u));
+	const auto ballot = ctx.Ballot(IR::Value(true));
+	const auto low    = state.builder.AllocateId();
+	const auto high   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, u32, low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, u32, high, ballot, 1);
+	const auto bit   = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
+	const auto upper = Binary(state, spv::OpUGreaterThanEqual, bool_, lane, ConstantU32(state, 32));
+	const auto word  = Select(state, u32, upper, high, low);
+	const auto live  = Binary(
+	    state, spv::OpINotEqual, bool_,
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, word,
+	                  EmitBinaryU32(state, spv::OpShiftLeftLogical, ConstantU32(state, 1), bit)),
+	    ConstantU32(state, 0));
+	// Lanes 0..bit of the named lane's word; (2 << 31) wraps to 0, so bit 31 keeps the whole word.
+	const auto at_or_below =
+	    EmitBinaryU32(state, spv::OpISub,
+	                  EmitBinaryU32(state, spv::OpShiftLeftLogical, ConstantU32(state, 2), bit),
+	                  ConstantU32(state, 1));
+	const auto low_live =
+	    Select(state, u32, upper, low, EmitBinaryU32(state, spv::OpBitwiseAnd, low, at_or_below));
+	const auto high_live =
+	    Select(state, u32, upper, EmitBinaryU32(state, spv::OpBitwiseAnd, high, at_or_below),
+	           ConstantU32(state, 0));
+	const auto low_msb  = state.builder.AllocateId();
+	const auto high_msb = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, u32, low_msb, GlslStd450(state), GLSLstd450FindUMsb,
+	                          low_live);
+	state.builder.AddFunction(spv::OpExtInst, u32, high_msb, GlslStd450(state), GLSLstd450FindUMsb,
+	                          high_live);
+	const auto high_any = Binary(state, spv::OpINotEqual, bool_, high_live, ConstantU32(state, 0));
+	const auto any_live =
+	    Binary(state, spv::OpINotEqual, bool_,
+	           EmitBinaryU32(state, spv::OpBitwiseOr, low_live, high_live), ConstantU32(state, 0));
+	const auto below =
+	    Select(state, u32, high_any,
+	           EmitBinaryU32(state, spv::OpIAdd, high_msb, ConstantU32(state, 32)), low_msb);
+	const auto source = Select(state, u32, live, lane, Select(state, u32, any_live, below, lane));
+	return ctx.Shuffle(inst, 0, source);
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {

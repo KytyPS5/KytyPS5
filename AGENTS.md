@@ -80,6 +80,14 @@ this narrower user instruction; do not repost it or publish a clarification.
 
 ## Resume Ghost of Yōtei work
 
+The primary execution branch is now `yotei-integration-native` in
+`G:\repos\KytyPS5\_Build\worktrees\yotei-fork-baseline-6d041035`.
+Read [the session resume plan](docs/yotei-session-resume.md) before new integration
+work. Preserve this previous `yotei-windows-bringup` checkout and its artifacts.
+The user requests batch collection with diagnostic fallback as the next phase
+after the saved plan; retain original failures and full inputs before fallback,
+and separate collection results from independent correctness proof.
+
 When the user says "continue" or another agent takes over this task, use the
 first checkpoint in [the launch plan](docs/ghost-of-yotei-windows-plan.md) as the
 current progress record and [the test debt](docs/emulator-test-debt.md) for

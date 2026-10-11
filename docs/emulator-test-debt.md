@@ -1,5 +1,34 @@
 # Emulator regression test debt
 
+## Pre-generation capture and batch replay (2026-10-11, validation pending)
+
+Native progress: capture140927 passes all6 CTest modes; cfg141157/shared
+validator pass. Emit-positive141259 PS passes emission/validation, while the
+unchanged valid fused CS gives intended audit RED: initial DecodeProgram demands
+S_ENDPGM on the front that hands off to its back. Fix the audit preflight and
+repeat unchanged CS; full corpus and real main capture run still required.
+Runner Windows PowerShell5.1 tree cleanup has actual RED140558 (orphan child)
+and unchanged GREEN140751 after bounded hidden taskkill; no workers remain.
+
+The user requests retaining failed shader generation inputs and fixing groups by
+shared cause. Current diagnostic changes capture complete compiler inputs before
+TranslateProgram, retain exact main/back code, stage/static/host/user-data inputs,
+the production push-data start offset, and ordered resource callback transcripts.
+Pending phase records are not proven failures: an interrupted run can leave them.
+
+Required native checks before treating the workflow as validated: exact-input
+deduplication and variant retention, archive quota/persistence, synthetic pixel
+and fused compute inputs replayed through emission and production SPIR-V
+validation, missing runtime/back-code negatives, then the available Yotei corpus.
+The PowerShell runner fixture already checks resume, changed inputs, overlapping
+cause counts, timeout/output bounds and owned-process cleanup; this does not
+validate native emission or GPU execution. No emulator semantic fix is claimed.
+
+Keep source inputs fixed during the later native build. The isolated fork game
+currently owns the native slot; native capture/audit checks must wait for its
+bounded completion. A new failed group still requires its own independent
+synthetic intended RED before changing production semantics.
+
 ## Finite inline selectors and exact optimizer cache (2026-10-11)
 
 Completed local selector fix257189e5: RED101934 retains unreachable inter-record

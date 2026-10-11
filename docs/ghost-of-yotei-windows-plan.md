@@ -1,5 +1,108 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2026-10-11 15:15 UTC** (primary base changed; session persistence):
+
+- User requests a saved plan, separate branch, progress shared across sessions;
+  batch collection with diagnostic fallback is the NEXT phase after this plan.
+  [Resume plan](yotei-session-resume.md) records paths, exact artifacts, tests,
+  unvalidated work and the fallback collection/verification rules.
+- New primary branch `yotei-integration-native` is created at engine6d041035 in
+  `_Build/worktrees/yotei-fork-baseline-6d041035`. Previous
+  `yotei-windows-bringup`/completed85494f56 remains intact. New worktree gets its
+  own versioned launch plan, test debt, AGENTS and regression-first skill.
+- Fork baseline: visually confirmed interactive intro and SETTINGS/CONTROLS,
+  Enter responds. Character movement/world/title screen pending;6.2/9.1FPS
+  is an observation, not benchmark. No PR497/main milestone or issue post.
+- Old current run142826/85494f56/EXE975b finished/drained14:59:27, graceful0
+  after1800s timeout, minfree8.88GiB/no memory guards/forced cleanup/reset.
+  Screenshot1434 remains black; no PS617c materialization/menu proof reached.
+  Driver cache payload1236842005bytes, modules346832/521303words. These are
+  expensive-compilation leads, not proof of one sole performance cause.
+- Completed workflow tests: capture6/6, unchanged fused emit2/2 and six damaged
+  inputs all input_error.825 partial profiles in39.048s:777pass/47fail/1timeout,
+  68 overlapping reason memberships. Preserve explicit CFG/resource-plan scope.
+- Real capture5215records exposed admission bug:4096 cached/compiler userdata
+  variants exhausted quota before late143514 generation;1119runtime variants.
+  Follow-up source is UNVALIDATED WIP: actual Translate/Emit admission,
+  deferred cache-hit transcripts, protected failure capacity and exact policy/
+  push/back fallback metadata. Native follow-up tests/retry still pending.
+- No native slot active at checkpoint. Preserve `_Build` evidence/caches and
+  original installed454656/eboot5178/saves. No push. Next agent must inspect
+  newest shared handoff and current diff before building or committing WIP.
+
+Checkpoint **2026-10-11 14:15 UTC** (fork menu confirmed; native batch validation):
+
+- Pinned upstream fork6d041035/private EXEb3ed original01.512 run133628
+  completed/drained at14:06:33UTC, graceful exit0 after1800s timeout; no memory
+  guard/reset/forced cleanup, minfree9.86GiB. Native slot is free for CPU checks.
+  Visually confirmed interactive intro and SETTINGS/CONTROLS after Enter/Options;
+  screenshots1404 andbefore-timeout. Character movement/open-world/title-menu
+  remain unproved; observed title6.2/9.1FPS is not a throughput benchmark.
+  This is the fork baseline, not a PR497/main result; no issue108 publication.
+- Fork cache payload265360493bytes/disk265360640, final stage counters
+  VS1041/PS1413/CS541; journal2749envelopes/2471hash headers are different counts.
+  PS617c reached. Defaults/placeholders, including17requested warning reasons,
+  and8partly-unmapped warnings remain explicit scope limits. Detailed final
+  report: `_Build/analysis/yotei-fork-verification-20261011/final-baseline-20261011T141306Z.md`.
+- Main diagnostics native capture140927 passed6/6; native cfg141157 and shared
+  validator pass. Emit-positive141259: PS emits57words and validates, valid
+  fused CS exposes an audit preflight defect (generic DecodeProgram demands
+  S_ENDPGM instead of accepting the actual front/back handoff). This is a
+  workflow RED; the unchanged synthetic input is the required GREEN oracle.
+- Runner wrapper-tree cleanup has intended RED140558 and unchanged GREEN140751
+  under Windows PowerShell5.1. Full workflow suite passes; all owned fixtures
+  terminated. Fix decoder preflight, repeat the native emit fixtures/negative
+  inputs, then825-manifest grouped audit and current original capture retry.
+  Main source still local/uncommitted onab4480ff; installed454656/eboot5178 intact.
+
+Checkpoint **2026-10-11 13:50 UTC** (pinned fork baseline active; batch workflow):
+
+- Native fork6d041035 built in isolated detached source/dependency worktrees;
+  configure132531, build132928 and install133454 all exit0. Private EXE SHA256
+  `b3ed953555e91759b798aced8a04af324508ceaafd25a70a34d6d34c879c96ef`.
+  Original installed454656/eboot5178/user saves are preserved; seed manifest and
+  build logs: `_Build/analysis/yotei-fork-verification-20261011`.
+- ACTIVE `_Build/runs/game-20261011-133628-fork-6d041035-baseline-fb3974`,
+  PID37912/supervisor15239; fork source frozen. Original01.512, same save seed,
+  Performance1280x720, bindless/linear-readback/raw-alias-sync,1800s/32GiB/8GiB
+  reserve. Native game/test/build slot remains exclusively owned by this run.
+  Initial screenshot black; later screenshot shows only a loading indicator.
+  A frame/title FPS counter does not establish menu, gameplay or throughput.
+- Main uncommitted diagnostics now save complete inputs before generation and
+  retain successful/failed runtime callback variants with explicit phase state.
+  Bounded batch runner groups shared failures, deduplicates full inputs, resumes
+  and retries changed inputs. Script fixtures134559 pass; native build, synthetic
+  PS/CS SPIR-V replay/validation and825-manifest corpus audit remain pending.
+  Separate compiler/runtime capture quotas are being completed before source freeze.
+- Await bounded fork outcome, then run native workflow checks and grouped audit,
+  then current original warm control with captures. A cause group must obtain
+  synthetic intended RED/GREEN before a semantic fix. No new issue108/push.
+
+Checkpoint **2026-10-11 13:12 UTC** (strategy comparison; native slot idle):
+
+- User redirects work to a fresh comparison of peepostarexx/YOTEI-BRANCH,
+  SharpEmu PR926 and current code. New recommended decision gate is recorded in
+  [the base comparison plan](yotei-base-comparison-plan-2026-10-11.md).
+  No new source fixes, native builds or game runs during this research.
+- Latest original cold run103831/3391a9fd/EXE33bb84e5 completed exit0 at
+  10:45:42.8412626 UTC, before PS617c; no timeout/memory guard, min free19.32GiB.
+  Previous turn was interrupted; run.json does not identify the exit cause.
+  PID40376 and supervisor81189 are finished/drained. No native process active.
+  657 completed pipelines,760 optimizer misses/43 hits show real cache use;
+  target materialization/menu/gameplay and full warm gain remain unproved.
+- Live pins: peepo6d041035; Sharp95648c2 (426commits/383files); current code and
+  published draft PR497 head3391a9fd, local docs headab4480ff. No current-head
+  green CI proof returned for PR497. Claimed~7FPS is another person's result.
+- Fork directly addresses the same PS617c pointer/layer resource path through
+  runtime bindless images, but retains default sampler/placeholders/materialization
+  work skips. Use it as an isolated empirical baseline, then assess strict paths;
+  do not merge whole divergent histories or replace verified failures with success.
+- Next execution phase: bounded native paired current/fork comparison with
+  identical original01.512/SaveData/config, fork linear-image readback enabled,
+  then decide integration base and smallest shared mechanism ports. Source
+  artifacts/reviews saved under `_Build/analysis/yotei-strategy-reset-20261011`.
+  Original installed EXE/eboot/user saves intact. No new issue108 milestone/push.
+
 Checkpoint **2026-10-11 10:39 UTC** (finite selectors/cache; original retry active):
 
 - Local selector correction257189e5: RED101934 -> GREEN102546; reachable

@@ -70,6 +70,8 @@ public:
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
+	// The last scheduler tick a draw or dispatch bound the buffer in.
+	uint64_t last_use_tick = 0;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 

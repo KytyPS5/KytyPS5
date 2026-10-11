@@ -253,6 +253,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range,
                     const CommandRecorder&               command_buffer) {
+	// Every use of the image goes through here, also when no barrier is needed: the cache keeps
+	// a released image until the GPU has finished the last tick that used it.
+	tick_accessed_last = std::max(tick_accessed_last, m_scheduler.CurrentTick());
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};

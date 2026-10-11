@@ -133,11 +133,18 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	Unregister(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
-	} else {
-		m_slot_buffers.erase(id);
+	// Command buffers submitted earlier may still use the buffer on the GPU.
+	m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
+}
+
+void BufferCache::ReleaseBuffer(BufferId id) {
+	const auto* buffer = m_slot_buffers.try_get(id);
+	if (buffer != nullptr && !m_scheduler.IsFree(buffer->last_use_tick)) {
+		// Bound after it was dropped, in a tick the GPU has not finished: keep it until then.
+		m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
+		return;
 	}
+	m_slot_buffers.erase(id);
 }
 
 template <bool async>
@@ -525,6 +532,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
+	buffer.last_use_tick = m_scheduler.CurrentTick();
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
@@ -545,6 +553,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
+	buffer.last_use_tick = m_scheduler.CurrentTick();
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 	if (written_size != 0) {
@@ -566,6 +575,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
+			buffer.last_use_tick = m_scheduler.CurrentTick();
 			TouchBuffer(buffer);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 			return {&buffer, buffer.Offset(vaddr)};

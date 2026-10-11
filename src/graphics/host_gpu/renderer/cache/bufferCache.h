@@ -117,6 +117,7 @@ private:
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
+	void ReleaseBuffer(BufferId id);
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);

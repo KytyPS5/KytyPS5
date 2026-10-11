@@ -52,8 +52,9 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	void InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	/// Returns the registered buffer slot; the caller must supply a live buffer ID.
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	/// Obtains coherent storage and offset, tracking GPU ownership when is_written is set.
@@ -100,6 +101,7 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
+	/// Reports whether the slot is absent or its buffer is already marked for deletion.
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;
@@ -131,7 +133,7 @@ private:
 	/// Updates buffer lookup structures for the insert or removal selected by the template.
 	template <bool insert>
 	void ChangeRegister(BufferId id);
-	/// Untracks and unregisters a buffer, deferring destruction until its GPU users complete.
+	/// Unregisters a buffer, deferring destruction until its GPU users complete.
 	void DeleteBuffer(BufferId id);
 	/// Uploads CPU-owned bytes and optionally acquires GPU write ownership.
 	/// Returns whether the read-only texel source was synchronized from an image.

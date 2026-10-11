@@ -10,6 +10,7 @@
 
 namespace Libs::Graphics {
 
+/// Initializes renderer caches and scheduling on the host main thread.
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
@@ -19,17 +20,20 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
+/// Stops the guest GPU and drains the command scheduler before member destruction.
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }
 
+/// Starts the guest GPU command lane and associates the optional video output.
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
 }
 
+/// Stops the guest GPU and drains pending video-output operations.
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
@@ -44,16 +48,19 @@ void RenderContext::ShutdownGpu() {
 	}
 }
 
+/// Returns the active guest GPU, rejecting access before initialization.
 GuestGpu& RenderContext::GetGpu() const {
 	EXIT_IF(m_gpu == nullptr);
 	return *m_gpu;
 }
 
+/// Returns the associated video output, rejecting access when none is present.
 VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	EXIT_IF(m_video_out == nullptr);
 	return *m_video_out;
 }
 
+/// Resolves a mapped host page fault through coherent buffer or texture ownership.
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -70,6 +77,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+/// Invalidates both caches for a fully mapped guest range; rejects unmapped ranges.
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -79,6 +87,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+/// Tests full guest-range coverage under the mapped-range read lock.
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
@@ -138,6 +147,7 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+/// Processes pending BDA faults and performs renderer cache garbage collection.
 void RenderContext::RunGarbageCollector() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
@@ -148,6 +158,7 @@ void RenderContext::RunGarbageCollector() {
 	m_buffer_cache.RunGarbageCollector();
 }
 
+/// Registers the guest event queue for the selected renderer interrupt.
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
 	Common::LockGuard lock(m_interrupt_mutex);
 
@@ -161,6 +172,7 @@ void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int e
 	m_interrupt_eqs.push_back({eq, event_id});
 }
 
+/// Removes the event queue registration for the selected renderer interrupt.
 void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
 	Common::LockGuard lock(m_interrupt_mutex);
 
@@ -174,6 +186,7 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 	m_interrupt_eqs.erase(it);
 }
 
+/// Signals registered event queues for the interrupt and command context.
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	std::vector<InterruptEqRegistration> registrations;
 	{

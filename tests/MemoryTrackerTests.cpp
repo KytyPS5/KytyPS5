@@ -375,6 +375,7 @@ void TestConcurrentRegionPublication() {
         "concurrent region publication lost initial CPU ownership");
 }
 
+/// Checks upload ranges and the transition from CPU-dirty to tracked clean pages.
 void TestCpuDirtyUpload() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -407,6 +408,7 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+/// Checks that clean uploads retain protection and ownership for later CPU writes.
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1240,6 +1242,7 @@ void TestFaultOnProtectedStack() {
 
 namespace Libs::LibKernel::Memory {
 
+/// Adapts guest protection requests to the test host address-space helper.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
                             Common::VirtualMemory::Mode mode) {
   return ProtectAddressSpace(vaddr, size, mode);

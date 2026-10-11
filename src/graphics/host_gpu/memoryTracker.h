@@ -73,6 +73,7 @@ public:
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
 
+	/// Visits GPU-dirty spans under region locks and optionally clears their ownership.
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
@@ -87,6 +88,8 @@ public:
 		});
 	}
 
+	/// Visits CPU-dirty spans and records uploads while preserving required write ordering.
+	/// Upload callbacks must not re-enter this tracker.
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
@@ -120,12 +123,14 @@ private:
 	static constexpr size_t DIRTY_GROUP_COUNT = (DIRTY_WORD_COUNT + 63) / 64;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
+	/// Rejects reentrant tracker use from its current thread upload callback.
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}
 
+	/// Visits intersecting tracker regions, optionally creating them and allowing early exit.
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {
 		ValidateRange(vaddr, size);

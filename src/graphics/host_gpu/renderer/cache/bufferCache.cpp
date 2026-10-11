@@ -78,6 +78,7 @@ void BufferCache::Register(BufferId id) {
 	m_memory_tracker.QueueCpuDirtyRange(buffer.CpuAddress(), buffer.Size());
 }
 
+/// Removes the buffer from cached guest-address and BDA lookup structures.
 void BufferCache::Unregister(BufferId id) {
 	ChangeRegister<false>(id);
 }
@@ -123,12 +124,14 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
+/// Updates the registered buffer age used by garbage collection.
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 	}
 }
 
+/// Unregisters the buffer, deferring destruction until GPU users finish.
 void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
@@ -224,6 +227,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+/// Creates utility buffers, the BDA page table, and guest buffer ownership tracking.
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -258,6 +262,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
 
+/// Releases buffer-cache resources after the owning renderer has drained GPU work.
 BufferCache::~BufferCache() {
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
@@ -272,6 +277,7 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
+/// Makes guest bytes CPU-writable, downloading GPU-owned data when necessary.
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
@@ -280,6 +286,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+/// Synchronously publishes GPU-owned bytes to guest backing for a host read or write.
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -301,6 +308,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	});
 }
 
+/// Finds a native owner for the range, creating and merging buffers when required.
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -375,6 +383,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 	return {first, last, begin, end, has_stream_leap};
 }
 
+/// Copies the overlapping buffer into its replacement and retires the old owner.
 void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
 	auto& new_buffer = m_slot_buffers[new_id];
 	auto& overlap    = m_slot_buffers[overlap_id];
@@ -488,6 +497,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+/// Returns coherent storage and offset, using streaming storage for eligible small reads.
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -549,6 +559,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return {&m_staging_buffer, stage_offset};
 }
 
+/// Fills guest or GDS bytes with a DWORD pattern using the eligible host or GPU path.
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
@@ -611,6 +622,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 
+/// Tests whether the guest range intersects a live registered native buffer.
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid registered-region query\n");
@@ -625,14 +637,17 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	return address + m_slot_buffers[id].Size() > vaddr;
 }
 
+/// Queries tracked GPU-dirty page ownership for the guest range.
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
+/// Tests exact cached GPU-written byte ranges rather than coarse page ownership.
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+/// Queries tracked CPU-dirty page ownership for the guest range.
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
@@ -693,6 +708,7 @@ void BufferCache::RunGarbageCollector() {
 	}
 }
 
+/// Processes the GPU fault buffer through the cache fault manager.
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
@@ -710,6 +726,7 @@ void BufferCache::SynchronizeCpuDirtyBuffers(const RangeSet& mapped_ranges) {
 	}
 }
 
+/// Uploads CPU-owned intersections of registered buffers with the supplied guest range.
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);

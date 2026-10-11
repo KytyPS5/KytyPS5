@@ -16,6 +16,7 @@ MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_man
 	m_cpu_dirty_groups = std::make_unique<std::atomic<uint64_t>[]>(DIRTY_GROUP_COUNT);
 }
 
+/// Releases tracker metadata; the referenced page manager must outlive the tracker.
 MemoryTracker::~MemoryTracker() = default;
 
 /// Publishes a region hint without allocating or changing page ownership.
@@ -64,6 +65,7 @@ void MemoryTracker::TakeCpuDirtyRegions(std::vector<GuestRange>& regions) {
 }
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
+/// Checks in debug builds that cached GPU-dirty ranges agree with tracked page bits.
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                           const char* operation) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid() || (vaddr & (TRACKER_PAGE_SIZE - 1)) != 0 ||
@@ -79,6 +81,7 @@ void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr,
 	}
 }
 
+/// Checks GPU-dirty ownership for the requested range in debug builds.
 void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                               const char* operation) {
 	ValidateRange(vaddr, size);
@@ -95,6 +98,7 @@ void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t va
 }
 #endif
 
+/// Rejects empty, overflowing, or out-of-address-space guest ranges.
 void MemoryTracker::ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("invalid memory tracker range\n");
@@ -118,6 +122,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+/// Reports whether any existing tracked page in the range is CPU-dirty.
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -126,6 +131,7 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+/// Reports whether any existing tracked page in the range is GPU-dirty.
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -144,6 +150,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+/// Marks the requested pages GPU-owned under their tracker region locks.
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -152,6 +159,7 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+/// Clears GPU-dirty ownership for the requested tracked pages.
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

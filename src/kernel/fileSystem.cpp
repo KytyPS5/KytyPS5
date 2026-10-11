@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <new>
 #include <random>
 #include <system_error>
 #include <vector>
@@ -1058,13 +1059,18 @@ int64_t KYTY_SYSV_ABI KernelWritev(int d, const KernelIovec* iov, int iovcnt) {
 	if (::Libs::Network::Net::IsSocket(d)) {
 		// A datagram socket sends one message per call, so gather the vectors and send them together.
 		std::vector<uint8_t> gathered;
-		gathered.reserve(total);
-		for (const auto& buffer: buffers) {
-			if (buffer.iov_len == 0) {
-				continue;
+		// The total can be close to INT_MAX; do not let an allocation failure escape the guest ABI boundary.
+		try {
+			gathered.reserve(total);
+			for (const auto& buffer: buffers) {
+				if (buffer.iov_len == 0) {
+					continue;
+				}
+				const auto* bytes = static_cast<const uint8_t*>(buffer.iov_base);
+				gathered.insert(gathered.end(), bytes, bytes + buffer.iov_len);
 			}
-			const auto* bytes = static_cast<const uint8_t*>(buffer.iov_base);
-			gathered.insert(gathered.end(), bytes, bytes + buffer.iov_len);
+		} catch (const std::bad_alloc&) {
+			return KERNEL_ERROR_ENOMEM;
 		}
 		if (gathered.empty()) {
 			return 0;

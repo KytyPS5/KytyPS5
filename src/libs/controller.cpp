@@ -10,6 +10,7 @@
 #include "kernel/pthread.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
+#include "libs/hapticsRumble.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
 
@@ -33,6 +34,18 @@ constexpr int PAD_HANDLE                = 1;
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
+
+// Haptics-to-rumble output timing for non-Sony pads. Each SDL rumble call lasts
+// HAPTICS_RUMBLE_DURATION_MS, so it stops by itself if the audio feed stops (pause, port close).
+constexpr uint32_t HAPTICS_RUMBLE_DURATION_MS     = 100;
+constexpr uint32_t HAPTICS_RUMBLE_MIN_INTERVAL_MS = 28;     // at most ~35 updates per second
+constexpr uint32_t HAPTICS_RUMBLE_REFRESH_MS      = 70;     // re-send unchanged values before expiry
+constexpr int      HAPTICS_RUMBLE_MIN_DELTA       = 0x0a00; // ~4% of full scale counts as a change
+
+static bool IsSonyGamepadType(SDL_GamepadType type) {
+	return type == SDL_GAMEPAD_TYPE_PS3 || type == SDL_GAMEPAD_TYPE_PS4 ||
+	       type == SDL_GAMEPAD_TYPE_PS5;
+}
 
 struct PadControllerInformation {
 	float    touch_pixel_density;
@@ -130,6 +143,7 @@ public:
 	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
+	void SubmitHapticsRumble(float low_level, float high_level);
 	int  GetActiveControllerId();
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
@@ -172,6 +186,12 @@ private:
 	// The game's last requests, re-sent when their intensity setting changes.
 	std::array<uint8_t, 2> m_vibration {};
 	uint64_t               m_vibration_until = 0;
+	// Haptics-derived rumble state (non-Sony pads only), protected by m_mutex.
+	bool     m_haptics_rumble_active = false;
+	uint16_t m_haptics_low           = 0;
+	uint16_t m_haptics_high          = 0;
+	uint64_t m_haptics_last_ms       = 0;
+	int      m_haptics_announced_id  = -1;
 	PadTriggerEffectParam  m_trigger_effect {};
 	PadTriggerEffectStateInformation m_trigger_state {};
 	// Setting changes share the output lock; audio only needs an atomic scale snapshot.
@@ -475,6 +495,13 @@ void GameController::CheckActive() {
 	if (!m_connected && new_connected) {
 		m_connected_count++;
 	}
+	if (m_haptics_rumble_active && m_active_id >= 0 && m_active_id != HOST_INPUT_CONTROLLER_ID) {
+		// Stop the previous pad's haptics rumble; it may already be gone (null pad).
+		if (auto* old_pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+		    old_pad != nullptr) {
+			(void)SDL_RumbleGamepad(old_pad, 0, 0, 0);
+		}
+	}
 	m_active_id     = new_active_id;
 	m_connected     = new_connected;
 	m_state         = {};
@@ -485,6 +512,10 @@ void GameController::CheckActive() {
 	m_next_touch_id = 1;
 	m_vibration          = {};
 	m_vibration_until    = 0;
+	// A different pad (or none) is active now; its rumble (if any) expires on its own.
+	m_haptics_rumble_active = false;
+	m_haptics_low           = 0;
+	m_haptics_high          = 0;
 	m_trigger_effect     = {};
 	m_trigger_state      = {};
 }
@@ -705,6 +736,7 @@ void GameController::ResetInputState() {
 void GameController::ReleaseHostPads() {
 	Common::LockGuard lock(m_mutex);
 	DualSenseHaptics::Shutdown();
+	m_haptics_rumble_active = false;
 
 	std::vector<SDL_Gamepad*> pads;
 	for (const auto id: m_connected_ids) {
@@ -774,6 +806,71 @@ void GameController::ApplyVibration() {
 int GameController::GetActiveControllerId() {
 	Common::LockGuard lock(m_mutex);
 	return m_active_id;
+}
+
+// Called from the audio thread. Lock order: Audio::m_mutex (if held) -> GameController::m_mutex;
+// this class never calls into Audio, so there is no cycle. SDL_RumbleGamepad is non-blocking.
+void GameController::SubmitHapticsRumble(float low_level, float high_level) {
+	Common::LockGuard lock(m_mutex);
+
+	const bool want_stop = !(low_level > 0.0f) && !(high_level > 0.0f);
+	if (m_active_id < 0 || m_active_id == HOST_INPUT_CONTROLLER_ID) {
+		m_haptics_rumble_active = false;
+		return;
+	}
+	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+	if (pad == nullptr) {
+		m_haptics_rumble_active = false;
+		return;
+	}
+	if (IsSonyGamepadType(SDL_GetGamepadType(pad))) {
+		return; // DualSense path owns these
+	}
+
+	const uint64_t now = SDL_GetTicks();
+	// A classic nonzero scePadSetVibration request wins; do not fight it.
+	if ((m_vibration[0] != 0 || m_vibration[1] != 0) && m_vibration_until > now) {
+		m_haptics_rumble_active = false;
+		return;
+	}
+
+	const float scale = GetSettingScale(Setting::VibrationIntensity);
+	const auto  low   = want_stop ? uint16_t {0} : HapticsRumble::ToMotor16(low_level, scale);
+	const auto  high  = want_stop ? uint16_t {0} : HapticsRumble::ToMotor16(high_level, scale);
+
+	if (low == 0 && high == 0) {
+		// Silence: stop once, then stay quiet.
+		if (m_haptics_rumble_active) {
+			(void)SDL_RumbleGamepad(pad, 0, 0, 0);
+			m_haptics_rumble_active = false;
+			m_haptics_low           = 0;
+			m_haptics_high          = 0;
+			m_haptics_last_ms       = now;
+		}
+		return;
+	}
+
+	const uint64_t since   = now - m_haptics_last_ms;
+	const bool     changed = !m_haptics_rumble_active ||
+	                     std::abs(static_cast<int>(low) - static_cast<int>(m_haptics_low)) >=
+	                         HAPTICS_RUMBLE_MIN_DELTA ||
+	                     std::abs(static_cast<int>(high) - static_cast<int>(m_haptics_high)) >=
+	                         HAPTICS_RUMBLE_MIN_DELTA;
+	if (m_haptics_rumble_active &&
+	    (since < HAPTICS_RUMBLE_MIN_INTERVAL_MS || (!changed && since < HAPTICS_RUMBLE_REFRESH_MS))) {
+		return;
+	}
+
+	const bool ok           = SDL_RumbleGamepad(pad, low, high, HAPTICS_RUMBLE_DURATION_MS);
+	m_haptics_rumble_active = ok;
+	m_haptics_low           = low;
+	m_haptics_high          = high;
+	m_haptics_last_ms       = now;
+
+	if (ok && m_haptics_announced_id != m_active_id) {
+		m_haptics_announced_id = m_active_id;
+		LOGF("HapticsRumble: enabled for non-Sony pad %s\n", SDL_GetGamepadName(pad));
+	}
 }
 
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
@@ -937,6 +1034,20 @@ void ResetInputState() {
 
 int GetActiveControllerId() {
 	return g_controller != nullptr ? g_controller->GetActiveControllerId() : -1;
+}
+
+bool IsActivePadNonSony() {
+	const int id = GetActiveControllerId();
+	if (id < 0 || id == HOST_INPUT_CONTROLLER_ID) {
+		return false;
+	}
+	return !IsSonyGamepadType(SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(id)));
+}
+
+void SubmitHapticsRumble(float low_level, float high_level) {
+	if (g_controller != nullptr) {
+		g_controller->SubmitHapticsRumble(low_level, high_level);
+	}
 }
 
 static bool PadOpenArgsAreValid(int user_id, int type, int index) {

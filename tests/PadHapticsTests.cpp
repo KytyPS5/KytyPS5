@@ -326,6 +326,10 @@ namespace Libs::Controller {
 int GetActiveControllerId() {
 	return active_controller;
 }
+bool IsActivePadNonSony() {
+	return false;
+}
+void SubmitHapticsRumble(float, float) {}
 float GetSettingScale(Setting setting) {
 	return setting == Setting::SpeakerVolume ? speaker_scale : vibration_scale;
 }
@@ -1271,6 +1275,7 @@ void TestAudioDefaultResumeFailure() {
 
 int main() {
 	SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+	Config::Initialize();
 	TestAudioSpeakerFallback();
 	TestAudioSpeakerRouting();
 	TestAudioFallbackGain();

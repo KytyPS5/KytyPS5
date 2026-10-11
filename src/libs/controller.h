@@ -75,6 +75,12 @@ void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
 int  GetActiveControllerId();
+bool IsActivePadNonSony();
+
+// Approximate rumble for non-Sony pads from haptic audio levels (0..1 per motor). Throttled and
+// coalesced internally; call with zeros to stop. Takes the controller lock, so callers must not
+// hold a lock that the controller code could wait on (the controller never calls into Audio).
+void SubmitHapticsRumble(float low_level, float high_level);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 

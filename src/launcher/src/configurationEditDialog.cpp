@@ -212,6 +212,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
 	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
 	m_ui->slider_controller_volume->setValue(info.controller.speaker_volume);
+	m_ui->checkBox_controller_haptics_rumble->setChecked(info.controller.haptics_rumble);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -427,6 +428,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
 		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
 		info.controller.speaker_volume      = ui.slider_controller_volume->value();
+		info.controller.haptics_rumble      = ui.checkBox_controller_haptics_rumble->isChecked();
 	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());

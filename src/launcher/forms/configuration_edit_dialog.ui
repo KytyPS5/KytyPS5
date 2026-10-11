@@ -318,6 +318,13 @@
             </item>
            </layout>
           </item>
+          <item row="3" column="0" colspan="2">
+           <widget class="QCheckBox" name="checkBox_controller_haptics_rumble">
+            <property name="toolTip"><string>Rumble non-PlayStation gamepads from the haptic effects of games that only use the DualSense haptics. Has no effect on PlayStation controllers.</string></property>
+            <property name="text"><string>Rumble from haptics (non-PlayStation gamepads)</string></property>
+            <property name="checked"><bool>true</bool></property>
+           </widget>
+          </item>
          </layout>
         </widget>
        </item>

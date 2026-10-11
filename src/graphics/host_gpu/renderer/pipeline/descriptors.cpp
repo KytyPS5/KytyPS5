@@ -775,14 +775,16 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				if (program.info.buffers[resource].written) {
 					// Sentinel write ranges end before tables captured by any bound stage. A
 					// compute dispatch's own scalar reads may overlap its writes (see
-					// CommitBindings).
+					// CommitBindings), so a table at the start of its own range is allowed; later
+					// tables still end the range so it never grows past the existing limits.
 					for (const auto* reader: stages) {
-						if (reader == stage && program.stage == ShaderType::Compute) continue;
+						const bool own_compute_reads =
+						    reader == stage && program.stage == ShaderType::Compute;
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
+							} else if (address - read_address < read_size && !own_compute_reads) {
 								EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}

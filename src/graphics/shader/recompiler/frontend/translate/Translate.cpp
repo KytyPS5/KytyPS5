@@ -372,6 +372,15 @@ IR::F32 Translator::ApplyF32ResultModifiers(const Decoder::Operand& operand, IR:
 			default: break;
 		}
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(multiplier)}));
+		// RDNA 2 ISA, output modifiers: with output denormals disabled the result is flushed to
+		// zero, and -0 is flushed to +0 (output modifiers are not IEEE compatible). A result
+		// with a zero exponent (a denormal or either zero) becomes +0; NaN and Inf pass.
+		const auto bits     = IR::U32(ir.Emit(IR::ValueOpcode::BitCastU32F32, {value}));
+		const auto exponent = IR::U32(
+		    ir.Emit(IR::ValueOpcode::BitwiseAnd32, {bits, IR::Value(0x7f800000u)}));
+		const auto tiny =
+		    IR::U1(ir.Emit(IR::ValueOpcode::IEqual32, {exponent, IR::Value(0u)}));
+		value = SelectF32(tiny, IR::F32(IR::Value::F32(0.0f)), value);
 	}
 	if (operand.clamp) {
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPSaturate32, {value}));

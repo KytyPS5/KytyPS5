@@ -166,25 +166,27 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 	return EmitClassMaskBits(state, bits, mask, true);
 }
 
+uint32_t EmitIsNanF32(EmitterState& state, uint32_t value) {
+	return Unary(state, spv::OpIsNan, TypeBool(state), value);
+}
+
+// V_MIN/V_MAX_F32 are IEEE minNum/maxNum: a NaN operand yields the other operand, and -0 orders
+// below +0.
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto lhs_class = EmitClassifyF32(state, lhs);
-	const auto rhs_class = EmitClassifyF32(state, rhs);
-
-	const auto numeric_cond = state.builder.AllocateId();
-	state.builder.AddFunction(max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
-	                          TypeBool(state), numeric_cond, lhs, rhs);
-	const auto ordered_bits =
-	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
-
-	const auto both_zero    = EmitLogicalAndBool(state, lhs_class.zero, rhs_class.zero);
-	const auto zero_bits    = max_value ? EmitAndU32(state, lhs_class.bits, rhs_class.bits)
-	                                    : EmitOrU32(state, lhs_class.bits, rhs_class.bits);
-	const auto numeric_bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
-
-	const auto rhs_nan_bits =
-	    EmitSelectValueU32(state, rhs_class.nan, lhs_class.bits, numeric_bits);
-	const auto result_bits = EmitSelectValueU32(state, lhs_class.nan, rhs_class.bits, rhs_nan_bits);
-	return EmitBitcastU32ToF32(state, result_bits);
+	// NMax(x, y) is y if x < y, else x (NMin: y if y < x), and the other operand for one
+	// NaN: the order below for everything but two zeros, which NMin/NMax may return either
+	// of. Two zeros give the AND (max) or OR (min) of their bits.
+	const auto numeric   = max_value ? EmitGlsl<GLSLstd450NMax, IR::Type::F32>(state, lhs, rhs)
+	                                 : EmitGlsl<GLSLstd450NMin, IR::Type::F32>(state, lhs, rhs);
+	const auto lhs_bits  = EmitBitcastF32ToU32(state, lhs);
+	const auto rhs_bits  = EmitBitcastF32ToU32(state, rhs);
+	const auto both_zero = EmitCompareU32Constant(
+	    state, spv::OpIEqual,
+	    EmitAndConstant(state, EmitOrU32(state, lhs_bits, rhs_bits), 0x7fffffffu), 0);
+	const auto zero_bits = max_value ? EmitAndU32(state, lhs_bits, rhs_bits)
+	                                 : EmitOrU32(state, lhs_bits, rhs_bits);
+	return Select(state, TypeF32(state), both_zero, EmitBitcastU32ToF32(state, zero_bits),
+	              numeric);
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {

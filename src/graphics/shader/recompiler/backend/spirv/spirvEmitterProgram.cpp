@@ -285,6 +285,10 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
+	// Wave LDS ordering (WaveLdsScope): a barrier separates an LDS write from the next LDS access
+	// and a read from the next write. The block may be entered right after a write.
+	bool lds_written = true;
+	bool lds_read    = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 			if (emitted_non_phi) {
@@ -292,6 +296,22 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			}
 		} else {
 			emitted_non_phi = true;
+		}
+		if (ctx.state.wave_lds_scope != 0) {
+			const auto access = IR::SharedAccessOf(inst.GetOpcode());
+			if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
+				lds_written = false;
+				lds_read    = false;
+			} else if (access != IR::SharedAccess::None) {
+				const bool writes = access != IR::SharedAccess::Read;
+				if (lds_written || (writes && lds_read)) {
+					EmitWaveLdsBarrier(ctx.state);
+					lds_written = false;
+					lds_read    = false;
+				}
+				lds_written |= writes;
+				lds_read |= access != IR::SharedAccess::Write;
+			}
 		}
 		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;

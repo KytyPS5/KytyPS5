@@ -96,6 +96,14 @@ static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_
 	return false;
 }
 
+bool VertexAttributeFetched(const ShaderVertexInputInfo& info, int attribute) {
+	if (!info.fetch_embedded || info.stage.program == nullptr || attribute < 0 ||
+	    static_cast<size_t>(attribute) >= info.stage.program->info.vertex_fetch_components.size()) {
+		return true;
+	}
+	return info.stage.program->info.vertex_fetch_components[attribute] != 0;
+}
+
 static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
                            uint32_t used_components) {
 	const auto fmt        = res.Format();
@@ -129,7 +137,8 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	format = VulkanFormat(fmt);
 	size   = ShaderRecompiler::Format::GetFormatInfo(fmt).component_count;
 	if (format == vk::Format::eUndefined || size == 0) {
-		EXIT("unknown vertex format: fmt = %u\n", raw_format);
+		EXIT("unknown vertex format: fmt = %u descriptor=%08x,%08x,%08x,%08x\n", raw_format,
+		     res.fields[0], res.fields[1], res.fields[2], res.fields[3]);
 	}
 
 	if (NarrowInputFormat(format, size, used_components)) {
@@ -298,10 +307,18 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		                                    ? vk::VertexInputRate::eInstance
 		                                    : vk::VertexInputRate::eVertex;
 	}
+	uint32_t input_attribute_count = 0;
 	for (uint32_t index = 0; index < vertex_input.attribute_count; index++) {
-		input_attr[index].binding  = vertex_input.attributes[index].binding;
-		input_attr[index].location = index;
-		input_attr[index].offset   = vertex_input.attributes[index].offset;
+		// An embedded fetch whose components are all constants reads no memory and has no
+		// shader input; its descriptor is not consumed and can hold anything (format 0 ended
+		// the emulator in GetInputFormat). The remaining attributes keep their locations.
+		if (!VertexAttributeFetched(vs_input_info, static_cast<int>(index))) {
+			continue;
+		}
+		auto& native_attribute    = input_attr[input_attribute_count++];
+		native_attribute.binding  = vertex_input.attributes[index].binding;
+		native_attribute.location = index;
+		native_attribute.offset   = vertex_input.attributes[index].offset;
 
 		uint32_t   attr_size     = 4;
 		const auto registers_num = vs_input_info.resources_dst[index].registers_num;
@@ -309,7 +326,7 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		    vs_input_info.stage.program->info.vertex_fetch_components[index];
 		const auto used_components =
 		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
-		GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
+		GetInputFormat(vs_input_info.resources[index], native_attribute.format, attr_size,
 		               static_cast<uint32_t>(used_components));
 
 		if (graphics_debug_dump_enabled()) {
@@ -319,9 +336,9 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 				LOGF("VertexInputState[%u]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
 				     "src_fmt=%u dst=v%u regs=%u"
 				     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
-				     log_id, index, input_attr[index].binding, input_attr[index].offset,
-				     input_desc[input_attr[index].binding].stride,
-				     static_cast<int>(input_attr[index].format),
+				     log_id, index, native_attribute.binding, native_attribute.offset,
+				     input_desc[native_attribute.binding].stride,
+				     static_cast<int>(native_attribute.format),
 				     static_cast<uint32_t>(vs_input_info.resources[index].Format()),
 				     static_cast<uint32_t>(vs_input_info.resources_dst[index].register_start),
 				     static_cast<uint32_t>(registers_num), static_cast<uint32_t>(used_components),
@@ -346,7 +363,7 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 
 	build.vertex_input_info.vertexBindingDescriptionCount   = vertex_input.binding_count;
 	build.vertex_input_info.pVertexBindingDescriptions      = input_desc.data();
-	build.vertex_input_info.vertexAttributeDescriptionCount = vertex_input.attribute_count;
+	build.vertex_input_info.vertexAttributeDescriptionCount = input_attribute_count;
 	build.vertex_input_info.pVertexAttributeDescriptions    = input_attr.data();
 
 	build.input_assembly.topology = static_params.topology;

@@ -694,8 +694,15 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(i, vs_input_info);
-		sizes[i]           = size;
+		// A buffer only constant-only embedded fetches refer to is never read: bind the null
+		// buffer instead of acquiring whatever its unconsumed descriptor names.
+		bool fetched = false;
+		for (int a = 0; a < vs_input_info.resources_num && !fetched; a++) {
+			fetched = vs_input_info.resources_dst[a].buffer_index == i &&
+			          VertexAttributeFetched(vs_input_info, a);
+		}
+		const auto size = fetched ? VertexBufferDescriptorSize(i, vs_input_info) : 0;
+		sizes[i]        = size;
 		if (size == 0) {
 			continue;
 		}

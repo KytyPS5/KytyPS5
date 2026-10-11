@@ -245,6 +245,9 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
                         const ShaderPixelInputInfo*            ps_input_info,
                         const PipelineCache::GraphicsPrograms& programs,
                         const PipelineStaticParameters&        static_params);
+// False for an embedded-fetch attribute whose components the shader only replaces by constants:
+// it gets no native vertex attribute, and its buffer is not bound for it.
+[[nodiscard]] bool VertexAttributeFetched(const ShaderVertexInputInfo& info, int attribute);
 // Any thread.
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
                                   vk::Pipeline* pipeline);

@@ -107,6 +107,9 @@ struct EmitterState {
 	uint32_t                                         tess_patch_base     = 0;
 
 	uint32_t                                         lane_count              = 1;
+	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
+	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
+	uint32_t                                         wave_lds_scope          = 0;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
@@ -497,6 +500,9 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
+
+// Whether a 32-bit float is a NaN.
+uint32_t EmitIsNanF32(EmitterState& state, uint32_t value);
 
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 

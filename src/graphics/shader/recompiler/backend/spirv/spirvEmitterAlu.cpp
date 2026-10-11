@@ -77,7 +77,7 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	} else {
 		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), converted_raw, trunc);
 	}
-	const auto nan = EmitClassifyF32(state, src).nan;
+	const auto nan = EmitIsNanF32(state, src);
 	if (signed_value) {
 		const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src,
 		                          ConstantF32(state, 0xcf000000u));
@@ -128,10 +128,10 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);
 	const auto high_min = EmitMinMaxF32Value(state, max_ab, c, false);
 	const auto median   = EmitMinMaxF32Value(state, min_ab, high_min, true);
-	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state),
-	                             EmitClassifyF32(state, a).nan, EmitClassifyF32(state, b).nan);
+	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state), EmitIsNanF32(state, a),
+	                             EmitIsNanF32(state, b));
 	const auto any_nan =
-	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitClassifyF32(state, c).nan);
+	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitIsNanF32(state, c));
 	return Select(state, TypeF32(state), any_nan, min3, median);
 }
 

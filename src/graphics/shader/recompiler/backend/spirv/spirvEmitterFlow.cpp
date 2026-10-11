@@ -672,6 +672,19 @@ void EmitBarrier(EmitterState& state) {
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }
 
+// One guest wave's LDS accesses are in program order (all LDS reads and writes of a wavefront
+// complete in order), so a lane reads LDS another lane of its wave just wrote without a barrier.
+// Host invocations do not run in lockstep: they need one, at the scope WaveLdsScope chose.
+void EmitWaveLdsBarrier(EmitterState& state) {
+	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
+	                        ? spv::MemorySemanticsUniformMemoryMask
+	                        : spv::MemorySemanticsWorkgroupMemoryMask;
+	state.builder.AddFunction(
+	    spv::OpControlBarrier, ConstantU32(state, state.wave_lds_scope),
+	    ConstantU32(state, spv::ScopeWorkgroup),
+	    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+}
+
 uint32_t EmitLaneId(EmitterState& state) {
 	return state.program.stage == ShaderType::TessellationControl
 	           ? EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0)

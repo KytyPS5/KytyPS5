@@ -1491,6 +1491,102 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
+static BufferCopy AnalyzeBufferCopy(const Program& program) {
+	    !program.info.samplers.empty() || !program.info.images.empty() ||
+	    program.info.buffers.size() != 2) {
+		return {};
+	}
+	for (;;) {
+			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
+			if (!inst.MayHaveSideEffects()) continue;
+			if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write ||
+			    stores.size() >= BufferCopy::MaxPairs)
+				return {};
+			stores.push_back(&inst);
+		}
+		if (term.kind == CFG::TerminatorKind::Return) break;
+		if (term.kind != CFG::TerminatorKind::Branch) return {};
+	}
+	if (stores.empty() || visited.size() != program.blocks.size()) return {};
+
+	constexpr std::array store_ops {ValueOpcode::StoreBufferU32, ValueOpcode::StoreBufferU32x2,
+	                                ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
+	constexpr std::array load_ops {ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU32x2,
+	                               ValueOpcode::LoadBufferU32x3, ValueOpcode::LoadBufferU32x4};
+	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
+	                                 ValueOpcode::CompositeConstructU32x3,
+	                                 ValueOpcode::CompositeConstructU32x4};
+	constexpr std::array extracts {ValueOpcode::CompositeExtractU32x2,
+	                               ValueOpcode::CompositeExtractU32x3,
+	                               ValueOpcode::CompositeExtractU32x4};
+	// Raw dword elements addressed by index alone; a format or type conversion is not a copy.
+	const auto raw_element = [](const MemoryInfo& memory, uint32_t words) {
+		return !memory.formatted && !memory.typed && memory.idxen && !memory.offen &&
+		       memory.offset == 0 && memory.data_bits == 32 && memory.data_dwords == words &&
+		       !memory.planning_only && memory.kind == ResourceKind::Buffer;
+	};
+	BufferCopy result;
+	for (const auto* store: stores) {
+		const auto store_op = std::ranges::find(store_ops, store->GetOpcode());
+		if (store_op == store_ops.end()) return {};
+		const auto words = static_cast<uint32_t>(store_op - store_ops.begin() + 1);
+		const auto guard = store->Arg(5).Resolve();
+		if (store->Arg(2).Resolve() != Value(0u) || store->Arg(3).Resolve() != Value(0u) ||
+		    !IsFullDispatchPredicate(guard))
+			return {};
+		const auto& store_memory = program.memory_info.at(store->Flags<MemoryFlags>().index);
+		if (!raw_element(store_memory, words)) return {};
+
+		// The stored value must be the loaded one, component for component.
+		const Inst* load = nullptr;
+		const auto  data = ResolveActiveU32(store->Arg(4), guard);
+		if (words == 1) {
+			load = data.TryInstruction();
+		} else {
+			const auto* vector = data.TryInstruction();
+			if (vector == nullptr || vector->GetOpcode() != composites[words - 2]) return {};
+			for (uint32_t i = 0; i < words; ++i) {
+				const auto* extract = ResolveActiveU32(vector->Arg(i), guard).TryInstruction();
+				if (extract == nullptr || extract->GetOpcode() != extracts[words - 2] ||
+				    extract->Arg(1).Resolve() != Value(i))
+					return {};
+				const auto* source = extract->Arg(0).Resolve().TryInstruction();
+				if (source == nullptr || (load != nullptr && source != load)) return {};
+				load = source;
+			}
+		}
+		if (load == nullptr || load->GetOpcode() != load_ops[words - 1] ||
+		    load->Arg(1).Resolve() != store->Arg(1).Resolve() ||
+		    load->Arg(2).Resolve() != Value(0u) || load->Arg(3).Resolve() != Value(0u) ||
+		    !IsFullDispatchPredicate(load->Arg(4).Resolve()))
+			return {};
+		const auto& load_memory = program.memory_info.at(load->Flags<MemoryFlags>().index);
+		if (!raw_element(load_memory, words) || load_memory.resource == store_memory.resource)
+			return {};
+
+		const auto element = FillIndex(store->Arg(1), 0, guard);
+		if (!element || (*element)[1] != 1 || (*element)[2] == 0 || (*element)[0] > UINT32_MAX)
+			return {};
+		if (result.pairs == 0) {
+			result.src          = load_memory.resource;
+			result.dst          = store_memory.resource;
+			result.words        = words;
+			result.group_stride = static_cast<uint32_t>((*element)[2]);
+		} else if (result.src != load_memory.resource || result.dst != store_memory.resource ||
+		           result.words != words || result.group_stride != (*element)[2]) {
+			return {};
+		}
+		result.offsets[result.pairs++] = static_cast<uint32_t>((*element)[0]);
+	}
+	const auto& source      = program.info.buffers.at(result.src);
+	const auto& destination = program.info.buffers.at(result.dst);
+	if (source.written || source.atomic || !destination.written || destination.read ||
+	    destination.atomic)
+		return {};
+	result.valid = true;
+	return result;
+}
+
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
 	plan.user_data_base             = program.user_data_base;
@@ -1652,6 +1748,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	plan.uniform_fill = program.uniform_fill.fill.kind != UniformFillKind::None
 	    ? program.uniform_fill : AnalyzeUniformFill(program);
+	plan.buffer_copy  = AnalyzeBufferCopy(program);
 	for (auto& value: plan.uniform_fill.values) value = Clone(value);
 	plan.uniform_fill.pattern_size = Clone(plan.uniform_fill.pattern_size);
 	plan.uniform_fill.element_count = Clone(plan.uniform_fill.element_count);
@@ -1856,6 +1953,7 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 		}
 	}
 	snapshot.uniform_fill = {};
+	snapshot.buffer_copy          = program.buffer_copy;
 	const auto& fill = program.uniform_fill;
 	auto words = fill.fill.words;
 	bool uniform_fill = words != 0;

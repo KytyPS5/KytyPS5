@@ -778,6 +778,7 @@ struct ResourcePlan {
 	std::vector<uint32_t>                 unfoldable_pcs;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	BufferCopy                            buffer_copy;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;

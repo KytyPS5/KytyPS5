@@ -18,6 +18,20 @@ struct DescriptorValue {
 	}
 };
 
+struct BufferCopy {
+	static constexpr uint32_t MaxPairs = 8;
+
+	bool                           valid        = false;
+	uint32_t                       src          = 0;
+	uint32_t                       dst          = 0;
+	uint32_t                       words        = 0;
+	uint32_t                       pairs        = 0;
+	uint32_t                       group_stride = 0;
+	std::array<uint32_t, MaxPairs> offsets {};
+
+	bool operator==(const BufferCopy&) const = default;
+};
+
 enum class UniformFillKind { None, Buffer, Image };
 
 struct UniformFill {
@@ -53,6 +67,7 @@ struct ResourceSnapshot {
 	// Per specialization read, the flat SRT slot whose walk issued it; UINT32_MAX for none.
 	std::vector<uint32_t>           specialization_read_slots;
 	UniformFill                 uniform_fill;
+	BufferCopy                      buffer_copy;
 
 	void AddHeapRead(uint64_t base, uint64_t size) {
 		specialization_reads.emplace_back(base, size);

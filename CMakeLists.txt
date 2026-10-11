@@ -732,6 +732,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	add_test(NAME compute_image_copy
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-image-copy-only)
 	add_test(NAME dispatch_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
 	add_test(NAME long_recording_submit

@@ -182,6 +182,49 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+bool ResolveComputeBufferCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+                              uint32_t group_y, uint32_t group_z, uint32_t mode, uint64_t& source,
+                              uint64_t& destination, uint64_t& size) {
+	const auto& resources = *input.stage.resources;
+	const auto& copy      = resources.buffer_copy;
+	if (!copy.valid || copy.pairs == 0 || copy.pairs > ShaderRecompiler::IR::BufferCopy::MaxPairs ||
+	    copy.src >= resources.buffers.size() || copy.dst >= resources.buffers.size() ||
+	    mode != 0x41u || input.dispatch_thread_dimensions) {
+		return false;
+	}
+	const uint64_t threads = input.threads_num[0];
+	if (threads == 0 || input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 ||
+	    group_y != 1 || group_z != 1 || copy.group_stride != threads * copy.pairs) {
+		return false;
+	}
+	std::array<uint32_t, ShaderRecompiler::IR::BufferCopy::MaxPairs> offsets = copy.offsets;
+	std::sort(offsets.begin(), offsets.begin() + copy.pairs);
+	for (uint32_t k = 0; k < copy.pairs; ++k) {
+		if (offsets[k] != k * threads) {
+			return false;
+		}
+	}
+	const auto     from = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.src]);
+	const auto     to   = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.dst]);
+	const uint64_t element = uint64_t {copy.words} * sizeof(uint32_t);
+	for (const auto& descriptor: {from, to}) {
+		if (descriptor.Base48() == 0 || descriptor.Stride() != element ||
+		    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid()) {
+			return false;
+		}
+	}
+	const uint64_t records = to.NumRecords();
+	const uint64_t covered = uint64_t {group_x} * copy.group_stride;
+	if (records == 0 || from.NumRecords() != records || covered < records ||
+	    covered - records >= copy.group_stride || records > UINT64_MAX / element) {
+		return false;
+	}
+	size        = records * element;
+	source      = from.Base48();
+	destination = to.Base48();
+	return size <= 0x40000000u && (source + size <= destination || destination + size <= source);
+}
+
 bool ResolveComputeRecordFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource&    resolved_descriptor,
@@ -329,6 +372,19 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
+bool RenderExecutor::TryConsumeComputeImageCopy(const ShaderComputeInputInfo& input,
+                                                CommandBuffer& command, uint32_t group_x,
+                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+	uint64_t source      = 0;
+	uint64_t destination = 0;
+	uint64_t size        = 0;
+	if (!ResolveComputeBufferCopy(input, group_x, group_y, group_z, mode, source, destination,
+	                              size)) {
+		return false;
+	}
+	return command.GetContext().GetBufferCache().CopyImageForBufferCopy(source, destination, size);
+}
+
 static void MarkStorageImagesFlushed(TextureCache& cache, const PreparedBindings& bindings) {
 	for (const auto& binding: bindings.images) {
 		if (binding.desc.type != TextureCache::BindingType::Storage || !binding.image_id) {
@@ -369,9 +425,19 @@ static void CollectDispatchAccess(TextureCache& textures, const ShaderStageRunti
 		access.reads_all  = true;
 		access.writes_all = true;
 	}
+	const auto buffer_count = layout.descriptor_counts[static_cast<size_t>(
+	    ShaderRecompiler::IR::DescriptorBindingKind::Buffers)];
+	if (buffer_count != 0) {
+		if (bindings.buffer_sources.size() != buffer_count) {
 			access.reads_all  = true;
 			access.writes_all = true;
 		} else {
+			for (const auto& resource: program.info.buffers) {
+				if (resource.descriptor_index == UINT32_MAX) {
+					continue;
+				}
+				const auto& source = bindings.buffer_sources[resource.descriptor_index];
+				access.Add(Space::Guest, 0, source.address, source.size, resource.written);
 			}
 		}
 	}
@@ -535,11 +601,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
-	                           thread_group_z, mode))) {
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y, thread_group_z,
 	                           mode) ||
 	     TryConsumeComputeRecordFill(input_info, buffer, thread_group_x, thread_group_y,
 	                                 thread_group_z, mode) ||
+	     TryConsumeComputeImageCopy(input_info, buffer, thread_group_x, thread_group_y,
+	                                thread_group_z, mode))) {
 		ResetBindings();
 		return;
 	}

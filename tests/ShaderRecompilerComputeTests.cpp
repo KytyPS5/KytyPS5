@@ -16879,6 +16879,507 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckComputeImageCopy() {
+    constexpr const char *name = "ComputeImageCopy";
+    constexpr uintptr_t base = 0x000000020e000000ull;
+    constexpr uint64_t allocation_size = 0x800000;
+    // Larger than a caching page, so a raw read of the source goes through its image.
+    constexpr uint32_t width = 256, height = 256;
+    constexpr uint64_t image_bytes = width * height * sizeof(u32);
+    constexpr u32 records = width * height;
+    // The guest shader, verbatim: element (group << 9) + lane and the one 256 after it.
+    static constexpr std::array<u32, 21> copy_shader{
+        0xbfa00001u, 0xd7460001u, 0x04011202u, 0xf40c0100u, 0xfa000000u, 0xbf8cc07fu,
+        0xe0302000u, 0x80010201u, 0xbf8c3f70u, 0xe0702000u, 0x80420201u, 0x8f6a8902u,
+        0xd76d0000u, 0x0401fe6au, 0x00000100u, 0xe0302000u, 0x80010300u, 0xbf8c3f70u,
+        0xe0702000u, 0x80420300u, 0xbf810000u};
+    ShaderMapUserData(reinterpret_cast<uint64_t>(copy_shader.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(copy_shader.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "image copy fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "image copy fixture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      const auto descriptor_words = [&](uint64_t address) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[1] |= static_cast<u32>(sizeof(u32)) << 16u;
+        descriptor.fields[2] = records;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        return descriptor;
+      };
+      const auto image_desc = [&](uint64_t address, vk::Format format,
+                                  Prospero::BufferFormat guest) {
+        return MakeLinearDesc(address, image_bytes, format, guest, Prospero::ImageType::kColor2D,
+                              {width, height, 1}, 1, 4, 1);
+      };
+      const auto run_copy = [&](uint64_t table, uint64_t from, uint64_t to) {
+        const auto source = descriptor_words(from);
+        const auto destination = descriptor_words(to);
+        std::memcpy(reinterpret_cast<void *>(table), source.fields, sizeof(source.fields));
+        std::memcpy(reinterpret_cast<void *>(table + sizeof(source.fields)), destination.fields,
+                    sizeof(destination.fields));
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(copy_shader.data()),
+                             .num_thread_x = 256, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 2, .tgid_x_en = true});
+        shaders.SetCsUserSgpr(0, static_cast<u32>(table));
+        shaders.SetCsUserSgpr(1, static_cast<u32>(table >> 32u));
+        processor.DispatchDirect(records / 512u, 1, 1, 0x41u);
+      };
+      const auto paint = [&](ImageId id, u32 value) {
+        vk::ClearValue clear{};
+        clear.color.uint32 = std::array{value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      };
+      const auto check_bytes = [&](const char *what, uint64_t address, u32 expected) {
+        cache.ReadMemory(address, image_bytes);
+        std::vector<u32> actual(records);
+        Require(name, "readback",
+                LibKernel::Memory::TryReadBacking(address, actual.data(), image_bytes),
+                "copied bytes could not be read back");
+        for (u32 i = 0; i < records; i++) {
+          Require(name, what, actual[i] == expected,
+                  "word " + std::to_string(i) + " expected " + Hex(expected) + ", got " +
+                      Hex(actual[i]));
+        }
+      };
+
+      // Two lone images of one layout: the copy is served image to image.
+      const uint64_t table = base;
+      const uint64_t from = base + 0x40000, to = base + 0x80000;
+      auto from_desc = image_desc(from, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+      auto to_desc = image_desc(to, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+      const auto from_id = textures.FindImage(from_desc);
+      const auto to_id = textures.FindImage(to_desc);
+      paint(from_id, 0x13572468u);
+      paint(to_id, 0xdeadbeefu);
+      run_copy(table, from, to);
+      const auto &copied = textures.GetImage(to_id);
+      Require(name, "destination image state",
+              copied.IsGpuModified() && !copied.IsBufferModified(),
+              "the copy was not served as an image copy");
+      Require(name, "source stays in its image", textures.GetImage(from_id).IsGpuModified(),
+              "the image copy wrote the source back");
+      const auto texels = ReadCachedTexel(name, context, to_id, {}, {width, height, 1});
+      for (u32 i = 0; i < texels.size(); i++) {
+        Require(name, "destination texels", texels[i] == 0x13572468u,
+                "texel " + std::to_string(i) + " expected 0x13572468, got " + Hex(texels[i]));
+      }
+      const uint64_t plain = base + 0xc0000;
+      run_copy(table + 0x40, to, plain);
+      check_bytes("destination bytes", plain, 0x13572468u);
+
+      const uint64_t table2 = base + 0x100, from2 = base + 0x100000, to2 = base + 0x140000;
+      auto from2_desc = image_desc(from2, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+      auto to2_desc = image_desc(to2, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+      const auto from2_id = textures.FindImage(from2_desc);
+      (void)textures.FindImage(to2_desc);
+      // A 16-bit surface over the same bytes, parked again once the destination is looked up.
+      auto alias_desc = MakeLinearDesc(to2, image_bytes, vk::Format::eR16Uint,
+                                       Prospero::BufferFormat::k16UInt,
+                                       Prospero::ImageType::kColor2D, {width * 2, height, 1}, 1,
+                                       2, 1);
+      const auto alias_id = textures.FindImage(alias_desc);
+      const auto to2_id = textures.FindImage(to2_desc);
+      Require(name, "alias fixture", alias_id && alias_id != to2_id,
+              "the alias did not become its own surface");
+      paint(from2_id, 0x2468ace0u);
+      run_copy(table2, from2, to2);
+      const auto &aliased_to = textures.GetImage(to2_id);
+      Require(name, "aliased destination state",
+              aliased_to.IsGpuModified() && !aliased_to.IsBufferModified(),
+              "the aliased copy was not served as an image copy");
+      check_bytes("aliased destination bytes", to2, 0x2468ace0u);
+
+      {
+        const uint64_t table3 = base + 0x200, from3 = base + 0x200000, to3 = base + 0x240000;
+        auto from3_desc = image_desc(from3, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+        auto to3_desc = image_desc(to3, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+        auto parker_desc = MakeLinearDesc(to3, image_bytes, vk::Format::eR32Uint,
+                                          Prospero::BufferFormat::k32UInt,
+                                          Prospero::ImageType::kColor2D, {width * 2, height / 2, 1},
+                                          1, 4, 1);
+        const auto from3_id = textures.FindImage(from3_desc);
+        const auto to3_id = textures.FindImage(to3_desc);
+        paint(to3_id, 0x11111111u);
+        const auto parker_id = textures.FindImage(parker_desc);
+        Require(name, "parked destination fixture",
+                parker_id != to3_id && textures.GetImage(to3_id).dormant,
+                "the second surface did not park the destination");
+        paint(parker_id, 0x22222222u);
+        paint(from3_id, 0x3579bdf1u);
+        run_copy(table3, from3, to3);
+        const auto &woken = textures.GetImage(to3_id);
+        Require(name, "parked destination served",
+                !woken.dormant && woken.IsGpuModified() && !woken.IsBufferModified(),
+                "the copy did not wake and fill the parked destination");
+        const auto parked_texels = [&](TextureCache::ImageDesc desc, u32 expected,
+                                       const char *what) {
+          const auto id = textures.FindImage(desc);
+          (void)textures.FindTexture(id, desc);
+          const auto texels =
+              ReadCachedTexel(name, context, id, {}, {desc.info.extent.width,
+                                                      desc.info.extent.height, 1});
+          for (u32 i = 0; i < texels.size(); i++) {
+            Require(name, what, texels[i] == expected,
+                    "texel " + std::to_string(i) + " expected " + Hex(expected) + ", got " +
+                        Hex(texels[i]));
+          }
+        };
+        parked_texels(to3_desc, 0x3579bdf1u, "woken destination texels");
+        parked_texels(parker_desc, 0x3579bdf1u, "parking surface reads the copy");
+        parked_texels(to3_desc, 0x3579bdf1u, "destination after the parking surface");
+      }
+
+      {
+        const uint64_t table4 = base + 0x300, from4 = base + 0x280000, to4 = base + 0x2c0000;
+        auto from4_desc = image_desc(from4, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+        auto to4_desc = image_desc(to4, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt);
+        auto part_desc = MakeLinearDesc(to4 + image_bytes / 2, image_bytes / 2,
+                                        vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                                        Prospero::ImageType::kColor2D, {width, height / 2, 1}, 1,
+                                        4, 1);
+        const auto from4_id = textures.FindImage(from4_desc);
+        const auto part_id = textures.FindImage(part_desc);
+        paint(part_id, 0x44444444u);
+        paint(from4_id, 0x0badf00du);
+        run_copy(table4, from4, to4);
+        const auto created = textures.FindImageFromRange(to4, image_bytes, false);
+        Require(name, "destination created",
+                created && textures.GetImage(created).info.data == GuestRange{to4, image_bytes} &&
+                    textures.GetImage(created).IsGpuModified(),
+                "the copy did not create its destination surface");
+        const auto consumer = textures.FindImage(to4_desc);
+        Require(name, "consumer binds the created surface",
+                consumer == created,
+                "the consumer built another surface over the copied range");
+        (void)textures.FindTexture(consumer, to4_desc);
+        const auto texels = ReadCachedTexel(name, context, consumer, {}, {width, height, 1});
+        for (u32 i = 0; i < texels.size(); i++) {
+          Require(name, "created destination texels", texels[i] == 0x0badf00du,
+                  "texel " + std::to_string(i) + " expected 0x0badf00d, got " + Hex(texels[i]));
+        }
+        const auto part = textures.FindImage(part_desc);
+        (void)textures.FindTexture(part, part_desc);
+        const auto part_texels = ReadCachedTexel(name, context, part, {}, {width, height / 2, 1});
+        for (u32 i = 0; i < part_texels.size(); i++) {
+          Require(name, "overlapped surface reads the copy", part_texels[i] == 0x0badf00du,
+                  "texel " + std::to_string(i) + " expected 0x0badf00d, got " +
+                      Hex(part_texels[i]));
+        }
+      }
+
+      // A depth surface copied onto another (cs 0x409f: 0x20198b0000 -> 0x2008470000 in RE2).
+      {
+        const uint64_t table5 = base + 0x400, from5 = base + 0x300000, to5 = base + 0x340000;
+        const auto depth_desc = [&](uint64_t address) {
+          auto desc = MakeLinearDesc(address, image_bytes, vk::Format::eD32Sfloat,
+                                     Prospero::BufferFormat::k32Float,
+                                     Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+          desc.type = TextureCache::BindingType::DepthTarget;
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+          return desc;
+        };
+        auto from5_desc = depth_desc(from5);
+        auto to5_desc = depth_desc(to5);
+        const auto from5_id = textures.FindImage(from5_desc);
+        const auto to5_id = textures.FindImage(to5_desc);
+        const auto clear_depth = [&](ImageId id, float depth) {
+          vk::ClearValue clear{};
+          clear.depthStencil = vk::ClearDepthStencilValue{depth, 0};
+          TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), id,
+                                             {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, clear);
+        };
+        clear_depth(from5_id, 0.5f);
+        clear_depth(to5_id, 0.25f);
+        run_copy(table5, from5, to5);
+        const auto &depth_to = textures.GetImage(to5_id);
+        Require(name, "depth destination served",
+                depth_to.IsGpuModified() && !depth_to.IsBufferModified(),
+                "the depth copy was not served image to image");
+        run_copy(table5 + 0x40, to5, base + 0x380000);
+        check_bytes("depth destination bytes", base + 0x380000, 0x3f000000u);
+      }
+
+      {
+        const uint64_t table6 = base + 0x500, from6 = base + 0x400000, to6 = base + 0x440000;
+        const auto stencil_desc = [&](uint64_t address, uint64_t stencil) {
+          auto desc = MakeLinearDesc(address, image_bytes, vk::Format::eD32SfloatS8Uint,
+                                     Prospero::BufferFormat::k32Float,
+                                     Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+          desc.type = TextureCache::BindingType::DepthTarget;
+          desc.info.stencil = {stencil, uint64_t{width} * height};
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+          return desc;
+        };
+        auto from6_desc = stencil_desc(from6, base + 0x480000);
+        auto to6_desc = stencil_desc(to6, base + 0x4a0000);
+        const auto from6_id = textures.FindImage(from6_desc);
+        const auto to6_id = textures.FindImage(to6_desc);
+        const auto clear_both = [&](ImageId id, float depth, u32 stencil) {
+          vk::ClearValue clear{};
+          clear.depthStencil = vk::ClearDepthStencilValue{depth, stencil};
+          TextureCacheTestAccess::ClearImage(
+              textures, scheduler.Current(), id,
+              {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+              clear);
+        };
+        clear_both(from6_id, 0.5f, 0x11u);
+        clear_both(to6_id, 0.25f, 0x99u);
+        run_copy(table6, from6, to6);
+        const auto &stencil_to = textures.GetImage(to6_id);
+        Require(name, "stencil-carrying depth destination served",
+                stencil_to.IsGpuModified() && !stencil_to.IsBufferModified(),
+                "the depth copy between stencil-carrying surfaces was not served");
+        run_copy(table6 + 0x40, to6, base + 0x4c0000);
+        check_bytes("stencil-carrying depth bytes", base + 0x4c0000, 0x3f000000u);
+      }
+
+      {
+        const uint64_t table7 = base + 0x600, from7 = base + 0x500000, to7 = base + 0x540000;
+        auto from7_desc = image_desc(from7, vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float);
+        auto to7_desc = MakeLinearDesc(to7, image_bytes, vk::Format::eD32Sfloat,
+                                       Prospero::BufferFormat::k32Float,
+                                       Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+        to7_desc.type = TextureCache::BindingType::DepthTarget;
+        to7_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        to7_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        const auto from7_id = textures.FindImage(from7_desc);
+        const auto to7_id = textures.FindImage(to7_desc);
+        vk::ClearValue half{};
+        half.color.float32 = std::array{0.5f, 0.0f, 0.0f, 0.0f};
+        TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), from7_id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, half);
+        vk::ClearValue quarter{};
+        quarter.depthStencil = vk::ClearDepthStencilValue{0.25f, 0};
+        TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), to7_id,
+                                           {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, quarter);
+        run_copy(table7, from7, to7);
+        const auto &view_to = textures.GetImage(to7_id);
+        Require(name, "depth target served from its colour view",
+                view_to.IsGpuModified() && !view_to.IsBufferModified(),
+                "the colour-view to depth copy was not served");
+        run_copy(table7 + 0x40, to7, base + 0x580000);
+        check_bytes("depth target bytes from a colour view", base + 0x580000, 0x3f000000u);
+      }
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image copy fixture unmap failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "image copy fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckComputeImageCopyAliasBlocks() {
+    constexpr const char *name = "ComputeImageCopyAliasBlocks";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint32_t width = 256, height = 256, alias_width = 512, alias_height = 256;
+    constexpr uint64_t image_bytes = uint64_t{width} * height * sizeof(u32);
+    constexpr uint64_t alias_bytes = uint64_t{alias_width} * alias_height * sizeof(u32);
+    constexpr u32 records = width * height;
+    static constexpr std::array<u32, 21> copy_shader{
+        0xbfa00001u, 0xd7460001u, 0x04011202u, 0xf40c0100u, 0xfa000000u, 0xbf8cc07fu,
+        0xe0302000u, 0x80010201u, 0xbf8c3f70u, 0xe0702000u, 0x80420201u, 0x8f6a8902u,
+        0xd76d0000u, 0x0401fe6au, 0x00000100u, 0xe0302000u, 0x80010300u, 0xbf8c3f70u,
+        0xe0702000u, 0x80420300u, 0xbf810000u};
+    ShaderMapUserData(reinterpret_cast<uint64_t>(copy_shader.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(copy_shader.size() * sizeof(u32))});
+    TileBlockLayout block{};
+    Require(name, "render-target block layout",
+            TileGetBlockLayout(TileBlockFamily::RenderTarget64KB, 4, block) &&
+                block.block_width == 128 && block.block_height == 128,
+            "the 4-byte render-target block is not 128x128");
+    // Byte offset of texel (x, y) in a render-target surface `pitch` texels wide.
+    const auto texel_offset = [&](uint32_t pitch, uint32_t x, uint32_t y) {
+      uint32_t inside = 0;
+      Require(name, "block offset",
+              TileGetBlockOffset(block, x % block.block_width, y % block.block_height, 0, inside),
+              "texel has no block offset");
+      const uint64_t per_row = pitch / block.block_width;
+      return (uint64_t{y / block.block_height} * per_row + x / block.block_width) *
+                 block.block_size + inside;
+    };
+    // The source's guest bytes: every dword names its own offset.
+    const auto pattern = [](uint64_t offset) { return static_cast<u32>(0x40000000u + offset / 4); };
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "alias fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "alias fixture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const uint64_t table = base, from = base + 0x100000, to = base + 0x200000;
+    // The alias starts two blocks into the destination and runs past its end.
+    const uint64_t alias = to + 2 * block.block_size;
+    for (uint64_t offset = 0; offset < image_bytes; offset += sizeof(u32)) {
+      const auto word = pattern(offset);
+      std::memcpy(reinterpret_cast<void *>(from + offset), &word, sizeof(word));
+    }
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &textures = context.GetTextureCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      const auto target_desc = [&](uint64_t address, uint32_t w, uint32_t h) {
+        auto desc = MakeLinearDesc(address, uint64_t{w} * h * sizeof(u32), vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D, {w, h, 1}, 1, 4, 1);
+        desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+        return desc;
+      };
+      const auto paint = [&](ImageId id, u32 value) {
+        vk::ClearValue clear{};
+        clear.color.uint32 = std::array{value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      };
+      const auto sample = [&](TextureCache::ImageDesc desc) {
+        const auto id = textures.FindImage(desc);
+        (void)textures.FindTexture(id, desc);
+        return std::pair{id, ReadCachedTexel(name, context, id, {}, {desc.info.extent.width,
+                                                                     desc.info.extent.height, 1})};
+      };
+      auto from_desc = target_desc(from, width, height);
+      auto to_desc = target_desc(to, width, height);
+      auto alias_desc = target_desc(alias, alias_width, alias_height);
+
+      // The source comes up from guest memory; check the block reference against the detiler.
+      const auto [from_id, from_texels] = sample(from_desc);
+      for (u32 y = 0; y < height; y++) {
+        for (u32 x = 0; x < width; x++) {
+          const auto expected = pattern(texel_offset(width, x, y));
+          Require(name, "source detile", from_texels[y * width + x] == expected,
+                  "texel " + std::to_string(x) + "," + std::to_string(y) + " expected " +
+                      Hex(expected) + ", got " + Hex(from_texels[y * width + x]));
+        }
+      }
+      const auto alias_id = textures.FindImage(alias_desc);
+      (void)textures.FindRenderTarget(alias_id, [&] {
+        auto target = alias_desc;
+        target.type = TextureCache::BindingType::RenderTarget;
+        target.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+        return target;
+      }());
+      paint(alias_id, 0x77777777u);
+      const auto to_id = textures.FindImage(to_desc);
+      paint(to_id, 0xbbbbbbbbu);
+
+      // The copy.
+      ShaderBufferResource descriptors[2]{};
+      for (const auto [index, address] : {std::pair{0, from}, std::pair{1, to}}) {
+        descriptors[index].UpdateAddress48(address);
+        descriptors[index].fields[1] |= static_cast<u32>(sizeof(u32)) << 16u;
+        descriptors[index].fields[2] = records;
+        descriptors[index].fields[3] =
+            DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      }
+      std::memcpy(reinterpret_cast<void *>(table), descriptors, sizeof(descriptors));
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(copy_shader.data()),
+                           .num_thread_x = 256, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 2, .tgid_x_en = true});
+      shaders.SetCsUserSgpr(0, static_cast<u32>(table));
+      shaders.SetCsUserSgpr(1, static_cast<u32>(table >> 32u));
+      processor.DispatchDirect(records / 512u, 1, 1, 0x41u);
+      const auto &synced = textures.GetImage(alias_id);
+      Require(name, "alias synced block for block",
+              synced.IsGpuModified() && !synced.IsBufferModified() && !synced.IsSuperseded() &&
+                  !textures.GetImage(to_id).IsBufferModified(),
+              "the alias was not brought up to date from the destination image");
+
+      // The destination holds the source texels.
+      const auto [to_again, to_texels] = sample(to_desc);
+      for (u32 i = 0; i < to_texels.size(); i++) {
+        Require(name, "destination texels", to_texels[i] == from_texels[i],
+                "texel " + std::to_string(i) + " expected " + Hex(from_texels[i]) + ", got " +
+                    Hex(to_texels[i]));
+      }
+      const auto [alias_again, alias_texels] = sample(alias_desc);
+      for (u32 y = 0; y < alias_height; y++) {
+        for (u32 x = 0; x < alias_width; x++) {
+          const auto at = alias + texel_offset(alias_width, x, y);
+          const auto expected = at < to + image_bytes ? pattern(at - to) : 0x77777777u;
+          Require(name, "alias reads the copied bytes", alias_texels[y * alias_width + x] == expected,
+                  "texel " + std::to_string(x) + "," + std::to_string(y) + " expected " +
+                      Hex(expected) + ", got " + Hex(alias_texels[y * alias_width + x]));
+        }
+      }
+      // A write into the alias after the copy stays, sampled again later.
+      paint(alias_again, 0x99999999u);
+      (void)sample(to_desc);
+      const auto [alias_last, alias_written] = sample(alias_desc);
+      for (u32 i = 0; i < alias_written.size(); i++) {
+        Require(name, "alias keeps its later write", alias_written[i] == 0x99999999u,
+                "texel " + std::to_string(i) + " expected 0x99999999, got " +
+                    Hex(alias_written[i]));
+      }
+      (void)alias_last;
+      (void)to_again;
+      (void)alias_bytes;
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "alias fixture unmap failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "alias fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorMetadataClear() {
     constexpr const char *name = "RenderExecutorColorMetadataClear";
     struct PackedCase {
@@ -58957,6 +59458,12 @@ int main(int argc, char **argv) {
     vulkan.CheckLongRecordingSubmit();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-image-copy-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckComputeImageCopy();
+    vulkan.CheckComputeImageCopyAliasBlocks();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dispatch-overlap-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDispatchOverlap();
@@ -60217,6 +60724,8 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   vulkan.CheckDispatchOverlap();
+  vulkan.CheckComputeImageCopy();
+  vulkan.CheckComputeImageCopyAliasBlocks();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckRefusedShaderSkipsDispatch();
   vulkan.CheckOrderedDispatch();

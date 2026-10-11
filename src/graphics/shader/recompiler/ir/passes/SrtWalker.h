@@ -29,6 +29,11 @@ using SrtReadRefusalDescriber = const char* (*)(void* userdata, uint64_t address
 // costs a cache lock and a region search; enumerating a table pays that tens of thousands of times.
 using SrtBlockReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
 
+// XXH3-64 of a contiguous block, false wherever the strict reader's first read would refuse.
+using SrtBlockHasher = bool (*)(void* userdata, uint64_t address, uint64_t size, uint64_t* hash);
+
+using SrtOwnershipQuery = bool (*)(void* userdata, uint64_t address, uint64_t size);
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -38,8 +43,13 @@ struct SrtRuntime {
 	SrtExtentQuery            readable_extent            = nullptr;
 	SrtReadRefusalDescriber   describe_read_refusal      = nullptr;
 	SrtBlockReader            read_specialization_block  = nullptr;
+	SrtBlockHasher            hash_specialization_block  = nullptr;
+	// Reads a branch condition's memory without draining the GPU; a refusal visits both arms.
+	SrtMemoryReader read_condition_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	SrtOwnershipQuery         gpu_owned = nullptr;
+	// Told when a materialization throws its walk away and walks again without pruning.
+	void (*walk_restarted)(void* userdata) = nullptr;
 };
 
 // Records every guest range a walk reads, so a caller can revalidate them later.
@@ -181,10 +191,27 @@ SrtRuntime CleanRuntime(SrtRuntime runtime);
 
 uint32_t CurrentSrtReadSlot();
 
-[[nodiscard]] RawReadReject RawReadAddress(const ResourcePlan& program, const Inst& inst,
-                                           uint32_t                       component_bytes,
-                                           const std::array<uint64_t, 5>& operands,
-                                           uint64_t&                      address);
+struct RawReadEvent {
+	const Inst*             inst            = nullptr;
+	uint32_t                component_bytes = 0;
+	std::array<uint64_t, 5> operands {}; // base low, base high, offset, num_records, word3
+};
+[[nodiscard]] const RawReadEvent* CurrentRawReadEvent();
+[[nodiscard]] size_t              RawReadOffsetArgument(ValueOpcode op);
+struct RawReadShape {
+	enum class Kind : uint8_t { Address, ConstBuffer, VectorBuffer };
+	Kind    kind      = Kind::Address;
+	int64_t immediate = 0;
+};
+[[nodiscard]] RawReadReject       RawReadShapeOf(const ResourcePlan& program, const Inst& inst,
+                                                 uint32_t component_bytes, RawReadShape& shape);
+[[nodiscard]] RawReadReject       RawReadAddressFrom(const RawReadShape&            shape,
+                                                     const std::array<uint64_t, 5>& operands,
+                                                     uint64_t&                      address);
+[[nodiscard]] RawReadReject       RawReadAddress(const ResourcePlan& program, const Inst& inst,
+                                                 uint32_t                       component_bytes,
+                                                 const std::array<uint64_t, 5>& operands,
+                                                 uint64_t&                      address);
 
 // One pass of the per-lane sweep a readfirstlane runs. `dependent` stays clear for an operand
 // that never asks for the lane, which is every shader that does not go through the mask model,
@@ -259,7 +286,9 @@ public:
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	// With prune clear every block counts as reachable and no branch condition is read.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailure* failure = nullptr,
-	                       bool prune = true);
+	                       bool prune = true, SrtWalker* conditions = nullptr);
+	// Whether the last refused descriptor stopped at a loop phi the walk could not prove invariant.
+	[[nodiscard]] bool RefusedOnPhi() const { return m_phi_reject != PhiReject::None; }
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);

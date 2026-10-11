@@ -115,6 +115,9 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+using BackingVisitor = void (*)(void* context, const uint8_t* data, uint64_t size);
+// TryReadGpuCleanBacking, handing each backing piece to `visit` in place instead of copying it.
+bool TryVisitGpuCleanBacking(uint64_t vaddr, uint64_t size, BackingVisitor visit, void* context);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   HasGpuOwnedBytes(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);

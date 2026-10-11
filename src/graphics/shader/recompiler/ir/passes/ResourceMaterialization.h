@@ -64,6 +64,13 @@ std::string_view LastMaterializeFailure();
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+bool               RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                          ResourceSpecialization& specialization);
+[[nodiscard]] bool ImageServedBindless(const ResourcePlan& program, uint32_t image_index);
+[[nodiscard]] bool ReadOverlapsWrittenBuffer(const ResourcePlan&     program,
+                                             const ResourceSnapshot& snapshot, uint64_t address,
+                                             uint64_t bytes);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 // Names the first field two specializations differ in, or nullptr when they match. Reporting
 // only, but it is what tells a redundant permutation apart from a genuinely new one.

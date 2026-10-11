@@ -247,6 +247,43 @@ public:
 		return true;
 	}
 
+	bool TryVisitBacking(uint64_t vaddr, uint64_t size, BackingVisitor visit, void* context) {
+		if (!IsAvailable() || visit == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+
+		std::shared_lock lock(m_mutex);
+		const auto       end   = vaddr + size;
+		auto             first = m_maps.upper_bound(vaddr);
+		if (first == m_maps.begin()) {
+			return false;
+		}
+		--first;
+		auto current = vaddr;
+		for (auto mapping = first; current < end; ++mapping) {
+			if (mapping == m_maps.end() || current < mapping->second.vaddr ||
+			    current >= mapping->second.vaddr + mapping->second.size) {
+				return false;
+			}
+			const auto& entry = mapping->second;
+			const auto  bytes = std::min(end, entry.vaddr + entry.size) - current;
+			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
+				return false;
+			}
+			current += bytes;
+		}
+
+		current = vaddr;
+		for (auto mapping = first; current < end; ++mapping) {
+			const auto& entry  = mapping->second;
+			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - current;
+			const auto  offset = entry.backing_offset + current - entry.vaddr;
+			visit(context, m_backing_base + offset, bytes);
+			current += bytes;
+		}
+		return true;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -771,6 +808,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryVisitBacking(uint64_t vaddr, uint64_t size, BackingVisitor visit, void* context) {
+		return m_backing->TryVisitBacking(vaddr, size, visit, context);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {

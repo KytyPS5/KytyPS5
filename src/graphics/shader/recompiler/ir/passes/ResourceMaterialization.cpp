@@ -183,6 +183,46 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	return true;
 }
 
+struct ReadCapture {
+	SrtRuntime                                  source;
+	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
+	std::vector<uint32_t>&                      slots;
+
+	void Record(uint64_t address, uint64_t bytes) {
+		ranges.emplace_back(address, bytes);
+		slots.push_back(CurrentSrtReadSlot());
+	}
+};
+
+bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (!capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
+		return false;
+	}
+	capture.Record(address, values.size_bytes());
+	return true;
+}
+
+bool CaptureConditionRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (!capture.source.read_condition_memory(capture.source.userdata, address, values)) {
+		return false;
+	}
+	capture.Record(address, values.size_bytes());
+	return true;
+}
+
+bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (capture.source.read_memory != nullptr) {
+		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
+	} else {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	capture.Record(address, values.size_bytes());
+	return true;
+}
+
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
@@ -2244,6 +2284,25 @@ static bool CapturedReadsAvoidWrittenBuffers(const ResourcePlan& program,
 	return true;
 }
 
+bool ImageServedBindless(const ResourcePlan& program, uint32_t image_index) {
+	return image_index < program.info.images.size() && ServedBindless(program, image_index);
+}
+
+bool ReadOverlapsWrittenBuffer(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                               uint64_t address, uint64_t bytes) {
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); ++i) {
+		if (!program.info.buffers[i].written) continue;
+		ShaderBufferResource buffer;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) continue;
+		const auto base = buffer.Base48();
+		const auto size = buffer.GetSize();
+		if (size != 0u && bytes != 0u && address < base + size && base < address + bytes) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
                      ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                      bool prune = true) {
@@ -2252,15 +2311,33 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 		MaterializeFailure() = "plan incomplete";
 		return false;
 	}
-	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
-	auto& reads = snapshot.specialization_reads;
-	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
-	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
+	const bool capture_reads = program.capture_specialization_reads;
+	auto&      reads         = snapshot.specialization_reads;
+	reads.clear();
+	snapshot.specialization_read_slots.clear();
+	ReadCapture capture {runtime, reads, snapshot.specialization_read_slots};
+	SrtRuntime observed = runtime;
+	if (capture_reads) {
+		observed.userdata = &capture;
+		observed.read_specialization_memory =
+		    runtime.read_specialization_memory != nullptr ? CaptureStrictRead : nullptr;
+		observed.read_memory = CaptureOrdinaryRead;
+	}
+	if (capture_reads && runtime.read_condition_memory != nullptr) {
+		observed.read_condition_memory = CaptureConditionRead;
+	}
+	SrtRuntime condition_runtime = observed;
+	if (observed.read_condition_memory != nullptr) {
+		condition_runtime.read_memory                = observed.read_condition_memory;
+		condition_runtime.read_specialization_memory = observed.read_condition_memory;
+	}
+	SrtWalker          clean(program, CleanRuntime(observed));
+	SrtWalker          conditions(program, condition_runtime);
+	SrtWalker          walker(program, observed, program.clean_flat_slots, &clean);
 	FlatRefreshFailure flat_failure;
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &flat_failure, prune)) {
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &flat_failure, prune,
+	                              observed.read_condition_memory != nullptr ? &conditions
+	                                                                        : nullptr)) {
 		MaterializeFailure() =
 		    fmt::format("flat srt refresh: {}", DescribeFlatRefreshFailure(flat_failure));
 		return false;
@@ -2468,6 +2545,47 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	return BuildResourceSpecialization(program, snapshot, specialization) &&
+	       WriteIndirectImageSlots(program, snapshot, specialization);
+}
+
+bool RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                            ResourceSpecialization& specialization) {
+	if (snapshot.images.size() != program.info.images.size() ||
+	    specialization.images.size() != program.info.images.size() ||
+	    snapshot.samplers.size() != program.info.samplers.size()) {
+		return false;
+	}
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& image  = program.info.images[i];
+		const auto* source = Source(program, image.source);
+		if (source == nullptr || source->indirect_descriptor.has_value()) {
+			continue;
+		}
+		specialization.images[i] = {
+		    .numeric_class              = image.numeric_class,
+		    .dimension                  = image.dimension,
+		    .mip_count                  = image.mip_count,
+		    .conversion_format          = image.conversion_format,
+		    .shader_swizzle             = image.shader_swizzle,
+		    .indirect_root              = image.indirect_root,
+		    .indirect_mapping_offset    = image.indirect_mapping_offset,
+		    .indirect_search_iterations = image.indirect_search_iterations,
+		    .cube                       = image.cube,
+		};
+		if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+			snapshot.images[i].dwords.fill(0);
+		}
+	}
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+		if (program.info.samplers[i].gather_lod) {
+			const auto control = snapshot.samplers[i].dwords[2];
+			const auto filter  = (control >> 26u) & 3u;
+			if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
+				return false;
+			}
+		}
+	}
 	return BuildResourceSpecialization(program, snapshot, specialization) &&
 	       WriteIndirectImageSlots(program, snapshot, specialization);
 }

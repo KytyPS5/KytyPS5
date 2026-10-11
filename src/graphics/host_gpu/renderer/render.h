@@ -144,6 +144,11 @@ public:
 		return m_full_barrier_mark == m_handle_requests;
 	}
 	void MarkFullBarrier() const noexcept { m_full_barrier_mark = m_handle_requests; }
+	// The open render pass clears an attachment when it begins: restarting it would clear again.
+	[[nodiscard]] bool RenderingWithClear() const noexcept {
+		return m_rendering && m_rendering_clear;
+	}
+
 	struct DeferredJoin {
 		bool joined = false;
 		// Everything recorded before the group is ordered before the joining dispatch too.
@@ -156,6 +161,7 @@ public:
 	void               CancelDeferredJoin() const noexcept { m_deferred_joining = false; }
 	void               FlushDeferredBarrier() const;
 	[[nodiscard]] bool HasDeferredBarrier() const noexcept { return m_deferred_barrier; }
+
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -187,6 +193,8 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering = false;
+	// The open pass began by clearing an attachment; m_render_state no longer says so.
+	mutable bool           m_rendering_clear        = false;
 	mutable bool           m_indirect_barrier_holds = false;
 	mutable uint64_t       m_handle_requests        = 0;
 	mutable uint64_t       m_full_barrier_mark      = UINT64_MAX;

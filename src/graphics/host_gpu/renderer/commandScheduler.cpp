@@ -535,8 +535,27 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_recorded_guest_ops = 0;
 	m_dynamic_state.Invalidate();
 	return m_command;
+}
+
+bool CommandScheduler::SubmitLongRecording() {
+	constexpr uint32_t MinGuestOps = 8;
+	constexpr auto     Budget      = std::chrono::microseconds(1500);
+	if (!Active() || m_command.IsInvalid()) {
+		return false;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (m_recorded_guest_ops++ == 0) {
+		m_first_guest_op = now;
+	}
+	if (m_recorded_guest_ops < MinGuestOps || now - m_first_guest_op < Budget ||
+	    m_command.RenderingWithClear()) {
+		return false;
+	}
+	Flush();
+	return true;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {

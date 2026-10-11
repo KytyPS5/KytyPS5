@@ -168,6 +168,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
+	m_rendering_clear =
+	    depth_stencil.depth_clear || depth_stencil.stencil_clear ||
+	    std::any_of(colors.begin(), colors.begin() + state.num_color_attachments,
+	                [](const auto& color) { return color.loadOp == vk::AttachmentLoadOp::eClear; });
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
 	for (auto& color: m_render_state.color_attachments) {

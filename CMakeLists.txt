@@ -325,6 +325,8 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+add_gpu_blit_shader(gpu_dispatch_threads gpu_dispatch_threads.comp)
+add_gpu_blit_shader(gpu_page_diff gpu_page_diff.comp)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -730,6 +732,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	add_test(NAME dispatch_overlap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
+	add_test(NAME long_recording_submit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --long-recording-only)
 	add_test(NAME image_transfer_layout
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-layout-only)
 

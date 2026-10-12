@@ -35165,6 +35165,75 @@ template <u32 wave_size> TestCase ImageSampleOffsetsReadFourNeighbors() {
   return test;
 }
 
+// Runtime texel offsets (v0 is the thread id, so the offset DWORD is not an IR constant) move the
+// coordinates by offset / size of the sampled level: IMAGE_SAMPLE_LZ_O with an offset outside
+// ConstOffset's guaranteed range, IMAGE_SAMPLE_L_O with a LOD past the last level and
+// IMAGE_SAMPLE_D_O, whose gradients select the level.
+TestCase ImageSampleRuntimeOffsetsMoveCoordinates() {
+  using O = ShaderOpcode;
+  const auto coord = [](u32 texel) {
+    return std::bit_cast<u32>((static_cast<float>(texel) + 0.5f) / 16.0f);
+  };
+  const auto runtime_offset = [](std::vector<u32> *code, u32 dst, u32 packed) {
+    code->push_back(EncodeVop2(0x25, dst, 255u, 0)); // v_add_nc_u32 dst, literal, v0
+    code->push_back(packed);
+  };
+  std::vector<u32> code;
+  runtime_offset(&code, 20, 0x00000103u); // (+3, +1)
+  AppendVMovLiteral(&code, 21, coord(4));
+  AppendVMovLiteral(&code, 22, coord(9));
+  code.push_back(EncodeMimg0(0x37, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  runtime_offset(&code, 24, 0x00000837u); // (-9, +8)
+  AppendVMovLiteral(&code, 25, coord(12));
+  AppendVMovLiteral(&code, 26, coord(3));
+  code.push_back(EncodeMimg0(0x37, 0x1));
+  code.push_back(EncodeMimg1(1, 24));
+  runtime_offset(&code, 28, 0x00000201u); // (+1, +2)
+  AppendVMovLiteral(&code, 29, coord(8));
+  AppendVMovLiteral(&code, 30, coord(2));
+  AppendVMovLiteral(&code, 31, std::bit_cast<u32>(3.0f)); // LOD past the only level
+  code.push_back(EncodeMimg0(0x34, 0x1));
+  code.push_back(EncodeMimg1(2, 28));
+  runtime_offset(&code, 32, 0x0000013eu); // (-2, +1)
+  for (u32 i = 0; i < 4u; i++) {
+    AppendVMovLiteral(&code, 33 + i, std::bit_cast<u32>(1.0f / 16.0f)); // one texel
+  }
+  AppendVMovLiteral(&code, 37, coord(10));
+  AppendVMovLiteral(&code, 38, coord(12));
+  code.push_back(EncodeMimg0(0x32, 0x1));
+  code.push_back(EncodeMimg1(3, 32));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(16, 16, 0x41100000u);
+  SetRgbaPixel(&image, 16, 7, 10, 0x3f800000u, 0, 0, 0);
+  SetRgbaPixel(&image, 16, 3, 11, 0x40000000u, 0, 0, 0);
+  SetRgbaPixel(&image, 16, 9, 4, 0x40400000u, 0, 0, 0);
+  SetRgbaPixel(&image, 16, 8, 13, 0x40800000u, 0, 0, 0);
+
+  TestCase test;
+  test.name = "ImageSampleRuntimeOffsetsMoveCoordinates";
+  test.code = code;
+  test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.image_width = 16;
+  test.image_height = 16;
+  test.sampled_image_rgba = image;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpImageQuerySizeLod", "OpImageQueryLevels", "OpBitFieldSExtract",
+                         "OpFDiv"};
+  test.forbidden_spirv = {"ConstOffset"};
+  return test;
+}
+
 TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   using O = ShaderOpcode;
 
@@ -37951,6 +38020,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>);
   AddCase(ImageSampleOffsetsReadFourNeighbors<32>);
   AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
+  AddCase(ImageSampleRuntimeOffsetsMoveCoordinates);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
@@ -43622,6 +43692,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageSampleOffsetsReadFourNeighbors<32>());
     RunCase(&vulkan, ImageSampleOffsetsReadFourNeighbors<64>());
+    RunCase(&vulkan, ImageSampleRuntimeOffsetsMoveCoordinates());
     RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<32>());
     RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>());
     RunCase(&vulkan, ImageSampleAndGather());

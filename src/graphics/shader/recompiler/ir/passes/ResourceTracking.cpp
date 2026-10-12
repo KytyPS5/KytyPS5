@@ -997,7 +997,7 @@ private:
 				shared_image_heap = descriptor.dword_count == 8u &&
 				    (a.table_record_bytes != 0u || b.table_record_bytes != 0u);
 				if (a.selector != b.selector || a.table_maximum != b.table_maximum ||
-				    a.pointer_table != b.pointer_table ||
+				    a.pointer_table != b.pointer_table || a.chain != b.chain ||
 				    a.table_source != b.table_source ||
 				    (!shared_image_heap && (a.table_offset != b.table_offset ||
 				                           a.table_immediate != b.table_immediate ||
@@ -3043,7 +3043,8 @@ private:
 			if (!plan.table_indexed) {
 				for (const auto& owner: m_indirect_descriptors) {
 					const auto& selected = *m_sources[owner.source].indirect_descriptor;
-					if (!selected.selector || !EquivalentValue(m_program, key, owner.key) ||
+					if (!selected.selector || selected.chain ||
+					    !EquivalentValue(m_program, key, owner.key) ||
 					    !std::ranges::all_of(handle.Uses(), [&](const Use& target) {
 						    const auto target_active = active(target, false);
 						    return !target_active.IsEmpty() &&
@@ -3146,6 +3147,128 @@ private:
 			selector.byte_ranges.erase(selector.byte_ranges.begin() + i);
 		}
 		indirect.selector = std::move(selector);
+		return true;
+	}
+
+	// One DWORD of a raw scalar load (s_load) at an immediate byte offset of a 64-bit address.
+	bool MatchPointerLoad(Value value, uint32_t& offset, const Inst*& address) const {
+		const auto* read  = value.Resolve().TryInstruction();
+		uint32_t    index = 0, dynamic = 0;
+		const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+		if (memory == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+		    !ImmediateU32(read->Arg(1), dynamic) ||
+		    uint64_t {dynamic} + memory->offset > INT32_MAX || !MemoryIndexBelongsTo(index, *read))
+			return false;
+		offset  = dynamic + memory->offset;
+		address = read->Arg(0).Resolve().TryInstruction();
+		return address != nullptr && address->GetOpcode() == ValueOpcode::GetAddressResource &&
+		       address->NumArgs() == 2u;
+	}
+
+	// A material record selected by a GPU key holds the address of its descriptor tables:
+	// T# = *(*(V#[key * stride + offset]) + hop ...) + table_offset. The host enumerates
+	// every record of the runtime V# and maps the key to the descriptor it selects.
+	bool TryMakeMaterialChain(Inst& handle, const DescriptorSource& descriptor,
+	                          IndirectDescriptorPlan& plan) {
+		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
+		const auto width   = static_cast<uint32_t>(handle.NumArgs());
+		if ((!sampler && handle.GetOpcode() != ValueOpcode::GetImageResource) ||
+		    width != (sampler ? 4u : 8u) || descriptor.dword_count != width || m_shader_writes)
+			return false;
+		const auto equivalent = [&](const Inst* a, const Inst* b) {
+			return EquivalentValue(m_program, Value(const_cast<Inst*>(a)),
+			                       Value(const_cast<Inst*>(b)));
+		};
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.chain.emplace();
+		IndirectDescriptorPlan chain_plan;
+		chain_plan.read_dwords = width;
+		const Inst*            address = nullptr;
+		bool                   retain  = false;
+		for (uint32_t word = 0; word < width; ++word) {
+			uint32_t    offset  = 0;
+			const Inst* current = nullptr;
+			if (!MatchPointerLoad(descriptor.dwords[word], offset, current) ||
+			    (word != 0u && (!equivalent(current, address) ||
+			                    offset != indirect.table_offset + word * sizeof(uint32_t))))
+				return false;
+			if (word == 0u) indirect.table_offset = offset;
+			address                 = current;
+			const auto* read        = descriptor.dwords[word].Resolve().TryInstruction();
+			chain_plan.reads[word]  = read;
+			chain_plan.memory[word] = read->Flags<MemoryFlags>().index;
+			// Descriptor bytes that also feed shader arithmetic stay GPU loads.
+			retain |= std::ranges::any_of(read->Uses(), [&](const Use& use) {
+				return use.user->GetOpcode() != handle.GetOpcode();
+			});
+		}
+		Value            key;
+		DescriptorSource root;
+		for (uint32_t depth = 0;; ++depth) {
+			const auto  low = address->Arg(0), high = address->Arg(1);
+			uint32_t    low_offset = 0, high_offset = 0;
+			const Inst *low_address = nullptr, *high_address = nullptr;
+			if (MatchPointerLoad(low, low_offset, low_address) &&
+			    MatchPointerLoad(high, high_offset, high_address)) {
+				if (depth >= 4u || high_offset != low_offset + 4u ||
+				    !equivalent(low_address, high_address))
+					return false;
+				indirect.chain->hops.insert(indirect.chain->hops.begin(), low_offset);
+				address = low_address;
+				continue;
+			}
+			const auto* low_read  = low.Resolve().TryInstruction();
+			const auto* high_read = high.Resolve().TryInstruction();
+			uint32_t    low_index = 0, high_index = 0;
+			const auto* low_memory =
+			    low_read != nullptr ? ScalarReadMemory(*low_read, low_index) : nullptr;
+			const auto* high_memory =
+			    high_read != nullptr ? ScalarReadMemory(*high_read, high_index) : nullptr;
+			Value    high_key;
+			uint32_t stride = 0, high_stride = 0;
+			if (low_memory == nullptr || high_memory == nullptr ||
+			    low_read->GetOpcode() != ValueOpcode::ReadConstBuffer ||
+			    high_read->GetOpcode() != ValueOpcode::ReadConstBuffer ||
+			    !EquivalentValue(m_program, low_read->Arg(0), high_read->Arg(0)) ||
+			    !MemoryIndexBelongsTo(low_index, *low_read) ||
+			    !MemoryIndexBelongsTo(high_index, *high_read) ||
+			    !MatchTableOffset(low_read->Arg(1), key, low_offset, stride) ||
+			    !MatchTableOffset(high_read->Arg(1), high_key, high_offset, high_stride) ||
+			    !EquivalentValue(m_program, key, high_key) || stride != high_stride ||
+			    uint64_t {low_offset} + low_memory->offset > INT32_MAX ||
+			    uint64_t {high_offset} + high_memory->offset !=
+			        uint64_t {low_offset} + low_memory->offset + 4u ||
+			    ((low_offset + low_memory->offset) & 3u) != 0u || (stride & 3u) != 0u ||
+			    low_offset + low_memory->offset + 8u > stride ||
+			    ValidateRuntimeValue(m_program, key, RuntimeValueType::Integer) ||
+			    !MakeRuntimeTableSource(*low_read, root) || root.dword_count != 4u)
+				return false;
+			indirect.selector.emplace(DescriptorSource::IndirectDescriptor::SelectorRead {
+			    .source = UINT32_MAX, .stride = stride, .offset = low_offset + low_memory->offset});
+			break;
+		}
+		// A record pointer read directly from the V# is the nested pointer table's shape
+		// (TryMakeNestedDescriptor), which bounds its key. Chains add at least one hop, and
+		// zero pointers select null only while every read stays in the unmapped first page.
+		if (indirect.chain->hops.empty() ||
+		    uint64_t {indirect.table_offset} + width * sizeof(uint32_t) > 0x4000u ||
+		    std::ranges::any_of(indirect.chain->hops,
+		                        [](uint32_t hop) { return uint64_t {hop} + 8u > 0x4000u; }))
+			return false;
+		indirect.selector->source = InternSource(root);
+		indirect.table_source     = indirect.selector->source;
+		DescriptorSource chain_source;
+		chain_source.dword_count = width;
+		chain_source.dwords.fill(Value(0u));
+		std::copy_n(root.dwords.begin(), 4u, chain_source.dwords.begin());
+		chain_source.indirect_descriptor = std::move(indirect);
+		chain_plan.retain_reads = retain;
+		if (retain) chain_plan.reads.fill(nullptr);
+		chain_plan.handle = &handle;
+		chain_plan.source = InternSource(chain_source);
+		chain_plan.key    = key;
+		chain_plan.roots  = chain_source.dwords;
+		plan              = std::move(chain_plan);
 		return true;
 	}
 
@@ -3653,8 +3776,9 @@ private:
 					if (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
 					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
 					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
-					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
-					                  TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
+					    (!sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
+					    TryMakeMaterialChain(*handle, descriptor, plan) ||
+					    (!sampler && TryMakeIndirectBuffer(*handle, descriptor, plan))) {
 						for (const auto& previous: m_indirect_descriptors) {
 							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 							    !EquivalentValue(m_program, previous.key, plan.key))
@@ -3800,7 +3924,9 @@ private:
 		m_info.samplers.push_back({source, pc});
 		const auto root = static_cast<uint32_t>(m_info.samplers.size() - 1);
 		const auto* descriptor = Source(source);
-		if (descriptor != nullptr && descriptor->indirect_descriptor) {
+		// A material-chain sampler is one S# shared by every record; see MaterializeResources.
+		if (descriptor != nullptr && descriptor->indirect_descriptor &&
+		    !descriptor->indirect_descriptor->chain) {
 			const auto& sources = descriptor->indirect_descriptor->sources;
 			if (sources.empty()) return root;
 			std::vector<uint32_t> resources {root};

@@ -7966,6 +7966,158 @@ void TestConditionalIndirectImageMaterialization() {
         "taken indirect image branch did not require its descriptor table");
 }
 
+// Guardians of the Galaxy (PPSA01748, #1004) pixel shader 0x4a260221f9feeae6: a flat
+// interpolant selects a material record, s[0:3] holds the record table V#, and each
+// record points to its image and sampler tables (s_load_dwordx4 s[80:83], mat+160).
+std::unique_ptr<Fixture> MakeMaterialPointerChainFixture() {
+  auto fixture = std::make_unique<Fixture>(ShaderType::Pixel);
+  std::array<Value, 4> table_words;
+  for (uint32_t dword = 0; dword < 4; dword++) table_words[dword] = fixture->UserData(dword);
+  const auto table = fixture->Buffer(table_words, 0x80);
+  const auto flat = fixture->Emit(ValueOpcode::GetInterpolationParameter,
+                                  {Value(2u), Value(3u), Value(2u)});
+  const auto field = fixture->Emit(ValueOpcode::BitFieldUExtract, {flat, Value(16u), Value(16u)});
+  const auto index = fixture->Emit(ValueOpcode::ReadFirstLane, {field, Value(true)});
+  const auto record = fixture->Emit(ValueOpcode::ShiftLeftLogical32, {index, Value(3u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  std::array<Value, 2> pointer;
+  for (uint32_t dword = 0; dword < 2u; ++dword) {
+    scalar.offset = dword * 4u;
+    pointer[dword] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, record},
+                                   fixture->AddMemory(scalar, 0x80));
+  }
+  const auto load = [&](Value address, uint32_t offset, uint32_t pc) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = offset;
+    return fixture->Emit(ValueOpcode::LoadAddressU32,
+                         {address, Value(0u), Value(0u), Value(true)},
+                         fixture->AddMemory(memory, pc));
+  };
+  const auto material = fixture->Address(pointer[0], pointer[1]);
+  std::array<Value, 4> tables;
+  for (uint32_t dword = 0; dword < 4u; ++dword) tables[dword] = load(material, 160u + dword * 4u, 0x90);
+  // The record's constants V# (mat+208) stays a GPU-selected scalar buffer.
+  std::array<Value, 4> constant_words;
+  for (uint32_t dword = 0; dword < 4u; ++dword)
+    constant_words[dword] = load(material, 208u + dword * 4u, 0x98);
+  scalar.offset = 32u;
+  fixture->Emit(ValueOpcode::ReadConstBuffer, {fixture->Buffer(constant_words, 0x9c), Value(0u)},
+                fixture->AddMemory(scalar, 0x9c));
+  const auto images = fixture->Address(tables[0], tables[1]);
+  const auto samplers = fixture->Address(tables[2], tables[3]);
+  const auto sample = [&](uint32_t image_offset, uint32_t sampler_offset, uint32_t pc) {
+    std::array<Value, 8> image_words;
+    for (uint32_t dword = 0; dword < 8u; ++dword)
+      image_words[dword] = load(images, image_offset + dword * 4u, pc - 8u);
+    std::array<Value, 4> sampler_words;
+    for (uint32_t dword = 0; dword < 4u; ++dword)
+      sampler_words[dword] = load(samplers, sampler_offset + dword * 4u, pc - 4u);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture->Emit(ValueOpcode::ImageSampleRaw,
+                  {fixture->Image(image_words, pc), fixture->Sampler(sampler_words, pc),
+                   fixture->ImageAddress(), Value(true)},
+                  fixture->AddMemory(memory, pc));
+  };
+  sample(32u, 16u, 0x1d8);
+  sample(64u, 0u, 0x210);
+  return fixture;
+}
+
+void TestMaterialPointerChainImages() {
+  auto fixture = MakeMaterialPointerChainFixture();
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  Check(plan.info.images.size() == 2u && plan.info.samplers.size() == 2u,
+        "per-material image and sampler slots were not tracked");
+  std::array<uint32_t, 2> roots{};
+  for (uint32_t image = 0; image < 2u; ++image) {
+    const auto &indirect = plan.descriptor_sources[plan.info.images[image].source].indirect_descriptor;
+    Check(indirect && indirect->chain && indirect->chain->hops == std::vector<uint32_t>{160u} &&
+              indirect->selector && indirect->selector->stride == 8u &&
+              indirect->selector->offset == 0u,
+          "material image slot lost its pointer chain");
+    roots[indirect->table_offset == 32u ? 0u : 1u] = image;
+  }
+  Check(std::ranges::any_of(fixture->program.memory_info, [](const MemoryInfo &memory) {
+          return memory.kind == ResourceKind::IndirectBuffer;
+        }), "per-material constants are no longer a GPU-selected scalar buffer");
+
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  LinearTestMemory memory;
+  const auto word = [&](uint64_t address) -> uint32_t & { return memory.words[(address - 0x1000u) / 4u]; };
+  const auto put = [&](uint64_t address, uint32_t identity) {
+    auto value = descriptor;
+    value[0] += identity;
+    std::copy(value.begin(), value.end(), memory.words.begin() + (address - 0x1000u) / 4u);
+  };
+  // Records: 0 -> 0x1100, 1 -> 0x1200, 2 -> null. Both materials share one sampler table.
+  word(0x1000u) = 0x1100u;
+  word(0x1008u) = 0x1200u;
+  word(0x11a0u) = 0x1400u;
+  word(0x11a8u) = 0x1600u;
+  word(0x12a0u) = 0x1800u;
+  word(0x12a8u) = 0x1600u;
+  put(0x1420u, 0u);
+  put(0x1440u, 1u);
+  put(0x1820u, 2u);
+  put(0x1840u, 1u);
+  const std::array<uint32_t, 4> sampler0{0x11u, 0x22u, 0x33u, 0u};
+  const std::array<uint32_t, 4> sampler1{0x44u, 0x55u, 0x66u, 0u};
+  std::copy(sampler0.begin(), sampler0.end(), &word(0x1600u));
+  std::copy(sampler1.begin(), sampler1.end(), &word(0x1610u));
+  std::array<uint32_t, 4> user_data{0x1000u, 0u, 24u, 0u};
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 5u && snapshot.samplers.size() == 2u,
+        "material records did not materialize their image candidates");
+  const auto mapping = [&](uint32_t image) {
+    const auto offset = specialization.images[image].indirect_mapping_offset;
+    return std::vector<uint32_t>(snapshot.flattened_srt.begin() + offset,
+                                 snapshot.flattened_srt.begin() + offset + 7u);
+  };
+  Check(snapshot.images[roots[0]].dwords[0] == 0x20u && snapshot.images[roots[1]].dwords[0] == 0x21u &&
+            mapping(roots[0]) == std::vector<uint32_t>{3u, 0u, 0u, 1u, 1u, 2u, 2u} &&
+            mapping(roots[1]) == std::vector<uint32_t>{3u, 0u, 0u, 1u, 0u, 2u, 1u},
+        "material index did not map to its record's image");
+  Check(std::ranges::count_if(snapshot.images, [](const DescriptorValue &image) {
+          return std::ranges::all_of(image.dwords, [](uint32_t value) { return value == 0u; });
+        }) == 2u, "null material record did not select a null image");
+  for (uint32_t sampler = 0; sampler < 2u; ++sampler) {
+    const auto &words = snapshot.samplers[sampler].dwords;
+    Check(std::equal(sampler0.begin(), sampler0.end(), words.begin()) ||
+              std::equal(sampler1.begin(), sampler1.end(), words.begin()),
+          "shared material sampler was not materialized");
+  }
+  // Zeroed S#s of unused records are skipped. Records whose samplers differ, or a record
+  // table larger than the probe bound, are refused instead of guessing one material.
+  word(0x12a8u) = 0x1700u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            std::equal(sampler1.begin(), sampler1.end(), snapshot.samplers[0].dwords.begin()) !=
+                std::equal(sampler0.begin(), sampler0.end(), snapshot.samplers[0].dwords.begin()),
+        "a record with zeroed samplers replaced the shared sampler");
+  std::copy(sampler1.begin(), sampler1.end(), &word(0x1700u));
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "materials with different samplers specialized one sampler");
+  word(0x12a8u) = 0x1600u;
+  user_data[2] = 0xffffffffu;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unbounded material table was enumerated");
+}
+
 void TestShaderInfoCollection() {
   Fixture fixture;
   const auto handle = fixture.Buffer(
@@ -8306,6 +8458,7 @@ int main() {
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
+    Run("material pointer chain images", TestMaterialPointerChainImages);
     Run("shader info collection", TestShaderInfoCollection);
     Run("image binding ABI", TestImageBindingAbi);
     Run("live shader data collection", TestLiveShaderDataCollection);

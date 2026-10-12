@@ -119,6 +119,12 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
+// over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again
+// and returns the range's id. 0 for any other fault.
+[[nodiscard]] uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept;
+// Whether such a fault can be retried (false once the same page keeps faulting).
+[[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 

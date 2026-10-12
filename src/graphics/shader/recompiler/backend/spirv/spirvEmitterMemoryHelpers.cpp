@@ -157,9 +157,16 @@ void EmitMemoryOffsets(EmitterState& state) {
 	}
 }
 
+// Stages without a workgroup emulate LDS with one private array per invocation. A GPU keeps
+// hundreds of thousands of invocations in flight, so this size multiplies into driver local memory:
+// the former 8192 dwords (32 KB) asked for gigabytes and killed the device (a write fault in the
+// first heavy pixel shader that touched LDS). Shaders in these stages address it by lane id plus
+// a small offset, so 1024 dwords (4 KB) is enough; accesses beyond it are already bounds-checked.
+constexpr uint32_t FUNCTION_LDS_DWORDS = 1024u;
+
 uint32_t LdsDwordCount(const EmitterState& state) {
 	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	return workgroup != nullptr ? workgroup->lds_size_dwords : FUNCTION_LDS_DWORDS;
 }
 
 void EnsureLdsStorage(EmitterState& state) {

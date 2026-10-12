@@ -113,6 +113,10 @@ foreach(mutant IN ITEMS NO_CLAMP NO_TAIL_CHECK)
 	target_compile_definitions(per_vertex_vsstore_test_mutant_${mutant_lower}_tests PRIVATE KYTY_PVVS_TEST_MUTANT_${mutant}=1)
 endforeach()
 
+# Emitter mutant: the PS asks for the Geometry capability (a feature the device does not enable) again.
+kyty_pv_make_mutant(capability_geometry "${KYTY_PV_EMITTER_REL}"
+	"RequireCapability(spv::CapabilityTessellation);" "RequireCapability(spv::CapabilityGeometry);")
+
 # Emitter mutant: location 31 aborts the emission again.
 kyty_pv_make_mutant(location31_exit "${KYTY_PV_EMITTER_REL}"
 	"EXIT_IF(host_location > kPvVsStoreInstanceLocation);" "EXIT_IF(host_location >= kPvVsStoreInstanceLocation);")
@@ -123,5 +127,7 @@ add_kyty_full_emulator_test(shader_cfg_pv_vsstore_mutant_first_third_tests "${KY
 target_include_directories(shader_cfg_pv_vsstore_mutant_first_third_tests BEFORE PRIVATE "${KYTY_PV_MUTANT_DIR}/first_third")
 add_kyty_full_emulator_test(shader_cfg_pv_vsstore_mutant_stride_dword_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp"
 	"${KYTY_SOURCE_DIR}/${KYTY_PV_EMITTER_REL}" "${KYTY_PV_MUTANT_DIR}/stride_dword/${KYTY_PV_EMITTER_REL}")
+add_kyty_full_emulator_test(shader_cfg_pv_vsstore_mutant_capability_geometry_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp"
+	"${KYTY_SOURCE_DIR}/${KYTY_PV_EMITTER_REL}" "${KYTY_PV_MUTANT_DIR}/capability_geometry/${KYTY_PV_EMITTER_REL}")
 add_kyty_full_emulator_test(shader_cfg_pv_vsstore_mutant_location31_exit_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp"
 	"${KYTY_SOURCE_DIR}/${KYTY_PV_EMITTER_REL}" "${KYTY_PV_MUTANT_DIR}/location31_exit/${KYTY_PV_EMITTER_REL}")

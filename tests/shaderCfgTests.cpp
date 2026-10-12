@@ -16112,8 +16112,10 @@ void TestPvVsStoreEmission() {
   Check(text.find("PerVertexKHR") == std::string::npos,
         "VS-store PS still declares PerVertexKHR");
   Check(text.find("BuiltIn PrimitiveId") != std::string::npos &&
-            text.find("Capability Geometry") != std::string::npos,
+            text.find("Capability Tessellation") != std::string::npos,
         "PS does not read the primitive id");
+  Check(text.find("Capability Geometry") == std::string::npos,
+        "PS needs the Geometry capability, which the device does not enable");
   Check(text.find("BuiltIn BaryCoordKHR") != std::string::npos,
         "PS lost the barycentric weights");
   Check(text.find("%pv_indices Binding 1") != std::string::npos &&

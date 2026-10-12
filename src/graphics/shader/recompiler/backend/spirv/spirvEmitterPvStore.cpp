@@ -153,8 +153,9 @@ void DefinePvStore(EmitterState& state) {
 		                            1);
 		state.builder.AddAnnotation(spv::OpDecorate, state.pv_index_buffer,
 		                            spv::DecorationNonWritable);
-		// PrimitiveId in a fragment shader needs the Geometry capability.
-		state.builder.RequireCapability(spv::CapabilityGeometry);
+		// PrimitiveId in a fragment shader needs the Geometry or the Tessellation capability; the
+		// device enables tessellationShader (MoltenVK has no geometry shaders).
+		state.builder.RequireCapability(spv::CapabilityTessellation);
 	}
 	// The instance index travels VS -> PS as a flat varying (the PS has no instance builtin).
 	state.pv_instance_variable = DefineInterfaceVariable(

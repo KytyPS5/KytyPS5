@@ -93,6 +93,16 @@ int main() {
 	Check(Common::AmdCpuModeFromStored("auto", true) == AmdCpuMode::Auto, "stored auto lost to the old bool");
 	Check(Common::AmdCpuModeFromStored("garbage", std::nullopt) == AmdCpuMode::Auto, "bad stored mode is not auto");
 
+	// The legacy export value must be a bool string; anything else is rejected, not read as true.
+	Check(Common::ParseLegacyAmdCpuEnabled("true") == std::optional<bool>(true),
+	      "legacy true not parsed");
+	Check(Common::ParseLegacyAmdCpuEnabled("false") == std::optional<bool>(false),
+	      "legacy false not parsed");
+	Check(!Common::ParseLegacyAmdCpuEnabled("banana"), "legacy banana accepted");
+	Check(!Common::ParseLegacyAmdCpuEnabled(""), "legacy empty accepted");
+	Check(!Common::ParseLegacyAmdCpuEnabled("1"), "legacy 1 accepted");
+	Check(!Common::ParseLegacyAmdCpuEnabled("True"), "legacy True accepted");
+
 	// KYTY_AMD_PATCH: which instruction groups the patcher rewrites.
 	using namespace Common;
 	Check(ParseAmdPatchKinds("all") == AmdPatchAll, "all");

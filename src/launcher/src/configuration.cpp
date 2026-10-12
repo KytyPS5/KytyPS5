@@ -137,6 +137,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 		if (!it.value().isString()) {
 			return fail(tr("Game setting %1 must be a string.").arg(it.key()));
 		}
+		if (legacy_key && !Common::ParseLegacyAmdCpuEnabled(it.value().toString().toStdString())) {
+			return fail(tr("Invalid value for game setting: %1").arg(it.key()));
+		}
 		values.insert(it.key(), it.value().toString());
 	}
 	// Without a mode in the import the legacy bool decides (true -> on, false -> auto), not the

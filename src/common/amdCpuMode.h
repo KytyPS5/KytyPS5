@@ -49,6 +49,13 @@ inline AmdCpuMode ResolveAmdCpuMode(std::optional<AmdCpuMode> command_line, cons
 	return AmdCpuMode::Auto;
 }
 
+// The old amd_cpu_enabled value as the launcher exports it: only "true" and "false" are a bool.
+inline std::optional<bool> ParseLegacyAmdCpuEnabled(std::string_view text) {
+	if (text == "true") return true;
+	if (text == "false") return false;
+	return std::nullopt;
+}
+
 // The launcher setting. A stored amd_cpu_mode wins; the older amd_cpu_enabled bool maps true -> on,
 // but false -> auto: that default was written for every configuration whether or not the user
 // touched the checkbox, so it is no choice to honour. Neither key (or an unparsable mode) is auto.

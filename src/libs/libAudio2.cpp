@@ -414,13 +414,13 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	context->object_mix.clear();
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
-	for (const auto& state: g_audioout2_ports) {
+	for (auto& state: g_audioout2_ports) {
 		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
 			continue;
 		}
 		if (audioout2_port_type_is_object(state.port_type)) {
 			audioout2_mix_object(*context, state);
-		} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
+		} else if (state.audio_handle >= 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
 			params.push_back({state.audio_handle, state.pcm_data.data(), state.gains.data()});
 		}
 	}
@@ -433,7 +433,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	}
 }
 static void audioout2_close_audio_handle(int audio_handle) {
-	if (audio_handle > 0) {
+	if (audio_handle >= 0) {
 		AudioInternal::AudioOutClose(audio_handle);
 	}
 }
@@ -488,7 +488,7 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	        ? 0
 	        : AudioInternal::AudioOutOpen(AUDIO_OUT_PORT_TYPE_MAIN, num_grains, 48000,
 	                                      AudioInternal::Format::FloatStereo);
-	if (params->max_object_ports != 0 && object_audio_handle == 0) {
+	if (params->max_object_ports != 0 && object_audio_handle < 0) {
 		return AUDIO_OUT2_ERROR_OUT_OF_RESOURCE;
 	}
 
@@ -529,14 +529,14 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		if (state->object_audio_handle > 0) {
+		if (state->object_audio_handle >= 0) {
 			audio_handles[audio_handles_num++] = state->object_audio_handle;
 		}
 		*state = AudioOut2ContextState {};
 	}
 	for (auto& port_state: g_audioout2_ports) {
 		if (port_state.used && port_state.context == ctx) {
-			if (port_state.audio_handle > 0 && audio_handles_num < audio_handles.size()) {
+			if (port_state.audio_handle >= 0 && audio_handles_num < audio_handles.size()) {
 				audio_handles[audio_handles_num++] = port_state.audio_handle;
 			}
 			port_state = AudioOut2PortStateEntry {};
@@ -651,7 +651,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
 	if (audioout2_port_type_is_object(params->port_type) &&
-	    (params->port_type != 0x100 || context_state->object_audio_handle == 0 ||
+	    (params->port_type != 0x100 || context_state->object_audio_handle < 0 ||
 	     params->sampling_freq != 48000 ||
 	     (audio_format != AudioInternal::Format::FloatMono &&
 	      audio_format != AudioInternal::Format::Signed16bitMono))) {

@@ -549,6 +549,11 @@ void TestPcm16RenderOutput() {
 	    reinterpret_cast<Ngs2RackInternal*>(sampler_handle) + 1);
 	auto& mastering = *reinterpret_cast<Ngs2VoiceInternal*>(
 	    reinterpret_cast<Ngs2RackInternal*>(mastering_handle) + 1);
+	const Ngs2VoicePatchParam mastering_patch {
+	    {sizeof(Ngs2VoicePatchParam), 0, 0x00000005}, 0, 0, mastering_handle};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&samplers[0]), &mastering_patch.header) == OK &&
+	          samplers[0].ports[0].dest == &mastering,
+	      "mastering rack handle did not resolve to its voice");
 	mastering.channels = 1;
 	mastering.state    = Ngs2VoicePlayState::Playing;
 	const int16_t source[2][4] = {{16384, -16384, 32767, -32768},
@@ -557,7 +562,13 @@ void TestPcm16RenderOutput() {
 		samplers[i].SetupSampler({0x12, 1, 48000});
 		samplers[i].blocks.push_back(
 		    {reinterpret_cast<const uint8_t*>(source[i]), {0, sizeof(source[i]), 0, 0, 4}});
-		samplers[i].ports[0].dest = &mastering;
+		if (i == 0) {
+			Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&samplers[i]),
+			                       &mastering_patch.header) == OK,
+			      "mastering rack patch failed after sampler setup");
+		} else {
+			samplers[i].ports[0].dest = &mastering;
+		}
 		samplers[i].SetEvent(1);
 	}
 	int16_t output_samples[4] = {};
@@ -680,6 +691,43 @@ void TestCustomPcmStillPlays() {
 	Check(f.voice.samples[0] == 0.25f && f.voice.samples[1] == -0.5f &&
 	          f.voice.samples[2] == 0.0f && f.voice.blocks.empty(),
 	      "custom PCM sampler regressed");
+}
+
+void TestReverbSetupRoutesDrySignal() {
+	Fixture source(48000, 2);
+	source.voice.ports.resize(1);
+	Ngs2RackInternal reverb_rack {};
+	reverb_rack.ngs  = &source.system;
+	reverb_rack.type = Ngs2RackType::Reverb;
+	Ngs2VoiceInternal reverb;
+	reverb.rack = &reverb_rack;
+	reverb.ports.resize(1);
+
+	Ngs2RackInternal mastering_rack {};
+	mastering_rack.ngs  = &source.system;
+	mastering_rack.type = Ngs2RackType::Mastering;
+	Ngs2VoiceInternal mastering;
+	mastering.rack     = &mastering_rack;
+	mastering.channels = 2;
+	mastering.state    = Ngs2VoicePlayState::Playing;
+
+	struct ReverbSetup {
+		Ngs2VoiceParamHeader header {24, 0, 0x20010000};
+		uint32_t             channels = 2;
+		uint32_t             flags = 0;
+		uint64_t             reserved = 0;
+	} setup;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&reverb), &setup.header) == OK,
+	      "reverb setup failed");
+	source.voice.ports[0] = {&reverb, 0, 1.0f, -1};
+	reverb.ports[0]       = {&mastering, 0, 1.0f, -1};
+	reverb.state          = Ngs2VoicePlayState::Playing;
+
+	const int16_t pcm[] = {8192, -8192};
+	source.Queue(pcm, 1, 0);
+	Ngs2RenderVoice(mastering, {&source.voice, &reverb, &mastering}, 1);
+	Check(mastering.samples == std::vector<float> {0.25f, -0.25f},
+	      "reverb did not route its dry signal to mastering");
 }
 
 void TestSamplerReuseResetsRouting() {
@@ -1418,7 +1466,124 @@ void TestFiniteFilterTail() {
 	Check(!split.voice.has_samples, "completed finite filter tail still produced samples");
 }
 
+void TestMasteringGainControl() {
+	Ngs2Internal      system;
+	Ngs2RackInternal  rack {};
+	Ngs2VoiceInternal voice;
+	rack.ngs   = &system;
+	rack.type  = Ngs2RackType::Mastering;
+	voice.rack = &rack;
+
+	const Ngs2MasteringVoiceGainParam gain {{16, 0, 0x30000004}, 0.5f, 0.25f};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &gain.header) == OK,
+	      "mastering gain control failed");
+	Check(voice.fbw_level == gain.fbw_level && voice.lfe_level == gain.lfe_level,
+	      "mastering gain control did not preserve levels");
+
+	struct MasteringSetup {
+		Ngs2VoiceParamHeader header {16, 0, 0x30000000};
+		uint32_t             channels = 2;
+		uint32_t             reserved = 0;
+	} setup;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK,
+	      "mastering setup failed");
+	Check(voice.channels == setup.channels && voice.state == Ngs2VoicePlayState::Playing,
+	      "mastering setup did not activate the mixing bus");
+}
+
+void TestWaveformResetReopensClosedStream() {
+	Fixture f(48000);
+	const int16_t first[] = {8192};
+	const int16_t replacement[] = {16384};
+	f.Queue(first, 1, 0);
+	Check(!f.voice.accepts_blocks, "waveform submission did not close stream");
+	f.Queue(replacement, 1, 4);
+	Check(f.voice.accepts_blocks == false && f.voice.blocks.size() == 1 &&
+	          f.voice.blocks.front().data == reinterpret_cast<const uint8_t*>(replacement),
+	      "waveform reset did not replace closed stream");
+}
+
+void TestVoicePortInfo() {
+	Fixture source(48000), destination(48000);
+	source.voice.ports.resize(1);
+	source.voice.ports[0] = {&destination.voice, 3, 0.25f, 2};
+
+	Ngs2VoicePortInfo info {};
+	Check(Ngs2VoiceGetPortInfo(reinterpret_cast<uintptr_t>(&source.voice), 0, &info, sizeof(info)) ==
+	          OK,
+	      "voice port query failed");
+	Check(info.matrix_id == 2 && info.volume == 0.25f && info.num_delay_samples == 0 &&
+	          info.dest_input_id == 3 &&
+	          info.dest_handle == reinterpret_cast<uintptr_t>(&destination.voice),
+	      "voice port query returned incorrect routing state");
+}
+
+void TestVoiceChannelsInfo() {
+	Fixture f(48000, 2);
+	Ngs2VoiceChannelsInfo info {};
+	Check(Ngs2VoiceQueryInfo(reinterpret_cast<uintptr_t>(&f.voice), 0x4001, &info, sizeof(info)) ==
+	          OK,
+	      "voice channel query failed");
+	Check(info.num_channels == 2 && info.reserved == 0,
+	      "voice channel query returned incorrect channel count");
+}
+
+void TestRackInfo() {
+	Ngs2Internal     system;
+	Ngs2RackInternal rack {};
+	rack.ngs                       = &system;
+	rack.type                      = Ngs2RackType::Sampler;
+	rack.option.common.max_voices  = 0;
+	rack.option.common.max_matrices = 2;
+	rack.option.common.max_ports   = 3;
+	std::memcpy(rack.option.common.name, "test-rack", sizeof("test-rack"));
+
+	Ngs2RackInfo info {};
+	Check(Ngs2RackGetInfo(reinterpret_cast<uintptr_t>(&rack), &info, sizeof(info)) == OK,
+	      "rack query failed");
+	Check(std::string_view(info.name) == "test-rack" && info.rack_handle == reinterpret_cast<uintptr_t>(&rack) &&
+	          info.owner_system_handle == reinterpret_cast<uintptr_t>(&system) &&
+	          info.rack_id == 0x1000 && info.max_voices == 0 && info.max_matrices == 2 &&
+	          info.max_ports == 3 && info.active_voice_count == 0,
+	      "rack query returned incorrect state");
+	Check(Ngs2RackGetInfo(reinterpret_cast<uintptr_t>(&rack), &info, sizeof(info) - 1) ==
+	          static_cast<int32_t>(0x804a8011u),
+	      "rack query accepted an incompatible output size");
+
+	alignas(Ngs2RackInfo) std::array<uint8_t, 232> extended_info {};
+	auto* extended = reinterpret_cast<Ngs2RackInfo*>(extended_info.data());
+	Check(Ngs2RackGetInfo(reinterpret_cast<uintptr_t>(&rack), extended, extended_info.size()) == OK,
+	      "extended rack query failed");
+	Check(extended->rack_handle == reinterpret_cast<uintptr_t>(&rack) &&
+	          std::ranges::all_of(extended_info.begin() + sizeof(Ngs2RackInfo),
+	                              extended_info.end(), [](uint8_t value) { return value == 0; }),
+	      "extended rack query did not preserve a zeroed extension");
+}
+
 } // namespace
+
+void TestStereoPanMatrix() {
+	Ngs2PanWork work {};
+	work.speaker_angles[0] = -90.0f;
+	work.speaker_angles[1] = 90.0f;
+	work.unit_angle        = 360.0f;
+	work.num_speakers      = 2;
+
+	Ngs2PanParam params[3] {};
+	params[0].angle = 0.0f;
+	params[1].angle = -90.0f;
+	params[2].angle = 90.0f;
+	float matrix[6] {};
+
+	Check(Ngs2PanGetVolumeMatrix(&work, params, 3, 2, matrix) == OK, "pan matrix failed");
+	Check(std::abs(matrix[0] - std::numbers::sqrt2_v<float> / 2.0f) < 0.0001f &&
+	          std::abs(matrix[1] - std::numbers::sqrt2_v<float> / 2.0f) < 0.0001f,
+	      "center pan was not balanced");
+	Check(std::abs(matrix[2] - 1.0f) < 0.0001f && std::abs(matrix[3]) < 0.0001f,
+	      "left pan was not routed left");
+	Check(std::abs(matrix[4]) < 0.0001f && std::abs(matrix[5] - 1.0f) < 0.0001f,
+	      "right pan was not routed right");
+}
 
 int main() {
 	TestProgressDrivenWaveformRing();
@@ -1439,6 +1604,12 @@ int main() {
 	TestWaveformReadAddress();
 	TestFilterTailDuringStarvation();
 	TestFiniteFilterTail();
+	TestMasteringGainControl();
+	TestWaveformResetReopensClosedStream();
+	TestVoicePortInfo();
+	TestVoiceChannelsInfo();
+	TestRackInfo();
+	TestStereoPanMatrix();
 	TestLowPassResponse();
 	TestFilterHistoryAndChannels();
 	TestFilterUsesOutputRate();
@@ -1455,6 +1626,7 @@ int main() {
 	TestMonoRateAndRouting();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
+	TestReverbSetupRoutesDrySignal();
 	TestPlayStateBeforeRender();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();

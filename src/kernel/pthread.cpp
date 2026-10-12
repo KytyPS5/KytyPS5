@@ -2277,7 +2277,12 @@ int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
+	// A statically-initialized rwlock that was never locked (or one that has
+	// already been destroyed) has no backing object; destroying it is a no-op.
+	// Matches PthreadMutexDestroy.
+	if (*rwlock == nullptr) {
+		return OK;
+	}
 
 	{
 		std::lock_guard lock((*rwlock)->m);

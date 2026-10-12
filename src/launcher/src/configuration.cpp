@@ -129,7 +129,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	};
 	auto values = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
-		if (!values.contains(it.key())) {
+		// Exports written before amd_cpu_mode existed carry the old bool.
+		const bool legacy_key = it.key() == QStringLiteral("amd_cpu_enabled");
+		if (!legacy_key && !values.contains(it.key())) {
 			return fail(tr("Unknown game setting: %1").arg(it.key()));
 		}
 		if (!it.value().isString()) {
@@ -137,10 +139,19 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 		}
 		values.insert(it.key(), it.value().toString());
 	}
+	// Without a mode in the import the legacy bool decides (true -> on, false -> auto), not the
+	// current mode that GameSettings() put in as the default.
+	if (settings.contains(QStringLiteral("amd_cpu_enabled")) &&
+	    !settings.contains(QStringLiteral("amd_cpu_mode"))) {
+		values.remove(QStringLiteral("amd_cpu_mode"));
+	}
 
 	ReadGameSettingsValues(values);
 	const auto canonical = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
+		if (it.key() == QStringLiteral("amd_cpu_enabled")) {
+			continue; // not exported any more, so there is nothing to compare it with
+		}
 		if (canonical.value(it.key()) != values.value(it.key())) {
 			return fail(tr("Invalid value for game setting: %1").arg(it.key()));
 		}

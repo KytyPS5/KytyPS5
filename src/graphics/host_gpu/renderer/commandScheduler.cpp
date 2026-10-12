@@ -4,6 +4,8 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -153,6 +155,13 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 
 	if (m_command.IsInvalid()) {
 		BeginNext();
+	}
+	// Device-local page table memory is uninitialized. A missing entry must read as zero so a
+	// buffer-device-address load faults in the shader instead of chasing a garbage pointer.
+	if (!m_bda_pagetable_cleared) {
+		m_context.GetBufferCache().GetBdaPageTableBuffer()->Fill(
+		    0, BufferCache::BDA_PAGETABLE_SIZE, 0);
+		m_bda_pagetable_cleared = true;
 	}
 }
 

@@ -101,6 +101,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	bool                         m_bda_pagetable_cleared = false;
 };
 
 } // namespace Libs::Graphics

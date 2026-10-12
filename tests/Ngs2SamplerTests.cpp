@@ -24,9 +24,11 @@ struct Fixture {
 
 	Fixture(uint32_t rate, uint32_t channels = 1, Ngs2RackType type = Ngs2RackType::Sampler) {
 		system.option.sample_rate = 48000;
+		system.option.num_grain_samples = 256;
 		rack.ngs                  = &system;
 		rack.type                 = type;
 		voice.rack                = &rack;
+		SetCapacity(4);
 		struct Setup {
 			Ngs2VoiceParamHeader header {40, 0, 0x10000000};
 			Ngs2WaveformFormat   format;
@@ -39,20 +41,51 @@ struct Fixture {
 		voice.state = Ngs2VoicePlayState::Playing;
 	}
 
-	void Queue(const int16_t* data, uint32_t frames, uint32_t flags, uint32_t repeats = 0,
-	           uint32_t skip = 0) {
-		Ngs2WaveformBlock block {
-		    0,  size_t(frames + skip) * voice.channels * sizeof(int16_t), repeats, skip, frames, 0,
-		    123};
+	void SetCapacity(uint32_t capacity) {
+		if (rack.type == Ngs2RackType::Sampler) {
+			rack.option.sampler.max_waveform_blocks = capacity;
+		} else {
+			rack.option.custom_sampler.max_waveform_blocks = capacity;
+			rack.option.custom_sampler.custom_rack_option.state_size = sizeof(Ngs2CustomSamplerVoiceState);
+		}
+	}
+
+	Ngs2SamplerVoiceState State() {
+		Ngs2SamplerVoiceState state {};
+		if (rack.type == Ngs2RackType::CustomSampler) {
+			Ngs2CustomSamplerVoiceState custom {};
+			Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&voice), &custom.voice_state,
+			                       sizeof(custom)) == OK, "custom sampler state failed");
+			state.voice_state = custom.voice_state;
+			state.num_decoded_samples = custom.num_decoded_samples;
+			state.decoded_data_size = custom.decoded_data_size;
+			state.waveform_data = custom.waveform_data;
+			state.user_data = custom.user_data;
+		} else {
+			Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&voice), &state.voice_state,
+			                       sizeof(state)) == OK, "sampler state failed");
+		}
+		return state;
+	}
+
+	int QueueBlocks(const void* data, const Ngs2WaveformBlock* blocks, uint32_t count,
+	                uint32_t flags) {
 		struct Blocks {
 			Ngs2VoiceParamHeader     header {32, 0, 0x10000001};
 			const void*              data;
 			uint32_t                 flags, count;
 			const Ngs2WaveformBlock* blocks;
-		} param {{32, 0, 0x10000001}, data, flags, 1, &block};
+		} param {{32, 0, 0x10000001}, data, flags, count, blocks};
 		param.header.id = rack.type == Ngs2RackType::Sampler ? 0x10000001 : 0x40010001;
-		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header) == OK,
-		      "sampler queue failed");
+		return Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header);
+	}
+
+	void Queue(const int16_t* data, uint32_t frames, uint32_t flags, uint32_t repeats = 0,
+	           uint32_t skip = 0) {
+		const Ngs2WaveformBlock block {
+		    0, size_t(frames + skip) * voice.channels * sizeof(int16_t), repeats, skip, frames, 0,
+		    123};
+		Check(QueueBlocks(data, &block, 1, flags) == OK, "sampler queue failed");
 	}
 
 	void Render(uint32_t frames) {
@@ -60,6 +93,190 @@ struct Fixture {
 		Ngs2RenderVoice(voice, {}, frames);
 	}
 };
+
+void TestWaveformQueueCapacity() {
+	constexpr int32_t full = static_cast<int32_t>(0x804a8054u);
+	constexpr int32_t invalid_count = static_cast<int32_t>(0x804a8053u);
+	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
+		for (uint32_t capacity: {1u, 4u, 16u}) {
+			Fixture f(24000, 1, rack);
+			f.SetCapacity(capacity);
+			f.system.option.num_grain_samples = 1;
+			const int16_t pcm[] = {8192, 16384};
+			const int16_t replacement[] = {24576, 4096};
+			std::vector<Ngs2WaveformBlock> blocks(capacity + 1);
+			for (uint32_t i = 0; i < blocks.size(); ++i) {
+				blocks[i] = {0, sizeof(pcm), 0, 0, 2, 0, i + 1};
+			}
+			Check(f.QueueBlocks(pcm, blocks.data(), capacity, 1) == OK,
+			      "configured waveform capacity was not available");
+			f.Render(1);
+			const auto phase = f.voice.sample_phase;
+			Check(f.QueueBlocks(replacement, blocks.data(), 1, 0) == full,
+			      "full waveform queue accepted another guest buffer");
+			Check(f.QueueBlocks(replacement, blocks.data(), capacity + 1, 4) == invalid_count,
+			      "oversized waveform request did not reject before CLEAR");
+			Check(f.voice.blocks.size() == capacity && f.voice.accepts_blocks &&
+			          f.voice.sample_phase == phase && f.voice.decoded_samples == 1 &&
+			          f.voice.decoded_bytes == sizeof(int16_t),
+			      "rejected waveform request changed playback or stream continuity");
+			for (uint32_t i = 0; i < capacity; ++i) {
+				Check(f.voice.blocks[i].data == reinterpret_cast<const uint8_t*>(pcm) &&
+				          f.voice.blocks[i].info.user_data == i + 1 &&
+				          f.voice.blocks[i].cursor == (i == 0 ? 1u : 0u),
+				      "rejected waveform request replaced an outstanding block");
+			}
+			f.Render(3);
+			Check(f.voice.samples == std::vector<float> {0.375f, 0.5f,
+			                                            capacity == 1 ? 0.5f : 0.375f} &&
+			          f.voice.blocks.size() == capacity - 1,
+			      "queue rejection changed partially played source audio");
+			Check(f.QueueBlocks(replacement, blocks.data(), 1, 1) == OK &&
+			          f.voice.blocks.size() == capacity,
+			      "completed waveform block did not release its queue slot");
+			const auto progress = f.State();
+			Check(f.QueueBlocks(replacement, blocks.data(), 1, 5) == OK &&
+			          f.voice.blocks.size() == 1 && f.voice.sample_phase == 0 &&
+			          f.voice.decoded_samples == progress.num_decoded_samples &&
+			          f.voice.decoded_bytes == progress.decoded_data_size,
+			      "CLEAR failed to replace a full queue while preserving progress");
+			f.Render(2);
+			Check(f.voice.samples == std::vector<float> {0.75f, 0.4375f},
+			      "CLEAR retained an old source or fractional playback position");
+		}
+	}
+}
+
+struct PcmRing {
+	static constexpr uint32_t block_frames = 7, block_count = 64;
+	Fixture& fixture;
+	std::array<std::array<int16_t, block_frames * 2>, 4> buffers {};
+	uint32_t next_block = 0, completed = 0;
+
+	void QueueNext(uint32_t slot) {
+		auto& buffer = buffers[slot];
+		for (uint32_t i = 0; i < block_frames; ++i) {
+			buffer[2 * i] = static_cast<int16_t>(100 + (next_block * block_frames + i) * 16);
+			buffer[2 * i + 1] = -buffer[2 * i];
+		}
+		const Ngs2WaveformBlock block {0, sizeof(buffer), 0, 0, block_frames, 0, slot};
+		++next_block;
+		Check(fixture.QueueBlocks(buffer.data(), &block, 1, next_block == block_count ? 0 : 1) == OK,
+		      "released ring buffer could not be queued again");
+	}
+};
+
+void KYTY_SYSV_ABI RefillPcmRing(const Ngs2VoiceCallbackInfo* info) {
+	auto& ring = *reinterpret_cast<PcmRing*>(info->data);
+	const auto slot = ring.completed++ % ring.buffers.size();
+	Check(info->flag == 1 && info->attributes == 0 && info->user == slot &&
+	          info->block_data == ring.buffers[slot].data() &&
+	          info->size == sizeof(ring.buffers[slot]),
+	      "ring completion callback released the wrong source buffer");
+	for (const auto& block: ring.fixture.voice.blocks) {
+		Check(block.data != reinterpret_cast<const uint8_t*>(ring.buffers[slot].data()),
+		      "completion callback retained the buffer about to be overwritten");
+	}
+	if (ring.next_block < PcmRing::block_count) {
+		ring.QueueNext(static_cast<uint32_t>(slot));
+	}
+}
+
+void TestWaveformRingReuse() {
+	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
+		Fixture f(48000, 2, rack);
+		PcmRing ring {f};
+		f.voice.callback = reinterpret_cast<uintptr_t>(&RefillPcmRing);
+		f.voice.callback_data = reinterpret_cast<uintptr_t>(&ring);
+		f.voice.callback_flags = 1;
+		for (uint32_t slot = 0; slot < ring.buffers.size(); ++slot) {
+			ring.QueueNext(slot);
+		}
+		constexpr std::array<uint32_t, 6> grains {1, 16, 3, 29, 2, 11};
+		constexpr auto total_frames = PcmRing::block_frames * PcmRing::block_count;
+		uint32_t rendered = 0, grain_index = 0;
+		while (rendered < total_frames) {
+			const auto grain = std::min(grains[grain_index++ % grains.size()], total_frames - rendered);
+			f.Render(grain);
+			for (uint32_t i = 0; i < grain; ++i) {
+				const float expected = (100 + (rendered + i) * 16) / 32768.0f;
+				Check(f.voice.samples[i] == expected && f.voice.samples[grain + i] == -expected,
+				      "ring buffer reuse replayed overwritten data or mixed stereo channels");
+			}
+			rendered += grain;
+			const auto decoded = f.State().num_decoded_samples;
+			Check(f.voice.blocks.size() <= ring.buffers.size() &&
+			          decoded >= rendered && decoded - rendered < 256 &&
+			          f.voice.decoded_bytes == decoded * 4 &&
+			          ring.completed == decoded / PcmRing::block_frames,
+			      "ring playback lost queue capacity or decoded progress");
+			if (decoded < total_frames) {
+				const auto slot = (decoded / PcmRing::block_frames) % ring.buffers.size();
+				Check(f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(
+				          ring.buffers[slot].data() + (decoded % PcmRing::block_frames) * 2),
+				      "ring read address did not track the active source buffer");
+			}
+		}
+		Check(f.voice.blocks.empty() && f.voice.state == Ngs2VoicePlayState::Empty &&
+		          ring.completed == PcmRing::block_count,
+		      "finite ring stream did not release all buffers and finish");
+	}
+}
+
+void TestProgressDrivenWaveformRing() {
+	const auto source_sample = [](uint64_t frame) {
+		return static_cast<int16_t>(static_cast<int32_t>((frame * 43) % 32768) - 16384);
+	};
+	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
+		Fixture f(44100, 2, rack);
+		std::array<std::array<int16_t, 1024 * 2>, 4> buffers {};
+		uint64_t submitted = 0, decoded_bytes = 0, rendered = 0;
+		uint32_t slot = 0;
+		const auto refill = [&](uint32_t frames) {
+			auto& buffer = buffers[slot];
+			for (const auto& block: f.voice.blocks) {
+				Check(block.data != reinterpret_cast<const uint8_t*>(buffer.data()),
+				      "decoded progress allowed the guest to overwrite an outstanding ring buffer");
+			}
+			for (uint32_t i = 0; i < frames; ++i) {
+				buffer[i * 2] = source_sample(submitted + i);
+				buffer[i * 2 + 1] = -buffer[i * 2];
+			}
+			const Ngs2WaveformBlock block {0, frames * 4u, 0, 0, frames, 0, slot};
+			Check(f.QueueBlocks(buffer.data(), &block, 1, 1) == OK,
+			      "progress-driven ring exhausted its waveform slots");
+			submitted += frames;
+			slot = (slot + 1) % buffers.size();
+		};
+		refill(1024);
+		for (uint32_t grain = 0; grain < 128; ++grain) {
+			f.Render(256);
+			for (uint32_t i = 0; i < 256; ++i) {
+				const uint64_t phase = (rendered + i) * 44100;
+				const auto frame = phase / 48000;
+				const float fraction = static_cast<float>(phase % 48000) / 48000.0f;
+				const float expected = std::lerp(static_cast<float>(source_sample(frame)),
+				                                 static_cast<float>(source_sample(frame + 1)), fraction) /
+				                       32768.0f;
+				Check(std::abs(f.voice.samples[i] - expected) < 0.00001f &&
+				          std::abs(f.voice.samples[256 + i] + expected) < 0.00001f,
+				      "progress-driven ring replayed overwritten music samples");
+			}
+			rendered += 256;
+			const auto state = f.State();
+			const auto delta = state.decoded_data_size - decoded_bytes;
+			Check(state.decoded_data_size >= decoded_bytes && delta <= sizeof(buffers[0]) &&
+			          delta % 4 == 0 && state.num_decoded_samples * 4 == state.decoded_data_size &&
+			          state.num_decoded_samples <= submitted,
+			      "published sampler progress does not describe decoded source data");
+			decoded_bytes = state.decoded_data_size;
+			if (delta != 0) {
+				refill(static_cast<uint32_t>(delta / 4));
+			}
+		}
+		Check(decoded_bytes > 28 * sizeof(buffers[0]), "ring test did not exercise repeated buffer reuse");
+	}
+}
 
 void TestStreamingResample() {
 	Fixture              f(44100, 2);
@@ -178,6 +395,7 @@ void TestAtrac9ResampleAcrossFrames() {
 		f->voice.next_decoded_frame[0] = 1.0f;
 		f->voice.next_decoded_frame[1] = 1.5f;
 		f->voice.next_frame_samples = 2;
+		f->voice.decoded_samples = 4;
 		f->voice.accepts_blocks = false;
 		return f;
 	};
@@ -218,6 +436,7 @@ void TestAtrac9ResampleAfterStarvation() {
 	f.voice.decoded_frame[0] = 0.0f;
 	f.voice.decoded_frame[1] = 0.5f;
 	f.voice.frame_samples    = 2;
+	f.voice.decoded_samples  = 2;
 	f.Render(4);
 	Check(f.voice.samples == std::vector<float> {0.0f, 0.25f, 0.5f, 0.5f} &&
 	          f.voice.decoded_samples == 2,
@@ -230,6 +449,7 @@ void TestAtrac9ResampleAfterStarvation() {
 	f.voice.next_decoded_frame[0] = 1.0f;
 	f.voice.next_decoded_frame[1] = 1.5f;
 	f.voice.next_frame_samples    = 2;
+	f.voice.decoded_samples       += 2;
 	f.Render(4);
 	Check(f.voice.samples == std::vector<float> {1.0f, 1.25f, 1.5f, 1.5f} &&
 	          f.voice.decoded_samples == 4,
@@ -773,8 +993,8 @@ void TestLoopCallbacksAndExit() {
 	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0, 0x10000004};
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&active.voice), &exit_loop);
 	active.voice.SetEvent(32);
-	active.Render(3);
-	Check(active.voice.samples == std::vector<float> {0.25f, 0.5f, 0.75f} &&
+	active.Render(5);
+	Check(active.voice.samples == std::vector<float> {0.25f, 0.5f, 0.25f, 0.5f, 0.75f} &&
 	          active.voice.blocks.empty() && log.events.size() == 1,
 	      "exiting infinite loop lost its final iteration or ignored callback flags");
 
@@ -858,8 +1078,69 @@ void TestAtrac9Looping() {
 	      "compressed loop exit failed to finish the active iteration");
 }
 
+void TestAtrac9WaveformJoining() {
+	std::array<uint8_t, 192> encoded {};
+	for (size_t i = 0; i < 4; ++i) {
+		std::copy(ATRAC9_MONO_BLOCK.begin(), ATRAC9_MONO_BLOCK.end(),
+		          encoded.begin() + i * ATRAC9_MONO_BLOCK.size());
+		if (i != 0) encoded[i * ATRAC9_MONO_BLOCK.size()] |= 0x80;
+	}
+	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
+		Fixture reference(24000, 1, rack);
+		reference.voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
+		reference.voice.state = Ngs2VoicePlayState::Playing;
+		const Ngs2WaveformBlock whole {0, encoded.size(), 0, 0, 512, 0, 123};
+		Check(reference.QueueBlocks(encoded.data(), &whole, 1, 0) == OK,
+		      "compressed reference block could not be queued");
+		reference.Render(1024);
+		for (bool nojoin: {false, true}) {
+			Fixture f(24000, 1, rack);
+			f.SetCapacity(1);
+			f.voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
+			f.voice.state = Ngs2VoicePlayState::Playing;
+			LoopCallbacks callbacks;
+			f.voice.callback = reinterpret_cast<uintptr_t>(&RecordLoopCallback);
+			f.voice.callback_data = reinterpret_cast<uintptr_t>(&callbacks);
+			f.voice.callback_flags = 1;
+			const Ngs2WaveformBlock first {0, 36, 0, 0, 512, 0, 123};
+			const Ngs2WaveformBlock rest {36, encoded.size() - 36, 99, 99, 99, 0, 123};
+			Check(f.QueueBlocks(encoded.data(), &first, 1, 1) == OK,
+			      "compressed stream start could not be queued");
+			const uint32_t flags = nojoin ? 0x12 : 2;
+			if (nojoin) {
+				Check(f.QueueBlocks(encoded.data(), &rest, 1, flags) ==
+				          static_cast<int32_t>(0x804a8054u) &&
+				          f.voice.blocks.size() == 1 && f.voice.blocks.front().info.data_size == 36 &&
+				          f.voice.accepts_blocks,
+				      "NOJOINT bypassed capacity or changed the full stream");
+				f.SetCapacity(2);
+			}
+			Check(f.QueueBlocks(encoded.data(), &rest, 1, flags) == OK &&
+			          f.voice.blocks.size() == (nojoin ? 2u : 1u),
+			      "consecutive ONLY_DATA blocks did not follow the joining flag");
+			f.Render(1024);
+			Check(f.voice.samples == reference.voice.samples && f.voice.decoded_samples == 512 &&
+			          f.voice.decoded_bytes == encoded.size() && f.voice.blocks.empty() &&
+			          callbacks.events.size() == (nojoin ? 2u : 1u),
+			      "compressed joining changed audio, progress, or block completion callbacks");
+		}
+		Fixture full(24000, 1, rack);
+		full.SetCapacity(2);
+		full.voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
+		const Ngs2WaveformBlock initial[] = {{0, 36, 0, 0, 512}, {36, 36, 0, 0, 512}};
+		const Ngs2WaveformBlock addition[] = {{72, 36}, {144, 48}};
+		Check(full.QueueBlocks(encoded.data(), initial, 2, 1) == OK &&
+		          full.QueueBlocks(encoded.data(), addition, 2, 2) ==
+		              static_cast<int32_t>(0x804a8054u) &&
+		          full.voice.blocks.size() == 2 && full.voice.blocks.back().info.data_size == 36 &&
+		          full.voice.accepts_blocks,
+		      "overflow after a tentative join partially extended or closed the stream");
+	}
+}
+
 void TestWaveformReadAddress() {
 	Fixture       f(48000, 2);
+	f.system.option.num_grain_samples = 1;
 	const int16_t pcm[] = {-100, -100, 8192, 4096, 16384, 8192};
 	f.Queue(pcm, 2, 1, 1, 1);
 	const auto next_data = [&]() {
@@ -887,11 +1168,12 @@ struct CallbackEvent {
 	Ngs2VoiceInternal* voice;
 	uint32_t           event;
 	uint32_t           calls = 0;
+	uint32_t           trigger = 1;
 };
 
 void KYTY_SYSV_ABI ApplyCallbackEvent(const Ngs2VoiceCallbackInfo* info) {
 	auto& context = *reinterpret_cast<CallbackEvent*>(info->data);
-	if (++context.calls == 1) {
+	if (++context.calls == context.trigger) {
 		context.voice->SetEvent(context.event);
 	}
 }
@@ -910,14 +1192,15 @@ void TestCallbackStopsConsumption() {
 			f.Render(2);
 			Check(f.voice.state != Ngs2VoicePlayState::Playing && context.calls == 1,
 			      "completion callback failed to interrupt playback");
-			Check(f.voice.samples[0] == 0.25f && f.voice.samples[1] == 0.0f &&
+			Check(f.voice.samples[0] == 0.0f && f.voice.samples[1] == 0.0f &&
 			          f.voice.decoded_samples == 1 && f.voice.blocks.size() == 1 &&
 			          f.voice.blocks.front().cursor == 0,
 			      "callback pause/stop consumed the next queued block");
 			if (event == 16) {
 				f.voice.SetEvent(32);
-				f.Render(1);
-				Check(f.voice.samples[0] == 0.5f && f.voice.decoded_samples == 2,
+				f.Render(2);
+				Check(f.voice.samples == std::vector<float> {0.25f, 0.5f} &&
+				          f.voice.decoded_samples == 2,
 				      "callback pause failed to preserve queued audio for resume");
 			}
 		}
@@ -936,13 +1219,93 @@ void TestCallbackPauseDuringLargeStep() {
 	f.voice.callback_data  = reinterpret_cast<uintptr_t>(&context);
 	f.voice.callback_flags = 1;
 	f.Render(2);
-	Check(context.calls == 1 && f.voice.decoded_samples == 1 &&
-	          f.voice.sample_phase == (uint64_t(72000) << 32u),
+	Check(context.calls == 1 && f.voice.decoded_samples == 1 && f.voice.sample_phase == 0 &&
+	          !f.voice.has_samples,
 	      "pause advanced across additional blocks in a large resampling step");
 	f.voice.SetEvent(32);
-	f.Render(1);
-	Check(std::abs(f.voice.samples[0] - 0.4375f) < 1e-7f && context.calls == 3,
+	f.Render(2);
+	Check(f.voice.samples[0] == 0.25f && std::abs(f.voice.samples[1] - 0.4375f) < 1e-7f &&
+	          context.calls == 3,
 	      "resume lost fractional position or read past the next short block");
+}
+
+void TestCallbackPauseDuringLookahead() {
+	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
+		Fixture f(24000, 1, rack);
+		f.system.option.num_grain_samples = 1;
+		int16_t pcm[] = {8192, 16384};
+		f.Queue(pcm, 1, 1);
+		f.Queue(pcm + 1, 1, 0);
+		CallbackEvent context {&f.voice, 16, 0, 2};
+		f.voice.callback = reinterpret_cast<uintptr_t>(&ApplyCallbackEvent);
+		f.voice.callback_data = reinterpret_cast<uintptr_t>(&context);
+		f.voice.callback_flags = 1;
+		f.Render(1);
+		Check(f.voice.samples[0] == 0.25f, "initial source sample was not rendered");
+		f.Render(2);
+		Check(!f.voice.has_samples && f.voice.state == Ngs2VoicePlayState::Paused &&
+		          context.calls == 2 && f.State().num_decoded_samples == 2 &&
+		          f.voice.sample_phase == (uint64_t(24000) << 32u),
+		      "lookahead callback pause consumed output or lost decoded progress");
+		pcm[0] = pcm[1] = -32768;
+		f.voice.SetEvent(32);
+		f.Render(3);
+		Check(f.voice.samples == std::vector<float> {0.375f, 0.5f, 0.5f} &&
+		          f.voice.state == Ngs2VoicePlayState::Empty,
+		      "lookahead pause failed to preserve owned samples or fractional playback position");
+	}
+}
+
+struct CallbackReplacement {
+	Fixture& fixture;
+	bool setup;
+	uint32_t trigger, calls = 0;
+	const std::array<int16_t, 4> pcm {16384, 8192, 4096, 2048};
+};
+
+void KYTY_SYSV_ABI ReplaceCallbackSource(const Ngs2VoiceCallbackInfo* info) {
+	auto& replacement = *reinterpret_cast<CallbackReplacement*>(info->data);
+	if (++replacement.calls != replacement.trigger) {
+		return;
+	}
+	auto& f = replacement.fixture;
+	f.voice.callback_flags = 0;
+	if (replacement.setup) {
+		f.voice.SetupSampler({0x12, 1, 48000});
+	}
+	f.Queue(replacement.pcm.data(), 2, replacement.setup ? 0 : 4);
+	f.voice.SetEvent(1);
+}
+
+void TestCallbackReplacesSource() {
+	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
+		for (bool setup: {false, true}) {
+			for (uint32_t trigger: {1u, 2u}) {
+				Fixture f(24000, 2, rack);
+				f.system.option.num_grain_samples = 1;
+				CallbackReplacement replacement {f, setup, trigger};
+				const int16_t pcm[] = {8192, 4096};
+				for (uint32_t i = 0; i < trigger; ++i) {
+					f.Queue(pcm, 1, 1);
+				}
+				f.voice.callback = reinterpret_cast<uintptr_t>(&ReplaceCallbackSource);
+				f.voice.callback_data = reinterpret_cast<uintptr_t>(&replacement);
+				f.voice.callback_flags = 1;
+				f.Render(4);
+				Check(!f.voice.has_samples && f.voice.samples.size() == (setup ? 4u : 8u) &&
+				          std::ranges::all_of(f.voice.samples, [](float value) { return value == 0; }) &&
+				          f.voice.blocks.size() == 1 && f.voice.blocks.front().cursor == 0,
+				      "callback source replacement used an old frame or channel layout");
+				f.Render(4);
+				const std::vector<float> expected = setup
+				    ? std::vector<float> {0.5f, 0.25f, 0, 0}
+				    : std::vector<float> {0.5f, 0.3125f, 0.125f, 0.125f,
+				                          0.25f, 0.15625f, 0.0625f, 0.0625f};
+				Check(f.voice.samples == expected && f.voice.state == Ngs2VoicePlayState::Empty,
+				      "callback replacement failed to play the new source on the next render");
+			}
+		}
+	}
 }
 
 void TestUpstreamCustomSamplerControls() {
@@ -953,7 +1316,7 @@ void TestUpstreamCustomSamplerControls() {
 	Check(f.voice.samples[0] == 0.25f, "custom sampler source rate was rejected");
 	f.Queue(pcm + 2, 2, 4);
 	f.Render(1);
-	Check(f.voice.samples[0] == 0.75f && f.voice.blocks.size() == 1,
+	Check(f.voice.samples[0] == 0.75f && f.voice.blocks.empty() && f.voice.frame_samples == 2,
 	      "replacement blocks retained old data or fractional position");
 	struct Pitch {
 		Ngs2VoiceParamHeader header {16, 0, 0x40010005};
@@ -1058,6 +1421,9 @@ void TestFiniteFilterTail() {
 } // namespace
 
 int main() {
+	TestProgressDrivenWaveformRing();
+	TestWaveformQueueCapacity();
+	TestWaveformRingReuse();
 	TestAtrac9Vibration();
 	TestPcm16RenderOutput();
 	TestSubmixerSetupAndRouting();
@@ -1069,6 +1435,7 @@ int main() {
 	TestDeferredSamplerSetup();
 	TestLoopCallbacksAndExit();
 	TestAtrac9Looping();
+	TestAtrac9WaveformJoining();
 	TestWaveformReadAddress();
 	TestFilterTailDuringStarvation();
 	TestFiniteFilterTail();
@@ -1079,6 +1446,8 @@ int main() {
 	TestUpstreamCustomSamplerControls();
 	TestCallbackStopsConsumption();
 	TestCallbackPauseDuringLargeStep();
+	TestCallbackPauseDuringLookahead();
+	TestCallbackReplacesSource();
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();

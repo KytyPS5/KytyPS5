@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/DeadLaneMasks.h"
 #include "graphics/shader/recompiler/ir/passes/IndexRangeFold.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -1458,6 +1459,14 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	std::vector<IR::Inst*> exec_reads;
+	for (auto* block: ir.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == IR::ValueOpcode::GetExec) {
+				exec_reads.push_back(&inst);
+			}
+		}
+	}
 	IR::RewriteToSsa(ir.blocks);
 	const auto simplify = [&ir] {
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
@@ -1465,6 +1474,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		IR::EliminateDeadCode(ir.blocks);
 	};
 	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+	// Before identities are removed: the former GetExec reads are still identities in place.
+	IR::EliminateDeadLaneWriteMasks(ir, exec_reads);
 	if (IR::FoldUnreachableIndexCompares(ir) != 0) {
 		// Twice: the first pass reaches loop phis before their back edges are rewritten.
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
@@ -1582,6 +1593,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (IR::EliminateUndemandedWriteMasks(ir) != 0) {
+		IR::RemoveIdentities(ir);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;

@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/ir/passes/DeadLaneMasks.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
@@ -331,7 +332,8 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 				value = IR::U32(ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()},
 				                        DppFlags(operand)));
 			} else {
-				value = ir.Select(ir.GetExec(), value, old);
+				value = IR::U32(ir.Emit(IR::ValueOpcode::SelectU32, {ir.GetExec(), value, old},
+				                        IR::VgprWriteMaskFlag));
 			}
 			ir.SetVectorReg(reg, value);
 			break;

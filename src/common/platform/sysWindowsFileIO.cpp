@@ -13,6 +13,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -63,10 +64,47 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	return FILE_ATTRIBUTE_NORMAL;
 }
 
+// Reads into an intermediate buffer and copies the data out in chunks. The copy runs in user mode,
+// so a write to a protected destination page raises a fault the emulator's handler can resolve.
+static DWORD ReadThroughBuffer(HANDLE handle, void* data, uint32_t size) {
+	constexpr uint32_t                chunk_size = 1u << 20u;
+	thread_local std::vector<uint8_t> buffer;
+	if (buffer.size() < chunk_size) {
+		buffer.resize(chunk_size);
+	}
+	uint32_t total = 0;
+	while (total < size) {
+		const uint32_t chunk = std::min(size - total, chunk_size);
+		DWORD          read  = 0;
+		if (ReadFile(handle, buffer.data(), chunk, &read, nullptr) == 0) {
+			break;
+		}
+		std::memcpy(static_cast<uint8_t*>(data) + total, buffer.data(), read);
+		total += read;
+		if (read < chunk) {
+			break;
+		}
+	}
+	return total;
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
-		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		LARGE_INTEGER start {};
+		const BOOL    have_start = SetFilePointerEx(f.handle, {}, &start, FILE_CURRENT);
+		DWORD         w          = 0;
+		if (ReadFile(f.handle, data, size, &w, nullptr) == 0 && have_start != 0) {
+			// The kernel does not fault on a destination page that is read-only or inaccessible,
+			// such as guest memory write-protected for GPU tracking. ReadFile fails instead, with
+			// ERROR_NOACCESS (the page is protected before the read starts) or with
+			// ERROR_INVALID_USER_BUFFER (seen as well, likely when the protection changes during
+			// the copy). Without this retry the guest sees a successful read of zero bytes.
+			const DWORD error = GetLastError();
+			if ((error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER) &&
+			    SetFilePointerEx(f.handle, start, nullptr, FILE_BEGIN) != 0) {
+				w = ReadThroughBuffer(f.handle, data, size);
+			}
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

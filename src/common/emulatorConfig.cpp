@@ -89,6 +89,10 @@ Common::AmdCpuMode GetAmdCpuMode() {
 	return Common::ResolveAmdCpuMode(g_config->amd_cpu_mode, std::getenv("KYTY_AMD_CPU"));
 }
 
+uint32_t GetAmdPatchKinds() {
+	return Common::ResolveAmdPatchKinds(std::getenv("KYTY_AMD_PATCH"), GetAmdCpuMode());
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }

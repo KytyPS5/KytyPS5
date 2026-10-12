@@ -84,14 +84,16 @@ static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value;
 }
 
-// Decided once per run; the reason is logged so a slow Rosetta run and a patched one can be told apart.
+// Decided once per run; the reason is logged so a slow Rosetta run and a patched one can be told
+// apart.
 static bool AmdCpuPatchEnabled() {
 	static const bool enabled = [] {
-		const auto host     = GetGuestInstructionHostFeatures();
-		const auto decision = Common::DecideAmdCpu(Config::GetAmdCpuMode(),
-		                                           {host.sse4a, host.rdpid, host.clwb});
-		Log::WriteToConsoleAndLog(fmt::format("AMD CPU compatibility: patching {} ({})\n",
-		                                      decision.enabled ? "on" : "off", decision.reason));
+		const auto host = GetGuestInstructionHostFeatures();
+		const auto decision =
+		    Common::DecideAmdCpu(Config::GetAmdCpuMode(), {host.sse4a, host.rdpid, host.clwb});
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "AMD CPU compatibility: patching {} ({}), kinds={}\n", decision.enabled ? "on" : "off",
+		    decision.reason, Common::AmdPatchKindsName(Config::GetAmdPatchKinds())));
 		return decision.enabled;
 	}();
 	return enabled;
@@ -1809,8 +1811,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			const auto result = PatchGuestInstructions(
+			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
+			    GetGuestInstructionHostFeatures(), Config::GetAmdPatchKinds());
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;

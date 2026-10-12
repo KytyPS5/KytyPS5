@@ -31,7 +31,8 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(printf_output_file);
 	KYTY_CFG_SET(profiler_enabled);
 	KYTY_CFG_SET(renderdoc_enabled);
-	values.insert(QStringLiteral("amd_cpu_mode"), QString::fromLatin1(Common::AmdCpuModeName(amd_cpu_mode)));
+	values.insert(QStringLiteral("amd_cpu_mode"),
+	              QString::fromLatin1(Common::AmdCpuModeName(amd_cpu_mode)));
 #if defined(_WIN32)
 	KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -81,9 +82,11 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(printf_output_file);
 	KYTY_CFG_GET(profiler_enabled);
 	KYTY_CFG_GET(renderdoc_enabled);
-	// Settings saved before the mode existed hold a bool: true -> on, false -> auto (the old default, never a choice).
+	// Settings saved before the mode existed hold a bool: true -> on, false -> auto (the old
+	// default, never a choice).
 	{
-		const std::string               mode_utf8 = s.value("amd_cpu_mode").toString().toStdString();
+		const QString                   mode_text = s.value("amd_cpu_mode").toString();
+		const std::string               mode_utf8 = mode_text.toStdString();
 		std::optional<std::string_view> mode;
 		if (s.contains("amd_cpu_mode")) mode = mode_utf8;
 		std::optional<bool> legacy;

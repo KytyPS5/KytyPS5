@@ -925,22 +925,26 @@ void GenerateExtractQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerato
 void CollectAmdInstructions(const DecodedFunction&                   function,
                             std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                             GuestInstructionPatchResult&             result,
-                            GuestInstructionHostFeatures             host_features) {
+                            GuestInstructionHostFeatures host_features, uint32_t amd_kinds) {
 	for (const auto& [address, decoded]: function.instructions) {
 		const auto&            instruction = decoded.instruction;
 		InstructionReplacement replacement {};
-		if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
+		if ((amd_kinds & Common::AmdPatchRsqrt) != 0 &&
+		    instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
 		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
 		    instruction.raw.vex.offset == 0 && decoded.operands[0].size == 128 &&
 		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
 			replacement = InstructionReplacement::ReciprocalSquareRoot;
-		} else if (!host_features.sse4a && IsSupportedBitFieldInstruction(decoded)) {
+		} else if ((amd_kinds & Common::AmdPatchSse4a) != 0 && !host_features.sse4a &&
+		           IsSupportedBitFieldInstruction(decoded)) {
 			replacement = instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ
 			                  ? InstructionReplacement::ExtractQ
 			                  : InstructionReplacement::InsertQ;
-		} else if (!host_features.rdpid && instruction.mnemonic == ZYDIS_MNEMONIC_RDPID) {
+		} else if ((amd_kinds & Common::AmdPatchCpuExt) != 0 && !host_features.rdpid &&
+		           instruction.mnemonic == ZYDIS_MNEMONIC_RDPID) {
 			replacement = InstructionReplacement::ReadProcessorId;
-		} else if (!host_features.clwb && instruction.mnemonic == ZYDIS_MNEMONIC_CLWB) {
+		} else if ((amd_kinds & Common::AmdPatchCpuExt) != 0 && !host_features.clwb &&
+		           instruction.mnemonic == ZYDIS_MNEMONIC_CLWB) {
 			replacement = InstructionReplacement::CacheLineWriteBack;
 		} else {
 			continue;
@@ -1497,7 +1501,8 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
-                                                   GuestInstructionHostFeatures host_features) {
+                                                   GuestInstructionHostFeatures host_features,
+                                                   uint32_t                     amd_kinds) {
 	GuestInstructionPatchResult result {};
 	if (!protect_memory && !emulate_amd) {
 		return result;
@@ -1550,7 +1555,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
 		if (emulate_amd) {
-			CollectAmdInstructions(function, rewrite_sites, result, host_features);
+			CollectAmdInstructions(function, rewrite_sites, result, host_features, amd_kinds);
 		}
 		if (!rewrite_sites.empty()) {
 			RelocateGuestInstructions(module, function, rewrite_sites, result);

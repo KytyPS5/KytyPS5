@@ -462,9 +462,16 @@ add_amd_cpu_mode_mutant(CLI_IGNORED common/amdCpuMode.h "if (command_line) retur
 add_amd_cpu_mode_mutant(ZERO_UNPARSED common/amdCpuMode.h "text == \"off\" || text == \"0\"" "text == \"off\"")
 add_amd_cpu_mode_mutant(OFF_PATCHES common/amdCpuMode.h "return {false, \"forced off" "return {true, \"forced off")
 add_amd_cpu_mode_mutant(BAD_ENV_OFF common/amdCpuMode.h "	return AmdCpuMode::Auto;\n}\n\ninline AmdCpuDecision" "	return AmdCpuMode::Off;\n}\n\ninline AmdCpuDecision")
+# KYTY_AMD_PATCH: AUTO_ALL: auto rewrites every kind by default; AUTO_NONE_ALL: "none" selects everything;
+# RSQRT_DROPPED: rsqrt not understood; BAD_NONE: an unparsable value disables all kinds; ENV_IGNORED: the variable loses to the default.
 # STORED_FALSE_OFF: the old launcher bool false maps to off; STORED_MODE_IGNORED: the old bool beats a stored mode.
 add_amd_cpu_mode_mutant(STORED_FALSE_OFF common/amdCpuMode.h "if (legacy_enabled && *legacy_enabled) return AmdCpuMode::On;" "if (legacy_enabled) return *legacy_enabled ? AmdCpuMode::On : AmdCpuMode::Off;")
 add_amd_cpu_mode_mutant(STORED_MODE_IGNORED common/amdCpuMode.h "	if (mode) {\n		if (const auto parsed" "	if (false) {\n		if (const auto parsed")
+add_amd_cpu_mode_mutant(PATCH_AUTO_ALL common/amdCpuMode.h "AmdCpuMode::Auto ? AmdPatchSse4a : 0u" "AmdCpuMode::Auto ? AmdPatchAll : 0u")
+add_amd_cpu_mode_mutant(PATCH_NONE_ALL common/amdCpuMode.h "if (text == \"none\") return 0u;" "if (text == \"none\") return AmdPatchAll;")
+add_amd_cpu_mode_mutant(PATCH_RSQRT_DROPPED common/amdCpuMode.h "else if (item == \"rsqrt\")\n\t\t\tkinds |= AmdPatchRsqrt;" "else if (item == \"rsqrt\")\n\t\t\tkinds |= 0;")
+add_amd_cpu_mode_mutant(PATCH_BAD_NONE common/amdCpuMode.h "	return DefaultAmdPatchKinds(mode);\n}" "	return 0u;\n}")
+add_amd_cpu_mode_mutant(PATCH_ENV_IGNORED common/amdCpuMode.h "if (const auto kinds = ParseAmdPatchKinds(env)) return *kinds;" "")
 
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
@@ -661,6 +668,16 @@ if(BUILD_TESTING)
 	set_tests_properties(amd_cpu_mode_mutant_stored_false_off PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME amd_cpu_mode_mutant_stored_mode_ignored COMMAND $<TARGET_FILE:amd_cpu_mode_mutant_stored_mode_ignored_tests>)
 	set_tests_properties(amd_cpu_mode_mutant_stored_mode_ignored PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME amd_cpu_mode_mutant_patch_auto_all COMMAND $<TARGET_FILE:amd_cpu_mode_mutant_patch_auto_all_tests>)
+	set_tests_properties(amd_cpu_mode_mutant_patch_auto_all PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME amd_cpu_mode_mutant_patch_none_all COMMAND $<TARGET_FILE:amd_cpu_mode_mutant_patch_none_all_tests>)
+	set_tests_properties(amd_cpu_mode_mutant_patch_none_all PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME amd_cpu_mode_mutant_patch_rsqrt_dropped COMMAND $<TARGET_FILE:amd_cpu_mode_mutant_patch_rsqrt_dropped_tests>)
+	set_tests_properties(amd_cpu_mode_mutant_patch_rsqrt_dropped PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME amd_cpu_mode_mutant_patch_bad_none COMMAND $<TARGET_FILE:amd_cpu_mode_mutant_patch_bad_none_tests>)
+	set_tests_properties(amd_cpu_mode_mutant_patch_bad_none PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME amd_cpu_mode_mutant_patch_env_ignored COMMAND $<TARGET_FILE:amd_cpu_mode_mutant_patch_env_ignored_tests>)
+	set_tests_properties(amd_cpu_mode_mutant_patch_env_ignored PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -748,6 +765,11 @@ if(BUILD_TESTING)
 		amd_cpu_mode_mutant_bad_env_off_tests
 		amd_cpu_mode_mutant_stored_false_off_tests
 		amd_cpu_mode_mutant_stored_mode_ignored_tests
+		amd_cpu_mode_mutant_patch_auto_all_tests
+		amd_cpu_mode_mutant_patch_none_all_tests
+		amd_cpu_mode_mutant_patch_rsqrt_dropped_tests
+		amd_cpu_mode_mutant_patch_bad_none_tests
+		amd_cpu_mode_mutant_patch_env_ignored_tests
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests
@@ -794,6 +816,78 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 		set_tests_properties(macos_sse4a PROPERTIES TIMEOUT 15)
 		add_dependencies(kyty_tests macos_sse4a_tests)
 	endif()
+	# Bit-exact check of the AMD patcher's EXTRQ/INSERTQ/VRSQRTPS replacements, executed on the CPU.
+	add_executable(amd_trampoline_bitexact_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/amdTrampolineBitExactTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+		"${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp"
+	)
+	target_link_libraries(amd_trampoline_bitexact_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
+	target_include_directories(amd_trampoline_bitexact_tests PRIVATE ${inc_headers})
+	if(BUILD_TESTING)
+		add_test(NAME amd_trampoline_bitexact COMMAND $<TARGET_FILE:amd_trampoline_bitexact_tests>)
+		set_tests_properties(amd_trampoline_bitexact PROPERTIES TIMEOUT 300)
+		add_dependencies(kyty_tests amd_trampoline_bitexact_tests)
+	endif()
+	# Mutants of the AMD patcher / SSE4a emulator for amd_trampoline_bitexact (each must fail, WILL_FAIL; the test
+	# exits with 1 on a failed check, a signal exit would not be inverted). One or two edits are applied to a copy of
+	# src/loader/<file> in the build tree:
+	#   EXTRQ_LEN0 (len 0 not 64), EXTRQ_IDX_DROPPED (no shift by idx), EXTRQ_REG_NO_NEG / EXTRQ_REG_SHIFT9 (register form
+	#   decodes the controls wrongly), EXTRQ_RDX_CLOBBER / EXTRQ_FLAGS_LOST / EXTRQ_NO_RED_ZONE (trampoline leaks state),
+	#   EXTRQ_UPPER_KEPT (upper quadword not cleared), RSQRT_NO_DAZ / RSQRT_MXCSR_LEAK / RSQRT_MUL (VRSQRTPS replacement),
+	#   KIND_*_IGNORED (KYTY_AMD_PATCH selection ignored), EMU_* (signal emulator used for INSERTQ).
+	function(add_bitexact_mutant name file from to from2 to2)
+		string(TOLOWER ${name} name_lower)
+		set(mutant_dir "${CMAKE_CURRENT_BINARY_DIR}/amd_bitexact_mutants/${name_lower}")
+		file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/loader/${file}" text)
+		string(REPLACE "${from}" "${to}" edited "${text}")
+		if(edited STREQUAL text)
+			message(FATAL_ERROR "bitexact mutant ${name}: pattern not found in ${file}")
+		endif()
+		if(NOT from2 STREQUAL "")
+			set(before "${edited}")
+			string(REPLACE "${from2}" "${to2}" edited "${before}")
+			if(edited STREQUAL before)
+				message(FATAL_ERROR "bitexact mutant ${name}: second pattern not found in ${file}")
+			endif()
+		endif()
+		file(WRITE "${mutant_dir}/${file}" "${edited}")
+		if(file STREQUAL "guestInstructionPatcher.cpp")
+			set(patcher_src "${mutant_dir}/${file}")
+			set(emulator_src "${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp")
+		else()
+			set(patcher_src "${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp")
+			set(emulator_src "${mutant_dir}/${file}")
+		endif()
+		add_executable(amd_trampoline_bitexact_mutant_${name_lower}_tests EXCLUDE_FROM_ALL
+			"${KYTY_TESTS_DIR}/amdTrampolineBitExactTests.cpp" "${emulator_src}" "${patcher_src}")
+		target_link_libraries(amd_trampoline_bitexact_mutant_${name_lower}_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
+		target_include_directories(amd_trampoline_bitexact_mutant_${name_lower}_tests PRIVATE ${inc_headers})
+		if(BUILD_TESTING)
+			add_test(NAME amd_trampoline_bitexact_mutant_${name_lower} COMMAND $<TARGET_FILE:amd_trampoline_bitexact_mutant_${name_lower}_tests>)
+			set_tests_properties(amd_trampoline_bitexact_mutant_${name_lower} PROPERTIES TIMEOUT 300 WILL_FAIL TRUE)
+			add_dependencies(kyty_tests amd_trampoline_bitexact_mutant_${name_lower}_tests)
+		endif()
+	endfunction()
+	add_bitexact_mutant(EXTRQ_LEN0 guestInstructionPatcher.cpp "const u64 mask   = length == 0 ? UINT64_MAX : (u64 {1} << length) - 1;" "const u64 mask   = length == 0 ? 0 : (u64 {1} << length) - 1;" "" "")
+	add_bitexact_mutant(EXTRQ_IDX_DROPPED guestInstructionPatcher.cpp "if (index != 0) {" "if (false) {" "" "")
+	add_bitexact_mutant(EXTRQ_REG_NO_NEG guestInstructionPatcher.cpp "generator.neg(ecx);" "" "" "")
+	add_bitexact_mutant(EXTRQ_REG_SHIFT9 guestInstructionPatcher.cpp "generator.shr(rax, 8);" "generator.shr(rax, 9);" "" "")
+	add_bitexact_mutant(EXTRQ_RDX_CLOBBER guestInstructionPatcher.cpp "generator.pop(rdx);" "generator.pop(r11);" "" "")
+	add_bitexact_mutant(EXTRQ_FLAGS_LOST guestInstructionPatcher.cpp "generator.popfq();\n\tgenerator.lea(rsp, ptr[rsp + GuestRedZoneSize]);" "generator.add(rsp, 8);\n\tgenerator.lea(rsp, ptr[rsp + GuestRedZoneSize]);" "" "")
+	add_bitexact_mutant(EXTRQ_NO_RED_ZONE guestInstructionPatcher.cpp "generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);\n\tgenerator.pushfq();" "generator.pushfq();" "generator.popfq();\n\tgenerator.lea(rsp, ptr[rsp + GuestRedZoneSize]);" "generator.popfq();")
+	add_bitexact_mutant(EXTRQ_UPPER_KEPT guestInstructionPatcher.cpp "generator.movq(destination, rax);" "generator.pinsrq(destination, rax, 0);" "" "")
+	add_bitexact_mutant(RSQRT_NO_DAZ guestInstructionPatcher.cpp "0x1fc0" "0x1f80" "" "")
+	add_bitexact_mutant(RSQRT_MXCSR_LEAK guestInstructionPatcher.cpp "generator.ldmxcsr(ptr[rsp + 32]);" "" "" "")
+	add_bitexact_mutant(RSQRT_MUL guestInstructionPatcher.cpp "generator.vdivpd(" "generator.vmulpd(" "" "")
+	add_bitexact_mutant(KIND_RSQRT_IGNORED guestInstructionPatcher.cpp "(amd_kinds & Common::AmdPatchRsqrt) != 0 &&" "" "" "")
+	add_bitexact_mutant(KIND_SSE4A_IGNORED guestInstructionPatcher.cpp "(amd_kinds & Common::AmdPatchSse4a) != 0 && !host_features.sse4a &&" "!host_features.sse4a &&" "" "")
+	add_bitexact_mutant(KIND_RDPID_IGNORED guestInstructionPatcher.cpp "(amd_kinds & Common::AmdPatchCpuExt) != 0 && !host_features.rdpid &&" "!host_features.rdpid &&" "" "")
+	add_bitexact_mutant(KIND_CLWB_IGNORED guestInstructionPatcher.cpp "(amd_kinds & Common::AmdPatchCpuExt) != 0 && !host_features.clwb &&" "!host_features.clwb &&" "" "")
+	add_bitexact_mutant(EMU_LENGTH_MASK x64InstructionEmulator.cpp "length &= 0x3fu;" "length &= 0x7fu;" "" "")
+	add_bitexact_mutant(EMU_INSERTQ_CONTROLS_LOW x64InstructionEmulator.cpp "source[prefix == 0x66 ? 0 : 1]" "source[0]" "" "")
+	add_bitexact_mutant(EMU_INDEX_SHIFT9 x64InstructionEmulator.cpp "static_cast<uint8_t>(controls >> 8u)" "static_cast<uint8_t>(controls >> 9u)" "" "")
+	add_bitexact_mutant(EMU_INSERT_SWAPPED x64InstructionEmulator.cpp "dest[0] = InsertBitField(dest[0], source[0], length, index);" "dest[0] = InsertBitField(source[0], dest[0], length, index);" "" "")
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})

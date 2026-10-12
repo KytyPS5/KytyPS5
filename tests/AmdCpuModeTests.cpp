@@ -72,6 +72,35 @@ int main() {
 	Check(Common::AmdCpuModeFromStored("auto", true) == AmdCpuMode::Auto, "stored auto lost to the old bool");
 	Check(Common::AmdCpuModeFromStored("garbage", std::nullopt) == AmdCpuMode::Auto, "bad stored mode is not auto");
 
+	// KYTY_AMD_PATCH: which instruction groups the patcher rewrites.
+	using namespace Common;
+	Check(ParseAmdPatchKinds("all") == AmdPatchAll, "all");
+	Check(ParseAmdPatchKinds("none") == 0u, "none");
+	Check(ParseAmdPatchKinds("sse4a") == AmdPatchSse4a, "sse4a alone");
+	Check(ParseAmdPatchKinds("rsqrt") == AmdPatchRsqrt, "rsqrt alone");
+	Check(ParseAmdPatchKinds("cpuext") == AmdPatchCpuExt, "cpuext alone");
+	Check(ParseAmdPatchKinds("sse4a,cpuext") == (AmdPatchSse4a | AmdPatchCpuExt), "list");
+	Check(!ParseAmdPatchKinds("").has_value() && !ParseAmdPatchKinds("sse4a,").has_value() &&
+	          !ParseAmdPatchKinds("sse4a,bogus").has_value() && !ParseAmdPatchKinds("ALL").has_value() &&
+	          !ParseAmdPatchKinds("auto").has_value(),
+	      "garbage accepted");
+	// Defaults: auto rewrites EXTRQ/INSERTQ only (VRSQRTPS and RDPID/CLWB are opt-in), --amd-cpu everything.
+	Check(DefaultAmdPatchKinds(AmdCpuMode::Auto) == AmdPatchSse4a, "auto default is not sse4a only");
+	Check((DefaultAmdPatchKinds(AmdCpuMode::Auto) & (AmdPatchRsqrt | AmdPatchCpuExt)) == 0u,
+	      "auto default rewrites VRSQRTPS or RDPID/CLWB");
+	Check(DefaultAmdPatchKinds(AmdCpuMode::On) == AmdPatchAll, "--amd-cpu default is not everything");
+	Check(ResolveAmdPatchKinds(nullptr, AmdCpuMode::Auto) == AmdPatchSse4a, "unset: auto default");
+	Check(ResolveAmdPatchKinds("bogus", AmdCpuMode::Auto) == AmdPatchSse4a, "bad value: auto default");
+	Check(ResolveAmdPatchKinds(nullptr, AmdCpuMode::On) == AmdPatchAll, "unset: on default");
+	Check(ResolveAmdPatchKinds("none", AmdCpuMode::Auto) == 0u && ResolveAmdPatchKinds("rsqrt", AmdCpuMode::Auto) == AmdPatchRsqrt,
+	      "env value ignored in auto");
+	Check(ResolveAmdPatchKinds("all", AmdCpuMode::Auto) == AmdPatchAll && ResolveAmdPatchKinds("sse4a", AmdCpuMode::On) == AmdPatchSse4a,
+	      "env value ignored");
+	Check(AmdPatchKindsName(AmdPatchAll) == "all" && AmdPatchKindsName(0) == "none" &&
+	          AmdPatchKindsName(AmdPatchSse4a) == "sse4a" &&
+	          AmdPatchKindsName(AmdPatchSse4a | AmdPatchRsqrt) == "sse4a,rsqrt",
+	      "kinds name");
+
 	std::puts("AmdCpuModeTests: ok");
 	return 0;
 }

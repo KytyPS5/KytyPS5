@@ -68,8 +68,10 @@ static void PrintUsage() {
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Always apply AMD CPU instruction patches.\n");
 	::printf("  --no-amd-cpu                         Never apply AMD CPU instruction patches.\n");
-	::printf("                                       Default (auto, or KYTY_AMD_CPU=auto|0|1): apply them only when the host\n");
-	::printf("                                       CPU lacks SSE4a, RDPID or CLWB (e.g. under Rosetta).\n");
+	::printf("                                       Default (auto, or KYTY_AMD_CPU=auto|0|1): "
+	         "apply them only when the host\n");
+	::printf("                                       CPU lacks SSE4a, RDPID or CLWB (e.g. under "
+	         "Rosetta).\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");

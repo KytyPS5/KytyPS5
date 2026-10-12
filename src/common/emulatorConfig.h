@@ -106,7 +106,9 @@ bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     HideCursorEnabled();
 bool     VrEnabled();
+// GetAmdPatchKinds: Common::AmdPatchKind mask, KYTY_AMD_PATCH or else the default of the mode
 Common::AmdCpuMode GetAmdCpuMode();
+uint32_t           GetAmdPatchKinds();
 bool     IsNetworkConnected();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();

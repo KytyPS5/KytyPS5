@@ -1,15 +1,18 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_COMMON_AMDCPUMODE_H_
 #define EMULATOR_INCLUDE_EMULATOR_COMMON_AMDCPUMODE_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace Common {
 
-// The guest is built for an AMD CPU. Without the patcher every SSE4a/RDPID/CLWB instruction the host lacks
-// raises SIGILL and is emulated in a signal handler (about ten thousand signals per frame on Rosetta, which
-// reports an Intel CPU without SSE4a). Auto turns the patcher on only when the host lacks one of them.
+// The guest is built for an AMD CPU. Without the patcher every SSE4a/RDPID/CLWB instruction the
+// host lacks raises SIGILL and is emulated in a signal handler (about ten thousand signals per
+// frame on Rosetta, which reports an Intel CPU without SSE4a). Auto turns the patcher on only when
+// the host lacks one of them.
 enum class AmdCpuMode { Auto, On, Off };
 
 // Instructions the AMD patcher rewrites, as reported by CPUID of the host.
@@ -36,7 +39,8 @@ inline const char* AmdCpuModeName(AmdCpuMode mode) {
 	return mode == AmdCpuMode::On ? "on" : mode == AmdCpuMode::Off ? "off" : "auto";
 }
 
-// An explicit command line flag wins over KYTY_AMD_CPU; an unset or unparsable variable leaves auto.
+// An explicit command line flag wins over KYTY_AMD_CPU; an unset or unparsable variable leaves
+// auto.
 inline AmdCpuMode ResolveAmdCpuMode(std::optional<AmdCpuMode> command_line, const char* env) {
 	if (command_line) return *command_line;
 	if (env != nullptr) {
@@ -45,10 +49,11 @@ inline AmdCpuMode ResolveAmdCpuMode(std::optional<AmdCpuMode> command_line, cons
 	return AmdCpuMode::Auto;
 }
 
-// The launcher setting. A stored amd_cpu_mode wins; the older amd_cpu_enabled bool maps true -> on, but false -> auto:
-// that default was written for every configuration whether or not the user touched the checkbox, so it is no
-// choice to honour. Neither key (or an unparsable mode) is auto.
-inline AmdCpuMode AmdCpuModeFromStored(std::optional<std::string_view> mode, std::optional<bool> legacy_enabled) {
+// The launcher setting. A stored amd_cpu_mode wins; the older amd_cpu_enabled bool maps true -> on,
+// but false -> auto: that default was written for every configuration whether or not the user
+// touched the checkbox, so it is no choice to honour. Neither key (or an unparsable mode) is auto.
+inline AmdCpuMode AmdCpuModeFromStored(std::optional<std::string_view> mode,
+                                       std::optional<bool>             legacy_enabled) {
 	if (mode) {
 		if (const auto parsed = ParseAmdCpuMode(*mode)) return *parsed;
 	}
@@ -70,6 +75,68 @@ inline AmdCpuDecision DecideAmdCpu(AmdCpuMode mode, AmdCpuHostSupport host) {
 	add(host.clwb, "CLWB");
 	if (missing.empty()) return {false, "auto: host supports SSE4a, RDPID and CLWB"};
 	return {true, "auto: host lacks " + missing};
+}
+
+// Which instruction groups the patcher rewrites once it is on (KYTY_AMD_PATCH): sse4a =
+// EXTRQ/INSERTQ, rsqrt = VRSQRTPS, cpuext = RDPID/CLWB. The automatic mode rewrites only sse4a. On
+// Rosetta the VRSQRTPS patch leaves about a thousand call sites that still trap (+550 SIGILL per
+// frame measured) and is slower than the native rsqrtps Rosetta translates, and its result is an
+// exact reciprocal square root where AMD hardware gives the approximation, so it is opt-in.
+// RDPID/CLWB are opt-in too. --amd-cpu (mode on) keeps rewriting everything.
+enum AmdPatchKind : uint32_t {
+	AmdPatchSse4a  = 1u << 0,
+	AmdPatchRsqrt  = 1u << 1,
+	AmdPatchCpuExt = 1u << 2,
+	AmdPatchAll    = AmdPatchSse4a | AmdPatchRsqrt | AmdPatchCpuExt,
+};
+
+inline uint32_t DefaultAmdPatchKinds(AmdCpuMode mode) {
+	return mode == AmdCpuMode::On ? AmdPatchAll : mode == AmdCpuMode::Auto ? AmdPatchSse4a : 0u;
+}
+
+// "all", "none", or a comma separated list of sse4a, rsqrt, cpuext; anything else (including empty,
+// "auto" and an empty list item) is not a selection.
+inline std::optional<uint32_t> ParseAmdPatchKinds(std::string_view text) {
+	if (text == "all") return AmdPatchAll;
+	if (text == "none") return 0u;
+	uint32_t kinds = 0;
+	while (true) {
+		const std::size_t      comma = text.find(',');
+		const std::string_view item  = text.substr(0, comma);
+		if (item == "sse4a")
+			kinds |= AmdPatchSse4a;
+		else if (item == "rsqrt")
+			kinds |= AmdPatchRsqrt;
+		else if (item == "cpuext")
+			kinds |= AmdPatchCpuExt;
+		else
+			return std::nullopt;
+		if (comma == std::string_view::npos) return kinds;
+		text.remove_prefix(comma + 1);
+	}
+}
+
+// An unset or unparsable variable keeps the default set of the mode.
+inline uint32_t ResolveAmdPatchKinds(const char* env, AmdCpuMode mode) {
+	if (env != nullptr) {
+		if (const auto kinds = ParseAmdPatchKinds(env)) return *kinds;
+	}
+	return DefaultAmdPatchKinds(mode);
+}
+
+inline std::string AmdPatchKindsName(uint32_t kinds) {
+	if (kinds == AmdPatchAll) return "all";
+	if (kinds == 0) return "none";
+	std::string name;
+	const auto  add = [&](uint32_t bit, const char* text) {
+		if ((kinds & bit) == 0) return;
+		if (!name.empty()) name += ",";
+		name += text;
+	};
+	add(AmdPatchSse4a, "sse4a");
+	add(AmdPatchRsqrt, "rsqrt");
+	add(AmdPatchCpuExt, "cpuext");
+	return name;
 }
 
 } // namespace Common

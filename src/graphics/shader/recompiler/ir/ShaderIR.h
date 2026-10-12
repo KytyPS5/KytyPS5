@@ -479,10 +479,22 @@ constexpr uint32_t NativeDescriptorSetCount = 2;
 // by `DescriptorBindingKind::Count`, so the index *is* the stage, and both directions read the same
 // constant. That is what keeps the SPIR-V's DescriptorSet decoration and the host's descriptor
 // writes in step - they are not two intentions that must agree, they are one function asked twice.
-// ShaderIRDescriptorSetTests locks that down in both directions.
+// The static_assert below locks that down for every stage.
 [[nodiscard]] constexpr uint32_t NativeDescriptorSetForBinding(uint32_t native_binding) {
-	return native_binding >= static_cast<uint32_t>(DescriptorBindingKind::Count) ? 1u : 0u;
+	return native_binding / static_cast<uint32_t>(DescriptorBindingKind::Count) == 1u ? 1u : 0u;
 }
+
+[[nodiscard]] constexpr bool NativeDescriptorSetAgrees(ShaderType stage) {
+	constexpr auto last = static_cast<DescriptorBindingKind>(
+	    static_cast<uint32_t>(DescriptorBindingKind::Count) - 1u);
+	return NativeDescriptorSetForBinding(NativeBinding(stage, DescriptorBindingKind {})) ==
+	           NativeDescriptorSet(stage) &&
+	       NativeDescriptorSetForBinding(NativeBinding(stage, last)) == NativeDescriptorSet(stage);
+}
+static_assert(NativeDescriptorSetAgrees(ShaderType::Vertex) &&
+              NativeDescriptorSetAgrees(ShaderType::Pixel) &&
+              NativeDescriptorSetAgrees(ShaderType::TessellationControl) &&
+              NativeDescriptorSetAgrees(ShaderType::TessellationEvaluation));
 
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);

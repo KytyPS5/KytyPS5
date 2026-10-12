@@ -888,7 +888,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, local_hash, params[1].code,
+	                                              control_hash, tess);
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}

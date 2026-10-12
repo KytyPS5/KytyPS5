@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -977,6 +978,22 @@ public:
 		if (!frame) {
 			return false;
 		}
+		// Skip frames that are already late to stay in sync (KYTY_AVPLAYER_DROP_LATE=0: off).
+		static const bool drop_late = [] {
+			const auto* v = std::getenv("KYTY_AVPLAYER_DROP_LATE");
+			return v == nullptr || v[0] == '\0' || std::strcmp(v, "0") != 0;
+		}();
+		if (drop_late && !deliver_seek_frame && sync_mode == 0) {
+			while (auto next = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+				const auto now = CurrentTimeNoLock();
+				return now != 0 && candidate.info.time_stamp + candidate.timestamp_offset <= now;
+			})) {
+				if (frame->buffer) {
+					video_buffers.Push(std::move(frame->buffer));
+				}
+				frame = std::move(next);
+			}
+		}
 		if (current_video) {
 			video_buffers.Push(std::move(current_video->buffer));
 		}
@@ -1129,8 +1146,19 @@ private:
 		if (c == nullptr) {
 			return false;
 		}
-		if (avcodec_parameters_to_context(c, s->codecpar) < 0 ||
-		    avcodec_open2(c, dec, nullptr) < 0) {
+		const bool params_ok = avcodec_parameters_to_context(c, s->codecpar) >= 0;
+		// Decode video on all CPU threads (KYTY_AVPLAYER_THREADS=1: the old single thread).
+		if (params_ok && s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			static const int threads = [] {
+				const auto* v = std::getenv("KYTY_AVPLAYER_THREADS");
+				return v != nullptr && v[0] != '\0' ? std::max(0, std::atoi(v)) : 0;
+			}();
+			if (threads != 1) {
+				c->thread_count = threads; // 0: FFmpeg picks one thread per logical CPU
+				c->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+			}
+		}
+		if (!params_ok || avcodec_open2(c, dec, nullptr) < 0) {
 			avcodec_free_context(&c);
 			return false;
 		}

@@ -453,6 +453,16 @@ int RunGpu(const Shaders& shaders) {
 	rp_info.pAttachments    = &color;
 	rp_info.subpassCount    = 1;
 	rp_info.pSubpasses      = &subpass;
+	// the attachment writes and the final layout transition happen before the copy reads the image
+	VkSubpassDependency to_copy_dependency {};
+	to_copy_dependency.srcSubpass    = 0;
+	to_copy_dependency.dstSubpass    = VK_SUBPASS_EXTERNAL;
+	to_copy_dependency.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	to_copy_dependency.dstStageMask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	to_copy_dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	to_copy_dependency.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	rp_info.dependencyCount = 1;
+	rp_info.pDependencies   = &to_copy_dependency;
 	VkRenderPass render_pass = VK_NULL_HANDLE;
 	CheckVk(vkCreateRenderPass_(gpu.device, &rp_info, nullptr, &render_pass), "render pass");
 	VkImageCreateInfo image_info {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -539,6 +549,7 @@ int RunGpu(const Shaders& shaders) {
 	CheckVk(vkCreateGraphicsPipelines_(gpu.device, VK_NULL_HANDLE, 1, &gi, nullptr, &pipeline), "graphics pipeline");
 
 	VkCommandPoolCreateInfo cp_info {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+	cp_info.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; // the loop re-records one buffer
 	cp_info.queueFamilyIndex = gpu.family;
 	VkCommandPool pool = VK_NULL_HANDLE;
 	CheckVk(vkCreateCommandPool_(gpu.device, &cp_info, nullptr, &pool), "command pool");
@@ -665,6 +676,12 @@ int RunGpu(const Shaders& shaders) {
 		copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 		copy.imageExtent      = {kDim, kDim, 1};
 		vkCmdCopyImageToBuffer_(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &copy);
+		// the copy and the vertex shader stores (the cap buffer) are read on the host after the wait
+		VkMemoryBarrier to_host {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+		to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		vkCmdPipelineBarrier_(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+		                      &to_host, 0, nullptr, 0, nullptr);
 		CheckVk(vkEndCommandBuffer_(cmd), "end");
 		VkSubmitInfo submit {VK_STRUCTURE_TYPE_SUBMIT_INFO};
 		submit.commandBufferCount = 1;

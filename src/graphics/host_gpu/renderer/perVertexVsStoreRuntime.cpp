@@ -179,6 +179,22 @@ const PvVsStorePrograms* GetPvVsStorePrograms(GraphicContext&                   
 	return &s_pairs.emplace(key, std::move(value)).first->second;
 }
 
+void ShutdownPvVsStore(vk::Device device) {
+	std::lock_guard lock(s_mutex);
+	for (auto& [key, value]: s_pairs) {
+		// Only an accepted pair owns modules (CompileSPV); the rest of `graphics` is borrowed.
+		if (value.verdict != PvVsStoreInterfaceVerdict::Use) continue;
+		if (value.graphics.vertex[0].module != nullptr)
+			device.destroyShaderModule(value.graphics.vertex[0].module, nullptr);
+		if (value.graphics.pixel.module != nullptr)
+			device.destroyShaderModule(value.graphics.pixel.module, nullptr);
+	}
+	s_pairs.clear();
+	s_shaders.clear();
+	if (s_set_layout != nullptr) device.destroyDescriptorSetLayout(s_set_layout, nullptr);
+	s_set_layout = nullptr;
+}
+
 PvVsStoreRuntime::PvVsStoreRuntime(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics), m_scheduler(scheduler), m_slabs(kSlabVec4s, kMaxSlabs) {}
 

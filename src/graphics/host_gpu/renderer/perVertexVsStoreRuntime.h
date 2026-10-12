@@ -51,6 +51,11 @@ const PvVsStorePrograms* GetPvVsStorePrograms(GraphicContext&                   
 // (PS).
 vk::DescriptorSetLayout PvVsStoreSetLayout(GraphicContext& graphics);
 
+// Destroys the VS-store shader modules and the set layout and forgets the shaders and pairs. Call
+// with the device idle and the render context (pipelines, pipeline layouts) already gone, before
+// the device is destroyed.
+void ShutdownPvVsStore(vk::Device device);
+
 // Push constant offset of the VS-store block (it follows the native push data).
 uint32_t PvVsStorePushOffset();
 

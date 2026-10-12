@@ -76,6 +76,16 @@ or graphical glitches, so please include the version you tested when reporting a
       <img src="docs/screenshots/ps5-06.jpg" width="300" alt="UFC 6 running in KytyPS5">
     </td>
   </tr>
+  <tr>
+    <td align="center">
+      <strong>Crash Bandicoot 4: It's About Time</strong><br>
+      <img src="docs/screenshots/ps5-07.jpg" width="300" alt="Crash Bandicoot 4: It's About Time running in KytyPS5">
+    </td>
+    <td align="center">
+      <strong>Contra: Operation Galuga</strong><br>
+      <img src="docs/screenshots/ps5-08.jpg" width="300" alt="Contra: Operation Galuga running in KytyPS5">
+    </td>
+  </tr>
 </table>
 
 <p align="center"><em>And many more...</em></p>

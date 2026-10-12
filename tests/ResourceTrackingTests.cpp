@@ -310,8 +310,13 @@ void TestInvariantIndirectImageMaterialization() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // A null root, then the two candidates in a run padded to four slots.
+  const auto null_image = [](const DescriptorValue &image) {
+    return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+  };
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
+            snapshot.images.size() == 5u && null_image(snapshot.images[3]) &&
+            null_image(snapshot.images[4]) && memory.watched_reads == 1u &&
             memory.watched_dwords == 36u && memory.reads == 1u,
         "image table was not read once independently of its GPU selector chain");
   const auto root = specialization.images[0];
@@ -333,15 +338,38 @@ void TestInvariantIndirectImageMaterialization() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images[2].dwords[0] == descriptor[0] + 7u,
         "changed table descriptor was not refreshed");
+  // A read-only table that selects fewer descriptors, or none, keeps its layout: the compiled
+  // shader must not follow the table's contents.
+  const auto stable_specialization = specialization;
+  std::fill_n(memory.words.begin() + (0x1000u + 112u) / 4u, 8u, 0u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization == stable_specialization,
+        "a table with fewer candidates changed shader specialization");
+  std::fill_n(memory.words.begin() + (0x1000u + 16u) / 4u, 8u, 0u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization == stable_specialization &&
+            std::ranges::all_of(snapshot.images, [](const DescriptorValue &image) {
+              return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+            }),
+        "a table that selects nothing changed shader specialization or kept a descriptor");
+  put(16u, 0u);
+  put(112u, 7u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization == stable_specialization &&
+            snapshot.images[2].dwords[0] == descriptor[0] + 7u,
+        "a refilled table changed shader specialization");
   // Scalar reads align each DWORD and return zero beyond the V# byte size.
   data[5] = 0u;
   data[6] = 19u;
   std::fill(memory.words.begin() + 0x1000u / 4u, memory.words.end(), 0u);
   put(0u, 0u);
   memory.fail_address = 0x2010u;
+  // A bounded table is laid out stably: it keeps the previous dispatch's capacity, padded with
+  // null entries.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.watched_dwords == 4u && snapshot.images.size() == 2u &&
-            snapshot.images[1].dwords == descriptor,
+            memory.watched_dwords == 4u && snapshot.images.size() >= 2u &&
+            snapshot.images[1].dwords == descriptor &&
+            std::all_of(snapshot.images.begin() + 2, snapshot.images.end(), null_image),
         "partial descriptor prefix did not zero its out-of-bounds DWORDs");
   memory.fail_address = 0x2008u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -349,10 +377,9 @@ void TestInvariantIndirectImageMaterialization() {
   memory.fail_address = UINT64_MAX;
   for (uint32_t size : {0u, 3u, 4u}) {
     data[6] = size;
+    // Every slot, including the padding a stable layout keeps, is null.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1u &&
-              specialization.images[0].indirect_root == ImageResource::NoIndirectImage &&
-              std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
+              std::ranges::all_of(snapshot.images, null_image),
           "empty image table did not specialize as a safe null image");
   }
   // The GPU computes these offsets; host materialization must not enumerate the key.
@@ -407,8 +434,13 @@ void TestBoundedImageViewEligibility() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The stable layout pads the three compatible views to four slots; the padding is null.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 4u && memory.reads == 1u,
+            snapshot.images.size() >= 4u && memory.reads == 1u &&
+            std::all_of(snapshot.images.begin() + 4, snapshot.images.end(),
+                        [](const DescriptorValue &image) {
+                          return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+                        }),
         "unrelated cube/3D heap entries prevented a typed 2D table view");
   const auto mapping = specialization.images[0].indirect_mapping_offset;
   Check(snapshot.flattened_srt[mapping] == 53u &&
@@ -561,7 +593,7 @@ void TestWaterfallImageTable() {
 void TestGuardedDirectImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Guard { Nonzero, SccNonZero, Plain, Zero, Unrelated, Bypass, ExecZero, VccZero };
-  const auto make_plan = [](Guard guard) {
+  const auto make_plan = [](Guard guard, bool guarded = true) {
     Fixture fixture(ShaderType::Pixel);
     fixture.program.wave_size = 64u;
     auto *entry = fixture.block;
@@ -647,6 +679,13 @@ void TestGuardedDirectImageTable() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    if (!guarded) {
+      // Without a dominating nonzero guard the selector range is not proven, so the key can only
+      // be one the GPU computes, enumerated at dispatch.
+      Check(indirect && !indirect->selector_value.IsEmpty(),
+            "direct table accepted a selector without a dominating nonzero guard");
+      return ExtractResourcePlan(fixture.program);
+    }
     Check(indirect && !indirect->selector.has_value() &&
               indirect->table_offset == 344u &&
               indirect->key_count.Resolve().IsImmediate() &&
@@ -661,8 +700,7 @@ void TestGuardedDirectImageTable() {
   make_plan(Guard::Plain);
   for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass,
                            Guard::ExecZero, Guard::VccZero}) {
-    CheckFatal([&] { make_plan(guard); }, "not a valid runtime value",
-               "direct table accepted a selector without a dominating nonzero guard");
+    make_plan(guard, false);
   }
   LinearTestMemory memory;
   constexpr uint64_t table = 0x1800u + 344u;
@@ -736,6 +774,30 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             endpoint.watched_reads == 0u,
         "batched descriptor read crossed the 48-bit endpoint");
+
+  // A key the GPU computes over-approximates the table's candidates; an entry of another
+  // dimension than the sample's is never the one the GPU samples.
+  const auto enumerated = make_plan(Guard::Zero, false);
+  LinearTestMemory mixed;
+  mixed.words[0] = 0x1800u;
+  fill_table(mixed, table);
+  const auto cube_word = (table - mixed.base) / 4u + 3u * 8u;
+  mixed.words[cube_word + 3u] = (mixed.words[cube_word + 3u] & 0x0fffffffu) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube) << 28u);
+  std::array<uint32_t, 2> pointer{0x1000u, 0u};
+  SrtRuntime mixed_runtime{.user_data = pointer, .read_memory = ReadLinearTestMemory,
+                           .userdata = &mixed, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot mixed_snapshot;
+  ResourceSpecialization mixed_specialization;
+  const auto identity = [](uint32_t value) {
+    return [value](const DescriptorValue &image) { return image.dwords[0] == value; };
+  };
+  Check(MaterializeResources(enumerated, mixed_runtime, mixed_snapshot, mixed_specialization) &&
+            std::ranges::none_of(mixed_snapshot.images, identity(0x103u)) &&
+            std::ranges::any_of(mixed_snapshot.images, identity(0x104u)) &&
+            std::ranges::none_of(mixed_specialization.images,
+                                 [](const auto &image) { return image.cube; }),
+        "a GPU-keyed 2D image table kept a cube-map candidate");
 }
 
 void TestBoundedComputeImageLoop() {
@@ -748,7 +810,7 @@ void TestBoundedComputeImageLoop() {
     Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite,
     GuardedDiamond, GuardedDiamondBypass
   };
-  const auto make_plan = [](Variant variant) {
+  const auto make_plan = [](Variant variant, bool *enumerated = nullptr) {
     const bool diamond = variant >= Variant::GuardedDiamond;
     Fixture fixture(diamond ? ShaderType::Vertex : ShaderType::Compute);
     fixture.program.wave_size = 64u;
@@ -995,6 +1057,10 @@ void TestBoundedComputeImageLoop() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    if (enumerated != nullptr) {
+      *enumerated = indirect && !indirect->selector_value.IsEmpty();
+      return ExtractResourcePlan(fixture.program);
+    }
     Check(indirect && !indirect->selector.has_value() &&
               indirect->table_offset == 0x6b0u &&
               indirect->key_count.Resolve() == count.Resolve(),
@@ -1002,6 +1068,20 @@ void TestBoundedComputeImageLoop() {
     return ExtractResourcePlan(fixture.program);
   };
 
+  // Without a proven bound the loop's count is not accepted: the key is rejected, or planned as
+  // one the GPU computes and enumerated at dispatch.
+  const auto check_unbounded = [&](Variant variant, const char *message) {
+    bool enumerated = false;
+    try {
+      make_plan(variant, &enumerated);
+    } catch (const std::runtime_error &error) {
+      Check(std::string_view(error.what()).find("not a valid runtime value") !=
+                std::string_view::npos,
+            message);
+      return;
+    }
+    Check(enumerated, message);
+  };
   auto plan = make_plan(Variant::Bounded);
   make_plan(Variant::Plain);
   make_plan(Variant::Nonzero);
@@ -1016,28 +1096,16 @@ void TestBoundedComputeImageLoop() {
                              Variant::MaskedWrongGuard,
                              Variant::MaskResurrection, Variant::StatusOverwrite,
                              Variant::GuardedDiamondBypass}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "compute image loop allowed an unbounded induction or mask resurrection");
+    check_unbounded(variant, "compute image loop allowed an unbounded induction or mask resurrection");
   }
-  CheckFatal([&] { make_plan(Variant::WrongGuard); },
-             "not a valid runtime value",
-             "compute image loop accepted an unrelated guard");
-  CheckFatal([&] { make_plan(Variant::EntryBypass); },
-             "not a valid runtime value",
-             "compute image loop accepted an entry bypass");
-  CheckFatal([&] { make_plan(Variant::ExitBypass); },
-             "not a valid runtime value",
-             "compute image loop accepted an exit bypass");
-  CheckFatal([&] { make_plan(Variant::GuardBlock); },
-             "not a valid runtime value",
-             "compute image loop accepted a descriptor read before the guard");
-  CheckFatal([&] { make_plan(Variant::WrongStep); },
-             "not a valid runtime value",
-             "compute image loop accepted a two-step induction");
+  check_unbounded(Variant::WrongGuard, "compute image loop accepted an unrelated guard");
+  check_unbounded(Variant::EntryBypass, "compute image loop accepted an entry bypass");
+  check_unbounded(Variant::ExitBypass, "compute image loop accepted an exit bypass");
+  check_unbounded(Variant::GuardBlock, "compute image loop accepted a descriptor read before the guard");
+  check_unbounded(Variant::WrongStep, "compute image loop accepted a two-step induction");
   for (const auto variant : {Variant::DivergentBound, Variant::DivergentKey,
                              Variant::Disjunction, Variant::WrongPolarity}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "compute image loop accepted a guard without a uniform bound");
+    check_unbounded(variant, "compute image loop accepted a guard without a uniform bound");
   }
 
   LinearTestMemory memory;
@@ -1091,7 +1159,7 @@ void TestUniformizedMaterialImageKeys() {
     AndNot, Subset, FirstLane, FirstLaneDirect, FirstLaneAndNot, EmptyFirstEntry, WrongFirstBackedge,
     WideningFirstEntry, WideningFirstBackedge, WrongFirstLoadMask
   };
-  const auto make_plan = [](Variant variant) {
+  const auto make_plan = [](Variant variant, bool *enumerated = nullptr) {
     Fixture fixture;
     fixture.program.wave_size = 64u;
     const bool first_lane = variant >= Variant::FirstLane;
@@ -1371,6 +1439,10 @@ void TestUniformizedMaterialImageKeys() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    if (enumerated != nullptr) {
+      *enumerated = indirect && !indirect->selector_value.IsEmpty();
+      return ExtractResourcePlan(fixture.program);
+    }
     Check(indirect && indirect->selector->stride == 0x90u &&
               indirect->selector->offset == 0xc00u &&
               indirect->table_offset == 0x20e0u &&
@@ -1379,6 +1451,20 @@ void TestUniformizedMaterialImageKeys() {
               indirect->key_count.Resolve().U32() == 32u,
           "uniformized image key lost its finite material range");
     return ExtractResourcePlan(fixture.program);
+  };
+  // An unproven material key is rejected, or planned as one the GPU computes and enumerated at
+  // dispatch; it never keeps the finite material range.
+  const auto check_unproven = [&](Variant variant, const char *message) {
+    bool enumerated = false;
+    try {
+      make_plan(variant, &enumerated);
+    } catch (const std::runtime_error &error) {
+      Check(std::string_view(error.what()).find("not a valid runtime value") !=
+                std::string_view::npos,
+            message);
+      return;
+    }
+    Check(enumerated, message);
   };
   auto plan = make_plan(Variant::Valid);
   make_plan(Variant::Plain);
@@ -1446,21 +1532,16 @@ void TestUniformizedMaterialImageKeys() {
                 std::pair<uint64_t, uint64_t>{first_table, 32}) !=
                 snapshot.specialization_reads.end(),
         "image descriptor read was omitted from the renderer write-overlap check");
-  CheckFatal([&] { make_plan(Variant::WrongUpdate); }, "not a valid runtime value",
-             "non-clearing material mask was accepted");
-  CheckFatal([&] { make_plan(Variant::WrongEquality); }, "not a valid runtime value",
-             "unrelated ReadLane key was accepted");
-  CheckFatal([&] { make_plan(Variant::WrongExit); }, "not a valid runtime value",
-             "one inactive lane bypassed material index initialization for active lanes");
+  check_unproven(Variant::WrongUpdate, "non-clearing material mask was accepted");
+  check_unproven(Variant::WrongEquality, "unrelated ReadLane key was accepted");
+  check_unproven(Variant::WrongExit, "one inactive lane bypassed material index initialization for active lanes");
   for (const auto variant : {Variant::WrongCarry, Variant::WrongBackedge}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "inactive material lane did not preserve its selected index across iterations");
+    check_unproven(variant, "inactive material lane did not preserve its selected index across iterations");
   }
   for (const auto variant : {Variant::EmptyFirstEntry, Variant::WrongFirstBackedge,
                             Variant::WideningFirstEntry, Variant::WideningFirstBackedge,
                             Variant::WrongFirstLoadMask}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "first-lane material key escaped its active load mask");
+    check_unproven(variant, "first-lane material key escaped its active load mask");
   }
 }
 
@@ -1729,6 +1810,94 @@ void TestComputeBufferFill() {
   Run({.shifted = true, .clean = true});
   Run({.extra_store = true, .clean = true});
   Run({.clean = true, .branch = true});
+}
+
+// A captured CMASK fast clear: a 64-bit memset bounded by a user-data element count, with the
+// store inside the compiler's EXEC skip.
+void TestCountedComputeBufferFill() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Accepted, InvertedSkip, ScalarBranch, UnboundIndex };
+  const auto Run = [](Variant variant) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *body = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(exit);
+    body->AddBranch(exit);
+    const auto buffer =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    const auto low = fixture.UserData(4);
+    const auto high = fixture.UserData(5);
+    const auto count = fixture.UserData(6);
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto group = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto index = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {group, Value(6u)}),
+         local});
+    const auto guard = fixture.Emit(
+        ValueOpcode::UGreaterThan32,
+        {count, variant == Variant::UnboundIndex ? local : index});
+    Value condition;
+    if (variant == Variant::ScalarBranch) {
+      condition = fixture.Emit(
+          ValueOpcode::ConditionRef,
+          {fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(7), Value(0u)})},
+          CFG::BranchCondition::ScalarInstruction);
+    } else {
+      // !(all lanes fail the guard): the true edge enters the store.
+      condition = fixture.Emit(
+          ValueOpcode::ConditionRef,
+          {fixture.Emit(ValueOpcode::LogicalNot, {guard})},
+          CFG::BranchCondition::ExecZero);
+      if (variant != Variant::InvertedSkip)
+        condition = fixture.Emit(ValueOpcode::LogicalNot, {condition});
+    }
+    entry->condition = condition;
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body,
+                         .false_block = exit};
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    store.formatted = true;
+    store.idxen = true;
+    store.data_dwords = 2;
+    fixture.Emit(ValueOpcode::StoreBufferU32x2,
+                 {buffer, index, Value(0u), Value(0u),
+                  fixture.Emit(ValueOpcode::CompositeConstructU32x2, {low, high},
+                               0, body),
+                  guard},
+                 fixture.AddMemory(store, 16), body);
+    fixture.PlanAndTrack();
+    const auto plan = ExtractResourcePlan(fixture.program);
+    std::array<uint32_t, 7> userdata{0x200000u, 8u << 16, 0x4000u, 0x14204u, 0u, 0u, 8192u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
+          "counted fill fixture did not materialize");
+    const auto &fill = snapshot.uniform_fill;
+    if (variant != Variant::Accepted) {
+      Check(fill.kind == UniformFillKind::None,
+            "a fill whose store a branch or bound can skip was accepted");
+      return;
+    }
+    Check(fill.kind == UniformFillKind::Buffer && fill.words == 2 &&
+              fill.group_stride[0] == 64 && fill.value == 0u && fill.count == 8192u,
+          "counted memset lost its value, element count or address coverage");
+  };
+  Run(Variant::Accepted);
+  Run(Variant::InvertedSkip);
+  Run(Variant::ScalarBranch);
+  Run(Variant::UnboundIndex);
 }
 
 void TestDenseBufferTracking() {
@@ -3714,6 +3883,7 @@ int main() {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
+    Run("counted compute buffer fill", TestCountedComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);

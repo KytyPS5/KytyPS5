@@ -24,7 +24,9 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <limits>
+#include <memory>
 
 namespace Libs::Graphics {
 
@@ -312,7 +314,26 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	// As for color targets: the description depends only on the depth registers, and the image
+	// the texture cache found stays valid while its lookup generation is unchanged.
+	struct Remembered {
+		bool                    valid = false;
+		HW::DepthRenderTarget   registers;
+		TextureCache::ImageDesc desc;
+		uint64_t                lookup_generation = 0;
+		ImageId                 image;
+		uint32_t                base_level = 0;
+		uint32_t                base_layer = 0;
+	};
+	static thread_local auto remembered = std::make_unique<std::array<Remembered, 8>>();
+	auto&                    memo       = (*remembered)[(z.z_read_base_addr >> 16u) % 8u];
+	if (!memo.valid || std::memcmp(&memo.registers, &z, sizeof(z)) != 0) {
+		memo.valid = true;
+		std::memcpy(&memo.registers, &z, sizeof(z));
+		memo.desc              = MakeDepthTargetDesc(buffer, z);
+		memo.lookup_generation = 0;
+	}
+	r.desc                    = memo.desc;
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
@@ -351,7 +372,17 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 	}
 	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	if (memo.lookup_generation == cache.LookupGeneration()) {
+		r.desc.view_info.base_level = memo.base_level;
+		r.desc.view_info.base_layer = memo.base_layer;
+		r.image_id = cache.ReuseImage(memo.image, r.desc, memo.desc.view_info.base_layer);
+	} else {
+		r.image_id             = cache.FindImage(r.desc);
+		memo.lookup_generation = cache.LookupGeneration();
+		memo.image             = r.image_id;
+		memo.base_level        = r.desc.view_info.base_level;
+		memo.base_layer        = r.desc.view_info.base_layer;
+	}
 	BindRenderTarget(r.image_id);
 }
 

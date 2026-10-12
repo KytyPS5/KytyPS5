@@ -146,6 +146,8 @@ public:
 	}
 
 	TrackingSpinLock lock;
+	// Whether the region is in the tracker's queue of regions with new CPU-modified pages.
+	std::atomic<bool> queued {false};
 
 private:
 	template <bool track, bool is_read>

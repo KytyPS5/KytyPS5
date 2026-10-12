@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Xbyak {
@@ -155,6 +156,9 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// A candidate of a descriptor table the host reads speculatively: the GPU may never select
+	// it, so binding it must not fail or reshape cached images.
+	bool                          speculative                = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -518,6 +522,18 @@ struct DescriptorSource {
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;
+		// A bounded key computed on the GPU. The host enumerates its possible values from the
+		// guest memory it reads; table entries at those keys are the candidates.
+		Value    selector_value;
+		// Loop counters selector_value depends on, with the half-open range their guards prove.
+		struct InductionRange {
+			Value counter;
+			Value begin;
+			Value end;
+
+			bool operator==(const InductionRange& other) const = default;
+		};
+		std::vector<InductionRange> selector_ranges;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectDescriptor& other) const = default;
@@ -562,7 +578,36 @@ struct CompiledShaderInfo {
 struct UniformFillPlan {
 	UniformFill          fill;
 	std::array<Value, 4> values;
+	Value                count; // Empty unless the store is guarded by index < count.
 };
+
+// A compute shader whose only effect is copying buffer elements: each store writes, at the global
+// invocation index, the element a load of the same form read from another buffer at that index,
+// for lanes below a uniform count. The copies may sit in one uniform counted loop.
+struct UniformCopyPlan {
+	// A buffer descriptor: four DWORD values, or a tracked descriptor source. An enumerated table
+	// source is read at `key`.
+	struct Descriptor {
+		std::array<Value, 4> dwords {};
+		uint32_t             source = UINT32_MAX;
+		Value                key;
+	};
+	struct Copy {
+		Descriptor source;
+		Descriptor destination;
+		Value      count;
+		uint32_t   words     = 1;
+		bool       formatted = false;
+	};
+	std::vector<Copy> copies;
+	// The loop counter, bound to each value in [begin, end); empty without a loop.
+	Value    counter;
+	uint32_t begin        = 0;
+	Value    end;
+	uint32_t group_stride = 0;
+};
+
+struct SrtTape; // A plan's flat SRT refresh compiled for straight-line evaluation (SrtWalker.cpp).
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -596,11 +641,15 @@ struct ResourcePlan {
 	std::vector<SrtRead>                srt_reads;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
+	// Low/high dwords of DMA (device address) bases the host can evaluate. A DMA read of memory
+	// without a cached buffer returns zero, so the renderer backs these bases before dispatch.
+	std::vector<std::array<Value, 2>>   address_bases;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	UniformCopyPlan                     uniform_copy;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
@@ -610,6 +659,12 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// Built on the first refresh; null when the plan needs the walker.
+	mutable std::shared_ptr<const SrtTape>  srt_tape;
+	mutable bool                            srt_tape_built = false;
+	mutable std::vector<uint64_t>           srt_tape_values;
+	// ResolveInvariantPhi of each phi the walkers evaluated.
+	mutable std::unordered_map<const Inst*, Value> invariant_phis;
 };
 
 struct Program: ResourcePlan {

@@ -42,8 +42,10 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
+		// The word is in guest memory layout, which a transformed host format does not share.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
+		       desc.info.GetColorTransform() == ColorTransform::None &&
 		       DecodePackedColorClear(format, metadata.clear_word, clear);
 	}
 	if (cmask) {
@@ -119,8 +121,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache),
-      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+      m_buffer_cache(buffer_cache), m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+      m_lookup_memo(std::make_unique<std::array<LookupMemo, 512>>()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -179,6 +181,12 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	return true;
 }
 
+// Image lookups read a cached image's metadata only for its kind and range; its clear state is
+// rewritten by every lookup and does not change which image is found.
+static bool SameLookupMetadata(const ImageMetadataInfo& left, const ImageMetadataInfo& right) {
+	return left.kind == right.kind && left.range == right.range;
+}
+
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	if (image.info.IsDepth()) {
 		if (image.info.tile_mode == Prospero::TileMode::kDepth ||
@@ -204,6 +212,38 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+void TextureCache::ImageRegionCounts::Add(GuestRange range, int32_t delta) {
+	constexpr uint64_t ChunkMask = (uint64_t {1} << ChunkBits) - 1u;
+	for (auto region = range.address >> RegionBits; region <= (range.End() - 1u) >> RegionBits;
+	     region++) {
+		if ((region >> ChunkBits) >= m_chunks.size()) {
+			EXIT("TextureCache: image outside the tracked address space\n");
+		}
+		auto& slot  = m_chunks[region >> ChunkBits];
+		auto* chunk = slot.load(std::memory_order_relaxed);
+		if (chunk == nullptr) {
+			m_storage.push_back(std::make_unique<Chunk[]>(ChunkMask + 1u));
+			chunk = m_storage.back().get();
+			slot.store(chunk, std::memory_order_release);
+		}
+		chunk[region & ChunkMask].fetch_add(static_cast<uint32_t>(delta));
+	}
+}
+
+bool TextureCache::ImageRegionCounts::MayHoldImage(uint64_t address, uint64_t size) const {
+	constexpr uint64_t ChunkMask = (uint64_t {1} << ChunkBits) - 1u;
+	for (auto region = address >> RegionBits; region <= (address + size - 1u) >> RegionBits;
+	     region++) {
+		const auto* chunk = (region >> ChunkBits) < m_chunks.size()
+		                        ? m_chunks[region >> ChunkBits].load(std::memory_order_acquire)
+		                        : nullptr;
+		if (chunk != nullptr && chunk[region & ChunkMask].load() != 0u) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -216,6 +256,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_image_regions.Add(image.info.data, 1);
+	ChangeStructure();
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -237,6 +279,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_image_regions.Add(image.info.data, -1);
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -244,6 +287,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	ChangeStructure();
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -458,14 +502,15 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
-	const auto format = desc.info.pixel_format;
-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
+	// One per format and image type: a 1D or 3D view needs an image of its own type.
+	const auto key = std::pair {desc.info.pixel_format, desc.info.type};
+	if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = desc.info.type;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
@@ -474,7 +519,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
+	m_null_images.emplace(key, id);
 	return id;
 }
 
@@ -1068,7 +1113,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
-		auto& image         = m_slot_images[id];
+		auto&            image = m_slot_images[id];
+		if (!SameLookupMetadata(image.info.metadata, desc.info.metadata)) {
+			ChangeStructure();
+		}
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
@@ -1208,9 +1256,75 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
+		ChangeStructure();
 	}
 
 	return association;
+}
+
+// Every bound texture and target of every draw is looked up again. A lookup depends only on its
+// description and on the cache's images.
+TextureCache::LookupMemo& TextureCache::LookupSlot(const ImageDesc& desc, bool exact_format,
+                                                   bool speculative) {
+	const auto& info = desc.info;
+	uint64_t hash = info.data.address ^ (info.data.size << 20u) ^
+	                (uint64_t {static_cast<uint32_t>(info.pixel_format)} << 40u) ^
+	                (uint64_t {info.extent.width} << 8u) ^ (uint64_t {info.extent.height} << 28u) ^
+	                (uint64_t {desc.view_info.base_level} << 52u) ^
+	                (uint64_t {desc.view_info.base_layer} << 56u) ^
+	                (uint64_t {static_cast<uint8_t>(desc.type)} << 61u) ^
+	                (uint64_t {exact_format} << 62u) ^ (uint64_t {speculative} << 63u);
+	hash *= 0x9e3779b97f4a7c15ull;
+	return (*m_lookup_memo)[(hash >> 32u) % m_lookup_memo->size()];
+}
+
+bool TextureCache::LookupMatches(const LookupMemo& memo, const ImageDesc& desc, bool exact_format,
+                                 bool speculative) const {
+	// Bitwise: an equal description in other padding only misses.
+	return memo.generation == m_structure_generation && memo.type == desc.type &&
+	       memo.exact_format == exact_format && memo.speculative == speculative &&
+	       std::memcmp(&memo.info, &desc.info, sizeof(ImageInfo)) == 0 &&
+	       std::memcmp(&memo.view, &desc.view_info, sizeof(ImageViewInfo)) == 0;
+}
+
+void TextureCache::StoreLookup(LookupMemo& memo, const ImageDesc& desc, const ImageViewInfo& view,
+                               bool exact_format, bool speculative, ImageId result,
+                               int32_t view_mip, int32_t view_layer) {
+	std::memcpy(&memo.info, &desc.info, sizeof(ImageInfo));
+	std::memcpy(&memo.view, &view, sizeof(ImageViewInfo));
+	memo.generation   = m_structure_generation;
+	memo.type         = desc.type;
+	memo.exact_format = exact_format;
+	memo.speculative  = speculative;
+	memo.result       = result;
+	memo.view_mip     = view_mip;
+	memo.view_layer   = view_layer;
+}
+
+ImageId TextureCache::FindSpeculativeImage(ImageDesc& desc, bool exact_format) {
+	if (!desc.info.data.Empty()) {
+		std::scoped_lock lock {m_lock};
+		auto&            memo       = LookupSlot(desc, exact_format, true);
+		bool             overlapped = false;
+		if (LookupMatches(memo, desc, exact_format, true)) {
+			overlapped = memo.view_mip != 0;
+		} else {
+			for (const auto id:
+			     FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
+				if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) {
+					overlapped = false;
+					break;
+				}
+				overlapped = true;
+			}
+			// Remembers only whether a differently shaped image overlaps.
+			StoreLookup(memo, desc, desc.view_info, exact_format, true, {}, overlapped ? 1 : 0, -1);
+		}
+		if (overlapped) {
+			return {};
+		}
+	}
+	return FindImage(desc, exact_format);
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
@@ -1218,16 +1332,38 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
+	const auto metadata_base_layer = desc.view_info.base_layer;
+	ImageId    remembered {};
+	if (!desc.info.data.Empty()) {
+		std::scoped_lock lock {m_lock};
+		const auto&      memo = LookupSlot(desc, exact_format, false);
+		if (LookupMatches(memo, desc, exact_format, false)) {
+			if (memo.view_mip >= 0) {
+				desc.view_info.base_level = static_cast<uint32_t>(memo.view_mip);
+			}
+			if (memo.view_layer >= 0) {
+				desc.view_info.base_layer = static_cast<uint32_t>(memo.view_layer);
+			}
+			auto& image              = m_slot_images[memo.result];
+			image.tick_accessed_last = m_scheduler.CurrentTick();
+			TouchImage(image);
+			remembered = memo.result;
+		}
+	}
+	if (remembered) {
+		return FinishLookup(remembered, desc, metadata_base_layer);
+	}
 	ValidateImageDesc(desc);
 	if (desc.info.data.Empty()) {
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
 	}
-	const auto metadata_base_layer = desc.view_info.base_layer;
+	const auto requested_view = desc.view_info;
 
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		auto&            memo = LookupSlot(desc, exact_format, false);
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 		bool block_alias = false;
@@ -1306,7 +1442,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		StoreLookup(memo, desc, requested_view, exact_format, false, result, view_mip, view_layer);
 	}
+	return FinishLookup(result, desc, metadata_base_layer);
+}
+
+ImageId TextureCache::ReuseImage(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image   = m_slot_images[id];
+		image.tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(image);
+	}
+	return FinishLookup(id, desc, metadata_base_layer);
+}
+
+ImageId TextureCache::FinishLookup(ImageId result, const ImageDesc& desc,
+                                   uint32_t metadata_base_layer) {
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -1361,12 +1513,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 			}
 		}
 	}
-	if (selected && ensure_valid) {
-		const auto owner = m_slot_images.try_get(selected);
-		if (owner != nullptr && owner->depth_id) {
-			selected = owner->depth_id;
-		}
-	}
+	// A stencil association is returned as itself: its range holds the stencil plane, not depth.
 	return selected;
 }
 
@@ -1449,11 +1596,19 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		const auto offset     = desc.info.data.address - image.info.data.address;
 		EXIT_IF(slice_size == 0 || offset % slice_size != 0 || offset / slice_size >= layers ||
 		        desc.info.resources.layers > layers - offset / slice_size);
-		image.stencil_subresources = {0, desc.info.resources.levels,
-		                             static_cast<uint32_t>(offset / slice_size),
-		                             desc.info.resources.layers};
+		const ImageSubresourceRange subresources {0, desc.info.resources.levels,
+		                                          static_cast<uint32_t>(offset / slice_size),
+		                                          desc.info.resources.layers};
+		if (image.stencil_subresources != subresources) {
+			image.stencil_subresources = subresources;
+			ChangeStructure();
+		}
 	}
-	image.info.stencil = desc.info.stencil;
+	if (image.info.stencil != desc.info.stencil ||
+	    !SameLookupMetadata(image.info.metadata, desc.info.metadata)) {
+		ChangeStructure();
+	}
+	image.info.stencil  = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		m_surface_metas.emplace(desc.info.metadata.range.address,
@@ -1655,6 +1810,10 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	// Most CPU writes land in buffers far from any image; they need not wait for the lock.
+	if (!m_image_regions.MayHoldImage(address, size)) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
 }
@@ -1713,6 +1872,36 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
+bool TextureCache::CanDownloadStencil(const Image& association) const {
+	const auto* depth = m_slot_images.try_get(association.depth_id);
+	// Mirrors RefreshImage: compressed or multisampled stencil planes are not uploaded either.
+	return depth != nullptr && depth->backing.image != nullptr && depth->info.HasStencil() &&
+	       depth->SafeToDownload() && !depth->info.metadata.stencil_compressed &&
+	       depth->info.samples == 1 && depth->backing.samples == 1 &&
+	       !association.IsBufferModified() && !association.IsCpuDirty() &&
+	       association.info.data.size != 0;
+}
+
+void TextureCache::DownloadStencil(Image& association, Buffer& destination,
+                                   uint64_t destination_offset) {
+	auto&       depth  = m_slot_images[association.depth_id];
+	const auto& info   = association.info;
+	const bool  tiled  = info.IsTiled();
+	auto        copies = info.BufferCopies(tiled ? 0 : destination_offset);
+	for (auto& copy: copies) {
+		copy.imageSubresource.baseArrayLayer += association.stencil_subresources.base_layer;
+	}
+	if (!tiled) {
+		depth.Download(copies, destination.Handle(), destination_offset, info.data.size);
+		return;
+	}
+	const auto linear_capacity = info.LinearSize();
+	auto       linear          = m_tiler.GetScratchBuffer(linear_capacity);
+	depth.Download(copies, linear.buffer, 0, linear.size);
+	m_tiler.Tile(linear.buffer, 0, linear_capacity, destination.Handle(), destination_offset,
+	             info.data.size, info);
+}
+
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                  uint64_t destination_size, uint32_t levels) {
 	if (!CanDownload(image)) {
@@ -1750,6 +1939,15 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
+	if (image.depth_id) {
+		// The depth image renders its stencil plane; this range is that plane's guest copy.
+		if (!m_texture_cache.CanDownloadStencil(image) ||
+		    !buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+			return false;
+		}
+		m_texture_cache.DownloadStencil(image, buffer, buffer.Offset(image.info.data.address));
+		return true;
+	}
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
 	if (!image.SafeToDownload()) {
 		return false;
@@ -1785,6 +1983,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	NoteWrite(buffer.CpuAddress() + buf_offset, copy_size);
 	return true;
 }
 
@@ -1823,9 +2022,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_buffer_cache.BeginAsyncPublish();
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		m_buffer_cache.EndAsyncPublish();
 	});
 	return true;
 }

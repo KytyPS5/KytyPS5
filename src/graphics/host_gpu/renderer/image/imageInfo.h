@@ -27,7 +27,8 @@ struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
 	uint32_t            control              = 0;
-	uint32_t            clear_word           = 0;
+	// CB_COLOR_CLEAR_WORD0 in the low half and WORD1 in the high half; 64-bit colors use both.
+	uint64_t            clear_word           = 0;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
@@ -414,9 +415,11 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 	return false;
 }
 
-[[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint32_t packed,
+[[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint64_t packed64,
                                                  vk::ClearColorValue& clear) {
 	vk::ClearColorValue next {};
+	const auto packed = static_cast<uint32_t>(packed64);
+	const auto high   = static_cast<uint32_t>(packed64 >> 32u);
 	const auto unorm8 = [](uint32_t value) { return static_cast<float>(value & 0xffu) / 255.0f; };
 	const auto srgb8  = [](uint32_t value) {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
@@ -433,7 +436,38 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 		return std::bit_cast<float>(sign | ((exponent == 31 ? 255u : exponent + 112u) << 23u) |
 		                            (mantissa << 13u));
 	};
+	// Unsigned 11- and 10-bit floats share the half-float exponent with a shorter mantissa.
+	const auto ufloat = [](uint32_t value, uint32_t mantissa_bits) {
+		const auto exponent = (value >> mantissa_bits) & 0x1fu;
+		const auto mantissa = value & ((1u << mantissa_bits) - 1u);
+		if (exponent == 0) {
+			return std::ldexp(static_cast<float>(mantissa), -14 - static_cast<int>(mantissa_bits));
+		}
+		return std::bit_cast<float>(((exponent == 31 ? 255u : exponent + 112u) << 23u) |
+		                            (mantissa << (23u - mantissa_bits)));
+	};
 	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+			next.float32[0] = float16(packed);
+			next.float32[1] = float16(packed >> 16u);
+			next.float32[2] = float16(high);
+			next.float32[3] = float16(high >> 16u);
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[0] = static_cast<float>(packed & 0xffffu) / 65535.0f;
+			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
+			next.float32[2] = static_cast<float>(high & 0xffffu) / 65535.0f;
+			next.float32[3] = static_cast<float>(high >> 16u) / 65535.0f;
+			break;
+		case vk::Format::eR32G32Sfloat:
+			next.float32[0] = std::bit_cast<float>(packed);
+			next.float32[1] = std::bit_cast<float>(high);
+			break;
+		case vk::Format::eB10G11R11UfloatPack32:
+			next.float32[0] = ufloat(packed & 0x7ffu, 6);
+			next.float32[1] = ufloat((packed >> 11u) & 0x7ffu, 6);
+			next.float32[2] = ufloat(packed >> 22u, 5);
+			break;
 		case vk::Format::eR16G16Sfloat:
 			next.float32[1] = float16(packed >> 16u);
 			[[fallthrough]];
@@ -507,7 +541,8 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 		clear = vk::ClearColorValue {};
 		return true;
 	}
-	return DecodePackedColorClear(format, packed, clear);
+	// A 64-bit pixel sees the fill word in both halves.
+	return DecodePackedColorClear(format, uint64_t {packed} * 0x100000001ull, clear);
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

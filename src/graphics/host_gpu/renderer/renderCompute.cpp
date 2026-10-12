@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -32,6 +33,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -82,6 +84,39 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	return false;
 }
 
+// The elements of `words` DWORDs a V# holds in range when element i is at base + i * stride and
+// moves as plain DWORDs: an unswizzled buffer accessed by raw DWORD operations, or by format
+// operations whose 32-bit components and identity DST_SEL convert nothing. RDNA 2 range checking
+// tests index >= NumRecords for OOB_SELECT 0 and 1 (with offset 0 < stride) and only an empty
+// buffer for 2; out-of-range loads return 0 and stores are dropped.
+static std::optional<uint64_t> DwordElementsInRange(const ShaderBufferResource& descriptor,
+                                                   uint32_t words, bool formatted) {
+	using Prospero::BufferFormat;
+	constexpr std::array<std::array<BufferFormat, 3>, 4> formats {{
+	    {BufferFormat::k32UInt, BufferFormat::k32SInt, BufferFormat::k32Float},
+	    {BufferFormat::k32_32UInt, BufferFormat::k32_32SInt, BufferFormat::k32_32Float},
+	    {BufferFormat::k32_32_32UInt, BufferFormat::k32_32_32SInt, BufferFormat::k32_32_32Float},
+	    {BufferFormat::k32_32_32_32UInt, BufferFormat::k32_32_32_32SInt,
+	     BufferFormat::k32_32_32_32Float},
+	}};
+	if (words == 0u || words > 4u || descriptor.Type() != 0u || descriptor.SwizzleEnabled() ||
+	    descriptor.AddTid() || descriptor.Stride() != words * sizeof(uint32_t) ||
+	    descriptor.Base48() == 0u || (descriptor.Base48() & 3u) != 0u ||
+	    descriptor.Format() == BufferFormat::kInvalid || descriptor.OutOfBounds() == 3u)
+		return {};
+	if (formatted) {
+		const auto& candidates = formats[words - 1];
+		if (std::ranges::find(candidates, descriptor.Format()) == candidates.end()) return {};
+		for (uint32_t i = 0; i < words; ++i) {
+			if (((descriptor.DstSelXYZW() >> (3u * i)) & 7u) != 4u + i) return {};
+		}
+	}
+	if (descriptor.OutOfBounds() == 2u) {
+		return descriptor.NumRecords() == 0u ? 0u : UINT64_MAX;
+	}
+	return descriptor.NumRecords();
+}
+
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
@@ -99,7 +134,7 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	    Prospero::BufferFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt};
 	if (descriptor.Stride() != element_size || descriptor.Format() != formats[fill.words - 1] ||
 	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
-	    descriptor.Base48() == 0) {
+	    descriptor.Base48() == 0 || !DwordElementsInRange(descriptor, fill.words, true)) {
 		return false;
 	}
 	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
@@ -111,7 +146,8 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	                                 ? group_x
 	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
 	const auto     size        = descriptor.GetSize();
-	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
+	if (invocations != descriptor.NumRecords() || fill.count < invocations || size == 0 ||
+	    size > UINT32_MAX ||
 	    (input.dispatch_thread_dimensions &&
 	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
 	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
@@ -122,6 +158,145 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
+	return true;
+}
+
+bool ResolveComputeDmaFill(const ShaderComputeInputInfo& input, uint32_t group_x, uint32_t group_y,
+                           uint32_t group_z, uint32_t mode, GuestRange& destination) {
+	const auto& resources = *input.stage.resources;
+	const auto& fill      = resources.uniform_fill;
+	destination           = {};
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
+		return false;
+	}
+	const uint64_t element = fill.words * sizeof(uint32_t);
+	const auto     descriptor =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
+	// The proof only accepts BUFFER_STORE_FORMAT_* stores, which convert through the V#'s format.
+	const auto in_range = DwordElementsInRange(descriptor, fill.words, true);
+	if (!in_range) {
+		return false;
+	}
+	// Invocations index consecutive elements from zero.
+	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		return false;
+	}
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	// Stores past the range are dropped.
+	const auto elements = std::min({invocations, uint64_t {fill.count}, *in_range});
+	if (elements == 0) {
+		return true;
+	}
+	const GuestRange range {descriptor.Base48(), elements * element};
+	if (!range.Valid() || !FillSourcesDisjoint(resources.buffers, range, fill.resource)) {
+		return false;
+	}
+	destination = range;
+	return true;
+}
+
+// A uniform fill of memory that holds no cached image is what a DMA fill does, so run it as one.
+// Games fast-clear CMASK with memset kernels every frame; executed on the GPU, every surface
+// bound afterwards drained the GPU to read its clear code back.
+static bool TryConsumeComputeBufferFill(RenderContext& context, const ShaderComputeInputInfo& input,
+                                        uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                                        uint32_t mode) {
+	GuestRange destination;
+	if (!ResolveComputeDmaFill(input, group_x, group_y, group_z, mode, destination)) {
+		return false;
+	}
+	if (destination.size == 0) {
+		return true;
+	}
+	if (!context.IsMapped(destination.address, destination.size) ||
+	    context.GetTextureCache().IsRegionRegistered(destination.address, destination.size)) {
+		return false;
+	}
+	context.GetBufferCache().FillBuffer(destination.address, destination.size,
+	                                    input.stage.resources->uniform_fill.value, false);
+	return true;
+}
+
+bool ResolveComputeCopies(const ShaderComputeInputInfo& input, uint32_t group_x, uint32_t group_y,
+                          uint32_t group_z, uint32_t mode, std::vector<ComputeCopy>& copies) {
+	const auto& resources = *input.stage.resources;
+	copies.clear();
+	if (!resources.copies_proven) return false;
+	// Invocations index consecutive elements from zero.
+	if (input.threads_num[0] == 0 || input.threads_num[0] != resources.copy_group_stride ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u) ||
+	    (input.dispatch_thread_dimensions &&
+	     (input.dispatch_threads_num[0] != group_x || input.dispatch_threads_num[1] != 1 ||
+	      input.dispatch_threads_num[2] != 1))) {
+		return false;
+	}
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	for (const auto& copy: resources.uniform_copies) {
+		ShaderRecompiler::IR::DescriptorValue source {.dword_count = 4};
+		ShaderRecompiler::IR::DescriptorValue destination {.dword_count = 4};
+		std::ranges::copy(copy.source, source.dwords.begin());
+		std::ranges::copy(copy.destination, destination.dwords.begin());
+		const auto read  = DecodeNativeDescriptor<ShaderBufferResource>(source);
+		const auto write = DecodeNativeDescriptor<ShaderBufferResource>(destination);
+		const auto read_range  = DwordElementsInRange(read, copy.words, copy.formatted);
+		const auto write_range = DwordElementsInRange(write, copy.words, copy.formatted);
+		if (!read_range || !write_range) return false;
+		// Stores past the destination's range are dropped; loads past the source's would store 0.
+		const auto elements = std::min({invocations, uint64_t {copy.count}, *write_range});
+		if (elements == 0) continue;
+		if (elements > *read_range) return false;
+		const auto element = uint64_t {copy.words} * sizeof(uint32_t);
+		const GuestRange from {read.Base48(), elements * element};
+		const GuestRange to {write.Base48(), elements * element};
+		if (!from.Valid() || !to.Valid()) return false;
+		copies.push_back({from.address, to.address, to.size});
+	}
+	// Lanes and waves run the copies concurrently: every write must miss every read, every other
+	// write and the memory the copies were evaluated from.
+	const auto overlaps = [](uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
+		return a < b + b_size && b < a + a_size;
+	};
+	for (uint32_t i = 0; i < copies.size(); ++i) {
+		const auto& write = copies[i];
+		for (uint32_t j = 0; j < copies.size(); ++j) {
+			if (overlaps(write.destination, write.bytes, copies[j].source, copies[j].bytes) ||
+			    (j != i && overlaps(write.destination, write.bytes, copies[j].destination, copies[j].bytes)))
+				return false;
+		}
+		for (const auto& [address, size]: resources.uniform_copy_reads) {
+			if (overlaps(write.destination, write.bytes, address, size)) return false;
+		}
+	}
+	return true;
+}
+
+// A kernel proven to only copy buffer elements is what a DMA copy does, so run it as one. Games
+// stage small CPU updates through such kernels; executed on the GPU, every CPU read of a destination
+// drained the GPU, while a DMA copy keeps the destinations CPU-visible.
+static bool TryConsumeComputeCopy(RenderContext& context, const ShaderComputeInputInfo& input,
+                                  uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                                  uint32_t mode) {
+	static thread_local std::vector<ComputeCopy> copies;
+	if (!ResolveComputeCopies(input, group_x, group_y, group_z, mode, copies)) return false;
+	auto& textures = context.GetTextureCache();
+	for (const auto& copy: copies) {
+		if (!context.IsMapped(copy.source, copy.bytes) ||
+		    !context.IsMapped(copy.destination, copy.bytes) ||
+		    textures.IsRegionRegistered(copy.source, copy.bytes) ||
+		    textures.IsRegionRegistered(copy.destination, copy.bytes))
+			return false;
+	}
+	auto& cache = context.GetBufferCache();
+	for (const auto& copy: copies) {
+		cache.CopyBuffer(copy.destination, copy.source, copy.bytes, false, false);
+	}
 	return true;
 }
 
@@ -228,6 +403,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
 	EXIT_IF(buffer.IsInvalid());
+	m_context.GetCommandScheduler().FlushIfStale();
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -306,9 +482,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	// Evaluated from the memory the kernel reads, which the copies are checked not to write.
+	if (TryConsumeComputeCopy(m_context, input_info, thread_group_x, thread_group_y, thread_group_z,
+	                          mode)) {
+		ResetBindings();
+		return;
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+	                                 thread_group_z, mode) ||
+	     TryConsumeComputeBufferFill(m_context, input_info, thread_group_x, thread_group_y,
 	                                 thread_group_z, mode))) {
 		ResetBindings();
 		return;
@@ -345,7 +529,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(input_info.stage.resources->address_bases);
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
@@ -430,6 +614,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	m_context.GetGraphics().SetCheckpoint(vk_buffer, GpuCheckpoint::Dispatch, program.shader_hash);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
@@ -441,6 +626,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	m_context.GetCommandScheduler().FlushIfStale();
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
@@ -462,7 +648,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(input_info.stage.resources->address_bases);
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);
@@ -492,6 +678,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	m_context.GetGraphics().SetCheckpoint(vk_buffer, GpuCheckpoint::DispatchIndirect,
+	                                      program.shader_hash, args_buffer->Handle(), args_offset,
+	                                      args_addr);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

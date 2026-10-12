@@ -78,6 +78,7 @@ public:
 
 	~Instance() {
 		ClearPictureMetadata();
+		av_frame_free(&m_lookahead);
 		if (m_sws != nullptr) {
 			sws_freeContext(m_sws);
 		}
@@ -222,13 +223,59 @@ public:
 		return result;
 	}
 
+	[[nodiscard]] Result DrainOutput(const FrameBuffer& frame_buffer, Output* output) {
+		std::scoped_lock lock(m_mutex);
+		*output = {};
+		if (!m_draining) {
+			const int result = avcodec_send_packet(m_codec, nullptr);
+			if (result < 0 && result != AVERROR_EOF) {
+				LOGF("Videodec2: ending the stream failed: %s (%d)\n", AvErrorString(result),
+				     result);
+				return Result::ApiFail;
+			}
+			m_draining  = true;
+			m_lookahead = ReceiveDrainedFrame();
+		}
+		if (m_lookahead == nullptr) {
+			return Result::Ok;
+		}
+		const auto result = CopyFrame(m_lookahead, frame_buffer, output);
+		if (result != Result::Ok) {
+			return result;
+		}
+		av_frame_free(&m_lookahead);
+		// One picture of lookahead lets the last one report completion without needing
+		// another guest frame buffer.
+		m_lookahead           = ReceiveDrainedFrame();
+		output->end_of_stream = m_lookahead == nullptr;
+		return Result::Ok;
+	}
+
 	void ResetDecoder() {
 		std::scoped_lock lock(m_mutex);
 		avcodec_flush_buffers(m_codec);
+		av_frame_free(&m_lookahead);
+		m_draining = false;
 		ClearPictureMetadata();
 	}
 
 private:
+	AVFrame* ReceiveDrainedFrame() {
+		AVFrame* frame = av_frame_alloc();
+		if (frame == nullptr) {
+			return nullptr;
+		}
+		const int result = avcodec_receive_frame(m_codec, frame);
+		if (result < 0) {
+			if (result != AVERROR_EOF && result != AVERROR(EAGAIN)) {
+				LOGF("Videodec2: receiving a drained frame failed: %s (%d)\n",
+				     AvErrorString(result), result);
+			}
+			av_frame_free(&frame);
+		}
+		return frame;
+	}
+
 	[[nodiscard]] PictureInfo MakePictureInfo(const AVFrame* frame) const {
 		PictureInfo result {};
 		if (frame->opaque_ref != nullptr && frame->opaque_ref->size >= sizeof(PacketMetadata)) {
@@ -347,8 +394,10 @@ private:
 	}
 
 	Config                    m_config;
-	AVCodecContext*           m_codec    = nullptr;
-	SwsContext*               m_sws      = nullptr;
+	AVCodecContext*           m_codec     = nullptr;
+	SwsContext*               m_sws       = nullptr;
+	AVFrame*                  m_lookahead = nullptr;
+	bool                      m_draining  = false;
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };
@@ -384,6 +433,10 @@ Result Decode(Instance* instance, const Input& input, const FrameBuffer& frame_b
 
 Result Flush(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
 	return instance->FlushOutput(frame_buffer, output);
+}
+
+Result Drain(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
+	return instance->DrainOutput(frame_buffer, output);
 }
 
 void Reset(Instance* instance) {

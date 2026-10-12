@@ -355,6 +355,46 @@ uint32_t PackedOffset(ValueEmitContext& ctx, IR::Value value, ImageDimension dim
 	return result;
 }
 
+// Normalized coordinates of a level-zero sample moved by a texel offset: one texel of level zero
+// is 1 / size. Vulkan gives unnormalized samplers no texel offsets at all.
+uint32_t OffsetSampleCoordinates(ValueEmitContext& ctx, uint32_t resource, uint32_t array_index,
+                                 IR::Value offset, uint32_t coord) {
+	auto&       state      = ctx.state;
+	const auto& image      = state.program.info.images.at(resource);
+	const auto& info       = ImageDimensionInfoFor(image.dimension);
+	const auto  spatial    = info.spatial_components;
+	const auto  components = info.coordinate_components;
+	uint32_t    mask       = 0;
+	const auto  texels     = PackedOffset(ctx, offset, image.dimension, mask);
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto size = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, image.dimension),
+	                          size, LoadImageDescriptor(state, resource, 0u, array_index),
+	                          ConstantU32(state, 0));
+	const auto component = [&](uint32_t type, uint32_t vector, uint32_t count, uint32_t index) {
+		if (count == 1u) return vector;
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, type, result, vector, index);
+		return result;
+	};
+	std::array<uint32_t, 3> parts {};
+	for (uint32_t index = 0; index < components; ++index) {
+		parts[index] = component(TypeF32(state), coord, components, index);
+		if (index >= spatial) continue;
+		const auto extent = Unary(state, spv::OpConvertUToF, TypeF32(state),
+		                          component(TypeU32(state), size, components, index));
+		const auto shift  = Unary(state, spv::OpConvertSToF, TypeF32(state),
+		                          component(TypeI32(state), texels, spatial, index));
+		parts[index] = Binary(state, spv::OpFAdd, TypeF32(state), parts[index],
+		                      Binary(state, spv::OpFDiv, TypeF32(state), shift, extent));
+	}
+	if (components == 1u) return parts[0];
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, components), result,
+	                          std::span(parts).first(components));
+	return result;
+}
+
 uint32_t HorizontalOffsets(EmitterState& state, ImageDimension dimension) {
 	const auto components   = ImageDimensionInfoFor(dimension).spatial_components;
 	const auto count        = ConstantU32(state, 4);
@@ -916,24 +956,39 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    state, ctx.Def(handle->Arg(0)), static_cast<uint32_t>(samplers.size()),
 			    TypeU32(state), [&](uint32_t ordinal) { return ConstantU32(state, samplers[ordinal]); });
 		}
-		if (layout.offset != NoImageComponent &&
-		    !offset_value.IsImmediate()) {
+		// RDNA 2 adds a VGPR texel offset to any sample. Vulkan takes a non-constant Offset on
+		// sampling instructions only with VK_KHR_maintenance8. Without it, a level-zero sample moves
+		// its coordinates instead; a sample that can filter other levels would need the offset in
+		// each level's texels.
+		const bool dynamic_offset = layout.offset != NoImageComponent && !offset_value.IsImmediate();
+		const bool level_zero     = explicit_lod && !HasFlag(mem, Decoder::ImageSampleFlagDerivative) &&
+		                        !(HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+		                          layout.lod != NoImageComponent);
+		const bool move_coordinates = dynamic_offset && !state.sample_offsets;
+		if (move_coordinates && !level_zero) {
 			ctx.Fail(inst, "has a nonconstant sample texel offset");
+		}
+		if (dynamic_offset && state.sample_offsets) {
+			state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
 			auto sample_operands = operands;
 			auto sample_operand_count = operand_count;
-			if (layout.offset != NoImageComponent) {
+			if (layout.offset != NoImageComponent && !move_coordinates) {
 				sample_operand_count = std::max(size_t{1}, sample_operand_count);
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);
 			}
-			const auto coord =
+			auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
+			if (move_coordinates) {
+				if (candidate.cube) ctx.Fail(inst, "has a nonconstant cube sample texel offset");
+				coord = OffsetSampleCoordinates(ctx, resource, array_index, offset_value, coord);
+			}
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);
 			const auto sample = state.builder.AllocateId();

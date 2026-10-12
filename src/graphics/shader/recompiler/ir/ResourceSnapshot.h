@@ -25,8 +25,22 @@ struct UniformFill {
 	std::array<uint32_t, 3> group_stride {};
 	uint32_t                 words        = 0;
 	uint32_t                 value        = 0;
+	// Elements a guarded buffer fill writes at most; unguarded fills cover the dispatch.
+	uint32_t                 count        = UINT32_MAX;
 
 	bool operator==(const UniformFill&) const = default;
+};
+
+// One proven buffer-to-buffer copy: lanes whose global index is below `count` copy one element of
+// `words` DWORDs from the source V# to the destination V#, at the same index.
+struct UniformCopy {
+	std::array<uint32_t, 4> source {};
+	std::array<uint32_t, 4> destination {};
+	uint32_t                count     = 0;
+	uint32_t                words     = 1;
+	bool                    formatted = false;
+
+	bool operator==(const UniformCopy&) const = default;
 };
 
 struct ResourceSnapshot {
@@ -36,7 +50,15 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// Evaluated ResourcePlan::address_bases; they do not affect specialization.
+	std::vector<uint64_t>        address_bases;
 	UniformFill                 uniform_fill;
+	// Every copy a proven copy kernel performs in this dispatch, valid when `copies_proven` is set;
+	// the memory read to evaluate them; and the lanes per workgroup the kernel's index assumes.
+	bool                         copies_proven      = false;
+	std::vector<UniformCopy>     uniform_copies;
+	std::vector<std::pair<uint64_t, uint64_t>> uniform_copy_reads;
+	uint32_t                     copy_group_stride  = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

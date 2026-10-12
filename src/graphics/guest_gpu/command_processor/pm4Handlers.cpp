@@ -2171,7 +2171,16 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
 			break;
 		}
-		default: EXIT("unknown marker at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, id);
+		default: {
+			// A marker is a NOP packet: the GPU ignores its payload, and only the ids above
+			// carry work for the command processor. Others annotate the stream.
+			static std::array<std::atomic_bool, 0x1000> reported {};
+			if (!reported[id].exchange(true)) {
+				std::printf("Pm4: ignoring unknown marker 0x%03" PRIx32 " (%" PRIu32 " dwords)\n",
+				            id, len_dw + 1u);
+			}
+			break;
+		}
 	}
 
 	return len_dw + 1;

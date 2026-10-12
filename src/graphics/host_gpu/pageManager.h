@@ -19,6 +19,9 @@ public:
 	KYTY_CLASS_NO_COPY(PageManager);
 
 	[[nodiscard]] uint64_t GetPageSize() const;
+	// Whether a watcher currently revokes this access to the page. Faults on unwatched pages
+	// belong to the guest or to the address space, not to the GPU caches.
+	[[nodiscard]] bool IsWatched(uint64_t vaddr, PageFaultAccess access) const noexcept;
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

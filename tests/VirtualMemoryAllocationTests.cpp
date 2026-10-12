@@ -63,8 +63,9 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 namespace Libs::LibKernel::Memory {
-bool TestWindowsBackingViewModes();
-}
+bool     TestWindowsBackingViewModes();
+uint32_t TestWindowsHostProtection(uint64_t vaddr);
+} // namespace Libs::LibKernel::Memory
 #endif
 
 namespace Libs::Fiber {
@@ -1486,6 +1487,52 @@ void TestWindowsBackingViewPermissions() {
 	const char* test = "WindowsBackingViewPermissions";
 	Check(test, Libs::LibKernel::Memory::TestWindowsBackingViewModes(),
 	      "backing view permissions differ from the requested mode");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// The GPU watches whatever guest memory its resources cover, which can include pages of code.
+void TestPageWatchKeepsCodeExecutable() {
+	using namespace Libs::LibKernel::Memory;
+	using Common::VirtualMemory::Mode;
+	const char*        test     = "PageWatchKeepsCodeExecutable";
+	constexpr auto     page     = SceKernelPageSize;
+	constexpr uint32_t ReadOnly = 0x02, ExecuteRead = 0x20, ExecuteReadWrite = 0x40,
+	                   NoAccess = 0x01;
+	const auto         base     = AllocateRuntimeMemory(0, page * 2, Mode::ReadWrite, "watch_code");
+	Check(test, base != 0, "runtime allocation failed");
+	const auto code = base + page;
+	Check(test, ProtectGuestMemory(code, page, Mode::ExecuteReadWrite), "code protection failed");
+
+	Check(test, ProtectGuestHostMemory(base, page * 2, Mode::Read), "write watch failed");
+	Check(test,
+	      TestWindowsHostProtection(base) == ReadOnly &&
+	          TestWindowsHostProtection(code) == ExecuteRead,
+	      "a write watch over data and code changed execute access");
+	Check(test,
+	      ProtectGuestHostMemory(base, page * 2, Mode::ReadWrite) &&
+	          TestWindowsHostProtection(code) == ExecuteReadWrite,
+	      "lifting a write watch left code without execute access");
+	Check(test,
+	      ProtectGuestHostMemory(code, page, Mode::NoAccess) &&
+	          TestWindowsHostProtection(code) == NoAccess,
+	      "an access watch on code did not block access");
+
+	Check(test,
+	      ProtectGuestMemory(code, page, Mode::ReadWrite) &&
+	          ProtectGuestHostMemory(code, page, Mode::Read) &&
+	          TestWindowsHostProtection(code) == ReadOnly,
+	      "code that the guest made non-executable stayed executable");
+	Check(test,
+	      ProtectGuestMemory(code, page, Mode::ExecuteRead) && FreeGuestMemory(base, page * 2),
+	      "runtime free failed");
+	const auto reused = AllocateRuntimeMemory(base, page * 2, Mode::ReadWrite, "watch_reuse", true);
+	Check(test,
+	      reused == base && ProtectGuestHostMemory(code, page, Mode::Read) &&
+	          TestWindowsHostProtection(code) == ReadOnly,
+	      "freed code kept execute access after the range was reused for data");
+	Check(test,
+	      ProtectGuestHostMemory(code, page, Mode::ReadWrite) && FreeGuestMemory(reused, page * 2),
+	      "reused runtime free failed");
 	std::printf("[host]    %-48s ok\n", test);
 }
 #endif
@@ -4501,6 +4548,7 @@ int main(int argc, char** argv) {
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestWindowsBackingViewPermissions);
+	RunTest(TestPageWatchKeepsCodeExecutable);
 #endif
 	RunTest(TestDirectMappingNamesTypesAndValidation);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);

@@ -43,6 +43,11 @@ public:
 	// The id is unique and can't be reused by another thread.
 	static int GetThreadIdUnique();
 
+	// Gives the calling thread a performance core of its own: it runs only on that core's
+	// logical processors, and the process's other threads default to the remaining ones.
+	// Returns the core's first logical processor, or -1 where no core can be spared.
+	static int ReserveCoreForCurrentThread();
+
 	KYTY_CLASS_NO_COPY(Thread);
 
 private:

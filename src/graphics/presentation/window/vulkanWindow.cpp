@@ -24,6 +24,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -413,11 +414,38 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
-	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	uint32_t family_count = 0;
+	physical_device.getQueueFamilyProperties(&family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> families(family_count);
+	physical_device.getQueueFamilyProperties(&family_count, families.data());
+	graphics.readback_family = static_cast<uint32_t>(-1);
+	for (uint32_t family = 0; family < family_count; family++) {
+		const auto flags = families[family].queueFlags;
+		if (families[family].queueCount != 0 && (flags & vk::QueueFlagBits::eTransfer) &&
+		    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+			graphics.readback_family = family;
+			break;
+		}
+	}
+	const bool second_main_queue = graphics.readback_family == static_cast<uint32_t>(-1) &&
+	                               queue_family < family_count &&
+	                               families[queue_family].queueCount >= 2;
+	if (second_main_queue) {
+		graphics.readback_family = queue_family;
+	}
+	const std::array<float, 2>               queue_priorities {1.0f, 1.0f};
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	queue_create_infos[0].queueFamilyIndex = queue_family;
+	queue_create_infos[0].queueCount       = second_main_queue ? 2u : 1u;
+	queue_create_infos[0].pQueuePriorities = queue_priorities.data();
+	uint32_t queue_create_count            = 1;
+	if (graphics.readback_family != static_cast<uint32_t>(-1) &&
+	    graphics.readback_family != queue_family) {
+		queue_create_infos[1].queueFamilyIndex = graphics.readback_family;
+		queue_create_infos[1].queueCount       = 1;
+		queue_create_infos[1].pQueuePriorities = queue_priorities.data();
+		queue_create_count                     = 2;
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -550,6 +578,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.depth_color_copy_enabled = maintenance8_extension && maintenance8.maintenance8;
+	graphics.sample_offsets_enabled   = graphics.depth_color_copy_enabled;
 	LOGF("Vulkan depth/color copy support: %s\n",
 	     graphics.depth_color_copy_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -652,8 +681,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+		vk::PhysicalDeviceFeatures2        query {};
+		query.pNext = &supported_fault;
+		physical_device.getFeatures2(&query);
+		if (supported_fault.deviceFault == VK_TRUE) {
+			device_fault.deviceFault      = VK_TRUE;
+			device_fault.pNext            = const_cast<void*>(create_info.pNext);
+			create_info.pNext             = &device_fault;
+			graphics.device_fault_enabled = true;
+		}
+	}
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1020,8 +1062,16 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// A marker per draw and dispatch names the command a lost device stopped in, so the
+		// device-lost report shows it.
+		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			graphic_ctx.checkpoints_enabled = true;
+			Log::WriteToConsoleAndLog("Vulkan: GPU checkpoints enabled.\n");
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
@@ -1045,6 +1095,12 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family,
+		                            graphic_ctx.readback_family == graphic_ctx.queue_family ? 1 : 0,
+		                            &graphic_ctx.readback_queue);
+		LOGF("Vulkan: readback queue family %u\n", graphic_ctx.readback_family);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

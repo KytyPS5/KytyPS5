@@ -348,7 +348,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.buffer_u16 |= bits == 16u;
 				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
 					if (program.stage != ShaderType::Compute) {
-						return Fail("buffer ADD_TID is only valid for compute shaders");
+						return Fail(fmt::format(
+						    "shader 0x{:016x} stage {} buffer {}: ADD_TID (packed stride 0x{:08x}) is "
+						    "only valid for compute shaders",
+						    program.shader_hash, static_cast<uint32_t>(program.stage), memory.resource,
+						    info.buffers[memory.resource].packed_stride));
 					}
 					info.subgroup_local_invocation_id = true;
 				}

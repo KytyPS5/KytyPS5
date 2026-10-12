@@ -42,6 +42,7 @@ public:
 	[[nodiscard]] Inst*     TryInstruction() const;
 	[[nodiscard]] Inst*     ResolveInstruction() const;
 	[[nodiscard]] Value     Resolve() const;
+	[[nodiscard]] Inst*     ResolveInstructionSlow() const;
 	[[nodiscard]] ScalarReg ScalarRegister() const;
 	[[nodiscard]] VectorReg VectorRegister() const;
 	[[nodiscard]] bool      U1() const;
@@ -183,5 +184,83 @@ private:
 };
 
 static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
+
+// Resource evaluation walks the value graph for every draw; keep its accessors inline.
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+// Identity chains are followed iteratively, so callers inline these instead of calling a
+// recursive out-of-line copy.
+inline Value Value::Resolve() const {
+	auto value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	return value;
+}
+
+inline Type Value::GetType() const {
+	const auto value = Resolve();
+	if (value.type != Type::Opaque) {
+		return value.type;
+	}
+	return value.inst->GetOpcode() == ValueOpcode::Phi ? value.inst->Flags<Type>()
+	                                                   : value.inst->GetType();
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	if (type == Type::Opaque && inst->GetOpcode() != ValueOpcode::Identity) [[likely]] {
+		return inst;
+	}
+	return ResolveInstructionSlow();
+}
+
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline Type Inst::GetType() const {
+	if (opcode == ValueOpcode::Phi) {
+		return static_cast<Type>(flags);
+	}
+	if (opcode == ValueOpcode::Identity && num_args != 0) {
+		return Arg(0).GetType();
+	}
+	return TypeOf(opcode);
+}
+
+inline size_t Inst::NumArgs() const {
+	return num_args == PhiArity ? phi_args.size() : num_args;
+}
+
+inline Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= NumArgs());
+	if (num_args <= InlineArity) {
+		return fixed_args[index];
+	}
+	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

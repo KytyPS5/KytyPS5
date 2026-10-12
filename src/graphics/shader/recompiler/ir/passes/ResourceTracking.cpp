@@ -345,6 +345,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_program.address_bases.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -917,7 +918,10 @@ private:
 				     !EquivalentValue(m_program, a.selector_first, b.selector_first)) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
-				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask))) continue;
+				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask)) ||
+				    a.selector_value.IsEmpty() != b.selector_value.IsEmpty() ||
+				    (!a.selector_value.IsEmpty() &&
+				     !EquivalentValue(m_program, a.selector_value, b.selector_value))) continue;
 			}
 			bool same = true;
 			for (uint32_t i = 0; i < descriptor.dword_count; i++) {
@@ -1527,6 +1531,83 @@ private:
 		});
 	}
 
+	using InductionRange = DescriptorSource::IndirectDescriptor::InductionRange;
+
+	// A counter that starts at an immediate and steps by one, with a comparison that guards
+	// every other use: counter >= 0 bounds a descending loop to [0, start], and
+	// counter < bound bounds an ascending one to [start, bound).
+	std::optional<InductionRange> CountingLoopRange(const Inst& phi) const {
+		if (phi.GetOpcode() != ValueOpcode::Phi || phi.GetType() != Type::U32 || phi.NumArgs() != 2u)
+			return {};
+		const Value self(const_cast<Inst*>(&phi));
+		for (uint32_t initial = 0; initial < 2u; ++initial) {
+			uint32_t    start = 0;
+			const auto* step  = phi.Arg(initial ^ 1u).Resolve().TryInstruction();
+			if (!ImmediateU32(phi.Arg(initial), start) || start > INT32_MAX || step == nullptr ||
+			    step->NumArgs() != 2u)
+				continue;
+			uint32_t   amount = 0;
+			const auto op     = step->GetOpcode();
+			const bool forward = step->Arg(0).Resolve() == self && ImmediateU32(step->Arg(1), amount);
+			const bool commuted = op == ValueOpcode::IAdd32 && step->Arg(1).Resolve() == self &&
+			                      ImmediateU32(step->Arg(0), amount);
+			if (!forward && !commuted) continue;
+			const bool descending = (op == ValueOpcode::IAdd32 && amount == UINT32_MAX) ||
+			                        (op == ValueOpcode::ISub32 && forward && amount == 1u);
+			const bool ascending  = op == ValueOpcode::IAdd32 && amount == 1u;
+			for (const auto& candidate: phi.Uses()) {
+				const auto* compare = candidate.user;
+				if (candidate.operand != 0u || compare->NumArgs() != 2u) continue;
+				const auto cop = compare->GetOpcode();
+				InductionRange range {.counter = self};
+				if (descending && cop == ValueOpcode::SGreaterThanEqual32 &&
+				    compare->Arg(1).Resolve() == Value(0u)) {
+					range.begin = Value(0u);
+					range.end   = Value(start + 1u);
+				} else if (ascending &&
+				           (cop == ValueOpcode::ULessThan32 || cop == ValueOpcode::SLessThan32) &&
+				           ValidateRuntimeValue(m_program, compare->Arg(1), RuntimeValueType::Integer)) {
+					range.begin = Value(start);
+					range.end   = compare->Arg(1).Resolve();
+				} else {
+					continue;
+				}
+				const Value guard(const_cast<Inst*>(compare));
+				const bool  guarded = std::ranges::all_of(phi.Uses(), [&](const Use& use) {
+					return use.user == compare || use.user == step ||
+					       GuardedOnEntry(
+					           use.user->Parent(), [&](const Block* block) { return block == phi.Parent(); },
+					           [&](const EdgePredicate& edge) {
+						           return edge.positive && Implies(edge.condition, guard);
+					           });
+				});
+				if (guarded) return range;
+			}
+		}
+		return {};
+	}
+
+	// The counting loops an enumerated key depends on.
+	std::vector<InductionRange> KeyInductionRanges(Value key) const {
+		std::vector<InductionRange> ranges;
+		std::vector<const Inst*>    pending {key.Resolve().TryInstruction()};
+		std::vector<const Inst*>    visited;
+		while (!pending.empty() && visited.size() < 1024u) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) continue;
+			visited.push_back(inst);
+			if (const auto range = CountingLoopRange(*inst)) {
+				ranges.push_back(*range);
+				continue;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+				pending.push_back(inst->Arg(arg).Resolve().TryInstruction());
+			}
+		}
+		return ranges;
+	}
+
 	bool MatchScalarMaterialKey(Value key, DescriptorSource::IndirectDescriptor& indirect,
 	                            DescriptorSource& material_source) {
 		const auto* read = key.Resolve().TryInstruction();
@@ -1733,7 +1814,7 @@ private:
 			} else if (std::ranges::any_of(read->Uses(), [](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [](const Use& consumer) {
-					       return consumer.user->GetOpcode() != ValueOpcode::StoreBufferU32;
+					       return BufferAccessOf(consumer.user->GetOpcode()) != BufferAccess::Write;
 				       });
 			    })) {
 				return false;
@@ -1769,20 +1850,32 @@ private:
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.retain_reads = true;
 		} else if (table_source.dword_count == 2u) {
-			if (table_stride != 32u) return false;
+			// Bit-scan, loop and material keys index tables of bare T#s; a record table with
+			// another stride can only use an enumerated key.
+			const bool bare_table = table_stride == 32u;
 			const auto* selector = key.Resolve().TryInstruction();
-			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
+			const bool bitscan = bare_table && selector != nullptr &&
+			    selector->GetOpcode() == ValueOpcode::FindILsb32 &&
 			    selector->NumArgs() == 1u && !m_shader_writes &&
 			    NonzeroOnEntry(selector->Arg(0), handle.Parent());
 			if (bitscan) {
 				indirect.key_count = Value(32u);
-			} else if (!m_shader_writes) {
+			} else if (bare_table && !m_shader_writes) {
 				if (const auto* bound = BoundedLoop(key, handle.Parent()))
 					indirect.key_count = bound->Arg(1);
 			}
-			if (indirect.key_count.IsEmpty() &&
-			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source)) {
-				return false;
+			if (indirect.key_count.IsEmpty()) {
+				const auto unmatched = indirect;
+				if (!bare_table || !MatchUniformizedMaterialKey(key, handle, indirect, material_source)) {
+					// The GPU computes the key, for example from a shader-built list indexing a
+					// guest buffer. Its value set is enumerated from guest memory at dispatch;
+					// invalid or differently typed entries it reaches are null candidates.
+					if (key.Resolve().GetType() != Type::U32) return false;
+					indirect                 = unmatched;
+					material_source          = {};
+					indirect.selector_value  = key;
+					indirect.selector_ranges = KeyInductionRanges(key);
+				}
 			}
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
@@ -1825,14 +1918,16 @@ private:
 	                           IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
 		    handle.Uses().empty()) return false;
+		bool linear = true;
 		for (const auto& use: handle.Uses()) {
 			const auto& inst = *use.user;
-			if (inst.GetOpcode() != ValueOpcode::StoreBufferU32) return false;
+			if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write) return false;
 			const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
 			uint32_t scalar = 1u;
-			if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
-			    memory.idxen || !memory.offen || !ImmediateU32(inst.Arg(3), scalar) || scalar != 0u)
-				return false;
+			if (memory.kind != ResourceKind::Buffer) return false;
+			linear &= inst.GetOpcode() == ValueOpcode::StoreBufferU32 && !memory.typed &&
+			          !memory.formatted && !memory.idxen && memory.offen &&
+			          ImmediateU32(inst.Arg(3), scalar) && scalar == 0u;
 		}
 		DescriptorSource table_source;
 		Value key;
@@ -1840,8 +1935,51 @@ private:
 		uint32_t table_stride = 0;
 		uint32_t table_immediate = 0;
 		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset,
-		                          table_stride, table_immediate) || table_stride != 16u ||
-		    table_source.dword_count != 4u || table_offset != 0u || table_immediate != 0u) return false;
+		                          table_stride, table_immediate)) return false;
+		if (!linear || table_stride != 16u || table_source.dword_count != 4u || table_offset != 0u ||
+		    table_immediate != 0u || !TryMakeMaterialSelectedBuffer(handle, plan, table_source, key))
+			return TryMakeEnumeratedBuffer(handle, plan, table_source, key, table_offset,
+			                               table_stride, table_immediate);
+		return true;
+	}
+
+	// The key is a bounded value the GPU computes, for example a masked byte of a guest lookup
+	// table indexed by shared-memory results. Its possible values are enumerated from guest
+	// memory at dispatch, so each table entry it can reach is bound as a store candidate.
+	bool TryMakeEnumeratedBuffer(Inst& handle, IndirectDescriptorPlan& plan,
+	                             const DescriptorSource& table_source, Value key,
+	                             uint32_t table_offset, uint32_t table_stride,
+	                             uint32_t table_immediate) {
+		constexpr uint32_t MaxEnumeratedKeys = 4096;
+		if (plan.table_indexed || plan.split_offsets || table_stride == 0u ||
+		    key.Resolve().GetType() != Type::U32)
+			return false;
+		// Unlike sampled images, a store destination must not be over-approximated by entries
+		// that are not descriptors: require a mask or a counting loop to bound the key.
+		auto ranges = KeyInductionRanges(key);
+		if (ranges.empty() && SelectorMaximum(key) >= MaxEnumeratedKeys) return false;
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.table_offset    = table_offset;
+		indirect.table_immediate = table_immediate;
+		indirect.table_stride    = table_stride;
+		indirect.selector_value  = key;
+		indirect.selector_ranges = std::move(ranges);
+		indirect.table_source    = InternSource(table_source);
+		DescriptorSource source;
+		source.dword_count = 4u;
+		source.dwords.fill(Value(0u));
+		source.indirect_descriptor = indirect;
+		plan.handle = &handle;
+		plan.source = InternSource(source);
+		plan.key    = key;
+		return true;
+	}
+
+	// The key is one lane's read of a bounded material buffer index; the host reads the
+	// material entries in that range to enumerate the keys.
+	bool TryMakeMaterialSelectedBuffer(Inst& handle, IndirectDescriptorPlan& plan,
+	                                   const DescriptorSource& table_source, Value key) {
+		constexpr uint32_t table_stride = 16u;
 		const auto* lane_read = key.Resolve().TryInstruction();
 		if (lane_read == nullptr || lane_read->GetOpcode() != ValueOpcode::ReadFirstLane)
 			return false;
@@ -2093,7 +2231,7 @@ private:
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
-				     inst.GetOpcode() != ValueOpcode::StoreBufferU32) ||
+				     BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write) ||
 				    inst.NumArgs() == 0u) {
 					continue;
 				}
@@ -2119,7 +2257,7 @@ private:
 						m_indirect_descriptors.push_back(std::move(plan));
 					}
 				};
-				plan_handle(inst.Arg(0), inst.GetOpcode() == ValueOpcode::StoreBufferU32 ? 4u : 8u,
+				plan_handle(inst.Arg(0), BufferAccessOf(inst.GetOpcode()) == BufferAccess::Write ? 4u : 8u,
 				            memory.resource * 4u, false);
 				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
 				    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) == 0u)
@@ -2396,6 +2534,14 @@ private:
 				m_program.has_address_writes = true;
 			}
 			m_info.uses_dma = true;
+			if (const auto* base = inst.Arg(0).Resolve().TryInstruction();
+			    base != nullptr && base->GetOpcode() == ValueOpcode::GetAddressResource &&
+			    base->NumArgs() == 2) {
+				const std::array<Value, 2> pair {base->Arg(0).Resolve(), base->Arg(1).Resolve()};
+				if (std::ranges::find(m_program.address_bases, pair) == m_program.address_bases.end()) {
+					m_program.address_bases.push_back(pair);
+				}
+			}
 			return;
 		}
 

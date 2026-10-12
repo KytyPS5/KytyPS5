@@ -18,6 +18,11 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// Whether guest memory is mapped, without reading it; null skips the check.
+	bool (*is_mapped)(uint64_t address, uint64_t size) = nullptr;
+	// Whether a texture descriptor places its image where the GPU could sample it; null skips
+	// the check.
+	bool (*is_placeable_texture)(std::span<const uint32_t, 8> descriptor) = nullptr;
 };
 
 class SrtReadCapture {
@@ -43,8 +48,9 @@ struct SrtReadFlags {
 
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
+// `counter` is a loop counter the caller binds (SrtWalker::Bind) before evaluating the value.
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
+                          RuntimeValueType type = RuntimeValueType::Any, Value counter = {});
 void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
@@ -60,6 +66,9 @@ public:
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	// Fixes an instruction's value for this session, such as a loop counter for one iteration;
+	// everything evaluated afterwards that depends on it uses this value.
+	void Bind(Value value, uint64_t result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
@@ -72,12 +81,19 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// The straight-line refresh of a plan without control flow; Unsupported leaves it to the walker.
+	enum class TapeResult { Done, Failed, Unsupported };
+	TapeResult RefreshFlatBufferTape(std::vector<uint32_t>& flat);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// Every node of the plan's control-flow-free tape holds this session's value.
+	bool m_tape_complete = false;
+	// Some instruction was evaluated through the memo in this session.
+	bool m_memo_used = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -106,6 +107,10 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	// Binds a graphics pipeline unless it is the one bound last. Code that binds a graphics
+	// pipeline through the native handle must call ForgetGraphicsPipeline.
+	void BindGraphicsPipeline(vk::Pipeline pipeline) const;
+	void ForgetGraphicsPipeline() const noexcept { m_graphics_pipeline = nullptr; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -135,8 +140,9 @@ private:
 	uint32_t            m_debug_arg2      = 0;
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
-	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
+	mutable RenderState  m_render_state;
+	mutable bool         m_rendering         = false;
+	mutable vk::Pipeline m_graphics_pipeline = nullptr;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -146,7 +152,8 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -165,6 +172,7 @@ public:
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	[[nodiscard]] DrawRenderState& BeginDrawState();
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -209,8 +217,14 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// Scratch for the ranges one draw writes, flagged when an image or attachment writes them.
+	std::vector<std::pair<GuestRange, bool>> m_written_ranges;
+	// Scratch for the DMA bases of every stage of one draw.
+	std::vector<uint64_t>                 m_address_bases;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// One draw's prepared state, reused: its shader input infos are kilobytes.
+	std::unique_ptr<DrawRenderState>      m_draw_state;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
@@ -220,6 +234,24 @@ private:
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);
+
+// The guest memory a dispatch of a proven fill kernel writes, when a DMA fill of its value writes
+// exactly that; empty when every store is out of range or no lane stores.
+[[nodiscard]] bool ResolveComputeDmaFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                         uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                         GuestRange& destination);
+
+struct ComputeCopy {
+	uint64_t source      = 0;
+	uint64_t destination = 0;
+	uint64_t bytes       = 0;
+};
+
+// The byte copies a dispatch of a proven copy kernel performs, when they are exactly what the
+// kernel does: in range, unconverted and independent of each other.
+[[nodiscard]] bool ResolveComputeCopies(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                        uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                        std::vector<ComputeCopy>& copies);
 
 } // namespace Libs::Graphics
 

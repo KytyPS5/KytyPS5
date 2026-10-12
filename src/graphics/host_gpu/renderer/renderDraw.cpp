@@ -448,6 +448,26 @@ struct DrawRenderState {
 	PipelineCache::GraphicsPrograms programs;
 };
 
+RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
+RenderExecutor::~RenderExecutor() = default;
+
+DrawRenderState& RenderExecutor::BeginDrawState() {
+	if (m_draw_state == nullptr) {
+		m_draw_state = std::make_unique<DrawRenderState>();
+	}
+	// The shader input infos and programs are reset by the code that fills them, so zeroing the
+	// whole state for every draw would only repeat that work.
+	auto& state = *m_draw_state;
+	state.depth_info  = {};
+	// Targets are resolved in order into color_info[color_count]; the slot after the last counted
+	// one may hold a target that was rejected.
+	std::fill_n(state.color_info, std::min(state.color_count + 1u, RENDER_COLOR_ATTACHMENTS_MAX),
+	            RenderColorInfo {});
+	state.color_count = 0;
+	state.ps_active   = true;
+	return state;
+}
+
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
 	uint32_t             index_count    = 0;
@@ -1206,10 +1226,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	buffer.BindGraphicsPipeline(pipeline.pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	m_context.GetGraphics().SetCheckpoint(vk_buffer, GpuCheckpoint::Draw,
+	                                      state.ps_active
+	                                          ? state.ps_input_info.stage.program->shader_hash
+	                                          : state.vertex_info[0].stage.program->shader_hash);
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
@@ -1244,6 +1268,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	m_context.GetCommandScheduler().FlushIfStale();
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -1326,7 +1351,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
-	DrawRenderState state {};
+	auto& state = BeginDrawState();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
@@ -1357,6 +1382,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	m_context.GetCommandScheduler().FlushIfStale();
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -1405,7 +1431,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return;
 	}
-	DrawRenderState state {};
+	auto& state = BeginDrawState();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;

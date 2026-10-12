@@ -1014,6 +1014,14 @@ void Require(const char *shader_name, const char *stage, bool value,
   }
 }
 
+// A guest access faults only where a page watch revokes it, and the caches must claim that fault.
+// An access to an unwatched page simply succeeds.
+bool GuestAccess(RenderContext &resources, PageFaultAccess access,
+                 uint64_t address) {
+  return !resources.IsWatched(access, address) ||
+         resources.HandleFault(access, address);
+}
+
 void CheckErrorDialogLifecycle() {
   namespace ErrorDialog = Libs::Dialog::ErrorDialog;
   namespace SystemDialog = Libs::Dialog::SystemDialog;
@@ -1351,6 +1359,8 @@ struct TestCase {
   bool has_user_data = false;
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
+  // Compile for a host that takes non-constant sample offsets (VK_KHR_maintenance8).
+  bool sample_offsets = false;
   size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
@@ -1417,8 +1427,11 @@ bool ReadTestMemory(void *userdata, uint64_t address, std::span<u32> values) {
   return true;
 }
 
-void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv) {
+void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv,
+                   bool sample_offsets = false) {
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  spvtools::ValidatorOptions options;
+  options.SetAllowOffsetTextureOperand(sample_offsets);
   std::string messages;
   tools.SetMessageConsumer([&messages](spv_message_level_t, const char *,
                                        const spv_position_t &position,
@@ -1429,7 +1442,7 @@ void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv) {
     messages += buffer;
   });
 
-  if (!tools.Validate(spirv)) {
+  if (!tools.Validate(spirv.data(), spirv.size(), options)) {
     Fail(shader_name, "SPIR-V validation", messages);
   }
 }
@@ -1653,6 +1666,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
+  options.sample_offsets = test.sample_offsets;
 
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
@@ -1728,7 +1742,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
-  ValidateSpirv(test.name, result.spirv);
+  ValidateSpirv(test.name, result.spirv, test.sample_offsets);
   CheckSpirvText(test, result.spirv);
   if (test.expected_buffer_resources) {
     std::vector<u32> resources;
@@ -3576,22 +3590,22 @@ public:
                               2 * sizeof(source_words), false, true);
     });
     Require("GpuCommandLane", "DMA_DATA immediate GDS readback",
-            resources.HandleFault(PageFaultAccess::Read, immediate_dst),
+            GuestAccess(resources, PageFaultAccess::Read, immediate_dst),
             "immediate-to-GDS-to-memory copy did not publish GPU bytes");
     Require("GpuCommandLane", "DMA_DATA memory GDS readback",
-            resources.HandleFault(PageFaultAccess::Read, memory_dst),
+            GuestAccess(resources, PageFaultAccess::Read, memory_dst),
             "memory-to-GDS-to-memory copy did not publish GPU bytes");
     Require("GpuCommandLane", "DMA_DATA immediate memory readback",
-            resources.HandleFault(PageFaultAccess::Read, immediate_memory_dst),
+            GuestAccess(resources, PageFaultAccess::Read, immediate_memory_dst),
             "immediate-to-memory copy did not publish GPU bytes");
     Require("GpuCommandLane", "DMA_DATA memory copy readback",
-            resources.HandleFault(PageFaultAccess::Read, memory_copy_dst),
+            GuestAccess(resources, PageFaultAccess::Read, memory_copy_dst),
             "memory-to-memory copy did not publish GPU bytes");
     Require("GpuCommandLane", "DMA_DATA L2 readback",
-            resources.HandleFault(PageFaultAccess::Read, l2_copy_dst),
+            GuestAccess(resources, PageFaultAccess::Read, l2_copy_dst),
             "MemoryUsingL2 copy did not publish GPU bytes");
     Require("GpuCommandLane", "clean cached mirror readback",
-            resources.HandleFault(PageFaultAccess::Read, clean_cached_readback),
+            GuestAccess(resources, PageFaultAccess::Read, clean_cached_readback),
             "clean host DMA was not reflected in the cached buffer");
     std::array<uint32_t, 2> immediate_words{};
     std::array<uint32_t, 2> copied_words{};
@@ -3685,7 +3699,7 @@ public:
     block_entered.acquire();
     std::jthread clean_fault_thread([&] {
       clean_fault_handled =
-          resources.HandleFault(PageFaultAccess::Write, immediate_dst);
+          GuestAccess(resources, PageFaultAccess::Write, immediate_dst);
       clean_fault_complete.release();
     });
     const bool clean_fault_was_direct =
@@ -3703,7 +3717,7 @@ public:
     bool dirty_fault_handled = false;
     std::jthread dirty_fault_thread([&] {
       dirty_fault_handled =
-          resources.HandleFault(PageFaultAccess::Write, dirty_fault_address);
+          GuestAccess(resources, PageFaultAccess::Write, dirty_fault_address);
       dirty_fault_complete.release();
     });
     const bool dirty_fault_bypassed_lane =
@@ -4041,8 +4055,10 @@ public:
     constexpr uint64_t unmap_offset = 0x4100;
     constexpr uint64_t partial_unmap_offset = 0x8100;
     constexpr uint64_t partial_unmap_survivor_offset = 0xc100;
-    constexpr uint64_t ring_fault_first_offset = 0x2100;
-    constexpr uint64_t ring_fault_second_offset = 0x2110;
+    // Readbacks publish the GPU-modified data in the 1 MiB window around the access, so the ring
+    // fault keeps a window of its own.
+    constexpr uint64_t ring_fault_first_offset = 0x402100;
+    constexpr uint64_t ring_fault_second_offset = 0x402110;
     constexpr uint32_t first_value = 0x10203040u;
     constexpr uint32_t second_value = 0x50607080u;
     constexpr uint32_t first_stale = 0x0badf00du;
@@ -4362,7 +4378,7 @@ public:
                        sizeof(ring_fault_second_value), ring_fault_second_value,
                        false);
       Require(name, "fault-ring wrapped batch",
-              resources.HandleFault(PageFaultAccess::Read,
+              GuestAccess(resources, PageFaultAccess::Read,
                                     base + ring_fault_first_offset),
               "fault readback could not wrap a live download-ring tick");
       // Both disjoint writes on the faulting page share one wrapped batch.
@@ -4419,7 +4435,8 @@ public:
               "the earlier page did not publish its dirty ranges on its own read");
 
       constexpr uint64_t page_size = TRACKER_PAGE_SIZE;
-      constexpr uint64_t page_owner_offset = 0x240000;
+      // The owner straddles a 1 MiB readback window: the fault's window ends at the outside page.
+      constexpr uint64_t page_owner_offset = 0x300000 - TRACKER_PAGE_SIZE;
       constexpr uint64_t page_owner_size = 0xc0000;
       constexpr uint64_t page_fault_offset = page_owner_offset + 0x100;
       constexpr uint64_t page_inside_offset =
@@ -4736,7 +4753,7 @@ public:
                                       sizeof(partial_unmap_value)),
           "partial invalidation read back an unrelated mapped page");
       Require(name, "partial-invalidation survivor read fault",
-              resources.HandleFault(PageFaultAccess::Read,
+              GuestAccess(resources, PageFaultAccess::Read,
                                     base + partial_unmap_survivor_offset),
               "CPU read did not publish the retained GPU-dirty page");
       uint32_t partial_unmap_survivor_backing = 0;
@@ -5437,7 +5454,7 @@ public:
       auto &image = texture_cache.GetImage(first);
       constexpr uint32_t final_sampled_value = 0x88776655u;
       Require(name, "sampled write between discovery and acquisition",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     sampled.info.data.address),
               "sampled image did not accept a CPU update after discovery");
       std::memcpy(memory, &final_sampled_value, sizeof(final_sampled_value));
@@ -5635,7 +5652,7 @@ public:
       for (const uint32_t width : {32u, 64u, 32u}) {
         if (previous) {
           Require(name, "mip-layout CPU overwrite",
-                  resources.HandleFault(PageFaultAccess::Write,
+                  GuestAccess(resources, PageFaultAccess::Write,
                                         base + mip_layout_offset),
                   "mip-layout guest overwrite did not invalidate the old texture");
         }
@@ -6494,7 +6511,7 @@ public:
       const std::array<uint16_t, 2> refreshed_multisample_source{0x2000u,
                                                                  0xe000u};
       Require(name, "unequal-sample source CPU write",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     color_desc.info.data.address),
               "color-to-MS-depth source did not accept a CPU update");
       std::memcpy(memory + 0x2000, refreshed_multisample_source.data(),
@@ -6682,7 +6699,7 @@ public:
               "changing stencil address recreated depth or discarded an "
               "existing lightweight association");
       Require(name, "CPU write to tracked stencil association",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     base + second_stencil_offset) &&
                   !texture_cache.GetImage(second_stencil_association).IsTracked() &&
                   texture_cache.GetImage(second_stencil_association).IsCpuDirty() &&
@@ -6747,7 +6764,7 @@ public:
       texture_cache.MarkGpuWritten(mirror_image);
       constexpr uint32_t mirror_cpu_value = 0x0f1e2d3cu;
       Require(name, "CPU-dirty formatted mirror fault",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     mirror_desc.info.data.address),
               "GPU image did not accept a CPU write before Buffer mirroring");
       std::memcpy(memory + 0x5000, &mirror_cpu_value, sizeof(mirror_cpu_value));
@@ -7106,7 +7123,7 @@ public:
               partial_clean_source.first != nullptr,
               "clean same-page bytes inherited unrelated buffer ownership");
       Require(name, "partial-page remaining fault",
-              resources.HandleFault(PageFaultAccess::Read,
+              GuestAccess(resources, PageFaultAccess::Read,
                                     base + partial_buffer_offset),
               "same-page buffer ownership was lost after image transfer");
       uint32_t partial_buffer_backing = 0;
@@ -7121,7 +7138,7 @@ public:
               "same-page image/buffer readback published incorrect bytes");
       constexpr uint32_t partial_cpu_refresh_value = 0x13579bdfu;
       Require(name, "partial-page CPU write fault",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     base + partial_clean_offset),
               "same-page CPU write did not invalidate cached ownership");
       std::memcpy(memory + partial_clean_offset, &partial_cpu_refresh_value,
@@ -7200,7 +7217,7 @@ public:
               "TextureCache claimed a CPU read fault instead of preserving "
               "GPU image ownership");
       Require(name, "same-page image write invalidation",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     base + padding_fault_offset) &&
                   texture_cache.GetImage(fault_a_image).IsGpuModified() &&
                   texture_cache.GetImage(fault_b_image).IsGpuModified() &&
@@ -7230,7 +7247,7 @@ public:
                   texture_cache.GetImage(fault_b_image).IsGpuModified(),
               "copying one same-page image lost an authoritative owner");
       Require(name, "same-page survivor write fault",
-              resources.HandleFault(PageFaultAccess::Write, base + 0x8010) &&
+              GuestAccess(resources, PageFaultAccess::Write, base + 0x8010) &&
                   texture_cache.GetImage(fault_b_image).IsGpuModified() &&
                   texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty(),
               "the surviving image was not protected after its alias retired");
@@ -7309,7 +7326,7 @@ public:
             texture_cache.GetImage(image).IsGpuModified() &&
                 standalone_cpu_read == 0 &&
                 texture_cache.GetImage(image).IsGpuModified() &&
-                resources.HandleFault(PageFaultAccess::Write, base + offset) &&
+                GuestAccess(resources, PageFaultAccess::Write, base + offset) &&
                 texture_cache.GetImage(image).IsGpuModified() &&
                 texture_cache.GetImage(image).IsDefinitelyCpuDirty(),
             "fresh multisample target violated write-only ownership");
@@ -7691,7 +7708,7 @@ public:
       const bool replacement_changed = replacement != replacement_source_image;
       const bool replacement_gpu_before =
           texture_cache.GetImage(replacement).IsGpuModified();
-      const bool replacement_fault = resources.HandleFault(
+      const bool replacement_fault = GuestAccess(resources,
           PageFaultAccess::Write, base + replacement_offset + 0x1000);
       const bool replacement_gpu_after =
           texture_cache.GetImage(replacement).IsGpuModified();
@@ -7767,7 +7784,7 @@ public:
               mixed_owner.first != nullptr,
               "mixed CPU/GPU image source did not create a containing buffer");
       Require(name, "mixed-page CPU write fault",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     base + mixed_source_offset),
               "mixed image source could not dirty its first page");
       std::memcpy(memory + mixed_source_offset, &mixed_cpu_value,
@@ -7830,7 +7847,7 @@ public:
                                             bridged_texel_size, 0, false);
       Require(
           name, "bridged CPU write fault",
-          resources.HandleFault(PageFaultAccess::Write,
+          GuestAccess(resources, PageFaultAccess::Write,
                                 base + bridged_cpu_offset),
           "bridged image source could not transfer its second owner to CPU");
       std::memcpy(memory + bridged_cpu_offset, bridged_cpu_values.data(),
@@ -10345,6 +10362,9 @@ public:
                              .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
         set_buffer(0, output, 16u * sizeof(u32));
+        // A recording older than a millisecond is submitted before the next dispatch; start a
+        // fresh one so only the dispatch's own argument handling could submit.
+        scheduler.Flush();
         const auto tick = scheduler.CurrentTick();
         if (test.transfer) {
           const std::array<u32, 3> packet{static_cast<u32>(args),
@@ -10653,7 +10673,7 @@ public:
     constexpr const char *name = "RenderExecutorColorMetadataClear";
     struct PackedCase {
       vk::Format format;
-      uint32_t word;
+      uint64_t word;
       std::array<float, 4> channels;
     };
     const std::array packed_cases{
@@ -10671,16 +10691,30 @@ public:
         PackedCase{vk::Format::eR16G16Unorm, 0x0000ffffu, {1.0f, 0.0f}},
         PackedCase{vk::Format::eR16G16Unorm, 0x80000001u,
                    {1.0f / 65535.0f, 32768.0f / 65535.0f}},
+        // A captured wake map cleared to one through this 11_11_10 register word.
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0x781e03c0u, {1.0f, 1.0f, 1.0f}},
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0x00000001u, {0x1p-20f}},
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0x00400000u, {0.0f, 0.0f, 0x1p-19f}},
+        PackedCase{vk::Format::eR16G16B16A16Sfloat, 0x3c000000bc003c00ull,
+                   {1.0f, -1.0f, 0.0f, 1.0f}},
+        PackedCase{vk::Format::eR16G16B16A16Unorm, 0xffff00000000ffffull,
+                   {1.0f, 0.0f, 0.0f, 1.0f}},
+        PackedCase{vk::Format::eR32G32Sfloat, 0xbf8000003f800000ull, {1.0f, -1.0f}},
     };
     for (const auto &test : packed_cases) {
       vk::ClearColorValue clear{};
-      Require(name, "packed 16-bit clear",
+      Require(name, "packed register clear",
               DecodePackedColorClear(test.format, test.word, clear) &&
                   std::bit_cast<std::array<uint32_t, 4>>(clear.float32) ==
                       std::bit_cast<std::array<uint32_t, 4>>(test.channels),
-              "16-bit clear lost channel order, sign, range or unused-channel zeros");
+              "register clear lost channel order, sign, range or unused-channel zeros");
     }
     vk::ClearColorValue clear{};
+    Require(name, "64-bit DWORD fill",
+            DecodeColorDwordFill(vk::Format::eR16G16B16A16Unorm, 0x0000ffffu, clear) &&
+                std::bit_cast<std::array<uint32_t, 4>>(clear.float32) ==
+                    std::bit_cast<std::array<uint32_t, 4>>(std::array{1.0f, 0.0f, 1.0f, 0.0f}),
+            "a DWORD fill did not repeat across both halves of a 64-bit pixel");
     Require(name, "half NaN clear",
             DecodePackedColorClear(vk::Format::eR16Sfloat, 0x7e00u, clear) &&
                 std::isnan(clear.float32[0]),
@@ -18641,7 +18675,7 @@ private:
               const auto access =
                   info.access_violation_type == Exception::AccessViolationType::Write
                       ? PageFaultAccess::Write : PageFaultAccess::Read;
-              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              return LibKernel::Memory::HandleMemoryFault(access, info.access_violation_vaddr);
             }),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
@@ -35165,6 +35199,58 @@ template <u32 wave_size> TestCase ImageSampleOffsetsReadFourNeighbors() {
   return test;
 }
 
+// IMAGE_SAMPLE_LZ_O takes its texel offset from a VGPR, here loaded at runtime. A host with
+// VK_KHR_maintenance8 takes it as a non-constant Offset; otherwise the level-zero coordinates
+// move by offset / size, which addresses the same texel.
+template <u32 wave_size, bool native> TestCase ImageSampleRuntimeOffsetsReadFourNeighbors() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = native ? (wave_size == 32 ? "ImageSampleNativeRuntimeOffsets32"
+                                        : "ImageSampleNativeRuntimeOffsets64")
+                     : (wave_size == 32 ? "ImageSampleRuntimeOffsetsReadFourNeighbors32"
+                                        : "ImageSampleRuntimeOffsetsReadFourNeighbors64");
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  constexpr std::array offsets{0x01u, 0x3fu, 0x3f00u, 0x0100u};
+  test.initial.assign(8, 0u);
+  std::ranges::copy(offsets, test.initial.begin() + 4);
+  for (u32 sample = 0; sample < offsets.size(); ++sample) {
+    AppendVMovU32(&test.code, 30, (4u + sample) * 4u);
+    test.code.push_back(EncodeMubuf0(0x0cu)); // BUFFER_LOAD_DWORD v20, v30, s[48:51]
+    test.code.push_back(EncodeMubuf1(20, 12, 30));
+    // Each sample addresses the center of texel (2, 1) before applying the offset.
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.625f));
+    AppendVMovLiteral(&test.code, 22, std::bit_cast<u32>(0.375f));
+    test.code.push_back(EncodeMimg0(0x37u, 0x1));
+    test.code.push_back(EncodeMimg1(sample, 20));
+    AppendStoreVgpr(&test.code, sample, sample);
+  }
+  AppendEnd(&test.code);
+  test.sampled_image_rgba = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&test.sampled_image_rgba, 4, 2, 1, std::bit_cast<u32>(16.f), 0, 0, 0);
+  constexpr std::array<std::array<u32, 2>, 4> neighbors{{{3, 1}, {1, 1}, {2, 0}, {2, 2}}};
+  for (u32 sample = 0; sample < neighbors.size(); ++sample) {
+    const auto value = std::bit_cast<u32>(float(sample + 1));
+    SetRgbaPixel(&test.sampled_image_rgba, 4, neighbors[sample][0], neighbors[sample][1],
+                 value, 0, 0, 0);
+    test.expected.push_back(value);
+  }
+  test.expected.insert(test.expected.end(), offsets.begin(), offsets.end());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  if (native) {
+    // The harness device does not enable VK_KHR_maintenance8, so this case only compiles.
+    test.sample_offsets = true;
+    test.compile_only = true;
+    test.required_spirv = {"Lod|Offset", "ImageGatherExtended"};
+    test.forbidden_spirv = {"OpImageQuerySizeLod", "OpFDiv"};
+  } else {
+    test.required_spirv = {"OpImageQuerySizeLod", "OpFDiv"};
+    test.forbidden_spirv = {"Lod|Offset", "Lod|ConstOffset"};
+  }
+  return test;
+}
+
 TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   using O = ShaderOpcode;
 
@@ -37951,6 +38037,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>);
   AddCase(ImageSampleOffsetsReadFourNeighbors<32>);
   AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
+  AddCase(ImageSampleRuntimeOffsetsReadFourNeighbors<32, false>);
+  AddCase(ImageSampleRuntimeOffsetsReadFourNeighbors<64, false>);
+  AddCase(ImageSampleRuntimeOffsetsReadFourNeighbors<64, true>);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
@@ -38218,6 +38307,44 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           !ResolveComputeBufferFill(compute, 2, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "excess invocation coverage was accepted as a fill");
+  // A DMA fill writes exactly what the BUFFER_STORE_FORMAT_* stores would: through a format that
+  // converts nothing, an identity DST_SEL, and only in range.
+  GuestRange dma{};
+  Require("Ps5GameExampleImageClear", "DMA fill",
+          ResolveComputeDmaFill(compute, 1, 1, 1, 0x41u, dma) && dma.address == 0x200000u &&
+              dma.size == 256u,
+          "a proven 32-bit fill did not resolve to its destination range");
+  Require("Ps5GameExampleImageClear", "DMA fill dropped stores",
+          ResolveComputeDmaFill(compute, 2, 1, 1, 0x41u, dma) && dma.size == 256u,
+          "stores past NumRecords were written by the DMA fill");
+  const auto dma_word3 = [&](u32 word3) {
+    runtime_resources = scalar;
+    runtime_resources.buffers[0].dwords[3] = word3;
+    return ResolveComputeDmaFill(compute, 1, 1, 1, 0x41u, dma);
+  };
+  const auto format = [](Prospero::BufferFormat value) { return static_cast<u32>(value) << 12u; };
+  Require("Ps5GameExampleImageClear", "converting DMA fill format",
+          !dma_word3(format(Prospero::BufferFormat::k16_16UInt) | 0x204u),
+          "a 16_16 format, which converts the stored DWORD, was filled with raw DWORDs");
+  Require("Ps5GameExampleImageClear", "float DMA fill format",
+          dma_word3(format(Prospero::BufferFormat::k32Float) | 0x204u) && dma.size == 256u,
+          "a 32-bit float format, which converts nothing, was not filled");
+  Require("Ps5GameExampleImageClear", "DMA fill DST_SEL",
+          !dma_word3(format(Prospero::BufferFormat::k32UInt) | 0x205u),
+          "a DST_SEL that moves the stored component was filled with raw DWORDs");
+  Require("Ps5GameExampleImageClear", "DMA fill OOB_SELECT 3",
+          !dma_word3(format(Prospero::BufferFormat::k32UInt) | 0x204u | (3u << 28u)),
+          "OOB_SELECT 3, which this fill cannot model exactly, was accepted");
+  runtime_resources = scalar;
+  runtime_resources.buffers[0].dwords[2] = 16u;
+  Require("Ps5GameExampleImageClear", "partial DMA fill",
+          ResolveComputeDmaFill(compute, 1, 1, 1, 0x41u, dma) && dma.size == 64u,
+          "stores past NumRecords were written by the DMA fill");
+  runtime_resources.buffers[0].dwords[3] |= 2u << 28u;
+  Require("Ps5GameExampleImageClear", "DMA fill OOB_SELECT 2",
+          ResolveComputeDmaFill(compute, 1, 1, 1, 0x41u, dma) && dma.size == 256u,
+          "OOB_SELECT 2, which only checks for an empty buffer, was bounded by NumRecords");
+  runtime_resources = scalar;
   auto alias = scalar.buffers.front();
   runtime_resources.buffers.push_back(alias);
   Require("Ps5GameExampleImageClear", "aliased scalar input",
@@ -40549,7 +40676,13 @@ void CheckImageSamplerSpecialization() {
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
+                snapshot.images.size() >= count + 1u &&
+                // A bounded table's stable layout pads its candidates with null entries.
+                std::all_of(snapshot.images.begin() + count + 1u, snapshot.images.end(),
+                            [](const DescriptorValue &image) {
+                              return std::ranges::all_of(image.dwords,
+                                                         [](u32 word) { return word == 0u; });
+                            }),
             "GPU-selected material descriptors did not expand beyond native root capacity");
     const auto offset = specialization.images[0].indirect_mapping_offset;
     const auto ordinal = [&](u32 byte_offset) {
@@ -40708,6 +40841,27 @@ void CheckShaderRecompilerFatalContracts() {
 
   ExpectFatal("WritableFlatStoreRejection", [] {
     const auto test = FlatStoreVariants();
+    (void)CompileCase(test);
+  });
+
+  ExpectFatal("RuntimeLodSampleOffsetRejection", [] {
+    // Without VK_KHR_maintenance8 only a level-zero sample takes a runtime texel offset.
+    using O = ShaderOpcode;
+    TestCase test;
+    test.name = "RuntimeLodSampleOffsetRejection";
+    test.initial = {0u, 0x01u};
+    AppendVMovU32(&test.code, 30, 4u);
+    test.code.push_back(EncodeMubuf0(0x0cu));
+    test.code.push_back(EncodeMubuf1(20, 12, 30));
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.625f));
+    AppendVMovLiteral(&test.code, 22, std::bit_cast<u32>(0.375f));
+    AppendVMovU32(&test.code, 23, 0);
+    test.code.push_back(EncodeMimg0(0x34u, 0x1)); // IMAGE_SAMPLE_L_O
+    test.code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&test.code, 0, 0);
+    AppendEnd(&test.code);
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                    O::S_ENDPGM};
     (void)CompileCase(test);
   });
 

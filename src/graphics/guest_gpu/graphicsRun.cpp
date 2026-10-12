@@ -28,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -445,6 +446,13 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	// This thread bounds the frame rate of CPU-heavy titles. Left to the scheduler it moves onto
+	// efficiency cores and shares its core with the guest's spinning workers.
+	if (const auto processor = Common::Thread::ReserveCoreForCurrentThread(); processor >= 0) {
+		Log::WriteToConsoleAndLog(
+		    "GPU: the command processor thread has the core of logical processor " +
+		    std::to_string(processor) + " to itself.\n");
+	}
 
 	for (;;) {
 		Submission                   submission;
@@ -662,9 +670,13 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	uint32_t packets = 0;
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+		}
+		if ((++packets & 15u) == 0) {
+			GetScheduler().FlushIfStale();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());

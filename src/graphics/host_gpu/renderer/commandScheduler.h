@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -26,6 +27,9 @@ public:
 	void           EndRendering();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// Submits a command buffer that has been recording for a while, so the GPU runs it while the
+	// rest of a long guest submission is recorded.
+	void           FlushIfStale();
 	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
@@ -92,6 +96,7 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	std::chrono::steady_clock::time_point m_command_begin_time;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;

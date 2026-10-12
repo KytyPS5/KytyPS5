@@ -14,11 +14,21 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -28,6 +38,123 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 } // namespace
+
+// Copies buffer data to the host on the readback queue, which waits on the main timeline only for
+// the work that wrote the data. On a transfer-only family the copy engines run it beside 3D work.
+// Used synchronously from the GPU thread, so one command buffer and staging buffer do.
+class BufferCache::ReadbackQueue {
+public:
+	ReadbackQueue(GraphicContext& graphics, CommandScheduler& scheduler)
+	    : m_graphics(graphics), m_scheduler(scheduler) {
+		vk::CommandPoolCreateInfo pool {};
+		pool.queueFamilyIndex = graphics.readback_family;
+		pool.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                        vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		EXIT_NOT_IMPLEMENTED(graphics.device.createCommandPool(&pool, nullptr, &m_pool) !=
+		                     vk::Result::eSuccess);
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		EXIT_NOT_IMPLEMENTED(graphics.device.allocateCommandBuffers(&allocate, &m_command) !=
+		                     vk::Result::eSuccess);
+		vk::SemaphoreTypeCreateInfo type {};
+		type.semaphoreType = vk::SemaphoreType::eTimeline;
+		vk::SemaphoreCreateInfo semaphore {};
+		semaphore.pNext = &type;
+		EXIT_NOT_IMPLEMENTED(graphics.device.createSemaphore(&semaphore, nullptr, &m_semaphore) !=
+		                     vk::Result::eSuccess);
+	}
+	~ReadbackQueue() {
+		m_staging.reset();
+		m_graphics.device.destroySemaphore(m_semaphore, nullptr);
+		m_graphics.device.destroyCommandPool(m_pool, nullptr);
+	}
+	KYTY_CLASS_NO_COPY(ReadbackQueue);
+
+	// Copies regions of `source` to host memory once the main timeline reaches `after_tick`.
+	// The bytes stay valid until the next call.
+	const uint8_t* Copy(vk::Buffer source, std::span<const vk::BufferCopy> copies,
+	                    uint64_t total_size, uint64_t after_tick) {
+		std::scoped_lock lock(m_mutex);
+		if (m_staging == nullptr || m_staging->Size() < total_size) {
+			m_staging.reset();
+			m_staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+			                                     vk::BufferUsageFlagBits::eTransferDst,
+			                                     std::bit_ceil(std::max(total_size, 4 * MiB)));
+		}
+		vk::CommandBufferBeginInfo begin {};
+		begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		EXIT_NOT_IMPLEMENTED(m_command.begin(&begin) != vk::Result::eSuccess);
+		m_command.copyBuffer(source, m_staging->Handle(), static_cast<uint32_t>(copies.size()),
+		                     copies.data());
+		vk::MemoryBarrier to_host {};
+		to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		m_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eHost, {}, 1, &to_host, 0, nullptr, 0,
+		                          nullptr);
+		EXIT_NOT_IMPLEMENTED(m_command.end() != vk::Result::eSuccess);
+
+		const auto                      main_timeline = m_scheduler.GetMasterSemaphore().Handle();
+		const auto                      signal        = ++m_value;
+		vk::TimelineSemaphoreSubmitInfo timeline {};
+		timeline.waitSemaphoreValueCount   = 1;
+		timeline.pWaitSemaphoreValues      = &after_tick;
+		timeline.signalSemaphoreValueCount = 1;
+		timeline.pSignalSemaphoreValues    = &signal;
+		// The wait makes the main queue's writes up to `after_tick` visible to the copy.
+		const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+		vk::SubmitInfo               submit {};
+		submit.pNext                = &timeline;
+		submit.waitSemaphoreCount   = 1;
+		submit.pWaitSemaphores      = &main_timeline;
+		submit.pWaitDstStageMask    = &wait_stage;
+		submit.commandBufferCount   = 1;
+		submit.pCommandBuffers      = &m_command;
+		submit.signalSemaphoreCount = 1;
+		submit.pSignalSemaphores    = &m_semaphore;
+		EXIT_NOT_IMPLEMENTED(m_graphics.readback_queue.submit(1, &submit, nullptr) !=
+		                     vk::Result::eSuccess);
+
+		// The copy takes tens of microseconds, about what waking a blocked thread costs, and
+		// this thread has a core of its own: poll it for a while first.
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+		uint64_t   value    = 0;
+		while (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &value) ==
+		           vk::Result::eSuccess &&
+		       value < signal && std::chrono::steady_clock::now() < deadline) {
+#if defined(__x86_64__) || defined(_M_X64)
+			_mm_pause();
+#else
+			std::this_thread::yield();
+#endif
+		}
+		vk::SemaphoreWaitInfo wait {};
+		wait.semaphoreCount = 1;
+		wait.pSemaphores    = &m_semaphore;
+		wait.pValues        = &signal;
+		const auto result   = m_graphics.device.waitSemaphores(&wait, UINT64_MAX);
+		if (result != vk::Result::eSuccess) {
+			if (result == vk::Result::eErrorDeviceLost) {
+				m_graphics.ReportDeviceFault();
+			}
+			EXIT("BufferCache: readback copy failed: %s\n", vk::to_string(result).c_str());
+		}
+		m_staging->Invalidate(0, total_size);
+		return m_staging->Mapped().data();
+	}
+
+private:
+	GraphicContext&         m_graphics;
+	CommandScheduler&       m_scheduler;
+	std::mutex              m_mutex;
+	vk::CommandPool         m_pool      = nullptr;
+	vk::CommandBuffer       m_command   = nullptr;
+	vk::Semaphore           m_semaphore = nullptr;
+	uint64_t                m_value     = 0;
+	std::unique_ptr<Buffer> m_staging;
+};
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
@@ -97,6 +224,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		// The buffer may cover pages that are CPU-modified already.
+		m_memory_tracker.QueueRegions(buffer.CpuAddress(), buffer.Size());
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
@@ -137,6 +266,63 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+uint64_t BufferCache::CurrentTick() const noexcept {
+	return m_scheduler.CurrentTick();
+}
+
+void BufferCache::NoteWrite(uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t ChunkMask = (uint64_t {1} << WriteTickChunkBits) - 1u;
+	const auto         tick      = CurrentTick();
+	for (auto mib = vaddr >> 20u; mib <= (vaddr + size - 1u) >> 20u; ++mib) {
+		EXIT_IF((mib >> WriteTickChunkBits) >= m_write_ticks.size());
+		auto& chunk = m_write_ticks[mib >> WriteTickChunkBits];
+		if (chunk == nullptr) {
+			chunk = std::make_unique<std::array<uint64_t, WriteTickChunkSize>>();
+		}
+		(*chunk)[mib & ChunkMask] = tick;
+	}
+}
+
+uint64_t BufferCache::LastWriteTick(uint64_t vaddr) const {
+	constexpr uint64_t ChunkMask = (uint64_t {1} << WriteTickChunkBits) - 1u;
+	const auto         mib       = vaddr >> 20u;
+	if ((mib >> WriteTickChunkBits) >= m_write_ticks.size()) {
+		return 0;
+	}
+	const auto& chunk = m_write_ticks[mib >> WriteTickChunkBits];
+	return chunk != nullptr ? (*chunk)[mib & ChunkMask] : 0;
+}
+
+bool BufferCache::DownloadOnReadbackQueue(const Buffer& buffer, uint64_t buffer_address,
+                                          std::span<const vk::BufferCopy> copies,
+                                          uint64_t                        total_size) {
+	if (m_readback == nullptr || m_async_publishes.load() != 0) {
+		return false;
+	}
+	uint64_t after = m_address_write_tick;
+	for (const auto& copy: copies) {
+		const auto first = buffer_address + copy.srcOffset;
+		for (auto mib = first >> 20u; mib <= (first + copy.size - 1u) >> 20u; ++mib) {
+			const auto tick = LastWriteTick(mib << 20u);
+			// The GPU wrote this memory where this cache did not see it; the main queue covers it.
+			if (tick == 0) {
+				return false;
+			}
+			after = std::max(after, tick);
+		}
+	}
+	// Another queue cannot wait for the command buffer still recording.
+	if (after >= CurrentTick()) {
+		return false;
+	}
+	const auto* data = m_readback->Copy(buffer.Handle(), copies, total_size, after);
+	for (const auto& copy: copies) {
+		Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+		                                      data + copy.dstOffset, copy.size);
+	}
+	return true;
+}
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
@@ -155,6 +341,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    });
 	if (copies.empty()) {
 		return false;
+	}
+	if constexpr (!async) {
+		// Most downloaded memory was written by work the GPU has finished, while the main queue
+		// would run the copy only after everything recorded since.
+		if (DownloadOnReadbackQueue(buffer, buffer_address, copies, total_size)) {
+			return true;
+		}
 	}
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
@@ -207,7 +400,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		BeginAsyncPublish();
+		m_scheduler.DeferPriorityOperation([this, publish = std::move(publish)]() mutable {
+			publish();
+			EndAsyncPublish();
+		});
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
@@ -237,6 +434,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	if (m_graphics.readback_queue != nullptr) {
+		m_readback = std::make_unique<ReadbackQueue>(m_graphics, m_scheduler);
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -265,28 +465,35 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
-void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool exact) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	m_memory_tracker.InvalidateRegion(
+	    vaddr, size, [this, vaddr, size, exact] { ReadMemory(vaddr, size, true, exact); });
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool exact) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, exact] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// A synchronous download waits for all submitted GPU work, which costs far more than the
+		// copy. Guests touch GPU-written memory page after page, so take the GPU-modified data in
+		// the surrounding window too; nearby accesses then find it resident.
+		const uint64_t window = exact ? 1u : DownloadWindow;
+		const auto buffer_end = buffer.CpuAddress() + buffer.Size();
+		const auto begin = std::max(buffer.CpuAddress(), Common::AlignDown(vaddr, window));
+		const auto end   = std::min(buffer_end, Common::AlignUp(vaddr + size, window));
+		if (DownloadBufferMemory<false>(buffer, begin, end - begin)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -372,6 +579,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	NoteWrite(overlap.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
 }
 
@@ -480,8 +688,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionOnlyCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -500,6 +707,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		NoteWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

@@ -12,7 +12,10 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,6 +54,15 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Moves whenever a lookup could find a different image.
+	[[nodiscard]] uint64_t LookupGeneration() const noexcept { return m_structure_generation; }
+	// Repeats, in the same lookup generation, a lookup of an equal description that found `id`
+	// and left `desc` with its view.
+	[[nodiscard]] ImageId ReuseImage(ImageId id, const ImageDesc& desc,
+	                                 uint32_t metadata_base_layer);
+	// For a descriptor the GPU may never use: reuses an image with the same backing or inserts
+	// one into an empty region, and returns an invalid id rather than reshape cached images.
+	[[nodiscard]] ImageId       FindSpeculativeImage(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -149,6 +161,8 @@ private:
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
+	[[nodiscard]] bool CanDownloadStencil(const Image& association) const;
+	void DownloadStencil(Image& association, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
@@ -161,8 +175,49 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
+	// The result of an image lookup, valid while the cache's images and their matching state are
+	// unchanged. A speculative overlap check sets view_mip to 1 when an image of another shape
+	// overlaps. Caller holds m_lock.
+	struct LookupMemo {
+		ImageInfo     info;
+		ImageViewInfo view;
+		uint64_t      generation = 0;
+		ImageId       result;
+		int32_t       view_mip     = -1;
+		int32_t       view_layer   = -1;
+		BindingType   type         = BindingType::Texture;
+		bool          exact_format = false;
+		bool          speculative  = false;
+	};
+	[[nodiscard]] LookupMemo& LookupSlot(const ImageDesc& desc, bool exact_format, bool speculative);
+	[[nodiscard]] bool        LookupMatches(const LookupMemo& memo, const ImageDesc& desc,
+	                                        bool exact_format, bool speculative) const;
+	void StoreLookup(LookupMemo& memo, const ImageDesc& desc, const ImageViewInfo& view,
+	                 bool exact_format, bool speculative, ImageId result, int32_t view_mip,
+	                 int32_t view_layer);
+	void ChangeStructure() { ++m_structure_generation; }
+	[[nodiscard]] ImageId FinishLookup(ImageId result, const ImageDesc& desc,
+	                                   uint32_t metadata_base_layer);
+
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+
+	// Registered images per MiB of guest memory, readable without m_lock: guest threads take a
+	// write fault on every buffer page they rewrite, and most of those pages hold no image.
+	class ImageRegionCounts {
+	public:
+		// Under m_lock, before the image's pages are watched or read.
+		void               Add(GuestRange range, int32_t delta);
+		[[nodiscard]] bool MayHoldImage(uint64_t address, uint64_t size) const;
+
+	private:
+		static constexpr uint64_t RegionBits = 20;
+		static constexpr uint64_t ChunkBits  = 12;
+		using Chunk                          = std::atomic<uint32_t>;
+		std::array<std::atomic<Chunk*>, (TRACKER_ADDRESS_SIZE >> (RegionBits + ChunkBits))>
+		                                      m_chunks {};
+		std::vector<std::unique_ptr<Chunk[]>> m_storage;
+	};
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -173,7 +228,8 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	ImageRegionCounts                                             m_image_regions;
+	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
@@ -184,6 +240,10 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// Moves whenever a lookup could find a different image: on registration and when a cached
+	// image's stencil, metadata or depth association changes.
+	uint64_t                                    m_structure_generation = 1;
+	std::unique_ptr<std::array<LookupMemo, 512>> m_lookup_memo;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

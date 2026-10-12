@@ -66,13 +66,26 @@ public:
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		return FindContaining(address, size, begin, end);
+	}
+
+	// The single range that covers [address, address + size), if one does.
+	[[nodiscard]] bool FindContaining(uint64_t address, uint64_t size, uint64_t& range_begin,
+	                                  uint64_t& range_end) const {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it == m_ranges.begin()) {
 			return false;
 		}
 		--it;
-		return it->first <= address && it->second >= end;
+		if (it->first > address || it->second < end) {
+			return false;
+		}
+		range_begin = it->first;
+		range_end   = it->second;
+		return true;
 	}
 
 	template <typename Func>

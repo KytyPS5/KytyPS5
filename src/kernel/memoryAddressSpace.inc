@@ -26,6 +26,66 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
 	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
 }
+
+// Current page protections of a committed range. Guest mprotect and GPU page watches both live
+// only in these protections, so a view that is recreated must get them back explicitly.
+struct HostProtection {
+	uint64_t vaddr   = 0;
+	uint64_t size    = 0;
+	DWORD    protect = 0;
+};
+
+static bool CaptureHostProtection(uint64_t vaddr, uint64_t size,
+                                  std::vector<HostProtection>& ranges) {
+	const auto end = vaddr + size;
+	while (vaddr < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT) {
+			return false;
+		}
+		const auto next =
+		    std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+		ranges.push_back({vaddr, next - vaddr, info.Protect});
+		vaddr = next;
+	}
+	return true;
+}
+
+// Reapplies the captured protections inside [vaddr, vaddr + size). Runs that already match the
+// protection the view was mapped with need no call.
+static bool RestoreHostProtection(const std::vector<HostProtection>& ranges, uint64_t vaddr,
+                                  uint64_t size, DWORD mapped) {
+	for (const auto& range: ranges) {
+		const auto begin = std::max(vaddr, range.vaddr);
+		const auto end   = std::min(vaddr + size, range.vaddr + range.size);
+		DWORD      old   = 0;
+		if (begin < end && range.protect != mapped &&
+		    VirtualProtect(reinterpret_cast<void*>(begin), end - begin, range.protect, &old) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool HostProtectionAllows(DWORD protect, Graphics::PageFaultAccess access) {
+	using Access = Graphics::PageFaultAccess;
+	if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+		return false;
+	}
+	switch (access) {
+		case Access::Read:
+			return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+			                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+		case Access::Write:
+			return (protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
+			                   PAGE_EXECUTE_WRITECOPY)) != 0;
+		case Access::Execute:
+			return (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+			                   PAGE_EXECUTE_WRITECOPY)) != 0;
+		default: return false;
+	}
+}
 #endif
 
 class GuestBackingStore {
@@ -433,6 +493,16 @@ public:
 			return true;
 		}
 
+		// A view can only be unmapped whole, so its surviving fragments are briefly absent and are
+		// recreated with the view's mapping protection. Restore what they had before; a racing
+		// access during the gap is retried by ResolveTransientFault.
+		std::vector<HostProtection> protection;
+		if (!CaptureHostProtection(old.vaddr, old.size, protection)) {
+			std::lock_guard lock(m_mutex);
+			m_maps.emplace(old.vaddr, old);
+			return false;
+		}
+		const auto mapped_protect = GetProtect(old.mode);
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -450,6 +520,8 @@ public:
 				     ok;
 			}
 			if (ok) {
+				EXIT_IF(!RestoreHostProtection(protection, old.vaddr, left_size, mapped_protect));
+				EXIT_IF(!RestoreHostProtection(protection, right_addr, right_size, mapped_protect));
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
@@ -465,6 +537,7 @@ public:
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
+			EXIT_IF(!RestoreHostProtection(protection, old.vaddr, old.size, mapped_protect));
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
@@ -765,11 +838,15 @@ public:
 		});
 	}
 
+	// Splitting a Windows view briefly removes its surviving neighbours from the backing map.
+	// Transfers wait for such a mapping transaction instead of failing on a mapped range.
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		std::shared_lock lock(m_mutex);
 		return m_backing->TryWriteBacking(vaddr, data, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
+		std::shared_lock lock(m_mutex);
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
@@ -791,23 +868,115 @@ public:
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
 	}
 
-	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+	bool BackingContains(uint64_t vaddr, uint64_t size) {
+		std::shared_lock lock(m_mutex);
+		return m_backing->Contains(vaddr, size);
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Waits for an in-flight mapping transaction, then checks the page's current protection.
+	bool HostAccessAllowed(uint64_t vaddr, Graphics::PageFaultAccess access) {
+		std::shared_lock lock(m_mutex);
+		const bool owned = std::any_of(m_owned.begin(), m_owned.end(), [vaddr](const auto& range) {
+			return vaddr >= range.first && vaddr - range.first < range.second;
+		});
+		MEMORY_BASIC_INFORMATION info {};
+		return owned &&
+		       VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) != 0 &&
+		       info.State == MEM_COMMIT && HostProtectionAllows(info.Protect, access);
+	}
+#endif
+
+	// A fixed mapping over live memory replaces it in two transactions on Windows: the old
+	// mappings are released, then the new view is mapped. Accesses in the window wait for it.
+	void BeginReplacement(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_replacement_mutex);
+		m_replacing.emplace_back(vaddr, size);
+	}
+
+	void EndReplacement(uint64_t vaddr, uint64_t size) {
+		{
+			std::lock_guard lock(m_replacement_mutex);
+			const auto      found =
+			    std::find(m_replacing.begin(), m_replacing.end(), std::pair(vaddr, size));
+			EXIT_IF(found == m_replacing.end());
+			m_replacing.erase(found);
+			m_replacement_generation++;
+		}
+		m_replacement_done.notify_all();
+	}
+
+	// Resolves a fault no page watcher claimed but that a mapping change may have caused: a view
+	// split briefly unmaps its surviving fragments, and a fixed replacement unmaps its range.
+	// Waits for either, then retries the access if the page permits it now.
+	bool ResolveTransientFault(uint64_t vaddr, Graphics::PageFaultAccess access) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const auto replacing = [&] {
+			return std::any_of(m_replacing.begin(), m_replacing.end(), [vaddr](const auto& range) {
+				return vaddr >= range.first && vaddr - range.first < range.second;
+			});
+		};
+		for (;;) {
+			uint64_t generation = 0;
+			{
+				std::lock_guard lock(m_replacement_mutex);
+				generation = m_replacement_generation;
+			}
+			if (HostAccessAllowed(vaddr, access)) {
+				return true;
+			}
+			std::unique_lock lock(m_replacement_mutex);
+			if (!replacing() && m_replacement_generation == generation) {
+				return false;
+			}
+			m_replacement_done.wait(lock, [&] { return !replacing(); });
+		}
+#else
+		// Other hosts replace mappings atomically.
+		(void)vaddr;
+		(void)access;
+		return false;
+#endif
+	}
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		SetExecutableUnlocked(vaddr, size, VirtualMemory::IsExecute(mode));
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	// A page watch only changes read and write access. Guest code in a watched page (the GPU
+	// can watch any guest memory, including the pages a module's code shares) stays executable.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		// Watches only read the mappings. The page manager serializes the watches of each page,
+		// so faulting guest threads no longer queue behind the GPU thread's protection changes.
+		std::shared_lock lock(m_mutex);
+		const auto       end     = vaddr + size;
+		auto            current = vaddr;
+		auto            it      = m_executable.upper_bound(vaddr);
+		if (it != m_executable.begin() && std::prev(it)->second > vaddr) {
+			--it;
+		}
+		for (; it != m_executable.end() && it->first < end; ++it) {
+			const auto code_begin = std::max(current, it->first);
+			const auto code_end   = std::min(end, it->second);
+			if (current < code_begin &&
+			    !ProtectMappedUnlocked(current, code_begin - current, mode)) {
+				return false;
+			}
+			if (!ProtectMappedUnlocked(code_begin, code_end - code_begin, WithExecute(mode))) {
+				return false;
+			}
+			current = code_end;
+		}
+		return current == end || ProtectMappedUnlocked(current, end - current, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -832,6 +1001,7 @@ public:
 			if (!replacing) {
 				EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
 			}
+			SetExecutableUnlocked(vaddr, size, VirtualMemory::IsExecute(mode));
 			return true;
 		}
 		if (!replacing) {
@@ -853,6 +1023,7 @@ public:
 			return false;
 		}
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
+		SetExecutableUnlocked(vaddr, size, false);
 		AddFreeUnlocked(vaddr, size);
 		return true;
 	}
@@ -924,10 +1095,12 @@ public:
 			return false;
 		}
 		EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
+		SetExecutableUnlocked(vaddr, size, VirtualMemory::IsExecute(mode));
 		return true;
 #else
 		if (VirtualMemory::Protect(vaddr, size, host_mode)) {
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
+			SetExecutableUnlocked(vaddr, size, VirtualMemory::IsExecute(mode));
 			return true;
 		}
 		AddFreeUnlocked(vaddr, size);
@@ -965,6 +1138,7 @@ public:
 		}
 #endif
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Private));
+		SetExecutableUnlocked(vaddr, size, false);
 		AddFreeUnlocked(vaddr, size);
 		return true;
 	}
@@ -1042,6 +1216,43 @@ private:
 			}
 		}
 		return true;
+	}
+
+	static VirtualMemory::Mode WithExecute(VirtualMemory::Mode mode) {
+		switch (mode) {
+			case VirtualMemory::Mode::Read: return VirtualMemory::Mode::ExecuteRead;
+			case VirtualMemory::Mode::Write:
+			case VirtualMemory::Mode::ReadWrite: return VirtualMemory::Mode::ExecuteReadWrite;
+			// Executing a page that must not be read faults like a read and resolves the watch.
+			default: return mode;
+		}
+	}
+
+	void SetExecutableUnlocked(uint64_t vaddr, uint64_t size, bool executable) {
+		const auto end = vaddr + size;
+		auto       it  = m_executable.lower_bound(vaddr);
+		if (it != m_executable.begin()) {
+			auto previous = std::prev(it);
+			if (previous->second > vaddr) {
+				const auto previous_end = previous->second;
+				previous->second        = vaddr;
+				if (previous_end > end) {
+					m_executable.emplace(end, previous_end);
+				}
+			}
+		}
+		while (it != m_executable.end() && it->first < end) {
+			if (it->second > end) {
+				const auto tail_end = it->second;
+				m_executable.erase(it);
+				m_executable.emplace(end, tail_end);
+				break;
+			}
+			it = m_executable.erase(it);
+		}
+		if (executable) {
+			m_executable.emplace(vaddr, end);
+		}
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
@@ -1406,7 +1617,13 @@ private:
 	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	// Begin -> end of the ranges the guest mapped or protected executable.
+	std::map<uint64_t, uint64_t>               m_executable;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
+	std::mutex                                 m_replacement_mutex;
+	std::condition_variable                    m_replacement_done;
+	std::vector<std::pair<uint64_t, uint64_t>> m_replacing;
+	uint64_t                                   m_replacement_generation = 0;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
 };

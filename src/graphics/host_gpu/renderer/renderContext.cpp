@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
 
 namespace Libs::Graphics {
 
@@ -58,7 +59,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	// Only a page watcher makes a fault the caches' to resolve. Any other fault in GPU-visible
+	// memory (a guest protection, or a page briefly absent while its view is remapped) must not
+	// create cache state here: before the first submission there is no command buffer for it.
+	if (!IsWatched(access, fault_vaddr) || !IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
@@ -70,6 +74,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+bool RenderContext::IsWatched(PageFaultAccess access, uint64_t fault_vaddr) const noexcept {
+	return m_page_manager.IsWatched(fault_vaddr, access);
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -79,17 +87,45 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+// Generations are unique across contexts, so a thread's cached range never matches another one.
+static uint64_t NextMappingGeneration() {
+	static std::atomic<uint64_t> next {0};
+	return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
+	// Shader resource evaluation probes dozens of words of one mapping per draw, and the shared
+	// lock is contended by faulting guest threads. Remember the last mapping this thread found;
+	// every map and unmap moves the generation and invalidates it.
+	struct CachedRange {
+		const RenderContext* owner      = nullptr;
+		uint64_t             generation = 0;
+		uint64_t             begin      = 0;
+		uint64_t             end        = 0;
+	};
+	thread_local CachedRange cached;
+	if (cached.owner == this &&
+	    cached.generation == m_mapping_generation.load(std::memory_order_acquire) &&
+	    vaddr >= cached.begin && size <= cached.end - vaddr && vaddr < cached.end) {
+		return true;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	return m_mapped_ranges.Contains(vaddr, size);
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	if (!m_mapped_ranges.FindContaining(vaddr, size, begin, end)) {
+		return false;
+	}
+	cached = {this, m_mapping_generation.load(std::memory_order_relaxed), begin, end};
+	return true;
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_mapping_generation.store(NextMappingGeneration(), std::memory_order_release);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -109,10 +145,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
-		m_buffer_cache.InvalidateMemory(vaddr, size);
+		// Only the unmapped range loses its backing; the rest of a buffer keeps its GPU data.
+		m_buffer_cache.InvalidateMemory(vaddr, size, true);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapping_generation.store(NextMappingGeneration(), std::memory_order_release);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -123,15 +161,45 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(std::span<const uint64_t> address_bases) {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// A DMA read of memory without a cached buffer returns zero; the fault only backs the page for
+	// later dispatches. A shader reading from a per-frame ring this way read zeros whenever the
+	// ring had moved onto new pages. Back a window at each known base.
+	constexpr uint64_t BaseWindow = 256ull << 10u;
+	for (const auto base: address_bases) {
+		if (base == 0) {
+			continue;
+		}
+		m_mapped_ranges.ForEachInRange(base, BaseWindow, [&](uint64_t start, uint64_t end) {
+			if (start == base) {
+				(void)m_buffer_cache.FindBuffer(start, end - start);
+			}
+		});
+	}
+	// Every buffer must hold the guest's CPU writes before the shader reads memory directly. A
+	// sweep of every buffer before each DMA draw and dispatch would mostly find nothing to upload,
+	// so only the buffers in tracker regions with new CPU writes are visited. Regions are taken
+	// before uploading, and writes from then on queue their region again.
+	m_buffer_cache.TakeCpuModifiedRegions(m_bda_regions);
+	const auto generation = m_mapping_generation.load(std::memory_order_relaxed);
+	if (generation != m_bda_mapping_generation) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		m_bda_mapping_generation = generation;
+	} else {
+		for (const auto region: m_bda_regions) {
+			m_mapped_ranges.ForEachInRange(
+			    region, TRACKER_REGION_SIZE, [this](uint64_t start, uint64_t end) {
+				    m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			    });
+		}
+	}
 	m_fault_process_pending = true;
 }
 
@@ -141,6 +209,14 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	// The caches age resources in collections, and this runs after every guest submission. A
+	// title that submits dozens of times a frame had its buffers and images retired after a
+	// fraction of a second unused, then recreated and uploaded again. Collect once per frame.
+	const auto frame = m_gpu != nullptr ? m_gpu->GetFrameNum() : 0;
+	if (frame == m_gc_frame) {
+		return;
+	}
+	m_gc_frame = frame;
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
 }

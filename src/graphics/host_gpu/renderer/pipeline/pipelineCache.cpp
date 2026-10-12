@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -104,10 +105,54 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	// Reads on paths the GPU does not take can follow garbage pointers; memory that is not
+	// mapped cannot be what the GPU reads, and reads as zero.
+	if (!Libs::LibKernel::Memory::IsGpuMemoryMapped(address, values.size_bytes())) {
+		std::ranges::fill(values, 0u);
+		return true;
+	}
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                     values.size_bytes());
+}
+
+// A texture the texture cache can place: its view lies within its physical mips, and its image
+// is mapped and aligned for its tiling block.
+bool IsPlaceableTexture(std::span<const uint32_t, 8> words) {
+	ShaderTextureResource descriptor;
+	std::ranges::copy(words, descriptor.fields);
+	const auto type = descriptor.Type();
+	const auto base = descriptor.BaseLevel();
+	const auto last = descriptor.LastLevel();
+	// Multisampled descriptors encode log2(samples) in their level fields.
+	const bool msaa = type == Prospero::ImageType::kColor2DMsaa ||
+	                  type == Prospero::ImageType::kColor2DMsaaArray;
+	if (msaa ? base != 0 || last == 0 || last > 3 || descriptor.MaxMip() != last
+	         : base > last || last > descriptor.MaxMip()) {
+		return false;
+	}
+	// Destination selects 2 and 3 are reserved.
+	for (const auto select: {descriptor.DstSelX(), descriptor.DstSelY(), descriptor.DstSelZ(),
+	                         descriptor.DstSelW()}) {
+		if (select == 2u || select == 3u) {
+			return false;
+		}
+	}
+	const auto address = descriptor.Base40();
+	if (!Libs::LibKernel::Memory::IsGpuMemoryMapped(address, 1)) {
+		return false;
+	}
+	if (descriptor.TileMode() == Prospero::TileMode::kLinear) {
+		return (address & 255u) == 0;
+	}
+	TileTextureBlockLayout layout;
+	return TileGetTextureBlockLayout(descriptor.Format(), descriptor.TileMode(),
+	                                 descriptor.Type() == Prospero::ImageType::kColor3D, layout) &&
+	       layout.block.block_size != 0 && (address & (layout.block.block_size - 1u)) == 0;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -147,8 +192,8 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	file.Write(code.data(), code.size_bytes());
 }
 
-bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
+bool ValidateShaderSpirv(const char* label, uint64_t shader_hash, const std::vector<uint32_t>& spirv,
+                         bool sample_offsets) {
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
@@ -160,7 +205,10 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        static_cast<int>(position.column), static_cast<int>(position.index),
 		                        message);
 	});
-	if (tools.Validate(spirv)) {
+	// VK_KHR_maintenance8 allows a non-constant Offset on sampling instructions.
+	spvtools::ValidatorOptions validator;
+	validator.SetAllowOffsetTextureOperand(sample_offsets);
+	if (tools.Validate(spirv.data(), spirv.size(), validator)) {
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -246,8 +294,11 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+			                                                specialization)) {
+				EXIT("resource materialization failed: hash=0x%016" PRIx64 " stage=%u\n",
+				     resource_plan.shader_hash, static_cast<uint32_t>(resource_plan.stage));
+			}
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -296,7 +347,8 @@ struct PipelineCache::ProgramCache {
 	                               std::span<const uint32_t> function_code) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+		                         options.sample_offsets)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -341,6 +393,8 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .is_mapped                  = Libs::LibKernel::Memory::IsGpuMemoryMapped,
+		    .is_placeable_texture       = IsPlaceableTexture,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
@@ -391,6 +445,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.sample_offsets = sample_offsets;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -422,9 +477,12 @@ struct PipelineCache::ProgramCache {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
+			                                                entry->second.resources,
+			                                                entry->second.specialization)) {
+				EXIT("resource materialization failed: hash=0x%016" PRIx64 " stage=%s\n",
+				     params.hash, stage_name);
+			}
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
@@ -456,7 +514,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, bool sample_offsets)
+	    : device(device), sample_offsets(sample_offsets) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -471,11 +530,14 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	bool                                                        sample_offsets = false;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics),
+      m_program_cache(
+          std::make_unique<ProgramCache>(graphics.device, graphics.sample_offsets_enabled)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

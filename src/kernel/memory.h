@@ -119,8 +119,12 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Whether guest memory in the range is mapped for GPU access; reads nothing.
+[[nodiscard]] bool     IsGpuMemoryMapped(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
-[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// Resolves host faults on guest memory: GPU page watches, then transient remapping gaps.
+[[nodiscard]] bool HandleMemoryFault(Graphics::PageFaultAccess access,
+                                     uint64_t                  fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

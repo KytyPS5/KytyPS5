@@ -480,10 +480,17 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	    });
 }
 
+template <typename Store>
+void ForEachStoreBinding(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
+                         Store&& store);
+
 void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		StoreSubwordPrepared(ctx, inst, mem, resource, bits, ctx.Arg(inst, inst.NumArgs() - 2));
+		ForEachStoreBinding(ctx, inst, mem, [&](const IR::MemoryInfo& target) {
+			const auto resource = PrepareMemoryResourceAccess(ctx.state, target);
+			StoreSubwordPrepared(ctx, inst, target, resource, bits,
+			                     ctx.Arg(inst, inst.NumArgs() - 2));
+		});
 	});
 }
 
@@ -546,52 +553,64 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	});
 }
 
+// Emits a buffer store once for its binding, or, through a GPU-selected descriptor, once per
+// candidate binding under a switch on the key. Null candidates store nothing.
+template <typename Store>
+void ForEachStoreBinding(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
+                         Store&& store) {
+	auto&      state     = ctx.state;
+	const auto candidate = [&](uint32_t resource) {
+		const auto& buffer = state.program.info.buffers[resource];
+		if (buffer.packed_stride == 0u && buffer.source < state.program.descriptor_sources.size() &&
+		    state.program.descriptor_sources[buffer.source].indirect_descriptor)
+			return;
+		mem.resource = resource;
+		store(mem);
+	};
+	if (mem.kind != IR::ResourceKind::Buffer ||
+	    state.program.info.buffers[mem.resource].indirect_root != mem.resource) {
+		if (mem.kind == IR::ResourceKind::Buffer) {
+			candidate(mem.resource);
+		} else {
+			store(mem);
+		}
+		return;
+	}
+	const auto& buffer = state.program.info.buffers[mem.resource];
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	if (handle == nullptr || buffer.indirect_resources.empty() ||
+	    state.flattened_srt_variable == 0 || buffer.indirect_search_iterations == 0u) {
+		ctx.Fail(inst, "has no indirect buffer runtime mapping");
+		return;
+	}
+	const auto selected = EmitIndirectResourceIndex(
+	    state, ctx.Arg(*handle, 0), buffer.indirect_mapping_offset,
+	    buffer.indirect_search_iterations, UINT32_MAX);
+	const auto merge = state.builder.AllocateId();
+	std::vector<uint32_t> labels(buffer.indirect_resources.size());
+	std::vector<uint32_t> branches {spv::OpSwitch, selected, merge};
+	for (uint32_t i = 0; i < labels.size(); ++i) {
+		labels[i] = state.builder.AllocateId();
+		branches.push_back(i);
+		branches.push_back(labels[i]);
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(branches);
+	for (uint32_t i = 0; i < labels.size(); ++i) {
+		EmitLabel(state, labels[i]);
+		candidate(buffer.indirect_resources[i]);
+		state.builder.AddFunction(spv::OpBranch, merge);
+	}
+	EmitLabel(state, merge);
+}
+
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
-		const auto store = [&](uint32_t resource) {
-			if (mem.kind == IR::ResourceKind::Buffer) {
-				const auto& buffer = state.program.info.buffers[resource];
-				if (buffer.packed_stride == 0u &&
-				    buffer.source < state.program.descriptor_sources.size() &&
-				    state.program.descriptor_sources[buffer.source].indirect_descriptor) return;
-			}
-			mem.resource = resource;
-			const auto access = PrepareMemoryResourceAccess(state, mem);
-			StoreWordPrepared(ctx, inst, mem, access, data);
-		};
-		if (mem.kind != IR::ResourceKind::Buffer ||
-		    state.program.info.buffers[mem.resource].indirect_root != mem.resource) {
-			store(mem.resource);
-			return;
-		}
-		const auto& buffer = state.program.info.buffers[mem.resource];
-		const auto* handle = inst.Arg(0).ResolveInstruction();
-		if (handle == nullptr || buffer.indirect_resources.empty() ||
-		    state.flattened_srt_variable == 0 || buffer.indirect_search_iterations == 0u) {
-			ctx.Fail(inst, "has no indirect buffer runtime mapping");
-			return;
-		}
-		const auto selected = EmitIndirectResourceIndex(
-		    state, ctx.Arg(*handle, 0), buffer.indirect_mapping_offset,
-		    buffer.indirect_search_iterations, UINT32_MAX);
-		const auto merge = state.builder.AllocateId();
-		std::vector<uint32_t> labels(buffer.indirect_resources.size());
-		std::vector<uint32_t> branches {spv::OpSwitch, selected, merge};
-		for (uint32_t i = 0; i < labels.size(); ++i) {
-			labels[i] = state.builder.AllocateId();
-			branches.push_back(i);
-			branches.push_back(labels[i]);
-		}
-		state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
-		state.builder.AddFunction(branches);
-		for (uint32_t i = 0; i < labels.size(); ++i) {
-			EmitLabel(state, labels[i]);
-			store(buffer.indirect_resources[i]);
-			state.builder.AddFunction(spv::OpBranch, merge);
-		}
-		EmitLabel(state, merge);
+		ForEachStoreBinding(ctx, inst, mem, [&](const IR::MemoryInfo& target) {
+			StoreWordPrepared(ctx, inst, target, PrepareMemoryResourceAccess(state, target), data);
+		});
 	});
 }
 
@@ -825,14 +844,16 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 
 void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		const auto data     = ctx.Arg(inst, inst.NumArgs() - 2);
-		const auto info     = Format::GetFormatInfo(BufferFormat(ctx, mem));
-		if (info.type == Format::ComponentType::Unknown) {
-			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, 0u), resource, data);
-			return;
-		}
-		StoreFormattedPrepared(ctx, inst, mem, resource, info, data, 1u);
+		const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
+		ForEachStoreBinding(ctx, inst, mem, [&](const IR::MemoryInfo& target) {
+			const auto resource = PrepareMemoryResourceAccess(ctx.state, target);
+			const auto info     = Format::GetFormatInfo(BufferFormat(ctx, target));
+			if (info.type == Format::ComponentType::Unknown) {
+				StoreWordPrepared(ctx, inst, RebaseRawComponent(target, 0u), resource, data);
+				return;
+			}
+			StoreFormattedPrepared(ctx, inst, target, resource, info, data, 1u);
+		});
 	});
 }
 
@@ -1058,21 +1079,22 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto mem       = ctx.Memory(inst);
-		const auto resource  = PrepareMemoryResourceAccess(state, mem);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
-		const auto info = Format::GetFormatInfo(
-		    mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
-		if (info.type != Format::ComponentType::Unknown) {
-			StoreFormattedPrepared(ctx, inst, mem, resource, info, composite, components);
-			return;
-		}
-		for (uint32_t component = 0; component < components; component++) {
-			const auto data = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite,
-			                          component);
-			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
-		}
+		ForEachStoreBinding(ctx, inst, ctx.Memory(inst), [&](const IR::MemoryInfo& mem) {
+			const auto resource = PrepareMemoryResourceAccess(state, mem);
+			const auto info     = Format::GetFormatInfo(
+			    mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
+			if (info.type != Format::ComponentType::Unknown) {
+				StoreFormattedPrepared(ctx, inst, mem, resource, info, composite, components);
+				return;
+			}
+			for (uint32_t component = 0; component < components; component++) {
+				const auto data = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite,
+				                          component);
+				StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
+			}
+		});
 	});
 }
 

@@ -25,6 +25,9 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// The host takes a non-constant Offset image operand on sampling instructions
+	// (VK_KHR_maintenance8), as RDNA 2 takes a VGPR texel offset.
+	bool                        sample_offsets             = false;
 };
 
 struct TranslateResult {

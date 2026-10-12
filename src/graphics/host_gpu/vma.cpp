@@ -20,7 +20,14 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cinttypes>
+#include <cstdio>
+#include <fmt/format.h>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -52,9 +59,178 @@ bool GraphicContext::CreateAllocator() {
 	return true;
 }
 
+namespace {
+
+// Checkpoint markers index this ring; a marker is the record's sequence number plus one.
+struct CheckpointRecord {
+	GpuCheckpoint kind        = GpuCheckpoint::Dispatch;
+	uint64_t      shader_hash = 0;
+	uint64_t      args_addr   = 0;
+};
+constexpr uint32_t                            CheckpointCount = 1u << 16u;
+constexpr uint32_t                            ArgsStride      = 16;
+std::array<CheckpointRecord, CheckpointCount> g_checkpoints;
+std::atomic<uint64_t>                         g_next_checkpoint {0};
+// Indirect arguments as the GPU read them, copied just before each indirect command.
+std::once_flag  g_args_once;
+VkBuffer        g_args_buffer     = VK_NULL_HANDLE;
+VmaAllocation   g_args_allocation = nullptr;
+const uint32_t* g_args_mapped     = nullptr;
+
+void ReportArgs(uint64_t marker, const CheckpointRecord& record) {
+	if (record.args_addr == 0 || g_args_mapped == nullptr) {
+		return;
+	}
+	const auto* args = g_args_mapped + ((marker - 1u) % CheckpointCount) * (ArgsStride / 4u);
+	std::printf("    args at 0x%016" PRIx64 ": %u %u %u\n", record.args_addr, args[0], args[1],
+	            args[2]);
+}
+
+void ReportCheckpoints(vk::Queue queue) {
+	const auto get_data = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV;
+	if (get_data == nullptr || queue == nullptr) {
+		return;
+	}
+	uint32_t count = 0;
+	get_data(queue, &count, nullptr);
+	std::vector<VkCheckpointDataNV> data(count);
+	for (auto& entry: data) {
+		entry.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+	}
+	get_data(queue, &count, data.data());
+	const auto newest = g_next_checkpoint.load(std::memory_order_acquire);
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto marker = reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker);
+		const auto stage  = vk::to_string(static_cast<vk::PipelineStageFlagBits>(data[i].stage));
+		if (marker == 0 || marker > newest || newest - marker >= CheckpointCount) {
+			std::printf("  checkpoint %s: marker %zu (no record)\n", stage.c_str(),
+			            static_cast<size_t>(marker));
+			continue;
+		}
+		const auto& record = g_checkpoints[(marker - 1u) % CheckpointCount];
+		const char* kind   = record.kind == GpuCheckpoint::Draw       ? "draw"
+		                     : record.kind == GpuCheckpoint::Dispatch ? "dispatch"
+		                                                              : "indirect dispatch";
+		std::printf("  checkpoint %s: #%zu %s shader 0x%016" PRIx64 " (%zu commands before the "
+		            "newest)\n",
+		            stage.c_str(), static_cast<size_t>(marker), kind, record.shader_hash,
+		            static_cast<size_t>(newest - marker));
+		ReportArgs(marker, record);
+	}
+	// Earlier indirect commands show what their arguments normally look like.
+	uint32_t shown = 0;
+	for (uint64_t marker = newest; marker > 0 && newest - marker < CheckpointCount && shown < 8;
+	     --marker) {
+		const auto& record = g_checkpoints[(marker - 1u) % CheckpointCount];
+		if (record.args_addr != 0) {
+			std::printf("  recent indirect #%zu shader 0x%016" PRIx64 "\n",
+			            static_cast<size_t>(marker), record.shader_hash);
+			ReportArgs(marker, record);
+			shown++;
+		}
+	}
+	std::fflush(stdout);
+}
+
+void CreateArgsBuffer(VmaAllocator allocator) {
+	VkBufferCreateInfo buffer_info {};
+	buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	buffer_info.size  = uint64_t {CheckpointCount} * ArgsStride;
+	buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationCreateInfo alloc_info {};
+	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	alloc_info.flags =
+	    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VmaAllocationInfo info {};
+	if (vmaCreateBuffer(allocator, &buffer_info, &alloc_info, &g_args_buffer, &g_args_allocation,
+	                    &info) == VK_SUCCESS) {
+		g_args_mapped = static_cast<const uint32_t*>(info.pMappedData);
+	}
+}
+
+} // namespace
+
+void GraphicContext::SetCheckpoint(vk::CommandBuffer command, GpuCheckpoint kind,
+                                   uint64_t shader_hash, vk::Buffer args,
+                                   vk::DeviceSize args_offset, uint64_t args_addr) const {
+	if (!checkpoints_enabled) {
+		return;
+	}
+	const auto sequence = g_next_checkpoint.fetch_add(1, std::memory_order_acq_rel) + 1u;
+	g_checkpoints[(sequence - 1u) % CheckpointCount] = {kind, shader_hash,
+	                                                    args ? args_addr : uint64_t {0}};
+	if (args) {
+		std::call_once(g_args_once, CreateArgsBuffer, allocator);
+	}
+	if (args && g_args_buffer != VK_NULL_HANDLE) {
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                        vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr,
+		                        0, nullptr);
+		const vk::BufferCopy copy {args_offset, ((sequence - 1u) % CheckpointCount) * ArgsStride,
+		                           3 * sizeof(uint32_t)};
+		command.copyBuffer(args, vk::Buffer {g_args_buffer}, 1, &copy);
+	}
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetCheckpointNV(
+	    command, reinterpret_cast<const void*>(static_cast<uintptr_t>(sequence)));
+}
+
+// A lost device says little by itself; VK_EXT_device_fault reports the addresses the GPU faulted
+// on, which identify the buffer or image it was accessing.
+void GraphicContext::ReportDeviceFault() const {
+	if (checkpoints_enabled) {
+		ReportCheckpoints(queue);
+	}
+	const auto get_fault_info = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT;
+	if (!device_fault_enabled || get_fault_info == nullptr || device == nullptr) {
+		return;
+	}
+	VkDeviceFaultCountsEXT counts {};
+	counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+	if (get_fault_info(device, &counts, nullptr) != VK_SUCCESS) {
+		return;
+	}
+	std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<VkDeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	counts.vendorBinarySize = 0;
+	VkDeviceFaultInfoEXT info {};
+	info.sType         = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+	info.pAddressInfos = addresses.data();
+	info.pVendorInfos  = vendors.data();
+	const auto result  = get_fault_info(device, &counts, &info);
+	if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+		return;
+	}
+	const auto report = [](const std::string& line) {
+		LOGF("%s", line.c_str());
+		std::printf("%s", line.c_str());
+	};
+	report(fmt::format("Device fault: {}\n", info.description));
+	for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
+		const auto& address = addresses[i];
+		report(fmt::format(
+		    "  address 0x{:016x} precision 0x{:x}: {}\n", address.reportedAddress,
+		    address.addressPrecision,
+		    vk::to_string(static_cast<vk::DeviceFaultAddressTypeEXT>(address.addressType))));
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
+		const auto& vendor = vendors[i];
+		report(fmt::format("  vendor: {} code=0x{:x} data=0x{:x}\n", vendor.description,
+		                   vendor.vendorFaultCode, vendor.vendorFaultData));
+	}
+	std::fflush(stdout);
+}
+
 void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
+	}
+	if (g_args_buffer != VK_NULL_HANDLE) {
+		vmaDestroyBuffer(allocator, g_args_buffer, g_args_allocation);
+		g_args_buffer = VK_NULL_HANDLE;
+		g_args_mapped = nullptr;
 	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;

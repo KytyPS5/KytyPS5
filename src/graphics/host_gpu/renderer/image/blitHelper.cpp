@@ -180,6 +180,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                             &descriptor_write);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics,
 	                     GetPipeline({destination_info.samples, destination_info.pixel_format}));
+	command_buffer.ForgetGraphicsPipeline();
 
 	const vk::Viewport viewport {0.0f,
 	                             0.0f,

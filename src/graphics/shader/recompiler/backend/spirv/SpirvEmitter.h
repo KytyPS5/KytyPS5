@@ -10,8 +10,9 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
+// `sample_offsets`: the host takes a non-constant Offset operand on sampling instructions.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t push_data_start_dword = 0);
+                                  uint32_t push_data_start_dword = 0, bool sample_offsets = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

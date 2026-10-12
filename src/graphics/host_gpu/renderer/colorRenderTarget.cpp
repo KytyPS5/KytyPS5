@@ -18,6 +18,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
+#include <memory>
 
 namespace Libs::Graphics {
 
@@ -55,6 +57,47 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	r             = {};
 	r.target_slot = rt_slot;
+
+	// Targets rarely change between draws, but resolving one rebuilds its tiled layout and looks
+	// it up in the texture cache. Remember resolved targets by their registers, with the image
+	// the cache found while its lookup generation is unchanged.
+	struct Remembered {
+		bool             valid = false;
+		HW::RenderTarget registers;
+		uint32_t         mask         = 0;
+		uint32_t         slice_offset = 0;
+		RenderColorInfo  resolved;
+		uint64_t         lookup_generation = 0;
+		bool             exact_format      = false;
+		ImageId          image;
+		uint32_t         base_level = 0;
+		uint32_t         base_layer = 0;
+	};
+	static thread_local auto remembered    = std::make_unique<std::array<Remembered, 64>>();
+	auto&                    texture_cache = m_context.GetTextureCache();
+	auto&                    memo =
+	    (*remembered)[(rt_slot * 8u + ((rt.base.addr >> 8u) ^ (rt.base.addr >> 16u))) % 64u];
+	if (rt.base.addr != 0 && mask != 0 && memo.valid && memo.mask == mask &&
+	    memo.slice_offset == render_target_slice_offset && memo.resolved.target_slot == rt_slot &&
+	    std::memcmp(&memo.registers, &rt, sizeof(rt)) == 0) {
+		r = memo.resolved;
+		if (memo.lookup_generation == texture_cache.LookupGeneration() &&
+		    memo.exact_format == exact_format) {
+			r.desc.view_info.base_level = memo.base_level;
+			r.desc.view_info.base_layer = memo.base_layer;
+			r.image_id = texture_cache.ReuseImage(memo.image, r.desc,
+			                                      memo.resolved.desc.view_info.base_layer);
+		} else {
+			r.image_id             = texture_cache.FindImage(r.desc, exact_format);
+			memo.lookup_generation = texture_cache.LookupGeneration();
+			memo.exact_format      = exact_format;
+			memo.image             = r.image_id;
+			memo.base_level        = r.desc.view_info.base_level;
+			memo.base_layer        = r.desc.view_info.base_layer;
+		}
+		BindRenderTarget(r.image_id);
+		return;
+	}
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
@@ -236,7 +279,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		// DCC owns the clear when both planes are enabled; single-sample CMASK stays expanded.
 		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
-		desc.info.metadata.clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.clear_word =
+		    rt.clear_word0.word0 | (uint64_t {rt.clear_word1.word1} << 32u);
 		desc.info.metadata.clear_register_valid = true;
 	}
 	desc.view_info.format = target_format.format;
@@ -253,11 +297,20 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	memo.valid                 = true;
+	std::memcpy(&memo.registers, &rt, sizeof(rt));
+	memo.mask              = mask;
+	memo.slice_offset      = render_target_slice_offset;
+	memo.resolved          = r;
+	r.image_id             = texture_cache.FindImage(r.desc, exact_format);
+	memo.lookup_generation = texture_cache.LookupGeneration();
+	memo.exact_format      = exact_format;
+	memo.image             = r.image_id;
+	memo.base_level        = r.desc.view_info.base_level;
+	memo.base_layer        = r.desc.view_info.base_layer;
 	BindRenderTarget(r.image_id);
 }
 

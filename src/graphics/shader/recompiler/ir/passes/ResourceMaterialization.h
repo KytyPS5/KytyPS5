@@ -30,6 +30,7 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		bool                          speculative                = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

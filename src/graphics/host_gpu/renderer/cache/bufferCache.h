@@ -11,7 +11,10 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -50,8 +53,12 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// A readback publishes the GPU-modified data in the DownloadWindow-aligned window around the
+	// range, since guests touch GPU-written memory page after page. An exact readback, such as for
+	// an unmap, publishes only the range.
+	static constexpr uint64_t DownloadWindow = uint64_t {1} << 20u;
+	void InvalidateMemory(uint64_t vaddr, uint64_t size, bool exact = false);
+	void ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false, bool exact = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -81,10 +88,26 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// The tracker regions where SynchronizeBuffersInRange could find new CPU-modified data since
+	// the last call: pages became CPU-modified there, or a buffer was registered.
+	void TakeCpuModifiedRegions(std::vector<uint64_t>& regions) {
+		m_memory_tracker.TakeCpuModifiedRegions(regions);
+	}
 	void               RunGarbageCollector();
+	// A draw or dispatch that writes guest memory through shader addresses. Those writes have no
+	// tracked range, so a readback waits for the last of them.
+	void NoteAddressWrites() noexcept { m_address_write_tick = CurrentTick(); }
+	// Records that the command buffer recording now writes these bytes of guest memory. A
+	// readback on the readback queue waits for the last such command buffer.
+	void NoteWrite(uint64_t vaddr, uint64_t size);
+	// Readbacks published later from GPU completion (asynchronous downloads) must not be
+	// overtaken by a newer synchronous one; these bracket each.
+	void BeginAsyncPublish() noexcept { m_async_publishes.fetch_add(1); }
+	void EndAsyncPublish() noexcept { m_async_publishes.fetch_sub(1); }
 
 private:
 	friend struct BufferCacheTestAccess;
+	class ReadbackQueue;
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
@@ -120,6 +143,15 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// A synchronous download whose memory the main queue has finished writing, or will once
+	// submitted work completes, copied on the readback queue. False leaves it to the main queue.
+	[[nodiscard]] bool DownloadOnReadbackQueue(const Buffer& buffer, uint64_t buffer_address,
+	                                           std::span<const vk::BufferCopy> copies,
+	                                           uint64_t                        total_size);
+	// The tick of the command buffer recording now.
+	[[nodiscard]] uint64_t CurrentTick() const noexcept;
+	// The tick of the last recorded write to the MiB holding `vaddr`; zero if none was.
+	[[nodiscard]] uint64_t LastWriteTick(uint64_t vaddr) const;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -137,6 +169,16 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
+	std::unique_ptr<ReadbackQueue>                    m_readback;
+	// Per MiB of guest memory, in chunks allocated as memory is written: the tick of the last
+	// command buffer that wrote it on the GPU.
+	static constexpr uint64_t WriteTickChunkBits = 12;
+	static constexpr size_t   WriteTickChunkSize = size_t {1} << WriteTickChunkBits;
+	static constexpr size_t   WriteTickChunks    = size_t {1} << (44u - 20u - WriteTickChunkBits);
+	std::array<std::unique_ptr<std::array<uint64_t, WriteTickChunkSize>>, WriteTickChunks>
+	                                                  m_write_ticks;
+	uint64_t                                          m_address_write_tick = 0;
+	std::atomic<uint32_t>                             m_async_publishes {0};
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

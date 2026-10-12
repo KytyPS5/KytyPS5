@@ -14,6 +14,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -914,6 +917,10 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	}
 }
 
+bool IsGpuMemoryMapped(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
+}
+
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
@@ -926,8 +933,27 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
-bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+bool HandleMemoryFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	// In GPU-visible memory, other threads lift a page's watch while handling their own faults and
+	// the GPU watches it again, so a fault can momentarily belong to neither owner. Give such a
+	// fault a bounded time to settle before reporting it.
+	constexpr auto SettleTime = std::chrono::milliseconds(250);
+	const bool     gpu_visible =
+	    g_gpu_resources != nullptr && g_gpu_resources->IsMapped(fault_vaddr, 1);
+	const auto deadline = std::chrono::steady_clock::now() + SettleTime;
+	for (;;) {
+		if (g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr)) {
+			return true;
+		}
+		if (g_guest_address_space != nullptr &&
+		    g_guest_address_space->ResolveTransientFault(fault_vaddr, access)) {
+			return true;
+		}
+		if (!gpu_visible || std::chrono::steady_clock::now() >= deadline) {
+			return false;
+		}
+		std::this_thread::yield();
+	}
 }
 
 struct PrtAperture {
@@ -1007,6 +1033,30 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 }
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
+
+// Spans a fixed mapping that replaces live memory, from releasing the old mappings until the new
+// one is mapped. Faulting accesses in the range wait for it instead of failing.
+class ReplacementWindow {
+public:
+	ReplacementWindow() = default;
+	~ReplacementWindow() {
+		if (m_size != 0) {
+			g_guest_address_space->EndReplacement(m_vaddr, m_size);
+		}
+	}
+	KYTY_CLASS_NO_COPY(ReplacementWindow);
+
+	void Open(uint64_t vaddr, uint64_t size) {
+		EXIT_IF(m_size != 0 || size == 0);
+		g_guest_address_space->BeginReplacement(vaddr, size);
+		m_vaddr = vaddr;
+		m_size  = size;
+	}
+
+private:
+	uint64_t m_vaddr = 0;
+	uint64_t m_size  = 0;
+};
 
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
@@ -2306,9 +2356,10 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		EXIT("unknown prot: %d\n", prot);
 	}
 
-	auto     in_addr         = reinterpret_cast<uint64_t>(*addr_in_out);
-	uint64_t out_addr        = 0;
-	bool     reserved_target = false;
+	auto              in_addr         = reinterpret_cast<uint64_t>(*addr_in_out);
+	uint64_t          out_addr        = 0;
+	bool              reserved_target = false;
+	ReplacementWindow replacement;
 
 	if ((flags & GUEST_MAP_FIXED) != 0) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0 ||
@@ -2327,9 +2378,12 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 			reserved_target = true;
 			out_addr        = in_addr;
 		}
-		if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
-			reserved_target = true;
-			out_addr        = in_addr;
+		if (!reserved_target) {
+			replacement.Open(in_addr, len);
+			if (ReplaceFixedRangeWithReserved(in_addr, len)) {
+				reserved_target = true;
+				out_addr        = in_addr;
+			}
 		}
 	} else {
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
@@ -3092,6 +3146,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		} else
 #endif
 		{
+			ReplacementWindow replacement;
 			if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
 			    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 				    return range.type == VirtualRangeType::Reserved;
@@ -3099,8 +3154,9 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				UnmapGpuRange(in_addr, len);
 				reserved_target = true;
 			}
-			if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
-				reserved_target = true;
+			if (!reserved_target) {
+				replacement.Open(in_addr, len);
+				reserved_target = ReplaceFixedRangeWithReserved(in_addr, len);
 			}
 			if (!reserved_target) {
 				return KERNEL_ERROR_ENOMEM;
@@ -3639,6 +3695,13 @@ bool TestWindowsBackingViewModes() {
 		EXIT_IF(!backing.Unmap(address, size));
 	}
 	return VirtualFree(placeholder, 0, MEM_RELEASE) != 0 && valid;
+}
+
+uint32_t TestWindowsHostProtection(uint64_t vaddr) {
+	MEMORY_BASIC_INFORMATION info {};
+	return VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) != 0
+	           ? static_cast<uint32_t>(info.Protect)
+	           : 0u;
 }
 #endif
 

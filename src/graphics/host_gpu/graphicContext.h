@@ -18,6 +18,8 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+enum class GpuCheckpoint : uint32_t { Dispatch, DispatchIndirect, Draw };
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -27,6 +29,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               device_fault_enabled                  = false;
+	bool                               checkpoints_enabled                   = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -34,6 +38,8 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               depth_color_copy_enabled               = false;
+	// VK_KHR_maintenance8: sampling instructions take a non-constant Offset image operand.
+	bool                               sample_offsets_enabled                 = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
@@ -45,6 +51,11 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// A queue for readbacks that must not wait behind the main queue: a transfer-only family's,
+	// whose copy engines run beside 3D work, else a second queue of the main family. Buffers
+	// are shared concurrently with a different readback family.
+	uint32_t  readback_family = static_cast<uint32_t>(-1);
+	vk::Queue readback_queue  = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -96,6 +107,14 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
+	// After VK_ERROR_DEVICE_LOST: prints the device fault description and faulting addresses,
+	// and with checkpoints the last commands the GPU reached.
+	void               ReportDeviceFault() const;
+	// With checkpoints, marks a command so a lost device can name it. An indirect command also
+	// passes its argument buffer, which is copied so the report can show it.
+	void SetCheckpoint(vk::CommandBuffer command, GpuCheckpoint kind, uint64_t shader_hash,
+	                   vk::Buffer args = {}, vk::DeviceSize args_offset = 0,
+	                   uint64_t args_addr = 0) const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;

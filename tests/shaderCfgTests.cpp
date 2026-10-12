@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/render.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -13903,6 +13904,166 @@ void TestComputeImageFill() {
     Run(mutation);
 }
 
+void TestComputeUniformCopy() {
+  using namespace ShaderRecompiler::IR;
+  // A captured batched DWORD-copy kernel. For i below table[0x120] (S_CMP_LT_U32 at the loop top),
+  // lanes whose gid = group * 64 + lane is below table[0x100 + 4i] (V_CMPX_GT_U32, S_CBRANCH_EXECZ)
+  // copy element gid of the V# at table[16i] (BUFFER_LOAD_FORMAT_X) to the V# at table[0x80 + 16i]
+  // (BUFFER_STORE_FORMAT_X); S_MOV_B64 exec, -1 restores every lane for the next segment.
+  const uint32_t shader[] = {
+      0xbfa00001u, 0xd7460000u, 0x04010c02u, 0xbeeb0380u, 0xf4000080u, 0xfa000120u,
+      0xbf8cc07fu, 0xbf0a026bu, 0xbf840015u, 0x97eaff6bu, 0x00000100u, 0xf40000c0u,
+      0xd4000000u, 0xbf8cc07fu, 0x7da80003u, 0xbf88000bu, 0x8f6a846bu, 0xf4080100u,
+      0xd4000000u, 0xbf8cc07fu, 0xe0002000u, 0x80010100u, 0xf4080200u, 0xd4000080u,
+      0xbf8c0070u, 0xe0102000u, 0x80020100u, 0x816b816bu, 0xbefe04c1u, 0xbf82ffe8u,
+      0xbf810000u,
+  };
+  constexpr uint32_t Segments = 3;
+  constexpr uint32_t Records  = 128;
+  constexpr uint32_t Uint32   = (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u) | 0xfacu;
+  // Room for every destination entry a long segment count enumerates.
+  alignas(16) std::array<uint32_t, 0x1000 / 4> table{};
+  std::array<std::array<uint32_t, Records>, Segments> sources{};
+  std::array<std::array<uint32_t, Records>, Segments> destinations{};
+  const auto vsharp = [](const void *base, uint32_t records, uint32_t word3) {
+    const auto address = reinterpret_cast<uint64_t>(base);
+    return std::array<uint32_t, 4>{static_cast<uint32_t>(address),
+                                   static_cast<uint32_t>(address >> 32) | (4u << 16), records, word3};
+  };
+  const std::array<uint32_t, Segments> counts{100u, 7u, 0u};
+  const auto fill_table = [&] {
+    table.fill(0u);
+    table[0x120 / 4] = Segments;
+    for (uint32_t i = 0; i < Segments; ++i) {
+      std::ranges::copy(vsharp(sources[i].data(), Records, Uint32), table.begin() + i * 4);
+      std::ranges::copy(vsharp(destinations[i].data(), Records, Uint32), table.begin() + 0x80 / 4 + i * 4);
+      table[0x100 / 4 + i] = counts[i];
+    }
+  };
+  fill_table();
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  const std::array<uint32_t, 2> userdata{static_cast<uint32_t>(address),
+                                         static_cast<uint32_t>(address >> 32)};
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.wave_size = 64;
+  compute.workgroup_register = 2;
+  compute.thread_ids_num = 1;
+  compute.group_id[0] = true;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.wave_size = 64;
+  options.user_data = userdata;
+  enum class Mutation { None, LoadIndex, StoreData, LoadGuard, LoopStep };
+  ResourceSnapshot snapshot;
+  const auto Run = [&](Mutation mutation) {
+    auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+    auto &program = translated.program;
+    for (auto *block : program.blocks) {
+      for (auto &inst : *block) {
+        const auto op = inst.GetOpcode();
+        if (op == ValueOpcode::LoadBufferU32 && mutation == Mutation::LoadIndex) {
+          inst.SetArg(1, Value(&*block->PrependNewInst(std::ranges::find(*block, &inst, [](auto &i) { return &i; }),
+                                                       ValueOpcode::IAdd32, {inst.Arg(1), Value(1u)})));
+        } else if (op == ValueOpcode::LoadBufferU32 && mutation == Mutation::LoadGuard) {
+          inst.SetArg(4, Value(false));
+        } else if (op == ValueOpcode::StoreBufferU32 && mutation == Mutation::StoreData) {
+          inst.SetArg(4, inst.Arg(1));
+        } else if (op == ValueOpcode::IAdd32 && mutation == Mutation::LoopStep &&
+                   inst.Arg(1).Resolve() == Value(1u)) {
+          inst.SetArg(1, Value(2u));
+        }
+      }
+    }
+    auto plan = ExtractResourcePlan(program);
+    ResourceSpecialization specialization;
+    snapshot = {};
+    Check(MaterializeResources(plan,
+              {.user_data = userdata, .read_memory = ReadHostTestMemory,
+               .read_specialization_memory = ReadHostTestMemory},
+              snapshot, specialization),
+          "captured copy kernel did not materialize");
+    return plan.uniform_copy.copies.size();
+  };
+  Check(Run(Mutation::None) == 1 && snapshot.copies_proven && snapshot.copy_group_stride == 64 &&
+            snapshot.uniform_copies.size() == Segments,
+        "copy proof missed the captured copy kernel or its segments");
+  for (uint32_t i = 0; i < Segments; ++i) {
+    const auto &copy = snapshot.uniform_copies[i];
+    Check(copy.count == counts[i] && copy.words == 1 && copy.formatted &&
+              std::ranges::equal(copy.source, std::span(table).subspan(i * 4, 4)) &&
+              std::ranges::equal(copy.destination, std::span(table).subspan(0x80 / 4 + i * 4, 4)),
+          "copy proof evaluated a segment from the wrong table entry");
+  }
+  const auto table_end = address + sizeof(table);
+  Check(!snapshot.uniform_copy_reads.empty() &&
+            std::ranges::all_of(snapshot.uniform_copy_reads, [&](const auto &read) {
+              return read.first >= address && read.first + read.second <= table_end;
+            }),
+        "copy proof did not record the table reads it depends on");
+  for (const auto mutation : {Mutation::LoadIndex, Mutation::StoreData, Mutation::LoadGuard,
+                              Mutation::LoopStep}) {
+    Check(Run(mutation) == 0 && !snapshot.copies_proven,
+          "copy proof accepted a kernel that does not copy element gid to element gid");
+  }
+  table[0x120 / 4] = 0;
+  Check(Run(Mutation::None) == 1 && snapshot.copies_proven && snapshot.uniform_copies.empty(),
+        "a copy kernel with no segments was not proven to do nothing");
+  table[0x120 / 4] = 65;
+  Check(Run(Mutation::None) == 1 && !snapshot.copies_proven,
+        "copy proof unrolled more than 64 iterations");
+
+  // The renderer runs the copies only when the V#s move plain DWORDs in range.
+  fill_table();
+  Run(Mutation::None);
+  const auto proven = snapshot;
+  compute.stage.resources = &snapshot;
+  std::vector<ComputeCopy> copies;
+  const auto resolve = [&](uint32_t groups = 2, uint32_t mode = 0x41u) {
+    return ResolveComputeCopies(compute, groups, 1, 1, mode, copies);
+  };
+  const auto base = [](const auto &array) { return reinterpret_cast<uint64_t>(array.data()); };
+  Check(resolve() && copies.size() == 2 && copies[0].source == base(sources[0]) &&
+            copies[0].destination == base(destinations[0]) && copies[0].bytes == 400 &&
+            copies[1].source == base(sources[1]) && copies[1].bytes == 28,
+        "proven copies did not resolve to their byte ranges");
+  Check(resolve(1) && copies[0].bytes == 256, "copies were not bounded by the dispatched lanes");
+  Check(!resolve(2, 0x61u) && !resolve(2, 0x40u), "an unproven dispatch shape resolved to copies");
+  const auto mutate = [&](uint32_t segment, bool destination, auto &&change) {
+    snapshot = proven;
+    auto &words = destination ? snapshot.uniform_copies[segment].destination
+                              : snapshot.uniform_copies[segment].source;
+    change(words);
+    return resolve();
+  };
+  Check(mutate(0, true, [](auto &w) { w[2] = 50; }) && copies[0].bytes == 200,
+        "stores past the destination's records were not dropped");
+  Check(!mutate(0, false, [](auto &w) { w[2] = 50; }),
+        "loads past the source's records (which return 0) were copied");
+  Check(mutate(0, false, [](auto &w) { w[2] = 50; w[3] |= 2u << 28; }),
+        "OOB_SELECT 2 was range checked against NumRecords");
+  Check(!mutate(0, false, [](auto &w) { w[3] |= 3u << 28; }), "OOB_SELECT 3 was accepted");
+  Check(mutate(0, true, [](auto &w) {
+          w[3] = (w[3] & ~(0x7fu << 12)) | (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12);
+        }),
+        "a 32-bit float format, which converts nothing, was rejected");
+  Check(!mutate(0, true, [](auto &w) {
+          w[3] = (w[3] & ~(0x7fu << 12)) | (static_cast<uint32_t>(Prospero::BufferFormat::k16UInt) << 12);
+        }),
+        "a converting format was copied as DWORDs");
+  Check(!mutate(0, false, [](auto &w) { w[3] = (w[3] & ~7u) | 5u; }),
+        "a source DST_SEL that moves components was copied as DWORDs");
+  Check(!mutate(0, false, [](auto &w) { w[1] |= 1u << 31; }), "a swizzled buffer was copied linearly");
+  Check(!mutate(0, false, [](auto &w) { w[1] = (w[1] & 0xffffu) | (8u << 16); }),
+        "a strided buffer was copied contiguously");
+  Check(!mutate(1, true, [&](auto &w) { std::ranges::copy(vsharp(sources[0].data() + 64, Records, Uint32), w.begin()); }),
+        "a destination overlapping another copy's source was accepted");
+  Check(!mutate(1, true, [&](auto &w) { std::ranges::copy(vsharp(table.data(), Records, Uint32), w.begin()); }),
+        "a destination overlapping the table the copies were read from was accepted");
+  compute.stage.resources = nullptr;
+}
+
 void TestGpuProducedWritableDescriptor() {
   using namespace ShaderRecompiler::IR;
   // Reduced from 994af59d50bedca8: the GPU-built BVH header supplies a relative
@@ -15716,6 +15877,7 @@ int main() {
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();
+  TestComputeUniformCopy();
   TestGpuProducedWritableDescriptor();
   TestUniformSelectedWritableDescriptor();
   TestUniformSelectedDescriptorLoadAddress();

@@ -18,9 +18,12 @@
 #include <ctime>
 #endif
 
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <vector>
 
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
@@ -239,6 +242,78 @@ bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
 }
 
+int Thread::ReserveCoreForCurrentThread() {
+#ifdef KYTY_WIN_CS
+	ULONG size = 0;
+	GetSystemCpuSetInformation(nullptr, 0, &size, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(size);
+	if (size == 0 ||
+	    GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()),
+	                               size, &size, GetCurrentProcess(), 0) == 0) {
+		return -1;
+	}
+	struct CpuSet {
+		ULONG    id;
+		uint32_t core; // group << 8 | group-relative core index
+		BYTE     logical;
+		BYTE     efficiency;
+		BYTE     scheduling;
+	};
+	std::vector<CpuSet> sets;
+	for (ULONG offset = 0; offset < size;) {
+		const auto& entry = *reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(&buffer[offset]);
+		if (entry.Size == 0) {
+			break;
+		}
+		offset += entry.Size;
+		if (entry.Type != CpuSetInformation || entry.CpuSet.Parked != 0) {
+			continue;
+		}
+		sets.push_back({entry.CpuSet.Id,
+		                (static_cast<uint32_t>(entry.CpuSet.Group) << 8u) | entry.CpuSet.CoreIndex,
+		                entry.CpuSet.LogicalProcessorIndex, entry.CpuSet.EfficiencyClass,
+		                entry.CpuSet.SchedulingClass});
+	}
+	std::vector<uint32_t> cores;
+	for (const auto& set: sets) {
+		if (std::find(cores.begin(), cores.end(), set.core) == cores.end()) {
+			cores.push_back(set.core);
+		}
+	}
+	// Leave the guest at least the seven cores a PS5 game expects for its own threads.
+	if (cores.size() < 8) {
+		return -1;
+	}
+	// The fastest class first, then the cores the scheduler prefers; core 0 serves interrupts.
+	const auto best = std::max_element(sets.begin(), sets.end(), [](const auto& a, const auto& b) {
+		return std::tuple(a.efficiency, a.scheduling, a.core) <
+		       std::tuple(b.efficiency, b.scheduling, b.core);
+	});
+	std::vector<ULONG> reserved;
+	std::vector<ULONG> others;
+	int                first_logical = INT32_MAX;
+	for (const auto& set: sets) {
+		if (set.core == best->core) {
+			reserved.push_back(set.id);
+			first_logical = std::min<int>(first_logical, set.logical);
+		} else {
+			others.push_back(set.id);
+		}
+	}
+	if (SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(),
+	                             static_cast<ULONG>(others.size())) == 0) {
+		return -1;
+	}
+	if (SetThreadSelectedCpuSets(GetCurrentThread(), reserved.data(),
+	                             static_cast<ULONG>(reserved.size())) == 0) {
+		SetProcessDefaultCpuSets(GetCurrentProcess(), nullptr, 0);
+		return -1;
+	}
+	return first_logical;
+#else
+	return -1;
+#endif
+}
 std::string Thread::GetId() const {
 	std::stringstream ss;
 	ss << m_thread->m_thread.get_id();

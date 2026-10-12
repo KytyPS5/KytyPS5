@@ -42281,7 +42281,7 @@ void CheckShaderFusion() {
 
 void CheckAgcSystemTable(RenderContext &renderer) {
   constexpr const char *name = "AgcSystemTable";
-  constexpr uint64_t driver_base = 0x0fe0000000ull;
+  constexpr uint64_t driver_base = Gen5Driver::DriverDmemBase;
   constexpr uint64_t table_address = driver_base + 0x40000;
   constexpr std::array<uint32_t, 16> native_validator{
       0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,

@@ -58,6 +58,9 @@ public:
 	void Unlock();
 	bool TryLock();
 
+	// Returns true if the current thread holds this mutex.
+	bool IsHeldByCurrentThread() const;
+
 	friend class CondVar;
 
 	KYTY_CLASS_NO_COPY(Mutex);

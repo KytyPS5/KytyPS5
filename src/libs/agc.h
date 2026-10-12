@@ -22,11 +22,13 @@ struct MemoryRange {
 
 void Initialize();
 void Shutdown();
+void EmergencyShutdown();
 
 struct Lifecycle {
-	static constexpr const char* name       = "Graphics";
-	static constexpr auto        initialize = Libs::Graphics::Initialize;
-	static constexpr auto        shutdown   = Libs::Graphics::Shutdown;
+	static constexpr const char* name               = "Graphics";
+	static constexpr auto        initialize         = Libs::Graphics::Initialize;
+	static constexpr auto        shutdown           = Libs::Graphics::Shutdown;
+	static constexpr auto        emergency_shutdown = Libs::Graphics::EmergencyShutdown;
 };
 
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer);

@@ -1228,7 +1228,12 @@ std::vector<Program*> RuntimeLinker::LoadImportedBundledModules(
 	}
 	// A bundled PRX is named after the module it exports, e.g. libSceNpCppWebApi.prx.
 	for (const auto& imported: (*main)->dynamic_info->import_modules) {
-		const auto path = folder / (imported.name + ".prx");
+		const std::filesystem::path file_name = imported.name + ".prx";
+		// The name comes from the ELF; only plain file names may resolve inside the folder.
+		if (file_name.filename() != file_name) {
+			continue;
+		}
+		const auto path = folder / file_name;
 		if (Common::File::IsFileExisting(path) && FindProgramByFileName(path) == nullptr) {
 			modules.push_back(LoadProgram(path));
 		}

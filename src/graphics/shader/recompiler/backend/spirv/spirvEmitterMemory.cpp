@@ -1530,6 +1530,9 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
+	if (state.bda_miss_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.bda_miss_variable, ConstantBool(state, true));
+	}
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);

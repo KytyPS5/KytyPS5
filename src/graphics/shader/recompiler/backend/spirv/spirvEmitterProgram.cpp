@@ -134,6 +134,36 @@ void ReportLoopBudget(const EmitterState& state) {
 	std::fflush(stdout);
 }
 
+// "May keep looping" for the whole wave: under budget and no BDA miss; 0 when unguarded.
+uint32_t ChargeLoopBudget(EmitterState& state, bool bda_exit) {
+	uint32_t allowed = 0;
+	if (state.loop_budget_variable != 0) {
+		const auto before = state.builder.AllocateId();
+		const auto after  = state.builder.AllocateId();
+		allowed           = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), before, state.loop_budget_variable);
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), after, before,
+		                          ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, after);
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), allowed, after,
+		                          ConstantU32(state, state.loop_budget_limit));
+	}
+	if (state.bda_miss_variable != 0 && bda_exit) {
+		const auto missed      = state.builder.AllocateId();
+		const auto wave_missed = state.builder.AllocateId();
+		const auto served      = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeBool(state), missed, state.bda_miss_variable);
+		state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), wave_missed,
+		                          ConstantU32(state, spv::ScopeSubgroup), missed);
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), served, wave_missed);
+		if (allowed == 0) {
+			allowed = served;
+		} else {
+			const auto both = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), both, allowed, served);
+			allowed = both;
+		}
+	}
 	return allowed;
 }
 
@@ -185,7 +215,15 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
+			auto       condition = ctx.Def(block->condition);
 			const auto latch     = ctx.state.loop_budget_latch.find(block);
+			const auto allowed =
+			    latch != ctx.state.loop_budget_latch.end()
+			        ? ChargeLoopBudget(ctx.state, !ctx.state.loop_bda_exit_exempt.contains(block))
+			        : 0u;
+			if (allowed != 0) {
+				const auto folded = ctx.state.builder.AllocateId();
+				if (term.true_block->id == latch->second) {
 					// Back edge on the true arm: stay in the loop only while under budget.
 					ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), folded,
 					                              condition, allowed);
@@ -208,6 +246,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 }
 
 void CollectDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
+                             const IR::Block* from, const IR::Block* block,
                              DispatcherPhiCopies& copies) {
 	if (block != nullptr) {
 		CollectDispatcherPhiEdge(ctx, dispatcher, from, block, copies);
@@ -220,6 +259,7 @@ void CollectDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionStat
 // The phi stores go last: the condition and selector may still load from a spill slot.
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                               const IR::Block* block) {
+	const auto&         term = block->terminator;
 	DispatcherPhiCopies copies;
 	const auto          finish = [&](uint32_t selected) {
 		StoreDispatcherPhiCopies(ctx, copies);
@@ -228,6 +268,7 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
 			CollectDispatcherTarget(ctx, dispatcher, block, term.true_block, copies);
+			return finish(ConstantU32(ctx.state, term.true_block->id));
 		case CFG::TerminatorKind::ConditionalBranch: {
 			CollectDispatcherTarget(ctx, dispatcher, block, term.true_block, copies);
 			CollectDispatcherTarget(ctx, dispatcher, block, term.false_block, copies);
@@ -407,37 +448,112 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 	}
 }
 
+// A loop with atomics may be a work queue whose waiters spin on every worker: no BDA exit.
+size_t LoopEnd(const IR::Program& program, size_t header_index) {
+	const auto* merge_block = program.blocks[header_index]->terminator.merge_block;
+	const auto  merge       = std::ranges::find(program.blocks, merge_block);
+	const auto  end         = static_cast<size_t>(merge - program.blocks.begin());
+	return merge_block != nullptr && merge != program.blocks.end() && end > header_index ? end : 0;
+}
+
+bool LoopHasAtomics(const IR::Program& program, size_t header_index) {
+	const auto end = LoopEnd(program, header_index);
+	if (end == 0) {
+		return true;
+	}
+	for (size_t index = header_index; index < end && index < program.blocks.size(); index++) {
+		for (const auto& inst: *program.blocks[index]) {
+			const auto op     = inst.GetOpcode();
+			const auto shared = IR::SharedAccessOf(op);
+			if (IR::BufferAccessOf(op) == IR::BufferAccess::Atomic ||
+			    IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Atomic ||
+			    shared == IR::SharedAccess::Atomic || shared == IR::SharedAccess::Append ||
+			    shared == IR::SharedAccess::Consume) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// The exit returns from the whole invocation, so it also skips every loop around this one.
+bool LoopNestHasAtomics(const IR::Program& program, size_t header_index) {
+	for (size_t index = 0; index <= header_index; index++) {
+		if (!program.blocks[index]->terminator.loop_header) {
+			continue;
+		}
+		const auto end      = LoopEnd(program, index);
+		const bool encloses = index == header_index || (end != 0 && header_index < end);
+		if (encloses && LoopHasAtomics(program, index)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // The charge sits in the block the header branches into, once per iteration.
 std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
 	std::unordered_set<const IR::Block*> sites;
+	if (ctx.state.loop_budget_variable == 0 && ctx.state.bda_miss_variable == 0) {
 		return sites;
 	}
 	const auto& program = ctx.state.program;
 	// Splitting a continue target would put an OpReturn inside its continue construct.
+	std::unordered_set<const IR::Block*> continue_targets;
+	for (const auto* block: program.blocks) {
+		if (block->terminator.loop_header) {
+			continue_targets.insert(block->terminator.continue_block);
 		}
 	}
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		const auto* header = program.blocks[index];
+		const auto& term   = header->terminator;
+		if (!term.loop_header) {
 			continue;
 		}
+		if (term.true_block != nullptr && continue_targets.contains(term.true_block)) {
 			// A body that is the latch folds the budget into its (header, merge) branch.
+			const auto* latch      = term.true_block;
+			const auto& latch_term = latch->terminator;
+			const bool  foldable =
+			    latch_term.kind == CFG::TerminatorKind::ConditionalBranch &&
+			    ((latch_term.true_block == header && latch_term.false_block == term.merge_block) ||
+			     (latch_term.false_block == header && latch_term.true_block == term.merge_block));
+			if (foldable && ctx.state.loop_budget_latch.emplace(latch, header->id).second) {
 				ctx.state.loop_budget_guarded++;
+				if (LoopNestHasAtomics(program, index)) {
+					ctx.state.loop_bda_exit_exempt.insert(latch);
+				}
 			} else if (!foldable) {
 				ctx.state.loop_budget_unguardable++;
 			}
 			continue;
 		}
+		const auto* body = term.kind == CFG::TerminatorKind::Branch ? term.true_block : nullptr;
+		if (body == nullptr || body == header) {
 			ctx.state.loop_budget_unguardable++;
 			continue;
 		}
+		if (body->terminator.loop_header) {
 			ctx.state.loop_budget_unguardable++;
 			continue;
 		}
 		if (sites.insert(body).second) {
 			ctx.state.loop_budget_guarded++;
+			if (LoopNestHasAtomics(program, index)) {
+				ctx.state.loop_bda_exit_exempt.insert(body);
+			}
 		}
 	}
 	return sites;
 }
 
+void EmitLoopCharge(ValueEmitContext& ctx, const IR::Block* site) {
+	const auto allowed =
+	    ChargeLoopBudget(ctx.state, !ctx.state.loop_bda_exit_exempt.contains(site));
+	if (allowed == 0) {
+		return;
+	}
 	const auto abort = ctx.state.builder.AllocateId();
 	const auto rest  = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpSelectionMerge, rest, spv::SelectionControlMaskNone);
@@ -461,6 +577,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			return;
 		}
 		if (charge_sites.contains(block)) {
+			EmitLoopCharge(ctx, block);
 		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block);
@@ -753,8 +870,19 @@ void EmitProgram(EmitterState& state) {
 	}
 	// The guard exits by OpReturn, which outside compute abandons the whole invocation.
 	state.loop_budget_limit = state.program.stage == ShaderType::Compute ? LoopBudgetLimit() : 0u;
+	const bool has_loops    = std::ranges::any_of(
+	    program.blocks, [](const IR::Block* block) { return block->terminator.loop_header; });
+	if (state.loop_budget_limit != 0 && has_loops) {
 		state.loop_budget_variable = state.builder.AllocateId();
 		state.builder.AddName(state.loop_budget_variable, "loop_budget");
+	}
+	if (state.program.stage == ShaderType::Compute && state.program.info.uses_dma && has_loops) {
+		state.bda_miss_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeBool(state)),
+		    spv::StorageClassPrivate);
+		state.builder.AddName(state.bda_miss_variable, "bda_miss");
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
 	for (const auto* block: program.blocks) {
 		// Re-emission may use a different host subgroup width and ID allocation order.
@@ -897,6 +1025,10 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.loop_budget_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, 0));
+	}
+	if (state.bda_miss_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.bda_miss_variable,
+		                          ConstantBool(state, false));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

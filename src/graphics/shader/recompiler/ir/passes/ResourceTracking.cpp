@@ -1679,20 +1679,24 @@ private:
 		return {};
 	}
 
-	uint32_t PostTestLoopMaximum(Value key) const {
-		const auto induction = MatchInduction(key,
-		    [](uint32_t initial, uint32_t step) { return initial == 0u && step == 1u; });
-		if (!induction) return UINT32_MAX;
+	// key = Phi [start, entry], [key + 1, latch] whose only way back to the header is the
+	// uniform true edge of (key + 1 < limit), with immediate start < limit. The test runs
+	// after the body, so every value of key, inside or after the loop, is in [start, limit).
+	bool PostTestLoopRange(Value key, uint32_t& first, uint32_t& limit) const {
+		const auto induction =
+		    MatchInduction(key, [](uint32_t, uint32_t step) { return step == 1u; });
+		if (!induction) return false;
 		const auto [phi, step, initial_arm] = *induction;
+		const auto start = phi->Arg(initial_arm).Resolve().U32();
 		const auto* incoming = phi->PhiBlock(initial_arm ^ 1u);
-		if (incoming == nullptr) return UINT32_MAX;
+		if (incoming == nullptr) return false;
 		for (const auto& use: step->Uses()) {
 			const auto* compare = use.user;
 			uint32_t bound = 0;
 			if (use.operand != 0u ||
 			    (compare->GetOpcode() != ValueOpcode::SLessThan32 &&
 			     compare->GetOpcode() != ValueOpcode::ULessThan32) ||
-			    !ImmediateU32(compare->Arg(1), bound) || bound == 0u ||
+			    !ImmediateU32(compare->Arg(1), bound) || start >= bound ||
 			    (compare->GetOpcode() == ValueOpcode::SLessThan32 && bound > INT32_MAX) ||
 			    !AvailableBefore(*step, *compare)) continue;
 			const auto accepts = [&](const EdgePredicate& edge) {
@@ -1704,12 +1708,20 @@ private:
 				// A guard before the increment may belong to the previous iteration.
 				return block == phi->Parent() || block == step->Parent();
 			}, accepts)) {
-				// Starting at zero, next < bound keeps the carried value in range;
+				// Starting below bound, next < bound keeps the carried value in range;
 				// incrementing bound - 1 cannot overflow either accepted comparison domain.
-				return bound - 1u;
+				first = start;
+				limit = bound;
+				return true;
 			}
 		}
-		return UINT32_MAX;
+		return false;
+	}
+
+	uint32_t PostTestLoopMaximum(Value key) const {
+		uint32_t first = 0, limit = 0;
+		if (!PostTestLoopRange(key, first, limit) || first != 0u) return UINT32_MAX;
+		return limit - 1u;
 	}
 
 	const Inst* BoundedLoop(Value key, const Block* use, const auto& accepts_bound,
@@ -3015,6 +3027,11 @@ private:
 						indirect.selector_first = Value(first);
 						indirect.signed_count = false;
 					}
+				} else if (uint32_t limit = 0; PostTestLoopRange(key, first, limit) && first != 0u) {
+					// Enumerate the post-tested keys from their start value, so the record
+					// before it is not read.
+					indirect.selector_first = Value(first);
+					indirect.key_count = Value(limit - first);
 				}
 			}
 			if (indirect.key_count.IsEmpty() &&

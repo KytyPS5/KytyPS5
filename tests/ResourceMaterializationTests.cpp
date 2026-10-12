@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -146,6 +147,37 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
+  return program;
+}
+
+// A sampled image whose 8-dword descriptor carries `format` in the T# format field. Every other
+// dword is a plausible 2D color texture so only the format decides the outcome.
+Libs::Graphics::ShaderRecompiler::IR::Program
+UndefinedFormatImageProgram(uint32_t format) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  AddValueBlock(program);
+
+  DescriptorSource source;
+  source.dword_count = 8;
+  for (uint32_t i = 0; i < source.dword_count; ++i) {
+    source.dwords[i] = Value(0u);
+  }
+  source.dwords[0] = Value(0x1234000u);
+  source.dwords[1] = Value(format << 20u);
+  source.dwords[3] = Value(static_cast<uint32_t>(
+                            Libs::Graphics::Prospero::ImageType::kColor2D)
+                        << 28u);
+  program.descriptor_sources.push_back(source);
+  program.info.images.push_back(
+      {.source = 0,
+       .resource_class = ImageResourceClass::Sampled,
+       .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+       .dimension =
+           Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
   return program;
 }
 
@@ -1112,6 +1144,49 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   }
 }
 
+// A descriptor whose format value falls in a gap of the encoding (139 sits between
+// k4_4_4_4UNorm = 136 and the FMASK range = 156) names no format at all: the guest left
+// garbage in a texture-table slot it never samples. It must bind a null image and keep
+// materializing instead of failing specialization (KytyPS5 #1019, Demon's Souls).
+void TestUndefinedImageFormatBindsNullImage() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Check(!Libs::Graphics::Prospero::IsDefinedBufferFormat(
+            static_cast<Libs::Graphics::Prospero::BufferFormat>(139)),
+        "format 139 is in the encoding's gap and must not be defined");
+  Check(Libs::Graphics::Prospero::IsDefinedBufferFormat(
+            Libs::Graphics::Prospero::BufferFormat::k4_4_4_4UNorm),
+        "k4_4_4_4UNorm is a real format and must stay defined");
+  Check(Libs::Graphics::Prospero::IsDefinedBufferFormat(
+            Libs::Graphics::Prospero::BufferFormat::kBc7Srgb),
+        "kBc7Srgb is a real format and must stay defined");
+  for (const uint32_t format : {137u, 139u, 155u}) {
+    auto program = UndefinedFormatImageProgram(format);
+    auto plan = ExtractResourcePlan(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {}, snapshot, specialization),
+          "an undefined image format aborted materialization instead of binding null");
+    Check(snapshot.images.size() == 1 &&
+              std::all_of(snapshot.images[0].dwords.begin(),
+                          snapshot.images[0].dwords.end(),
+                          [](uint32_t dword) { return dword == 0u; }),
+          "an undefined image format did not bind a null image");
+    Check(specialization.images.size() == 1 &&
+              specialization.images[0].numeric_class ==
+                  Libs::Graphics::Prospero::TextureNumericClass::Float,
+          "a null-bound image lost its default float class");
+  }
+  // A defined format still binds its descriptor untouched.
+  auto program = UndefinedFormatImageProgram(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32Float));
+  auto plan = ExtractResourcePlan(program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.images.size() == 1 && snapshot.images[0].dwords[0] == 0x1234000u,
+        "a defined sampled format was rejected or altered");
+}
+
 } // namespace
 
 namespace Common {
@@ -1147,6 +1222,7 @@ int main() {
   TestCyclicControlPredicatesRemainUnknown();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestUndefinedImageFormatBindsNullImage();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

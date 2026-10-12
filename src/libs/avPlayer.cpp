@@ -994,8 +994,12 @@ public:
 				frame = std::move(next);
 			}
 		}
+		// Return the shown frame's buffer one frame later; the GPU may still read it (tearing).
+		if (previous_video) {
+			video_buffers.Push(std::move(previous_video));
+		}
 		if (current_video) {
-			video_buffers.Push(std::move(current_video->buffer));
+			previous_video = std::move(current_video->buffer);
 		}
 		current_video = std::move(*frame);
 		*out          = current_video->info;
@@ -1073,6 +1077,7 @@ private:
 		video_buffers.Clear();
 		audio_buffers.Clear();
 		if (!retain_output_buffers) {
+			previous_video.reset();
 			current_video.reset();
 			current_audio.reset();
 		}
@@ -1177,7 +1182,7 @@ private:
 	bool AllocateBuffers() {
 		if (video_id) {
 			auto size     = VideoBufferSize(fmt->streams[video_id.value()]);
-			auto retained = current_video ? 1u : 0u;
+			auto retained = (previous_video ? 1u : 0u) + (current_video ? 1u : 0u);
 			for (size_t i = retained; i < static_cast<size_t>(max_video_buffers); i++) {
 				auto buffer = std::make_unique<GuestBuffer>(mem, 0x100, size, true);
 				if (!buffer->Valid()) {
@@ -1699,6 +1704,7 @@ private:
 	WorkQueue<ReadyFrame>                    audio_frames;
 	std::optional<ReadyFrame>                current_video;
 	std::optional<ReadyFrame>                current_audio;
+	std::unique_ptr<GuestBuffer>             previous_video;
 	LibKernel::Pthread                       demux_thread = nullptr;
 	LibKernel::Pthread                       video_thread = nullptr;
 	LibKernel::Pthread                       audio_thread = nullptr;

@@ -444,6 +444,18 @@ constexpr uint32_t NativeDescriptorSetCount = PixelDescriptorSet + 1u;
 	           : 0u;
 }
 
+[[nodiscard]] constexpr bool NativeDescriptorSetAgrees(ShaderType stage) {
+	constexpr auto last = static_cast<DescriptorBindingKind>(
+	    static_cast<uint32_t>(DescriptorBindingKind::Count) - 1u);
+	return NativeDescriptorSetForBinding(NativeBinding(stage, DescriptorBindingKind {})) ==
+	           NativeDescriptorSet(stage) &&
+	       NativeDescriptorSetForBinding(NativeBinding(stage, last)) == NativeDescriptorSet(stage);
+}
+static_assert(NativeDescriptorSetAgrees(ShaderType::Vertex) &&
+              NativeDescriptorSetAgrees(ShaderType::Pixel) &&
+              NativeDescriptorSetAgrees(ShaderType::TessellationControl) &&
+              NativeDescriptorSetAgrees(ShaderType::TessellationEvaluation));
+
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);
 	if (value >= FirstImageBinding && value < FirstStorageImageBinding) {

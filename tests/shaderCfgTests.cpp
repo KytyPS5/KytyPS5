@@ -12549,6 +12549,44 @@ void TestU64ShiftConstantPropagation() {
   }
 }
 
+void TestUnreachableEqualityPropagation() {
+  using namespace ShaderRecompiler::IR;
+
+  Program program;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.blocks.push_back(program.block_storage.back().get());
+  program.block_info.emplace_back();
+  IREmitter ir(program.blocks.front());
+  // An M0 index scaled from a loop counter: any value, but a multiple of four below 256.
+  const auto lane = ir.Emit(ValueOpcode::LaneId);
+  const auto scaled = ir.Emit(ValueOpcode::ShiftLeftLogical32, {lane, Value(2u)});
+  const auto index = ir.Emit(ValueOpcode::BitwiseAnd32, {scaled, Value(255u)});
+  const auto odd = ir.Emit(ValueOpcode::IEqual32, {index, Value(107u)});
+  const auto too_large = ir.Emit(ValueOpcode::IEqual32, {index, Value(256u)});
+  const auto aligned = ir.Emit(ValueOpcode::IEqual32, {index, Value(108u)});
+  const auto odd_not_equal = ir.Emit(ValueOpcode::INotEqual32, {Value(3u), index});
+  // A select between two known values.
+  const auto first_lane = ir.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  const auto choice =
+      ir.Emit(ValueOpcode::SelectU32, {first_lane, Value(4u), Value(8u)});
+  const auto missing = ir.Emit(ValueOpcode::IEqual32, {choice, Value(5u)});
+  const auto present = ir.Emit(ValueOpcode::IEqual32, {choice, Value(8u)});
+  ConstantPropagationPass(program.blocks);
+
+  const auto is_bool = [](Value value, bool expected) {
+    value = value.Resolve();
+    return value.IsImmediate() && value.GetType() == Type::U1 && value.U1() == expected;
+  };
+  Check(is_bool(odd, false) && is_bool(too_large, false) &&
+            is_bool(odd_not_equal, true),
+        "comparisons with values a scaled index cannot take were not folded");
+  Check(is_bool(missing, false),
+        "a comparison with a value a select cannot produce was not folded");
+  Check(!aligned.Resolve().IsImmediate() && !present.Resolve().IsImmediate() &&
+            !first_lane.Resolve().IsImmediate(),
+        "a comparison that can hold was folded");
+}
+
 void TestU64RegisterPairRoundTrip() {
   using namespace ShaderRecompiler::IR;
   Program program;
@@ -15700,6 +15738,7 @@ int main() {
   TestValuePhiValidation();
   TestWave32MaskProjection();
   TestU64ShiftConstantPropagation();
+  TestUnreachableEqualityPropagation();
   TestU64RegisterPairRoundTrip();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();

@@ -790,6 +790,10 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
 	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+#if defined(__APPLE__)
+	IR::LowerVertexLaunchMaskPass(ir);
+	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+#endif
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);

@@ -724,6 +724,7 @@ endif()
 # Test Darwin signal-context restoration for SSE4a instructions.
 if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")))
+	add_kyty_full_emulator_test(macos_ngg_vertex_tests "${KYTY_TESTS_DIR}/MacosNggVertexTests.cpp")
 	add_executable(macos_sse4a_tests EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/macosSse4aTests.cpp"
 		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
@@ -732,6 +733,9 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	target_link_libraries(macos_sse4a_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
 	target_include_directories(macos_sse4a_tests PRIVATE ${inc_headers})
 	if(BUILD_TESTING)
+		add_test(NAME macos_ngg_vertex COMMAND $<TARGET_FILE:macos_ngg_vertex_tests>)
+		set_tests_properties(macos_ngg_vertex PROPERTIES TIMEOUT 30)
+		add_dependencies(kyty_tests macos_ngg_vertex_tests)
 		add_test(NAME macos_sse4a COMMAND $<TARGET_FILE:macos_sse4a_tests>)
 		set_tests_properties(macos_sse4a PROPERTIES TIMEOUT 15)
 		add_dependencies(kyty_tests macos_sse4a_tests)

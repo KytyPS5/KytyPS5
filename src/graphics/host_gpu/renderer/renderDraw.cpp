@@ -540,9 +540,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                                         native->info);
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
-		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled

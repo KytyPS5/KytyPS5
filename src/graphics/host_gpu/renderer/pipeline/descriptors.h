@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DESCRIPTORS_H_
 
 #include "common/assert.h"
+#include "common/hash.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -24,6 +25,60 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+};
+
+// What a texture descriptor decodes to before the texture cache looks up its image (see
+// RenderExecutor::DecodeTexture). It depends only on the descriptor and on how the shader uses the
+// texture, so a frame that binds the same texture thousands of times decodes it once.
+struct DecodedTexture {
+	TextureCache::ImageDesc desc;
+	bool                    null_descriptor   = false;
+	bool                    shader_conversion = false;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+};
+
+struct TextureDecodeKey {
+	ShaderRecompiler::IR::DescriptorValue value;
+	ShaderRecompiler::IR::ImageResource   resource;
+
+	bool operator==(const TextureDecodeKey& other) const = default;
+};
+
+// A lookup of the table by reference: the key, with its resource's vectors, is copied only when
+// it is added.
+struct TextureDecodeView {
+	const ShaderRecompiler::IR::DescriptorValue& value;
+	const ShaderRecompiler::IR::ImageResource&   resource;
+};
+
+struct TextureDecodeKeyHash {
+	using is_transparent = void;
+
+	size_t operator()(const TextureDecodeKey& key) const noexcept {
+		return (*this)(TextureDecodeView {key.value, key.resource});
+	}
+	size_t operator()(const TextureDecodeView& key) const noexcept {
+		uint64_t hash = key.value.dword_count;
+		for (const auto dword: key.value.dwords) {
+			hash = Common::Fnv64Step(hash, dword);
+		}
+		hash = Common::Fnv64Step(hash, key.resource.source);
+		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(key.resource.written));
+		return static_cast<size_t>(hash);
+	}
+};
+
+struct TextureDecodeKeyEqual {
+	using is_transparent = void;
+
+	bool operator()(const TextureDecodeKey& a, const TextureDecodeKey& b) const { return a == b; }
+	bool operator()(const TextureDecodeView& a, const TextureDecodeKey& b) const {
+		return a.value == b.value && a.resource == b.resource;
+	}
+	bool operator()(const TextureDecodeKey& a, const TextureDecodeView& b) const {
+		return (*this)(b, a);
+	}
 };
 
 struct PreparedBindings {

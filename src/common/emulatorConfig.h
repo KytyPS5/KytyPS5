@@ -27,6 +27,9 @@ enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
+// The output resolution the emulated console reports to games (videoOutResolution.h).
+enum class VideoOutResolution { Title, FullHd, Uhd };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -51,6 +54,7 @@ struct ConfigOptions {
 	uint32_t               controller_speaker_volume      = 50;
 	uint32_t               controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	VideoOutResolution     video_out_resolution        = VideoOutResolution::Title;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
@@ -63,15 +67,23 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	bool                   pipeline_wait_enabled       = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
+	// Empty: the host's per-user cache folder (cacheFolder.h).
+	std::filesystem::path  pipeline_cache_folder;
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
+	// Name Vulkan objects and label passes, draws, dispatches and copies, so a GPU capture reads
+	// as the emulator's work and not as anonymous commands.
+	bool                   gpu_debug_labels_enabled        = false;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
+	// Count the events that cost frame time and print them per frame (perfCounters.h).
+	bool                   perf_counters_enabled       = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
@@ -100,6 +112,7 @@ const std::optional<ControllerColor>& GetControllerColor();
 uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();
 PresentMode GetPresentMode();
+VideoOutResolution     GetVideoOutResolution();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
@@ -112,14 +125,18 @@ uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
+// Every draw waits for its pipeline to be built, instead of being left out while it builds.
+bool                   PipelineWaitEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
+std::filesystem::path  GetPipelineCacheFolder();
 
 bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
 bool GraphicsDebugDumpEnabled();
+bool GpuDebugLabelsEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

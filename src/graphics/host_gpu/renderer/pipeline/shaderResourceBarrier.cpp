@@ -22,6 +22,11 @@ vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage) {
 	}
 }
 
+vk::ShaderStageFlagBits NativeShaderStage(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	return program.mesh_emulated ? vk::ShaderStageFlagBits::eCompute
+	                             : NativeShaderStage(program.stage);
+}
+
 vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	vk::PipelineStageFlags result = {};
 	if (stages & vk::ShaderStageFlagBits::eVertex) {
@@ -106,6 +111,24 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
 	}
 	return has_writes;
+}
+
+bool HasShaderMemoryWrites(const ShaderStageRuntime& runtime) {
+	if (HasShaderBufferWrites(runtime)) {
+		return true;
+	}
+	const auto& program = *runtime.program;
+	for (const auto& buffer: program.info.buffers) {
+		if (buffer.atomic) {
+			return true;
+		}
+	}
+	for (const auto& image: program.info.images) {
+		if (image.written || image.atomic) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

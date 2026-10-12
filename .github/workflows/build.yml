@@ -112,16 +112,19 @@ jobs:
       - name: Build
         shell: cmd
         run: |
+          rem The unit tests: keep them as in .github/scripts/unit-tests.sh (the Linux job checks it).
           cmake --build _Build/windows --target launcher ^
-            audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            host_lowering_tests write_heat_tests perf_counters_tests guest_write_log_tests copy_workers_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests cache_folder_tests file_lock_tests program_list_tests soft_float64_tests metadata_fill_tests fence_retirement_tests queue_commits_tests cache_collection_tests buffer_chunk_tests ^
+            audio_out2_port_tests pad_haptics_tests controller_settings_tests pad_input_tests image_readback_tests overlay_queue_tests const_ram_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests shader_cfg_tests archive_file_tests trophy_system_tests avplayer_file_tests ^
+            audio_out_timing_tests bit_array_tests ces_tests event_queue_lifetime_tests http_uri_parse_tests image_page_table_tests kernel_file_system_tests ngs2_sampler_tests png_enc_tests save_data_dialog_tests save_data_memory_tests sync_on_address_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^(archive_file|audio_out2_port|audio_out_timing|avplayer_file|bit_array|buffer_chunk|cache_collection|cache_folder|ces|controller_settings|copy_workers|guest_write_log|depth_snapshot_plan|device_suitability|event_queue_lifetime|fence_retirement|file_lock|host_lowering|http_uri_parse|image_page_table|image_readback|overlay_queue|const_ram|ime_dialog|kernel_file_system|lru_cache|metadata_fill|ngs2_sampler|pad_haptics|pad_input|perf_counters|pipeline_use|png_enc|program_list|queue_commits|readback_plan|resource_materialization|resource_tracking|save_data_dialog|save_data_memory|scalar_provenance|shader_cfg|shader_vertex_metadata|soft_float64|submit_plan|sync_on_address|trophy_system|video_out_resolution|virtual_memory_allocation|write_heat|emulator_present_mode_cli|emulator_present_mode_invalid|emulator_user_name_cli|emulator_user_name_too_long|emulator_video_out_resolution_cli|emulator_video_out_resolution_invalid|guest_red_zone_patcher)$"
 
       - name: Install
         shell: cmd
@@ -201,18 +204,19 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          # The unit tests are listed in .github/scripts/unit-tests.sh.
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+            --target launcher shader_recompiler_compute_tests \
+              $(.github/scripts/unit-tests.sh targets memory_tracker page_manager macos_sse4a) \
             --parallel
 
       - name: Test
         shell: bash
         run: |
-          ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          .github/scripts/unit-tests.sh check-registered _Build/macos memory_tracker page_manager \
+            macos_sse4a
+          ctest --test-dir _Build/macos --output-on-failure --no-tests=error \
+            -R "$(.github/scripts/unit-tests.sh filter memory_tracker page_manager macos_sse4a)"
 
       - name: Install
         shell: bash
@@ -386,18 +390,20 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          # The unit tests are listed in .github/scripts/unit-tests.sh.
           cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+            --target launcher \
+              $(.github/scripts/unit-tests.sh targets memory_tracker page_manager) \
             --parallel
 
       - name: Test
         shell: bash
         run: |
-          ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          # Windows runs cmd and keeps its own copy of the list: it must match the script.
+          .github/scripts/unit-tests.sh check-windows .github/workflows/build.yml
+          .github/scripts/unit-tests.sh check-registered _Build/linux memory_tracker page_manager
+          ctest --test-dir _Build/linux --output-on-failure --no-tests=error \
+            -R "$(.github/scripts/unit-tests.sh filter memory_tracker page_manager)"
 
       - name: Install
         shell: bash

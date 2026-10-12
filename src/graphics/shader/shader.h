@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/hostCapabilities.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -89,6 +90,9 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	// The host has no mesh shaders: run this shader as compute and draw its records with a
+	// generated vertex shader (see capturedVertexLayout.h).
+	bool emulated = false;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -143,6 +147,10 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// A pixel shader may read one parameter both flat and interpolated. It then reads the two
+	// at different locations (see ShaderPixelParameterLocation), and the last vertex stage must
+	// write the parameter to both. For each parameter: the second location plus one, or zero.
+	std::array<uint8_t, RES_MAX> param_copy_location {};
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -162,6 +170,16 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
 enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
+// The numbers a colour target holds. A pixel shader output must have the target's type: Metal
+// refuses to build a pipeline that writes floats into an integer target, which AMD hardware takes.
+enum class ShaderColorNumberClass : uint8_t { Float, Uint, Sint };
+
+// What a pixel shader needs to know of a colour target it exports to.
+struct ShaderColorTarget {
+	Prospero::ColorComponentMapping export_mapping;
+	ShaderColorNumberClass          number_class = ShaderColorNumberClass::Float;
+};
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
@@ -174,6 +192,7 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	std::array<ShaderColorNumberClass, 8>          target_number_class          = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
@@ -183,6 +202,10 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
 	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
+	// The host has no per-vertex inputs: a parameter read both flat and interpolated reads a
+	// copy at a second location, which the vertex shader also writes. Otherwise both read the
+	// raw vertex values at the export location.
+	bool                                           flat_aliases_copied = false;
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;
@@ -191,6 +214,11 @@ struct ShaderPixelInputInfo {
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
+	// The host has no depth bounds test. When the draw enables one, the pixel shader tests the
+	// depth buffer copy that the renderer made before the draw. 1 = 32-bit float, 2 = 16-bit
+	// normalized; 0 = no test. The test parameters are in push data from the given dword.
+	uint32_t                                       ps_depth_bounds_format       = 0;
+	uint32_t                                       ps_depth_bounds_dword        = 0;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
 
@@ -217,6 +245,17 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
+// ShaderVertexInputInfo::param_copy_location for a vertex stage whose parameters this pixel
+// shader reads through `active_inputs`.
+std::array<uint8_t, 32> ShaderVertexParameterCopies(const ShaderPixelInputInfo& info,
+                                                    std::span<const uint32_t>   active_inputs);
+// On a host with no per-vertex pixel shader inputs, an input whose raw vertex values the shader
+// reads gets three more flat inputs: the value at each vertex of the triangle. This gives their
+// locations for the input at `location`. `used_locations` has a bit for every location the
+// shader's inputs take, and `per_vertex_locations` a bit for each of them that needs the values.
+std::array<uint32_t, 3> ShaderPixelVertexValueLocations(uint32_t used_locations,
+                                                        uint32_t per_vertex_locations,
+                                                        uint32_t location);
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;

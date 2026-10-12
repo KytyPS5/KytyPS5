@@ -357,11 +357,18 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     image.layers);
 	}
 
+	if (is_storage && !(image.usage & vk::ImageUsageFlagBits::eStorage)) {
+		EXIT("storage access to an image whose format the host GPU cannot use as storage: "
+		     "format=%d\n",
+		     static_cast<int>(image.format));
+	}
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
-	if (normalized.min_lod != 0) {
+	// Without VK_EXT_image_view_min_lod the view has no minimum, and the samplers the texture is
+	// read through apply it (see IR::SampledResourcePair).
+	if (normalized.min_lod != 0 && m_graphics.host.capabilities.image_view_min_lod) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;

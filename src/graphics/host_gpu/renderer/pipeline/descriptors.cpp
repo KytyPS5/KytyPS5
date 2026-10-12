@@ -504,7 +504,51 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+	auto decoded = m_decoded_textures.find(TextureDecodeView {value, resource});
+	if (decoded == m_decoded_textures.end()) {
+		if (m_decoded_textures.size() >= MaxDecodedTextures) {
+			m_decoded_textures.clear();
+		}
+		auto texture = DecodeTexture(resource, value);
+		decoded = m_decoded_textures.emplace(TextureDecodeKey {value, resource}, std::move(texture))
+		              .first;
+	}
+	// The texture cache can change the description, and a later decode can drop the table.
+	auto  desc          = decoded->second.desc;
+	auto& texture_cache = m_context.GetTextureCache();
+	if (decoded->second.null_descriptor) {
+		const auto id = texture_cache.FindImage(desc);
+		return {.image_id = id, .desc = std::move(desc)};
+	}
+	const auto pixel_format = decoded->second.pixel_format;
+	const auto view_format  = decoded->second.view_format;
+	const bool storage      = resource.written;
+	const auto descriptor   = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const auto swizzle      = descriptor.DstSelXYZW();
+
+	auto       id                  = texture_cache.FindImage(desc, decoded->second.shader_conversion);
+	auto*      image               = &texture_cache.GetImage(id);
+	const bool stencil_association = static_cast<bool>(image->depth_id);
+	if (stencil_association) {
+		id    = image->depth_id;
+		image = &texture_cache.GetImage(id);
+	} else if (image->info.IsDepth()) {
+		if (storage) {
+			EXIT("depth target cannot be bound as a storage image\n");
+		}
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
+		                            desc.info.data.size);
+	} else if (storage) {
+		ValidateStorageColorView(image->info.pixel_format, view_format, swizzle);
+	} else {
+		(void)SelectSampledColorView(image->info.pixel_format, pixel_format, swizzle);
+	}
+	return {.image_id = id, .desc = std::move(desc)};
+}
+
+DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                             const ShaderRecompiler::IR::DescriptorValue& value) const {
+	if (resource.atomic64 && !m_context.GetGraphics().host.capabilities.image_int64_atomics) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
@@ -513,12 +557,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageImageResource(resource);
 	}
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		DecodedTexture texture;
+		texture.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                 : TextureCache::BindingType::Texture);
+		texture.null_descriptor = true;
+		return texture;
 	}
 
 	const auto address         = descriptor.Base40();
@@ -638,31 +682,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
-	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association) {
-		id    = image->depth_id;
-		image = &texture_cache.GetImage(id);
-	} else if (image->info.IsDepth()) {
-		if (storage) {
-			EXIT("depth target cannot be bound as a storage image\n");
-		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
-		                            desc.info.data.size);
-	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
-	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
-		                             descriptor.DstSelXYZW());
-	}
-	return {id, nullptr, std::move(desc)};
+	return {std::move(desc), false, shader_conversion, pixel_format, view_format};
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
+static vk::Sampler NativeSampler(RenderContext&                                  context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value,
+                                 uint32_t view_min_lod) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {
@@ -671,7 +697,7 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
+	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border, view_min_lod);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -733,10 +759,24 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
-	prepared.samplers.reserve(program.info.samplers.size());
+	// One host sampler for each entry of the sampler binding: first each guest sampler, then the
+	// sampler of each texture that has its own entry. That one applies the texture view's minimum
+	// LOD, which this host cannot put on the view (see IR::SampledResourcePair).
+	const auto make_sampler = [&](uint32_t sampler, uint32_t min_lod) {
+		return NativeSampler(m_context, program, sampler,
+		                     snapshot.samplers[program.info.samplers[sampler].snapshot_index],
+		                     min_lod);
+	};
+	prepared.samplers.reserve(
+	    program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Samplers)]);
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		prepared.samplers.push_back(make_sampler(i, 0));
+	}
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.descriptor_index == UINT32_MAX) continue;
+		EXIT_IF(pair.descriptor_index != prepared.samplers.size());
+		prepared.samplers.push_back(
+		    make_sampler(pair.sampler, prepared.images.at(pair.image).desc.view_info.min_lod));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
@@ -879,13 +919,15 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma = false;
+	bool uses_dma       = false;
+	bool address_writes = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->program->info.uses_dma;
+		address_writes |= stage->runtime->program->has_address_writes;
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(address_writes);
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);
@@ -941,7 +983,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image_descriptor_count += count;
 			}
 		}
-		const auto shader_stage = NativeShaderStage(program.stage);
+		const auto shader_stage = NativeShaderStage(program);
 		push_stages |= shader_stage;
 		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
 		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
@@ -991,7 +1033,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
 		auto&       descriptors   = *prepared;
-		const auto  shader_stage  = NativeShaderStage(program.stage);
+		const auto  shader_stage  = NativeShaderStage(program);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();

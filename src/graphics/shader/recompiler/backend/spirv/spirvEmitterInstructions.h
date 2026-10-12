@@ -15,8 +15,8 @@ inline constexpr auto EmitConvertU32U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U8  = EmitBitCastU16F16;
 inline constexpr auto EmitBitCastU32F32 = EmitBitCastU16F16;
 EMIT_NATIVE(BitCastF32U32, OpBitcast, F32, uint32_t)
-EMIT_NATIVE(BitCastU64F64, OpBitcast, U64, uint32_t)
-EMIT_NATIVE(BitCastF64U64, OpBitcast, F64, uint32_t)
+uint32_t EmitBitCastU64F64(EmitterState& state, uint32_t arg0);
+uint32_t EmitBitCastF64U64(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU16U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU8U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertF16F32(EmitterState& state, uint32_t arg0);
@@ -24,11 +24,11 @@ inline constexpr auto EmitConvertF32F16 = EmitF16BitsToF32;
 uint32_t              EmitConvertS32F32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU32F32(EmitterState& state, uint32_t arg0);
 EMIT_NATIVE(ConvertF32S32, OpConvertSToF, F32, uint32_t)
-EMIT_NATIVE(ConvertF64S32, OpConvertSToF, F64, uint32_t)
+uint32_t              EmitConvertF64S32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertF32F64(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertF64F32(EmitterState& state, uint32_t arg0);
 EMIT_NATIVE(ConvertF32U32, OpConvertUToF, F32, uint32_t)
-EMIT_NATIVE(ConvertF64U32, OpConvertUToF, F64, uint32_t)
+uint32_t EmitConvertF64U32(EmitterState& state, uint32_t arg0);
 uint32_t EmitCompositeConstructU64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1);
 EMIT_NATIVE(CompositeConstructU32x2, OpCompositeConstruct, U32x2, uint32_t, uint32_t)
 EMIT_NATIVE(CompositeConstructU32x3, OpCompositeConstruct, U32x3, uint32_t, uint32_t, uint32_t)
@@ -126,37 +126,47 @@ EMIT_NATIVE(LogicalOr, OpLogicalOr, U1, uint32_t, uint32_t)
 EMIT_NATIVE(LogicalAnd, OpLogicalAnd, U1, uint32_t, uint32_t)
 EMIT_NATIVE(LogicalXor, OpLogicalNotEqual, U1, uint32_t, uint32_t)
 EMIT_NATIVE(LogicalNot, OpLogicalNot, U1, uint32_t)
+// An operand of a 32-bit float comparison. SPIR-V's DenormFlushToZero mode does not require
+// comparison operands to flush, so the flush is done here.
+inline uint32_t FloatCompareOperand32(ValueEmitContext& ctx, const IR::Inst& inst, size_t index) {
+	const bool flush = inst.Flags<IR::FPCompareFlags>().flush_input_denorms;
+	const auto value = inst.Arg(index);
+	if (flush && value.IsImmediate()) {
+		const auto bits = std::bit_cast<uint32_t>(value.F32Value());
+		return ConstantF32(ctx.state,
+		                   (bits & 0x7fffffffu) < 0x00800000u ? bits & 0x80000000u : bits);
+	}
+	const auto id = ctx.Arg(inst, index);
+	return flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
+}
 template <spv::Op opcode>
 uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	// SPIR-V's DenormFlushToZero mode does not require comparison operands to flush.
-	const bool flush = inst.Flags<IR::FPCompareFlags>().flush_input_denorms;
-	const auto operand = [&](size_t index) {
-		const auto value = inst.Arg(index);
-		if (flush && value.IsImmediate()) {
-			const auto bits = std::bit_cast<uint32_t>(value.F32Value());
-			return ConstantF32(ctx.state, (bits & 0x7fffffffu) < 0x00800000u
-			                                  ? bits & 0x80000000u : bits);
-		}
-		const auto id = ctx.Arg(inst, index);
-		return flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
-	};
-	return EmitNative<opcode, IR::Type::U1>(ctx.state, operand(0), operand(1));
+	return EmitNative<opcode, IR::Type::U1>(ctx.state, FloatCompareOperand32(ctx, inst, 0),
+	                                        FloatCompareOperand32(ctx, inst, 1));
+}
+// Ordered and not equal, as less than or greater than: MoltenVK turns OpFOrdNotEqual into
+// Metal's !=, which is true for NaN.
+inline uint32_t EmitFPOrdNotEqual32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto a = FloatCompareOperand32(ctx, inst, 0);
+	const auto b = FloatCompareOperand32(ctx, inst, 1);
+	return EmitNative<spv::OpLogicalOr, IR::Type::U1>(
+	    ctx.state, EmitNative<spv::OpFOrdLessThan, IR::Type::U1>(ctx.state, a, b),
+	    EmitNative<spv::OpFOrdGreaterThan, IR::Type::U1>(ctx.state, a, b));
 }
 inline constexpr auto EmitFPOrdEqual32 = EmitFloatCompare32<spv::OpFOrdEqual>;
-EMIT_NATIVE(FPOrdEqual64, OpFOrdEqual, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPOrdLessThanEqual64, OpFOrdLessThanEqual, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPOrdGreaterThanEqual64, OpFOrdGreaterThanEqual, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPOrdNotEqual64, OpFOrdNotEqual, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPOrdLessThan64, OpFOrdLessThan, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPOrdGreaterThan64, OpFOrdGreaterThan, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPUnordEqual64, OpFUnordEqual, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPUnordNotEqual64, OpFUnordNotEqual, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPUnordLessThan64, OpFUnordLessThan, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPUnordGreaterThan64, OpFUnordGreaterThan, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPUnordLessThanEqual64, OpFUnordLessThanEqual, U1, uint32_t, uint32_t)
-EMIT_NATIVE(FPUnordGreaterThanEqual64, OpFUnordGreaterThanEqual, U1, uint32_t, uint32_t)
+uint32_t EmitFPOrdEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPOrdLessThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPOrdGreaterThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPOrdNotEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPOrdLessThan64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPOrdGreaterThan64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPUnordEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPUnordNotEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPUnordLessThan64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPUnordGreaterThan64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPUnordLessThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPUnordGreaterThanEqual64(EmitterState& state, uint32_t arg0, uint32_t arg1);
 inline constexpr auto EmitFPUnordEqual32 = EmitFloatCompare32<spv::OpFUnordEqual>;
-inline constexpr auto EmitFPOrdNotEqual32 = EmitFloatCompare32<spv::OpFOrdNotEqual>;
 inline constexpr auto EmitFPUnordNotEqual32 = EmitFloatCompare32<spv::OpFUnordNotEqual>;
 inline constexpr auto EmitFPOrdLessThan32 = EmitFloatCompare32<spv::OpFOrdLessThan>;
 inline constexpr auto EmitFPUnordLessThan32 = EmitFloatCompare32<spv::OpFUnordLessThan>;
@@ -167,16 +177,15 @@ inline constexpr auto EmitFPUnordLessThanEqual32 = EmitFloatCompare32<spv::OpFUn
 inline constexpr auto EmitFPOrdGreaterThanEqual32 = EmitFloatCompare32<spv::OpFOrdGreaterThanEqual>;
 inline constexpr auto EmitFPUnordGreaterThanEqual32 = EmitFloatCompare32<spv::OpFUnordGreaterThanEqual>;
 EMIT_NATIVE(FPIsNan32, OpIsNan, U1, uint32_t)
-EMIT_NATIVE(FPIsNan64, OpIsNan, U1, uint32_t)
+uint32_t EmitFPIsNan64(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 inline constexpr auto EmitFPCmpClass16 = EmitClassMaskF16;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
-EMIT_NATIVE(FPAdd64, OpFAdd, F64, uint32_t, uint32_t)
-EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
-inline constexpr auto EmitFPFma64 =
-    EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
+uint32_t EmitFPAdd64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPMul64(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPFma64(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPFma32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMad32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
@@ -198,11 +207,11 @@ inline constexpr auto EmitFPRoundEven32 = EmitGlsl<GLSLstd450RoundEven, IR::Type
 inline constexpr auto EmitFPFloor32     = EmitGlsl<GLSLstd450Floor, IR::Type::F32, uint32_t>;
 inline constexpr auto EmitFPCeil32      = EmitGlsl<GLSLstd450Ceil, IR::Type::F32, uint32_t>;
 inline constexpr auto EmitFPTrunc32     = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
-inline constexpr auto EmitFPFloor64     = EmitGlsl<GLSLstd450Floor, IR::Type::F64, uint32_t>;
-inline constexpr auto EmitFPCeil64      = EmitGlsl<GLSLstd450Ceil, IR::Type::F64, uint32_t>;
-inline constexpr auto EmitFPTrunc64     = EmitGlsl<GLSLstd450Trunc, IR::Type::F64, uint32_t>;
-inline constexpr auto EmitFPFract32     = EmitGlsl<GLSLstd450Fract, IR::Type::F32, uint32_t>;
-inline constexpr auto EmitFPFract64     = EmitGlsl<GLSLstd450Fract, IR::Type::F64, uint32_t>;
+uint32_t              EmitFPFloor64(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPCeil64(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPTrunc64(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPFract32(EmitterState& state, uint32_t arg0);
+uint32_t              EmitFPFract64(EmitterState& state, uint32_t arg0);
 uint32_t              EmitFPSin(EmitterState& state, uint32_t arg0);
 uint32_t              EmitFPCos(EmitterState& state, uint32_t arg0);
 #undef EMIT_NATIVE

@@ -6,10 +6,14 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/cacheCollection.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/imageReadback.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/image/colorMetadataFill.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -20,9 +24,11 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -32,6 +38,15 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// True when every byte of the metadata slice in guest memory equals `code`.
+[[nodiscard]] bool SliceHoldsOnly(uint64_t address, uint64_t size, uint8_t code) {
+	std::vector<uint8_t> bytes(size);
+	if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+		EXIT("TextureCache: failed to read color metadata slice\n");
+	}
+	return std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; });
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -276,11 +291,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
-	} else {
-		m_slot_images.erase(id);
-	}
+	m_scheduler.DeferDestruction([this, id] { m_slot_images.erase(id); });
 }
 
 void TextureCache::FreeImage(ImageId id) {
@@ -413,7 +424,15 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
+	const auto& info = image.info;
+	if (ReadsBackToGuest({.width            = info.extent.width,
+	                      .height           = info.extent.height,
+	                      .depth            = info.extent.depth,
+	                      .layers           = info.resources.layers,
+	                      .tiled            = info.IsTiled(),
+	                      .block_compressed = info.IsBlock()},
+	                     m_readback_linear_images) &&
+	    !info.data.Empty()) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -746,6 +765,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		}
 		PrepareImageCopy(replacement);
 		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
+		replacement.NoteContentWrite();
 		CommitGpuWrite(replacement);
 	} else {
 		LOGF_COLOR(Log::Color::BrightYellow,
@@ -966,6 +986,7 @@ bool TextureCache::CanDownload(const Image& image) const {
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	KYTY_PROFILER_FUNCTION();
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info        = image.info;
 	const auto  binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
@@ -1091,28 +1112,59 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	// The guest wrote the whole block with one code in a fill dispatch the renderer recognized:
+	// the code is known without reading the bytes back. Any write since then voids the record.
+	std::optional<ColorMetadataFill> known;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto       fill = m_color_metadata_fills.find(range.address);
+		if (fill != m_color_metadata_fills.end()) {
+			if (fill->second.size >= range.size &&
+			    fill->second.generation ==
+			        m_buffer_cache.WriteWatches().Generation(fill->second.watch) &&
+			    m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+				known = fill->second;
+			} else {
+				DropColorMetadataFill(fill);
+			}
+		}
+	}
+	static const bool validate = std::getenv("KYTY_VALIDATE_METADATA_FILL") != nullptr;
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	bool read_back = !known || validate;
+	if (read_back && m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+		// A slice this renderer consumed is CPU memory: its bytes are at hand and decide it.
+		const bool from_record = known && !known->IsConsumed(address - range.address, slice_size);
+		if ((read_back || !from_record) &&
+		    !LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
+		}
+		if (from_record) {
+			const auto known_code = known->code;
+			if (validate) {
+				if (!SliceHoldsOnly(address, slice_size, known_code)) {
+					EXIT("TextureCache: recorded metadata fill 0x%02x disagrees with the bytes "
+					     "(first 0x%02x) at 0x%016" PRIx64 " slice %u\n",
+					     known_code, code, address, slice);
+				}
+			}
+			code = known_code;
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			continue;
+		if (!from_record) {
+			if (!SliceHoldsOnly(address, slice_size, code)) {
+				continue;
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1130,14 +1182,50 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
-			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, slice_size);
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			// A write by anyone else since the record was checked voids it. Read the generation
+			// before this thread's own write, so that write cannot hide another one.
+			const bool unchanged = known && m_buffer_cache.WriteWatches().Generation(
+			                                    known->watch) == known->generation;
+			const std::vector<uint8_t> bytes(slice_size, uint8_t {0xff});
+			m_buffer_cache.ReplaceMemory(address, bytes.data(), bytes.size());
+			if (known) {
+				// The slice is CPU memory now and holds 0xff, which decodes to "no clear". A later
+				// guest write to CPU memory does not reach the watch, so the record no longer
+				// speaks for this slice: it is noted as consumed, and a consumed slice is decided
+				// from its bytes, which need no read-back. The writes above are this thread's
+				// own, so the record adopts their generation.
+				bool kept = false;
+				{
+					std::scoped_lock lock {m_lock};
+					const auto       fill = m_color_metadata_fills.find(range.address);
+					if (fill != m_color_metadata_fills.end()) {
+						if (unchanged &&
+						    m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+							fill->second.consumed.emplace_back(address - range.address, slice_size);
+							fill->second.generation =
+							    m_buffer_cache.WriteWatches().Generation(fill->second.watch);
+							known = fill->second;
+							kept  = true;
+						} else {
+							DropColorMetadataFill(fill);
+						}
+					}
+				}
+				if (!kept) {
+					// The record is void: the remaining slices are decided from the real bytes.
+					known.reset();
+					if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+						m_buffer_cache.ReadMemory(range.address, range.size, false);
+					}
+					read_back = true;
+				}
+			}
 		}
 	}
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	KYTY_PROFILER_FUNCTION();
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1380,6 +1468,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	if (desc.type == BindingType::Storage) {
+		image.NoteContentWrite();
 		image.MarkGpuModified();
 	}
 	if (!image.info.data.Empty()) {
@@ -1474,6 +1563,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	if (!image.registered || image.depth_id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
+	image.NoteContentWrite();
 	TrackImage(id);
 	CommitGpuWrite(image);
 	if (image.info.HasStencil()) {
@@ -1570,6 +1660,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
+	image.NoteContentWrite();
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -1660,6 +1751,12 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
+	// Now, and again when the copies are recorded: preparing them can submit.
+	destination.NoteGpuWrite();
+	const struct NoteWhenRecorded {
+		Buffer& buffer;
+		~NoteWhenRecorded() { buffer.NoteGpuWrite(); }
+	} note_when_recorded {destination};
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.linear_slice_stride;
@@ -1715,6 +1812,12 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                  uint64_t destination_size, uint32_t levels) {
+	// Now, and again when the copies are recorded: preparing them can submit.
+	destination.NoteGpuWrite();
+	const struct NoteWhenRecorded {
+		Buffer& buffer;
+		~NoteWhenRecorded() { buffer.NoteGpuWrite(); }
+	} note_when_recorded {destination};
 	if (!CanDownload(image)) {
 		EXIT("TextureCache: invalid image download\n");
 	}
@@ -1823,11 +1926,80 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
+	// The download writes guest memory without a page fault: tell the watchers now, before the
+	// write can happen.
+	m_buffer_cache.WriteWatches().NotifyWrite(range.address, range.size);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;
+}
+
+void TextureCache::SaveGpuWrites(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	// TODO: a stencil plane (depth_id) the GPU wrote is not saved: no path downloads a stencil
+	// plane to guest memory yet.
+	const auto any_unsaved = [&] {
+		for (const auto id: FindImagesInRegion(address, size, false)) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && image->registered && !image->depth_id &&
+			    image->SafeToDownload()) {
+				return true;
+			}
+		}
+		return false;
+	};
+	{
+		std::scoped_lock lock {m_lock};
+		if (!any_unsaved()) {
+			return;
+		}
+	}
+	// As for a buffer read-back: a completion that runs off the GPU thread cannot wait for the
+	// GPU thread. Only when there is something to save: a completion may write guest memory.
+	if (CommandScheduler::InCompletionOffGpuThread()) {
+		EXIT("unsupported texture save from an asynchronous GPU completion, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     address, size);
+	}
+	std::optional<uint64_t> tick;
+	auto                    round = [&] {
+        std::scoped_lock lock {m_lock};
+        for (const auto id: FindImagesInRegion(address, size, false)) {
+            const auto* image = m_slot_images.try_get(id);
+            if (image != nullptr && image->registered && !image->depth_id &&
+                image->SafeToDownload() && DownloadImageMemory(id)) {
+                tick = m_scheduler.CurrentTick();
+            }
+        }
+        if (tick) {
+            m_scheduler.Flush();
+        }
+	};
+	const bool on_gpu_thread = GuestGpu::IsGpuThread();
+	if (on_gpu_thread) {
+		round();
+	} else if (!m_scheduler.Context().GetGpu().TrySendCommandSync(round)) {
+		// The GPU thread takes no more work: the emulator is shutting down. Unlike a buffer
+		// read-back, this thread can go on: it is about to write, and losing the texture's GPU
+		// writes at shutdown harms nothing.
+		return;
+	}
+	if (!tick) {
+		return;
+	}
+	// One round, not a loop as for buffers: a downloaded image stays GPU-modified, so a loop
+	// would download it again without end. The download writes guest memory when its submission
+	// ends; that comes before the write.
+	if (on_gpu_thread) {
+		m_scheduler.Wait(*tick);
+	} else if (!m_scheduler.WaitSubmitted(*tick)) {
+		return;
+	}
+	m_scheduler.WaitPriorityOperations(*tick);
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
@@ -1870,6 +2042,48 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			MarkAsMaybeDirty(id, *owner);
 		}
 	}
+}
+
+void TextureCache::RecordColorMetadataFill(uint64_t address, uint64_t size, uint32_t value) {
+	const auto code = ColorMetadataFillCode(value);
+	if (!code || size == 0 || !GuestRange {address, size}.Valid()) {
+		return;
+	}
+	// The record is only safe while every later write to the range is seen. GPU writes go through
+	// the buffer cache. CPU stores are seen as page faults, which only happens while the GPU owns
+	// the pages; a range the CPU already owns is writable without a fault, so it is not recorded.
+	// Image downloads write guest backing without a fault; they notify the write watch themselves.
+	if (!m_buffer_cache.IsRegionGpuModified(address, size)) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	if (const auto previous = m_color_metadata_fills.find(address);
+	    previous != m_color_metadata_fills.end()) {
+		DropColorMetadataFill(previous);
+	}
+	if (m_color_metadata_fills.size() >= MaxColorMetadataFills) {
+		DropColorMetadataFillsLocked();
+	}
+	const auto watch                = m_buffer_cache.WriteWatches().Watch(address, size);
+	const auto generation           = m_buffer_cache.WriteWatches().Generation(watch);
+	m_color_metadata_fills[address] = {size, *code, watch, generation, {}};
+}
+
+void TextureCache::DropColorMetadataFills() {
+	std::scoped_lock lock {m_lock};
+	DropColorMetadataFillsLocked();
+}
+
+void TextureCache::DropColorMetadataFillsLocked() {
+	for (auto fill = m_color_metadata_fills.begin(); fill != m_color_metadata_fills.end();) {
+		fill = DropColorMetadataFill(fill);
+	}
+}
+
+TextureCache::ColorMetadataFillMap::iterator
+TextureCache::DropColorMetadataFill(ColorMetadataFillMap::iterator fill) {
+	m_buffer_cache.WriteWatches().Unwatch(fill->second.watch);
+	return m_color_metadata_fills.erase(fill);
 }
 
 bool TextureCache::IsMeta(uint64_t address) {
@@ -1921,6 +2135,10 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	for (auto fill = m_color_metadata_fills.lower_bound(address);
+	     fill != m_color_metadata_fills.end() && fill->first < address + size;) {
+		fill = DropColorMetadataFill(fill);
+	}
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
@@ -1945,13 +2163,18 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const auto kind = PlanCollection({.used_memory    = m_total_used_memory,
+	                                  .trigger_memory = m_trigger_gc_memory,
+	                                  .system_memory  = m_graphics.UsesSystemMemory(),
+	                                  .passes         = tick});
+	if (kind == CollectionKind::None) {
 		return;
 	}
+	const bool idle    = kind == CollectionKind::Idle;
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		bool pressured  = !idle && m_total_used_memory >= m_pressure_gc_memory;
+		bool aggressive = !idle && allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		const uint64_t age = CollectionAge(kind, aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -1971,6 +2194,11 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
+				if (idle) {
+					// A GPU-written image is kept (see cacheCollection.h).
+					m_lru_cache.Touch(owner->lru_id, tick);
+					continue;
+				}
 				const bool safe = owner->SafeToDownload();
 				if (safe && owner->info.IsTiled()) {
 					continue;

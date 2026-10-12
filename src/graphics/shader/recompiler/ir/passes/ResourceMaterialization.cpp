@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1070,6 +1071,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
+	plan.srt_tape = SrtTape::Build(plan);
 	CompileSrtWalker(plan);
 	return plan;
 }
@@ -1085,13 +1087,31 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
 	SrtReadCapture capture {runtime, reads};
-	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed,
-	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
+	const auto     observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	// A plan with a tape runs it in place of the walkers. Its plan has no indirect descriptor,
+	// no uniform fill, and no captured reads, so the walkers below are not used.
+	const auto*              tape = program.srt_tape.get();
+	std::optional<SrtWalker> clean;
+	std::optional<SrtWalker> walker;
+	if (tape != nullptr) {
+		tape->Run(program, observed);
+		program.active_sources.clear();
+		if (!tape->FlatBuffer(program, snapshot.flattened_srt)) {
+			return false;
+		}
+	} else {
+		clean.emplace(program, CleanRuntime(observed));
+		walker.emplace(program, observed,
+		               capture_reads || program.requires_specialization_memory ? &*clean : nullptr);
+		if (!walker->RefreshFlatBuffer(snapshot.flattened_srt)) {
+			return false;
+		}
 	}
+	// The tape builder refuses every plan that would reach the clean walker (SrtWalker.cpp).
+	const auto clean_walker = [&]() -> SrtWalker& {
+		EXIT_IF(!clean.has_value());
+		return *clean;
+	};
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
@@ -1099,7 +1119,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+		uniform_fill = clean_walker().Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
@@ -1110,7 +1130,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
+			if (tape != nullptr) {
+				return tape->Descriptor(program, source, value);
+			}
+			auto& source_walker = capture_reads && written ? clean_walker() : *walker;
+			return source_walker.EvaluateDescriptor(source, value);
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -1130,7 +1154,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
 					if (!MaterializeIndirectDescriptor(
-					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
+					        program, *source->indirect_descriptor, i, 4u, observed, clean_walker(), snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        NormalizeIndirectStoreBuffer))
 						return false;
@@ -1190,7 +1214,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
-			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
+			        program, indirect, i, 8u, observed, clean_walker(), snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
@@ -1236,10 +1260,30 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
+bool ResourceSpecializationFits(const ShaderInfo&             info,
+                                const ResourceSpecialization& specialization) {
+	// Each entry past the shader's own resources is a copy of one of them; every indirect root
+	// is an entry.
+	const auto fits = [](const auto& sources, size_t original_count, uint32_t no_root) {
+		if (original_count > sources.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < sources.size(); index++) {
+			const auto root = sources[index].indirect_root;
+			if ((index >= original_count && root >= original_count) ||
+			    (root != no_root && root >= sources.size())) {
+				return false;
+			}
+		}
+		return true;
+	};
+	return fits(specialization.buffers, info.buffers.size(), BufferResource::NoIndirectBuffer) &&
+	       fits(specialization.images, info.images.size(), ImageResource::NoIndirectImage);
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
-	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
-	        program.info.images.size() > specialization.images.size());
+	EXIT_IF(!ResourceSpecializationFits(program.info, specialization));
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();

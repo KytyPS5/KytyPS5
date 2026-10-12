@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RANGESET_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -89,6 +90,17 @@ public:
 				func(begin, last);
 			}
 		}
+	}
+
+	// The range that holds `address`; empty when no range holds it. Ranges that touch are one
+	// range here.
+	[[nodiscard]] GuestSpan Find(uint64_t address) const {
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return {};
+		}
+		--it;
+		return address < it->second ? GuestSpan {it->first, it->second} : GuestSpan {};
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }

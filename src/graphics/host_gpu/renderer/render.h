@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/profiler.h"
+#include "graphics/host_gpu/pipelineUse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -12,6 +14,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -101,11 +104,19 @@ public:
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const;
+	// Any command was recorded since Begin (Handle was taken).
+	[[nodiscard]] bool Used() const noexcept { return m_used; }
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	// The guest flushed its caches: writes recorded so far must be visible to later reads. Outside
+	// a render pass the barrier is recorded at once. Inside one it is recorded when the pass
+	// ends. That is equivalent: every shader or transfer write the renderer records ends the pass
+	// and is followed by its own barrier, so the only writes still open are to the attachments,
+	// and those cannot be read before the pass ends.
+	void RequestGlobalBarrier() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -137,6 +148,8 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable bool        m_used        = false;
+	mutable bool        m_global_barrier_pending = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -151,6 +164,9 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	// A frame of the game ends: what the next frame draws into is told apart from what it does
+	// not (see PlanPipelineUse).
+	void NoteFlip();
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
@@ -173,6 +189,9 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// Remembered in m_decoded_textures.
+	[[nodiscard]] DecodedTexture DecodeTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                           const ShaderRecompiler::IR::DescriptorValue& value) const;
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -190,6 +209,8 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	void ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
+	                              vk::PipelineLayout layout);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -209,8 +230,60 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// The frame in which each render target was last drawn into. A target is an image slot with
+	// its generation (so a slot given to a new image does not inherit the frame of the old one)
+	// and the mip level and array layer (a face of a cube map, a layer of an atlas or a cascade of
+	// a shadow map drawn once is not covered by draws into the others).
+	// One target of a draw: an image (slot and generation), a mip and a layer. Exact, no hash.
+	struct TargetId {
+		uint64_t image = 0;
+		uint32_t mip   = 0;
+		uint32_t layer = 0;
+		bool     operator==(const TargetId&) const = default;
+	};
+	struct TargetIdHash {
+		size_t operator()(const TargetId& id) const noexcept {
+			return std::hash<uint64_t> {}(id.image ^ ((uint64_t {id.mip} << 40) | (uint64_t {id.layer} << 8)));
+		}
+	};
+	static uint64_t ImageIdentity(ImageId image) {
+		return (uint64_t {image.index} << 32) | image.generation;
+	}
+	static TargetId TargetKey(ImageId image, uint32_t mip = 0, uint32_t layer = 0) {
+		return {ImageIdentity(image), mip, layer};
+	}
+	std::unordered_map<TargetId, TargetHistory, TargetIdHash> m_target_frames;
+	// Buffers a draw uses on the GPU alone, within one submission (a depth snapshot, the records
+	// of an emulated mesh draw). Kept and used again once the GPU has passed the submission that
+	// used them: creating and destroying one per draw cost 0.45 ms each on MoltenVK.
+	struct ScratchBuffer {
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                tick = 0;
+	};
+	std::vector<ScratchBuffer> m_scratch;
+	uint64_t                   m_scratch_bytes = 0;
+	// The depth snapshot the last depth-bounds draw read (see depthSnapshotPlan.h). Held out
+	// of the scratch pool while it may be read again; returned to it when replaced.
+	struct DepthSnapshot {
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                tick       = 0;
+		uint64_t                image      = 0;
+		uint32_t                layer      = 0;
+		uint64_t                generation = 0;
+		bool                    load_clear = false;
+		float                   clear      = 0.0f;
+	};
+	DepthSnapshot              m_depth_snapshot;
+	Buffer&                    AcquireScratch(uint64_t bytes);
+	static TargetId TargetKey(const RenderColorInfo& color);
+	static TargetId TargetKey(const RenderDepthInfo& depth);
+	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// Dropped whole when full: a frame of Crash Bandicoot 4 decodes about 1,500 different ones.
+	static constexpr size_t                MaxDecodedTextures = 4096;
+	std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash, TextureDecodeKeyEqual>
+	    m_decoded_textures;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -16,6 +16,9 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
+	if (state.single_lane) {
+		return Select(state, TypeU32(state), exec, source, ConstantU32(state, 0));
+	}
 	if (state.lane_count == 2) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
@@ -318,10 +321,27 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	    });
 }
 
+// On a host that may reuse a volatile load, a word of a device buffer that invocations share is
+// read and written with atomic operations: an atomic load is done every time it is reached, and
+// it must not race with a plain store. The order is relaxed, which is all the host offers.
+bool SharesWordsAtomically(const EmitterState& state, const MemoryResourceAccess& resource) {
+	return state.host.faults.volatile_loads_are_reused && resource.element_bits == 32u &&
+	       (resource.kind == IR::ResourceKind::Buffer ||
+	        resource.kind == IR::ResourceKind::IndirectBuffer ||
+	        resource.kind == IR::ResourceKind::Gds);
+}
+
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	if (resource.memory_access == spv::MemoryAccessVolatileMask &&
+	    SharesWordsAtomically(ctx.state, resource)) {
+		ctx.state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(ctx.state), value, pointer,
+		                              ConstantU32(ctx.state, spv::ScopeDevice),
+		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone));
+		return value;
+	}
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
 	                              resource.memory_access);
 	return value;
@@ -331,6 +351,14 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend) {
 	uint32_t value;
 	if (resource.element_bits < 32u) {
+		if (resource.memory_access == spv::MemoryAccessVolatileMask &&
+		    ctx.state.host.faults.volatile_loads_are_reused) {
+			// There is no atomic load of 8 or 16 bits, and a plain one may be reused.
+			EXIT("shader reads an 8-bit or 16-bit buffer element that another invocation may "
+			     "store, which the host GPU cannot read again each time: hash=0x%016" PRIx64
+			     " stage=%u\n",
+			     ctx.state.program.shader_hash, static_cast<unsigned>(ctx.state.program.stage));
+		}
 		const auto loaded = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpLoad,
 		                              ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, loaded,
@@ -489,6 +517,14 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
+	if (SharesWordsAtomically(ctx.state, resource)) {
+		// Every store, with or without GLC: the guest publishes each of them to other invocations.
+		ctx.state.builder.AddFunction(spv::OpAtomicStore,
+		                              EmitMemoryElementPointer(ctx.state, resource, index),
+		                              ConstantU32(ctx.state, spv::ScopeDevice),
+		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), data);
+		return;
+	}
 	ctx.state.builder.AddFunction(spv::OpStore,
 	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
 	                              resource.memory_access);
@@ -1305,7 +1341,31 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
-	const auto first = ctx.FirstLane(ballot);
+	auto       first = ctx.FirstLane(ballot);
+	if (state.helper_invocation_variable != 0) {
+		// A helper pixel is a lane of the subgroup like any other, but its atomic changes
+		// nothing and returns no defined value. The lane that moves the counter for all the
+		// lanes must be a real pixel. Helper lanes are still counted, as the masks of the
+		// shader count them: their places stay unused.
+		const auto helper =
+		    Unary(state, spv::OpLoad, TypeBool(state), state.helper_invocation_variable);
+		const auto real =
+		    AndCondition(state, exec, Unary(state, spv::OpLogicalNot, TypeBool(state), helper));
+		const auto real_ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4),
+		                          real_ballot, ConstantU32(state, spv::ScopeSubgroup), real);
+		const auto real_low  = state.builder.AllocateId();
+		const auto real_high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), real_low, real_ballot,
+		                          0);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), real_high, real_ballot,
+		                          1);
+		const auto any_real =
+		    Binary(state, spv::OpINotEqual, TypeBool(state),
+		           Binary(state, spv::OpBitwiseOr, TypeU32(state), real_low, real_high),
+		           ConstantU32(state, 0));
+		first = Select(state, TypeU32(state), any_real, ctx.FirstLane(real_ballot), first);
+	}
 	const auto source_lane =
 	    state.lane_count == 2
 	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))
@@ -1333,6 +1393,9 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          ConstantU32(state, spv::MemorySemanticsMaskNone), count);
 		return value;
 	});
+	if (state.single_lane) {
+		return atomic;
+	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);

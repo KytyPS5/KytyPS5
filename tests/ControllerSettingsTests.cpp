@@ -470,6 +470,8 @@ void TestTriggerEffectState() {
 	check_state(1, 5, "feedback position 9 activated before full travel");
 	SetAxis(HOST_INPUT_CONTROLLER_ID, Axis::TriggerLeft, 255);
 	check_state(2, 5, "keyboard trigger travel did not activate feedback");
+	// The key is released: the keyboard holds its trigger apart from the gamepad's.
+	SetAxis(HOST_INPUT_CONTROLLER_ID, Axis::TriggerLeft, 0);
 	param.command[0].data[0] = 0;
 	set_effect();
 	SetAxis(1, Axis::TriggerLeft, 0);

@@ -39,7 +39,8 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	if (!(Config::GraphicsDebugDumpEnabled() || Config::GpuDebugLabelsEnabled()) ||
+	    device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}
@@ -51,6 +52,21 @@ void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<A
 	    reinterpret_cast<uintptr_t>(static_cast<typename Handle::CType>(handle)));
 	info.pObjectName = name.c_str();
 	(void)device.setDebugUtilsObjectNameEXT(&info);
+}
+
+// Marks a point in a command buffer with a name that GPU capture tools show. Costs nothing unless
+// --gpu-debug-labels is on.
+template <typename... Args>
+void InsertDebugLabel(vk::CommandBuffer command, fmt::format_string<Args...> format,
+                      Args&&... args) {
+	if (!Config::GpuDebugLabelsEnabled() || command == nullptr ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdInsertDebugUtilsLabelEXT == nullptr) {
+		return;
+	}
+	const auto             name = fmt::format(format, std::forward<Args>(args)...);
+	vk::DebugUtilsLabelEXT label {};
+	label.pLabelName = name.c_str();
+	command.insertDebugUtilsLabelEXT(&label);
 }
 
 template <typename T, typename Enumerator>

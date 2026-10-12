@@ -3,9 +3,13 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/bufferChunk.h"
+#include "graphics/host_gpu/cacheCollection.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/readbackPlan.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -14,9 +18,11 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -130,11 +136,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	Unregister(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
-	} else {
-		m_slot_buffers.erase(id);
-	}
+	m_scheduler.DeferDestruction([this, id] { m_slot_buffers.erase(id); });
 }
 
 template <bool async>
@@ -174,6 +176,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto              native = command.Handle();
+	InsertDebugLabel(native, "Download {} ranges, {} bytes, from buffer 0x{:x}+0x{:x}",
+	                 copies.size(), total_size, buffer_address, buffer.Size());
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
@@ -213,6 +217,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
+		// A temporary download buffer is held by every command buffer committed while it lived,
+		// also by the other submitters' (see queueCommits.h).
+		m_scheduler.DeferDestruction([held = std::move(publish)] {});
 	}
 	return true;
 }
@@ -269,29 +276,166 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	m_write_watches.NotifyWrite(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	// After the dirty state is published: whoever takes this entry also sees the dirty bytes.
+	RecordGuestWrite(vaddr, size);
+}
+
+void BufferCache::ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid memory-replacement range\n");
+	}
+	m_write_watches.NotifyWrite(vaddr, size);
+	// What the GPU wrote in the range is about to be overwritten in full, so it is dropped: a
+	// read-back of it would only make the caller wait for bytes nobody reads.
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
+	LibKernel::Memory::WriteBacking(vaddr, data, size);
+	// After the dirty state is published: whoever takes this entry also sees the dirty bytes.
+	RecordGuestWrite(vaddr, size);
+}
+
+void BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped) {
+	// Each fault costs a signal and a protection change, which is slow under Rosetta. A game that
+	// rewrites buffers every frame faults on every page it touches, so one fault covers a window.
+	constexpr uint64_t WindowSize = 64 * 1024;
+	const auto         begin      = Common::AlignDown(fault_vaddr, WindowSize);
+	if (window_is_mapped && GuestRange {begin, WindowSize}.Valid() &&
+	    !m_memory_tracker.IsRegionGpuModified(begin, WindowSize)) {
+		InvalidateMemory(begin, WindowSize);
+		return;
+	}
+	InvalidateMemory(fault_vaddr, 1);
+}
+
+void BufferCache::NoteAddressWrites() noexcept {
+	m_unsettled_everywhere = true;
+}
+
+void BufferCache::SettleGpuWrites() noexcept {
+	for (const auto id: m_unsettled_writers) {
+		if (!IsBufferInvalid(id) && !m_slot_buffers[id].is_deleted) {
+			m_slot_buffers[id].NoteGpuWrite();
+		}
+	}
+	m_unsettled_writers.clear();
+	if (m_unsettled_everywhere) {
+		m_unsettled_everywhere = false;
+		m_address_write_tick   = m_scheduler.CurrentTick();
+		// No buffer was noted for these writes, so the barrier is asked for here.
+		m_scheduler.NoteWriteTheCpuReads();
+	}
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
-	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
+	KYTY_PROFILER_FUNCTION();
+	if (CommandScheduler::InCompletionOffGpuThread()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
+	// See ReadbackCallerCanWait: after a few waits the GPU thread does the waiting.
+	const bool    on_other_thread = !GuestGpu::IsGpuThread();
+	auto&         gpu             = m_scheduler.Context().GetGpu();
+	for (int waits = 0;; ++waits) {
+		std::optional<uint64_t> wait_tick;
+		auto round = [&] {
+			wait_tick = ReadBack(vaddr, size, is_write, ReadbackCallerCanWait(on_other_thread, waits));
+		};
+		// The GPU thread no longer takes work, or the device no longer answers: the emulator is
+		// shutting down. This thread cannot go on without the page, and must not stop the
+		// shutdown with an error, which would also lose the caches that are saved at exit. It
+		// stays here until the process ends.
+		const auto wait_for_exit = [] {
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::hours(1));
+			}
+		};
+		bool sent = false;
+		{
+			KYTY_PROFILER_BLOCK("ReadMemory: on the GPU thread");
+			sent = gpu.TrySendCommandSync(round);
+		}
+		if (!sent) {
+			wait_for_exit();
+		}
+		if (!wait_tick) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		KYTY_PROFILER_BLOCK("ReadMemory: wait for the GPU");
+		if (!m_scheduler.WaitSubmitted(*wait_tick)) {
+			wait_for_exit();
+		}
+		// And for what earlier submissions write to guest memory when they finish, so that the
+		// GPU thread finds nothing left to wait for when it publishes.
+		m_scheduler.WaitPriorityOperations(*wait_tick);
+	}
+}
 
+std::optional<uint64_t> BufferCache::ReadBack(uint64_t vaddr, uint64_t size, bool is_write,
+                                              bool caller_can_wait) {
+	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		return std::nullopt;
+	}
+	const auto id     = FindBuffer(vaddr, size);
+	auto&      buffer = m_slot_buffers[id];
+
+	const auto current = m_scheduler.CurrentTick();
+	// A write that is prepared but not recorded yet counts as one in the open submission.
+	const bool unsettled = m_unsettled_everywhere ||
+	                       std::ranges::find(m_unsettled_writers, id) != m_unsettled_writers.end();
+	const auto last_write =
+	    unsettled ? current : std::max(buffer.LastGpuWriteTick(), m_address_write_tick);
+	const auto plan       = PlanReadback({
+	          .cpu_readable    = !m_read_back_through_gpu && !buffer.Mapped().empty(),
+	          .last_write_tick = last_write,
+	          .current_tick    = current,
+	          .last_write_done = last_write < current && m_scheduler.IsFree(last_write),
+	          .caller_can_wait = caller_can_wait,
+    });
+	if (plan.step == ReadbackStep::CopyThroughGpu) {
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	} else {
+		if (plan.submit_first) {
+			m_scheduler.Flush();
 		}
-	});
+		if (plan.step == ReadbackStep::CallerWaits) {
+			return plan.tick;
+		}
+		m_scheduler.Wait(plan.tick);
+		// What earlier submissions write to guest memory when they finish comes first.
+		m_scheduler.WaitPriorityOperations(plan.tick);
+		if (PublishFromBufferMemory(buffer, vaddr, size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		}
+	}
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+	return std::nullopt;
+}
+
+bool BufferCache::PublishFromBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	bool       published = false;
+	const auto memory    = buffer.Mapped();
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "buffer read-back");
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    const auto offset = buffer.Offset(start);
+			    buffer.Invalidate(offset, end - start);
+			    Libs::LibKernel::Memory::WriteBacking(start, memory.data() + offset, end - start);
+			    published = true;
+		    });
+		    m_gpu_modified_ranges.Subtract(address, bytes);
+	    });
+	return published;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -377,13 +521,17 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
-	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
-	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+
+	// The whole chunk around the first use (see bufferChunk.h).
+	const auto chunk =
+	    ChunkRange({vaddr, vaddr + size}, m_scheduler.Context().MappingAt(vaddr), s_chunk_size);
+	const auto end     = Common::AlignUp(chunk.end, CACHING_PAGESIZE);
+	vaddr              = Common::AlignDown(chunk.begin, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
 	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+	    m_graphics, m_scheduler, MemoryUsage::Guest, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
@@ -394,11 +542,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
+	// A new buffer starts with guest bytes the GPU has not seen: it counts as a CPU write.
+	RecordGuestWrite(overlap.begin, overlap.end - overlap.begin);
 	return id;
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	KYTY_PROFILER_FUNCTION();
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -409,31 +560,62 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (!is_written) {
+		// Hot pages stay dirty and open after an upload (see writeHeat.h), so the CPU's next
+		// writes to them neither fault nor reach the log. The uploaded ranges that are still
+		// dirty hold them: uploaded again through device addresses in the next guest submission.
+		for (const auto& copy: copies) {
+			const auto address = buffer.CpuAddress() + copy.dstOffset;
+			if (m_memory_tracker.IsRegionCpuModified(address, copy.size)) {
+				m_guest_write_log.RecordHot({address, copy.size});
+			}
+		}
+	}
 	if (source) {
+		buffer.NoteGpuWrite();
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
-		vk::BufferMemoryBarrier before {};
-		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-		                       vk::AccessFlagBits::eTransferRead |
-		                       vk::AccessFlagBits::eTransferWrite;
-		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer              = buffer.Handle();
-		before.offset              = 0;
-		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
-		auto after          = before;
-		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		InsertDebugLabel(native, "Upload {} ranges, {} bytes, to buffer 0x{:x}+0x{:x}",
+		                 copies.size(), total_size, buffer.CpuAddress(), buffer.Size());
+		if (m_upload_batch_open) {
+			if (!m_upload_batch_started) {
+				m_upload_batch_started = true;
+				vk::MemoryBarrier before_all {};
+				before_all.srcAccessMask =
+				    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+				    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+				before_all.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+				native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+				                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before_all, 0,
+				                       nullptr, 0, nullptr);
+			}
+			native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                  copies.data());
+		} else {
+			vk::BufferMemoryBarrier before {};
+			before.srcAccessMask =
+			    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+			    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+			before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+			before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.buffer              = buffer.Handle();
+			before.offset              = 0;
+			before.size                = buffer.Size();
+			native.pipelineBarrier(
+			    vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+			    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+			native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                  copies.data());
+			auto after          = before;
+			after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			after.dstAccessMask =
+			    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			native.pipelineBarrier(
+			    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+			    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		}
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -441,18 +623,52 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+void BufferCache::BeginUploadBatch() {
+	EXIT_IF(m_upload_batch_open);
+	m_upload_batch_open    = true;
+	m_upload_batch_started = false;
+}
+
+void BufferCache::EndUploadBatch() {
+	EXIT_IF(!m_upload_batch_open);
+	m_upload_batch_open = false;
+	RunBatchCopies();
+	if (!m_upload_batch_started) {
+		return;
+	}
+	// A wrap of the staging buffer can submit in the middle of a batch. A barrier orders all
+	// earlier commands of the queue, so the one recorded here still covers the copies before it.
+	vk::MemoryBarrier after_all {};
+	after_all.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after_all.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                               vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+	                                               &after_all, 0, nullptr, 0, nullptr);
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
 		return nullptr;
 	}
+	PerfCounters::Add(PerfCounters::Counter::UploadBytes, total_size);
+	PerfCounters::Add(PerfCounters::Counter::UploadCopies, copies.size());
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	auto [mapped, base_offset] = MapStaging(total_size);
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			if (m_upload_batch_open) {
+				m_batch_copies.push_back({mapped + copy.srcOffset,
+				                          reinterpret_cast<const void*>(address), copy.size});
+			} else {
+				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address),
+				            copy.size);
+			}
 			copy.srcOffset += base_offset;
+		}
+		if (m_upload_batch_open && !m_staging_buffer.IsCoherent()) {
+			m_batch_flushes.push_back({.offset = base_offset, .size = total_size});
 		}
 		m_staging_buffer.Commit();
 		return m_staging_buffer.Handle();
@@ -471,15 +687,51 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+std::pair<uint8_t*, uint64_t> BufferCache::MapStaging(uint64_t size) {
+	// A map can wait for the GPU, and a wait for the open command buffer submits it. The batch's
+	// GPU copies would then read staging bytes not copied yet, so a map that has to wait runs the
+	// batch's copies first.
+	if (!m_batch_copies.empty()) {
+		if (const auto mapped = m_staging_buffer.Map(size, 4, false); mapped.first != nullptr) {
+			return mapped;
+		}
+		RunBatchCopies();
+	}
+	return m_staging_buffer.Map(size, 4);
+}
+
+void BufferCache::RunBatchCopies() {
+	if (m_batch_copies.empty()) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("UploadCopies: batch copy");
+	m_copy_workers.Run(m_batch_copies);
+	m_batch_copies.clear();
+	for (const auto& flush: m_batch_flushes) {
+		m_staging_buffer.Flush(flush.offset, flush.size);
+	}
+	m_batch_flushes.clear();
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	// A batch copies guest bytes when it ends. A written buffer protects its pages before that,
+	// and the copy would fault on its own page (see BeginUploadBatch).
+	EXIT_IF(m_upload_batch_open);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
+	// A read-only range the CPU wrote and the GPU has not: copy it into the stream buffer on the
+	// CPU instead of recording a GPU copy. A GPU copy ends the current render pass, and on a
+	// tile-based GPU every new pass loads and stores its whole targets. A draw-heavy frame can
+	// issue thousands of such copies, nearly all under 64 KiB. A formatted buffer over one page
+	// keeps the full path, which takes its bytes from an image when an image holds them.
+	constexpr uint64_t StreamUploadLimit = 4 * CACHING_PAGESIZE;
+	if (!is_written &&
+	    (size <= CACHING_PAGESIZE || (!is_texel_buffer && size <= StreamUploadLimit)) &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
@@ -499,6 +751,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		if (m_unsettled_writers.size() < MaxUnsettledWriters) {
+			m_unsettled_writers.push_back(id);
+		} else {
+			m_unsettled_everywhere = true;
+		}
+		m_write_watches.NotifyWrite(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -607,6 +865,26 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
+void BufferCache::RecordGuestWrite(uint64_t vaddr, uint64_t size) {
+	m_guest_write_log.Record({vaddr, size});
+}
+
+void BufferCache::RecordGpuThreadWrite(uint64_t vaddr, uint64_t size) {
+	RecordGuestWrite(vaddr, size);
+}
+
+void BufferCache::BeginSubmission() {
+	m_guest_write_log.BeginSubmission();
+}
+
+bool BufferCache::TakeGuestWrites(std::vector<GuestRange>& ranges) {
+	return m_guest_write_log.Take(ranges);
+}
+
+void BufferCache::RequestFullSynchronization() {
+	m_guest_write_log.RequestFullPass();
+}
+
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
@@ -616,16 +894,23 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	KYTY_PROFILER_FUNCTION();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Buffers are collected only for memory, never because they are idle (see cacheCollection.h):
+	// the plan is asked as for a GPU with memory of its own.
+	const auto kind = PlanCollection({.used_memory    = m_total_used_memory,
+	                                  .trigger_memory = m_trigger_gc_memory,
+	                                  .system_memory  = false,
+	                                  .passes         = tick});
+	if (kind == CollectionKind::None) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const uint64_t age        = CollectionAge(kind, aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
@@ -664,8 +949,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
-		Unregister(id);
-		m_slot_buffers.erase(id);
+		DeleteBuffer(id);
 	}
 }
 
@@ -674,6 +958,11 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Most buffers of a range hold nothing the CPU wrote; for them a synchronization uploads
+	// nothing and only costs its setup.
+	if (!m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return;
+	}
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
@@ -683,7 +972,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		auto&      buffer = m_slot_buffers[it->second];
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
+		if (start < finish && m_memory_tracker.IsRegionCpuModified(start, finish - start)) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}

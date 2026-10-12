@@ -888,6 +888,7 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 	// Approximate ordered counting with one GDS atomic per wave. Wave-launch ordering and
 	// release/done synchronization are not emulated.
+	program.uses_ordered_count = true;
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto m0 = ir.GetM0();
 	auto address = ir.BitwiseAnd(ir.ShiftRightLogical(m0, IR::U32(IR::Value(16u))),

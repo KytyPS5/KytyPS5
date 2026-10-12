@@ -117,6 +117,10 @@ public:
 		m_maybe_hash_valid = false;
 	}
 
+	// Counts the writes to the image's contents (GPU writes, uploads, clears, copies, draws
+	// that write depth or stencil). A reader that holds a copy compares it.
+	[[nodiscard]] uint64_t ContentGeneration() const noexcept { return m_content_generation; }
+	void                   NoteContentWrite() noexcept { m_content_generation++; }
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
@@ -170,6 +174,7 @@ private:
 	bool              m_maybe_cpu_dirty  = false;
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
+	uint64_t          m_content_generation = 0;
 	bool              m_buffer_modified  = false;
 };
 

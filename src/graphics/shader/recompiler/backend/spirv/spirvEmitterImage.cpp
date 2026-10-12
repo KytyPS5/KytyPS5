@@ -518,8 +518,9 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	                                 Binary(state, spv::OpFMul, TypeF32(state), coord, width_f32),
 	                                 ConstantF32(state, 0x3f000000u)));
 
-	const auto sampled = MakeSampledImage(state, mem.resource,
-	                                     LoadSamplerDescriptor(state, mem.sampler));
+	const auto sampled =
+	    MakeSampledImage(state, mem.resource,
+	                     LoadSamplerDescriptor(state, mem.sampler, mem.resource));
 	const auto vector_type = ImageVectorType(state, numeric_class, 4);
 	const auto scalar_type = ImageScalarType(state, numeric_class);
 	const auto component = ImageGatherSource(state, mem);
@@ -713,8 +714,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		const auto dimension = image.dimension;
-		const auto sampled = MakeSampledImage(state, mem.resource,
-		                                     LoadSamplerDescriptor(state, mem.sampler));
+		const auto sampled =
+		    MakeSampledImage(state, mem.resource,
+		                     LoadSamplerDescriptor(state, mem.sampler, mem.resource));
 		const auto lod       = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
@@ -831,8 +833,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			} else {
 				component_or_dref = ConstantU32(state, ImageGatherSource(state, mem));
 			}
-			const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
 			const auto EmitGather = [&](uint32_t resource, uint32_t array_index) {
+				// The sampler's entry for this texture, where the layout has one for each.
+				const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, resource);
 				const auto& candidate = state.program.info.images[resource];
 				const auto dimension = candidate.dimension;
 				const auto coord = CoordF32(
@@ -920,8 +923,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    !offset_value.IsImmediate()) {
 			ctx.Fail(inst, "has a nonconstant sample texel offset");
 		}
-		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
+			// The sampler's entry for this texture, where the layout has one for each.
+			const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, resource, sampler_index);
 			const auto& candidate = state.program.info.images[resource];
 			auto sample_operands = operands;
 			auto sample_operand_count = operand_count;
@@ -955,6 +959,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto zero = image.atomic64 ? ConstantU64(state, 0) : ConstantU32(state, 0);
 		ctx.Define(inst, EmitValueOrDefaultIfCondition(
 		                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
+			           // The atomic must see this invocation's earlier image writes, also through
+			           // another binding. SPIR-V orders them by program order, but MoltenVK puts
+			           // no fence between a texture write and a texture atomic. The barrier becomes
+			           // a texture memory fence there.
+			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
 			           const auto pointer      = state.builder.AllocateId();
 			           const auto pointer_type =
 			               state.builder.Type(spv::OpTypePointer, spv::StorageClassImage,

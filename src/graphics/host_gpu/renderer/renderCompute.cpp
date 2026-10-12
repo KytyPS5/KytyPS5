@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -227,6 +228,8 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	PerfCounters::Add(PerfCounters::Counter::Dispatches);
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -345,7 +348,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(program.has_address_writes);
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
@@ -430,15 +433,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	InsertDebugLabel(vk_buffer, "Dispatch {}x{}x{} submit={}", thread_group_x, thread_group_y,
+	                 thread_group_z, submit_id);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+
+	// A uniform fill of a colour metadata block is the guest's fast clear. Record the code so the
+	// first draw on that target needs no GPU read-back to find it.
+	ShaderBufferResource fill_descriptor;
+	uint32_t             fill_value = 0;
+	uint64_t             fill_size  = 0;
+	if (resources.uniform_fill.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
+	    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                             fill_descriptor, fill_value, fill_size)) {
+		m_context.GetTextureCache().RecordColorMetadataFill(fill_descriptor.Base48(), fill_size,
+		                                                    fill_value);
+	}
+	m_context.GetCommandScheduler().NoteWork();
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
+	PerfCounters::Add(PerfCounters::Counter::Dispatches);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -462,7 +481,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(program.has_address_writes);
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);
@@ -492,9 +511,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	InsertDebugLabel(vk_buffer, "DispatchIndirect submit={}", submit_id);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetCommandScheduler().NoteWork();
 }
 
 } // namespace Libs::Graphics

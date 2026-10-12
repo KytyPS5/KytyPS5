@@ -18,6 +18,10 @@ Pair ExtractPair(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, max_value ? SoftFloat64Op::Max : SoftFloat64Op::Min,
+		                       {lhs, rhs});
+	}
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
 	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
@@ -101,13 +105,37 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 
 } // namespace
 
+namespace {
+
+// Keeps a compiler from merging the operation with a neighbour. On a host where the mark is slow
+// it is left out, and the caller says why the result is exact without it.
+void MarkNoContraction(EmitterState& state, uint32_t result) {
+	if (!state.host.faults.no_contraction_is_slow) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
+}
+
+} // namespace
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
-	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	// Without the mark: a fused multiply-add is one operation already, and has no part a compiler
+	// could merge with a neighbour.
+	MarkNoContraction(state, result);
 	return result;
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (state.host.faults.no_contraction_is_slow) {
+		// The marks below are slow on this host. So the product goes to the sum through the
+		// denormal flush of legacy MAD/MAC, which works on its bits: no multiply then feeds an add
+		// directly, and there is nothing for a compiler to fuse. The operands and the sum are not
+		// flushed, as on the other hosts below. A flush takes six instructions, and with five of
+		// them a multiply-add took 33: a compute shader of Crash Bandicoot 4 grew to 1.65 million
+		// SPIR-V words, and the Metal compiler took from 1.5 to over 10 minutes to build it.
+		const auto product = EmitFPMul32(state, a, b);
+		return EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
 	// a = EmitFlushF32DenormToSignedZero(state, a);
@@ -171,6 +199,10 @@ uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
+	if (state.soft_float64) {
+		return Unary(state, spv::OpBitcast, TypeF32(state),
+		             EmitSoftFloat64(state, SoftFloat64Op::ToF32, {arg0}));
+	}
 	const auto converted = Unary(state, spv::OpFConvert, TypeF32(state), arg0);
 	const auto source    = EmitNative<spv::OpCompositeExtract, IR::Type::U32>(
 	    state, Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0), 1u);
@@ -187,6 +219,10 @@ uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0) {
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, SoftFloat64Op::FromF32,
+		                       {Unary(state, spv::OpBitcast, TypeU32(state), arg0)});
+	}
 	return EmitNative<spv::OpFConvert, IR::Type::F64>(state,
 	                                                  EmitFlushF32DenormToSignedZero(state, arg0));
 }
@@ -293,6 +329,9 @@ uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, SoftFloat64Op::Recip, {arg0});
+	}
 	const auto one = state.builder.Constant(spv::OpConstant, TypeF64(state), 0u, 0x3ff00000u);
 	return EmitNative<spv::OpFDiv, IR::Type::F64>(state, one, arg0);
 }

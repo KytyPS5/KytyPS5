@@ -25,6 +25,10 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 			       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 		case MemoryUsage::Download:
 			return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		case MemoryUsage::Guest:
+			// The allocator maps the memory only where the device's own memory is host-visible.
+			return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+			       VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT;
 		case MemoryUsage::DeviceLocal: return {};
 	}
 	return {};
@@ -33,6 +37,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 [[nodiscard]] VmaMemoryUsage AllocationUsage(MemoryUsage usage) {
 	switch (usage) {
 		case MemoryUsage::DeviceLocal:
+		case MemoryUsage::Guest:
 		case MemoryUsage::Stream: return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 		case MemoryUsage::Upload:
 		case MemoryUsage::Download: return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -73,7 +78,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
-	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
+	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal || usage == MemoryUsage::Guest
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
@@ -128,8 +133,16 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 	}
 }
 
+void Buffer::NoteGpuWrite() noexcept {
+	m_last_gpu_write_tick = m_scheduler->CurrentTick();
+	if (!m_mapped.empty()) {
+		m_scheduler->NoteWriteTheCpuReads();
+	}
+}
+
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+	EXIT_IF((m_usage != MemoryUsage::Download && m_usage != MemoryUsage::Guest) || offset > Size() ||
+	        size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
@@ -181,6 +194,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
+	NoteGpuWrite();
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
@@ -207,6 +221,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
+	NoteGpuWrite();
 	native.fillBuffer(Handle(), offset, size, value);
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
 	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);

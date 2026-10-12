@@ -130,13 +130,16 @@ constexpr PvVsStorePlan PlanPvVsStore(const PvVsStoreRequest& request) {
 	if (request.index_size != 2 && request.index_size != 4) return reject(V::BadIndexSize);
 	if (!request.range_known) return reject(V::NoRange);
 	if (request.range_dropped) return reject(V::Dropped);
+	// A zero stride leaves nothing to store (and would hide the size of the draw from the check
+	// below).
 	if (request.index_count < kPvVsStoreCorners || request.instance_count == 0 ||
-	    request.range_end <= request.range_first)
+	    request.range_end <= request.range_first || request.record_stride_vec4 == 0)
 		return reject(V::Empty);
 	const uint64_t span    = request.range_end - request.range_first;
 	const uint64_t records = span * request.instance_count;
-	// Record * stride * 4 dwords must stay below 2^32 in the shaders.
-	if (request.range_end > 0xffffffffull ||
+	// The record base is a uint32_t and record * stride * 4 dwords must stay below 2^32 in the
+	// shaders.
+	if (request.range_end > 0xffffffffull || records > 0xffffffffull ||
 	    records * request.record_stride_vec4 * 4ull > 0xffffffffull)
 		return reject(V::TooLarge);
 	plan.verdict = V::Use;

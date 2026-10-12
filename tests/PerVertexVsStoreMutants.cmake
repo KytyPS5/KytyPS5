@@ -46,7 +46,9 @@ set(KYTY_PV_HEADER_MUTANTS
 	no_touch
 	no_instanced_class
 	align_ignored
-	ring_ignored)
+	ring_ignored
+	stride_zero_ok
+	records_wrap_ok)
 set(KYTY_PV_FROM_first_third "\treturn k;\n}\n\n// Record written")
 set(KYTY_PV_TO_first_third "\treturn k == 0 ? 2u : (k == 2 ? 0u : k);\n}\n\n// Record written")
 set(KYTY_PV_FROM_no_instance "return base + (instance - first_instance) * span + (vertex_index - first);")
@@ -83,6 +85,10 @@ set(KYTY_PV_FROM_align_ignored "if (!index_aligned) {")
 set(KYTY_PV_TO_align_ignored "if (false && !index_aligned) {")
 set(KYTY_PV_FROM_ring_ignored "if (!place(decision.plan)) {")
 set(KYTY_PV_TO_ring_ignored "if (!place(decision.plan) && false) {")
+set(KYTY_PV_FROM_stride_zero_ok "request.range_end <= request.range_first || request.record_stride_vec4 == 0)")
+set(KYTY_PV_TO_stride_zero_ok "request.range_end <= request.range_first)")
+set(KYTY_PV_FROM_records_wrap_ok "request.range_end > 0xffffffffull || records > 0xffffffffull ||")
+set(KYTY_PV_TO_records_wrap_ok "request.range_end > 0xffffffffull ||")
 
 foreach(mutant IN LISTS KYTY_PV_HEADER_MUTANTS)
 	kyty_pv_make_mutant(${mutant} "${KYTY_PV_HEADER_REL}" "${KYTY_PV_FROM_${mutant}}" "${KYTY_PV_TO_${mutant}}")

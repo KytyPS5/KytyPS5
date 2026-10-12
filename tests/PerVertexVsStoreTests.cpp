@@ -194,6 +194,17 @@ void TestPlan() {
 	r = GoodRequest();
 	r.range_end = 0x100000000ull;
 	Check(PlanPvVsStore(r).verdict == V::TooLarge, "32-bit overflow rejected");
+	// records * stride * 4 wraps around 2^64 to 0: the record count itself has to be bounded
+	r = GoodRequest();
+	r.range_first = 0;
+	r.range_end = 0x40000000ull;
+	r.instance_count = 0x40000000u;
+	r.record_stride_vec4 = 4;
+	Check(PlanPvVsStore(r).verdict == V::TooLarge, "record count wrapping the 64-bit product accepted");
+	// no stride, nothing to store (the product is 0 whatever the draw size)
+	r = GoodRequest();
+	r.record_stride_vec4 = 0;
+	Check(PlanPvVsStore(r).verdict == V::Empty, "zero record stride accepted");
 }
 
 void TestRing() {

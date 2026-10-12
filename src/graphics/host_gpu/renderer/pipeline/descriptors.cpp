@@ -606,7 +606,26 @@ static TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResou
 	return result;
 }
 
-static uint64_t TextureDescriptionKey(const ShaderRecompiler::IR::ImageResource&   resource,
+// The fields DescribeTexture reads; it is given only these, so equal inputs give equal results.
+static ShaderRecompiler::IR::ImageResource
+TextureDescriptionInputs(const ShaderRecompiler::IR::ImageResource& resource) {
+	ShaderRecompiler::IR::ImageResource inputs {};
+	inputs.resource_class = resource.resource_class;
+	inputs.numeric_class  = resource.numeric_class;
+	inputs.dimension      = resource.dimension;
+	inputs.mip_mode       = resource.mip_mode;
+	inputs.mip_count      = resource.mip_count;
+	inputs.read           = resource.read;
+	inputs.written        = resource.written;
+	inputs.atomic         = resource.atomic;
+	inputs.atomic64       = resource.atomic64;
+	inputs.depth_compare  = resource.depth_compare;
+	inputs.cube           = resource.cube;
+	inputs.r128           = resource.r128;
+	return inputs;
+}
+
+static uint64_t TextureDescriptionKey(const ShaderRecompiler::IR::ImageResource&   inputs,
                                       const ShaderRecompiler::IR::DescriptorValue& value) {
 	uint64_t   hash = 0xcbf29ce484222325ull;
 	const auto mix  = [&hash](uint64_t word) {
@@ -616,19 +635,14 @@ static uint64_t TextureDescriptionKey(const ShaderRecompiler::IR::ImageResource&
 	for (uint32_t i = 0; i < value.dwords.size(); i += 2) {
 		mix(value.dwords[i] | (uint64_t {value.dwords[i + 1]} << 32u));
 	}
-	// Every compared field that tells two resources of the same descriptor apart.
-	mix(resource.source | (uint64_t {resource.first_use_pc} << 32u));
-	mix(resource.indirect_root | (uint64_t {resource.shader_swizzle} << 32u));
-	mix(static_cast<uint32_t>(resource.conversion_format) |
-	    (uint64_t {resource.indirect_mapping_offset} << 32u));
-	mix(value.dword_count | (uint64_t {static_cast<uint32_t>(resource.dimension)} << 32u));
-	mix(static_cast<uint32_t>(resource.resource_class) |
-	    (uint64_t {static_cast<uint32_t>(resource.numeric_class)} << 32u));
-	mix(static_cast<uint32_t>(resource.mip_mode) | (uint64_t {resource.mip_count} << 32u));
-	mix(uint64_t {resource.read} | (uint64_t {resource.written} << 8u) |
-	    (uint64_t {resource.atomic} << 16u) | (uint64_t {resource.atomic64} << 24u) |
-	    (uint64_t {resource.depth_compare} << 32u) | (uint64_t {resource.cube} << 40u) |
-	    (uint64_t {resource.r128} << 48u));
+	mix(value.dword_count | (uint64_t {static_cast<uint32_t>(inputs.dimension)} << 32u));
+	mix(static_cast<uint32_t>(inputs.resource_class) |
+	    (uint64_t {static_cast<uint32_t>(inputs.numeric_class)} << 32u));
+	mix(static_cast<uint32_t>(inputs.mip_mode) | (uint64_t {inputs.mip_count} << 32u));
+	mix(uint64_t {inputs.read} | (uint64_t {inputs.written} << 8u) |
+	    (uint64_t {inputs.atomic} << 16u) | (uint64_t {inputs.atomic64} << 24u) |
+	    (uint64_t {inputs.depth_compare} << 32u) | (uint64_t {inputs.cube} << 40u) |
+	    (uint64_t {inputs.r128} << 48u));
 	return hash;
 }
 
@@ -636,20 +650,21 @@ const TextureDescription&
 RenderExecutor::FindTextureDescription(const ShaderRecompiler::IR::ImageResource&   resource,
                                        const ShaderRecompiler::IR::DescriptorValue& value) {
 	constexpr size_t MaxTextureDescriptions = 16384;
-	const auto       key                    = TextureDescriptionKey(resource, value);
+	const auto       inputs                 = TextureDescriptionInputs(resource);
+	const auto       key                    = TextureDescriptionKey(inputs, value);
 	if (const auto found = m_texture_descriptions.find(key);
 	    found != m_texture_descriptions.end() && found->second.value == value &&
-	    found->second.resource == resource) {
+	    found->second.inputs == inputs) {
 		return found->second.description;
 	}
 	if (m_texture_descriptions.size() >= MaxTextureDescriptions) {
 		m_texture_descriptions.clear();
 	}
 	auto& entry       = m_texture_descriptions[key];
-	entry.resource    = resource;
+	entry.inputs      = inputs;
 	entry.value       = value;
-	entry.description = DescribeTexture(resource, value,
-	                                    m_context.GetGraphics().shader_image_int64_atomics_enabled);
+	entry.description =
+	    DescribeTexture(inputs, value, m_context.GetGraphics().shader_image_int64_atomics_enabled);
 	return entry.description;
 }
 

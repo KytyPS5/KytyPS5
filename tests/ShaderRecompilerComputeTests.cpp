@@ -427,6 +427,15 @@ struct RenderExecutorTestAccess {
     return executor.ResolveTexture(resource, value);
   }
 
+  static std::vector<ShaderRecompiler::IR::ImageResource>
+  TextureDescriptionInputs(const RenderExecutor &executor) {
+    std::vector<ShaderRecompiler::IR::ImageResource> result;
+    for (const auto &[key, entry] : executor.m_texture_descriptions) {
+      result.push_back(entry.inputs);
+    }
+    return result;
+  }
+
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
@@ -5383,6 +5392,30 @@ public:
                   repeated.desc.view_info == first.desc.view_info &&
                   TextureCacheTestAccess::QueryEpoch(texture_cache) == epoch,
               "an unchanged texture binding searched the image page table again");
+
+      // Fields the description does not read share its entry instead of replacing it.
+      const auto described =
+          RenderExecutorTestAccess::TextureDescriptionInputs(executor);
+      auto alias = resource;
+      alias.source = 7;
+      alias.descriptor_index = 3;
+      alias.first_use_pc = 0x40;
+      alias.indirect_search_iterations = 2;
+      alias.indirect_resources = {1};
+      const auto Unchanged = [&] {
+        return RenderExecutorTestAccess::TextureDescriptionInputs(executor) ==
+               described;
+      };
+      bool shared = true;
+      for (int i = 0; i < 2; ++i) {
+        const auto aliased = RenderExecutorTestAccess::ResolveTexture(
+            executor, alias, Value(base));
+        shared &= aliased.image_id == first.image_id &&
+                  aliased.desc.view_info == first.desc.view_info && Unchanged();
+        shared &= Resolve(base).image_id == first.image_id && Unchanged();
+      }
+      Require(name, "unread resource fields", shared,
+              "resources differing only in unread fields replaced each other's description");
 
       // A registration change gives the result of a full search: the last exact match.
       const auto newer = TextureCacheTestAccess::InsertImage(texture_cache, first.desc.info);

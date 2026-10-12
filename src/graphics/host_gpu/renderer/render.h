@@ -221,7 +221,7 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	struct TextureDescriptionEntry {
-		ShaderRecompiler::IR::ImageResource   resource;
+		ShaderRecompiler::IR::ImageResource   inputs;
 		ShaderRecompiler::IR::DescriptorValue value;
 		TextureDescription                    description;
 	};

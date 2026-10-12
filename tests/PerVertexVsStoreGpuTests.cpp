@@ -375,11 +375,13 @@ Gpu InitGpu() {
 	VkPhysicalDeviceFeatures supported {};
 	vkGetPhysicalDeviceFeatures_(gpu.physical, &supported);
 	Check(supported.vertexPipelineStoresAndAtomics, "device lacks vertexPipelineStoresAndAtomics (the VS cannot store)");
+	Check(supported.tessellationShader, "device lacks tessellationShader (PrimitiveId in the PS "
+	                                    "needs the Tessellation capability)");
 	VkPhysicalDeviceFeatures features {};
 	features.vertexPipelineStoresAndAtomics = VK_TRUE;
 	features.fragmentStoresAndAtomics       = supported.fragmentStoresAndAtomics;
 	features.shaderClipDistance             = supported.shaderClipDistance; // the emitted VS has a clip guard
-	features.geometryShader                 = supported.geometryShader; // PrimitiveId in the PS needs the Geometry capability
+	features.tessellationShader = VK_TRUE; // PrimitiveId in the PS uses the Tessellation capability
 	float                   priority = 1.f;
 	VkDeviceQueueCreateInfo queue_info {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
 	queue_info.queueFamilyIndex = gpu.family;

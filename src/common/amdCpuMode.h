@@ -61,22 +61,6 @@ inline AmdCpuMode AmdCpuModeFromStored(std::optional<std::string_view> mode,
 	return AmdCpuMode::Auto;
 }
 
-inline AmdCpuDecision DecideAmdCpu(AmdCpuMode mode, AmdCpuHostSupport host) {
-	if (mode == AmdCpuMode::On) return {true, "forced on (--amd-cpu or KYTY_AMD_CPU=1)"};
-	if (mode == AmdCpuMode::Off) return {false, "forced off (--no-amd-cpu or KYTY_AMD_CPU=0)"};
-	std::string missing;
-	const auto  add = [&missing](bool supported, const char* name) {
-		if (supported) return;
-		if (!missing.empty()) missing += ", ";
-		missing += name;
-	};
-	add(host.sse4a, "SSE4a");
-	add(host.rdpid, "RDPID");
-	add(host.clwb, "CLWB");
-	if (missing.empty()) return {false, "auto: host supports SSE4a, RDPID and CLWB"};
-	return {true, "auto: host lacks " + missing};
-}
-
 // Which instruction groups the patcher rewrites once it is on (KYTY_AMD_PATCH): sse4a =
 // EXTRQ/INSERTQ, rsqrt = VRSQRTPS, cpuext = RDPID/CLWB. The automatic mode rewrites only sse4a. On
 // Rosetta the VRSQRTPS patch leaves about a thousand call sites that still trap (+550 SIGILL per
@@ -89,6 +73,29 @@ enum AmdPatchKind : uint32_t {
 	AmdPatchCpuExt = 1u << 2,
 	AmdPatchAll    = AmdPatchSse4a | AmdPatchRsqrt | AmdPatchCpuExt,
 };
+
+// Auto turns the patcher on only when the host lacks an instruction that one of the selected kinds
+// rewrites (SSE4a for sse4a; RDPID and CLWB for cpuext); otherwise it would load every module with
+// the trampoline area and decode all functions without being able to change anything. auto_allowed
+// is false on platforms where an unrelocatable site cannot be left to the trap handler.
+inline AmdCpuDecision DecideAmdCpu(AmdCpuMode mode, AmdCpuHostSupport host,
+                                   uint32_t kinds = AmdPatchAll, bool auto_allowed = true) {
+	if (mode == AmdCpuMode::On) return {true, "forced on (--amd-cpu or KYTY_AMD_CPU=1)"};
+	if (mode == AmdCpuMode::Off) return {false, "forced off (--no-amd-cpu or KYTY_AMD_CPU=0)"};
+	if (!auto_allowed) return {false, "auto: not available on this platform"};
+	std::string missing;
+	const auto  add = [&missing](bool supported, const char* name) {
+		if (supported) return;
+		if (!missing.empty()) missing += ", ";
+		missing += name;
+	};
+	add(host.sse4a || (kinds & AmdPatchSse4a) == 0, "SSE4a");
+	add(host.rdpid || (kinds & AmdPatchCpuExt) == 0, "RDPID");
+	add(host.clwb || (kinds & AmdPatchCpuExt) == 0, "CLWB");
+	if (missing.empty())
+		return {false, "auto: nothing the selected patches rewrite is missing on the host"};
+	return {true, "auto: host lacks " + missing};
+}
 
 inline uint32_t DefaultAmdPatchKinds(AmdCpuMode mode) {
 	return mode == AmdCpuMode::On ? AmdPatchAll : mode == AmdCpuMode::Auto ? AmdPatchSse4a : 0u;

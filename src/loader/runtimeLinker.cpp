@@ -89,8 +89,16 @@ static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 static bool AmdCpuPatchEnabled() {
 	static const bool enabled = [] {
 		const auto host = GetGuestInstructionHostFeatures();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// An unrelocatable EXTRQ/INSERTQ with a live red zone cannot be left to the trap handler
+		// there (TrapUnrelocatedInstructions exits), so only an explicit --amd-cpu patches.
+		constexpr bool auto_allowed = false;
+#else
+		constexpr bool auto_allowed = true;
+#endif
 		const auto decision =
-		    Common::DecideAmdCpu(Config::GetAmdCpuMode(), {host.sse4a, host.rdpid, host.clwb});
+		    Common::DecideAmdCpu(Config::GetAmdCpuMode(), {host.sse4a, host.rdpid, host.clwb},
+		                         Config::GetAmdPatchKinds(), auto_allowed);
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "AMD CPU compatibility: patching {} ({}), kinds={}\n", decision.enabled ? "on" : "off",
 		    decision.reason, Common::AmdPatchKindsName(Config::GetAmdPatchKinds())));

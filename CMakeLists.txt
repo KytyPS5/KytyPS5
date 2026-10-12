@@ -455,13 +455,17 @@ function(add_amd_cpu_mode_mutant name header from to)
 	target_include_directories(amd_cpu_mode_mutant_${name_lower}_tests PRIVATE ${inc_headers})
 	target_include_directories(amd_cpu_mode_mutant_${name_lower}_tests BEFORE PRIVATE "${mutant_dir}")
 endfunction()
-add_amd_cpu_mode_mutant(SSE4A_IGNORED common/amdCpuMode.h "add(host.sse4a, \"SSE4a\");" "add(true, \"SSE4a\");")
-add_amd_cpu_mode_mutant(RDPID_IGNORED common/amdCpuMode.h "add(host.rdpid, \"RDPID\");" "add(true, \"RDPID\");")
-add_amd_cpu_mode_mutant(CLWB_IGNORED common/amdCpuMode.h "add(host.clwb, \"CLWB\");" "add(true, \"CLWB\");")
+add_amd_cpu_mode_mutant(SSE4A_IGNORED common/amdCpuMode.h "add(host.sse4a || (kinds & AmdPatchSse4a) == 0, \"SSE4a\");" "add(true, \"SSE4a\");")
+add_amd_cpu_mode_mutant(RDPID_IGNORED common/amdCpuMode.h "add(host.rdpid || (kinds & AmdPatchCpuExt) == 0, \"RDPID\");" "add(true, \"RDPID\");")
+add_amd_cpu_mode_mutant(CLWB_IGNORED common/amdCpuMode.h "add(host.clwb || (kinds & AmdPatchCpuExt) == 0, \"CLWB\");" "add(true, \"CLWB\");")
+# KINDS_SSE4A_IGNORED / KINDS_CPUEXT_IGNORED: auto turns on for an instruction no selected kind rewrites; AUTO_ALLOWED_IGNORED: auto ignores a platform that cannot use it.
+add_amd_cpu_mode_mutant(KINDS_SSE4A_IGNORED common/amdCpuMode.h "add(host.sse4a || (kinds & AmdPatchSse4a) == 0," "add(host.sse4a,")
+add_amd_cpu_mode_mutant(KINDS_CPUEXT_IGNORED common/amdCpuMode.h "add(host.rdpid || (kinds & AmdPatchCpuExt) == 0," "add(host.rdpid,")
+add_amd_cpu_mode_mutant(AUTO_ALLOWED_IGNORED common/amdCpuMode.h "	if (!auto_allowed) return {false, \"auto: not available on this platform\"};\n" "")
 add_amd_cpu_mode_mutant(CLI_IGNORED common/amdCpuMode.h "if (command_line) return *command_line;" "")
 add_amd_cpu_mode_mutant(ZERO_UNPARSED common/amdCpuMode.h "text == \"off\" || text == \"0\"" "text == \"off\"")
 add_amd_cpu_mode_mutant(OFF_PATCHES common/amdCpuMode.h "return {false, \"forced off" "return {true, \"forced off")
-add_amd_cpu_mode_mutant(BAD_ENV_OFF common/amdCpuMode.h "	return AmdCpuMode::Auto;\n}\n\ninline AmdCpuDecision" "	return AmdCpuMode::Off;\n}\n\ninline AmdCpuDecision")
+add_amd_cpu_mode_mutant(BAD_ENV_OFF common/amdCpuMode.h "	return AmdCpuMode::Auto;\n}\n\n// Which instruction groups" "	return AmdCpuMode::Off;\n}\n\n// Which instruction groups")
 # KYTY_AMD_PATCH: AUTO_ALL: auto rewrites every kind by default; AUTO_NONE_ALL: "none" selects everything;
 # RSQRT_DROPPED: rsqrt not understood; BAD_NONE: an unparsable value disables all kinds; ENV_IGNORED: the variable loses to the default.
 # STORED_FALSE_OFF: the old launcher bool false maps to off; STORED_MODE_IGNORED: the old bool beats a stored mode.

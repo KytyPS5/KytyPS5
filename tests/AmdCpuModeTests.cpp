@@ -53,6 +53,27 @@ int main() {
 	d = Common::DecideAmdCpu(AmdCpuMode::Auto, {false, false, false});
 	Check(d.enabled && d.reason.find("SSE4a, RDPID, CLWB") != std::string::npos, "nothing supported");
 
+	// The decision follows the selected patch kinds: nothing to rewrite, nothing to turn on.
+	d = Common::DecideAmdCpu(AmdCpuMode::Auto, {true, false, false}, Common::AmdPatchSse4a);
+	Check(!d.enabled, "auto patches although only SSE4a is selected and the host has it");
+	d = Common::DecideAmdCpu(AmdCpuMode::Auto, {false, true, true}, Common::AmdPatchSse4a);
+	Check(d.enabled && d.reason.find("SSE4a") != std::string::npos, "sse4a selected, host lacks it");
+	d = Common::DecideAmdCpu(AmdCpuMode::Auto, {false, false, false}, Common::AmdPatchCpuExt);
+	Check(d.enabled && d.reason.find("SSE4a") == std::string::npos &&
+	          d.reason.find("RDPID, CLWB") != std::string::npos,
+	      "cpuext selected: SSE4a named or RDPID/CLWB not");
+	d = Common::DecideAmdCpu(AmdCpuMode::Auto, {true, false, false}, Common::AmdPatchRsqrt);
+	Check(!d.enabled, "rsqrt needs no missing instruction");
+	d = Common::DecideAmdCpu(AmdCpuMode::Auto, {false, false, false}, 0u);
+	Check(!d.enabled, "no kinds selected but auto patches");
+	Check(Common::DecideAmdCpu(AmdCpuMode::On, {true, true, true}, 0u).enabled, "forced on follows kinds");
+
+	// Auto can be unavailable on a platform; it never overrides an explicit on/off.
+	d = Common::DecideAmdCpu(AmdCpuMode::Auto, {false, false, false}, Common::AmdPatchAll, false);
+	Check(!d.enabled && !d.reason.empty(), "auto not suppressed where it is unavailable");
+	Check(Common::DecideAmdCpu(AmdCpuMode::On, {true, true, true}, Common::AmdPatchAll, false).enabled,
+	      "forced on lost where auto is unavailable");
+
 	// On/off do not look at the host.
 	Check(Common::DecideAmdCpu(AmdCpuMode::On, amd).enabled, "forced on ignored");
 	Check(!Common::DecideAmdCpu(AmdCpuMode::Off, {false, false, false}).enabled, "forced off ignored");

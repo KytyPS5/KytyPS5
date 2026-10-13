@@ -1512,6 +1512,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	ir.robust_buffer_access2 = options.robust_buffer_access2;
 	ir.unfoldable_pcs.assign(options.unfoldable_pcs.begin(), options.unfoldable_pcs.end());
+	ir.refuse_indirect_buffer_table = options.refuse_indirect_buffer_table;
+	auto tracking = IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	ir.refuse_indirect_buffer_table = nullptr;
 	TranslateResult result;
 	if (!tracking.ok) {
 		result.status.ok     = false;

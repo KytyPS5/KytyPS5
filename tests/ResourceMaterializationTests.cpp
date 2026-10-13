@@ -1615,6 +1615,67 @@ bool HeapGpuOwned(void *userdata, uint64_t, uint64_t) {
 }
 
 // A table the GPU wrote, or whose V# the host cannot evaluate, is decoded in the shader.
+void TestBufferTableRefusal() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (const bool unevaluable : {false, true}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    DescriptorSource table;
+    table.dword_count = 4;
+    table.dwords = {unevaluable ? Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                                             {Value(static_cast<ScalarReg>(0))}))
+                                : Value(static_cast<uint32_t>(HeapMemory::base)),
+                    Value(0u), Value(4u * 16u), Value(0u)};
+    program.descriptor_sources.push_back(table);
+    DescriptorSource records;
+    records.dword_count = 4;
+    records.dwords.fill(Value(0u));
+    auto &indirect = records.indirect_descriptor.emplace();
+    indirect.table_source = 0;
+    indirect.table_stride = 16u;
+    indirect.key_count = Value(4u);
+    program.descriptor_sources.push_back(records);
+    program.info.buffers.push_back({.source = 1, .first_use_pc = 0x40u, .read = true});
+    auto plan = ExtractResourcePlan(program);
+    HeapMemory memory;
+    memory.words.assign(16u, 0u);
+    for (uint32_t record = 0; record < 4u; ++record) {
+      memory.words[record * 4u] = 0x8000u + record * 0x100u;
+      memory.words[record * 4u + 1u] = 1u << 16u;
+      memory.words[record * 4u + 2u] = 64u;
+      memory.words[record * 4u + 3u] = (3u << 28u) | (4u << 12u);
+    }
+    const SrtRuntime runtime{.read_memory = ReadHeapMemory, .userdata = &memory,
+                             .read_specialization_memory = ReadHeapMemory,
+                             .gpu_owned = HeapGpuOwned};
+    const std::span<const DescriptorSource> sources(program.descriptor_sources);
+    Check(IndirectBufferTableRefused(program, sources, 1u, runtime) == unevaluable &&
+              IndirectBufferTableRefused(program, sources, 0u, runtime) == unevaluable,
+          "a host-readable table was demoted, or an unevaluable one enumerated");
+    if (unevaluable) continue;
+    memory.gpu_written = true;
+    Check(IndirectBufferTableRefused(program, sources, 1u, runtime),
+          "a GPU-written table was enumerated");
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization, before;
+    std::vector<uint32_t> refused;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization, &refused) &&
+              refused == std::vector<uint32_t>{0x40u} && !LastMaterializeFailure().empty() &&
+              specialization == before,
+          "a GPU-written table was enumerated, or its refusal named no resource");
+    // Without a rebuild channel the table still enumerates, as upstream does.
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers.size() == 4u,
+          "a table with no rebuild channel was refused");
+    memory.gpu_written = false;
+    refused.clear();
+    Check(MaterializeResources(plan, runtime, snapshot, specialization, &refused) &&
+              refused.empty(),
+          "a host-readable table was refused");
+  }
+}
 
 // A refusal keeps the specialization the permutation lookup compares, and names itself.
 void TestRefusalKeepsSpecialization() {
@@ -2543,6 +2604,7 @@ int main() {
   TestUnboundImageSpecialization();
   TestFrozenPhiPlansWalkLikeTheProgram();
   TestDeepChainPlanExtraction();
+  TestBufferTableRefusal();
   TestRefusalKeepsSpecialization();
   TestShaderReadCache();
   TestMaterializeMemo();

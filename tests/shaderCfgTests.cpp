@@ -12229,6 +12229,62 @@ void TestMeshExportStorage() {
   }
 }
 
+// RE9 mesh ecd43ec21aab8c51: S_BUFFER_LOAD through a GPU-selected V# must emit.
+void TestMeshDynamicScalarBufferLoad() {
+  std::vector<uint32_t> code = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+  };
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    code.insert(code.end(), {EncodeVop1(0x01, 20, 128 + dword),
+                             EncodeMubuf0(0x0c), EncodeMubuf1(4 + dword, 2, 20)});
+  }
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    code.push_back(EncodeVop1(0x02, 16 + dword, 256 + 4 + dword)); // v_readfirstlane_b32
+  }
+  code.insert(code.end(), {
+      EncodeSmem0(0x0a, 20, 8), 16u | (125u << 25u), // s_buffer_load_dwordx4 s[20:23], s[16:19], 16
+      EncodeSmem0(0x08, 24, 8), 13u << 25u,          // s_buffer_load_dword s24, s[16:19], s13
+      EncodeVop1(0x01, 9, 20), EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 20),
+      EncodeVop1(0x01, 10, 24), EncodeMubuf0(0x1c), EncodeMubuf1(10, 2, 21),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  });
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 64;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 64;
+  mesh.max_primitives = 62;
+  std::array<uint32_t, 14> user_data{};
+  user_data[8] = 0x10000008u;
+  user_data[9] = 4u << 16u;
+  user_data[10] = 64u;
+  user_data[11] = 0x00027000u;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  options.user_data = user_data;
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto result = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(std::ranges::any_of(result.program.memory_info,
+                              [](const auto &memory) {
+                                return memory.kind ==
+                                       ShaderRecompiler::IR::ResourceKind::IndirectBuffer;
+                              }),
+          "mesh S_BUFFER_LOAD through a GPU-selected V# did not take the in-shader decode");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpConvertUToPtr") != std::string::npos,
+          "mesh S_BUFFER_LOAD through a GPU-selected V# did not read by device address");
+  }
+}
+
 void TestMeshAuxiliaryPositionOutputs() {
   // Point size, layer, viewport index and clip/cull distances reach the mesh output interface.
   const uint32_t code[] = {
@@ -18359,6 +18415,7 @@ int main() {
   TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
+  TestMeshDynamicScalarBufferLoad();
   TestMeshAuxiliaryPositionOutputs();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();

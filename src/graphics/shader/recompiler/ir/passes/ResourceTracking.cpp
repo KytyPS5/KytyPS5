@@ -4702,6 +4702,13 @@ private:
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
 				                                                        : ResourceKind::Buffer) ||
+				if (!m_status.ok || TakeIndirectBuffer(inst, flags.index, flags.pc))
+					return m_status.ok;
+				return Reject(
+				    flags.pc,
+				    "buffer descriptor is not a valid runtime value; GPU-selected access "
+				    "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load, "
+				    "or a buffer store or atomic");
 			} else if ((ReadsUnfoldableScalar(*handle) ||
 			            (std::ranges::find(m_program.unfoldable_pcs, flags.pc) !=
 			                 m_program.unfoldable_pcs.end() &&

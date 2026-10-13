@@ -61,12 +61,18 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Whether materialization would refuse buffer table `table_source` now; false when it cannot tell.
+bool IndirectBufferTableRefused(const Program& program, std::span<const DescriptorSource> sources,
+                                uint32_t table_source, const SrtRuntime& runtime);
+
 // One line naming why the last MaterializeResources on this thread refused.
 std::string_view LastMaterializeFailure();
 
 // Refreshes cached resources and specialization. A refusal leaves the specialization untouched.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* refused_tables = nullptr);
+
 bool               RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                           ResourceSpecialization& specialization);
 [[nodiscard]] bool ReadOverlapsWrittenBuffer(const ResourcePlan&     program,

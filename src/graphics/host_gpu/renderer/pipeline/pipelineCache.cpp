@@ -351,10 +351,11 @@ struct PipelineCache::ProgramCache {
 			permutations.reserve(8);
 		}
 
-		std::span<const uint32_t> FunctionCode() const {
-			return call_source
-			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
-			    : std::span<const uint32_t>{};
+		[[nodiscard]] std::span<const uint32_t> FunctionCode() const {
+			return call_source && call_source->linked
+			           ? std::span<const uint32_t>(call_source->linked->code)
+			                 .subspan(call_source->code.size())
+			           : std::span<const uint32_t> {};
 		}
 
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
@@ -364,31 +365,72 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
-		template <bool HasCalls>
-		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
-			for (auto& candidate: permutations) {
-				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords()) ||
-				    candidate.specialization != specialization) {
-					continue;
+		// A SWAPPC program's plan follows the callees its source links, so it always walks.
+		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                 std::vector<uint32_t>&                  refused) {
+			refused.clear();
+			const bool memoized = !call_source && !memo_backoff.Skip();
+			if (memoized) {
+				if (memo.Replay(resource_plan, runtime, resources, specialization)) {
+					memo_backoff.OnHit();
+					return true;
 				}
-				if constexpr (HasCalls) {
-					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
-				}
-				return &candidate;
+				memo_backoff.OnMiss();
+			} else {
+				memo.ForgetCurrent();
 			}
-			return nullptr;
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        resource_plan, memoized ? memo.Record(runtime) : runtime, resources,
+			        specialization, &refused)) {
+				return false;
+			}
+			if (memoized) {
+				memo.Commit(resource_plan, resources, specialization);
+			}
+			return true;
+		}
+
+		template <bool HasCalls>
+		bool FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                     uint32_t push_data_cursor, bool any_start, Permutation*& found,
+		                     std::vector<uint32_t>& refused) {
+			found = nullptr;
+			if (!Materialize(runtime, refused)) {
+				return false;
+			}
+			for (const bool exact: {true, false}) {
+				if (!exact && !any_start) {
+					break;
+				}
+				for (auto& candidate: permutations) {
+					const auto& layout   = candidate.program.bindings;
+					const bool  start_ok = exact
+					                           ? layout.push_data_start_dword ==
+					                                 ShaderRecompiler::IR::PushData::StartFor(
+					                                     push_data_cursor, layout.ShaderDataDwords())
+					                           : ShaderRecompiler::IR::PushData::StartServes(
+					                                 layout.push_data_start_dword, push_data_cursor);
+					if (!start_ok || !ShaderRecompiler::IR::SpecializationServes(
+					                     candidate.specialization, specialization)) {
+						continue;
+					}
+					if constexpr (HasCalls) {
+						if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+					}
+					found = &candidate;
+					return true;
+				}
+			}
+			return true;
 		}
 
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
-		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::IR::ResourcePlan              resource_plan;
+		ShaderRecompiler::IR::ResourceSnapshot          resources;
+		ShaderRecompiler::IR::ResourceSpecialization    specialization;
 		std::vector<Permutation>                        permutations;
+		ShaderRecompiler::IR::MaterializeMemoWays       memo;
+		ShaderRecompiler::IR::MaterializeMemoBackoff    memo_backoff;
 		bool                                            skip_dispatch = false;
 	};
 
@@ -427,6 +469,15 @@ struct PipelineCache::ProgramCache {
 		                 "hash=0x{:016x} stage={} descriptor materialization failed: {}",
 		                 hash, StageShortName(stage),
 		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
+	}
+
+	void ReportRebuildRefused(ShaderType stage, uint64_t hash, std::string_view reason) {
+		if (!reported_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("proven-unfoldable rebuild refused, keeping the previous translation: "
+		                 "hash=0x{:016x} stage={} {}",
+		                 hash, StageShortName(stage), reason);
 	}
 
 	void ReportStubbed(ShaderType stage, uint64_t hash) {
@@ -586,14 +637,27 @@ struct PipelineCache::ProgramCache {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
+		const bool            any_start = stage != ShaderType::Pixel;
+		std::vector<uint32_t> refused;
+		bool                  source_changed = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
+			Permutation* permutation  = nullptr;
+			bool         materialized = true;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
+				if (!source_changed) {
+					materialized = cached.FindPermutation<true>(runtime, push_data_cursor,
+					                                            any_start, permutation, refused);
+				}
 			} else {
+				materialized = cached.FindPermutation<false>(runtime, push_data_cursor, any_start,
 				                                             permutation, refused);
 			}
+			if (!materialized) {
+				return Unmaterialized(params, input_info, push_data_cursor, stage, code_size, key(),
+				                      refused);
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -655,20 +719,30 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		options.refuse_indirect_buffer_table =
+		    [&runtime](const ShaderRecompiler::IR::Program&                    program,
+		               std::span<const ShaderRecompiler::IR::DescriptorSource> sources,
+		               uint32_t                                                source) {
+			    return ShaderRecompiler::IR::IndirectBufferTableRefused(program, sources, source,
+			                                                            runtime);
+		    };
+		const auto refuse = [&](uint32_t pc, std::string_view reason) {
+			if (channel_rebuild && RefuseRebuild(unfoldable.Get(key()))) {
+				ReportRebuildRefused(stage, params.hash, reason);
+				return;
+			}
+			Skip(lookup_key, stage, params.hash, pc, reason);
+		};
 		ShaderRecompiler::ShaderSource source;
-		if (source.unsupported_call_pc != UINT32_MAX) {
-			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
-			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
-			                 params.hash, source.unsupported_call_pc);
-			programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan{}, nullptr)
-			    .first->second.skip_dispatch = true;
-			return {};
-		}
+		if (entry == programs.end())
+			source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
 			if (!current->calls.empty()) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				translated = ShaderRecompiler::TranslateProgram(
+				    current->linked ? current->linked->decoded : current->decoded, options);
 				translated.program.source_reads = current->reads;
 			} else {
 				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
@@ -676,6 +750,7 @@ struct PipelineCache::ProgramCache {
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
+		options.refuse_indirect_buffer_table = nullptr;
 		if (!translated.status.ok) {
 			refuse(translated.status.pc, translated.status.reason);
 			return {};
@@ -691,8 +766,18 @@ struct PipelineCache::ProgramCache {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			if (!entry->second.Materialize(runtime, refused)) {
+				return Unmaterialized(params, input_info, push_data_cursor, stage, code_size, key(),
+				                      refused);
+			}
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			Permutation* permutation = nullptr;
+			if (!entry->second.FindPermutation<true>(runtime, push_data_cursor, any_start,
+			                                         permutation, refused)) {
+				return Unmaterialized(params, input_info, push_data_cursor, stage, code_size, key(),
+				                      refused);
+			}
+			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
@@ -708,6 +793,7 @@ struct PipelineCache::ProgramCache {
 			ShaderRecompiler::IR::InheritUnboundShapes(donors, specialization);
 		}
 		entry->second.permutations.push_back(CompilePermutation(
+		    stage_name, options, std::move(translated), std::move(specialization), push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
 		if (!entry->second.permutations.back().handle) {
@@ -1132,6 +1218,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 		}
 		const auto& blend = context.GetBlendControl(0);
+		const bool  export0_to_cb0 = ShaderPixelExportTarget(pixel_info.target_shader_mask, 0) == 0;
 		pixel_info.dual_source_blending =
 		    export0_to_cb0 && blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		    (BlendFactorIsDualSource(blend.color_srcblend) ||
@@ -1264,6 +1351,8 @@ void PipelineCache::GetStencilBitPrograms(const ShaderParams&         pixel_para
 	const auto& base = *pixel_info.stage.program;
 	if (HasShaderBufferWrites(pixel_info.stage) ||
 	    std::ranges::any_of(base.info.images, [](const auto& image) { return image.written; }) ||
+	    base.bindings.descriptor_counts[static_cast<size_t>(
+	        ShaderRecompiler::IR::DescriptorBindingKind::Gds)] != 0) {
 		refuse();
 		return;
 	}

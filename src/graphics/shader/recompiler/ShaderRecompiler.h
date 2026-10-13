@@ -4,12 +4,13 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
 #include <bitset>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -36,6 +37,12 @@ struct CompileOptions {
 	bool robust_buffer_access2 = false;
 	// See IR::ResourcePlan::unfoldable_pcs.
 	std::span<const uint32_t> unfoldable_pcs;
+	// See IR::Program::refuse_indirect_buffer_table; dropped before TranslateProgram returns.
+	std::function<bool(const IR::Program& program, std::span<const IR::DescriptorSource> sources,
+	                   uint32_t source)>
+	    refuse_indirect_buffer_table;
+};
+
 // A guest shader the recompiler refuses; the caller drops its draws.
 struct RecompileStatus {
 	bool        ok = true;
@@ -88,8 +95,7 @@ struct ShaderSource {
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
-	std::vector<Call> calls;
-	uint32_t unsupported_call_pc = UINT32_MAX;
+	std::vector<Call>                          calls;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;

@@ -3912,6 +3912,16 @@ void TestPointerTableIndexedMaterialKeys() {
             snapshot.flattened_srt[mapping] == 3u && snapshot.flattened_srt[mapping + 3u] == 5u &&
             snapshot.flattened_srt[mapping + 5u] == 9u,
         "pointer-table selector lost sorted raw keys or the OOB-zero root descriptor");
+  // Every key a lane can load has its own entry, so the search never falls back to the root.
+  for (uint32_t lane = 0; lane < 64u; ++lane) {
+    const auto key = lane < records ? memory.words[(lane * 12u + 8u) / 4u] : 0u;
+    const auto count = snapshot.flattened_srt[mapping];
+    uint32_t entry = 0;
+    while (entry < count && snapshot.flattened_srt[mapping + 1u + entry * 2u] != key) ++entry;
+    Check(entry < count &&
+              snapshot.images[snapshot.flattened_srt[mapping + 2u + entry * 2u]].dwords[0] == 0x100u + key,
+          "a reachable selector key was missing from the enumerated keys");
+  }
 }
 
 void TestImageDescriptorFields() {
@@ -6295,6 +6305,21 @@ void TestWritableDescriptorPhi() {
         "control-dependent writable descriptor phi was not rejected transactionally");
 }
 
+// A store through a GPU V# no table proves is decoded in the shader rather than refused.
+void CheckStoreDecodedInShader(const Program &program, const char *message) {
+  bool decoded = program.resource_tracking_complete && program.info.writes_dma &&
+                 program.has_address_writes;
+  uint32_t stores = 0;
+  for (const auto *block : program.blocks)
+    for (const auto &inst : *block)
+      if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Write) {
+        ++stores;
+        decoded &= program.memory_info[inst.Flags<MemoryFlags>().index].kind ==
+                   ResourceKind::IndirectBuffer;
+      }
+  Check(decoded && stores != 0, message);
+}
+
 void TestBoundedFormattedBufferStore() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   namespace Prospero = Libs::Graphics::Prospero;
@@ -6443,8 +6468,9 @@ void TestBoundedFormattedBufferStore() {
   Check(formatted, "UInt32 candidate store lost the shared formatted store path");
   for (const auto [step, bypass, offset] :
        {std::tuple{2u, false, false}, std::tuple{1u, true, false}, std::tuple{1u, false, true}})
-    CheckFatal([&] { make(step, bypass, offset); }, "not a valid runtime value",
-               "finite store accepted an unproved induction or indexed byte offset");
+    CheckStoreDecodedInShader(make(step, bypass, offset)->program,
+                              "finite store with an unproved induction or indexed byte offset was "
+                              "not decoded in the shader");
 }
 
 std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass = false,
@@ -7265,8 +7291,9 @@ void TestGpuSelectedFormattedRecordStore() {
       }
   for (const auto [stride, shift, split] :
        {std::tuple{592u, 0u, false}, std::tuple{65540u, 16u, false}, std::tuple{592u, 16u, true}})
-    CheckFatal([&] { make(stride, shift, split); }, "not a valid runtime value",
-               "exact record store accepted an unbounded, wrapping or split descriptor offset");
+    CheckStoreDecodedInShader(make(stride, shift, split)->program,
+                              "exact record store with an unbounded, wrapping or split descriptor "
+                              "offset was not decoded in the shader");
 
   auto wide = make(16u, 16u, false, true);
   auto wide_plan = ExtractResourcePlan(wide->program);
@@ -7374,8 +7401,9 @@ void TestGpuSelectedFormattedRecordStore() {
               "RGBA16 specialization lost native wide conversion, selection or GLC");
       }
   for (const auto [shift, split] : {std::pair{0u, false}, std::pair{16u, true}})
-    CheckFatal([&] { make(16u, shift, split, true); }, "not a valid runtime value",
-               "finite RGBA16 store accepted an unbounded key or independently wrapping DWORDs");
+    CheckStoreDecodedInShader(make(16u, shift, split, true)->program,
+                              "finite RGBA16 store with an unbounded key or independently wrapping "
+                              "DWORDs was not decoded in the shader");
 
   struct PrefixMemory : LinearTestMemory { uint32_t read_attempts = 0u; } prefix_memory;
   const auto read_prefix = [](void* userdata, uint64_t address, std::span<uint32_t> words) {
@@ -7538,8 +7566,10 @@ void TestFiniteBufferSelection() {
         "finite buffer selection lost table roots after DCE or probed outside its domain");
   for (const auto variant : {Variant::WiderExec, Variant::Unbounded, Variant::Cycle, Variant::TooMany}) {
     auto invalid = make(variant);
-    CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
-               "finite buffer selection accepted an unproved EXEC or selector domain");
+    invalid->PlanAndTrack();
+    CheckStoreDecodedInShader(invalid->program,
+                              "finite buffer selection with an unproved EXEC or selector domain was "
+                              "not decoded in the shader");
   }
 }
 
@@ -7640,8 +7670,10 @@ void TestPackedScalarBufferSelection() {
   Check(!materialize(), "indexed DWORD write accepted raw byte bounds");
   for (auto bad : {0u, 1u, 2u}) {
     auto invalid = make(bad == 0u ? 28u : 24u, bad == 1u, bad == 2u ? 4u : 0u);
-    CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
-               "packed selector accepted a cross-byte shift, leafless cycle, or indexed byte offset");
+    invalid->PlanAndTrack();
+    CheckStoreDecodedInShader(invalid->program,
+                              "packed selector with a cross-byte shift, leafless cycle, or indexed "
+                              "byte offset was not decoded in the shader");
   }
   auto mixed = make(24u, false, 0u, true);
   mixed->PlanAndTrack();
@@ -9724,6 +9756,76 @@ void TestUnfoldableLoadKeepsWrittenHandleBound() {
         "a written V# sharing an unfoldable load was decoded in the shader");
 }
 
+// A buffer table the GPU writes, or whose key the host cannot evaluate, is decoded in the shader.
+void TestRefusedIndirectBufferTableDemotes() {
+  constexpr uint32_t store_pc = 0x190cu;
+  const auto make = [](std::vector<uint32_t> unfoldable,
+                       std::function<bool(const Program &, std::span<const DescriptorSource>,
+                                          uint32_t)>
+                           refuse) {
+    auto fixture = std::make_unique<Fixture>();
+    auto &f = *fixture;
+    f.program.unfoldable_pcs = std::move(unfoldable);
+    f.program.refuse_indirect_buffer_table = std::move(refuse);
+    std::array<Value, 4> table_words, selector_words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      table_words[word] = f.UserData(word);
+      selector_words[word] = f.UserData(4u + word);
+    }
+    const auto table = f.Buffer(table_words);
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    const auto key = f.Emit(ValueOpcode::ReadConstBuffer,
+                            {f.Buffer(selector_words), f.Emit(ValueOpcode::IMul32, {lane, Value(12u)})},
+                            f.AddMemory({.kind = ResourceKind::ScalarBuffer}, 0x1bcu));
+    const auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(192u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word)
+      words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                           f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 176u + word * 4u,
+                                        .component_index = word, .component_count = 4u},
+                                       0x1808u));
+    for (uint32_t use = 0; use < 2u; ++use)
+      f.Emit(ValueOpcode::StoreBufferU8,
+             {f.Buffer(words), lane, Value(0u), Value(0u), Value(uint8_t{42u}), Value(true)},
+             f.AddMemory({.kind = ResourceKind::Buffer, .data_bits = 8u, .idxen = true}, store_pc));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  const auto table_bound = [](const Program &program) {
+    return std::ranges::any_of(program.info.buffers, [&](const BufferResource &buffer) {
+      return program.descriptor_sources[buffer.source].indirect_descriptor.has_value();
+    });
+  };
+  auto plain = make({}, {});
+  Check(table_bound(plain->program) && !StoresDecodedInShader(plain->program),
+        "the buffer table fixture was not recognized as a table");
+
+  auto unrelated = make({0x1bcu}, {});
+  Check(table_bound(unrelated->program) && !StoresDecodedInShader(unrelated->program),
+        "a pc that names no table access demoted the table");
+
+  auto proven = make({store_pc}, {});
+  Check(!table_bound(proven->program) && StoresDecodedInShader(proven->program) &&
+            proven->program.info.writes_dma,
+        "a table access materialization proved unfoldable was not decoded in the shader");
+
+  uint32_t asked = 0;
+  auto kept = make({}, [&](const Program &, std::span<const DescriptorSource> sources,
+                           uint32_t source) {
+    ++asked;
+    return !(source < sources.size() && sources[source].indirect_descriptor &&
+             sources[source].indirect_descriptor->table_stride == 192u);
+  });
+  Check(asked != 0 && table_bound(kept->program) && !StoresDecodedInShader(kept->program),
+        "a table the predicate accepts was not enumerated, or the predicate saw another table");
+
+  auto refused = make({}, [](const Program &, std::span<const DescriptorSource>, uint32_t) {
+    return true;
+  });
+  Check(!table_bound(refused->program) && StoresDecodedInShader(refused->program) &&
+            refused->program.info.writes_dma && refused->program.has_address_writes,
+        "a refused table was still enumerated");
+}
 
 // A store through a V# that does not come from memory has nothing a shader decode could read.
 void TestLoopPhiStoreDescriptorIsRefused() {
@@ -10137,6 +10239,7 @@ int main() {
     Run("GPU-owned written handle stays on host", TestGpuOwnedWrittenHandleStaysOnHost);
     Run("GPU-owned relative written handle decodes", TestGpuOwnedRelativeWrittenHandleDecodes);
     Run("unfoldable load keeps written handle bound", TestUnfoldableLoadKeepsWrittenHandleBound);
+    Run("refused indirect buffer table demotes", TestRefusedIndirectBufferTableDemotes);
     Run("loop phi store descriptor is refused", TestLoopPhiStoreDescriptorIsRefused);
     Run("lane mask descriptor dword", TestLaneMaskDescriptorDword);
     Run("written descriptor sized by GPU count", TestWrittenDescriptorSizedByGpuCount);

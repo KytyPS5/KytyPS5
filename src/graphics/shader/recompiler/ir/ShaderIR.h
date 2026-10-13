@@ -15,9 +15,11 @@
 #include <array>
 #include <bit>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -81,6 +83,7 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	bool                    glc                                                   = false;
 
 	[[nodiscard]] bool IsCoherentBufferPairLoad(ValueOpcode opcode) const {
 		return kind == ResourceKind::Buffer && opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
@@ -844,6 +847,10 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
+	// Whether materialization would refuse indirect buffer table `source` against guest memory now.
+	std::function<bool(const Program& program, std::span<const DescriptorSource> sources,
+	                   uint32_t source)>
+	                              refuse_indirect_buffer_table;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;

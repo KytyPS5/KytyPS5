@@ -10,6 +10,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -26,6 +27,8 @@ constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 std::string& MaterializeFailure() {
 	static thread_local std::string reason;
 	return reason;
+}
+
 // A refusal skips the draw; its caller reports MaterializeFailure() as its one line.
 bool SpecializationFail(std::string_view message) {
 	MaterializeFailure() = message;
@@ -428,6 +431,11 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 
 // A table the GPU wrote is decoded in the shader: a host snapshot of it can name a stale record.
 bool BufferTableGpuWritten(const DescriptorValue& table_value, const SrtRuntime& runtime) {
+	ShaderBufferResource table;
+	return runtime.gpu_owned != nullptr && DecodeBufferDescriptor(table_value, table) &&
+	       table.Base48() != 0u && table.GetSize() != 0u &&
+	       runtime.gpu_owned(runtime.userdata, table.Base48(), table.GetSize());
+}
 
 bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offset) {
 	if (material.Type() != 0u || material.SwizzleEnabled() || material.AddTid() ||
@@ -1047,6 +1055,7 @@ private:
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
+	specialization.unbound_images.assign(specialization.images.size(), false);
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -1489,14 +1498,18 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
-ResourcePlan ExtractResourcePlan(const Program& program) {
-	ResourcePlan plan;
 static BufferCopy AnalyzeBufferCopy(const Program& program) {
+	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
 	    !program.info.samplers.empty() || !program.info.images.empty() ||
 	    program.info.buffers.size() != 2) {
 		return {};
 	}
+	std::unordered_set<const Block*> visited;
+	std::vector<const Inst*>         stores;
+	const auto*                      block = program.blocks.front();
 	for (;;) {
+		if (block == nullptr || !visited.insert(block).second) return {};
+		for (const auto& inst: *block) {
 			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
 			if (!inst.MayHaveSideEffects()) continue;
 			if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write ||
@@ -1504,8 +1517,10 @@ static BufferCopy AnalyzeBufferCopy(const Program& program) {
 				return {};
 			stores.push_back(&inst);
 		}
+		const auto& term = block->terminator;
 		if (term.kind == CFG::TerminatorKind::Return) break;
 		if (term.kind != CFG::TerminatorKind::Branch) return {};
+		block = term.true_block;
 	}
 	if (stores.empty() || visited.size() != program.blocks.size()) return {};
 
@@ -1587,52 +1602,171 @@ static BufferCopy AnalyzeBufferCopy(const Program& program) {
 	return result;
 }
 
+namespace {
+
+// Copies a value graph out of a translated program into a plan that owns it.
+class PlanValueCloner {
+public:
+	PlanValueCloner(const Program& program, ResourcePlan& plan): m_program(program), m_plan(plan) {}
+
+	// An explicit stack, so a deep chain cannot exhaust the native one.
+	Value operator()(Value value) {
+		Value result;
+		auto  root = Enter(value, result);
+		if (!root) {
+			return result;
+		}
+		m_stack.clear();
+		m_stack.push_back(*root);
+		while (!m_stack.empty()) {
+			auto& frame = m_stack.back();
+			if (frame.index == frame.source->NumArgs()) {
+				const auto done = Value(frame.target);
+				m_stack.pop_back();
+				if (!m_stack.empty()) {
+					Attach(m_stack.back(), done);
+				}
+				continue;
+			}
+			Value operand;
+			if (auto child = Enter(frame.source->Arg(frame.index), operand)) {
+				m_stack.push_back(*child);
+			} else {
+				Attach(frame, operand);
+			}
+		}
+		return result;
+	}
+
+	[[nodiscard]] bool Failed() const { return m_failed; }
+
+private:
+	struct Frame {
+		const Inst* source = nullptr;
+		Inst*       target = nullptr;
+		size_t      index  = 0;
+	};
+
+	std::optional<Frame> Enter(Value value, Value& result) {
+		for (;;) {
+			value              = value.Resolve();
+			const auto* source = value.TryInstruction();
+			if (source == nullptr) {
+				result = value;
+				return std::nullopt;
+			}
+			if (source->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = source->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= m_program.srt_reads.size()) {
+					m_failed = true;
+					result   = Value(0u);
+					return std::nullopt;
+				}
+				value = m_program.srt_reads[slot.U32()].value;
+				continue;
+			}
+			if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
+			    ValidateRuntimeValue(m_program, source->Arg(0))) {
+				// Uniform values need no new EXEC context; preserve their shared evaluation memo.
+				value = source->Arg(0);
+				continue;
+			}
+			if (source->GetOpcode() == ValueOpcode::Phi) {
+				const auto invariant = ResolveInvariantPhi(m_program, value);
+				if (!invariant.IsEmpty() && invariant != value) {
+					value = invariant;
+					continue;
+				}
+			}
+			if (const auto found = m_cloned.find(source); found != m_cloned.end()) {
+				result = Value(found->second);
+				return std::nullopt;
+			}
+			if (source->GetOpcode() == ValueOpcode::LoadBufferU32) {
+				m_plan.requires_specialization_memory = true;
+				m_plan.capture_specialization_reads   = true;
+			}
+			auto& target =
+			    m_plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+			if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
+			    source->GetOpcode() == ValueOpcode::LoadBufferU32) {
+				target.SetFlags(SrtReadFlags {.index = source->Flags<MemoryFlags>().index});
+			}
+			m_cloned.emplace(source, &target);
+			result = Value(&target);
+			return Frame {.source = source, .target = &target};
+		}
+	}
+
+	static void Attach(Frame& frame, Value operand) {
+		if (frame.source->GetOpcode() == ValueOpcode::Phi) {
+			frame.target->AddPhiOperand(nullptr, operand);
+		} else {
+			frame.target->SetArg(frame.index, operand);
+		}
+		frame.index++;
+	}
+
+	const Program&                         m_program;
+	ResourcePlan&                          m_plan;
+	std::unordered_map<const Inst*, Inst*> m_cloned;
+	std::vector<Frame>                     m_stack;
+	bool                                   m_failed = false;
+};
+
+void CopyPlanHeader(const Program& program, ResourcePlan& plan) {
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
 	plan.user_data_base             = program.user_data_base;
 	plan.user_data_count            = program.user_data_count;
+	plan.wave_size                  = program.wave_size;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
 	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
+	plan.frozen_values              = true;
+}
 
-	std::unordered_map<const Inst*, Inst*> cloned;
-	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
-		value              = value.Resolve();
-		const auto* source = value.TryInstruction();
-		if (source == nullptr) {
-			return value;
-		}
-		if (source->GetOpcode() == ValueOpcode::ReadConst) {
-			const auto slot = source->Arg(1).Resolve();
-			EXIT_IF(!slot.IsImmediate() || slot.GetType() != Type::U32 ||
-			        slot.U32() >= program.srt_reads.size());
-			return Clone(program.srt_reads[slot.U32()].value);
-		}
-		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
-		    ValidateRuntimeValue(program, source->Arg(0))) {
-			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
-			return Clone(source->Arg(0));
-		}
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			const auto invariant = ResolveInvariantPhi(program, value);
-			if (!invariant.IsEmpty() && invariant != value) {
-				return Clone(invariant);
+} // namespace
+
+bool IndirectBufferTableRefused(const Program& program, std::span<const DescriptorSource> sources,
+                                uint32_t table_source, const SrtRuntime& runtime) {
+	if (runtime.read_specialization_memory == nullptr || table_source >= sources.size()) {
+		return false;
+	}
+	if (sources[table_source].indirect_descriptor) {
+		table_source = sources[table_source].indirect_descriptor->table_source;
+		if (table_source >= sources.size()) return false;
+	}
+	const auto&     table = sources[table_source];
+	ResourcePlan    plan;
+	PlanValueCloner clone(program, plan);
+	CopyPlanHeader(program, plan);
+	auto& target       = plan.descriptor_sources.emplace_back();
+	target.dword_count = table.dword_count;
+	for (uint32_t dword = 0; dword < table.dword_count; dword++) {
+		target.dwords[dword] = clone(table.dwords[dword]);
+	}
+	if (clone.Failed()) return false;
+	DescriptorValue value;
+	SrtWalker       clean(plan, CleanRuntime(runtime));
+	// A table V# the host cannot evaluate would refuse every materialization of its enumeration.
+	return !clean.EvaluateDescriptor(0, value) || BufferTableGpuWritten(value, runtime);
+}
+
 			}
 		}
-		if (const auto found = cloned.find(source); found != cloned.end()) {
-		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
-		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
-		    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
-		    source->GetOpcode() == ValueOpcode::LoadBufferU32) {
-			target.SetFlags(SrtReadFlags {.index = source->Flags<MemoryFlags>().index});
-		}
-		cloned.emplace(source, &target);
-				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
-				target.SetArg(index, Clone(source->Arg(index)));
-	};
+ResourcePlan ExtractResourcePlan(const Program& program) {
+	ResourcePlan plan;
+	CopyPlanHeader(program, plan);
+	plan.data_flat_slots = program.data_flat_slots;
 	plan.srt_read_order  = program.srt_read_order;
+	plan.unfoldable_pcs  = program.unfoldable_pcs;
+
+	PlanValueCloner Clone(program, plan);
 
 	bool capture_indirect_reads = false;
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
@@ -1669,7 +1803,10 @@ static BufferCopy AnalyzeBufferCopy(const Program& program) {
 		plan.selector_groups[source] = group;
 	}
 	plan.srt_reads.reserve(program.srt_reads.size());
+	plan.srt_read_pcs.reserve(program.srt_reads.size());
 	for (const auto& read: program.srt_reads) {
+		const auto* inst = read.value.ResolveInstruction();
+		plan.srt_read_pcs.push_back(inst != nullptr ? inst->Flags<MemoryFlags>().pc : UINT32_MAX);
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
 	// Retain integer control expressions with opaque varying leaves. Their identities
@@ -1791,6 +1928,7 @@ static BufferCopy AnalyzeBufferCopy(const Program& program) {
 			if (image.written) MarkCleanReads(planned_reads, Source(plan, image.source));
 		}
 	}
+	EXIT_IF(Clone.Failed());
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
 	CompileSrtWalker(plan);
@@ -1953,6 +2091,16 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 	gpu_owned_slots.clear();
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, true, nullptr,
 	                              refused_tables != nullptr ? &gpu_owned_slots : nullptr)) {
+		// A hoisted read of data the GPU owns stays a native load on rebuild.
+		for (const auto slot: gpu_owned_slots) {
+			const auto pc = SrtReadPc(program, slot);
+			if (pc != UINT32_MAX) refused_tables->push_back(pc);
+		}
+		return SpecializationFail(fmt::format(
+		    "SRT refresh complete={} reads={} user_data={}: {}", program.srt_plan_complete,
+		    program.srt_reads.size(), runtime.user_data.size(), RefusalName(walker, clean)));
+	}
+	const auto active = std::span<const uint8_t>(program.active_sources);
 	std::array<uint32_t, 3> workgroup_counts {};
 	if (runtime.indirect_args_address != 0u) {
 		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
@@ -1970,26 +2118,89 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 	snapshot.buffer_copy          = program.buffer_copy;
 	const auto& fill = program.uniform_fill;
 	auto words = fill.fill.words;
+	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
 	bool                    words_agree  = true;
+	if (uniform_fill && !fill.pattern_size.IsEmpty())
+		uniform_fill = clean.Evaluate(fill.pattern_size, words) && words >= 1 && words <= 4;
+	uint32_t elements = 0;
+	if (uniform_fill && !fill.element_count.IsEmpty())
+		uniform_fill = clean.Evaluate(fill.element_count, elements) && elements != 0;
+	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
 		uniform_fill = clean.Evaluate(fill.values[i], stored[i]);
 		words_agree  = words_agree && stored[i] == stored[0];
+	}
+	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
 		snapshot.uniform_fill.word_values      = stored;
 		snapshot.uniform_fill.words_agree      = words_agree;
+		snapshot.uniform_fill.bounded_elements = elements;
+	}
+	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
+		if (source >= program.descriptor_sources.size()) {
 			return SpecializationFail(fmt::format("descriptor source {} is missing", source));
+		}
+		if (active.empty() || active[source]) {
 			auto& evaluator = capture_reads && written ? clean : walker;
 			return evaluator.EvaluateDescriptor(source, value) ||
 			       SpecializationFail(fmt::format("descriptor evaluation source={}: {}", source,
 			                                      SrtRefusalName(evaluator.Refusal())));
+		}
 		value = {};
+		value.dword_count = program.descriptor_sources[source].dword_count;
+		return true;
+	};
+	const auto resource_failed = [&](std::string_view kind, uint32_t resource, uint32_t source,
+	                                 size_t candidates) {
+		// Keep the table's own reason; name the resource only when it gave none.
 		return MaterializeFailure().empty() ? SpecializationFail(fmt::format(
 		                                          "indirect {} resource={} source={} candidates={}",
 		                                          kind, resource, source, candidates))
+		                                    : false;
+	};
+	// Every resource the host cannot re-evaluate is named, so one rebuild decodes them all.
+	bool       refused = false;
+	const auto refuse  = [&](uint32_t pc) {
+		refused_tables->push_back(pc);
+		refused = true;
+	};
+	snapshot.buffers.resize(program.info.buffers.size());
+	specialization.buffers.assign(program.info.buffers.size(), {});
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		const auto& base   = program.info.buffers[i];
+		const auto* source = Source(program, base.source);
+		if (source == nullptr) return SpecializationFail("buffer source is missing");
+		if (source->indirect_descriptor.has_value()) {
+			snapshot.buffers[i] = {.dword_count = 4u};
+			if (!active.empty() && !active[base.source]) continue;
+			const auto& indirect = *source->indirect_descriptor;
+			if (refused_tables != nullptr && indirect.sources.empty()) {
+				DescriptorValue table;
+				if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
+				    BufferTableGpuWritten(table, runtime)) {
+					refuse(base.first_use_pc);
+					continue;
 				}
+			}
+			MaterializeFailure().clear();
+			if (!MaterializeIndirectDescriptor(
+			        program, base.source, i, 4u, 4u, observed, clean, snapshot, snapshot.buffers,
+			        specialization.buffers, [&](DescriptorValue& value) {
+				        return NormalizeIndirectBuffer(value, indirect.indexed, base);
+			        }))
+				return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+		} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
+			auto& evaluator = capture_reads && base.written ? clean : walker;
 			if (refused_tables == nullptr || !PhiRefusal(evaluator.Refusal())) return false;
 			refuse(base.first_use_pc);
+		}
+	}
+	if (refused) {
+		return SpecializationFail(
+		    "a descriptor the host cannot re-evaluate is decoded in the shader on rebuild");
+	}
+	if (!SpecializeBuffers(program, snapshot, specialization)) return false;
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -2042,14 +2253,17 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 	for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
-		if (base_index >= program.info.samplers.size()) return false;
+		if (base_index >= program.info.samplers.size()) {
+			return SpecializationFail(fmt::format("sampler resource {} has an invalid root", i));
+		}
 		if (i < program.info.samplers.size()) {
 			auto source = program.info.samplers[i].source;
 			const auto* descriptor = Source(program, source);
-			if (descriptor == nullptr) return false;
+			if (descriptor == nullptr) return SpecializationFail("sampler source is missing");
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
 			if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
+				MaterializeFailure().clear();
 				if ((active.empty() || active[source]) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, clean, snapshot, snapshot.samplers,
 				        specialization.samplers,
@@ -2299,6 +2513,7 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 
 bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
+	if (program.info.buffers.size() > specialization.buffers.size() ||
 	    program.info.images.size() > specialization.images.size() ||
 	    program.info.samplers.size() > specialization.samplers.size()) {
 		return false;

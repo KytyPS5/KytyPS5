@@ -36,6 +36,19 @@ endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
 
+set(kyty_translations_dir "${CMAKE_CURRENT_BINARY_DIR}/translations")
+set(kyty_swedish_translation "${kyty_translations_dir}/kytyps5_sv.qm")
+find_program(KYTY_LRELEASE NAMES lrelease PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH REQUIRED)
+add_custom_command(
+	OUTPUT "${kyty_swedish_translation}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${kyty_translations_dir}"
+	COMMAND "${KYTY_LRELEASE}" "${CMAKE_CURRENT_SOURCE_DIR}/translations/kytyps5_sv.ts"
+		-qm "${kyty_swedish_translation}"
+	DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/translations/kytyps5_sv.ts"
+	VERBATIM)
+add_custom_target(launcher_translations ALL DEPENDS "${kyty_swedish_translation}")
+add_dependencies(launcher launcher_translations)
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)
@@ -100,6 +113,12 @@ endif()
 install(TARGETS launcher
 	BUNDLE DESTINATION .
 	RUNTIME DESTINATION .)
+
+if(APPLE)
+	install(FILES "${kyty_swedish_translation}" DESTINATION "KytyPS5.app/Contents/Resources/translations")
+else()
+	install(FILES "${kyty_swedish_translation}" DESTINATION translations)
+endif()
 
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")

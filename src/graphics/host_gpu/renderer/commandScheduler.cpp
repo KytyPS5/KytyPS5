@@ -208,17 +208,29 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	bool refreshed = false;
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
 			}
-			operation = std::move(m_pending_operations.front());
-			m_pending_operations.pop();
+			const auto tick = m_pending_operations.front().tick;
+			if (!m_master.IsFree(tick)) {
+				// The timeline is polled once, and not for the open tick: it is not submitted yet.
+				if (refreshed || tick >= CurrentTick()) {
+					return;
+				}
+			} else {
+				operation = std::move(m_pending_operations.front());
+				m_pending_operations.pop();
+			}
+		}
+		if (!operation.callback) {
+			m_master.Refresh();
+			refreshed = true;
+			continue;
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));

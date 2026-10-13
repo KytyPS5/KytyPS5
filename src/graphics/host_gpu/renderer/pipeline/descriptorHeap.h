@@ -38,6 +38,8 @@ private:
 	vk::DescriptorPool                                  m_current_pool = nullptr;
 	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
 	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
+
+	friend struct DescriptorHeapTestAccess;
 };
 
 } // namespace Libs::Graphics

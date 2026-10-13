@@ -809,6 +809,10 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			for (const auto& inst: *block)
 				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
 	}
+	IR::FoldVertexBranchSelects(ir);
+	IR::ResolveControlFlowIdentities(ir);
+	IR::RemoveIdentities(ir.blocks);
+	IR::EliminateDeadCode(ir.blocks);
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;
 	if (options.dump_ir) {

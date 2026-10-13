@@ -2151,6 +2151,8 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 		case 0x0: break;
 		case 0x4: cp.SetUserDataMarker(HW::UserSgprType::Vsharp); break;
 		case 0xd: cp.SetUserDataMarker(HW::UserSgprType::Region); break;
+		// Undocumented id seen in NHL 27 (#1101); there is no CP state to apply.
+		case 0x11: break;
 		case 0x777: {
 			cp.Flip();
 			break;

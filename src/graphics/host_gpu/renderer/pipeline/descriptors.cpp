@@ -660,9 +660,9 @@ RenderExecutor::FindTextureDescription(const ShaderRecompiler::IR::ImageResource
 	if (m_texture_descriptions.size() >= MaxTextureDescriptions) {
 		m_texture_descriptions.clear();
 	}
-	auto& entry       = m_texture_descriptions[key];
-	entry.inputs      = inputs;
-	entry.value       = value;
+	auto& entry  = m_texture_descriptions[key];
+	entry.inputs = inputs;
+	entry.value  = value;
 	entry.description =
 	    DescribeTexture(inputs, value, m_context.GetGraphics().shader_image_int64_atomics_enabled);
 	return entry.description;

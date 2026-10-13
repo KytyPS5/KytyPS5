@@ -240,7 +240,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
-	m_registration_generation++;
+	TouchRegistrations(image.info.data.address, image.info.data.size);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -268,8 +268,24 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
-	m_registration_generation++;
+	TouchRegistrations(image.info.data.address, image.info.data.size);
 	image.registered = false;
+}
+
+void TextureCache::TouchRegistrations(uint64_t address, uint64_t size) {
+	const auto generation = ++m_registration_generation;
+	ForEachPage(address, size,
+	            [this, generation](uint64_t page) { m_page_generations[page] = generation; });
+}
+
+bool TextureCache::RegistrationsSince(uint64_t address, uint64_t size, uint64_t generation) const {
+	bool changed = false;
+	ForEachPage(address, size, [&](uint64_t page) {
+		const auto* stamp = m_page_generations.Find(page);
+		changed           = stamp != nullptr && *stamp > generation;
+		return changed;
+	});
+	return changed;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1209,7 +1225,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
 		// The plane is matched by FindImage under its new description.
-		m_registration_generation++;
+		TouchRegistrations(stencil.address, stencil.size);
 	}
 
 	return association;
@@ -1240,11 +1256,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		                         desc.type,
 		                         exact_format};
 		const auto          exact = m_exact_images.find(key);
-		const bool          known =
-		    exact != m_exact_images.end() && exact->second.generation == m_registration_generation;
-		bool     exact_match = known;
-		bool     block_alias = false;
-		ImageIds candidates;
+		const bool          known = exact != m_exact_images.end() &&
+		                            !RegistrationsSince(desc.info.data.address, desc.info.data.size,
+		                                                exact->second.generation);
+		bool                exact_match = known;
+		bool                block_alias = false;
+		ImageIds            candidates;
 		if (known) {
 			result = exact->second.id;
 		} else {

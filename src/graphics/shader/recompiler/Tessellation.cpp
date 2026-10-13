@@ -140,7 +140,7 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 				EXIT("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
 				     inst.pc);
 			}
-			if (control_store && address.coefficient == 0u) {
+			if (control_store && is_constant(address)) {
 				const auto first = uint64_t {address.constant} + inst.offset;
 				EXIT_NOT_IMPLEMENTED(first + 4u * inst.data_dwords > UINT32_MAX);
 				fixed_stores.push_back({address.constant, static_cast<uint32_t>(first),
@@ -151,6 +151,12 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 				EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
 				                     (expected != 0u && expected != address.coefficient));
 				if (!control_read) stride = address.coefficient;
+				// The lowering writes a per-control-point store to the invocation's own output.
+				if (control_store &&
+				    uint64_t {address.constant} + inst.offset + 4u * inst.data_dwords > stride) {
+					EXIT("HS store at pc 0x%08x leaves its %u-byte control point record\n", inst.pc,
+					     stride);
+				}
 			}
 		}
 		// Store vdata is a source, despite occupying the decoder's dst field.

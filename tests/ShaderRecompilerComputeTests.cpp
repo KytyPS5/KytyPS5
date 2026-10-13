@@ -42895,10 +42895,41 @@ void CheckTessellationBranchedProgram() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void CheckTessellationStoreOutsideRecord() {
+  using namespace ShaderRecompiler;
+  constexpr u32 ls_stride = 132;
+  constexpr u32 hs_stride = 112;
+  const std::vector<u32> local{EncodeVop2(0x0b, 2, 255u, 3), ls_stride,
+                               EncodeDs0(0x0d),              EncodeDs1(0, 4, 2),
+                               EncodeSop1(0x20, 0, 6),       0xffffffffu};
+  std::vector<u32> control;
+  constexpr u32 control_point = 34;
+  AppendVop3(&control, 0x148, control_point, Vgpr(1), InlineU32(8), InlineU32(5));
+  control.push_back(EncodeVop2(0x0b, 35, 255u, control_point));
+  control.push_back(hs_stride);
+  // Each control point stores into the next record; the last one lands in the patch outputs.
+  control.push_back(EncodeMubuf0(0x1c, hs_stride));
+  control.push_back(EncodeMubuf1(10, 2, 35, 2));
+  AppendEnd(&control);
+  ExpectFatal("TessellationStoreOutsideRecord", [&] {
+    ShaderTessellationInputInfo tess{.input_control_points = 3,
+                                    .output_control_points = 3,
+                                    .domain = 1,
+                                    .partitioning = 0,
+                                    .output_topology = 2};
+    AnalyzeTessellationPrograms(local, control, tess);
+  });
+}
+#endif
+
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
   CheckTessellationBranchedProgram();
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  CheckTessellationStoreOutsideRecord();
+#endif
 }
 
 void CheckEmbeddedFetchVertexOffset() {

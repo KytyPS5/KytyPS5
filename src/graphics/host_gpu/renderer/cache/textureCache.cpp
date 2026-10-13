@@ -1910,6 +1910,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				}
 			} else if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
+			} else if (resolved.info.resources.levels < desc.info.resources.levels ||
+			           resolved.info.resources.layers < desc.info.resources.layers) {
 				FreeImage(result);
 				result = {};
 			}

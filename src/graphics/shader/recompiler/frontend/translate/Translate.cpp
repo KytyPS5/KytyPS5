@@ -1406,13 +1406,23 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                              (options.input_info.compute->float_mode & 0x10u) == 0;
-	for (const auto& cfg_block: cfg.blocks) {
-		auto*      block = blocks_by_id.at(cfg_block.id);
+	std::vector<LaunchedMasks> entry_masks;
+	const bool                 whole_quads = options.stage == ShaderType::Pixel;
+	if (options.wave_size == 64u) {
+		entry_masks = ComputeEntryLaunchedMasks(decoded, cfg, whole_quads);
+	}
+	for (size_t block_index = 0; block_index < cfg.blocks.size(); block_index++) {
+		const auto& cfg_block = cfg.blocks[block_index];
+		auto*       block     = blocks_by_id.at(cfg_block.id);
 		Translator translator(result, block, vector_limit, flush_f32_inputs,
 		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
+		if (!entry_masks.empty()) {
+			translator.SetLaunchedMasks(entry_masks[block_index], whole_quads);
+		}
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
+				translator.SkipInstruction(instruction);
 				continue;
 			}
 			const auto* embedded = FindEmbeddedFetchLoad(options.embedded_fetch, instruction.pc);
@@ -1428,6 +1438,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				translator.TranslateEmbeddedFetch(instruction, static_cast<uint32_t>(resource),
 				                                  embedded->components,
 				                                  options.input_info.vertex->resources[resource]);
+				translator.SkipInstruction(instruction);
 				continue;
 			}
 			translator.TranslateInstruction(instruction);

@@ -49757,6 +49757,29 @@ void CheckMaskedPatchOrdinalTessellation() {
   Require("MaskedPatchOrdinalTessellation", "decoded interface",
           tess.ls_stride == 60 && tess.hs_stride == 64,
           "a byte-masked patch ordinal must not hide the control point stride");
+  // A repeated LS/HS pair must reuse the analysis; empty code would EXIT if decoded.
+  constexpr uint64_t kLocalHash = 0x5245344c53000001ull, kControlHash = 0x5245344853000001ull;
+  ShaderTessellationInputInfo cached{.input_control_points = 3, .output_control_points = 3};
+  AnalyzeTessellationPrograms(local, kLocalHash, control, kControlHash, cached);
+  ShaderTessellationInputInfo reused{.input_control_points = 3, .output_control_points = 3};
+  AnalyzeTessellationPrograms({}, kLocalHash, {}, kControlHash, reused);
+  Require("MaskedPatchOrdinalTessellation", "cached interface",
+          cached.ls_stride == 60 && cached.hs_stride == 64 && reused.ls_stride == 60 &&
+              reused.hs_stride == 64,
+          "a repeated LS/HS pair must reuse the cached strides");
+  ShaderVertexInputInfo vertex;
+  vertex.logical_stage = ShaderType::TessellationControl;
+  vertex.tess = tess;
+  CompileOptions options;
+  options.stage = ShaderType::TessellationControl;
+  options.input_info.vertex = &vertex;
+  auto translated = TranslateProgram(control, options);
+  Require("MaskedPatchOrdinalTessellation", "translation", translated.status.ok,
+          translated.status.reason.c_str());
+  auto result = CompileProgram(std::move(translated), options, {});
+  Require("MaskedPatchOrdinalTessellation", "factor stores", result.status.ok,
+          result.status.reason.c_str());
+  ValidateSpirv("MaskedPatchOrdinalTessellation", result.spirv);
 }
 
 void CheckTessellationPrograms() {

@@ -2009,7 +2009,7 @@ private:
 		});
 	}
 
-	Value UnsignedResourceBound(Value key, const Inst& handle) const {
+	Value UnsignedResourceBound(Value key, const Inst& handle, bool finite_bitscan = false) const {
 		Value bound;
 		for (const auto& use: handle.Uses()) {
 			const auto& access = *use.user;
@@ -2020,8 +2020,9 @@ private:
 			// The access's own EXEC predicate proves the range for every accessing lane;
 			// an EXEC-nonzero branch alone only proves that some lane is active.
 			const auto active = access.Arg(access.NumArgs() - 1u);
-			auto candidate = UnsignedBound(active, key);
-			if (candidate.IsEmpty()) candidate = UnsignedBoundOnEntry(key, access.Parent(), false, active);
+			auto       candidate = UnsignedBound(active, key, true, finite_bitscan);
+			if (candidate.IsEmpty())
+				candidate = UnsignedBoundOnEntry(key, access.Parent(), finite_bitscan, active);
 			if (candidate.IsEmpty()) {
 				// A waterfall key inherits the local value's bound only where this same
 				// EXEC predicate proves both their equality and the local range.
@@ -3022,6 +3023,8 @@ private:
 			if (guarded_count.IsEmpty()) guarded_count = UnsignedResourceBound(key, handle);
 			// A runtime count can describe fewer rows than the mask's static bit range.
 			if (guarded_count.IsEmpty()) guarded_count = UnsignedBoundOnEntry(key, handle.Parent(), true);
+			// The accessing lanes may carry the scan's ff1 != -1 test themselves.
+			if (guarded_count.IsEmpty()) guarded_count = UnsignedResourceBound(key, handle, true);
 			if (!guarded_count.IsEmpty()) {
 				if (table_stride < plan.read_dwords * 4u || (table_stride & 3u) != 0u) return false;
 				// Materialization captures the count and descriptor reads; renderer alias

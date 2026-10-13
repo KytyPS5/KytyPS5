@@ -97,11 +97,16 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
-	// Newly mapped memory is exactly what a full walk would newly visit, and a range remapped at
-	// an address that was just unmapped has to come back. Queue after the add.
-	m_buffer_cache.QueueBdaSync(vaddr, size);
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+		// Newly mapped memory is exactly what a full walk would newly visit, and a range remapped
+		// at an address that was just unmapped has to come back. Queue after the add.
+		m_buffer_cache.QueueBdaSync(vaddr, size);
+	}
+	// New backing changes the bytes without a write fault. An image read while the range was
+	// unmapped holds zeros and no page watch, so it must reload and re-arm.
+	m_texture_cache.InvalidateMemory(vaddr, size);
 }
 
 void RenderContext::ProtectMemory(uint64_t vaddr, uint64_t size,

@@ -15915,6 +15915,214 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // RESIDENT EVIL 4 unmaps streamed texture pages while their descriptors stay bound; a lookup
+  // in that window uploads zeros, and the remapped data must replace them.
+  void CheckRemapReloadsTexture() {
+    constexpr const char *name = "RemapReloadsTexture";
+    constexpr uintptr_t base = 0x0000000212000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr auto tile = Prospero::TileMode::kStandard64KB;
+    constexpr vk::Extent3D extent{64, 64, 1};
+    constexpr uint32_t first_bits = 0x11223344u;
+    constexpr uint32_t remapped_bits = 0x55667788u;
+    EnsureRuntimeContext();
+
+    TileSizeAlign total{};
+    TileGetTextureTotalSize(Prospero::BufferFormat::k32UInt, extent.width, extent.height, 1, 1,
+                            tile, false, total);
+    TileSizeOffset offsets[16]{};
+    TilePaddedSize padded[16]{};
+    TileGetTextureSize(Prospero::BufferFormat::k32UInt, extent.width, extent.height, 1, tile,
+                       nullptr, offsets, padded);
+    ImageDesc desc{};
+    desc.type = BindingType::Texture;
+    desc.info.data = {base, total.size};
+    desc.info.pixel_format = vk::Format::eR32Uint;
+    desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+    desc.info.type = Prospero::ImageType::kColor2D;
+    desc.info.extent = extent;
+    desc.info.resources = {1, 1};
+    desc.info.pitch = TileGetTexturePitch(Prospero::BufferFormat::k32UInt, extent.width, tile);
+    desc.info.bytes_per_block = sizeof(uint32_t);
+    desc.info.tile_mode = tile;
+    desc.info.mip_layout[0] = {offsets[0].src_size != 0 ? offsets[0].src_offset : offsets[0].offset,
+                               offsets[0].src_size != 0 ? offsets[0].src_size : offsets[0].size,
+                               padded[0].width, padded[0].height};
+    desc.info.UpdateSize();
+    desc.view_info.format = vk::Format::eR32Uint;
+    desc.view_info.type = vk::ImageViewType::e2D;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+    desc.view_info.level_count = 1;
+    desc.view_info.layer_count = 1;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    Require(name, "layout fits", desc.info.data.size <= allocation_size,
+            "the texture does not fit the allocation");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "allocation failed");
+    const auto map = [&](const char *check) {
+      void *mapped = reinterpret_cast<void *>(base);
+      Require(name, check,
+              Libs::LibKernel::Memory::KernelMapDirectMemory(
+                  &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                  mapped == reinterpret_cast<void *>(base),
+              "mapping failed");
+      return static_cast<uint32_t *>(mapped);
+    };
+    std::fill_n(map("first mapping"), allocation_size / sizeof(uint32_t), first_bits);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      const auto lookup = [&] {
+        auto lookup_desc = desc;
+        const auto id = cache.FindImage(lookup_desc);
+        (void)cache.FindTexture(id, lookup_desc);
+        return id;
+      };
+      const auto expect = [&](const char *check, ImageId id, uint32_t bits) {
+        const auto pixels = ReadCachedTexel(name, context, id, {}, extent);
+        for (uint32_t texel = 0; texel < pixels.size(); ++texel) {
+          if (pixels[texel] == bits) {
+            continue;
+          }
+          char detail[96];
+          std::snprintf(detail, sizeof(detail), "texel %u holds 0x%08x, expected 0x%08x\n", texel,
+                        pixels[texel], bits);
+          Require(name, check, false, detail);
+        }
+      };
+
+      expect("first upload", lookup(), first_bits);
+
+      // The streamer evicts the pages, but the descriptor is still looked up meanwhile.
+      context.UnmapMemory(base, allocation_size);
+      Require(name, "unmap",
+              Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+              "unmap failed");
+      expect("unmapped range reads zero", lookup(), 0u);
+
+      // The same address comes back with new contents written through it.
+      auto *remapped = map("remapping");
+      context.MapMemory(base, allocation_size);
+      std::fill_n(remapped, allocation_size / sizeof(uint32_t), remapped_bits);
+      expect("remapped contents reload", lookup(), remapped_bits);
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                                  allocation_size) == 0,
+            "backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // RESIDENT EVIL 4 copies only the depth plane between two depth surfaces that share one stencil
+  // plane; the copy must not hand the shared plane to the destination's empty stencil aspect.
+  void CheckDepthOnlyCopyKeepsStencilOwner() {
+    constexpr const char *name = "DepthOnlyCopyKeepsStencilOwner";
+    constexpr uintptr_t base = 0x0000000213000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr vk::Extent3D extent{64, 64, 1};
+    constexpr uint64_t depth_size = 64ull * 64ull * 4ull;
+    constexpr uint64_t stencil_offset = 0x80000;
+    constexpr uint64_t stencil_size = 64ull * 64ull;
+    EnsureRuntimeContext();
+
+    const auto depth_desc = [&](uint64_t depth_offset) {
+      ImageDesc desc{};
+      desc.type = BindingType::DepthTarget;
+      desc.info.data = {base + depth_offset, depth_size};
+      desc.info.stencil = {base + stencil_offset, stencil_size};
+      desc.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      desc.info.guest_format = Prospero::BufferFormat::k32Float;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = extent;
+      desc.info.resources = {1, 1};
+      desc.info.pitch = extent.width;
+      desc.info.bytes_per_block = 4;
+      desc.info.samples = 1;
+      desc.info.tile_mode = Prospero::TileMode::kLinear;
+      desc.info.mip_layout[0] = {0, depth_size, extent.width, extent.height};
+      desc.info.UpdateSize();
+      desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+      desc.view_info.type = vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      desc.view_info.level_count = 1;
+      desc.view_info.layer_count = 1;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      return desc;
+    };
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      const auto owner = [&] {
+        const auto association =
+            cache.FindImageFromRange(base + stencil_offset, stencil_size, false);
+        return association ? cache.GetImage(association).depth_id : ImageId{};
+      };
+
+      auto source_desc = depth_desc(0);
+      const auto source = cache.FindImage(source_desc);
+      Require(name, "source depth target", cache.FindDepthTarget(source, source_desc) != nullptr,
+              "the source depth target did not bind");
+      Require(name, "source owns the plane", owner() == source,
+              "binding the source did not associate the shared stencil plane");
+
+      auto destination_desc = depth_desc(0x40000);
+      const auto destination = cache.FindImage(destination_desc);
+      Require(name, "distinct destination", destination && destination != source,
+              "the copy destination aliased the source");
+      cache.MarkGpuWritten(destination, false);
+      Require(name, "depth-only copy keeps the plane", owner() == source,
+              "a depth-only write moved the shared stencil plane to the destination");
+
+      cache.MarkGpuWritten(destination, true);
+      Require(name, "stencil write claims the plane", owner() == destination,
+              "a write that included stencil did not take the shared plane");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                                  allocation_size) == 0,
+            "backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // RESIDENT EVIL 4 streams a material table into a 32 MB descriptor page by page, so the bound
   // range has holes; records past the first hole must still reach the shader.
   void CheckSparseBufferBinding() {
@@ -56230,6 +56438,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--layout-alias-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLayoutAliasSync();
+    vulkan.CheckRemapReloadsTexture();
     vulkan.CheckSparseBufferBinding();
     vulkan.CheckDepthOnlyCopyKeepsStencilOwner();
     vulkan.CheckSparseBufferWrite();

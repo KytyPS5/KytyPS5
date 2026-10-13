@@ -96,7 +96,7 @@ constexpr std::array<uint8_t, 1> ColorClearCmaskCodes {0x00};
 	for (uint64_t offset = 0; offset < size; offset += chunk.size()) {
 		const auto bytes = std::min<uint64_t>(chunk.size(), size - offset);
 		if (!LibKernel::Memory::TryReadBacking(address + offset, chunk.data(), bytes)) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
+			return false;
 		}
 		if (!std::all_of(chunk.begin(), chunk.begin() + bytes,
 		                 [value](uint8_t byte) { return byte == value; })) {
@@ -1766,7 +1766,15 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t    code    = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read color metadata backing\n");
+			static RefusalReporter reports;
+			const auto             occurrences = reports.Observe(address, slice_size, 0);
+			if (occurrences != 0) {
+				char repeat[32] = "";
+				std::printf("TextureCache: color metadata backing unreadable addr=0x%016" PRIx64
+				            ", fast-clear skipped%s\n",
+				            address, RefusalReporter::RepeatSuffix(repeat, occurrences));
+			}
+			continue;
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color) ||

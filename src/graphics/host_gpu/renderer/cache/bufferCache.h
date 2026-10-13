@@ -169,8 +169,12 @@ private:
 	                                           bool is_written, bool is_texel_buffer,
 	                                           bool raw_image_read = false);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
-	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	                                      uint64_t                                    total_size,
+	                                      std::vector<std::pair<uint64_t, uint64_t>>& unbacked);
+	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                              bool whole_image = false);
+	[[nodiscard]] bool       WriteBackImage(Buffer& buffer, Common::SlotId id, uint64_t size,
+	                                        bool whole_image);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);

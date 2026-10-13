@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -24,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -213,6 +215,20 @@ static bool IsPooledRangeType(VirtualRangeType type) {
 
 static bool IsCommittedRangeType(VirtualRangeType type) {
 	return !IsReservedRangeType(type);
+}
+
+static const char* VirtualRangeTypeName(VirtualRangeType type) {
+	switch (type) {
+		case VirtualRangeType::Reserved: return "reserved";
+		case VirtualRangeType::PoolReserved: return "pool-reserved";
+		case VirtualRangeType::Direct: return "direct";
+		case VirtualRangeType::Flexible: return "flexible";
+		case VirtualRangeType::Pooled: return "pooled";
+		case VirtualRangeType::Stack: return "stack";
+		case VirtualRangeType::Code: return "code";
+		case VirtualRangeType::Runtime: return "runtime";
+		default: return "unknown";
+	}
 }
 
 static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
@@ -471,6 +487,75 @@ public:
 		}
 
 		return clamped_size;
+	}
+
+	// Like ClampRangeSize, but holes do not end the range: it reaches the end of the last committed
+	// mapping inside [virtual_addr, virtual_addr + size). Still 0 when the base is not committed.
+	uint64_t ClampSparseRangeSize(uint64_t virtual_addr, uint64_t size) {
+		Common::LockGuard lock(m_mutex);
+
+		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
+			return 0;
+		}
+
+		auto vma = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), virtual_addr,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (vma == m_ranges.begin()) {
+			return 0;
+		}
+		--vma;
+		if (virtual_addr >= End(vma->start, vma->size) || !IsCommittedRangeType(vma->type)) {
+			return 0;
+		}
+
+		const auto end          = virtual_addr + size;
+		uint64_t   last_covered = End(vma->start, vma->size);
+		for (++vma; vma != m_ranges.end() && vma->start < end; ++vma) {
+			if (IsCommittedRangeType(vma->type)) {
+				last_covered = End(vma->start, vma->size);
+			}
+		}
+		return std::min(last_covered, end) - virtual_addr;
+	}
+
+	// The range covering an address plus its two neighbours. "here=none" with a populated
+	// "prev"/"next" is an address the game never mapped; one it mapped and released leaves a
+	// reservation behind.
+	std::string DescribeAround(uint64_t addr) {
+		Common::LockGuard lock(m_mutex);
+
+		const Range* previous  = nullptr;
+		const Range* covering  = nullptr;
+		const Range* following = nullptr;
+		for (const auto& r: m_ranges) {
+			if (End(r.start, r.size) <= addr) {
+				previous = &r;
+			} else if (r.start <= addr) {
+				covering = &r;
+			} else {
+				following = &r;
+				break;
+			}
+		}
+
+		std::string out;
+		const auto  append = [&out](const char* label, const Range* r) {
+            char line[288];
+            if (r == nullptr) {
+                std::snprintf(line, sizeof(line), "%s=none ", label);
+            } else {
+                std::snprintf(line, sizeof(line),
+                              "%s=[0x%016" PRIx64 "+0x%" PRIx64 " %s prot=0x%x \"%s\"] ", label,
+                              r->start, r->size, VirtualRangeTypeName(r->type), r->protection,
+                              r->name);
+            }
+            out += line;
+		};
+		append("here", covering);
+		append("prev", previous);
+		append("next", following);
+		return out;
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -896,19 +981,63 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool HasGpuOwnedBytes(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       Graphics::GuestGpu::IsGpuThread() &&
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
+const char* DescribeGpuBackingRefusal(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			return "the read is off the GPU thread";
+		}
+		if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+			return "the buffer cache still holds GPU writes there";
+		}
+	}
+	std::array<uint8_t, 4> probe {};
+	const auto             probe_size = std::min<uint64_t>(size, probe.size());
+	if (!TryReadBacking(vaddr, probe.data(), probe_size)) {
+		return "nothing is mapped there";
+	}
+	return "the range reads back now";
+}
+
+static Common::Mutex           g_buffer_range_report_mutex;
+static BufferRangeReportPolicy g_buffer_range_reports;
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
-	if (clamped_size == 0) {
-		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
-		     "\n",
-		     vaddr, size);
+	if (clamped_size == size) {
+		return clamped_size;
 	}
-	if (clamped_size != size) {
+
+	BufferRangeReportPolicy::Decision decision {};
+	{
+		Common::LockGuard lock(g_buffer_range_report_mutex);
+		decision = g_buffer_range_reports.Observe(vaddr, size, clamped_size);
+	}
+	char repeat[32] = "";
+	if (decision.report && decision.occurrences > 1) {
+		std::snprintf(repeat, sizeof(repeat), " (x%" PRIu64 ")", decision.occurrences);
+	}
+
+	// A resource descriptor is guest data and may point at memory the guest never mapped, so an
+	// unmapped base is a bindable state, not an emulator fault. Callers bind nothing instead.
+	if (clamped_size == 0) {
+		if (decision.report) {
+			LOGF("Memory: unmapped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "%s\n",
+			     vaddr, size, repeat);
+		}
+		return 0;
+	}
+	if (decision.report) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
+		     " to 0x%016" PRIx64 "%s\n",
+		     vaddr, size, clamped_size, repeat);
 	}
 	return clamped_size;
 }
@@ -987,6 +1116,37 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
+}
+
+uint64_t ReadBackingPartial(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_guest_address_space == nullptr) {
+		if (data != nullptr && size != 0) {
+			std::memset(data, 0, size);
+		}
+		return 0;
+	}
+	return g_guest_address_space->ReadBackingPartial(vaddr, data, size);
+}
+
+uint64_t ReadGuestMemoryPartial(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_guest_address_space == nullptr) {
+		if (data != nullptr && size != 0) {
+			std::memset(data, 0, size);
+		}
+		return 0;
+	}
+	return g_guest_address_space->ReadMappedPartial(vaddr, data, size);
+}
+
+std::string DescribeGuestRange(uint64_t vaddr, uint64_t size) {
+	if (g_virtual_ranges == nullptr) {
+		return "ranges=unavailable";
+	}
+	char line[128];
+	std::snprintf(line, sizeof(line), "committed=0x%016" PRIx64 " prt=%s ",
+	              g_virtual_ranges->ClampRangeSize(vaddr, size),
+	              IsInPrtAperture(vaddr, size) ? "yes" : "no");
+	return std::string(line) + g_virtual_ranges->DescribeAround(vaddr);
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {

@@ -4626,6 +4626,158 @@ void TestSmallFiberStacksAndMigration() {
 	}
 }
 #endif
+// A handful of descriptors whose declared size outruns the guest's committed extent, re-bound once
+// per stage per draw, produced 500,670 identical reports in five minutes. The outcome has to be
+// summarised rather than restated, without going silent: the recurrence is the diagnostic.
+void TestBufferRangeReportsSummariseRepeats() {
+	const char* test = "BufferRangeReportsSummariseRepeats";
+	using Policy     = Libs::LibKernel::Memory::BufferRangeReportPolicy;
+
+	constexpr uint64_t kArena     = 0x000000223d000000ull;
+	constexpr uint64_t kDeclared  = 0x280000;
+	constexpr uint64_t kCommitted = 0x10000;
+	constexpr uint64_t kRepeats   = 177618; // the RE9 capture's count for this exact shape
+
+	Policy policy;
+
+	const auto first = policy.Observe(kArena, kDeclared, kCommitted);
+	Check(test, first.report, "the first sighting of a short range was not reported");
+	Check(test, first.occurrences == 1, "the first sighting did not count as one occurrence");
+
+	uint64_t reports       = 1;
+	uint64_t last_reported = 1;
+	for (uint64_t i = 1; i < kRepeats; i++) {
+		const auto decision = policy.Observe(kArena, kDeclared, kCommitted);
+		Check(test, decision.occurrences == i + 1,
+		      "a repeated range lost track of how often it had been seen");
+		if (decision.report) {
+			Check(test, decision.occurrences > last_reported,
+			      "a repeat was reported without advancing the occurrence count");
+			last_reported = decision.occurrences;
+			reports++;
+		}
+	}
+	// Logarithmic, so a longer run costs a handful more lines and never a proportional flood.
+	Check(test, reports <= 16,
+	      "an unchanging range was reported " + std::to_string(reports) +
+	          " times; it must be summarised, not restated per draw");
+	Check(test, reports >= 3,
+	      "an unchanging range must keep re-reporting, or a stale descriptor goes unnoticed");
+	Check(test, last_reported > kRepeats / 4,
+	      "the last report was too early to show the range was still recurring at the end");
+
+	// A growing arena changes its committed extent; that is news, not a repeat.
+	const auto grown = policy.Observe(kArena, kDeclared, kCommitted + 0x10000);
+	Check(test, grown.report, "a changed committed extent was not reported");
+	Check(test, grown.occurrences == 1, "a changed committed extent did not restart its count");
+
+	// Distinct ranges are tracked apart: a second arena reports on its own first sighting.
+	const auto other = policy.Observe(0x0000002216000000ull, 0x2000000, 0x1c10000);
+	Check(test, other.report && other.occurrences == 1,
+	      "a different range was suppressed by an unrelated range's history");
+
+        // The RE9 viewer binds these two alternately every frame; they hash to
+        // the same set.
+        Policy interleaved;
+        uint64_t interleaved_reports = 0;
+        for (uint64_t i = 0; i < kRepeats; i++) {
+          interleaved_reports +=
+              interleaved.Observe(kArena + 0x400000, kDeclared, kCommitted)
+                  .report;
+          interleaved_reports +=
+              interleaved.Observe(0x0000002216000000ull, 0x2000000, 0x1c10000)
+                  .report;
+        }
+        Check(test, interleaved_reports <= 32,
+              "two alternately bound ranges were reported " +
+                  std::to_string(interleaved_reports) +
+                  " times; they must not evict each other");
+
+        std::printf("[host]    %-48s ok (%" PRIu64 " lines for %" PRIu64 " events)\n", test, reports,
+	            kRepeats);
+}
+
+// Both guest readers are all-or-nothing: the dense one refuses a span if a single byte is
+// uncommitted, the sparse one only answers inside a registered PRT aperture. An image upload
+// cannot refuse, so it needs a reader that serves what the guest has and zeroes the rest.
+void TestPartialBackingReadServesCommittedGranules() {
+	const char*        test      = "PartialBackingReadServesCommittedGranules";
+	constexpr uint64_t kPages    = 3;
+	const auto         size      = SceKernelPageSize * kPages;
+	int64_t            phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, SceKernelPageSize,
+	            SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, size, SceKernelProtCpuRw,
+	                                                            0, phys_addr, SceKernelPageSize,
+	                                                            "partial_backing_read"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	std::memset(reinterpret_cast<void*>(base), 0xaa, SceKernelPageSize);
+	std::memset(reinterpret_cast<void*>(base + SceKernelPageSize * 2), 0xbb, SceKernelPageSize);
+
+	// The hole a streaming arena leaves behind when the game releases one granule of a surface
+	// whose descriptor still names the whole allocation.
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+
+	std::vector<uint8_t> bytes(size, 0x5a);
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), bytes.size()),
+	      "the dense reader accepted a partly committed span");
+	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t v) { return v == 0x5a; }),
+	      "a refused dense read modified its destination");
+
+	const auto copied = Libs::LibKernel::Memory::ReadBackingPartial(base, bytes.data(), size);
+	Check(test, copied == SceKernelPageSize * 2,
+	      "the partial reader reported " + std::to_string(copied) + " backed bytes, expected " +
+	          std::to_string(SceKernelPageSize * 2));
+	Check(test,
+	      std::all_of(bytes.begin(), bytes.begin() + SceKernelPageSize,
+	                  [](uint8_t v) { return v == 0xaa; }) &&
+	          std::all_of(bytes.begin() + SceKernelPageSize, bytes.begin() + SceKernelPageSize * 2,
+	                      [](uint8_t v) { return v == 0; }) &&
+	          std::all_of(bytes.begin() + SceKernelPageSize * 2, bytes.end(),
+	                      [](uint8_t v) { return v == 0xbb; }),
+	      "the partial reader did not serve the committed granules and zero the hole");
+
+	// The report has to say how far the commit reaches and what the guest owns around it, or the
+	// address in the log is unactionable.
+	const auto description = Libs::LibKernel::Memory::DescribeGuestRange(base, size);
+	Check(test, description.find("prt=no") != std::string::npos,
+	      "the range description did not report PRT aperture coverage: " + description);
+	Check(test, description.find("here=[") != std::string::npos,
+	      "the range description did not name the covering guest range: " + description);
+	char expected_commit[64] = "";
+	std::snprintf(expected_commit, sizeof(expected_commit), "committed=0x%016" PRIx64,
+	              SceKernelPageSize);
+	Check(test, description.find(expected_commit) != std::string::npos,
+	      "the range description did not clamp to the committed prefix: " + description);
+
+	// Nothing mapped at all is the other shape the abort covered, and it must still be defined.
+	constexpr uint64_t kNeverMapped = 0x0000007ffff00000ull;
+	std::fill(bytes.begin(), bytes.end(), 0x5a);
+	Check(test,
+	      Libs::LibKernel::Memory::ReadBackingPartial(kNeverMapped, bytes.data(), size) == 0,
+	      "the partial reader claimed backing for an address the guest never mapped");
+	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t v) { return v == 0; }),
+	      "the partial reader left an unmapped span undefined instead of zeroing it");
+	const auto unmapped_description =
+	    Libs::LibKernel::Memory::DescribeGuestRange(kNeverMapped, size);
+	Check(test, unmapped_description.find("here=none") != std::string::npos,
+	      "an unmapped address was not reported as uncovered: " + unmapped_description);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok (%" PRIu64 " of 0x%" PRIx64 " bytes backed)\n", test, copied,
+	            size);
+}
 
 } // namespace
 
@@ -4686,9 +4838,11 @@ int main(int argc, char** argv) {
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
+	RunTest(TestBufferRangeReportsSummariseRepeats);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestSparseReadDuringDirectCommit);
+	RunTest(TestPartialBackingReadServesCommittedGranules);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);

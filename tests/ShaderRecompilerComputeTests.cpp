@@ -24586,6 +24586,56 @@ TestCase Vop3MulLoU16CapturedAndSelectors() {
   return test;
 }
 
+TestCase Vop3F32ClampFlushesNaN() {
+  using O = ShaderOpcode;
+  struct ClampCase {
+    u32 opcode, input, expected;
+    u32 abs = 0;
+  };
+  constexpr u32 inf = 0x7f800000u, one = 0x3f800000u;
+  // GoW Ragnarok PS 3d52c7172f95fd37 0x2564: v_mul_f32 v18 clamp, inf, |v2|; and
+  // fma(x, inf, inf) clamp. The clamp modifier (DX10 clamp mode) turns their NaN into 0.
+  const std::array<ClampCase, 10> cases{{
+      {0x108, 0x00000000u, 0, 2}, // inf * |0| = NaN.
+      {0x108, 0x80000000u, 0, 2}, // inf * |-0| = NaN.
+      {0x108, 0x3f000000u, one, 2},
+      {0x108, 0xc0400000u, one, 2},
+      {0x14b, 0xbf800000u, 0}, // -1 * inf + inf = NaN.
+      {0x14b, 0x40000000u, one},
+      {0x103, 0x7fc00000u, 0}, // Quiet NaN input.
+      {0x103, 0xffc00001u, 0}, // Negative NaN input.
+      {0x103, 0x3e800000u, 0x3e800000u},
+      {0x103, 0x3fc00000u, one},
+  }};
+  TestCase test;
+  test.name = "Vop3F32ClampFlushesNaN";
+  for (const auto &entry : cases) test.initial.push_back(entry.input);
+  test.expected = test.initial;
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 20, inf);
+  AppendVMovU32(&code, 21, 0);
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 2, 30); // Runtime inputs prevent folding.
+    AppendVMovLiteral(&code, 18, 0xa5a5beefu);
+    if (entry.opcode == 0x108) {
+      AppendVop3(&code, 0x108, 18, Vgpr(20), Vgpr(2), 0, entry.abs, 0, true);
+    } else if (entry.opcode == 0x14b) {
+      AppendVop3(&code, 0x14b, 18, Vgpr(2), Vgpr(20), Vgpr(20), 0, 0, true);
+    } else {
+      AppendVop3(&code, 0x103, 18, Vgpr(2), Vgpr(21), 0, 0, 0, true);
+    }
+    AppendStoreVgpr(&code, 18, static_cast<u32>(cases.size()) + i);
+    test.expected.push_back(entry.expected);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MUL_F32, O::V_FMA_F32,
+                  O::V_ADD_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MUL_F32", 4}, {"V_FMA_F32", 2}, {"V_ADD_F32", 4}};
+  return test;
+}
+
 TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   using O = ShaderOpcode;
   struct MadCase {
@@ -41704,6 +41754,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
+  AddCase(Vop3F32ClampFlushesNaN);
   AddCase(Vop3Min3U16CapturedAndSelectors);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
@@ -48243,6 +48294,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mul-lo-u16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3MulLoU16CapturedAndSelectors());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--clamp-nan-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3F32ClampFlushesNaN());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-i16-only") == 0) {

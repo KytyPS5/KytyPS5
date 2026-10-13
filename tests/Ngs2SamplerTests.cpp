@@ -1474,6 +1474,7 @@ void TestMasteringGainControl() {
 	Ngs2VoiceInternal voice;
 	rack.ngs   = &system;
 	rack.type  = Ngs2RackType::Mastering;
+	rack.option.mastering.max_channels = 8;
 	voice.rack = &rack;
 
 	const Ngs2MasteringVoiceGainParam gain {{16, 0, 0x30000004}, 0.5f, 0.25f};

@@ -2585,6 +2585,9 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				const auto* values = reinterpret_cast<const uint32_t*>(param + 1);
 				switch (param->id & 0xffffu) {
 					case 0:
+						EXIT_NOT_IMPLEMENTED(param->size < sizeof(Ngs2VoiceParamHeader) + sizeof(uint32_t));
+						EXIT_NOT_IMPLEMENTED(values[0] == 0 ||
+						                     values[0] > voice->rack->option.mastering.max_channels);
 						voice->channels = values[0];
 						voice->SetEvent(1);
 						break;

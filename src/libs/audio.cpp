@@ -179,13 +179,13 @@ int AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
 }
 
 void AudioOutClose(int handle) {
-	if (g_audio != nullptr && handle >= 0) {
+	if (g_audio != nullptr && handle >= 0 && handle < OUT_PORTS_MAX) {
 		(void)g_audio->AudioOutClose(Audio::Id(handle + 1));
 	}
 }
 
 bool AudioOutHasDevice(int handle) {
-	return g_audio != nullptr && handle >= 0 &&
+	return g_audio != nullptr && handle >= 0 && handle < OUT_PORTS_MAX &&
 	       g_audio->AudioOutHasDevice(Audio::Id(handle + 1));
 }
 
@@ -197,7 +197,7 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	std::vector<Audio::OutputParam> output_params;
 	output_params.reserve(num);
 	for (uint32_t i = 0; i < num; i++) {
-		if (params[i].handle >= 0 && params[i].data != nullptr) {
+		if (params[i].handle >= 0 && params[i].handle < OUT_PORTS_MAX && params[i].data != nullptr) {
 			output_params.push_back(
 			    Audio::OutputParam {Audio::Id(params[i].handle + 1), params[i].data,
 			                        params[i].gains});

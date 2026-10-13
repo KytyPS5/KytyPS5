@@ -351,6 +351,19 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// The binary of the shader mapped at `addr` as the game gave it (code, metadata and the footer
+// that ends it), or an empty span when no shader is mapped there.
+std::span<const uint32_t> ShaderMappedBinary(uint64_t addr);
+// Names the driver resource registration gives guest memory (sceAgcDriverRegisterResource): the
+// libraries that register their shaders name each one by its code address. `name` null forgets
+// the name of `addr`.
+void ShaderSetRegisteredName(uint64_t addr, const char* name);
+// The registered name of the resource starting at `addr` (a shader's code address), or null. The
+// string stays valid for the life of the process.
+const char* ShaderRegisteredName(uint64_t addr);
+// Whether a resource was ever registered under `name` (a library's resources tell its version).
+bool ShaderNameRegistered(const char* name);
+
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 // Told about each mapped shader on the thread that maps it, with its hash and the code the hash

@@ -106,6 +106,11 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// For host work that reads guest memory through device addresses (the BDA page table) instead
+	// of through a binding: caches [vaddr, vaddr + size) in a buffer the page table reaches and
+	// uploads the CPU writes that buffer does not hold yet. ObtainBuffer() may answer a small read
+	// of CPU-written memory from the stream buffer, which the page table does not reach.
+	void PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;

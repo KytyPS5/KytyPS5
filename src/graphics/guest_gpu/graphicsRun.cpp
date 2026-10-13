@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -10,7 +11,11 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/psrShaders.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1683,8 +1688,323 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 	}
 }
 
+Psr::Shader CommandProcessor::ComputePsrShader(uint64_t data_addr) {
+	// The library's shaders live in the game's executable: their addresses never change.
+	auto [it, inserted] = m_cs_psr_shaders.try_emplace(data_addr, Psr::Shader::None);
+	if (inserted) {
+		it->second = Psr::IdentifyShader(data_addr);
+	}
+	return it->second;
+}
+
+// Reads guest memory on the execution thread without waiting for the GPU when the GPU wrote
+// other bytes of its pages.
+static void ReadGuestAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
+	if (!Libs::LibKernel::Memory::TryReadAroundGpuWrites(vaddr, data, size)) {
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	}
+}
+
+// Games using sce::Psr (GTA V) refit the BLASes of their animated geometry every frame with
+// Psr_Gpu_BottomLevelBvh_FanRefit, four Psr shaders dispatched once per BLAS (one of them once per
+// geometry): psr_qbvh_fan_refit_copy_dispatch_args (the indirect arguments of the next one, from
+// the BLAS header), psr_qbvh_fan_refit_async (the vertices of a geometry's triangle nodes, from
+// its vertex buffer and object matrix), psr_qbvh_fan_refit_recover_aabbs (the arguments of the
+// last one) and psr_qbvh_refit_bottom_level (the boxes, bottom up). With native ray tracing they
+// are replaced by NativeRayTracing::RecordHleRefit(): the dispatches are dropped; each BLAS
+// (s[0:1] of the first shader) and each geometry (the geometry table V# at s[0:3], BLAS at s[4:5]
+// and geometry index s8 of the second one in generation Base460, s6 in Base252) are kept and,
+// with the last box pass, one host command refits every BLAS (with the vertices other work wrote
+// meanwhile). GTA V 01.005 (Base252) runs the same passes on BLASes whose header has the same
+// fields at other offsets. True when the dispatch is dropped.
+bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
+	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+		return false;
+	}
+	using Psr::Shader;
+	const auto shader       = ComputePsrShader(data_addr);
+	const bool refit_shader = shader == Shader::QbvhFanRefitCopyDispatchArgs ||
+	                          shader == Shader::QbvhFanRefitAsync ||
+	                          shader == Shader::QbvhFanRefitRecoverAabbs ||
+	                          shader == Shader::QbvhRefitBottomLevel;
+	// Shaders of the game run meanwhile; another pass of the library inside a window is a refit
+	// the replacement does not know (GTA V runs none there).
+	if (!refit_shader) {
+		if (m_hle_refit_window && shader != Shader::None) {
+			Psr::StopReplacement("a BLAS refit runs a pass the native refit does not replace",
+			                     ShaderRegisteredName(data_addr));
+			// Every build starts with psr_morton_capture_memory: the refits are over without the
+			// passes that end them. The BLASes seen are refitted.
+			if (shader == Shader::MortonCaptureMemory) {
+				m_hle_refit_window = false;
+				EmitHleRefit();
+			}
+		}
+		return false;
+	}
+	if (!m_hle_refit_window) {
+		if (shader != Shader::QbvhFanRefitCopyDispatchArgs || !Psr::ReplacementEnabled()) {
+			return false;
+		}
+		m_hle_refit_window = true;
+		m_hle_refit_blases.clear();
+		m_hle_refit_geometries.clear();
+		m_hle_refit_finished = 0;
+	}
+	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+	if (shader == Shader::QbvhFanRefitCopyDispatchArgs) {
+		m_hle_refit_blases.push_back((uint64_t {user[0]} | (uint64_t {user[1]} << 32u)) &
+		                             0xffffffffffffull);
+	} else if (shader == Shader::QbvhFanRefitAsync) {
+		m_hle_refit_geometries.push_back(
+		    {.blas     = uint64_t {user[4]} | (uint64_t {user[5] & 0xffffu} << 32u),
+		     .table    = uint64_t {user[0]} | (uint64_t {user[1] & 0xffffu} << 32u),
+		     .geometry = Psr::LibraryGeneration() == Psr::Generation::Base252 ? user[6] : user[8]});
+	} else if (shader == Shader::QbvhRefitBottomLevel &&
+	           ++m_hle_refit_finished == m_hle_refit_blases.size()) {
+		m_hle_refit_window = false;
+		EmitHleRefit();
+	}
+	return true;
+}
+
+void CommandProcessor::EmitHleRefit() {
+	const uint32_t header_layout = Psr::LibraryGeneration() == Psr::Generation::Base252 ? 1u : 0u;
+	EmitHostCommand([this, blases = m_hle_refit_blases, refs = m_hle_refit_geometries, header_layout] {
+		auto&                                          context = m_renderer;
+		auto&                                          cache   = context.GetBufferCache();
+		std::vector<NativeRayTracing::HleRefitGeometry> geometries;
+		geometries.reserve(refs.size());
+		uint64_t last_vertices = 0;
+		for (const auto& ref: refs) {
+			if (ref.blas == 0 || ref.table == 0) {
+				continue;
+			}
+			// The geometry entry (120 bytes, written by the game's CPU): the vertex buffer V# at
+			// +8 and the object matrix at +56.
+			std::array<uint32_t, 30> entry {};
+			ReadGuestAroundGpuWrites(ref.table + uint64_t {ref.geometry} * 120u, entry.data(),
+			                         sizeof(entry));
+			NativeRayTracing::HleRefitGeometry geometry {.blas = ref.blas, .geometry = ref.geometry};
+			std::memcpy(geometry.vsharp.data(), &entry[2], sizeof(geometry.vsharp));
+			std::memcpy(geometry.matrix.data(), &entry[14], sizeof(geometry.matrix));
+			ShaderBufferResource vsharp;
+			std::memcpy(vsharp.fields, geometry.vsharp.data(), sizeof(vsharp.fields));
+			// The vertex buffer reaches the GPU (once per buffer in a row).
+			if (vsharp.Base48() != 0 && vsharp.Base48() != last_vertices && vsharp.GetSize() != 0) {
+				last_vertices = vsharp.Base48();
+				cache.PrepareDeviceAddressRead(vsharp.Base48(), vsharp.GetSize());
+			}
+			geometries.push_back(geometry);
+		}
+		// The refit reads the header (first 256 bytes), which stays, and writes the nodes.
+		for (const auto blas: blases) {
+			uint32_t size = 0;
+			ReadGuestAroundGpuWrites(blas + 16, &size, sizeof(size));
+			if (blas != 0 && size > 256u) {
+				cache.PrepareDeviceAddressRead(blas, 256u);
+				(void)cache.ObtainBuffer(blas + 256u, size - 256u, true);
+			}
+		}
+		// The refit reads and writes through device addresses: everything it reaches is in
+		// cached buffers now (PrepareBda() uploads nothing more).
+		context.PrepareBda(true, false);
+		auto& command = context.GetCommandScheduler().Current();
+		command.EndRendering();
+		context.GetNativeRayTracing().RecordHleRefit(command.Handle(), blases, geometries, header_layout);
+	});
+}
+
+// Games using sce::Psr (GTA V builds the four TLASes of its ray tracing passes every frame) build
+// TLASes in the kBase format with Psr_Gpu_TopLevelBvh_Build: 18 Psr shaders, each dispatched
+// once per TLAS (psr_morton_rotate_tree_top more often; a TLAS of one or two instances, like the
+// one of Nightreign's title screen, takes psr_morton_init_one_instance_root_node instead of the
+// sort and the hierarchy passes), several of which wait for the GPU. With
+// native ray tracing, the stage is replaced by NativeRayTracing::RecordHleTlas(): its dispatches
+// are dropped; the instance list of each build (the V# at s[6:9] and the count at s8 of
+// psr_morton_compute_bounding_box_for_instances, written by the game's CPU) is kept with the TLAS
+// address (s[0:1] of psr_collapse_to_qbvh_simple_top, the stage's last shader), user data of
+// generation Base460, and there one host command builds every TLAS. True when the dispatch is
+// dropped. A list the native build cannot read (records shorter than 96 bytes or not a multiple of
+// 16 bytes, no list, more than NativeRayTracing::HleTlasMaxInstances instances) is seen at the
+// stage's first dispatch: the game builds that TLAS itself, from that dispatch to its last pass.
+// GTA V 01.005 (generation Base252) builds its three TLASes of a frame with 12 shaders of an older
+// build of the library (no indirect arguments, valid instance indices or vec2u scans; the sort,
+// the scans and the last pass, collapse_to_qbvh_simple, serve its BLAS builds too) into TLASes of
+// another format (header and instance records, see hle_tlas.comp): the list is the V# at s[4:7]
+// with the count at s6 of morton_compute_bounding_box_for_instances, the TLAS s[0:1] of the last
+// pass, and the replacement writes that format.
+bool CommandProcessor::HleTlasBuild::Native() const {
+	// An empty list still makes an empty TLAS.
+	return count == 0 || (input != 0 && stride >= 96 && stride % 16 == 0 &&
+	                      count <= NativeRayTracing::HleTlasMaxInstances);
+}
+
+bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
+	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+		return false;
+	}
+	using Psr::Shader;
+	const auto shader = ComputePsrShader(data_addr);
+	if (shader == Shader::None) {
+		return false;
+	}
+	// Some of the stage's shaders (sorts, scans) also serve other builds: only the dispatches
+	// from the stage's first list (used only there) to the end of its last build are the TLAS
+	// builds. Shaders of the game run meanwhile (the stage reads nothing they write), but no other
+	// pass of the library does in GTA V: one in a window is a build the replacement does not know
+	// (rebraiding, kTrinity...), and from then on the builds are emulated.
+	if (!Psr::IsTopLevelBuildShader(shader)) {
+		if (m_hle_tlas_window) {
+			Psr::StopReplacement("a top level build runs a pass the native build does not replace",
+			                     ShaderRegisteredName(data_addr));
+			// Every build starts with psr_morton_capture_memory: the window's builds are over
+			// without the passes that end them. The ones that ended are replaced; the others keep
+			// what their TLAS held.
+			if (shader == Shader::MortonCaptureMemory) {
+				m_hle_tlas_window = false;
+				if (!m_hle_tlas_observe) {
+					m_hle_tlas_builds.resize(m_hle_tlas_finished);
+					EmitHleTlas();
+				}
+			}
+		}
+		return false;
+	}
+	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+	const auto  list = [&] {
+		const bool base252 = Psr::LibraryGeneration() == Psr::Generation::Base252;
+		const auto v       = base252 ? 4u : 6u;
+		return HleTlasBuild {.input  = uint64_t {user[v]} | (uint64_t {user[v + 1] & 0xffffu} << 32u),
+		                     .stride = (user[v + 1] >> 16u) & 0x3fffu,
+		                     .count  = user[v + 2],
+		                     .format = base252 ? NativeRayTracing::HleTlasFormat::Base252
+		                                       : NativeRayTracing::HleTlasFormat::Base460};
+	};
+	if (m_guest_tlas_builds != 0) {
+		// The game's own builds run to their last passes.
+		if (shader == Shader::MortonComputeBoundingBoxForInstances) {
+			m_guest_tlas_builds++;
+		} else if (shader == Shader::CollapseToQbvhSimpleTop) {
+			m_guest_tlas_builds--;
+		}
+		return false;
+	}
+	if (!m_hle_tlas_window) {
+		if (shader != Shader::MortonComputeBoundingBoxForInstances || !Psr::ReplacementEnabled()) {
+			return false;
+		}
+		if (!list().Native()) {
+			m_guest_tlas_builds = 1;
+			return false;
+		}
+		m_hle_tlas_window = true;
+		m_hle_tlas_builds.clear();
+		m_hle_tlas_finished = 0;
+		// The first window runs as the game dispatches it: its passes show whether its builds are
+		// the ones the replacement knows before any is dropped.
+		m_hle_tlas_observe = !m_hle_tlas_known;
+	}
+	if (m_hle_tlas_observe) {
+		if (shader == Shader::MortonComputeBoundingBoxForInstances) {
+			m_hle_tlas_builds.emplace_back();
+		} else if (shader == Shader::CollapseToQbvhSimpleTop && ++m_hle_tlas_finished >= m_hle_tlas_builds.size()) {
+			m_hle_tlas_window = false;
+			m_hle_tlas_known  = Psr::ReplacementEnabled();
+		}
+		return false;
+	}
+	if (shader == Shader::MortonComputeBoundingBoxForInstances) {
+		m_hle_tlas_builds.push_back(list());
+	}
+	if (shader != Shader::CollapseToQbvhSimpleTop) {
+		return true;
+	}
+	if (m_hle_tlas_finished < m_hle_tlas_builds.size()) {
+		// Addresses have 48 bits.
+		m_hle_tlas_builds[m_hle_tlas_finished].header =
+		    (uint64_t {user[0]} | (uint64_t {user[1]} << 32u)) & 0xffffffffffffull;
+	}
+	if (++m_hle_tlas_finished < m_hle_tlas_builds.size()) {
+		return true;
+	}
+	m_hle_tlas_window = false;
+	EmitHleTlas();
+	return true;
+}
+
+void CommandProcessor::EmitHleTlas() {
+	EmitHostCommand([this, builds = m_hle_tlas_builds] {
+		auto&                 context = m_renderer;
+		auto&                 cache   = context.GetBufferCache();
+		std::vector<uint8_t>  list;
+		std::vector<uint64_t> blases;
+		for (const auto& build: builds) {
+			if (build.header == 0 || !build.Native()) {
+				// [HACK] No build: a TLAS without an address, or a list the native build cannot read
+				// that started while other builds of the stage were already native (their first
+				// dispatches were dropped, so this one cannot go back to the game's build either).
+				// The TLAS keeps what it held.
+				Common::HackNotice::Report(
+				    "native TLAS build skipped for an instance list it cannot read",
+				    "CommandProcessor::HleTlasDispatch", 0, build.stride,
+				    fmt::format("{} instances of {} bytes at 0x{:x}, TLAS at 0x{:x}", build.count,
+				                build.stride, build.input, build.header));
+				continue;
+			}
+			// The list the CPU wrote reaches the GPU, and so do the header and root node of each
+			// BLAS it references (the build reads their flags and bounds) when the GPU did not
+			// write them (it builds and refits most BLASes; a game may also load them as they are).
+			// The header depends only on the instance count: it is written here too, so CPU reads
+			// of it need no readback; the rest of the TLAS becomes GPU written.
+			if (build.count != 0) {
+				const auto bytes = uint64_t {build.stride} * build.count;
+				cache.PrepareDeviceAddressRead(build.input, bytes);
+				list.resize(bytes);
+				ReadGuestAroundGpuWrites(build.input, list.data(), bytes);
+				blases.clear();
+				for (uint32_t i = 0; i < build.count; i++) {
+					uint64_t blas = 0;
+					std::memcpy(&blas, list.data() + uint64_t {i} * build.stride, sizeof(blas));
+					if (blas != 0) {
+						blases.push_back(blas);
+					}
+				}
+				std::ranges::sort(blases);
+				blases.erase(std::unique(blases.begin(), blases.end()), blases.end());
+				constexpr uint64_t BlasReadSize = 256 + 64;
+				for (const auto blas: blases) {
+					if (context.IsMapped(blas, BlasReadSize) && !cache.IsRegionGpuModified(blas, BlasReadSize)) {
+						cache.PrepareDeviceAddressRead(blas, BlasReadSize);
+					}
+				}
+			}
+			std::array<uint32_t, 32> header {};
+			const auto size = NativeRayTracing::HleTlasHeader(build.count, build.format, header);
+			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
+			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
+		}
+		// The builds read and store through device addresses: everything they reach is in cached
+		// buffers now (PrepareBda() uploads nothing more).
+		context.PrepareBda(true, false);
+		auto& command = context.GetCommandScheduler().Current();
+		command.EndRendering();
+		for (const auto& build: builds) {
+			if (build.header != 0 && build.Native()) {
+				context.GetNativeRayTracing().RecordHleTlas(command.Handle(), build.input,
+				                                            build.count, build.stride,
+				                                            build.header, build.format);
+			}
+		}
+	});
+	return true;
+}
+
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
+		return;
+	}
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	auto operation     = MakeOperation(GpuOperationKind::DispatchDirect);
 	operation.dispatch = {.thread_group_x = thread_group_x,
@@ -1713,6 +2033,9 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
+		return;
+	}
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	auto operation     = MakeOperation(GpuOperationKind::DispatchIndirect);

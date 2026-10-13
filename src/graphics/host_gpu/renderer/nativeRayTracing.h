@@ -86,6 +86,24 @@ public:
 	void Prepare(const CommandRecorder& command, uint64_t user_pointer, const TlasSource& source,
 	             uint64_t frame);
 
+	// The TLAS formats of the generations of sce::Psr (see hle_tlas.comp): the header and the
+	// instance records of GTA V 01.010/01.011 (Base460) and of 01.005 (Base252).
+	enum class HleTlasFormat : uint32_t {
+		Base460,
+		Base252,
+	};
+	// GTA V's TLAS builds (see CommandProcessor::HleTlasDispatch()): records the build of a TLAS
+	// in the game's format at `header_va` from the instance list the game's CPU writes (`count`
+	// records of `stride` bytes at `input_va`, see hle_tlas.comp). Outside a render pass.
+	void RecordHleTlas(const CommandRecorder& command, uint64_t input_va, uint32_t count,
+	                   uint32_t stride, uint64_t header_va, HleTlasFormat format);
+	// The instances one HLE TLAS build holds at most.
+	static constexpr uint32_t HleTlasMaxInstances = 4096;
+	// The first 128 bytes of the header hle_tlas.comp writes for `count` instances (it depends on
+	// nothing else); returns the TLAS size.
+	static uint32_t HleTlasHeader(uint32_t count, HleTlasFormat format,
+	                              std::array<uint32_t, 32>& header) noexcept;
+
 	// The device address of the context table the shaders look their TLAS up in (see
 	// ContextEntry in rt_tlas_walk.comp), 0 when disabled.
 	[[nodiscard]] uint64_t ContextAddress() const noexcept { return m_context_address; }
@@ -257,6 +275,9 @@ private:
 	vk::PipelineLayout      m_blas_layout       = nullptr;
 	vk::Pipeline            m_tlas_pipeline     = nullptr;
 	vk::Pipeline            m_blas_pipeline     = nullptr;
+	vk::PipelineLayout      m_hle_tlas_layout   = nullptr;
+	vk::Pipeline            m_hle_tlas_pipeline = nullptr;
+	std::unique_ptr<Buffer> m_hle_tlas_scratch;
 
 	std::unique_ptr<Buffer> m_state;
 	std::unique_ptr<Buffer> m_queue;

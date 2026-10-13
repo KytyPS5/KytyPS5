@@ -1063,6 +1063,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+void BufferCache::PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0) {
+		return;
+	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	TouchBuffer(buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {

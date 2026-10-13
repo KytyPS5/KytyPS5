@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/psrShaders.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -14028,10 +14029,10 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
 int main() {
   using namespace Libs::Graphics;
-
   EnsureConfigInitialized();
   TestVop3FloatConversionDecode();
   TestRayTracingInstructions();
+  TestPsrCodeRecognition();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();

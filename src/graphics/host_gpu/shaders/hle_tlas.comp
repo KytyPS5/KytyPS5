@@ -1,0 +1,387 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// HLE of GTA V's top-level BVH builds (the TLAS stage of its BVH compute queue, see
+// CommandProcessor::HleTlasDispatch()): builds a TLAS in the game's format (header, box32 nodes,
+// 128-byte instance records) from the instance list the game's CPU writes (96-byte records), in
+// one workgroup, straight into guest memory through the BDA page table.
+//
+// Input record (96 B): +0 BLAS address; +8 mask and instance flags (bits 0-3); +12, +16 user
+// data; +20 4x4 object-to-world matrix (column-major).
+// Instance record (128 B) of library generation Base460 (FORMAT_BASE460): +0 world-to-object 3x4
+// (row-major), +48/+52 BLAS address >> 3 (42 bits) with the flags at bits 54-63, +56 BLAS root,
+// +60 mask (bits 24-31 of the input's +8), +64 object-to-world 3x4 (row-major), +112 index,
+// +116/+120 user data; the records at header + [header + 48].
+// Generation Base252 (FORMAT_BASE252, GTA V 01.005): +0 BLAS address, +8 world-to-object 3x4
+// (column-major), +56 BLAS root, +60 the input's +8 with the flags in its low byte, +64
+// object-to-world 3x4 (column-major), +112 index, +116/+120 user data; the records at header +
+// [header + 40].
+// Tree: four children per box32 node, the root at header + 256 (node pointer 0x25), instance
+// leaves = instance index << 3, built bottom up over the instances sorted by Morton code.
+
+#include "rt_common.inc"
+
+layout(local_size_x = 512) in;
+
+layout(push_constant, std430) uniform Push {
+	uint64_t input_va;
+	uint64_t header_va;
+	// Bounds of the instances (kMaxInstances), then of the nodes (see Bounds).
+	uint64_t scratch;
+	uint     count;
+	uint     stride;
+	uint     format;
+} pc;
+
+const uint FORMAT_BASE460 = 0u;
+const uint FORMAT_BASE252 = 1u;
+
+const uint kMaxInstances = 4096u;
+// Box nodes of a tree over kMaxInstances leaves (1024 + 256 + 64 + 16 + 4 + 1).
+const uint kMaxNodes     = 1365u;
+const uint kHeaderSize   = 256u;
+const uint kNodeSize     = 128u;
+const uint kBlasRoot     = 0x25u;
+
+shared uint s_keys[kMaxInstances];
+shared uint s_order[kMaxInstances];
+shared uint s_scene[6];
+shared uint s_level_count[8];
+shared uint s_level_first[8];
+shared uint s_levels;
+shared uint s_nodes;
+
+// The world bounds of an instance or a node, shared by the invocations of the workgroup.
+layout(buffer_reference, std430, buffer_reference_align = 16) coherent buffer Bounds {
+	vec4 lo;
+	vec4 hi;
+};
+
+Bounds InstanceBounds(uint i) {
+	return Bounds(pc.scratch + uint64_t(i) * 32);
+}
+
+Bounds NodeBounds(uint slot) {
+	return Bounds(pc.scratch + uint64_t(kMaxInstances + slot) * 32);
+}
+
+// Guest stores through the page table (dropped where the memory is not cached).
+void StoreGuestU32x4(uint64_t va, uvec4 value) {
+	const uint64_t host = HostAddress(va);
+	if (host != 0) {
+		U32x4Ref(host).v = value;
+	}
+}
+
+void StoreGuestU32(uint64_t va, uint value) {
+	const uint64_t host = HostAddress(va);
+	if (host != 0) {
+		U32Ref(host).v = value;
+	}
+}
+
+// Order-preserving float <-> uint for atomic min/max.
+uint FloatKey(float f) {
+	const uint u = floatBitsToUint(f);
+	return (u & 0x80000000u) != 0 ? ~u : (u | 0x80000000u);
+}
+
+float KeyFloat(uint k) {
+	return uintBitsToFloat((k & 0x80000000u) != 0 ? (k & 0x7fffffffu) : ~k);
+}
+
+uint Spread(uint v) {
+	v = (v | (v << 16)) & 0x030000ffu;
+	v = (v | (v << 8)) & 0x0300f00fu;
+	v = (v | (v << 4)) & 0x030c30c3u;
+	v = (v | (v << 2)) & 0x09249249u;
+	return v;
+}
+
+uint NodePointer(uint slot) {
+	return ((4u + 2u * slot) << 3) | 5u;
+}
+
+uint64_t NodeVa(uint slot) {
+	return pc.header_va + kHeaderSize + uint64_t(slot) * kNodeSize;
+}
+
+struct InputRecord {
+	uint64_t blas;
+	uint     flags_mask;
+	uint     user0;
+	uint     user1;
+	mat3     o2w;
+	vec3     o2w_t;
+};
+
+InputRecord LoadInput(uint i) {
+	const uint64_t record = pc.input_va + uint64_t(i) * pc.stride;
+	uint           words[24];
+	for (uint q = 0; q < 6; q++) {
+		const uvec4 v    = LoadGuestU32x4(record + q * 16);
+		words[q * 4]     = v.x;
+		words[q * 4 + 1] = v.y;
+		words[q * 4 + 2] = v.z;
+		words[q * 4 + 3] = v.w;
+	}
+	InputRecord r;
+	r.blas       = uint64_t(words[0]) | (uint64_t(words[1]) << 32);
+	r.flags_mask = words[2];
+	r.user0      = words[3];
+	r.user1      = words[4];
+	// Column c of the 4x4 matrix: words[5 + 4c .. 8 + 4c].
+	for (uint c = 0; c < 3; c++) {
+		r.o2w[c] = uintBitsToFloat(uvec3(words[5 + 4 * c], words[6 + 4 * c], words[7 + 4 * c]));
+	}
+	r.o2w_t = uintBitsToFloat(uvec3(words[17], words[18], words[19]));
+	return r;
+}
+
+void main() {
+	const uint lid   = gl_LocalInvocationID.x;
+	const uint count = min(pc.count, kMaxInstances);
+	if (lid == 0) {
+		s_scene[0] = s_scene[1] = s_scene[2] = 0xffffffffu;
+		s_scene[3] = s_scene[4] = s_scene[5] = 0u;
+	}
+	barrier();
+
+	// Pass 1: world bounds of each instance (the BLAS bounds: the union of its root's children,
+	// through the instance's transform) and the instance records, in input order.
+	uint nodes_total = 0;
+	{
+		uint n = max((count + 3u) / 4u, 1u);
+		for (;;) {
+			nodes_total += n;
+			if (n == 1u) {
+				break;
+			}
+			n = (n + 3u) / 4u;
+		}
+	}
+	const uint     instance_offset = kHeaderSize + nodes_total * kNodeSize;
+	const uint64_t instances       = pc.header_va + instance_offset;
+	for (uint i = lid; i < count; i += gl_WorkGroupSize.x) {
+		const InputRecord r = LoadInput(i);
+		vec3              lo = vec3(1e30), hi = vec3(-1e30);
+		uint              blas_flags = 0u;
+		if (r.blas != 0) {
+			const BoxNode root = LoadBoxNode(r.blas, kBlasRoot);
+			for (uint c = 0; c < 4; c++) {
+				if (root.children[c] != kInvalidNode && all(lessThanEqual(root.lo[c], root.hi[c]))) {
+					lo = min(lo, root.lo[c]);
+					hi = max(hi, root.hi[c]);
+				}
+			}
+			blas_flags = LoadGuestU32(r.blas + 24);
+		}
+		vec3 world_lo = vec3(1e30), world_hi = vec3(-1e30);
+		if (all(lessThanEqual(lo, hi))) {
+			for (uint corner = 0; corner < 8; corner++) {
+				const vec3 p = vec3((corner & 1u) != 0 ? hi.x : lo.x, (corner & 2u) != 0 ? hi.y : lo.y,
+				                    (corner & 4u) != 0 ? hi.z : lo.z);
+				const vec3 q = r.o2w * p + r.o2w_t;
+				world_lo     = min(world_lo, q);
+				world_hi     = max(world_hi, q);
+			}
+		}
+		// No NaN bounds: an instance without valid bounds is never entered. The game's builder
+		// rounds the transformed box differently: a few ulps of margin keep it inside ours.
+		if (!all(lessThanEqual(world_lo, world_hi))) {
+			world_lo = vec3(1e30);
+			world_hi = vec3(-1e30);
+		} else {
+			world_lo -= abs(world_lo) * (1.0 / 2097152.0) + vec3(1.0 / 1048576.0);
+			world_hi += abs(world_hi) * (1.0 / 2097152.0) + vec3(1.0 / 1048576.0);
+		}
+		InstanceBounds(i).lo = vec4(world_lo, 0.0);
+		InstanceBounds(i).hi = vec4(world_hi, 0.0);
+		if (all(lessThanEqual(world_lo, world_hi))) {
+			const vec3 centre = (world_lo + world_hi) * 0.5;
+			atomicMin(s_scene[0], FloatKey(centre.x));
+			atomicMin(s_scene[1], FloatKey(centre.y));
+			atomicMin(s_scene[2], FloatKey(centre.z));
+			atomicMax(s_scene[3], FloatKey(centre.x));
+			atomicMax(s_scene[4], FloatKey(centre.y));
+			atomicMax(s_scene[5], FloatKey(centre.z));
+		}
+
+		const mat3     w2o    = inverse(r.o2w);
+		const vec3     w2o_t  = -(w2o * r.o2w_t);
+		const bool     opaque = (blas_flags & (1u << 13)) != 0;
+		const bool     alpha  = (blas_flags & (1u << 14)) != 0;
+		const uint64_t dst    = instances + uint64_t(i) * 128;
+		if (pc.format == FORMAT_BASE252) {
+			// The record. Flags (the low byte of +60): the input's, 0x40 when the BLAS holds only
+			// opaque geometry (its header +24 bit 13), 0x80 when it holds alpha tested geometry
+			// (bit 14), and then 0x1 or 0x2 unless the instance forces either (input bits 0-1).
+			uint flags = r.flags_mask & 0xffu;
+			if (r.blas != 0) {
+				const bool forced = (r.flags_mask & 3u) != 0;
+				flags |= (opaque ? 0x40u : 0u) | (alpha ? 0x80u : 0u) | (opaque && !forced ? 0x1u : 0u) |
+				         (alpha && !forced ? 0x2u : 0u);
+			}
+			// The 3x4 matrices M|t by columns: M[0], M[1], M[2], t.
+			StoreGuestU32x4(dst, uvec4(uint(r.blas), uint(r.blas >> 32), floatBitsToUint(w2o[0].xy)));
+			StoreGuestU32x4(dst + 16, floatBitsToUint(vec4(w2o[0].z, w2o[1])));
+			StoreGuestU32x4(dst + 32, floatBitsToUint(vec4(w2o[2], w2o_t.x)));
+			StoreGuestU32x4(dst + 48, uvec4(floatBitsToUint(w2o_t.yz), kBlasRoot, (r.flags_mask & 0xffffff00u) | flags));
+			StoreGuestU32x4(dst + 64, floatBitsToUint(vec4(r.o2w[0], r.o2w[1].x)));
+			StoreGuestU32x4(dst + 80, floatBitsToUint(vec4(r.o2w[1].yz, r.o2w[2].xy)));
+			StoreGuestU32x4(dst + 96, floatBitsToUint(vec4(r.o2w[2].z, r.o2w_t)));
+		} else {
+			// The record. Flags (bits 22-31 of +52): the input's (bits 0, 2, 3), 0x41 when the BLAS
+			// holds only opaque geometry (its header +24 bit 13), 0x80 when it holds alpha tested
+			// geometry (bit 14), and then 0x2 unless the instance forces opaque (input bit 0).
+			uint flags = (r.flags_mask & 0xdu) | (opaque ? 0x41u : 0u) | (alpha ? 0x80u : 0u);
+			if (alpha && (r.flags_mask & 1u) == 0) {
+				flags |= 0x2u;
+			}
+			const uint64_t shifted = r.blas >> 3;
+			// Row j of a 3x4 matrix M|t: (M[0][j], M[1][j], M[2][j], t[j]) (glsl matrices are columns).
+			for (uint j = 0; j < 3; j++) {
+				StoreGuestU32x4(dst + j * 16, floatBitsToUint(vec4(w2o[0][j], w2o[1][j], w2o[2][j], w2o_t[j])));
+				StoreGuestU32x4(dst + 64 + j * 16,
+				                floatBitsToUint(vec4(r.o2w[0][j], r.o2w[1][j], r.o2w[2][j], r.o2w_t[j])));
+			}
+			StoreGuestU32x4(dst + 48, uvec4(uint(shifted), (uint(shifted >> 32) & 0x3fffffu) | (flags << 22),
+			                                kBlasRoot, r.flags_mask & 0xff000000u));
+		}
+		StoreGuestU32x4(dst + 112, uvec4(i, r.user0, r.user1, 0u));
+	}
+	memoryBarrierBuffer();
+	barrier();
+
+	// Pass 2: Morton keys and a bitonic sort of (key, index) over the padded power of two.
+	const vec3 scene_lo = vec3(KeyFloat(s_scene[0]), KeyFloat(s_scene[1]), KeyFloat(s_scene[2]));
+	const vec3 scene_hi = vec3(KeyFloat(s_scene[3]), KeyFloat(s_scene[4]), KeyFloat(s_scene[5]));
+	const vec3 extent   = max(scene_hi - scene_lo, vec3(1e-6));
+	uint       padded   = 1;
+	while (padded < count) {
+		padded <<= 1;
+	}
+	for (uint i = lid; i < padded; i += gl_WorkGroupSize.x) {
+		uint key = 0xffffffffu;
+		const vec3 lo = i < count ? InstanceBounds(i).lo.xyz : vec3(1);
+		const vec3 hi = i < count ? InstanceBounds(i).hi.xyz : vec3(0);
+		if (i < count && all(lessThanEqual(lo, hi))) {
+			const vec3  n = clamp(((lo + hi) * 0.5 - scene_lo) / extent, 0.0, 1.0);
+			const uvec3 q = uvec3(n * 1023.0);
+			key           = (Spread(q.x) << 2) | (Spread(q.y) << 1) | Spread(q.z);
+		} else if (i < count) {
+			key = 0xfffffffeu; // no bounds: last
+		}
+		s_keys[i]  = key;
+		s_order[i] = i;
+	}
+	barrier();
+	for (uint size = 2; size <= padded; size <<= 1) {
+		for (uint stride = size >> 1; stride > 0; stride >>= 1) {
+			for (uint i = lid; i < padded; i += gl_WorkGroupSize.x) {
+				const uint partner = i ^ stride;
+				if (partner > i) {
+					const bool ascending = (i & size) == 0;
+					const uint a = s_keys[i], b = s_keys[partner];
+					if ((a > b) == ascending) {
+						s_keys[i]        = b;
+						s_keys[partner]  = a;
+						const uint t     = s_order[i];
+						s_order[i]       = s_order[partner];
+						s_order[partner] = t;
+					}
+				}
+			}
+			barrier();
+		}
+	}
+
+	// Pass 3: the tree shape: level 0 nodes hold up to 4 instances, each higher level up to 4
+	// nodes, up to one root. Slots run from the root down (the root at slot 0 = pointer 0x25).
+	if (lid == 0) {
+		uint n      = max((count + 3u) / 4u, 1u);
+		uint levels = 0;
+		for (;;) {
+			s_level_count[levels++] = n;
+			if (n == 1u || levels == 8u) {
+				break;
+			}
+			n = (n + 3u) / 4u;
+		}
+		s_levels   = levels;
+		uint first = 0;
+		for (int l = int(levels) - 1; l >= 0; l--) {
+			s_level_first[l] = first;
+			first += s_level_count[l];
+		}
+		s_nodes = first;
+	}
+	barrier();
+
+	// Box nodes, one level at a time from the bottom.
+	for (uint l = 0; l < s_levels; l++) {
+		const uint level_nodes = s_level_count[l];
+		const uint first       = s_level_first[l];
+		for (uint j = lid; j < level_nodes; j += gl_WorkGroupSize.x) {
+			uint children[4];
+			vec3 lo[4], hi[4];
+			vec3 node_lo = vec3(1e30), node_hi = vec3(-1e30);
+			for (uint c = 0; c < 4; c++) {
+				const uint k = j * 4 + c;
+				children[c]  = kInvalidNode;
+				lo[c]        = vec3(uintBitsToFloat(0x7f800000u));
+				hi[c]        = vec3(uintBitsToFloat(0xff800000u));
+				if (l == 0) {
+					if (k < count) {
+						const uint instance = s_order[k];
+						children[c]         = instance << 3;
+						lo[c]               = InstanceBounds(instance).lo.xyz;
+						hi[c]               = InstanceBounds(instance).hi.xyz;
+					}
+				} else if (k < s_level_count[l - 1]) {
+					const uint child_slot = s_level_first[l - 1] + k;
+					children[c]           = NodePointer(child_slot);
+					lo[c]                 = NodeBounds(child_slot).lo.xyz;
+					hi[c]                 = NodeBounds(child_slot).hi.xyz;
+				}
+				if (children[c] != kInvalidNode && all(lessThanEqual(lo[c], hi[c]))) {
+					node_lo = min(node_lo, lo[c]);
+					node_hi = max(node_hi, hi[c]);
+				}
+			}
+			const uint     slot = first + j;
+			const uint64_t va   = NodeVa(slot);
+			StoreGuestU32x4(va, uvec4(children[0], children[1], children[2], children[3]));
+			for (uint c = 0; c < 4; c += 2) {
+				// Two children per 48 bytes: lo.xyz hi.xyz lo.xyz hi.xyz.
+				const uint64_t at = va + 16 + c * 24;
+				StoreGuestU32x4(at, floatBitsToUint(vec4(lo[c], hi[c].x)));
+				StoreGuestU32x4(at + 16, floatBitsToUint(vec4(hi[c].yz, lo[c + 1].xy)));
+				StoreGuestU32x4(at + 32, floatBitsToUint(vec4(lo[c + 1].z, hi[c + 1])));
+			}
+			// The game's builder leaves all ones in the last 16 bytes.
+			StoreGuestU32x4(va + 112, uvec4(0xffffffffu));
+			NodeBounds(slot).lo = vec4(node_lo, 0.0);
+			NodeBounds(slot).hi = vec4(node_hi, 0.0);
+		}
+		memoryBarrierBuffer();
+		barrier();
+	}
+
+	// Header (also written by the host, see HleTlasHeader()).
+	if (lid == 0) {
+		const uint size = instance_offset + count * 128u;
+		if (pc.format == FORMAT_BASE252) {
+			StoreGuestU32x4(pc.header_va, uvec4(0x5f525350u, 0x4c485642u, 0xbbe6e938u, 0u));
+			StoreGuestU32x4(pc.header_va + 16, uvec4(size, 0u, 0x24u, 0u));
+			StoreGuestU32x4(pc.header_va + 32, uvec4(0u, 0u, instance_offset, 0u));
+			StoreGuestU32(pc.header_va + 80, count + 4u);
+			StoreGuestU32(pc.header_va + 116, count);
+		} else {
+			StoreGuestU32x4(pc.header_va, uvec4(0x5f525350u, 0x4c485642u, 0x5d1cba8cu, 0u));
+			StoreGuestU32x4(pc.header_va + 16, uvec4(size, 0u, 0x00020024u, 0u));
+			StoreGuestU32x4(pc.header_va + 48, uvec4(instance_offset, 0u, 0u, 0u));
+			StoreGuestU32(pc.header_va + 88, count + 4u);
+			StoreGuestU32(pc.header_va + 112, count);
+		}
+	}
+}

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "gpu_tiler_shaders/hle_tlas_spv.h"
 #include "gpu_tiler_shaders/rt_blas_walk_spv.h"
 #include "gpu_tiler_shaders/rt_tlas_walk_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -141,6 +142,20 @@ struct TlasPush {
 	std::array<uint32_t, 4> layout;
 };
 static_assert(sizeof(TlasPush) == 128 && offsetof(TlasPush, layout) % 16 == 0);
+
+struct HleTlasPush {
+	uint64_t input_va;
+	uint64_t header_va;
+	uint64_t scratch;
+	uint32_t count;
+	uint32_t stride;
+	uint32_t format;
+	uint32_t padding;
+};
+static_assert(sizeof(HleTlasPush) == 40);
+
+// The instance and node bounds of hle_tlas.comp (32 bytes each).
+constexpr uint64_t HleTlasScratchSize = uint64_t {4096 + 1365} * 32;
 
 struct BlasPush {
 	uint64_t jobs;
@@ -458,6 +473,8 @@ NativeRayTracing::~NativeRayTracing() {
 	device.destroyPipeline(m_blas_pipeline);
 	device.destroyPipelineLayout(m_tlas_layout);
 	device.destroyPipelineLayout(m_blas_layout);
+	device.destroyPipeline(m_hle_tlas_pipeline);
+	device.destroyPipelineLayout(m_hle_tlas_layout);
 	device.destroyDescriptorSetLayout(m_descriptor_layout);
 }
 
@@ -496,6 +513,7 @@ void NativeRayTracing::CreatePipelines() {
 	};
 	make(RT_TLAS_WALK_SPV, sizeof(TlasPush), m_tlas_layout, m_tlas_pipeline, "RT TLAS walk");
 	make(RT_BLAS_WALK_SPV, sizeof(BlasPush), m_blas_layout, m_blas_pipeline, "RT BLAS walk");
+	make(HLE_TLAS_SPV, sizeof(HleTlasPush), m_hle_tlas_layout, m_hle_tlas_pipeline, "HLE TLAS build");
 }
 
 void NativeRayTracing::CreateBuffers() {
@@ -518,6 +536,7 @@ void NativeRayTracing::CreateBuffers() {
 	m_changed        = make(uint64_t {ChangedCapacity} * 4, DataFlags, "RT changed");
 	m_jobs           = make(uint64_t {MaxJobs} * JobStride, DataFlags, "RT jobs");
 	m_build_scratch  = make(BuildScratchSize, AsFlags, "RT build scratch");
+	m_hle_tlas_scratch = make(HleTlasScratchSize, DataFlags, "HLE TLAS bounds");
 	for (auto& readback: m_readbacks) {
 		readback.buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                           AllFlags, ReadbackSize);
@@ -1350,5 +1369,71 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 	readback.tick = 0;
 }
 
+uint32_t NativeRayTracing::HleTlasHeader(uint32_t count, HleTlasFormat format,
+                                         std::array<uint32_t, 32>& header) noexcept {
+	// Larger lists keep the game's own build (CommandProcessor::HleTlasDispatch()).
+	count          = std::min(count, HleTlasMaxInstances);
+	uint32_t nodes = 0;
+	for (uint32_t n = std::max((count + 3u) / 4u, 1u);; n = (n + 3u) / 4u) {
+		nodes += n;
+		if (n == 1u) {
+			break;
+		}
+	}
+	const uint32_t instance_offset = 256u + nodes * 128u;
+	header                         = {};
+	header[0]                      = 0x5f525350u; // "PSR_BVHL"
+	header[1]                      = 0x4c485642u;
+	header[4]                      = instance_offset + count * 128u;
+	if (format == HleTlasFormat::Base252) {
+		header[2]  = 0xbbe6e938u;
+		header[6]  = 0x24u;
+		header[10] = instance_offset;
+		header[20] = count + 4u;
+		header[29] = count;
+	} else {
+		header[2]  = 0x5d1cba8cu;
+		header[6]  = 0x00020024u;
+		header[12] = instance_offset;
+		header[22] = count + 4u;
+		header[28] = count;
+	}
+	return header[4];
+}
+
+void NativeRayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t input_va,
+                                     uint32_t count, uint32_t stride, uint64_t header_va,
+                                     HleTlasFormat format) {
+	if (!m_enabled || header_va == 0 || (count != 0 && input_va == 0)) {
+		return;
+	}
+	// The game's CPU wrote the list; earlier GPU work wrote the BLASes the build reads and read
+	// the TLAS it replaces.
+	MemoryBarrier(command, vk::PipelineStageFlagBits2::eAllCommands,
+	              vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
+	              vk::PipelineStageFlagBits2::eComputeShader,
+	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	auto* page_table = m_buffer_cache.GetBdaPageTableBuffer();
+	const vk::DescriptorBufferInfo page_info {page_table->Handle(), 0, page_table->Size()};
+	vk::WriteDescriptorSet write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
+	write.pBufferInfo     = &page_info;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_hle_tlas_pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_hle_tlas_layout, 0, 1, &write);
+	const HleTlasPush push {input_va,
+	                        header_va,
+	                        m_hle_tlas_scratch->BufferDeviceAddress(),
+	                        count,
+	                        stride,
+	                        static_cast<uint32_t>(format),
+	                        0};
+	command.pushConstants(m_hle_tlas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	command.dispatch(1, 1, 1);
+	MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+	              vk::PipelineStageFlagBits2::eAllCommands,
+	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+}
 
 } // namespace Libs::Graphics

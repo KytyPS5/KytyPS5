@@ -161,6 +161,24 @@ void TestReadGivesTheNewestUnreadStates() {
 	Check(input.Read(out) == 0, "an unchanged input added a state");
 }
 
+void TestGamepadDeviceEvents() {
+	using enum GamepadDeviceEvent;
+	Check(PlanGamepadDeviceEvent(Added, false) == GamepadDeviceStep::Open,
+	      "a new pad is not opened");
+	// SDL reports a known joystick as added again when a new mapping makes it a gamepad.
+	Check(PlanGamepadDeviceEvent(Added, true) == GamepadDeviceStep::Nothing,
+	      "a pad that is open is opened again");
+	Check(PlanGamepadDeviceEvent(Removed, true) == GamepadDeviceStep::Close,
+	      "an open pad is not closed");
+	// SDL reports the removal of every pad, also of one it could not open.
+	Check(PlanGamepadDeviceEvent(Removed, false) == GamepadDeviceStep::Nothing,
+	      "a pad that is not open is closed");
+	// SDL has loaded the new mapping before it reports a remap.
+	Check(PlanGamepadDeviceEvent(Remapped, true) == GamepadDeviceStep::Nothing &&
+	          PlanGamepadDeviceEvent(Remapped, false) == GamepadDeviceStep::Nothing,
+	      "a remapped pad needs a step");
+}
+
 } // namespace
 
 int main() {
@@ -172,6 +190,7 @@ int main() {
 	TestTouchesGetTheirOwnIds();
 	TestAConnectionChangeKeepsHeldInput();
 	TestReadGivesTheNewestUnreadStates();
+	TestGamepadDeviceEvents();
 	std::puts("PadInputTests: passed");
 	return 0;
 }

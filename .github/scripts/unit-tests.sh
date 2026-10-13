@@ -31,6 +31,7 @@ names=(
 	event_queue_lifetime
 	fence_retirement
 	file_lock
+	gamepad_quit
 	guest_write_log
 	host_lowering
 	http_uri_parse
@@ -47,6 +48,7 @@ names=(
 	pad_input
 	perf_counters
 	pipeline_use
+	player_seats
 	png_enc
 	program_list
 	queue_commits

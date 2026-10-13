@@ -22,6 +22,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
+#include "libs/padInput.h"
 #include "loader/systemContent.h"
 
 #include <cstdlib>
@@ -286,9 +287,21 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #endif
 }
 
-static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+// Which device SDL opened, for the log: its name, vendor, product, device path, and the driver
+// that opened it ('m' for Apple's GameController framework). One device can show up as two
+// gamepads: that framework reports a Logitech Cordless RumblePad 2 twice.
+static void LogGamepad(SDL_Gamepad* pad, int id) {
+	const auto  guid   = SDL_GetGamepadGUIDForID(static_cast<SDL_JoystickID>(id));
+	const char  driver = guid.data[14] >= ' ' && guid.data[14] < 127 ? static_cast<char>(guid.data[14])
+	                                                                 : '-';
+	const char* name   = SDL_GetGamepadName(pad);
+	const char* path   = SDL_GetGamepadPath(pad);
+	LOGF("Controller: gamepad %d \"%s\": vendor %04x product %04x, driver '%c', path %s\n", id,
+	     name != nullptr ? name : "gamepad", SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad),
+	     driver, path != nullptr ? path : "none");
+}
 
+static void GameEventController([[maybe_unused]] const EventController& f) {
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
@@ -304,21 +317,29 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 #endif
 
-	if (f.added) {
-		auto* pad = SDL_OpenGamepad(f.id);
-		if (pad == nullptr) {
-			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
-			     SDL_GetError());
-			return;
-		}
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
-	}
-
-	if (f.removed) {
-		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
-			Controller::Disconnect(f.id);
-			SDL_CloseGamepad(pad);
+	if (f.added || f.removed || f.remapped) {
+		using Controller::GamepadDeviceEvent;
+		const auto event = f.added     ? GamepadDeviceEvent::Added
+		                   : f.removed ? GamepadDeviceEvent::Removed
+		                               : GamepadDeviceEvent::Remapped;
+		auto*      open  = SDL_GetGamepadFromID(f.id);
+		switch (Controller::PlanGamepadDeviceEvent(event, open != nullptr)) {
+			case Controller::GamepadDeviceStep::Open:
+				if (auto* pad = SDL_OpenGamepad(f.id); pad != nullptr) {
+					LogGamepad(pad, f.id);
+				} else {
+					LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
+					     SDL_GetError());
+					return;
+				}
+				Controller::Connect(f.id);
+				break;
+			case Controller::GamepadDeviceStep::Close:
+				HostInputGamepadRemoved(f.id);
+				Controller::Disconnect(f.id);
+				SDL_CloseGamepad(open);
+				break;
+			case Controller::GamepadDeviceStep::Nothing: break;
 		}
 	}
 
@@ -326,6 +347,12 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
+		} else if (f.button == SDL_GAMEPAD_BUTTON_GUIDE) {
+			// The PS button never reaches the game. A press of it seats the pad like any first
+			// press (playerSeats.h); a hold on player 1's pad closes the game.
+			if (HostInputGamepadGuide(f.id, f.down)) {
+				Controller::SeatGamepad(f.id);
+			}
 		} else if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
 			// Pads without a touchpad (Switch, Xbox, ...) have no way to click it, which
 			// blocks games that require it. Use their Back/Select button as a centered click.
@@ -347,6 +374,11 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		if (axis != Controller::Axis::AxisMax) {
 			Controller::SetAxis(f.id, axis,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+		}
+		const bool right_trigger = f.axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+		if (right_trigger || f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
+			// A hold of both triggers closes the game, for pads without a PS button.
+			HostInputGamepadTrigger(f.id, right_trigger, f.axis_value);
 		}
 	}
 }
@@ -761,10 +793,13 @@ void WindowContext::Run() {
 			title_frames = frames;
 		}
 		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
-		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
-			continue;
+		if (HostInputWaitEvent(&loop.event, wait_ms)) {
+			ProcessEvent(timer.GetTimeS());
 		}
-		ProcessEvent(timer.GetTimeS());
+		if (HostInputQuitRequested()) {
+			LOGF("Event: quit (player 1 held the PS button or both triggers)\n");
+			loop.need_exit = true;
+		}
 	}
 }
 

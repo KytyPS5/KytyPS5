@@ -128,6 +128,36 @@ private:
 	uint64_t m_read    = 0;
 };
 
+// A gamepad device event from SDL, and what the window does with it.
+enum class GamepadDeviceEvent : uint8_t {
+	Added,
+	Removed,
+	// SDL has loaded the pad's new mapping; the button and axis events that follow use it.
+	Remapped,
+};
+
+enum class GamepadDeviceStep : uint8_t {
+	// Open the pad and connect it as a source.
+	Open,
+	// Disconnect the source and close the pad.
+	Close,
+	Nothing,
+};
+
+// `open`: the window has the pad open. SDL reports a known joystick as added again when a new
+// mapping makes it a gamepad, and reports the removal of every pad, also of one it could not open.
+[[nodiscard]] constexpr GamepadDeviceStep PlanGamepadDeviceEvent(GamepadDeviceEvent event,
+                                                                 bool open) noexcept {
+	switch (event) {
+		case GamepadDeviceEvent::Added:
+			return open ? GamepadDeviceStep::Nothing : GamepadDeviceStep::Open;
+		case GamepadDeviceEvent::Removed:
+			return open ? GamepadDeviceStep::Close : GamepadDeviceStep::Nothing;
+		case GamepadDeviceEvent::Remapped: return GamepadDeviceStep::Nothing;
+	}
+	return GamepadDeviceStep::Nothing;
+}
+
 } // namespace Libs::Controller
 
 #endif /* EMULATOR_SRC_LIBS_PADINPUT_H_ */

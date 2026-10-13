@@ -629,6 +629,16 @@ add_executable(pad_input_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(pad_input_tests PRIVATE ${inc_headers})
 
+add_executable(gamepad_quit_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GamepadQuitTests.cpp"
+)
+target_include_directories(gamepad_quit_tests PRIVATE ${inc_headers})
+
+add_executable(player_seats_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PlayerSeatsTests.cpp"
+)
+target_include_directories(player_seats_tests PRIVATE ${inc_headers})
+
 add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ControllerSettingsTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/padInput.cpp"
@@ -788,6 +798,8 @@ if(BUILD_TESTING)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
+	add_test(NAME player_seats COMMAND $<TARGET_FILE:player_seats_tests>)
+	add_test(NAME gamepad_quit COMMAND $<TARGET_FILE:gamepad_quit_tests>)
 	add_test(NAME image_readback COMMAND $<TARGET_FILE:image_readback_tests>)
 	add_test(NAME overlay_queue COMMAND $<TARGET_FILE:overlay_queue_tests>)
 	add_test(NAME const_ram COMMAND $<TARGET_FILE:const_ram_tests>)
@@ -890,6 +902,8 @@ if(BUILD_TESTING)
 		pad_haptics_tests
 		controller_settings_tests
 		pad_input_tests
+		player_seats_tests
+		gamepad_quit_tests
 		image_readback_tests
 		overlay_queue_tests
 		const_ram_tests

@@ -1026,6 +1026,8 @@ private:
 						current.indirect_descriptor->table_immediate = 0u;
 					}
 					current.indirect_descriptor->table_scalar |= descriptor.indirect_descriptor->table_scalar;
+					current.indirect_descriptor->selector_nonnegative &=
+					    descriptor.indirect_descriptor->selector_nonnegative;
 					current.indirect_descriptor->table_record_bytes = std::max(
 					    current.indirect_descriptor->table_record_bytes,
 					    descriptor.indirect_descriptor->table_record_bytes);
@@ -2268,6 +2270,57 @@ private:
 		return false;
 	}
 
+	// True when every path from the definition of key to block tests key >= 0.
+	bool NonnegativeOnEntry(Value key, const Block* block) const {
+		const auto* definition = key.Resolve().TryInstruction();
+		if (definition == nullptr || block == nullptr) return false;
+		return GuardedOnEntry(
+		    block, [&](const Block* at) { return at == definition->Parent(); },
+		    [&](const EdgePredicate& edge) {
+			    return edge.lanes == LaneQuantifier::All &&
+			           ConditionProvesNonnegative(edge.condition, edge.positive, key);
+		    });
+	}
+
+	// True when condition (or its negation when !positive) implies value >= 0 as a signed
+	// integer.
+	bool ConditionProvesNonnegative(Value condition, bool positive, Value value,
+	                                uint32_t depth = 0) const {
+		if (depth > 12u) return false;
+		const auto* test = SimplifyGuard(condition).TryInstruction();
+		if (test == nullptr) return false;
+		const auto op = test->GetOpcode();
+		if (op == ValueOpcode::LogicalNot && test->NumArgs() == 1u)
+			return ConditionProvesNonnegative(test->Arg(0), !positive, value, depth + 1u);
+		if (test->NumArgs() != 2u) return false;
+		if ((op == ValueOpcode::LogicalAnd && positive) ||
+		    (op == ValueOpcode::LogicalOr && !positive)) {
+			return ConditionProvesNonnegative(test->Arg(0), positive, value, depth + 1u) ||
+			       ConditionProvesNonnegative(test->Arg(1), positive, value, depth + 1u);
+		}
+		for (uint32_t arg = 0; arg < 2u; ++arg) {
+			uint32_t immediate = 0;
+			if (!ImmediateU32(test->Arg(arg ^ 1u), immediate) ||
+			    !EquivalentValue(m_program, test->Arg(arg), value))
+				continue;
+			// Lower bound the outcome implies on value; `left`: value is the left operand.
+			const bool             left = arg == 0u;
+			const auto             c    = static_cast<int64_t>(std::bit_cast<int32_t>(immediate));
+			std::optional<int64_t> bound;
+			if (op == ValueOpcode::SGreaterThanEqual32) {
+				if (left == positive) bound = left ? c : c + 1; // v >= c, or c >= v false
+			} else if (op == ValueOpcode::SGreaterThan32) {
+				if (left == positive) bound = left ? c + 1 : c; // v > c, or c > v false
+			} else if (op == ValueOpcode::SLessThan32) {
+				if (left != positive) bound = left ? c : c + 1; // v < c false, or c < v
+			} else if (op == ValueOpcode::SLessThanEqual32) {
+				if (left != positive) bound = left ? c + 1 : c; // v <= c false, or c <= v
+			}
+			if (bound && *bound >= 0) return true;
+		}
+		return false;
+	}
+
 	bool MatchScalarMaterialKey(Value key, DescriptorSource::IndirectDescriptor& indirect,
 	                            DescriptorSource& material_source, bool require_bound,
 	                            bool allow_scalar_domain = false) {
@@ -2283,6 +2336,7 @@ private:
 		DescriptorSource count_source;
 		uint32_t row_stride = 0;
 		uint32_t offset = 0, stride = 0;
+		bool             signed_count = false;
 		if (memory == nullptr || memory->offset > INT32_MAX ||
 		    !MemoryIndexBelongsTo(memory_index, *read)) return false;
 		const bool affine = MatchTableOffset(read->Arg(1), index, offset, stride) &&
@@ -2305,8 +2359,10 @@ private:
 				}
 			}
 			const auto* bound = BoundedLoop(index, read->Parent());
-			if (bound != nullptr && bound->GetOpcode() == ValueOpcode::ULessThan32) {
+			if (bound != nullptr && (bound->GetOpcode() == ValueOpcode::ULessThan32 ||
+			                         bound->GetOpcode() == ValueOpcode::SLessThan32)) {
 				count = bound->Arg(1);
+				signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
 			}
 		}
 		// Raw pointers have no V# bounds for enumerating an unbounded selector domain.
@@ -2362,6 +2418,7 @@ private:
 		indirect.selector = std::move(selector);
 		indirect.key_count = count;
 		indirect.workgroup_axis = workgroup_axis;
+		indirect.signed_count   = signed_count;
 		if (rows) indirect.selector->rows.emplace(
 		    DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows {
 		        .source = InternSource(count_source), .stride = row_stride});
@@ -3007,6 +3064,8 @@ private:
 			// Keep live descriptor payloads, but project descriptor-only SMEM onto
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
+			// A negative key that never reaches the image has no table record candidate.
+			indirect.selector_nonnegative = NonnegativeOnEntry(key, handle.Parent());
 		} else if (!sampler && !plan.table_indexed && table_source.dword_count == 4u &&
 		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true)) {
 			// Preserve the heap's byte-offset key so runtime geometry can choose the

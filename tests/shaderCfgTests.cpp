@@ -5,6 +5,8 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
@@ -56,6 +58,7 @@
 #endif
 
 namespace Libs::Graphics {
+bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth, const HW::AaConfig& aa_config);
 namespace {
 
 void Check(bool value, const char *text) {
@@ -6595,7 +6598,6 @@ void TestPerspectiveCentroidInputs() {
     ShaderMapUserData(regs.ps_regs.data_addr, mapped);
     HW::ShaderRegisters sh{};
     sh.ps_input_ena = sh.ps_input_addr = inputs;
-    sh.m_cbShaderMask = 0xf;
     const std::array<Prospero::ColorComponentMapping, 8> mappings{};
     ShaderPixelInputInfo pixel{};
     (void)PrepareProgram(regs, sh, mappings, pixel);
@@ -6624,7 +6626,24 @@ void TestPerspectiveCentroidInputs() {
             "center pair lost its ordinary barycentric loads when centroid was enabled");
     }
     CheckSpirvBinaryValidates(result.spirv);
+    const auto multisample_key = MakeStageStaticKey(pixel);
+    pixel.ps_single_sample = true;
+    Check(multisample_key != MakeStageStaticKey(pixel), "single-sample centroid specialization missing from shader key");
+    const auto single_sample = RecompileForTest(shader, options);
+    const auto single_source = DisassembleSpirvBinary(single_sample.spirv);
+    Check(!SpirvContainsCapability(single_sample.spirv, 52u) &&
+              single_source.find("InterpolateAtCentroid") == std::string::npos &&
+              SpirvHasDecorationValue(single_sample.spirv, 11u, 5286u),
+          "single-sample centroid did not reuse the center barycentric builtin");
+    CheckSpirvBinaryValidates(single_sample.spirv);
   }
+  HW::AaConfig aa_config{};
+  aa_config.msaa_num_samples = 0;
+  std::array<RenderColorInfo, 1> colors{};
+  colors[0].image_id = ImageId{0};
+  colors[0].desc.info.samples = 4;
+  const RenderDepthInfo depth{};
+  Check(DrawUsesSingleSample({}, depth, aa_config) && !DrawUsesSingleSample(colors, depth, aa_config), "single-sample AA config overrode a multisampled attachment");
 }
 
 void TestPerspectiveSampleInputs() {

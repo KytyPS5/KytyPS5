@@ -32,26 +32,26 @@ struct ComputeShaderInfo;
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
-	bool                       negative_one_to_one      = false;
-	bool                       depth_clip_enable        = true;
-	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
-	bool                       primitive_restart_enable = false;
-	uint32_t                   samples                  = 1;
-	bool                       sample_shading_enable    = false;
-	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       cull_front                                         = false;
-	bool                       cull_back                                          = false;
-	bool                       face                                               = false;
-	bool                       provoking_vtx_last                                 = false;
-	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
-	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	uint8_t                    alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	bool                  negative_one_to_one      = false;
+	bool                  depth_clip_enable        = true;
+	vk::PrimitiveTopology topology                 = vk::PrimitiveTopology::ePointList;
+	bool                  primitive_restart_enable = false;
+	uint32_t              samples                  = 1;
+	bool                  sample_shading_enable    = false;
+	uint32_t              color_mask[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	bool                  cull_front                                    = false;
+	bool                  cull_back                                     = false;
+	bool                  face                                          = false;
+	bool                  provoking_vtx_last                            = false;
+	vk::PolygonMode       polygon_mode                                  = vk::PolygonMode::eFill;
+	uint8_t               color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               color_destblend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint8_t               alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool                  separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool                  blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -116,7 +116,7 @@ public:
 
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
-		ShaderProgram pixel;
+		ShaderProgram                pixel;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
@@ -127,7 +127,7 @@ public:
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo& pixel_info, bool single_sample = false);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);

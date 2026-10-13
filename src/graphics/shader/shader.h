@@ -133,6 +133,9 @@ struct ShaderTessellationInputInfo {
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
+	// HS ring bytes of the patch outputs, as addressed by the first patch.
+	uint32_t patch_begin = 0;
+	uint32_t patch_end   = 0;
 };
 
 struct ShaderVertexInputInfo {

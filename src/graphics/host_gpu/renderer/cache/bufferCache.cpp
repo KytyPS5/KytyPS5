@@ -1240,23 +1240,42 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer, raw_image_read);
-	if (is_written) {
-		const bool precise = CanTrackPreciseWrite(buffer, vaddr, size);
+	const auto record_write = [&](uint64_t address, uint64_t bytes) {
+		const bool precise = CanTrackPreciseWrite(buffer, address, bytes);
 		RangeSet   before;
 		if (precise) {
-			m_gpu_modified_ranges.ForEachInRange(
-			    vaddr, size, [&](uint64_t begin, uint64_t end) { before.Add(begin, end - begin); });
+			m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t begin, uint64_t end) {
+				before.Add(begin, end - begin);
+			});
 		}
-		m_gpu_modified_ranges.Add(vaddr, size);
+		m_gpu_modified_ranges.Add(address, bytes);
 		m_precise_marking = precise;
-		MarkGpuWrite(vaddr, size);
+		MarkGpuWrite(address, bytes);
 		m_precise_marking = false;
-		NoteHotWrite(vaddr, size);
-		ForgetClassifiedMetadata(vaddr, size);
+		NoteHotWrite(address, bytes);
+		ForgetClassifiedMetadata(address, bytes);
 		if (precise) {
-			TrackPreciseWrite(buffer, vaddr, size, std::move(before));
+			TrackPreciseWrite(buffer, address, bytes, std::move(before));
 		}
+	};
+	if (is_written && HasUnmappedHole(vaddr, size)) {
+		// A GPU write to an unmapped page is lost on the console. The holes only take zeros in,
+		// so nothing the shader leaves there is ever written back.
+		ForEachCommittedPiece(
+		    vaddr, size,
+		    [&](uint64_t address, uint64_t bytes) {
+			    (void)SynchronizeBuffer(buffer, address, bytes, true, is_texel_buffer,
+			                            raw_image_read);
+			    record_write(address, bytes);
+		    },
+		    [&](uint64_t address, uint64_t bytes) {
+			    (void)SynchronizeBuffer(buffer, address, bytes, false, false, false);
+		    });
+		return {&buffer, buffer.Offset(vaddr)};
+	}
+	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer, raw_image_read);
+	if (is_written) {
+		record_write(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

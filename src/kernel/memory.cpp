@@ -913,6 +913,11 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+uint64_t ClampSparseRangeSize(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+	return g_virtual_ranges->ClampSparseRangeSize(vaddr, size);
+}
+
 bool QueryCommittedRange(uint64_t vaddr, uint64_t* start, uint64_t* size) {
 	EXIT_IF(start == nullptr || size == nullptr);
 	VirtualRanges::Range range {};

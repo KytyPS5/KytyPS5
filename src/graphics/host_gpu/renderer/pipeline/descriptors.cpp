@@ -1077,7 +1077,32 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			const auto contiguous = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			if (contiguous != 0 && contiguous < size) {
+				// A streamed range maps its pages piecemeal; the GPU still reaches every mapped
+				// page past a hole, the holes upload as zeros, and writes into them are dropped.
+				const auto& graphics = m_context.GetGraphics();
+				const auto  limit =
+				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+				    (graphics.StorageMinAlignment() - 1);
+				const auto sparse = Libs::LibKernel::Memory::ClampSparseRangeSize(address, size);
+				size =
+				    std::max(contiguous, std::min({sparse, uint64_t {256} * 1024 * 1024, limit}));
+				if (program.info.buffers[resource].written) {
+					// As for a sentinel range, the extension stops before a captured scalar table.
+					for (const auto* reader: stages) {
+						for (const auto [read_address, read_size]:
+						     reader->runtime->resources->specialization_reads) {
+							if (read_size != 0 && read_address >= address + contiguous &&
+							    read_address < address + size) {
+								size = read_address - address;
+							}
+						}
+					}
+				}
+			} else {
+				size = contiguous;
+			}
 			if (size == 0) {
 				source = {};
 				continue;

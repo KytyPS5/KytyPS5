@@ -1390,9 +1390,11 @@ bool RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto            prim     = ucfg.GetPrimType();
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (prim == Prospero::PrimitiveType::kQuadListLegacy ||
-	    prim == Prospero::PrimitiveType::kPatch || Prospero::IsRectList(prim) ||
-	    !GetDrawTopology(ucfg, topology)) {
+	// The CPU path skips primitive types it cannot draw (patches without tessellation); their
+	// arguments only latch NUM_INSTANCES.
+	const bool drawn = GetDrawTopology(ucfg, topology);
+	if (prim == Prospero::PrimitiveType::kQuadListLegacy || Prospero::IsRectList(prim) ||
+	    (drawn && prim == Prospero::PrimitiveType::kPatch)) {
 		return false;
 	}
 	const uint32_t command_bytes = args.indexed ? 5 * sizeof(uint32_t) : 4 * sizeof(uint32_t);
@@ -1449,6 +1451,26 @@ bool RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::LockGuard lock(m_context.GetMutex());
 	uc_check(ucfg);
 	hw_check(buffer);
+	auto&      cache            = m_context.GetBufferCache();
+	const auto obtain_arguments = [&] {
+		const auto [arguments, arguments_offset] =
+		    cache.ObtainBuffer(args.arguments, arguments_size, false);
+		request.arguments        = arguments;
+		request.arguments_offset = arguments_offset;
+		request.arguments_size   = arguments_size;
+		if (args.count_address != 0) {
+			const auto [count, count_offset] = cache.ObtainBuffer(args.count_address, 4, false);
+			request.count                    = count;
+			request.count_offset             = count_offset;
+		}
+	};
+	if (!drawn) {
+		obtain_arguments();
+		buffer.EndRendering();
+		(void)m_indirect_prepare->Record(buffer.Handle(), request);
+		ResetBindings();
+		return true;
+	}
 	const DrawCallInfo draw {args.indexed ? CommandBufferDebugOp::DrawIndex
 	                                      : CommandBufferDebugOp::DrawIndexAuto,
 	                         0, 0, 0};
@@ -1460,17 +1482,7 @@ bool RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return false;
 	}
 	const bool primitive_restart = args.indexed && ResolvePrimitiveRestart(buffer, index_source);
-	auto&      cache             = m_context.GetBufferCache();
-	const auto [arguments, arguments_offset] =
-	    cache.ObtainBuffer(args.arguments, arguments_size, false);
-	request.arguments        = arguments;
-	request.arguments_offset = arguments_offset;
-	request.arguments_size   = arguments_size;
-	if (args.count_address != 0) {
-		const auto [count, count_offset] = cache.ObtainBuffer(args.count_address, 4, false);
-		request.count                    = count;
-		request.count_offset             = count_offset;
-	}
+	obtain_arguments();
 	// Native fetches consume the offsets through SGPRs; rewritten fetches through Vulkan.
 	request.keep_offsets = state.vertex_info[0].fetch_embedded;
 	buffer.EndRendering();

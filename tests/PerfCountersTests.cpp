@@ -2,7 +2,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -79,6 +81,48 @@ void TestOffUntilEnabled() {
 	PerfCounters::SetEnabled(false);
 }
 
+// A gauge holds the latest level of something that grows and shrinks (live buffers, memory): the
+// report prints it as it is at the end of the window, not as an average.
+void TestGaugesAreLevels() {
+	using PerfCounters::Gauge;
+	PerfCounters::SetEnabled(true);
+	PerfCounters::Set(Gauge::LiveBuffers, 872);
+	PerfCounters::Set(Gauge::WatchedPages, 10);
+	PerfCounters::Change(Gauge::WatchedPages, 5);
+	PerfCounters::Change(Gauge::WatchedPages, -3);
+	const auto gauges = PerfCounters::ReadGauges();
+	Check(gauges[static_cast<size_t>(Gauge::LiveBuffers)] == 872 &&
+	          gauges[static_cast<size_t>(Gauge::WatchedPages)] == 12,
+	      "a gauge did not hold its level");
+	FrameReporter reporter(1);
+	(void)reporter.EndFrame({}, 0.0);
+	const auto report = reporter.EndFrame({}, 0.05, gauges);
+	Check(report.has_value() && report->gauges == gauges, "the report did not carry the gauges");
+	const auto line = PerfCounters::Format(*report);
+	Check(line.find(" live: buffers=872 ") != std::string::npos &&
+	          line.find(" watched_pages=12") != std::string::npos,
+	      "the gauges are not printed as levels");
+	PerfCounters::SetEnabled(false);
+	PerfCounters::Set(Gauge::LiveBuffers, 1);
+	Check(PerfCounters::ReadGauges()[static_cast<size_t>(Gauge::LiveBuffers)] == 872,
+	      "a gauge moved while counting was off");
+}
+
+// The time the guest's faults take, so a script can divide it by the faults.
+void TestFaultTimeIsCounted() {
+	Check(std::string(PerfCounters::NameOf(Counter::FaultMicroseconds)) == "fault_us",
+	      "the fault time has no counter");
+	PerfCounters::SetEnabled(true);
+	const auto before = PerfCounters::Read()[static_cast<size_t>(Counter::FaultMicroseconds)];
+	{
+		const PerfCounters::ScopedMicroseconds timed(Counter::FaultMicroseconds);
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	Check(PerfCounters::Read()[static_cast<size_t>(Counter::FaultMicroseconds)] >= before + 2000,
+	      "a timed scope did not add its microseconds");
+	PerfCounters::SetEnabled(false);
+}
+
 } // namespace
 
 int main() {
@@ -86,6 +130,8 @@ int main() {
 	TestWindowsDoNotOverlap();
 	TestFormat();
 	TestOffUntilEnabled();
+	TestGaugesAreLevels();
+	TestFaultTimeIsCounted();
 	std::puts("PerfCountersTests: all cases passed");
 	return 0;
 }

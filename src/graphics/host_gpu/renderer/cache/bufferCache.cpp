@@ -899,6 +899,9 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	PerfCounters::Set(PerfCounters::Gauge::LiveBuffers, static_cast<int64_t>(m_buffers.size()));
+	PerfCounters::Set(PerfCounters::Gauge::DeviceMemoryMiB,
+	                  static_cast<int64_t>(m_total_used_memory >> 20u));
 	// Buffers are collected only for memory, never because they are idle (see cacheCollection.h):
 	// the plan is asked as for a GPU with memory of its own.
 	const auto kind = PlanCollection({.used_memory    = m_total_used_memory,

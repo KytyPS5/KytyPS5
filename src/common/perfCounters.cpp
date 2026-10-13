@@ -24,7 +24,7 @@ void EndFrame() {
 
 	const auto seconds =
 	    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-	if (const auto report = reporter.EndFrame(now, seconds)) {
+	if (const auto report = reporter.EndFrame(now, seconds, ReadGauges())) {
 		std::printf("%s\n", Format(*report).c_str());
 	}
 }

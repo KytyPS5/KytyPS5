@@ -250,6 +250,9 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+			if (watcher_edge) {
+				PerfCounters::Change(PerfCounters::Gauge::WatchedPages, track ? 1 : -1);
+			}
 			if (watcher_edge && old_perms != new_perms) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;

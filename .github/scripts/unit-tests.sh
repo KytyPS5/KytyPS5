@@ -19,6 +19,7 @@ names=(
 	audio_out2_port
 	audio_out_timing
 	avplayer_file
+	bench_script
 	bit_array
 	buffer_chunk
 	cache_collection
@@ -93,6 +94,7 @@ local_only=(
 	graphics_draw_offsets
 	graphics_pipeline_rasterization
 	host_image_allocation
+	image_transfer_layout
 	pm4_context_state
 	shader_recompiler_alignbyte
 	shader_recompiler_compute

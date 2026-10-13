@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window/benchScript.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
@@ -27,7 +28,10 @@
 
 #include <cstdlib>
 #include <fmt/format.h>
+#include <fstream>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -759,9 +763,41 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+// The benchmark script of --bench-script, or nullopt without one. Stops the emulator when the
+// file cannot be read or a step is wrong, so a measured run never goes on without its input.
+static std::optional<BenchScript> LoadBenchScript() {
+	const auto path = Config::GetBenchScript();
+	if (path.empty()) {
+		return std::nullopt;
+	}
+	std::ifstream file(path);
+	if (!file) {
+		EXIT("--bench-script %s: the file cannot be read\n", Common::PathToString(path).c_str());
+	}
+	std::stringstream text;
+	text << file.rdbuf();
+	std::string error;
+	auto        steps = ParseBenchScript(text.str(), error);
+	if (!steps) {
+		EXIT("--bench-script %s: %s\n", Common::PathToString(path).c_str(), error.c_str());
+	}
+	for (const auto& step: *steps) {
+		if (!step.quit && SDL_GetKeyFromName(step.key.c_str()) == SDLK_UNKNOWN) {
+			EXIT("--bench-script %s: unknown key \"%s\"\n", Common::PathToString(path).c_str(),
+			     step.key.c_str());
+		}
+	}
+	std::printf("Bench: %zu step(s) from %s\n", steps->size(), Common::PathToString(path).c_str());
+	return BenchScript(std::move(*steps));
+}
+
 void WindowContext::Run() {
 	Common::Timer timer;
 	timer.Start();
+
+	auto bench = LoadBenchScript();
+	// A step that waits for a frame is checked this often.
+	constexpr int bench_frame_poll_ms = 4;
 
 	loop.event     = {};
 	loop.need_exit = false;
@@ -785,14 +821,38 @@ void WindowContext::Run() {
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			const auto fps =
+			    static_cast<double>(frames - title_frames) * 1000.0 / static_cast<double>(elapsed);
 			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+				UpdateTitle(frames, fps);
+			}
+			if (bench) {
+				std::printf("Bench: %llu ms, frame %llu, fps %.1f\n",
+				            static_cast<unsigned long long>(now),
+				            static_cast<unsigned long long>(frames), fps);
+				std::fflush(stdout);
 			}
 			title_time   = now;
 			title_frames = frames;
 		}
-		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
+		auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
+		if (bench) {
+			bench->Advance(loop.presented_frames.load(std::memory_order_relaxed), now,
+			               [&](const BenchStep& step) {
+				               std::printf("Bench: %llu ms, step %s %s\n",
+				                           static_cast<unsigned long long>(now),
+				                           step.quit ? "quit" : step.key.c_str(),
+				                           step.quit ? "" : (step.down ? "down" : "up"));
+				               std::fflush(stdout);
+				               if (step.quit) {
+					               LOGF("Event: quit (bench script)\n");
+					               loop.need_exit = true;
+				               } else {
+					               HostInputKey(SDL_GetKeyFromName(step.key.c_str()), step.down);
+				               }
+			               });
+			wait_ms = bench->WaitMs(SDL_GetTicks(), bench_frame_poll_ms, wait_ms);
+		}
 		if (HostInputWaitEvent(&loop.event, wait_ms)) {
 			ProcessEvent(timer.GetTimeS());
 		}

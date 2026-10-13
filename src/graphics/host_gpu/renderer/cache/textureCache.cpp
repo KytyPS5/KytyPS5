@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -2163,6 +2164,7 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	PerfCounters::Set(PerfCounters::Gauge::LiveImages, static_cast<int64_t>(m_slot_images.size()));
 	const auto kind = PlanCollection({.used_memory    = m_total_used_memory,
 	                                  .trigger_memory = m_trigger_gc_memory,
 	                                  .system_memory  = m_graphics.UsesSystemMemory(),

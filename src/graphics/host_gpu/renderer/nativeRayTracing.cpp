@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "gpu_tiler_shaders/hle_blas_refit_spv.h"
 #include "gpu_tiler_shaders/hle_tlas_spv.h"
 #include "gpu_tiler_shaders/rt_blas_walk_spv.h"
 #include "gpu_tiler_shaders/rt_tlas_walk_spv.h"
@@ -31,9 +32,16 @@ constexpr uint32_t InstanceCapacity = 1u << 16u;
 constexpr uint32_t TableEntries     = 1u << 17u;
 constexpr uint32_t SlotCapacity     = 1u << 15u;
 constexpr uint32_t MissingCapacity  = 256;
-constexpr uint32_t MaxJobs          = 256;
+constexpr uint32_t MaxJobs          = 512;
+// The host table of BLASes whose builds the host saw (kHostTableEntries in rt_tlas_walk.comp),
+// after the walk's table, and the geometries of the layouts of one preparation's builds.
+constexpr uint32_t HostTableEntries = 1u << 14u;
+constexpr uint32_t HostTableProbes  = 32;
+constexpr uint32_t LayoutCapacity   = 1u << 16u;
+// The root of every BLAS of a TLAS built by hle_tlas.comp (kBlasRoot).
+constexpr uint32_t GuestBlasRoot    = 0x25;
 constexpr uint32_t ChangedCapacity  = 1024;
-constexpr uint32_t PoolCapacity     = 1u << 23u;
+constexpr uint32_t PoolCapacity     = 1u << 24u;
 // The largest queue one walk takes from the pool (kMaxQueue in rt_blas_walk.comp).
 constexpr uint64_t PoolQueueMax     = uint64_t {1} << 20u;
 constexpr uint64_t BuildScratchSize = uint64_t {64} << 20u;
@@ -77,7 +85,7 @@ constexpr uint64_t TableTombstone   = 1;
 
 constexpr uint32_t StateSize      = 96;
 constexpr uint32_t MissingStride  = 48;
-constexpr uint32_t JobStride      = 56;
+constexpr uint32_t JobStride      = 80;
 constexpr uint32_t SlotStride     = 64;
 constexpr uint32_t TableStride    = 16;
 constexpr uint32_t ContextStride  = 64;
@@ -86,6 +94,12 @@ constexpr uint32_t InstanceStride = 64;
 constexpr uint32_t ModeCount  = 0;
 constexpr uint32_t ModeBuild  = 1;
 constexpr uint32_t ModeVerify = 2;
+constexpr uint32_t ModeGather = 3;
+// Gathered builds of a slot before it walks the guest BVH again.
+constexpr uint32_t MaxGathers = 30;
+// The guest memory of a BLAS sce::Psr decompresses holds less than one triangle per this many
+// bytes (GTA V: 54 bytes or more per triangle, header and boxes included).
+constexpr uint64_t DecompressBytesPerTriangle = 32;
 
 // RtState (rt_common.inc).
 struct RtState {
@@ -157,6 +171,22 @@ static_assert(sizeof(HleTlasPush) == 40);
 // The instance and node bounds of hle_tlas.comp (32 bytes each).
 constexpr uint64_t HleTlasScratchSize = uint64_t {4096 + 1365} * 32;
 
+struct HleRefitPush {
+	uint64_t jobs;
+	uint64_t pool;
+	uint64_t state;
+	uint32_t mode;
+	uint32_t job_count;
+	uint32_t pool_capacity;
+	uint32_t layout;
+};
+
+constexpr uint32_t HleRefitGeometryStride = 96;
+constexpr uint32_t HleRefitBlasStride     = 16;
+constexpr uint64_t HleRefitJobsSize       = uint64_t {4} << 20u;
+constexpr uint32_t HleRefitPoolCapacity   = 1u << 22u;
+constexpr uint32_t HleRefitStateSize      = 16;
+
 struct BlasPush {
 	uint64_t jobs;
 	uint64_t pool;
@@ -167,6 +197,9 @@ struct BlasPush {
 	uint32_t pool_capacity;
 	uint32_t job_count;
 	uint32_t changed_capacity;
+	uint32_t prepare_id;
+	// BlasNodeCountAt80: the BLAS headers hold their node count at +80 (see RayTracingLayout).
+	uint32_t flags;
 };
 
 constexpr uint32_t BlasNodeCountAt80 = 1;
@@ -188,8 +221,23 @@ struct Job {
 	uint32_t capacity0;
 	uint32_t capacity1;
 	uint32_t result;
-	uint32_t pad;
+	uint32_t header_layout;
+	uint64_t layout;
+	uint32_t layout_count;
+	uint32_t mismatches;
+	uint32_t leaves;
+	uint32_t pad2;
 };
+
+// Job::result: the build did not match its layout, or the memory did not hold the BLAS the layout
+// describes any more.
+constexpr uint32_t JobLayoutMismatch = 16;
+constexpr uint32_t JobLayoutStale    = 32;
+
+// The host table hashes keys like FindSlot in rt_tlas_walk.comp.
+uint32_t TableHash(uint64_t key) {
+	return static_cast<uint32_t>(key >> 6u) * 0x9e3779b1u ^ static_cast<uint32_t>(key >> 32u) * 0x85ebca6bu;
+}
 static_assert(sizeof(Job) == JobStride);
 
 struct SlotInfo {
@@ -205,7 +253,7 @@ struct SlotInfo {
 	uint32_t root;
 	uint32_t stamp;
 	uint32_t leaf_count;
-	uint32_t pad;
+	uint32_t rebase;
 };
 static_assert(sizeof(SlotInfo) == SlotStride);
 
@@ -257,6 +305,22 @@ void UpdateBuffer(const CommandRecorder& command, vk::Buffer buffer, uint64_t of
 		c.updateBuffer(buffer, offset, size, copy);
 	});
 }
+
+// BLASes the guest changed lately are rebuilt before every use (see Prepare()): a fast build.
+// Once they stop changing they are built once more for tracing.
+constexpr vk::BuildAccelerationStructureFlagsKHR BlasFlags =
+    vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+constexpr vk::BuildAccelerationStructureFlagsKHR FastBlasFlags =
+    vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild;
+// BLASes the guest refits every frame are gathered again from the refit vertices with the same
+// triangles (see RecordBuilds()): their builds allow updates, and a gathered build updates the
+// last build in place instead of building it again. A walk now and then builds them anew.
+constexpr vk::BuildAccelerationStructureFlagsKHR UpdatableBlasFlags =
+    BlasFlags | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
+// A refit BLAS the guest changes again within the frame (dynamic) is gathered and updated before
+// each use: fast builds that allow updates.
+constexpr vk::BuildAccelerationStructureFlagsKHR FastUpdatableBlasFlags =
+    FastBlasFlags | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
 
 // Non-indexed triangles (3 floats per vertex): geometry 0 opaque, geometry 1 alpha tested (the
 // guest alpha test runs once per candidate).
@@ -475,6 +539,8 @@ NativeRayTracing::~NativeRayTracing() {
 	device.destroyPipelineLayout(m_blas_layout);
 	device.destroyPipeline(m_hle_tlas_pipeline);
 	device.destroyPipelineLayout(m_hle_tlas_layout);
+	device.destroyPipeline(m_hle_refit_pipeline);
+	device.destroyPipelineLayout(m_hle_refit_layout);
 	device.destroyDescriptorSetLayout(m_descriptor_layout);
 }
 
@@ -514,6 +580,8 @@ void NativeRayTracing::CreatePipelines() {
 	make(RT_TLAS_WALK_SPV, sizeof(TlasPush), m_tlas_layout, m_tlas_pipeline, "RT TLAS walk");
 	make(RT_BLAS_WALK_SPV, sizeof(BlasPush), m_blas_layout, m_blas_pipeline, "RT BLAS walk");
 	make(HLE_TLAS_SPV, sizeof(HleTlasPush), m_hle_tlas_layout, m_hle_tlas_pipeline, "HLE TLAS build");
+	make(HLE_BLAS_REFIT_SPV, sizeof(HleRefitPush), m_hle_refit_layout, m_hle_refit_pipeline,
+	     "HLE BLAS refit");
 }
 
 void NativeRayTracing::CreateBuffers() {
@@ -527,7 +595,7 @@ void NativeRayTracing::CreateBuffers() {
 	m_queue          = make(uint64_t {QueueCapacity} * 4, DataFlags, "RT queue");
 	m_instance_nodes = make(uint64_t {InstanceCapacity} * 4, DataFlags, "RT instance nodes");
 	m_instances      = make(uint64_t {InstanceCapacity} * InstanceStride, AsFlags, "RT instances");
-	m_table          = make(uint64_t {TableEntries} * TableStride, DataFlags, "RT BLAS table");
+	m_table          = make(uint64_t {TableEntries + HostTableEntries} * TableStride, DataFlags, "RT BLAS table");
 	m_slots          = make(uint64_t {SlotCapacity} * SlotStride, DataFlags, "RT slots");
 	m_missing        = make(uint64_t {MissingCapacity} * MissingStride, DataFlags, "RT missing");
 	m_context        = make(uint64_t {MaxContexts} * ContextStride, DataFlags, "RT context");
@@ -535,8 +603,13 @@ void NativeRayTracing::CreateBuffers() {
 	m_verify_list    = make(uint64_t {SlotCapacity} * 4, DataFlags, "RT verify list");
 	m_changed        = make(uint64_t {ChangedCapacity} * 4, DataFlags, "RT changed");
 	m_jobs           = make(uint64_t {MaxJobs} * JobStride, DataFlags, "RT jobs");
+	m_layouts        = make(uint64_t {LayoutCapacity} * 16, DataFlags, "RT build layouts");
+	m_host_keys.assign(HostTableEntries, 0);
 	m_build_scratch  = make(BuildScratchSize, AsFlags, "RT build scratch");
 	m_hle_tlas_scratch = make(HleTlasScratchSize, DataFlags, "HLE TLAS bounds");
+	m_hle_jobs       = make(HleRefitJobsSize, DataFlags, "HLE refit jobs");
+	m_hle_pool       = make(uint64_t {HleRefitPoolCapacity} * 4, DataFlags, "HLE refit pool");
+	m_hle_state      = make(HleRefitStateSize, DataFlags, "HLE refit state");
 	for (auto& readback: m_readbacks) {
 		readback.buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                           AllFlags, ReadbackSize);
@@ -590,13 +663,25 @@ bool NativeRayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSiz
 	const std::array counts {sizes.capacity0, sizes.capacity1};
 	vk::AccelerationStructureBuildGeometryInfoKHR info {};
 	info.type          = vk::AccelerationStructureTypeKHR::eBottomLevel;
-	info.flags         = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+	info.flags         = BlasFlags;
 	info.mode          = vk::BuildAccelerationStructureModeKHR::eBuild;
 	info.geometryCount = static_cast<uint32_t>(geometries.size());
 	info.pGeometries   = geometries.data();
 	vk::AccelerationStructureBuildSizesInfoKHR build {};
 	device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice, &info,
 	                                             counts.data(), &build);
+	{
+		// Every kind of build fits, and an update.
+		for (const auto flags: {FastBlasFlags, UpdatableBlasFlags, FastUpdatableBlasFlags}) {
+			auto other_info  = info;
+			other_info.flags = flags;
+			vk::AccelerationStructureBuildSizesInfoKHR other {};
+			device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice,
+			                                             &other_info, counts.data(), &other);
+			build.accelerationStructureSize = std::max(build.accelerationStructureSize, other.accelerationStructureSize);
+			build.buildScratchSize = std::max({build.buildScratchSize, other.buildScratchSize, other.updateScratchSize});
+		}
+	}
 	sizes.storage   = (build.accelerationStructureSize + 255u) & ~uint64_t {255};
 	sizes.vertices0 = (uint64_t {sizes.capacity0} * 36 + 255u) & ~uint64_t {255};
 	sizes.vertices1 = (uint64_t {sizes.capacity1} * 36 + 255u) & ~uint64_t {255};
@@ -624,6 +709,7 @@ void NativeRayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes) {
 	slot.entries       = m_arena.Allocate(sizes.entries, 256);
 	slot.build_scratch = sizes.scratch;
 	slot.built         = false;
+	slot.updatable     = false;
 	vk::AccelerationStructureCreateInfoKHR create {};
 	create.buffer = slot.storage.buffer->Handle();
 	create.offset = slot.storage.offset;
@@ -637,6 +723,16 @@ void NativeRayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes) {
 }
 
 bool NativeRayTracing::CreateSlot(const PendingSlot& pending) {
+	// Its build was seen after the walk reported it: the walk finds the host's slot first, the
+	// entry the walk claimed is released.
+	if (const auto it = m_slots_by_blas.find(pending.blas_va); it != m_slots_by_blas.end()) {
+		for (const auto index: it->second) {
+			if (m_slot_list[index]->root == pending.root) {
+				m_retry.push_back(pending.table_index);
+				return true;
+			}
+		}
+	}
 	// Implausibly large (see MaxSlotTriangles) or over the budget: reported again later.
 	SlotSizes sizes;
 	if (!ComputeSlotSizes(pending.opaque, pending.alpha, sizes)) {
@@ -714,6 +810,11 @@ void NativeRayTracing::EvictSlot(uint32_t index) {
 	auto& slot       = *m_slot_list[index];
 	slot.evicted     = true;
 	slot.needs_build = false;
+	if (slot.host_table_index != UINT32_MAX) {
+		m_host_keys[slot.host_table_index] = TableTombstone;
+		m_host_table_writes.emplace_back(slot.host_table_index, TableTombstone, 0);
+		slot.host_table_index = UINT32_MAX;
+	}
 	if (const auto it = m_slots_by_blas.find(slot.blas_va); it != m_slots_by_blas.end()) {
 		std::erase(it->second, index);
 		if (it->second.empty()) {
@@ -835,66 +936,115 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 	std::vector<uint32_t> slots;
 	uint64_t              scratch   = 0;
 	uint64_t              pool_use  = 0;
+	// The layouts of the jobs that have one.
+	std::vector<std::array<uint32_t, 4>> layouts;
 	constexpr uint64_t    Alignment = 256;
+	// A slot gathers (see below) when the guest only refit its BLAS since the last host build: the
+	// first build after a refit pass, or, for a slot the guest changes again within the frame
+	// (dynamic), every build of the same refit pass.
+	const auto gathers = [&](const Slot* slot) {
+		return slot != nullptr && slot->built && slot->refit_seq == m_refit_seq && slot->gathers < MaxGathers &&
+		       (slot->built_refit_seq + 1 == m_refit_seq ||
+		        (slot->built_refit_seq == m_refit_seq && slot->dynamic_until != 0));
+	};
 	{
 		Common::LockGuard lock(m_mutex);
-		// The oldest builds first (a slot never built counts as the oldest): the queue used to be
-		// served last in, first out, and under a long backlog (a hundred or more animated BLASes
-		// asking for a build every frame) the slots deep in it, such as a ped that just got out of
-		// a vehicle, kept the shape of their last build for tens of frames.
+		// The gathers of the last refit first (the animated BLASes the frame traces: cheap, no
+		// walk), then the oldest builds (a slot never built counts as the oldest): the queue used
+		// to be served last in, first out, and under a long backlog (a hundred or more animated
+		// BLASes asking for a build every frame) the slots deep in it, such as a ped that just got
+		// out of a vehicle, kept the shape of their last build for tens of frames. The queue is
+		// served from its end.
 		std::stable_sort(m_build_queue.begin(), m_build_queue.end(), [&](uint32_t a, uint32_t b) {
-			const auto age = [&](uint32_t index) {
-				const auto* slot = m_slot_list[index].get();
+			const auto* slot_a = m_slot_list[a].get();
+			const auto* slot_b = m_slot_list[b].get();
+			if (gathers(slot_a) != gathers(slot_b)) {
+				return !gathers(slot_a);
+			}
+			const auto age = [&](const Slot* slot) {
 				return slot == nullptr || slot->built_frame == UINT64_MAX ? uint64_t {0} : slot->built_frame;
 			};
-			return age(a) > age(b);
+			return age(slot_a) > age(slot_b);
 		});
+		// Slots whose walks did not fit in the pool this time: they keep their place in the queue.
+		std::vector<uint32_t> deferred;
 		while (!m_build_queue.empty() && jobs.size() < MaxJobs) {
 			const auto index = m_build_queue.back();
-			if (m_slot_list[index] == nullptr || m_slot_list[index]->evicted) {
-				// Released since it was queued.
+			if (m_slot_list[index] == nullptr || m_slot_list[index]->evicted ||
+			    !m_slot_list[index]->needs_build) {
+				// Released or built since it was queued.
 				m_build_queue.pop_back();
 				continue;
 			}
 			auto&      slot  = *m_slot_list[index];
 			const auto size  = (slot.build_scratch + Alignment - 1) & ~(Alignment - 1);
-			if (scratch + size > BuildScratchSize) {
+			if (scratch + size > BuildScratchSize ||
+			    (!slot.layout.empty() && layouts.size() + slot.layout.size() > LayoutCapacity)) {
 				break;
 			}
 			// The walks of the builds take a queue each from the pool, which the counts and the
 			// checks of the preparation need too: the builds use up to half of it, the rest waits
-			// for the next preparation (one build always goes).
+			// for the next preparation (the first walk always goes, or a BLAS whose walk needs
+			// a large queue would wait forever behind the gathers). A gathered build (see below)
+			// does not walk, so a walk that does not fit does not hold back the gathers behind it
+			// (the refit BLASes of the frame: peds and vehicles must not trace last frame's shape).
+			const bool     gathered = gathers(&slot);
 			const uint64_t queue =
-			    slot.leaf_count != 0
+			    gathered ? 0
+			    : slot.leaf_count != 0
 			        ? std::min<uint64_t>(uint64_t {slot.leaf_count} + slot.leaf_count / 2 + 64, PoolQueueMax)
 			        : PoolQueueMax;
-			if (!jobs.empty() && pool_use + queue > PoolCapacity / 2) {
-				break;
-			}
-			pool_use += queue;
 			m_build_queue.pop_back();
-			if (!slot.needs_build) {
+			if (pool_use != 0 && pool_use + queue > PoolCapacity / 2) {
+				deferred.push_back(index);
 				continue;
 			}
+			pool_use += queue;
 			slot.needs_build = false;
 			scratch += size;
 			Job job {slot.blas_va, slot.root, index, slot.vertices0.address,
 			         slot.vertices1.address, slot.entries.address, slot.capacity0,
 			         slot.capacity1, 0, 0, 0, 0, 0};
 			if (!slot.layout.empty()) {
-				job.layout       = m_layouts->BufferDeviceAddress() + uint64_t {layouts.size()} * 16;
-				job.layout_count = static_cast<uint32_t>(slot.layout.size());
+				job.header_layout = slot.header_layout;
+				job.layout        = m_layouts->BufferDeviceAddress() + uint64_t {layouts.size()} * 16;
+				job.layout_count  = static_cast<uint32_t>(slot.layout.size());
 				layouts.insert(layouts.end(), slot.layout.begin(), slot.layout.end());
 			}
 			jobs.push_back(job);
 			slots.push_back(index);
 		}
+		// Back at the end of the queue, in their order (the oldest last).
+		m_build_queue.insert(m_build_queue.end(), deferred.rbegin(), deferred.rend());
 	}
 	if (jobs.empty()) {
 		return;
 	}
-	// The slot infos (state 0 until built) and table entries (slot + 1) of the slots.
-	for (const auto index: slots) {
+	// A BLAS the guest only refit since the last host build keeps its triangles and their order:
+	// its vertices are gathered again through its entry table instead of walking the guest BVH.
+	// Gathers go after the walks; walked again now and then.
+	uint32_t walk_count = 0;
+	{
+		std::vector<Job>      walk_jobs, gather_jobs;
+		std::vector<uint32_t> walk_slots, gather_slots;
+		for (size_t i = 0; i < jobs.size(); i++) {
+			auto&      slot   = *m_slot_list[slots[i]];
+			const bool gather = gathers(&slot);
+			slot.gathers         = gather ? slot.gathers + 1 : 0;
+			slot.built_refit_seq = m_refit_seq;
+			(gather ? gather_jobs : walk_jobs).push_back(jobs[i]);
+			(gather ? gather_slots : walk_slots).push_back(slots[i]);
+		}
+		walk_count = static_cast<uint32_t>(walk_jobs.size());
+		jobs       = std::move(walk_jobs);
+		slots      = std::move(walk_slots);
+		jobs.insert(jobs.end(), gather_jobs.begin(), gather_jobs.end());
+		slots.insert(slots.end(), gather_slots.begin(), gather_slots.end());
+	}
+	// The slot infos (state 0 until built) and table entries (slot + 1) of the walked slots
+	// (gathered ones keep theirs: the gather reads their triangle counts).
+	for (uint32_t i = 0; i < walk_count; i++) {
+		const auto     index = slots[i];
 		const auto&    slot = *m_slot_list[index];
 		const SlotInfo info {.as_address  = slot.as_address,
 		                     .entry_table = slot.entries.address,
@@ -943,11 +1093,30 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 	const BlasPush push {m_jobs->BufferDeviceAddress(),    m_pool->BufferDeviceAddress(),
 	                     m_slots->BufferDeviceAddress(),   m_state->BufferDeviceAddress(),
 	                     m_changed->BufferDeviceAddress(), ModeBuild,
-	                     PoolCapacity,                     static_cast<uint32_t>(jobs.size()),
-	                     ChangedCapacity};
+	                     PoolCapacity,                     walk_count,
+	                     ChangedCapacity,                  m_prepare_id,
+	                     m_blas_flags};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_blas_pipeline);
 	command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-	command.dispatch(static_cast<uint32_t>(jobs.size()), 1, 1);
+	if (walk_count != jobs.size()) {
+		auto gather      = push;
+		gather.jobs      = m_jobs->BufferDeviceAddress() + uint64_t {walk_count} * JobStride;
+		gather.mode      = ModeGather;
+		gather.job_count = static_cast<uint32_t>(jobs.size()) - walk_count;
+		// A workgroup per 1024 triangles of the largest job (one workgroup per job left the
+		// thousands of triangles of a vehicle to 256 invocations in turn).
+		uint32_t largest = 0;
+		for (size_t i = walk_count; i < jobs.size(); i++) {
+			largest = std::max(largest, jobs[i].capacity0 + jobs[i].capacity1);
+		}
+		const uint32_t groups = std::clamp<uint32_t>((largest + 1023u) / 1024u, 1u, 64u);
+		command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(gather), &gather);
+		command.dispatch(gather.job_count, groups, 1);
+		command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	}
+	if (walk_count != 0) {
+		command.dispatch(walk_count, 1, 1);
+	}
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderWrite, AsBuildStage | vk::PipelineStageFlagBits2::eTransfer,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead);
@@ -960,14 +1129,27 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 		uint64_t                     scratch;
 		uint32_t                     capacity0;
 		uint32_t                     capacity1;
+		uint32_t                     fast;
+		// 1: allows updates, 2: updates the last build.
+		uint32_t                     update;
 	};
 	std::vector<BuildRecord> records;
 	uint64_t                 scratch_offset = 0;
 	const auto               scratch_base   = m_build_scratch->BufferDeviceAddress();
-	for (const auto index: slots) {
-		const auto& slot = *m_slot_list[index];
+	for (size_t i = 0; i < slots.size(); i++) {
+		auto&      slot     = *m_slot_list[slots[i]];
+		const bool fast     = slot.dynamic_until != 0;
+		const bool gathered = i >= walk_count;
+		// A BLAS the guest refits (gathered now, or walked between gathers) allows updates; a
+		// gathered build updates the last build when it has the same flags (fast or not).
+		const bool     updatable = slot.refit_seq == m_refit_seq;
+		const uint32_t update =
+		    gathered && updatable && slot.updatable && slot.fast_built == fast ? 2u : updatable ? 1u : 0u;
+		slot.fast_built = fast;
+		slot.updatable  = updatable;
 		records.push_back({slot.handle, slot.vertices0.address, slot.vertices1.address,
-		                   scratch_base + scratch_offset, slot.capacity0, slot.capacity1});
+		                   scratch_base + scratch_offset, slot.capacity0, slot.capacity1,
+		                   fast ? 1u : 0u, update});
 		scratch_offset += (slot.build_scratch + Alignment - 1) & ~(Alignment - 1);
 	}
 	const auto* copy  = command.CopyArray(records.data(), records.size());
@@ -982,8 +1164,12 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 			geometries[i * 2 + 1] = TriangleGeometry(copy[i].vertices1, copy[i].capacity1, false);
 			auto& info                     = infos[i];
 			info.type                      = vk::AccelerationStructureTypeKHR::eBottomLevel;
-			info.flags                     = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
-			info.mode                      = vk::BuildAccelerationStructureModeKHR::eBuild;
+			info.flags = copy[i].fast != 0 ? (copy[i].update != 0 ? FastUpdatableBlasFlags : FastBlasFlags)
+			             : copy[i].update != 0 ? UpdatableBlasFlags
+			                                   : BlasFlags;
+			info.mode  = copy[i].update == 2 ? vk::BuildAccelerationStructureModeKHR::eUpdate
+			                                 : vk::BuildAccelerationStructureModeKHR::eBuild;
+			info.srcAccelerationStructure  = copy[i].update == 2 ? copy[i].handle : nullptr;
 			info.dstAccelerationStructure  = copy[i].handle;
 			info.geometryCount             = 2;
 			info.pGeometries               = &geometries[i * 2];
@@ -1035,10 +1221,20 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	std::vector<std::pair<uint32_t, uint32_t>> evicted;
 	std::vector<std::pair<uint32_t, SlotInfo>> reallocated;
 	std::vector<uint32_t>                      moved;
+	std::vector<std::tuple<uint32_t, uint64_t, uint32_t>> host_writes;
 	{
 		Common::LockGuard lock(m_mutex);
 		m_frame = frame;
 		DestroyRetired();
+		for (const auto index: m_give_up) {
+			if (index < m_slot_list.size() && m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
+				evicted.push_back({index, m_slot_list[index]->table_index});
+				EvictSlot(index);
+			}
+		}
+		m_give_up.clear();
+		moved.insert(moved.end(), m_moved_slots.begin(), m_moved_slots.end());
+		m_moved_slots.clear();
 		for (const auto& pending: m_new_slots) {
 			if (!CreateSlot(pending)) {
 				// No free slot: reported again later (a few times).
@@ -1096,6 +1292,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 			return true;
 		});
 		retry.swap(m_retry);
+		host_writes.swap(m_host_table_writes);
 		// Slots the guest changed lately are rebuilt before each use: the verification finds a
 		// change only after the TLAS of that preparation was built.
 		std::erase_if(m_dynamic, [&](uint32_t index) {
@@ -1106,9 +1303,16 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 			auto& slot = *released;
 			if (slot.dynamic_until <= m_prepare_id) {
 				slot.dynamic_until = 0;
+				// No longer changing: built once more for tracing.
+				if (slot.fast_built && !slot.needs_build) {
+					slot.needs_build = true;
+					m_build_queue.push_back(index);
+				}
 				return true;
 			}
-			if (!slot.needs_build && slot.built_frame != frame) {
+			// Before every preparation, not once a frame: the guest may change it between the ray
+			// tracing passes of a frame.
+			if (!slot.needs_build) {
 				slot.needs_build = true;
 				m_build_queue.push_back(index);
 			}
@@ -1153,7 +1357,16 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	for (const auto& [index, table_index]: evicted) {
 		constexpr SlotInfo cleared {};
 		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &cleared, sizeof(cleared));
-		forget(table_index);
+		if (table_index != UINT32_MAX) {
+			forget(table_index);
+		}
+	}
+	// The host table, after the evictions released their entries.
+	for (const auto& [index, key, encoded]: host_writes) {
+		const std::array<uint32_t, 4> entry {static_cast<uint32_t>(key), static_cast<uint32_t>(key >> 32u),
+		                                     encoded, 0};
+		UpdateBuffer(command, m_table->Handle(), uint64_t {TableEntries + index} * TableStride, entry.data(),
+		             sizeof(entry));
 	}
 	for (const auto& [index, info]: reallocated) {
 		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
@@ -1223,7 +1436,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	                    m_slots->BufferDeviceAddress(),   m_state->BufferDeviceAddress(),
 	                    m_changed->BufferDeviceAddress(), ModeCount,
 	                    PoolCapacity,                     0,
-	                    ChangedCapacity};
+	                    ChangedCapacity,                  m_prepare_id,
+	                    m_blas_flags};
 	command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(blas_push),
 	                      &blas_push);
 	command.dispatchIndirect(m_state->Handle(), StateDispatch);
@@ -1324,6 +1538,35 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 				if (!slot.needs_build) {
 					slot.needs_build = true;
 					m_build_queue.push_back(index);
+				}
+			}
+		}
+		if ((job.result & (JobLayoutMismatch | JobLayoutStale)) != 0) {
+			// The guest BLAS is not (or no longer) laid out as its build said: given up, the walks
+			// find what the memory holds. A later build there is laid out again.
+			const auto index = readback.build_slots[i];
+			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted &&
+			    !m_slot_list[index]->layout.empty()) {
+				m_give_up.push_back(index);
+			}
+			continue;
+		}
+		if (job.leaves != 0 && (job.result & 0xfu) == 0) {
+			// A complete walk: the next one takes a queue of about as many nodes (a slot that
+			// grew or overflowed its queue walked with the largest one).
+			const auto index = readback.build_slots[i];
+			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
+				m_slot_list[index]->leaf_count = job.leaves;
+			}
+		}
+		if ((job.result & 0xfu) == 0 && job.layout == 0) {
+			// A complete walk of a slot with far more room than the BLAS has (a decompressed BLAS
+			// sized from its memory): it gets its exact size, like a grown slot.
+			const auto index = readback.build_slots[i];
+			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
+				const auto& slot = *m_slot_list[index];
+				if (slot.capacity0 > job.capacity0 * 2 + 1024 || slot.capacity1 > job.capacity1 * 2 + 1024) {
+					m_grow.push_back({index, job.capacity0, job.capacity1});
 				}
 			}
 		}
@@ -1434,6 +1677,267 @@ void NativeRayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t in
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
 	              vk::PipelineStageFlagBits2::eAllCommands,
 	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+}
+
+void NativeRayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> builds) {
+	if (!m_enabled) {
+		return;
+	}
+	Common::LockGuard lock(m_mutex);
+	for (const auto& build: builds) {
+		if (build.blas_va == 0 || build.geometries.empty()) {
+			continue;
+		}
+		// Each geometry's triangles follow those of the earlier geometries of its opacity.
+		std::vector<std::array<uint32_t, 4>> layout;
+		std::array<uint64_t, 2>              totals {};
+		for (const auto& [triangles, opaque]: build.geometries) {
+			auto& total = totals[opaque ? 0 : 1];
+			layout.push_back({static_cast<uint32_t>(total), triangles, opaque ? 1u : 0u, 0u});
+			total += triangles;
+		}
+		if (totals[0] + totals[1] == 0 || totals[0] + totals[1] > MaxSlotTriangles) {
+			continue;
+		}
+		const auto capacity0 = static_cast<uint32_t>(std::max<uint64_t>(totals[0], 1));
+		const auto capacity1 = static_cast<uint32_t>(std::max<uint64_t>(totals[1], 1));
+		// A BLAS with a slot already (built before, or found by a walk): laid out again.
+		uint32_t index = UINT32_MAX;
+		if (const auto it = m_slots_by_blas.find(build.blas_va); it != m_slots_by_blas.end()) {
+			for (const auto candidate: it->second) {
+				if (m_slot_list[candidate]->root == GuestBlasRoot) {
+					index = candidate;
+				}
+			}
+		}
+		if (index != UINT32_MAX) {
+			auto& slot = *m_slot_list[index];
+			if (slot.capacity0 != capacity0 || slot.capacity1 != capacity1) {
+				SlotSizes sizes;
+				if (!ComputeSlotSizes(capacity0, capacity1, sizes, true)) {
+					continue;
+				}
+				// The recorded work may still use the old structure: it is destroyed later.
+				RetireResources(slot, UINT32_MAX);
+				AllocateSlot(slot, sizes);
+				m_moved_slots.push_back(index);
+			}
+			slot.layout        = std::move(layout);
+			slot.header_layout = build.header_layout;
+			// Leaves hold one triangle or more: the walk's queue is sized for as many (a walk
+			// that needs more reports it, see RecordBuilds()).
+			slot.leaf_count = static_cast<uint32_t>(totals[0] + totals[1]);
+			if (!slot.needs_build) {
+				slot.needs_build = true;
+				m_build_queue.push_back(index);
+			}
+			continue;
+		}
+		SlotSizes sizes;
+		if (!ComputeSlotSizes(capacity0, capacity1, sizes, true)) {
+			continue;
+		}
+		if (const auto created = CreateHostSlot(build.blas_va, sizes); created != UINT32_MAX) {
+			auto& slot         = *m_slot_list[created];
+			slot.layout        = std::move(layout);
+			slot.header_layout = build.header_layout;
+			slot.leaf_count    = static_cast<uint32_t>(totals[0] + totals[1]);
+		}
+	}
+}
+
+uint32_t NativeRayTracing::FindHostSlotIndex(uint64_t blas_va) const {
+	if (const auto it = m_slots_by_blas.find(blas_va); it != m_slots_by_blas.end()) {
+		for (const auto candidate: it->second) {
+			if (m_slot_list[candidate]->root == GuestBlasRoot) {
+				return candidate;
+			}
+		}
+	}
+	return UINT32_MAX;
+}
+
+uint32_t NativeRayTracing::CreateHostSlot(uint64_t blas_va, const SlotSizes& sizes) {
+	// A host table entry: the first free (or released) one of the key's probe chain.
+	const uint64_t key  = blas_va ^ (uint64_t {GuestBlasRoot} << 48u);
+	const uint32_t hash = TableHash(key);
+	uint32_t       host = UINT32_MAX;
+	for (uint32_t probe = 0; probe < HostTableProbes; probe++) {
+		const uint32_t candidate = (hash + probe) & (HostTableEntries - 1);
+		if (m_host_keys[candidate] == 0 || m_host_keys[candidate] == TableTombstone) {
+			host = candidate;
+			break;
+		}
+	}
+	if (host == UINT32_MAX) {
+		return UINT32_MAX;
+	}
+	uint32_t index = UINT32_MAX;
+	if (!m_free_slots.empty()) {
+		index = m_free_slots.back();
+		m_free_slots.pop_back();
+	} else if (m_slot_list.size() < SlotCapacity) {
+		index = static_cast<uint32_t>(m_slot_list.size());
+		m_slot_list.emplace_back();
+	} else {
+		return UINT32_MAX;
+	}
+	auto slot              = std::make_unique<Slot>();
+	slot->blas_va          = blas_va;
+	slot->root             = GuestBlasRoot;
+	slot->table_index      = UINT32_MAX;
+	slot->host_table_index = host;
+	slot->last_use_frame   = m_frame;
+	AllocateSlot(*slot, sizes);
+	slot->needs_build = true;
+	m_slots_by_blas[blas_va].push_back(index);
+	m_build_queue.push_back(index);
+	m_slot_list[index] = std::move(slot);
+	m_host_keys[host]  = key;
+	m_host_table_writes.emplace_back(host, key, index + 1);
+	return index;
+}
+
+void NativeRayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_size) {
+	if (!m_enabled || blas_va == 0) {
+		return;
+	}
+	Common::LockGuard lock(m_mutex);
+	if (const auto index = FindHostSlotIndex(blas_va); index != UINT32_MAX) {
+		// The memory holds another BLAS now: no layout and no refits of the old one; the walk
+		// builds it again (and grows the slot if needed).
+		auto& slot     = *m_slot_list[index];
+		slot.layout.clear();
+		slot.refit_seq = 0;
+		if (!slot.needs_build) {
+			slot.needs_build = true;
+			m_build_queue.push_back(index);
+		}
+		return;
+	}
+	// Its triangle counts are not known before the decompression ran on the GPU: the slot takes
+	// as many triangles of each opacity as the BLAS memory can hold (a triangle takes more than
+	// DecompressBytesPerTriangle bytes of it), and its first build gives it its exact size.
+	const auto bound = static_cast<uint32_t>(
+	    std::clamp<uint64_t>(memory_size / DecompressBytesPerTriangle, 1, MaxSlotTriangles / 2));
+	SlotSizes sizes;
+	if (memory_size == 0 || !ComputeSlotSizes(bound, bound, sizes, true)) {
+		return;
+	}
+	if (const auto created = CreateHostSlot(blas_va, sizes); created != UINT32_MAX) {
+		m_slot_list[created]->leaf_count = bound;
+	}
+}
+
+void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
+                                      std::span<const HleRefitGeometry> geometries, uint32_t header_layout) {
+	if (!m_enabled || blases.empty()) {
+		return;
+	}
+	static_assert(sizeof(HleRefitGeometry) == HleRefitGeometryStride);
+	{
+		Common::LockGuard lock(m_mutex);
+		m_refit_seq++;
+		for (const auto blas: blases) {
+			if (const auto it = m_slots_by_blas.find(blas); it != m_slots_by_blas.end()) {
+				for (const auto index: it->second) {
+					// Built again (gathered) at the next preparation, so the frame that refit it
+					// traces the new shape.
+					auto& slot     = *m_slot_list[index];
+					slot.refit_seq = m_refit_seq;
+					if (slot.built && !slot.needs_build) {
+						slot.needs_build = true;
+						m_build_queue.push_back(index);
+					}
+				}
+			}
+		}
+	}
+	const auto upload = [&](uint64_t offset, const uint8_t* data, uint64_t size) {
+		for (uint64_t done = 0; done < size;) {
+			const auto chunk = static_cast<uint32_t>(std::min<uint64_t>(size - done, 65536));
+			UpdateBuffer(command, m_hle_jobs->Handle(), offset + done, data + done, chunk);
+			done += chunk;
+		}
+	};
+	auto* page_table = m_buffer_cache.GetBdaPageTableBuffer();
+	const vk::DescriptorBufferInfo page_info {page_table->Handle(), 0, page_table->Size()};
+	vk::WriteDescriptorSet write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
+	write.pBufferInfo     = &page_info;
+	const auto jobs = m_hle_jobs->BufferDeviceAddress();
+	// One pass of the refit with the jobs of `batch_geometries` and `batch_blases` in the job buffer:
+	// the vertices of the geometries, then the boxes of the BLASes.
+	const auto pass = [&](std::span<const HleRefitGeometry> batch_geometries, std::span<const uint64_t> batch_blases) {
+		const uint64_t geometry_bytes = uint64_t {HleRefitGeometryStride} * batch_geometries.size();
+		const uint64_t blas_offset    = (geometry_bytes + 255u) & ~uint64_t {255};
+		const uint64_t blas_bytes     = uint64_t {HleRefitBlasStride} * batch_blases.size();
+		// Earlier work read the jobs of the last pass and wrote what this one reads.
+		MemoryBarrier(command, vk::PipelineStageFlagBits2::eAllCommands,
+		              vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
+		              vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader,
+		              vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderRead |
+		                  vk::AccessFlagBits2::eShaderWrite);
+		if (geometry_bytes != 0) {
+			upload(0, reinterpret_cast<const uint8_t*>(batch_geometries.data()), geometry_bytes);
+		}
+		if (blas_bytes != 0) {
+			std::vector<uint64_t> blas_jobs(batch_blases.size() * 2);
+			for (size_t i = 0; i < batch_blases.size(); i++) {
+				blas_jobs[i * 2] = batch_blases[i];
+			}
+			upload(blas_offset, reinterpret_cast<const uint8_t*>(blas_jobs.data()), blas_bytes);
+		}
+		command.fillBuffer(m_hle_state->Handle(), 0, HleRefitStateSize, 0);
+		MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+		              vk::PipelineStageFlagBits2::eComputeShader,
+		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+		command.bindPipeline(vk::PipelineBindPoint::eCompute, m_hle_refit_pipeline);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_hle_refit_layout, 0, 1, &write);
+		HleRefitPush push {jobs,
+		                   m_hle_pool->BufferDeviceAddress(),
+		                   m_hle_state->BufferDeviceAddress(),
+		                   0,
+		                   static_cast<uint32_t>(batch_geometries.size()),
+		                   HleRefitPoolCapacity,
+		                   header_layout};
+		if (!batch_geometries.empty()) {
+			command.pushConstants(m_hle_refit_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+			command.dispatch(static_cast<uint32_t>(batch_geometries.size()), 1, 1);
+			// The boxes enclose the new vertices.
+			MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+			              vk::PipelineStageFlagBits2::eComputeShader,
+			              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+		}
+		if (!batch_blases.empty()) {
+			push.jobs      = jobs + blas_offset;
+			push.mode      = 1;
+			push.job_count = static_cast<uint32_t>(batch_blases.size());
+			command.pushConstants(m_hle_refit_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+			command.dispatch(static_cast<uint32_t>(batch_blases.size()), 1, 1);
+		}
+		MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+		              vk::PipelineStageFlagBits2::eAllCommands,
+		              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	};
+	const uint64_t geometry_bytes = uint64_t {HleRefitGeometryStride} * geometries.size();
+	const uint64_t blas_bytes     = uint64_t {HleRefitBlasStride} * blases.size();
+	if (((geometry_bytes + 255u) & ~uint64_t {255}) + blas_bytes <= HleRefitJobsSize) {
+		pass(geometries, blases);
+		return;
+	}
+	// More jobs than the job buffer holds: the vertices of every geometry first, as many geometries
+	// as it holds at a time, then the boxes of the BLASes the same way.
+	constexpr size_t GeometryBatch = HleRefitJobsSize / HleRefitGeometryStride;
+	constexpr size_t BlasBatch     = HleRefitJobsSize / HleRefitBlasStride;
+	for (size_t first = 0; first < geometries.size(); first += GeometryBatch) {
+		pass(geometries.subspan(first, std::min(GeometryBatch, geometries.size() - first)), {});
+	}
+	for (size_t first = 0; first < blases.size(); first += BlasBatch) {
+		pass({}, blases.subspan(first, std::min(BlasBatch, blases.size() - first)));
+	}
 }
 
 } // namespace Libs::Graphics

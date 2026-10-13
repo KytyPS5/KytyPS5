@@ -101,6 +101,29 @@ uint ReportMissing(TableEntry entry, uint index, uint64_t previous, uint64_t bla
 	return kSlotPending;
 }
 
+// BLASes whose builds the host saw (see NativeRayTracing::NoteGuestBlasBuilds()) are in a second
+// table, after the walk's own (pc.table_mask + 1 entries), that only the host writes: same
+// entries and hash, empty keys end a probe chain and released ones (tombstones) are skipped. It
+// is probed first, so such a BLAS never waits for a report.
+const uint kHostTableEntries = 1u << 14;
+const uint kHostTableProbes  = 32;
+
+uint FindHostSlot(uint64_t blas_va, uint root) {
+	const uint64_t key  = blas_va ^ (uint64_t(root) << 48);
+	const uint     hash = uint(key >> 6) * 0x9e3779b1u ^ uint(key >> 32) * 0x85ebca6bu;
+	for (uint probe = 0; probe < kHostTableProbes; probe++) {
+		TableEntry     entry = TableAt(pc.table_mask + 1u + ((hash + probe) & (kHostTableEntries - 1u)));
+		const uint64_t found = entry.key;
+		if (found == 0) {
+			break;
+		}
+		if (found == key) {
+			return SlotOf(entry);
+		}
+	}
+	return kNoEntry;
+}
+
 // Finds the slot of a BLAS. A BLAS the table does not have claims the first released entry of
 // its probe chain (or the empty one ending the chain) and is reported in the missing list.
 uint FindSlot(uint64_t blas_va, uint root) {
@@ -254,7 +277,10 @@ void main() {
 		uint64_t       reference    = 0;
 		uint           slot         = kSlotPending;
 		if (blas != 0 && mask != 0) {
-			slot = FindSlot(blas, root);
+			slot = FindHostSlot(blas, root);
+			if (slot == kNoEntry) {
+				slot = FindSlot(blas, root);
+			}
 			if (slot == kSlotPending) {
 				atomicAdd(state.unknown_blas, 1u);
 			} else {

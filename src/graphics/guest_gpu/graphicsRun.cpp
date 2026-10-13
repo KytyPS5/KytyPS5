@@ -1997,12 +1997,162 @@ void CommandProcessor::EmitHleTlas() {
 			}
 		}
 	});
-	return true;
+}
+
+// Games using sce::Psr build the BLASes of their triangle geometry with
+// Psr_Gpu_BottomLevelBvh_Build, one BLAS after another, each from a geometry table the game's CPU
+// writes (120-byte srt_geometry_config entries: +0 kind, 1 = triangles; +4 flags, bit 0 opaque;
+// +8 vertex buffer V#; +24 index buffer V#, whose record count, +32, is the triangle count; +56
+// object matrix). With native ray tracing the builds still run (shaders read the guest BVH), and
+// the command processor tells NativeRayTracing about each one as it ends, so the host BLAS follows
+// it in the same frame instead of waiting for a walk to find it: psr_morton_compute_bounding_box_
+// for_vertices runs once per geometry (the table V# at s[0:3], its record count the geometry count,
+// the build's scratch memory at s[4:5] and the geometry index s9), and so does
+// psr_morton_compute_code_for_mesh_* (geometry index s7) in builds that do not split triangles;
+// psr_collapse_to_qbvh_simple_bottom(_with_refit) writes the BLAS (its address at s[0:1], the same scratch memory at s[2:3], its
+// primitive count at s14), user data of generation Base460. The game builds BLASes in batches
+// (each pass for every BLAS of the batch, then the next pass), so the builds in progress are told
+// apart by their scratch memory. A build whose geometries are not all triangle geometries seen by
+// those passes, or that has fewer primitives than triangles, is left to the walks. Split
+// triangles (more primitives than triangles: the same triangle in several leaves) keep the layout
+// (see rt_blas_walk.comp). Generation Base252 (GTA V 01.005) runs the same passes: the geometry
+// index of the codes is in bits 18-31 of s6, builds without refit data end with
+// collapse_to_qbvh_simple (the last pass of its TLAS builds too), whose s14 is the primitive count
+// minus one, and its BLAS header holds the fields the layout build reads at other offsets
+// (NativeRayTracing::GuestBlasBuild::header_layout).
+//
+// It also streams in compressed BLASes and decompresses them on the GPU: psr_morton_capture_memory
+// (the BLAS memory at s[0:1], its size at s2), psr_decompress_header_base, then the other passes and
+// psr_decompress_compute_fan_node_* (the BLAS at s6 with its high bits at s1). Their triangle
+// counts are only on the GPU: NativeRayTracing sizes their slots from the memory.
+void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
+	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+		return;
+	}
+	using Psr::Shader;
+	const auto shader = ComputePsrShader(data_addr);
+	if (shader == Shader::Trinity) {
+		Psr::StopReplacement("the game builds kTrinity BVHs", ShaderRegisteredName(data_addr));
+	}
+	const auto generation = Psr::LibraryGeneration();
+	if (!Psr::ReplacementEnabled() ||
+	    (generation != Psr::Generation::Base460 && generation != Psr::Generation::Base252)) {
+		m_psr_blas_builds.clear();
+		m_psr_captured.clear();
+		return;
+	}
+	// Generation Base252 (GTA V 01.005) ends its BLAS builds without refit data with the last pass
+	// of its TLAS builds: outside the TLAS stage, that pass ends a BLAS build.
+	const bool base252 = generation == Psr::Generation::Base252;
+	auto       pass    = shader;
+	if (base252 && shader == Shader::CollapseToQbvhSimpleTop && !m_hle_tlas_window && m_guest_tlas_builds == 0) {
+		pass = Shader::CollapseToQbvhSimpleBottom;
+	}
+	if (pass != Shader::MortonComputeBoundingBoxForVertices && pass != Shader::MortonComputeCodeForMesh &&
+	    pass != Shader::CollapseToQbvhSimpleBottom && pass != Shader::MortonCaptureMemory &&
+	    pass != Shader::DecompressHeaderBase && pass != Shader::DecompressComputeFanNode) {
+		return;
+	}
+	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+	// Addresses have 48 bits.
+	const auto address = [&](uint32_t sgpr) {
+		return uint64_t {user[sgpr]} | (uint64_t {user[sgpr + 1] & 0xffffu} << 32u);
+	};
+	if (shader == Shader::MortonCaptureMemory) {
+		if (m_psr_captured.size() >= 4096) {
+			m_psr_captured.clear();
+		}
+		m_psr_captured[address(0)] = user[2];
+		return;
+	}
+	if (shader == Shader::DecompressHeaderBase || shader == Shader::DecompressComputeFanNode) {
+		const auto blas = uint64_t {user[6]} | (uint64_t {user[1] & 0xffffu} << 32u);
+		const auto it   = m_psr_captured.find(blas);
+		if (it == m_psr_captured.end()) {
+			return;
+		}
+		if (shader == Shader::DecompressComputeFanNode) {
+			m_psr_decompressed      = blas;
+			m_psr_decompressed_size = it->second;
+		}
+		return;
+	}
+	constexpr uint32_t GeometryStride = 120;
+	constexpr uint32_t MaxGeometries  = 1024;
+	// Builds whose last pass never came (a batch the game gave up) do not pile up.
+	constexpr size_t MaxBuilds = 4096;
+	if (shader == Shader::MortonComputeBoundingBoxForVertices || shader == Shader::MortonComputeCodeForMesh) {
+		const auto table = address(0);
+		const auto count = user[2];
+		// The geometry index: s9 of the bounds, s7 of the codes (bits 18-31 of s6 in Base252).
+		const auto geometry = shader == Shader::MortonComputeBoundingBoxForVertices ? user[9]
+		                      : base252                                             ? user[6] >> 18u
+		                                                                            : user[7];
+		if (m_psr_blas_builds.size() >= MaxBuilds) {
+			m_psr_blas_builds.clear();
+		}
+		auto& state = m_psr_blas_builds[address(4)];
+		if (table != state.table || count != state.seen.size()) {
+			state.table = count != 0 && count <= MaxGeometries ? table : 0;
+			state.seen.assign(state.table != 0 ? count : 0, 0);
+		}
+		if (geometry < state.seen.size()) {
+			state.seen[geometry] = 1;
+		}
+		return;
+	}
+	const auto blas = address(0);
+	// Base252 passes the primitive count minus one.
+	const auto primitives = base252 ? user[14] + 1u : user[14];
+	const auto it         = m_psr_blas_builds.find(address(2));
+	if (it == m_psr_blas_builds.end()) {
+		return;
+	}
+	const auto table = it->second.table;
+	const auto seen  = std::move(it->second.seen);
+	m_psr_blas_builds.erase(it);
+	if (blas == 0 || table == 0 || std::ranges::find(seen, 0) != seen.end()) {
+		return;
+	}
+	NativeRayTracing::GuestBlasBuild build {.blas_va = blas, .header_layout = base252 ? 1u : 0u};
+	std::vector<uint32_t>            entries(seen.size() * GeometryStride / 4);
+	ReadGuestAroundGpuWrites(table, entries.data(), entries.size() * 4);
+	uint64_t triangles = 0;
+	for (size_t g = 0; g < seen.size(); g++) {
+		const auto* entry = &entries[g * GeometryStride / 4];
+		if (entry[0] != 1) {
+			return;
+		}
+		build.geometries.emplace_back(entry[8], (entry[1] & 1u) != 0);
+		triangles += entry[8];
+	}
+	if (triangles == 0 || primitives < triangles) {
+		return;
+	}
+	m_psr_blas_built = std::move(build);
+}
+
+void CommandProcessor::EmitPsrBlasBuilt() {
+	if (m_psr_decompressed != 0) {
+		EmitHostCommand([this, blas = m_psr_decompressed, size = m_psr_decompressed_size] {
+			m_renderer.GetNativeRayTracing().NoteGuestBlasDecompressed(blas, size);
+		});
+		m_psr_decompressed = 0;
+	}
+	if (m_psr_blas_built.blas_va == 0) {
+		return;
+	}
+	EmitHostCommand([this, build = std::move(m_psr_blas_built)] {
+		m_renderer.GetNativeRayTracing().NoteGuestBlasBuilds(std::span(&build, 1));
+	});
+	m_psr_blas_built = {};
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
-	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
+	PsrBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr);
+	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr) ||
+	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
 		return;
 	}
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
@@ -2012,6 +2162,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	                      .thread_group_z = thread_group_z,
 	                      .mode           = mode};
 	Emit(std::move(operation));
+	EmitPsrBlasBuilt();
 }
 
 void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint32_t thread_group_x,
@@ -2033,7 +2184,9 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
-	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
+	PsrBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr);
+	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr) ||
+	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
 		return;
 	}
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
@@ -2041,6 +2194,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	auto operation     = MakeOperation(GpuOperationKind::DispatchIndirect);
 	operation.dispatch = {.mode = mode, .args_addr = args_addr};
 	Emit(std::move(operation));
+	EmitPsrBlasBuilt();
 }
 
 void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {

@@ -12,6 +12,7 @@
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32Ref { uint v; };
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U32x4Ref { uvec4 v; };
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64Ref { uint64_t v; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U32x2Ref { uvec2 v; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32Ref { float v; };
 
 // The BufferCache device-address page table: the host address of each caching page (0 when the
@@ -48,6 +49,11 @@ uvec4 LoadGuestU32x4(uint64_t va) {
 	return host == 0 ? uvec4(0) : U32x4Ref(host).v;
 }
 
+uvec2 LoadGuestU32x2(uint64_t va) {
+	const uint64_t host = HostAddress(va);
+	return host == 0 ? uvec2(0) : U32x2Ref(host).v;
+}
+
 uint64_t LoadGuestU64(uint64_t va) {
 	return uint64_t(LoadGuestU32(va)) | (uint64_t(LoadGuestU32(va + 4)) << 32);
 }
@@ -72,18 +78,23 @@ struct BoxNode {
 	vec3 hi[4];
 };
 
+// A 64-byte node never crosses a caching page: one translation (zeros where it is not cached).
+uvec4 LoadNodeU32x4(uint64_t host, uint offset) {
+	return host == 0 ? uvec4(0) : U32x4Ref(host + offset).v;
+}
+
 BoxNode LoadBoxNode(uint64_t base, uint node) {
-	const uint64_t address = NodeAddress(base, node);
+	const uint64_t host = HostAddress(NodeAddress(base, node));
 	BoxNode        box;
-	const uvec4    first = LoadGuestU32x4(address);
+	const uvec4    first = LoadNodeU32x4(host, 0);
 	box.children[0] = first.x;
 	box.children[1] = first.y;
 	box.children[2] = first.z;
 	box.children[3] = first.w;
 	if (NodeType(node) == 4u) {
-		const uvec4 a = LoadGuestU32x4(address + 16);
-		const uvec4 b = LoadGuestU32x4(address + 32);
-		const uvec4 c = LoadGuestU32x4(address + 48);
+		const uvec4 a = LoadNodeU32x4(host, 16);
+		const uvec4 b = LoadNodeU32x4(host, 32);
+		const uvec4 c = LoadNodeU32x4(host, 48);
 		const uint words[12] = uint[12](a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w, c.x, c.y, c.z, c.w);
 		for (uint child = 0; child < 4; child++) {
 			const vec2 xy = unpackHalf2x16(words[child * 3]);
@@ -95,7 +106,7 @@ BoxNode LoadBoxNode(uint64_t base, uint node) {
 	} else {
 		uint words[24];
 		for (uint i = 0; i < 6; i++) {
-			const uvec4 v = LoadGuestU32x4(address + 16 + i * 16);
+			const uvec4 v = LoadNodeU32x4(host, 16 + i * 16);
 			words[i * 4]     = v.x;
 			words[i * 4 + 1] = v.y;
 			words[i * 4 + 2] = v.z;
@@ -152,7 +163,11 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer SlotInfo {
 	uint     root;
 	uint     stamp;
 	uint     leaf_count;
-	uint     pad;
+	// Set by a gathered build (see MODE_GATHER in rt_blas_walk.comp) to bit 31 and the preparation:
+	// the triangles follow the guest's refit boxes, so the check of that same preparation takes their
+	// signature instead of reporting a change. A later check (the guest may have changed the BLAS
+	// since) compares as usual.
+	uint     rebase;
 };
 
 // A guest BLAS the top-level walk did not find, counted by the BLAS walk.
@@ -186,6 +201,18 @@ uvec3 TriangleVertexIds(uint type) {
 vec3 LoadVertex(uint64_t node, uint id) {
 	return uintBitsToFloat(uvec3(LoadGuestU32(node + id * 12), LoadGuestU32(node + id * 12 + 4),
 	                             LoadGuestU32(node + id * 12 + 8)));
+}
+
+// The three vertices of triangle `type` of a triangle node, read once with one translation (a
+// 64-byte node of a BVH, whose base is 256-byte aligned, never crosses a caching page); zeros
+// where the node is not cached, as LoadVertex().
+void LoadTriangle(uint64_t node, uint type, out vec3 p[3]) {
+	const uint64_t host = HostAddress(node);
+	const uvec3    ids  = TriangleVertexIds(type);
+	for (uint v = 0; v < 3; v++) {
+		const uint64_t at = host + uint64_t(ids[v] * 12);
+		p[v] = host == 0 ? vec3(0.0) : uintBitsToFloat(uvec3(U32Ref(at).v, U32Ref(at + 4).v, U32Ref(at + 8).v));
+	}
 }
 
 // A guest TLAS instance record (128 bytes, or the stride of the layout), laid out as the traversal

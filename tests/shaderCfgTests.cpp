@@ -14024,6 +14024,168 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
 #include "ShaderRayTracingTests.inc"
 
+// Shaders of sce::Psr, as the games' executables have them (code, metadata and footer).
+// GTA V 01.011 (build J03180688): psr_morton_capture_memory
+static const uint32_t kPsrGta011CaptureMemory[] = {
+    0xbf810000, 0x00000000, 0x00000000, 0x00000000, 0x30306c73, 0x00000079, 0x00000093, 0x00000000,
+    0x00102557, 0x0401a600, 0x0b100a10, 0x40100c10, 0x4b204240, 0x4d104c10, 0x6f104e10, 0x7a107960,
+    0x00108510, 0x00006e00, 0x21200f64, 0x25402410, 0x65000010, 0x40241021, 0x21640000, 0x00402410,
+    0x50286000, 0x00001029, 0x20002061, 0x0202b3c0, 0x4a025108, 0x63436110, 0x61106100, 0x0a382066,
+    0x10076a00, 0x35206e6a, 0x02771573, 0x73010101, 0x46a80b01, 0x580004b2, 0x80808009, 0x92cc2040,
+    0x0006ac95, 0x00000000, 0x00000000, 0x00000000, 0x65726162, 0x746f6f66, 0x814bb232, 0x00000000,
+    0x00000001, 0x00000004, 0x00000000, 0x00000093, 0x0649ca58, 0x6585494c, 0x00000000, 0x00000000,
+};
+// GTA V 01.011: psr_morton_initialize_indirect_args_top
+static const uint32_t kPsrGta011InitializeIndirectArgsTop[] = {
+    0xd7460000, 0x04010c02, 0xbe8303ff, 0x00016204, 0xbe811d92, 0xb0020050, 0x36020087, 0x7d8602f9,
+    0x06868481, 0x7d880283, 0x87ea6a04, 0x020302f9, 0x86860680, 0xe0702000, 0x80000100, 0xbf810000,
+    0x30306c73, 0x00000046, 0x00000060, 0x00000000, 0x100401a6, 0x100b100a, 0x4040100c, 0x104b2042,
+    0x104d104c, 0x606f104e, 0x107a1079, 0x00001085, 0x5400006e, 0x00001025, 0xa0020061, 0x12b3c000,
+    0x08330802, 0x44104230, 0x01014002, 0xa80b0142, 0x0004b246, 0x80800a38, 0xcc2040c0, 0x06ac9592,
+    0x65726162, 0x746f6f66, 0x0fe7d1b8, 0x00000000, 0x00000001, 0x00000040, 0x00000000, 0x00000060,
+    0x40d9c643, 0x6585494c, 0x00000000, 0x00000000,
+};
+// GTA V 01.011: psr_morton_initialize_indirect_args_top_trinity (the same code)
+static const uint32_t kPsrGta011InitializeIndirectArgsTopTrinity[] = {
+    0xd7460000, 0x04010c02, 0xbe8303ff, 0x00016204, 0xbe811d92, 0xb0020050, 0x36020087, 0x7d8602f9,
+    0x06868481, 0x7d880283, 0x87ea6a04, 0x020302f9, 0x86860680, 0xe0702000, 0x80000100, 0xbf810000,
+    0x30306c73, 0x00000046, 0x00000060, 0x00000000, 0x100401a6, 0x100b100a, 0x4040100c, 0x104b2042,
+    0x104d104c, 0x606f104e, 0x107a1079, 0x00001085, 0x5400006e, 0x00001025, 0xa0020061, 0x12b3c000,
+    0x08330802, 0x44104230, 0x01014002, 0xa80b0142, 0x0004b246, 0x80800a38, 0xcc2040c0, 0x06ac9592,
+    0x65726162, 0x746f6f66, 0x0fe7d1b8, 0x00000000, 0x00000001, 0x00000040, 0x00000000, 0x00000060,
+    0x40d9c643, 0x6585494c, 0x00000000, 0x00000000,
+};
+// GTA V 01.011: psr_qbvh_fan_refit_copy_dispatch_args
+static const uint32_t kPsrGta011FanRefitCopyDispatchArgs[] = {
+    0xbfa00003, 0xd7460001, 0x04010c0b, 0xbe90047e, 0x7da40280, 0xbf88000f, 0xf4001a80, 0xfa000018,
+    0xbf8cc07f, 0xbf0d846a, 0xbf850001, 0xbf920001, 0xbf0d926a, 0xbf840001, 0xbf920001, 0xf4001a80,
+    0xfa0000fc, 0xbf8cc07f, 0xbf076a89, 0xbf840001, 0xbf920001, 0xbefe0410, 0x4a000281, 0xf4041a80,
+    0xfa000050, 0xbf8cc07f, 0x8014006a, 0xbe9703ff, 0x00016204, 0x8215016b, 0xf4000580, 0xfa00006c,
+    0xbe951d92, 0xbf8cc07f, 0xe0302000, 0x80050201, 0xbe9703ff, 0x00016204, 0xbf8c3f70, 0x4c040480,
+    0x7daa000a, 0xbf880004, 0xe0302000, 0x80050000, 0xbf8c3f70, 0x4a000500, 0x8afe7e10, 0xbf880004,
+    0xf4001a80, 0xfa000078, 0xbf8cc07f, 0x4a00046a, 0xbefe0410, 0xbe800402, 0xd7460007, 0x02050301,
+    0xbe820404, 0x7e020281, 0x7e040281, 0xbe840406, 0xe0382000, 0x80000307, 0xbe860408, 0xbf8c3f70,
+    0x2c06069f, 0x2c08089f, 0x2c0a0a9f, 0x2c0c0c9f, 0xd76f0003, 0x040d0304, 0xd76f0003, 0x040d0505,
+    0xd76f0003, 0x040d0706, 0xe0782000, 0x80010007, 0xbf810000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000,
+    0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0x30306c73, 0x000000d3, 0x000000ef, 0x00000000,
+    0x00102557, 0x10216500, 0x00004024, 0x100401a6, 0x100b100a, 0x4040100c, 0x104b2042, 0x104d104c,
+    0x606f104e, 0x107a1079, 0x00001085, 0x6400006e, 0x1021200f, 0x10254024, 0x21640000, 0x00402410,
+    0x10255500, 0x50785077, 0x24450000, 0x61000040, 0x00001029, 0x29502860, 0x61000010, 0x00c00a82,
+    0x08a18408, 0x8008a084, 0x8108a000, 0x1e160f00, 0x634b9726, 0x391913e3, 0x665e5655, 0x2e9f746e,
+    0x8e1233e4, 0x00c52d1c, 0x08800423, 0x9c5f0164, 0x9e5a0101, 0x8081a901, 0x01a25100, 0x184a0280,
+    0xae15019c, 0x019e0801, 0x0001b215, 0xa91001a2, 0x3001b801, 0xbe000a3f, 0xbe100a01, 0x2c01c401,
+    0x1c01ca3c, 0x400201d0, 0x01ca0101, 0x46a80b01, 0x6b0004b2, 0xe08a8031, 0x92cc2040, 0x0006ac95,
+    0x65726162, 0x746f6f66, 0xae341220, 0x00000000, 0x00000001, 0x00000150, 0x00000000, 0x000000ef,
+    0xf401e441, 0x6585494c, 0x00000000, 0x00000000,
+};
+// GTA V 01.005 (build J02232310): morton_capture_memory
+static const uint32_t kPsrGta005CaptureMemory[] = {
+    0xbf810000, 0x00000000, 0x00000000, 0x00000000, 0x30306c73, 0x00000073, 0x00000083, 0x00000000,
+    0x00102557, 0x0401a600, 0x0b100a10, 0x40100c10, 0x4c104b40, 0x4e104d10, 0x7a606f10, 0x6e000010,
+    0x0f640000, 0x24102120, 0x00102540, 0x10216500, 0x00004024, 0x24102164, 0x60000040, 0x10295028,
+    0x20610000, 0xb3c02000, 0x4b080202, 0x5b104402, 0x5b005d3d, 0x20605b10, 0x64000a32, 0x68641007,
+    0x156d2f20, 0x01010271, 0xf0076d01, 0x00058b2e, 0x00160952, 0x00000000, 0x00000000, 0x00000000,
+    0x65726162, 0x746f6f66, 0xffd1a152, 0x00000000, 0x00000001, 0x00000004, 0x00000000, 0x00000083,
+    0x7dd3b209, 0xeddd574e, 0x00000000, 0x00000000,
+};
+// GTA V 01.005: qbvh_fan_refit_copy_dispatch_args
+static const uint32_t kPsrGta005FanRefitCopyDispatchArgs[] = {
+    0xbfa00003, 0xd7460001, 0x04010c0b, 0xf4041a80, 0xfa000048, 0xbf8cc07f, 0x8014006a, 0xbe9703ff,
+    0x00016204, 0x8215016b, 0xf4000580, 0xfa000070, 0xbe951d92, 0x4a000281, 0xbf8cc07f, 0xe0302000,
+    0x80050201, 0xbe9703ff, 0x00016204, 0xbe900302, 0xbe910303, 0xbe920304, 0xbe930305, 0xbe840306,
+    0xbe850307, 0xbe860308, 0xbe870309, 0xbe82047e, 0xbf8c3f70, 0x4c040480, 0x7daa000a, 0xbf880004,
+    0xe0302000, 0x80050000, 0xbf8c3f70, 0x4a000500, 0x8afe7e02, 0xbf880004, 0xf4001a80, 0xfa00007c,
+    0xbf8cc07f, 0x4a00046a, 0xbefe0402, 0xd7460007, 0x02050301, 0x7e020281, 0x7e040281, 0xe0382000,
+    0x80040307, 0xbf8c3f70, 0x2c08089f, 0x2c06069f, 0x2c0a0a9f, 0x2c0c0c9f, 0xd76f0003, 0x040d0304,
+    0xd76f0003, 0x040d0505, 0xd76f0003, 0x040d0706, 0xe0782000, 0x80010007, 0xbf810000, 0xbf9f0000,
+    0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0x00000000,
+    0x30306c73, 0x000000ba, 0x000000cf, 0x00000000, 0x00102557, 0x10216500, 0x00004024, 0x24102164,
+    0x61000040, 0x00001029, 0x100401a6, 0x100b100a, 0x4040100c, 0x104c104b, 0x104e104d, 0x1079606f,
+    0x0000107a, 0x6400006e, 0x1021200f, 0x10254024, 0x25570000, 0x78507710, 0x45000050, 0x00004024,
+    0x29502860, 0x01000010, 0x00a008e1, 0xe9044f84, 0x2dd2e2c7, 0xfb66d9a9, 0x0c004222, 0x7c230160,
+    0x907e5b01, 0x23008081, 0x1c020181, 0x01870194, 0x8b018752, 0x1c028001, 0x97157c18, 0x157e0801,
+    0x8100019a, 0x01901001, 0x472c019f, 0x01a5000a, 0x01a5100a, 0x442c01ab, 0xb72801b1, 0x01400201,
+    0x0701b101, 0x058b2ef0, 0x80156700, 0x0016608a, 0x65726162, 0x746f6f66, 0x60961246, 0x00000000,
+    0x00000001, 0x0000011c, 0x00000000, 0x000000cf, 0xa1dc51bf, 0xeddd574e, 0x00000000, 0x00000000,
+};
+// ASTRO BOT (build of Base460 J03093718): psr_morton_initialize_indirect_args_top
+static const uint32_t kPsrAstroInitializeIndirectArgsTop[] = {
+    0xd7460000, 0x04010c02, 0xbe8303ff, 0x00016204, 0xbe811d92, 0xb0020050, 0x36020087, 0x7d8602f9,
+    0x06868481, 0x7d880283, 0x87ea6a04, 0x020302f9, 0x86860680, 0xe0702000, 0x80000100, 0xbf810000,
+    0x30306c73, 0x00000046, 0x00000060, 0x00000000, 0x100401a6, 0x100b100a, 0x4040100c, 0x104b2042,
+    0x104d104c, 0x606f104e, 0x107a1079, 0x00001085, 0x5400006e, 0x00001025, 0xa0020061, 0x12b3c000,
+    0x08330802, 0x44104230, 0x01014002, 0xa80b0142, 0x00049846, 0x80800a38, 0xee2040c0, 0x0bc198fb,
+    0x65726162, 0x746f6f66, 0x23c9d186, 0x00000000, 0x00000001, 0x00000040, 0x00000000, 0x00000060,
+    0xf406bb22, 0xb8263dee, 0x00000000, 0x00000000,
+};
+// Gran Turismo 7 (Base515): psr_morton_capture_memory
+static const uint32_t kPsrGt7CaptureMemory[] = {
+    0xbf810000, 0x00000000, 0x00000000, 0x00000000, 0x30306c73, 0x0000007d, 0x00000099, 0x00000000,
+    0x00102557, 0x0401a600, 0x0b100a10, 0x40100c10, 0x4b204240, 0x4d104c10, 0x6f104e10, 0x7a107960,
+    0x90108510, 0x00109110, 0x00006e00, 0x21200f64, 0x25402410, 0x65000010, 0x40241021, 0x21640000,
+    0x00402410, 0x50286000, 0x00001029, 0x20002061, 0x0202b3c0, 0x4e025508, 0x67476510, 0x65106500,
+    0x0a3c206a, 0x10076e00, 0x3920726e, 0x027b1577, 0x77010101, 0x5de00e01, 0x5c000382, 0x80808009,
+    0xdeea2040, 0x0108c59c, 0x00000001, 0x00000000, 0x65726162, 0x746f6f66, 0x003b7f95, 0x00000000,
+    0x00000001, 0x00000004, 0x00000000, 0x00000099, 0xc4d40376, 0x88a72f6a, 0x00000000, 0x00000000,
+};
+
+// The library's shaders are recognized by their code in the builds whose shaders are all known.
+static void TestPsrCodeRecognition() {
+  namespace Psr = Libs::Graphics::Psr;
+  using Psr::Generation;
+  using Psr::Shader;
+  const auto is = [](std::span<const uint32_t> binary, Generation generation, Shader shader) {
+    const auto match = Psr::IdentifyCode(binary);
+    return match.generation == generation && match.shader == shader;
+  };
+  const auto fingerprint = [](std::span<const uint32_t> binary) { return Psr::CodeFingerprint(binary); };
+  Check(is(kPsrGta011CaptureMemory, Generation::Base460, Shader::MortonCaptureMemory),
+        "Psr: psr_morton_capture_memory of GTA V 01.011 is not recognized");
+  Check(is(kPsrGta011InitializeIndirectArgsTop, Generation::Base460, Shader::MortonInitializeIndirectArgsTop),
+        "Psr: psr_morton_initialize_indirect_args_top of GTA V 01.011 is not recognized");
+  Check(is(kPsrGta011InitializeIndirectArgsTopTrinity, Generation::Base460, Shader::MortonInitializeIndirectArgsTop),
+        "Psr: a copy of a pass under another name is not taken for that pass");
+  Check(is(kPsrGta011FanRefitCopyDispatchArgs, Generation::Base460, Shader::QbvhFanRefitCopyDispatchArgs),
+        "Psr: psr_qbvh_fan_refit_copy_dispatch_args of GTA V 01.011 is not recognized");
+  // GTA V 01.005: an older build (generation Base252), same code or not.
+  Check(is(kPsrGta005CaptureMemory, Generation::Base252, Shader::MortonCaptureMemory) &&
+            fingerprint(kPsrGta005CaptureMemory) == fingerprint(kPsrGta011CaptureMemory),
+        "Psr: morton_capture_memory of GTA V 01.005 is not recognized");
+  Check(is(kPsrGta005FanRefitCopyDispatchArgs, Generation::Base252, Shader::QbvhFanRefitCopyDispatchArgs),
+        "Psr: qbvh_fan_refit_copy_dispatch_args of GTA V 01.005 is not recognized");
+  // Builds whose replacements are not enabled are not recognized, even with the same code.
+  Check(fingerprint(kPsrAstroInitializeIndirectArgsTop) == fingerprint(kPsrGta011InitializeIndirectArgsTop) &&
+            is(kPsrAstroInitializeIndirectArgsTop, Generation::Unknown, Shader::None),
+        "Psr: a shader of ASTRO BOT's build is recognized");
+  Check(fingerprint(kPsrGt7CaptureMemory) == fingerprint(kPsrGta011CaptureMemory) &&
+            is(kPsrGt7CaptureMemory, Generation::Unknown, Shader::None),
+        "Psr: a shader of Gran Turismo 7's build is recognized");
+
+  // The fingerprint does not depend on registers, order or constants added to the PC.
+  constexpr uint32_t EndPgm = 0xbf810000u;
+  const uint32_t moves[] = {0xbe800301u /* s_mov_b32 s0, s1 */, 0x7e000301u /* v_mov_b32 v0, v1 */, EndPgm};
+  const uint32_t other_moves[] = {0x7e0a0307u /* v_mov_b32 v5, v7 */, 0xbe820303u /* s_mov_b32 s2, s3 */,
+                                  EndPgm};
+  const uint32_t one[] = {0xbe800381u /* s_mov_b32 s0, 1 */, 0x7e000301u, EndPgm};
+  const uint32_t two[] = {0xbe800382u /* s_mov_b32 s0, 2 */, 0x7e000301u, EndPgm};
+  const uint32_t no_end[] = {0xbe800301u, 0x7e000301u};
+  const uint32_t front[] = {0xbe802000u /* s_setpc_b64 s[0:1] */, EndPgm};
+  Check(fingerprint(moves) != 0 && fingerprint(moves) == fingerprint(other_moves),
+        "Psr: the fingerprint depends on registers or on the order of the instructions");
+  Check(fingerprint(one) != fingerprint(moves) && fingerprint(one) != fingerprint(two),
+        "Psr: the fingerprint ignores operands or constants");
+  Check(fingerprint(no_end) == 0 && fingerprint(front) == 0,
+        "Psr: code without s_endpgm or that jumps to another program has a fingerprint");
+  // s_getpc_b64 s[0:1]; s_add_u32 s0, s0, <constant>; s_addc_u32 s1, s1, 0; s_endpgm
+  const uint32_t pc_a[] = {0xbe801f00u, 0x8000ff00u, 0x00001234u, 0x82018001u, EndPgm};
+  const uint32_t pc_b[] = {0xbe801f00u, 0x8000ff00u, 0x00005678u, 0x82018001u, EndPgm};
+  // The same additions without s_getpc_b64.
+  const uint32_t add_a[] = {0x8000ff00u, 0x00001234u, 0x82018001u, EndPgm};
+  const uint32_t add_b[] = {0x8000ff00u, 0x00005678u, 0x82018001u, EndPgm};
+  Check(fingerprint(pc_a) == fingerprint(pc_b) && fingerprint(add_a) != fingerprint(add_b),
+        "Psr: the fingerprint depends on where the code is or ignores constants");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 

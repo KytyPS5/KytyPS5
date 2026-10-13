@@ -399,6 +399,46 @@ void TestHostCopyQueue() {
 	Check(targets == sources, "every copy lands");
 }
 
+// CopyInline() copies from a source the caller reuses at once, across several laps of its ring,
+// and mixes with plain copies; sources larger than a ring chunk are copied directly.
+void TestHostCopyQueueInline() {
+	constexpr size_t     Copies = 60000;
+	constexpr size_t     Bytes  = 520;
+	std::vector<uint8_t> expected(Copies * Bytes);
+	std::vector<uint8_t> targets(Copies * Bytes, 0);
+	std::vector<uint8_t> plain(Bytes);
+	std::vector<uint8_t> scratch(Bytes);
+	Libs::Graphics::HostCopyQueue queue;
+	for (size_t i = 0; i < Copies; i++) {
+		for (size_t k = 0; k < Bytes; k++) {
+			scratch[k] = static_cast<uint8_t>(i * 31 + k * 7 + k / 13);
+		}
+		std::memcpy(expected.data() + i * Bytes, scratch.data(), Bytes);
+		if (i % 7 == 3) {
+			// A plain copy from a source that stays put.
+			std::memcpy(plain.data(), scratch.data(), Bytes);
+			queue.Copy(targets.data() + i * Bytes, plain.data(), Bytes);
+			queue.Drain();
+		} else {
+			queue.CopyInline(targets.data() + i * Bytes, scratch.data(), Bytes);
+		}
+		// The caller overwrites its source right away.
+		std::memset(scratch.data(), 0xcd, Bytes);
+		if (i % 5 == 0) {
+			(void)queue.Flush();
+		}
+		if (i % 20000 == 0) {
+			Stall(std::chrono::milliseconds(3));
+		}
+	}
+	std::vector<uint8_t> large(size_t {200} << 10u, 0x5a);
+	std::vector<uint8_t> large_target(large.size(), 0);
+	queue.CopyInline(large_target.data(), large.data(), large.size());
+	queue.Drain();
+	Check(targets == expected, "every inline copy lands with the bytes of its call");
+	Check(large_target == large, "a large inline copy lands");
+}
+
 } // namespace
 
 
@@ -555,6 +595,7 @@ int main() {
 	TestProgressCounter();
 	TestInlineFunction();
 	TestHostCopyQueue();
+	TestHostCopyQueueInline();
 	TestOcclusionCounters();
 	TestPackedColorClear16();
 	std::printf("GpuPipelineTests: all tests passed\n");

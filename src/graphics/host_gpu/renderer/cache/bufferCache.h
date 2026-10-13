@@ -93,6 +93,9 @@ public:
 	// Copies guest memory into the mapped stream buffer, possibly on the host copy thread (see
 	// CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
+	// Copies host data into the stream buffer (on the host copy thread from the execution thread)
+	// and returns its offset there.
+	[[nodiscard]] uint64_t StreamUpload(const void* data, uint64_t size, uint64_t alignment);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);

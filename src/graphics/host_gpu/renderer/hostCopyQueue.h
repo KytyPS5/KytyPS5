@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_HOSTCOPYQUEUE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_HOSTCOPYQUEUE_H_
 
+#include "common/alignment.h"
 #include "common/common.h"
 #include "common/spscQueue.h"
 
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <immintrin.h>
+#include <memory>
 #include <thread>
 #include <utility>
 
@@ -25,6 +27,11 @@ namespace Libs::Graphics {
 // The producer must wait for its copies before anything may read their destinations (a queue
 // submission, through Flush() and WaitFor() on the submitting thread) and before the guest may
 // legally overwrite their sources (any guest-visible effect, through Drain()).
+//
+// The destinations are mapped device memory, which the CPU writes combined: a fence or a locked
+// instruction on the writing thread waits until those writes drained over the bus. The producer
+// fences on every operation it takes from its queue, so it hands even small writes to the copy
+// thread; CopyInline() first copies sources that do not outlive the call into a ring of its own.
 class HostCopyQueue {
 public:
 	static constexpr size_t BatchSize = 8;
@@ -55,6 +62,23 @@ public:
 			(void)Flush();
 		}
 	}
+	// Producer: queues a copy of `size` bytes from a source that may change once this returns.
+	// The bytes go through a ring of cached host memory that the copy thread copies from.
+	void CopyInline(void* destination, const void* source, size_t size) {
+		if (size > RingChunkSize) {
+			std::memcpy(destination, source, size);
+			return;
+		}
+		if (m_ring_offset + size > RingChunkSize) {
+			NextRingChunk();
+		}
+		auto* staged = m_ring.get() + m_ring_chunk * RingChunkSize + m_ring_offset;
+		std::memcpy(staged, source, size);
+		m_ring_offset += Common::AlignUp(size, size_t {16});
+		// The copy queued below is the (m_queued + m_pending.count + 1)-th one.
+		m_ring_users[m_ring_chunk] = m_queued + m_pending.count + 1;
+		Copy(destination, staged, size);
+	}
 	// Producer: hands the gathered copies to the copy thread; returns the number of copies
 	// queued so far.
 	uint64_t Flush() {
@@ -76,6 +100,20 @@ public:
 	}
 
 private:
+	static constexpr size_t RingChunkSize = size_t {128} << 10u;
+	static constexpr size_t RingChunks    = 64;
+
+	void NextRingChunk() {
+		m_ring_chunk  = (m_ring_chunk + 1) % RingChunks;
+		m_ring_offset = 0;
+		// The last copy that reads the chunk must have completed before it is rewritten; it
+		// completed long ago unless the copy thread fell a whole ring behind.
+		if (const auto user = m_ring_users[m_ring_chunk]; user != 0 && m_completed.Load() < user) {
+			(void)Flush();
+			m_completed.WaitFor(user);
+		}
+	}
+
 	struct Job {
 		void*       destination = nullptr;
 		const void* source      = nullptr;
@@ -118,6 +156,11 @@ private:
 	// Producer side.
 	alignas(64) Batch m_pending;
 	uint64_t    m_queued = 0;
+	// CopyInline() sources, in chunks; each chunk remembers the last copy that reads it.
+	std::unique_ptr<std::byte[]>     m_ring = std::make_unique<std::byte[]>(RingChunkSize * RingChunks);
+	std::array<uint64_t, RingChunks> m_ring_users {};
+	size_t                           m_ring_chunk  = 0;
+	size_t                           m_ring_offset = 0;
 	std::thread m_thread;
 };
 

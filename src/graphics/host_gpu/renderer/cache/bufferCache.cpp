@@ -567,13 +567,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 }
 
 void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size) {
-	// The execution thread hands larger copies to the host copy thread. It reads the backing
+	// The execution thread hands its copies to the host copy thread (see HostCopyQueue: writing
+	// the stream buffer itself would stall it on its next fence). The copy reads the backing
 	// store, which holds the same bytes as the guest range and is never protected, so a copy that
 	// runs after a later draw protected the range for GPU writes does not fault.
-	constexpr uint64_t MinHostCopy = 256;
-	auto*              copies      = m_scheduler.HostCopies();
-	if (copies != nullptr && size >= MinHostCopy && m_stream_buffer.IsCoherent() &&
-	    GuestGpu::IsGpuThread()) {
+	auto* copies = m_scheduler.HostCopies();
+	if (copies != nullptr && m_stream_buffer.IsCoherent() && GuestGpu::IsGpuThread()) {
 		if (const void* source = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size)) {
 			copies->Copy(destination, source, size);
 			return;
@@ -585,6 +584,18 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 	    !LibKernel::Memory::CopySparseMemory(vaddr, destination, size)) {
 		EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 	}
+}
+
+uint64_t BufferCache::StreamUpload(const void* data, uint64_t size, uint64_t alignment) {
+	auto* copies = m_scheduler.HostCopies();
+	if (copies == nullptr || !m_stream_buffer.IsCoherent() || !GuestGpu::IsGpuThread()) {
+		return m_stream_buffer.Copy(data, size, alignment);
+	}
+	const auto [mapped, offset] = m_stream_buffer.Map(size, alignment);
+	EXIT_IF(mapped == nullptr);
+	copies->CopyInline(mapped, data, size);
+	m_stream_buffer.Commit();
+	return offset;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -1262,8 +1273,8 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 	}
 	// The cached buffer is what the GPU and later readbacks of the page use: give it the bytes
 	// at this point of the command stream.
-	auto&      stream = GetUtilityBuffer(MemoryUsage::Stream);
-	const auto offset = stream.Copy(data, size, 4);
+	auto&      stream  = GetUtilityBuffer(MemoryUsage::Stream);
+	const auto offset  = StreamUpload(data, size, 4);
 	auto&      command = m_scheduler.Current();
 	command.EndRendering();
 	const auto native = command.Handle();

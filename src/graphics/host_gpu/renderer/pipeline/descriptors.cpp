@@ -1102,8 +1102,9 @@ vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledSh
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
                                              std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
-	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
+	auto&      cache  = context.GetBufferCache();
+	const auto offset = cache.StreamUpload(data.data(), data.size_bytes(), 256);
+	auto&      buffer = cache.GetUtilityBuffer(MemoryUsage::Stream);
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 

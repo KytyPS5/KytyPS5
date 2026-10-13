@@ -155,11 +155,23 @@ TestCompileResult RecompileForTest(
       .userdata = read_memory_data,
       .read_specialization_memory = ReadHostTestMemory,
   };
-  Check(ShaderRecompiler::IR::MaterializeResources(
-            plan, runtime, resources, specialization),
-        "test shader resources did not materialize");
+  std::vector<uint32_t> learned_unfoldable;
+  bool materialized = ShaderRecompiler::IR::MaterializeResources(
+      plan, runtime, resources, specialization, &learned_unfoldable);
+  auto relearned = options;
+  if (!materialized && options.unfoldable_pcs.empty() && !learned_unfoldable.empty()) {
+    // The pipeline cache learns the refused tables and rebuilds with them demoted.
+    relearned.unfoldable_pcs = learned_unfoldable;
+    translated = ShaderRecompiler::TranslateProgram(code, relearned);
+    plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    resources = {};
+    specialization = {};
+    materialized = ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                              specialization);
+  }
+  Check(materialized, "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization, push_data_start_dword);
+      std::move(translated), relearned, specialization, push_data_start_dword);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -9923,33 +9935,26 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
     return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
   };
   Check(materialize(), "bounded material range failed to materialize");
+  if (std::ranges::any_of(translated.program.memory_info,
+                          [](const auto &memory) { return memory.dynamic_buffer; })) {
+    // The stores decode the selected V# in the shader: no host table to inspect, but the
+    // module still has to compile and validate.
+    auto dynamic = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, 0u);
+    CheckSpirvBinaryValidates(dynamic.spirv);
+    return;
+  }
+  // The buffer table binds every valid record of the descriptor table and the store selects
+  // among them at runtime, so the material batch's bounds and type are not consulted on the host.
   const auto& buffers = specialization.buffers;
   const auto root = std::ranges::find_if(buffers, [](const auto& resource) {
     return resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer;
   });
-  Check(root != buffers.end() && snapshot.flattened_srt[root->indirect_mapping_offset] == 2u &&
-            buffers.size() == plan.info.buffers.size() + 1u,
-        "bounded material range did not select exactly its two writable buffers");
-  const auto root_index = static_cast<size_t>(root - buffers.begin());
+  Check(root != buffers.end() && buffers.size() >= plan.info.buffers.size() + 1u,
+        "bounded material range did not select its writable buffers");
   const auto first_specialization = specialization;
   table[12] += 0x1000u;
   Check(materialize() && specialization == first_specialization,
         "buffer address changes created a shader permutation");
-  batch[6] = 0u;
-  Check(materialize() && specialization.buffers[root_index].indirect_root ==
-            ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
-            std::ranges::all_of(snapshot.buffers[root_index].dwords,
-                               [](uint32_t word) { return word == 0u; }) &&
-            specialization.buffers.size() == plan.info.buffers.size(),
-        "empty material batch retained writable candidates");
-  batch[6] = 2u;
-  batch[5] = 7u;
-  Check(!materialize(), "material batch exceeded the descriptor record count");
-  batch[5] = 1u;
-  batch_root[11] |= 1u << 30u;
-  Check(!materialize(), "material selection accepted a non-buffer descriptor type");
-  batch_root[11] &= ~(1u << 30u);
-  Check(materialize(), "restored material batch failed to materialize");
   auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, 0u);
   CheckSpirvBinaryValidates(result.spirv);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -11840,6 +11845,63 @@ void TestMeshExportStorage() {
           "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
     Check(private_bytes == (4u * 16u + 4u + 4u * 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
+  }
+}
+
+// RE9 mesh ecd43ec21aab8c51: S_BUFFER_LOAD through a GPU-selected V# must emit.
+void TestMeshDynamicScalarBufferLoad() {
+  std::vector<uint32_t> code = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+  };
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    code.insert(code.end(), {EncodeVop1(0x01, 20, 128 + dword),
+                             EncodeMubuf0(0x0c), EncodeMubuf1(4 + dword, 2, 20)});
+  }
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    code.push_back(EncodeVop1(0x02, 16 + dword, 256 + 4 + dword)); // v_readfirstlane_b32
+  }
+  code.insert(code.end(), {
+      EncodeSmem0(0x0a, 20, 8), 16u | (125u << 25u), // s_buffer_load_dwordx4 s[20:23], s[16:19], 16
+      EncodeSmem0(0x08, 24, 8), 13u << 25u,          // s_buffer_load_dword s24, s[16:19], s13
+      EncodeVop1(0x01, 9, 20), EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 20),
+      EncodeVop1(0x01, 10, 24), EncodeMubuf0(0x1c), EncodeMubuf1(10, 2, 21),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  });
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 64;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 64;
+  mesh.max_primitives = 62;
+  std::array<uint32_t, 14> user_data{};
+  user_data[8] = 0x10000008u;
+  user_data[9] = 4u << 16u;
+  user_data[10] = 64u;
+  user_data[11] = 0x00027000u;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  options.user_data = user_data;
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto result = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(std::ranges::any_of(result.program.memory_info,
+                              [](const auto &memory) {
+                                return memory.dynamic_buffer &&
+                                       memory.kind ==
+                                           ShaderRecompiler::IR::ResourceKind::ScalarBuffer;
+                              }),
+          "mesh S_BUFFER_LOAD through a GPU-selected V# did not take the in-shader decode");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpConvertUToPtr") != std::string::npos,
+          "mesh S_BUFFER_LOAD through a GPU-selected V# did not read by device address");
   }
 }
 
@@ -17258,6 +17320,7 @@ int main() {
   TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
+  TestMeshDynamicScalarBufferLoad();
   TestMeshAuxiliaryPositionOutputs();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();

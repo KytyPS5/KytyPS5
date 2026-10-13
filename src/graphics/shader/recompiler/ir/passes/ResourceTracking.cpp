@@ -476,6 +476,7 @@ public:
 		m_cyclic_entries.program = &m_program;
 		PlanIndirectDescriptors();
 		PlanIndirectBuffers();
+		DemoteRefusedTables();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (!Collect(inst)) {
@@ -1450,6 +1451,38 @@ private:
 			}
 		}
 		return true;
+	}
+
+	static bool IsDynamicMemoryOrigin(Value value, uint32_t depth = 0) {
+		if (depth > 8) {
+			return false;
+		}
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return false;
+		}
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::LoadAddressU32 ||
+		    BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None) {
+			return true;
+		}
+		for (size_t i = 0; i < inst->NumArgs(); i++) {
+			if (IsDynamicMemoryOrigin(inst->Arg(i), depth + 1)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static bool IsDynamicDescriptor(const DescriptorSource& descriptor) {
+		for (uint32_t i = 0; i < descriptor.dword_count; i++) {
+			if (IsDynamicMemoryOrigin(descriptor.dwords[i])) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	uint32_t InternSource(const DescriptorSource& descriptor) {
@@ -3264,6 +3297,110 @@ private:
 		}
 	}
 
+	void DemoteRefusedTables() {
+		if (m_indirect_buffers.empty()) {
+			return;
+		}
+		// A table the materialization would refuse right now is demoted before the first
+		// translation binds it, so the shader is translated once instead of refused and rebuilt.
+		// Decided by the table's contents, never by its layout: a table of the same shape that
+		// fits stays an enumerated binding.
+		if (m_program.refuse_indirect_buffer_table) {
+			std::unordered_set<uint32_t> checked;
+			for (const auto& plan: m_indirect_buffers) {
+				if (m_demoted_tables.contains(plan.source) || !checked.insert(plan.source).second) {
+					continue;
+				}
+				if (m_program.refuse_indirect_buffer_table(m_program, m_sources, plan.source)) {
+					m_demoted_tables.insert(plan.source);
+				}
+			}
+		}
+		if (m_program.unfoldable_pcs.empty()) {
+			return;
+		}
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None ||
+				    inst.NumArgs() == 0u ||
+				    std::ranges::find(m_program.unfoldable_pcs, inst.Flags<MemoryFlags>().pc) ==
+				        m_program.unfoldable_pcs.end()) {
+					continue;
+				}
+				const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (const auto* plan = handle != nullptr ? FindIndirectBuffer(*handle) : nullptr;
+				    plan != nullptr) {
+					m_demoted_tables.insert(plan->source);
+				}
+			}
+		}
+	}
+
+	bool IsDemotedTable(const IndirectBufferPlan& plan) const {
+		return m_demoted_tables.contains(plan.source);
+	}
+
+	bool RejectFormattedDemotion(uint32_t pc) const {
+		return Reject(pc, "a refused buffer table's formatted access has no in-shader format "
+		                  "decode");
+	}
+
+	// A handle on a non-invariant loop phi: the one shape whose fixpoint a walk can fail to prove.
+	bool CarriesLoopPhi(const Inst& handle) const {
+		std::vector<const Inst*>        pending;
+		std::unordered_set<const Inst*> seen;
+		const auto                      push = [&](const Inst& inst) {
+			for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+				if (const auto* operand = inst.Arg(arg).Resolve().TryInstruction(); operand != nullptr) {
+					pending.push_back(operand);
+				}
+			}
+		};
+		push(handle);
+		while (!pending.empty() && seen.size() < 256u) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (!seen.insert(inst).second) {
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				if (ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(inst))).IsEmpty()) {
+					return true;
+				}
+				continue;
+			}
+			push(*inst);
+		}
+		return false;
+	}
+
+	bool TakeDynamicBuffer(const Inst* root, const MemoryInfo& memory, uint32_t index,
+	                       BufferAccess buffer, uint32_t pc) {
+		if (root == nullptr || root->GetOpcode() != ValueOpcode::GetBufferResource) {
+			return false;
+		}
+		DescriptorSource descriptor;
+		MakeSource(*root, 4u, false, false, memory.resource * 4u, descriptor, pc);
+		if (!IsDynamicDescriptor(descriptor)) {
+			return false;
+		}
+		m_program.memory_info[index].dynamic_buffer = true;
+		m_info.uses_dma                             = true;
+		if (DmaPointer pointer;
+		    buffer != BufferAccess::Read && RelativeWriteDecode() &&
+		    RelativeStoreHandle(*root, &pointer) &&
+		    std::ranges::find(m_info.dma_pointers, pointer) == m_info.dma_pointers.end()) {
+			m_info.dma_pointers.push_back(pointer);
+		}
+		if (buffer != BufferAccess::Read) {
+			// The store-pointer helper is only emitted, and its writable set only published,
+			// when the program declares that it writes through DMA.
+			m_program.has_address_writes = true;
+			m_info.writes_dma            = true;
+		}
+		return true;
+	}
+
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
 	               uint32_t base_reg, Inst*& handle, uint32_t& source, bool sampler = false,
 	               bool sample_adjust = false) {
@@ -3548,11 +3685,9 @@ private:
 			};
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				// Two mechanisms, layered narrow-first. Decoding the V# in the shader over a raw
-				// device pointer needs no host-visible descriptor but only serves an unformatted,
-				// untyped DWORD x2/x3/x4 load, so it goes first. Resolving the table on the host into
-				// real, deduped bindings covers what that cannot express, so it picks up the rest
-				// rather than competing for the same accesses.
+				// Three mechanisms, layered narrow-first: each takes only what the ones above it
+				// cannot express, so no access that resolves today moves onto a wider one.
+				// 1. A raw, unformatted DWORD x2/x3/x4 load decodes the V# over a device pointer.
 				const bool raw_multi_dword = op == ValueOpcode::LoadBufferU32x2 ||
 				                             op == ValueOpcode::LoadBufferU32x3 ||
 				                             op == ValueOpcode::LoadBufferU32x4;
@@ -3564,21 +3699,53 @@ private:
 				}
 				auto*       root     = inst.Arg(0).Resolve().TryInstruction();
 				const auto* indirect = root != nullptr ? FindIndirectBuffer(*root) : nullptr;
-				if (indirect == nullptr) {
+				if (indirect == nullptr || IsDemotedTable(*indirect)) {
+					if (indirect != nullptr && (memory.formatted || memory.typed)) {
+						// Only 4 decodes a format in the shader.
+						return take_indirect_load() || RejectFormattedDemotion(flags.pc);
+					}
+					// 3. Any other descriptor sourced from memory: decode the V# with full
+					// addressing, reaching the stores, atomics, subword and formatted accesses 1
+					// and 2 cannot.
+					if (TakeDynamicBuffer(root, memory, flags.index, buffer, flags.pc)) {
+						return true;
+					}
 					if (indirect == nullptr && take_indirect_load()) {
 						return true;
 					}
 					return Reject(flags.pc,
-					              fmt::format("{}; neither mechanism takes it: GPU-selected access "
-					                          "requires a raw DWORD x2/x3/x4 load or a recognisable "
-					                          "table",
+					              fmt::format("{}; no mechanism takes it: GPU-selected access "
+					                          "requires a raw DWORD x2/x3/x4 load, a recognisable "
+					                          "table, or descriptor dwords sourced from memory",
 					                          m_deferred_reject.empty()
 					                              ? "buffer descriptor is not a valid runtime value"
 					                              : m_deferred_reject));
 				}
+				// 2. A recognisable table resolves on the host into real, deduped bindings.
 				handle = root;
 				source = indirect->source;
 				m_applied_indirect_buffers.insert(root);
+			} else if (auto* carried = inst.Arg(0).Resolve().TryInstruction(); carried != nullptr) {
+				// A plan outlives a successful GetHandle only when its selector carries a phi the
+				// recognizer could not fold: it declines whenever the descriptor validates and the
+				// selector does not vary. The validator accepted that phi as the value the loop is
+				// entered with and left the evaluator to prove a fixpoint a cursor never reaches,
+				// so bind the table rather than the one record the first iteration selects.
+				if (const auto* planned = FindIndirectBuffer(*carried); planned != nullptr) {
+					if (IsDemotedTable(*planned)) {
+						if (memory.formatted || memory.typed) {
+							return RejectFormattedDemotion(flags.pc);
+						}
+						if (TakeDynamicBuffer(carried, memory, flags.index, buffer, flags.pc)) {
+							return true;
+						}
+						return Reject(flags.pc, "a refused buffer table's descriptor is not "
+						                        "sourced from memory");
+					}
+					handle = carried;
+					source = planned->source;
+					m_applied_indirect_buffers.insert(carried);
+				}
 			}
 			if (handle != nullptr && !m_applied_indirect_buffers.contains(handle) &&
 			    ReadsUnfoldableScalar(*handle) &&
@@ -3744,8 +3911,9 @@ private:
 	std::vector<IndirectDescriptorPlan>        m_indirect_descriptors;
 	std::map<const Inst*, Value>               m_descriptor_values;
 	bool                                       m_shader_writes = false;
-	std::vector<IndirectBufferPlan> m_indirect_buffers;
-	std::unordered_set<const Inst*> m_applied_indirect_buffers;
+	std::vector<IndirectBufferPlan>            m_indirect_buffers;
+	std::unordered_set<const Inst*>            m_applied_indirect_buffers;
+	std::unordered_set<uint32_t>               m_demoted_tables;
 	// Why the last descriptor fold failed, kept only across the reclassification attempt that
 	// the failure hands off to.
 	std::string m_deferred_reject;

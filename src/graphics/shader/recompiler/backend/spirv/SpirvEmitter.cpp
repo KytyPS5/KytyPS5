@@ -74,6 +74,19 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 			              program.memory_info[index].kind == IR::ResourceKind::FlatLocal;
 		       });
 	};
+	// Any access whose V# the shader decodes from memory, stores and atomics included.
+	const auto dynamic_buffer_handle = [&](const IR::Inst& handle) {
+		return !handle.Uses().empty() &&
+		       std::ranges::any_of(handle.Uses(), [&](const IR::Use& use) {
+			       const auto op = use.user->GetOpcode();
+			       if (IR::BufferAccessOf(op) == IR::BufferAccess::None) {
+				       return false;
+			       }
+			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
+			       return index < program.memory_info.size() &&
+			              program.memory_info[index].dynamic_buffer;
+		       });
+	};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();
@@ -118,7 +131,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 			const auto dense = inst.Flags<uint32_t>();
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::GetBufferResource:
-					if (planning_only_handle(inst) || indirect_buffer_handle(inst)) {
+					if (planning_only_handle(inst) || indirect_buffer_handle(inst) ||
+					    dynamic_buffer_handle(inst)) {
 						break;
 					}
 					if (dense >= program.info.buffers.size()) {
@@ -458,10 +472,15 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				    Emitter::CoherentBufferAccess(memory)) {
 					requirements.coherent_buffers = true;
 				}
-				// A planning-only read is never tracked or emitted; its resource is still a register.
-				if (!memory.planning_only && memory.kind == IR::ResourceKind::Buffer) {
+				// A planning-only read is never tracked or emitted; its resource is still a
+				// register. A dynamic V# has no host resource for the checks below.
+				if (!memory.planning_only && memory.kind == IR::ResourceKind::Buffer &&
+				    !memory.dynamic_buffer) {
 					requirements.coherent_buffers |= memory.coherent;
-
+					// A glc DWORDX2 goes through the u64 alias as one access, see LoadWideBuffer.
+					if (memory.glc && IR::BufferComponentCount(inst.GetOpcode()) == 2u) {
+						requirements.wide_glc_buffers = true;
+					}
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}

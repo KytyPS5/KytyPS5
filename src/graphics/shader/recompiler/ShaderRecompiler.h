@@ -5,9 +5,11 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -34,6 +36,11 @@ struct CompileOptions {
 	// cannot re-evaluate. Empty on the first translate of a shader; the caller grows it when a
 	// draw reports a degrade and re-translates once. See ResourcePlan::unfoldable_pcs.
 	std::span<const uint32_t>   unfoldable_pcs;
+	// See Program::refuse_indirect_buffer_table. Read by resource tracking only, and dropped
+	// before TranslateProgram returns, so it may capture state that lives only for this call.
+	std::function<bool(const IR::Program& program, std::span<const IR::DescriptorSource> sources,
+	                   uint32_t source)>
+	    refuse_indirect_buffer_table;
 };
 
 // Why a guest shader could not be recompiled: a CFG-build or resource-tracking rejection that
@@ -93,6 +100,34 @@ void FlushCfgCacheFile();
 
 // Empties the in-memory cache and forgets any file. Tests only.
 void ResetCfgCacheForTest();
+// Decoded source and typed scalar call queries are retained once per cache source.
+struct ShaderSource {
+	struct Call {
+		uint32_t instruction;
+		std::array<IR::Value, 2> target;
+	};
+	struct Linked {
+		std::vector<uint32_t> code;
+		Decoder::Program decoded;
+		std::vector<uint32_t> observed_function;
+	};
+	std::vector<uint32_t> code;
+	Decoder::Program decoded;
+	IR::ResourcePlan call_targets;
+	std::optional<Call> call;
+	std::optional<Linked> linked;
+	uint64_t revision = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> reads;
+};
+
+[[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
+	                                           const CompileOptions& options);
+// Links the SWAPPC leaf when it can and returns the program to translate. A call it cannot link
+// returns `source.decoded` unchanged, whose S_SWAPPC_B64 the translator lowers to the any-hit
+// stub; callers translate the returned program rather than `source.linked`.
+const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
+[[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
+	                                           const CompileOptions& options);
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);

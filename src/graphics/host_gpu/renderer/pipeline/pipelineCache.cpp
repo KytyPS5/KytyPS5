@@ -673,7 +673,7 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct Permutation {
-		std::vector<uint32_t>                       function_code;
+		std::vector<uint32_t>                        function_code;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
@@ -682,16 +682,17 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct SourceEntry {
-		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
+		SourceEntry(ShaderRecompiler::IR::ResourcePlan              plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
 		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
 			permutations.reserve(8);
 		}
 
-		std::span<const uint32_t> FunctionCode() const {
-			return call_source
-			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
-			    : std::span<const uint32_t>{};
+		[[nodiscard]] std::span<const uint32_t> FunctionCode() const {
+			return call_source && call_source->linked
+			           ? std::span<const uint32_t>(call_source->linked->code)
+			                 .subspan(call_source->code.size())
+			           : std::span<const uint32_t> {};
 		}
 
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
@@ -701,33 +702,37 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
-		template <bool HasCalls>
-		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+		// Materialization is the caller's: it can fail, and a failure is reported and relearned
+		// there. A program with SWAPPC calls is also keyed on the callee code it was linked with.
+		Permutation* FindPermutation(uint32_t push_data_cursor, bool exact_start) {
 			for (auto& candidate: permutations) {
-				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords()) ||
-				    candidate.specialization != specialization) {
+				const auto& layout   = candidate.program.bindings;
+				const bool  start_ok = exact_start
+				                           ? layout.push_data_start_dword ==
+				                                 ShaderRecompiler::IR::PushData::StartFor(
+				                                     push_data_cursor, layout.ShaderDataDwords())
+				                           : ShaderRecompiler::IR::PushData::StartServes(
+				                                 layout.push_data_start_dword, push_data_cursor);
+				if (!start_ok || !ShaderRecompiler::IR::SpecializationServes(
+				                     candidate.specialization, specialization)) {
 					continue;
 				}
-				if constexpr (HasCalls) {
-					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+				if (call_source && !std::ranges::equal(candidate.function_code, FunctionCode())) {
+					continue;
 				}
 				return &candidate;
 			}
 			return nullptr;
 		}
 
+		// Retained only for a program with SWAPPC calls, whose linked callees follow guest memory.
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
-		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                     permutations;
-		ShaderRecompiler::IR::MaterializeMemoWays    memo;
-		ShaderRecompiler::IR::MaterializeMemoBackoff memo_backoff;
+		ShaderRecompiler::IR::ResourcePlan              resource_plan;
+		ShaderRecompiler::IR::ResourceSnapshot          resources;
+		ShaderRecompiler::IR::ResourceSpecialization    specialization;
+		std::vector<Permutation>                        permutations;
+		ShaderRecompiler::IR::MaterializeMemoWays       memo;
+		ShaderRecompiler::IR::MaterializeMemoBackoff    memo_backoff;
 		// Whether the walk after a miss records for the memo; false while the stage backs off.
 		bool memo_recording = false;
 	};
@@ -824,6 +829,21 @@ struct PipelineCache::ProgramCache {
 		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
 	}
 
+	// The materialization refused a descriptor it cannot resolve on the host, and the shader is
+	// translated again with that descriptor decoded in the shader. The draw that hit the refusal is
+	// served by the re-translation in the same call, so this is not a skip; ReportUnmaterialized
+	// still fires if the re-translation draws nothing. Its own dedupe set, so a later real skip of
+	// the same hash is not swallowed by this line.
+	void ReportRelearned(ShaderType stage, uint64_t hash, std::string_view reason, size_t pcs) {
+		if (!relearned_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("shader re-translated with {} descriptor source(s) decoded in the shader: "
+		                 "hash=0x{:016x} stage={} host materialization refused: {}",
+		                 pcs, hash, StageShortName(stage),
+		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
+	}
+
 	// A hardware ray-tracing intersect lowered to a constant miss: the shader runs, but its
 	// traced results are fabricated. Report each distinct hash once so the log says so.
 	void ReportStubbed(ShaderType stage, uint64_t hash) {
@@ -866,7 +886,8 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t                  push_data_start_dword,
+	                               std::span<const uint32_t> function_code) {
 		// Read before the program is moved into the compile: the two numbers that say why a module
 		// came out the size it did.
 		const bool dispatcher  = translated.program.dispatcher_fallback;
@@ -925,6 +946,26 @@ struct PipelineCache::ProgramCache {
 		++depth;
 		auto program = Get(params, input_info, push_data_cursor);
 		--depth;
+		return program;
+	}
+
+	// A materialization failed. When it named sources the channel had not proved yet, the shader
+	// is re-translated with them decoded in the shader and this draw is served by that; otherwise
+	// the draw is dropped and the next one tries again.
+	template <typename InputInfo>
+	ShaderProgram Unmaterialized(const ShaderParams& params, InputInfo& input_info,
+	                             uint32_t& push_data_cursor, ShaderType stage, uint64_t code_size,
+	                             uint64_t code_key, std::span<const uint32_t> reported) {
+		const std::string reason(ShaderRecompiler::IR::LastMaterializeFailure());
+		if (!unfoldable.Learn(code_size, code_key, reported)) {
+			ReportUnmaterialized(stage, params.hash);
+			return {};
+		}
+		ReportRelearned(stage, params.hash, reason, reported.size());
+		auto program = Relearned(params, input_info, push_data_cursor);
+		if (!program) {
+			ReportUnmaterialized(stage, params.hash);
+		}
 		return program;
 	}
 
@@ -994,42 +1035,37 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
-		if (entry != programs.end() && !MaterializeMemoHit(entry->second, runtime)) {
+		bool source_changed = false;
+		if (entry != programs.end() && entry->second.call_source) {
+			source_changed = entry->second.RefreshCallSource(runtime);
+			// The memo replays a walk of the plan it recorded, and a SWAPPC program's plan follows
+			// the callees its source links, so such a program always walks.
+			entry->second.memo_recording = false;
+		}
+		// A changed callee re-translates below before anything is materialized against its plan.
+		if (entry != programs.end() && !source_changed &&
+		    (entry->second.call_source || !MaterializeMemoHit(entry->second, runtime))) {
 			auto&      memo     = entry->second.memo;
 			const auto recorded = entry->second.memo_recording ? memo.Record(runtime) : runtime;
 			// Call unconditionally: EXIT_IF drops its argument under KYTY_FINAL.
 			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
-			        entry->second.specialization)) {
-				ReportUnmaterialized(stage, params.hash);
-				return {};
+			        entry->second.resource_plan, recorded, entry->second.resources,
+			        entry->second.specialization, &reported_unfoldable)) {
+				return Unmaterialized(params, input_info, push_data_cursor, stage, code_size, key(),
+				                      reported_unfoldable);
 			}
 			if (entry->second.memo_recording) {
 				memo.Commit(entry->second.resource_plan, entry->second.resources,
 				            entry->second.specialization);
 			}
 		}
-		if (entry != programs.end()) {
+		if (entry != programs.end() && !source_changed) {
 			KYTY_PROFILER_BLOCK("ProgramCache permutation search");
-			const auto search = [&](bool exact_start) {
-				return std::ranges::find_if(
-				    entry->second.permutations, [&](const Permutation& candidate) {
-					    const auto& layout = candidate.program.bindings;
-					    return (exact_start
-					                ? layout.push_data_start_dword ==
-					                      ShaderRecompiler::IR::PushData::StartFor(
-					                          push_data_cursor, layout.ShaderDataDwords())
-					                : ShaderRecompiler::IR::PushData::StartServes(
-					                      layout.push_data_start_dword, push_data_cursor)) &&
-					           ShaderRecompiler::IR::SpecializationServes(
-					               candidate.specialization, entry->second.specialization);
-				    });
-			};
-			auto permutation = search(true);
-			if (permutation == entry->second.permutations.end() && stage != ShaderType::Pixel) {
-				permutation = search(false);
+			auto* permutation = entry->second.FindPermutation(push_data_cursor, true);
+			if (permutation == nullptr && stage != ShaderType::Pixel) {
+				permutation = entry->second.FindPermutation(push_data_cursor, false);
 			}
-			if (permutation != entry->second.permutations.end()) {
+			if (permutation != nullptr) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -1118,7 +1154,43 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		// Tracking asks the guest memory of this dispatch whether a recognised descriptor table
+		// would be refused, so such a table is decoded in the shader by this one translation
+		// instead of being refused by the materialization below and translated a second time.
+		static const bool no_table_check = EnvSwitch("KYTY_NO_FIRST_DISPATCH_TABLE_CHECK");
+		if (!no_table_check) {
+			options.refuse_indirect_buffer_table =
+			    [&runtime](const ShaderRecompiler::IR::Program&                    program,
+			               std::span<const ShaderRecompiler::IR::DescriptorSource> sources,
+			               uint32_t                                                source) {
+				    return ShaderRecompiler::IR::IndirectBufferTableRefused(program, sources,
+				                                                            source, runtime);
+			    };
+		}
+		// Decoded once per cache source; a program with SWAPPC calls keeps its source so later
+		// dispatches can follow the callees it links.
+		ShaderRecompiler::ShaderSource source;
+		if (entry == programs.end()) {
+			source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		}
+		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
+		ShaderRecompiler::TranslateResult translated;
+		if (current != nullptr) {
+			if (current->call) {
+				if (entry == programs.end()) {
+					ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				}
+				// An unlinked call falls back to the any-hit stub in the plain program.
+				translated = ShaderRecompiler::TranslateProgram(
+				    current->linked ? current->linked->decoded : current->decoded, options);
+				translated.program.source_reads = current->reads;
+			} else {
+				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+			}
+		} else {
+			translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		}
+		options.refuse_indirect_buffer_table = nullptr;
 		// A rejected recompile leaves no usable program: a CFG-build rejection returns an empty
 		// one, and resource tracking rewrites the program in place so a rejected pass leaves it
 		// half-written - extracting a plan from that indexes past the end of a resource list.
@@ -1136,17 +1208,38 @@ struct PipelineCache::ProgramCache {
 			ReportCallStubbed(stage, params.hash);
 		}
 		if (entry == programs.end()) {
+			auto retained =
+			    source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
+			                : nullptr;
 			entry = programs
 			            .try_emplace(lookup_key,
-			                         ShaderRecompiler::IR::ExtractResourcePlan(translated.program))
+			                         ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+			                         std::move(retained))
 			            .first;
 			// A rejected plan is still cached: MaterializeResources fails on it again, so later
 			// draws take the cheap cached path instead of re-translating the shader every time.
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
-			        entry->second.specialization)) {
-				ReportUnmaterialized(stage, params.hash);
-				return {};
+			        entry->second.specialization, &reported_unfoldable)) {
+				return Unmaterialized(params, input_info, push_data_cursor, stage, code_size, key(),
+				                      reported_unfoldable);
+			}
+		} else if (source_changed) {
+			// The callees changed: the plan follows the re-linked program, and a permutation built
+			// for the same callee code may already serve it.
+			entry->second.resource_plan =
+			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization, &reported_unfoldable)) {
+				return Unmaterialized(params, input_info, push_data_cursor, stage, code_size, key(),
+				                      reported_unfoldable);
+			}
+			if (const auto* permutation = entry->second.FindPermutation(push_data_cursor, true)) {
+				input_info.stage = {.program   = &permutation->program,
+				                    .resources = &entry->second.resources};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				return permutation->handle;
 			}
 		}
 		// Whether this permutation exists only because the unfoldable channel asked for it. Read
@@ -1162,9 +1255,9 @@ struct PipelineCache::ProgramCache {
 			}
 			ShaderRecompiler::IR::InheritUnboundShapes(donors, specialization);
 		}
-		entry->second.permutations.push_back(
-		    CompilePermutation(stage_name, options, std::move(translated),
-		                       std::move(specialization), push_data_cursor));
+		entry->second.permutations.push_back(CompilePermutation(
+		    stage_name, options, std::move(translated), std::move(specialization), push_data_cursor,
+		    entry->second.FunctionCode()));
 		if (!entry->second.permutations.back().handle) {
 			auto rejected = std::move(entry->second.permutations.back());
 			entry->second.permutations.pop_back();
@@ -1304,6 +1397,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<uint64_t> reported_shaders;
 	std::unordered_set<uint64_t> stubbed_shaders;
 	std::unordered_set<uint64_t> call_stubbed_shaders;
+	std::unordered_set<uint64_t> relearned_shaders;
 	ProgramKey                   lookup_key;
 	// A vertex or pixel stage has no workgroup input to carry the host subgroup width, and the
 	// translator needs it to know whether a wave64 guest mask has an upper half at all.
@@ -1721,7 +1815,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 		}
 		const auto& blend = context.GetBlendControl(0);
-		const bool  export0_to_cb0 = pixel_info.target_slot[0] == 0;
+		const bool  export0_to_cb0 = ShaderPixelExportTarget(pixel_info.target_shader_mask, 0) == 0;
 		pixel_info.dual_source_blending =
 		    export0_to_cb0 && blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		    (BlendFactorIsDualSource(blend.color_srcblend) ||
@@ -1732,7 +1826,6 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			// MRT1 supplies the second blend source for target 0.
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
-			pixel_info.target_slot[1]           = 1;
 		} else if (export0_to_cb0 && blend.enable &&
 		           !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
@@ -1844,9 +1937,8 @@ void PipelineCache::GetStencilBitPrograms(const ShaderParams&         pixel_para
 	const auto& base = *pixel_info.stage.program;
 	if (HasShaderBufferWrites(pixel_info.stage) ||
 	    std::ranges::any_of(base.info.images, [](const auto& image) { return image.written; }) ||
-	    std::ranges::any_of(base.bindings.descriptors, [](const auto& binding) {
-		    return binding.kind == ShaderRecompiler::IR::DescriptorBindingKind::Gds;
-	    })) {
+	    base.bindings.descriptor_counts[static_cast<size_t>(
+	        ShaderRecompiler::IR::DescriptorBindingKind::Gds)] != 0) {
 		refuse();
 		return;
 	}

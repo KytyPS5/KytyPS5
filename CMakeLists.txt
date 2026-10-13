@@ -482,7 +482,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(resource_materialization_tests fmt::fmt xxhash Tracy::TracyClient xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
@@ -496,7 +496,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/IndexRangeFold.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(resource_tracking_tests fmt::fmt xxhash Tracy::TracyClient xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(unresolved_import_registration_tests EXCLUDE_FROM_ALL

@@ -77,51 +77,6 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 	return ret;
 }
 
-uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
-                                   uint32_t search_iterations, uint32_t default_resource) {
-	const auto LoadMapping = [&](uint32_t index) {
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
-		                          index);
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-		return value;
-	};
-	const auto mapping = ConstantU32(state, mapping_offset);
-	const auto count = LoadMapping(mapping);
-	const auto entry_at = [&](uint32_t index) {
-		return Binary(state, spv::OpIAdd, TypeU32(state), mapping,
-		              Binary(state, spv::OpIAdd, TypeU32(state),
-		                     Binary(state, spv::OpShiftLeftLogical, TypeU32(state), index,
-		                            ConstantU32(state, 1u)), ConstantU32(state, 1u)));
-	};
-	auto low = ConstantU32(state, 0u);
-	auto high = count;
-	for (uint32_t iteration = 0; iteration < search_iterations; ++iteration) {
-		const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
-		const auto mid = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
-		                        Binary(state, spv::OpIAdd, TypeU32(state), low, high),
-		                        ConstantU32(state, 1u));
-		const auto probe = Select(state, TypeU32(state), active, mid, ConstantU32(state, 0u));
-		const auto less = Binary(state, spv::OpULessThan, TypeBool(state),
-		                         LoadMapping(entry_at(probe)), key);
-		low = Select(state, TypeU32(state),
-		             Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less),
-		             Binary(state, spv::OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
-		high = Select(state, TypeU32(state),
-		              Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
-		                     Unary(state, spv::OpLogicalNot, TypeBool(state), less)), mid, high);
-	}
-	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), low, count);
-	const auto entry = entry_at(Select(state, TypeU32(state), in_range, low, ConstantU32(state, 0u)));
-	const auto match = Binary(state, spv::OpLogicalAnd, TypeBool(state), in_range,
-	                          Binary(state, spv::OpIEqual, TypeBool(state), LoadMapping(entry), key));
-	const auto resource = LoadMapping(Binary(state, spv::OpIAdd, TypeU32(state), entry,
-	                                         ConstantU32(state, 1u)));
-	return Select(state, TypeU32(state), match, resource, ConstantU32(state, default_resource));
-}
-
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,

@@ -43,6 +43,12 @@ uint32_t MappingOf(const ResourceSnapshot &snapshot, uint32_t slot) {
                                               : std::numeric_limits<uint32_t>::max();
 }
 
+// The null shape arms sit at the end of their table, so these indices hold.
+size_t Materialized(const ResourceSpecialization &specialization) {
+  return static_cast<size_t>(std::ranges::count_if(
+      specialization.images, [](const auto &image) { return !image.shape_padding; }));
+}
+
 bool SameResourceSnapshot(const ResourceSnapshot &lhs,
                           const ResourceSnapshot &rhs) {
   return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
@@ -58,20 +64,6 @@ bool EvaluateDescriptorSource(const ResourcePlan &program, uint32_t source,
   SrtWalker clean(program, CleanRuntime(runtime));
   SrtWalker walker(program, runtime, program.clean_flat_slots, &clean);
   return walker.EvaluateDescriptor(source, result);
-}
-
-// The null shape arms sit at the end of their table, so these indices hold.
-size_t Materialized(const ResourceSpecialization &specialization) {
-  return static_cast<size_t>(std::ranges::count_if(
-      specialization.images, [](const auto &image) { return !image.shape_padding; }));
-}
-
-bool SameResourceSnapshot(const ResourceSnapshot &lhs,
-                          const ResourceSnapshot &rhs) {
-  return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
-         lhs.samplers == rhs.samplers &&
-         lhs.flattened_srt == rhs.flattened_srt &&
-         lhs.user_data == rhs.user_data && lhs.uniform_fill == rhs.uniform_fill;
 }
 
 template <typename F>
@@ -363,7 +355,8 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
 }
 
 std::unique_ptr<Fixture> MakeIndirectBufferFixture(uint32_t record_stride,
-                                                   bool broken_offset) {
+                                                   bool broken_offset,
+                                                   bool formatted = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> heap_words;
   for (uint32_t dword = 0; dword < 4; dword++) {
@@ -396,6 +389,7 @@ std::unique_ptr<Fixture> MakeIndirectBufferFixture(uint32_t record_stride,
   const auto table = fixture->Buffer(table_words, 0x0270);
   MemoryInfo load;
   load.kind = ResourceKind::Buffer;
+  load.formatted = formatted;
   const auto value =
       fixture->Emit(ValueOpcode::LoadBufferU32,
                     {table, Value(0u), Value(0u), Value(0u), Value(true)},
@@ -453,29 +447,48 @@ void TestIndirectBufferMaterialization() {
                        snapshot.buffers[1].dwords.begin()),
         "single-candidate indirect buffer table did not materialize");
 
-  // A second distinct record - an empty slot counts, since it selects nothing -
-  // needs a runtime selection stage one cannot express.
-  const auto prior_snapshot = snapshot;
-  const auto prior_specialization = specialization;
+  // A second record is bound as its own dense buffer. An empty slot counts as a record but
+  // selects nothing, so it maps to ordinal 0 and adds no buffer.
+  const auto root_index = 1u;
   for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
     memory.words[word(0x1000u + kStride + 8u) + dword] = 0u;
   }
-  Check(!MaterializeResources(resource_plan, runtime, snapshot,
-                              specialization) &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
-        "a two-candidate indirect buffer table was accepted by stage one");
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "a table with an empty second record was refused");
+  Check(snapshot.buffers.size() == 3u &&
+            std::equal(descriptor.begin(), descriptor.end(),
+                       snapshot.buffers[2].dwords.begin()),
+        "the live record was not bound as its own dense buffer");
+  Check(std::all_of(snapshot.buffers[root_index].dwords.begin(),
+                    snapshot.buffers[root_index].dwords.end(),
+                    [](uint32_t dword) { return dword == 0u; }),
+        "the root binding still names memory a missed key could read");
 
-  // Two live descriptors split the table the same way.
+  // Two live descriptors split the table the same way, and each gets its own binding.
   memory.words[word(0x1000u + kStride + 8u)] = 0x1900u;
   memory.words[word(0x1000u + kStride + 8u) + 2u] = 64u;
   memory.words[word(0x1000u + kStride + 8u) + 3u] =
       Libs::Graphics::DstSel(4, 5, 6, 7);
-  Check(!MaterializeResources(resource_plan, runtime, snapshot,
-                              specialization) &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
-        "two live indirect buffer candidates were accepted by stage one");
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 4u,
+        "two live indirect buffer candidates were not both bound");
+
+  // The search reads a directory slot, and the slot holds the offset of this table's mapping,
+  // whose first word is the key count. One hop short and the search reads the directory itself.
+  const auto &root = specialization.buffers[root_index];
+  Check(root.indirect_root == root_index && root.indirect_search_iterations != 0u,
+        "the expanded table did not name itself as an indirect root");
+  Check(root.indirect_mapping_offset < snapshot.flattened_srt.size(),
+        "the directory slot is outside the flattened SRT");
+  const auto mapping = snapshot.flattened_srt[root.indirect_mapping_offset];
+  Check(mapping > root.indirect_mapping_offset &&
+            mapping < snapshot.flattened_srt.size(),
+        "the directory slot does not point past itself at a mapping");
+  Check(snapshot.flattened_srt[mapping] == 2u,
+        "the mapping does not begin with this table's key count");
+  Check(mapping + 1u + snapshot.flattened_srt[mapping] * 2u <=
+            snapshot.flattened_srt.size(),
+        "the key/ordinal pairs run past the end of the flattened SRT");
 
   // A table whose declared stride is neither the selector stride nor byte
   // addressing is refused rather than probed.
@@ -483,9 +496,236 @@ void TestIndirectBufferMaterialization() {
   Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization),
         "an indirect buffer table with a foreign stride was probed");
 
+  // A non-consecutive table read is beyond what the host can enumerate, so the access falls to
+  // the in-shader decode. What must not happen is it being bound as an ordinary buffer.
   auto broken = MakeIndirectBufferFixture(kStride, true);
-  CheckTrackingRejected(*broken, "not a valid runtime value",
-                        "a non-consecutive table read was accepted");
+  const auto broken_status = broken->TryPlanAndTrack();
+  Check(broken_status.ok, "a non-consecutive table read was refused outright");
+  const bool dynamic = std::ranges::any_of(
+      broken->program.memory_info,
+      [](const auto &memory) { return memory.dynamic_buffer; });
+  Check(dynamic,
+        "a non-consecutive table read was accepted without the dynamic mark");
+}
+
+void TestRefusedIndirectBufferTableDemotes() {
+  constexpr uint32_t kStride = 48u;
+  constexpr uint32_t kRecords = ShaderInfo::MaxDenseBuffers + 2u;
+  auto fixture = MakeIndirectBufferFixture(kStride, false);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  Check(fixture->program.info.buffers.size() == 2 &&
+            fixture->program.descriptor_sources[fixture->program.info.buffers[1].source]
+                .indirect_buffer.has_value(),
+        "the table fixture was not recognized as a table");
+  const auto table_pc = fixture->program.info.buffers[1].first_use_pc;
+
+  std::array<uint32_t, 4> user_data{0x1000u, 0u, kRecords * kStride, 0u};
+  LinearTestMemory memory;
+  const auto word = [&](uint64_t address) { return (address - memory.base) / 4u; };
+  for (uint32_t record = 0; record < kRecords; record++) {
+    const std::array<uint32_t, 4> descriptor{0x4000u + record * 0x100u, 0u, 64u,
+                                             Libs::Graphics::DstSel(4, 5, 6, 7)};
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      memory.words[word(0x1000u + record * kStride + 8u) + dword] = descriptor[dword];
+    }
+  }
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "a table past the dense buffer limit was held");
+  for (uint32_t pass = 0; pass < 2u; pass++) {
+    std::vector<uint32_t> refused;
+    Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization, &refused) &&
+              refused == std::vector<uint32_t>{table_pc},
+          "a refused table was not named by its first use");
+  }
+
+  user_data[1] = (kStride + 8u) << 16u;
+  std::vector<uint32_t> foreign;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization, &foreign) &&
+            foreign == std::vector<uint32_t>{table_pc},
+        "a table with a foreign stride was not named");
+  user_data[1] = 0u;
+
+  memory.fail_address = 0x1000u + 8u;
+  std::vector<uint32_t> transient;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization, &transient) &&
+            transient.empty(),
+        "a failed table read was taken for a refusal");
+  memory.fail_address = UINT64_MAX;
+
+  auto demoted = MakeIndirectBufferFixture(kStride, false);
+  demoted->program.unfoldable_pcs = {table_pc};
+  demoted->PlanAndTrack();
+  Check(demoted->program.info.buffers.size() == 1 &&
+            !demoted->program.descriptor_sources[demoted->program.info.buffers[0].source]
+                 .indirect_buffer.has_value(),
+        "the refused table is still bound as a table");
+  Check(std::ranges::count_if(demoted->program.memory_info,
+                              [](const auto &memory_info) {
+                                return memory_info.dynamic_buffer;
+                              }) == 1 &&
+            demoted->program.info.uses_dma && !demoted->program.info.writes_dma,
+        "the refused table's access was not moved onto the in-shader decode");
+  const auto handle = std::ranges::find_if(*demoted->block, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::GetBufferResource &&
+           inst.Arg(0).Resolve().TryInstruction() != nullptr &&
+           inst.Arg(0).Resolve().TryInstruction()->GetOpcode() == ValueOpcode::ReadConstBuffer;
+  });
+  Check(handle != demoted->block->end(),
+        "the decoded descriptor no longer reads the selected record's first dword");
+  auto demoted_plan = ExtractResourcePlan(demoted->program);
+  std::vector<uint32_t> none;
+  Check(MaterializeResources(demoted_plan, runtime, snapshot, specialization, &none) &&
+            none.empty(),
+        "the re-translation with the table decoded in the shader did not materialize");
+
+  auto unrelated = MakeIndirectBufferFixture(kStride, false);
+  unrelated->program.unfoldable_pcs = {0x0264u};
+  unrelated->PlanAndTrack();
+  Check(unrelated->program.info.buffers.size() == 2 &&
+            unrelated->program.descriptor_sources[unrelated->program.info.buffers[1].source]
+                .indirect_buffer.has_value() &&
+            std::ranges::none_of(unrelated->program.memory_info,
+                                 [](const auto &memory_info) {
+                                   return memory_info.dynamic_buffer;
+                                 }),
+        "a pc that names no table moved one");
+
+  auto formatted = MakeIndirectBufferFixture(kStride, false, true);
+  formatted->PlanAndTrack();
+  Check(formatted->program.info.buffers.size() == 2,
+        "a formatted access through a table was not bound as a table");
+  auto formatted_demoted = MakeIndirectBufferFixture(kStride, false, true);
+  formatted_demoted->program.unfoldable_pcs = {table_pc};
+  const auto formatted_status = formatted_demoted->TryPlanAndTrack();
+  // A formatted X load decodes its format in the shader; any other formatted access is refused.
+  const bool format_decoded =
+      formatted_status.ok &&
+      std::ranges::any_of(formatted_demoted->program.memory_info, [](const auto &memory_info) {
+        return memory_info.kind == ResourceKind::IndirectBuffer && memory_info.formatted;
+      });
+  Check(format_decoded ||
+            (!formatted_status.ok &&
+             formatted_status.reason.find("formatted access") != std::string::npos),
+        "a formatted access through a refused table was decoded as raw dwords");
+}
+
+// The first translation asks the dispatch's memory whether a recognised table
+// would be refused, so a table already past the dense buffer limit is decoded
+// in the shader by that one translation - the same tracking the refusal would
+// have bought with a second one - while a table of the same shape that fits
+// stays an enumerated binding.
+void TestFirstTranslationChecksTableContents() {
+  constexpr uint32_t kStride = 48u;
+  constexpr uint32_t kRecords = ShaderInfo::MaxDenseBuffers + 2u;
+  LinearTestMemory memory;
+  const auto word = [&](uint64_t address) {
+    return (address - memory.base) / 4u;
+  };
+  const auto write_records = [&](uint32_t count) {
+    std::fill(memory.words.begin(), memory.words.end(), 0u);
+    for (uint32_t record = 0; record < count; record++) {
+      const std::array<uint32_t, 4> descriptor{
+          0x4000u + record * 0x100u, 0u, 64u,
+          Libs::Graphics::DstSel(4, 5, 6, 7)};
+      for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+        memory.words[word(0x1000u + record * kStride + 8u) + dword] =
+            descriptor[dword];
+      }
+    }
+  };
+  std::array<uint32_t, 4> user_data{0x1000u, 0u, kRecords * kStride, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  uint32_t asked = 0;
+  const auto check = [&](const Program &program,
+                         std::span<const DescriptorSource> sources,
+                         uint32_t source) {
+    asked++;
+    return IndirectBufferTableRefused(program, sources, source, runtime);
+  };
+  const auto dynamic_count = [](const Program &program) {
+    return std::ranges::count_if(
+        program.memory_info,
+        [](const auto &memory_info) { return memory_info.dynamic_buffer; });
+  };
+  const auto bound_as_table = [](const Program &program) {
+    return std::ranges::any_of(program.info.buffers, [&](const auto &buffer) {
+      return program.descriptor_sources[buffer.source]
+          .indirect_buffer.has_value();
+    });
+  };
+
+  auto plain = MakeIndirectBufferFixture(kStride, false);
+  plain->PlanAndTrack();
+  const auto table_pc = plain->program.info.buffers[1].first_use_pc;
+
+  // Over the cap: one translation, and it is the translation the refusal used
+  // to rebuild into.
+  write_records(kRecords);
+  auto over = MakeIndirectBufferFixture(kStride, false);
+  over->program.refuse_indirect_buffer_table = check;
+  over->PlanAndTrack();
+  Check(asked == 1u,
+        "the first translation did not ask about its table exactly once");
+  Check(!bound_as_table(over->program) && dynamic_count(over->program) == 1 &&
+            over->program.info.uses_dma,
+        "a table over the dense buffer limit was still bound by the first "
+        "translation");
+  auto relearned = MakeIndirectBufferFixture(kStride, false);
+  relearned->program.unfoldable_pcs = {table_pc};
+  relearned->PlanAndTrack();
+  Check(over->program.info.buffers.size() ==
+                relearned->program.info.buffers.size() &&
+            dynamic_count(over->program) == dynamic_count(relearned->program) &&
+            over->program.info.uses_dma == relearned->program.info.uses_dma &&
+            over->program.info.writes_dma == relearned->program.info.writes_dma,
+        "the first translation differs from the one the refusal rebuilds into");
+  auto over_plan = ExtractResourcePlan(over->program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  std::vector<uint32_t> refused;
+  Check(MaterializeResources(over_plan, runtime, snapshot, specialization,
+                             &refused) &&
+            refused.empty(),
+        "the first translation of an over-cap table still needed a refusal to "
+        "materialize");
+
+  // Under the cap, same layout and same heap: the table stays an enumerated
+  // binding.
+  asked = 0;
+  write_records(2u);
+  user_data[2] = 2u * kStride;
+  auto under = MakeIndirectBufferFixture(kStride, false);
+  under->program.refuse_indirect_buffer_table = check;
+  under->PlanAndTrack();
+  Check(asked == 1u && bound_as_table(under->program) &&
+            dynamic_count(under->program) == 0,
+        "a table that fits was moved off its enumerated binding");
+  auto under_plan = ExtractResourcePlan(under->program);
+  Check(MaterializeResources(under_plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 4u,
+        "a table that fits did not expand into one binding per live record");
+
+  // A heap the check cannot read is left to the materialization, as before the
+  // check existed.
+  asked = 0;
+  write_records(kRecords);
+  user_data[2] = kRecords * kStride;
+  memory.fail_address = 0x1000u + 8u;
+  auto unreadable = MakeIndirectBufferFixture(kStride, false);
+  unreadable->program.refuse_indirect_buffer_table = check;
+  unreadable->PlanAndTrack();
+  Check(asked == 1u && bound_as_table(unreadable->program) &&
+            dynamic_count(unreadable->program) == 0,
+        "a table whose memory could not be read was demoted on a guess");
+  memory.fail_address = UINT64_MAX;
 }
 
 void TestInvariantIndirectImageMaterialization() {
@@ -3064,6 +3304,82 @@ void TestWritableDescriptorPhi() {
         "control-dependent writable descriptor phi was not rejected transactionally");
 }
 
+// RE9 mesh 0e6382b2f7c0dfab: a decoded V# keeps its raw SRSRC operand as its resource.
+ResourcePlan DecodedBufferPlan(uint32_t raw_resource) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *decoded = fixture.AddBlock();
+  auto *tracked = fixture.AddBlock();
+  fixture.block->AddBranch(decoded);
+  fixture.block->AddBranch(tracked);
+  fixture.program.blocks[0]->terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = fixture.program.blocks[1],
+      .false_block = fixture.program.blocks[2]};
+  const auto control =
+      fixture.Buffer({Value(0x2000u), Value(0u), Value(200u), Value(0u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  const auto flag =
+      fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(196u)},
+                   fixture.AddMemory(scalar, 0x10));
+  fixture.program.blocks[0]->condition =
+      fixture.Emit(ValueOpcode::SGreaterThanEqual32, {flag, Value(0u)});
+
+  const auto record =
+      fixture.Emit(ValueOpcode::GetAddressResource,
+                   {fixture.UserData(0), fixture.UserData(1)},
+                   MemoryFlags{0, 0x20}, decoded);
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  const auto base = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {record, Value(0u), Value(0u), Value(true)},
+                                 fixture.AddMemory(global, 0x20), decoded);
+  const auto handle = fixture.Emit(
+      ValueOpcode::GetBufferResource, {base, Value(0u), Value(64u), Value(0u)},
+      MemoryFlags{0, 0x28}, decoded);
+  MemoryInfo raw;
+  raw.kind = ResourceKind::Buffer;
+  raw.resource = raw_resource;
+  const auto raw_flags = fixture.AddMemory(raw, 0x28);
+  fixture.Emit(ValueOpcode::LoadBufferU32x4,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               raw_flags, decoded);
+
+  const auto direct = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6),
+       fixture.UserData(7)},
+      MemoryFlags{0, 0x30}, tracked);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {direct, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 0x30), tracked);
+  fixture.PlanAndTrack();
+
+  const auto &memory = fixture.program.memory_info[raw_flags.index];
+  Check(memory.kind == ResourceKind::IndirectBuffer &&
+            memory.resource == raw_resource &&
+            fixture.program.info.buffers.size() == 2u,
+        "a raw DWORD x4 load over a GPU-read V# did not take the in-shader decode");
+  return ExtractResourcePlan(fixture.program);
+}
+
+void TestDecodedBufferControlFlow() {
+  // Past the tracked list: planning threw std::out_of_range.
+  const auto past = DecodedBufferPlan(5u);
+  Check(past.control_flow.size() == 3u && past.control_flow[1].sources.empty(),
+        "a decoded V# past the tracked buffers was not planned");
+  // Inside it: planning credited the decoded block with a buffer only the other arm reads.
+  const auto inside = DecodedBufferPlan(1u);
+  Check(inside.control_flow.size() == 3u &&
+            inside.control_flow[1].sources.empty() &&
+            inside.control_flow[2].sources ==
+                std::vector<uint32_t>{inside.info.buffers[1].source},
+        "a decoded V# was planned as the tracked buffer its raw operand names");
+}
+
 ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,
                                     bool nonuniform = false,
                                     bool writable = false) {
@@ -3833,17 +4149,27 @@ void TestBoundedRelativeRegisterWrites() {
     fixture.Emit(ValueOpcode::StoreBufferU32,
         {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
         fixture.AddMemory(memory, 0x3e8), exit);
-    if (variant != Variant::Bounded) {
-      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
-                 "relative register proof discarded a possible loop clobber");
-      continue;
-    }
-    fixture.PlanAndTrack();
-    auto plan = ExtractResourcePlan(fixture.program);
     const std::array<uint32_t, 3> user_data{0x1000u, 0u, 72u};
     SrtRuntime runtime{.user_data = user_data};
     DescriptorValue descriptor;
-    Check(SrtWalker(plan, runtime).EvaluateDescriptor(
+    if (variant != Variant::Bounded) {
+      // A possible clobber must not reach a host descriptor: tracking refuses it, the store
+      // decodes its V# in the shader, or the descriptor never evaluates.
+      const auto status = fixture.TryPlanAndTrack();
+      Check(!status.ok
+                ? status.reason.find("not a valid runtime value") != std::string::npos
+                : std::ranges::any_of(fixture.program.memory_info,
+                                      [](const auto &memory_info) {
+                                        return memory_info.dynamic_buffer;
+                                      }) ||
+                      !SrtWalker(fixture.program, runtime)
+                           .EvaluateDescriptor(fixture.program.info.buffers[0].source,
+                                               descriptor),
+            "relative register proof discarded a possible loop clobber");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(
               fixture.program.info.buffers[0].source, descriptor) &&
               descriptor.dwords[2] == 72u,
           "impossible relative writes left a false descriptor dependency");
@@ -4878,6 +5204,116 @@ void TestIndirectImageRefusalNamesItselfAndIsMemoed() {
         "the memo outlived the descriptors that produced it");
 }
 
+// Refuses anything wider than one heap record, forcing the per-record fallback.
+bool ReadOneRecordAtATime(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  return values.size() <= 8u && ReadLinearTestMemory(userdata, address, values);
+}
+
+// Spans and windows must match per-record reads, including the record a refusal names.
+void TestLargeIndirectTablesReadInSpans() {
+  constexpr uint32_t kRecords = 4096u;
+  constexpr uint32_t kKeys = 1024u;
+  constexpr uint32_t kDistinct = 200u;
+  auto fixture = MakeIndirectImageFixture(false, 4u, false, 0u, 16u, 32u);
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  LinearTestMemory memory;
+  constexpr uint64_t material = 0x1000u;
+  constexpr uint64_t heap = material + kRecords * 16u + 0x1000u;
+  memory.words.assign((heap - memory.base + kKeys * 32u) / 4u, 0u);
+  for (uint32_t record = 0; record < kRecords; record++) {
+    memory.words[(material - memory.base) / 4u + record * 4u + 1u] =
+        (record * 2654435761u) % kKeys;
+  }
+  for (uint32_t key = 0; key < kKeys; key++) {
+    const auto word = (heap - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x40000000u + (key % kDistinct) * 0x100u;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 2u] = 3u | (3u << 14u);
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 9> user_data{static_cast<uint32_t>(material), 16u << 16u, kRecords, 0u,
+                                    static_cast<uint32_t>(heap), 32u << 16u, kKeys, 0u, 7u};
+  const SrtRuntime spans{.user_data = user_data, .userdata = &memory,
+                         .read_specialization_memory = ReadLinearTestMemory};
+  auto single = spans;
+  single.read_specialization_memory = ReadOneRecordAtATime;
+
+  ResourceSnapshot spanned_snapshot, single_snapshot;
+  ResourceSpecialization spanned_specialization, single_specialization;
+  memory.reads = 0;
+  Check(MaterializeResources(plan, spans, spanned_snapshot, spanned_specialization) &&
+            memory.reads < 16u,
+        "a large indirect image table was not read in spans");
+  Check(MaterializeResources(plan, single, single_snapshot, single_specialization) &&
+            memory.reads > kRecords,
+        "the one-record reader did not fall back to per-record reads");
+  // 200 candidates cannot take a 256 bucket beside the root: 224 slots, the last 24 null.
+  Check(Materialized(spanned_specialization) == 224u + 1u &&
+            std::all_of(spanned_snapshot.images.begin() + kDistinct + 1u,
+                        spanned_snapshot.images.end(),
+                        [](const DescriptorValue &image) {
+                          return std::ranges::all_of(image.dwords,
+                                                     [](uint32_t word) { return word == 0u; });
+                        }) &&
+            SameResourceSnapshot(spanned_snapshot, single_snapshot) &&
+            spanned_specialization == single_specialization,
+        "reading a table in spans changed what it materializes");
+
+  // A refusal inside a span still names its own record, and the same one either way.
+  const auto material_record = 3001u;
+  memory.fail_address = material + material_record * 16u + 4u;
+  for (const auto &runtime : {spans, single}) {
+    Check(!MaterializeResources(plan, runtime, spanned_snapshot, spanned_specialization) &&
+              std::string{LastMaterializeFailure()}.find(
+                  fmt::format("material record at offset {} would", material_record * 16u + 4u)) !=
+                  std::string::npos,
+          "a refusal inside a material span named the wrong record");
+  }
+  const auto heap_key = 777u;
+  memory.fail_address = heap + heap_key * 32u + 12u;
+  for (const auto &runtime : {spans, single}) {
+    Check(!MaterializeResources(plan, runtime, spanned_snapshot, spanned_specialization) &&
+              std::string{LastMaterializeFailure()}.find(
+                  fmt::format("key {} names heap offset {} which", heap_key, heap_key * 32u)) !=
+                  std::string::npos,
+          "a refusal inside a heap window named the wrong record");
+  }
+  memory.fail_address = UINT64_MAX;
+
+  // A remembered buffer table reproduces its enumeration and sees a rewritten record.
+  constexpr uint32_t kStride = 48u;
+  auto buffer_fixture = MakeIndirectBufferFixture(kStride, false);
+  buffer_fixture->PlanAndTrack();
+  const auto buffer_plan = ExtractResourcePlan(buffer_fixture->program);
+  LinearTestMemory table;
+  table.words.assign(kRecords * kStride / 4u, 0u);
+  for (uint32_t record = 0; record < kRecords; record++) {
+    const auto word = record * kStride / 4u + 2u;
+    if (record % 7u == 3u) continue;
+    table.words[word] = 0x20000u + (record % 11u) * 0x100u;
+    table.words[word + 2u] = 64u;
+    table.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7);
+  }
+  std::array<uint32_t, 4> buffer_user_data{static_cast<uint32_t>(table.base), kStride << 16u,
+                                           kRecords, 0u};
+  const SrtRuntime buffer_runtime{.user_data = buffer_user_data, .userdata = &table,
+                                  .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot first, second;
+  ResourceSpecialization first_specialization, second_specialization;
+  Check(MaterializeResources(buffer_plan, buffer_runtime, first, first_specialization) &&
+            MaterializeResources(buffer_plan, buffer_runtime, second, second_specialization) &&
+            first.buffers.size() == 2u + 11u && SameResourceSnapshot(first, second) &&
+            first_specialization == second_specialization,
+        "a remembered buffer table did not reproduce its enumeration");
+  table.words[5u * kStride / 4u + 2u] = 0x90000u;
+  Check(MaterializeResources(buffer_plan, buffer_runtime, second, second_specialization) &&
+            second.buffers.size() == first.buffers.size() + 1u,
+        "a rewritten buffer table record was served from the memo");
+}
+
 void TestConditionalIndirectImageMaterialization() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = MakeIndirectImageFixture(false);
@@ -5705,10 +6141,15 @@ void TestUniformDwordX4DescriptorLoad() {
             runtime, descriptor),
         "a DWORDX4 descriptor load read past its own table");
 
-  // An indexed load names a record per lane, which the host cannot pick.
+  // An indexed load names a record per lane: the walk does not re-execute the idxen/offen terms,
+  // so folding one into a host descriptor would bind the wrong record. It is served in the shader.
   auto [indexed, indexed_target] = Build(64u, true);
-  CheckTrackingRejected(*indexed, "malformed instruction LoadBufferU32x4",
-                        "an indexed DWORDX4 load reached a host descriptor");
+  const auto indexed_status = indexed->TryPlanAndTrack();
+  Check(indexed_status.ok, "an indexed DWORDX4 load was refused outright");
+  const bool indexed_dynamic = std::ranges::any_of(
+      indexed->program.memory_info,
+      [](const auto &memory) { return memory.dynamic_buffer; });
+  Check(indexed_dynamic, "an indexed DWORDX4 load reached a host descriptor");
 }
 
 } // namespace
@@ -6012,6 +6453,10 @@ int main() {
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("indirect buffer table", TestIndirectBufferMaterialization);
+    Run("refused buffer table demotes", TestRefusedIndirectBufferTableDemotes);
+    Run("first translation checks table contents",
+        TestFirstTranslationChecksTableContents);
+    Run("decoded buffer control flow", TestDecodedBufferControlFlow);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("uniform buffer read addressing",
@@ -6056,6 +6501,7 @@ int main() {
     Run("bindless heap gather and depth compare", TestBindlessHeapServesGatherAndDepthCompare);
     Run("indirect image selection", TestIndirectImageSelectionResolvesEveryKey);
     Run("indirect image refusal reporting", TestIndirectImageRefusalNamesItselfAndIsMemoed);
+    Run("large indirect tables read in spans", TestLargeIndirectTablesReadInSpans);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info collection", TestShaderInfoCollection);
     Run("live shader data collection", TestLiveShaderDataCollection);

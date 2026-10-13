@@ -14,10 +14,13 @@
 
 #include <array>
 #include <bit>
+#include <bitset>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -73,11 +76,13 @@ struct MemoryInfo {
 	bool                    image_has_mip            = false;
 	bool                    image_r128               = false;
 	// glc read as a cache hint; false on an atomic, where the bit names the return value.
-	bool                    cache_bypass                                          = false;
-	bool                    idxen                                                 = false;
-	bool                    offen                                                 = false;
-	bool                    coherent                                              = false;
-	bool                    planning_only                                         = false;
+	bool cache_bypass   = false;
+	bool idxen          = false;
+	bool offen          = false;
+	bool coherent       = false;
+	bool planning_only  = false;
+	bool dynamic_buffer = false;
+	bool glc            = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		return !typed && data_bits == 32u &&
@@ -584,21 +589,15 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
-struct DescriptorBinding {
-	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
-	std::vector<uint32_t> resources;
-
-	bool operator==(const DescriptorBinding& other) const = default;
-};
-
-struct BindingLayout {
-	uint32_t                       push_data_start_dword = PushData::NoStart;
-	uint32_t                       memory_offset_dword   = 0;
-	uint32_t                       memory_offset_count   = 0;
-	std::vector<uint32_t>          user_data_registers;
-	std::vector<DescriptorBinding> descriptors;
-	bool                           uses_bindless    = false;
-	bool                           bindless_integer = false;
+struct Bindings {
+	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
+	uint64_t                                                                descriptor_mask = 0;
+	uint32_t push_data_start_dword = PushData::NoStart;
+	uint32_t memory_offset_dword   = 0;
+	// The shader samples images out of the global bindless heap sets, and whether it also needs
+	// the integer heap set.
+	bool uses_bindless    = false;
+	bool bindless_integer = false;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return memory_offset_dword +
@@ -634,7 +633,7 @@ struct ShaderInfo {
 	// still fit the 32-dword push constant block beside 16 user-data registers - a threshold, not a
 	// ceiling: past it a shader takes the shader-data storage buffer instead, which is one more
 	// upload and one more descriptor write per dispatch. Unlike MaxImages below, this one really is
-	// a push-constant number: AllocateBindings packs only the buffers' memory offsets.
+	// a push-constant number: the shader-data block packs only the buffers' memory offsets.
 	// A table reserves its candidate count rounded up to a power of two, so this is really a bucket
 	// plus the buffers a shader tracks: 128 candidate slots and the 11 buffers RE9's two indirect
 	// tables track. 64 candidate slots would serve 63 keys, and both of those tables have already
@@ -644,7 +643,7 @@ struct ShaderInfo {
 	static constexpr uint32_t MaxDenseBuffers = 138;
 	// Dense image slots a materialized shader may bind: the images it tracks plus the candidates an
 	// indirect image table expands into. Unlike MaxDenseBuffers above this is not a push-constant
-	// threshold - AllocateBindings packs only the buffers' memory offsets into the shader-data
+	// threshold - the emitter packs only the buffers' memory offsets into the shader-data
 	// block, so an image costs no push dword - and it is not a binding count either: images are
 	// grouped into at most ImageBindingCount bindings whose descriptorCount carries the rest. What
 	// an image does cost is one Vulkan descriptor per draw, so the real ceiling is the device's
@@ -670,28 +669,41 @@ struct ShaderInfo {
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
-	uint64_t                        live_buffers = 0;
+	// Buffers the shader binds, tracked plus the candidates an indirect table expands into.
+	std::bitset<MaxDenseBuffers>     live_buffers;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr   = -1;
 	int32_t                          instance_offset_sgpr = -1;
-	bool                             has_bitwise_xor      = false;
-	bool                             uses_dma             = false;
-	bool                             writes_dma           = false;
+	bool                             has_bitwise_xor              = false;
+	bool                             uses_dma                     = false;
+	bool                             writes_dma                   = false;
+	bool                             uses_swizzle                 = false;
+	bool                             uses_lds                     = false;
+	bool                             uses_gds                     = false;
+	bool                             uses_flattened_srt           = false;
+	bool                             uses_dispatch_threads        = false;
+	bool                             bvh                          = false;
+	bool                             subgroup_ballot              = false;
+	bool                             subgroup_barrier             = false;
+	bool                             subgroup_shuffle             = false;
+	bool                             subgroup_local_invocation_id = false;
+	bool                             compute_derivatives          = false;
+	bool                             image_gather_extended        = false;
+	bool                             function_lds                 = false;
+	bool                             function_scratch             = false;
+	bool                             pixel_valid_mask             = false;
+	bool                             buffer_int64_atomics         = false;
+	bool                             buffer_u8                    = false;
+	bool                             buffer_u16                   = false;
+	bool                             shared_int64_atomics         = false;
+	bool                             coherent_buffers             = false;
+	bool                             float64                      = false;
 	std::vector<DmaPointer>          dma_pointers;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
 static_assert(IndexedImageBindingElements == ShaderInfo::MaxImages);
-
-struct BlockInfo {
-	uint32_t        id       = 0;
-	uint32_t        start_pc = 0;
-	uint32_t        end_pc   = 0;
-	CFG::Terminator terminator;
-	Value           condition;
-	Value           indirect_target;
-};
 
 struct DescriptorSource {
 	// How the shader turns its wave-uniform selector into a byte offset into the material table.
@@ -785,16 +797,16 @@ struct ResourceBlock {
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
-	ShaderType    stage              = ShaderType::Unknown;
-	uint64_t      shader_hash        = 0;
-	uint32_t      wave_size          = 64;
-	uint32_t      user_data_base     = 0;
-	uint32_t      user_data_count    = 64;
-	uint32_t      scratch_dwords     = 0;
-	uint32_t      param_export_mask  = 0;
-	bool          has_address_writes = false;
-	ShaderInfo    info;
-	BindingLayout bindings;
+	ShaderType stage              = ShaderType::Unknown;
+	uint64_t   shader_hash        = 0;
+	uint32_t   wave_size          = 64;
+	uint32_t   user_data_base     = 0;
+	uint32_t   user_data_count    = 64;
+	uint32_t   scratch_dwords     = 0;
+	uint32_t   param_export_mask  = 0;
+	bool       has_address_writes = false;
+	ShaderInfo info;
+	Bindings   bindings;
 };
 
 struct UniformFillPlan {
@@ -821,7 +833,7 @@ struct ResourcePlan {
 
 	ResourcePlan(const ResourcePlan&)            = delete;
 	ResourcePlan& operator=(const ResourcePlan&) = delete;
-	ResourcePlan(ResourcePlan&&) noexcept        = default;
+	ResourcePlan(ResourcePlan&&) noexcept;
 	ResourcePlan& operator=(ResourcePlan&& other) noexcept;
 
 	ShaderType stage           = ShaderType::Unknown;
@@ -853,6 +865,8 @@ struct ResourcePlan {
 	std::vector<uint8_t>           clean_flat_slots;
 	std::vector<uint8_t>           data_flat_slots;
 	bool                           requires_specialization_memory = false;
+	// Guest ranges read while compiling (linked SWAPPC leaf calls); a draw revalidates them.
+	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                           capture_specialization_reads   = false;
 	bool                           srt_plan_complete              = false;
 	bool                           resource_tracking_complete     = false;
@@ -910,12 +924,11 @@ struct Program: ResourcePlan {
 	bool                                dispatcher_fallback = false;
 	// Set when a hardware ray-tracing intersect was lowered to a constant miss. Purely
 	// diagnostic: the caller reports the shader once so the log shows which output is a lie.
-	bool                   uses_bvh_intersect_stub = false;
+	bool uses_bvh_intersect_stub = false;
 	// Set when an S_SWAPPC_B64 call was replaced by an any-hit that accepts every hit.
-	bool                   uses_call_stub          = false;
-	CFG::FailureKind       cfg_failure_kind        = CFG::FailureKind::None;
-	std::string            fallback_reason;
-	std::vector<BlockInfo> block_info;
+	bool             uses_call_stub   = false;
+	CFG::FailureKind cfg_failure_kind = CFG::FailureKind::None;
+	std::string      fallback_reason;
 	struct ScalarWrite {
 		uint32_t  pc;
 		ScalarReg reg;
@@ -924,10 +937,17 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo> export_info;
-	bool                    has_address_writes   = false;
-	bool                    shader_info_complete = false;
-	BindingLayout           bindings;
-	bool                    binding_layout_complete = false;
+	// Set only for the duration of one translation, by a caller that can read guest memory: asks
+	// whether the materialization would refuse the recognised indirect buffer table `source`
+	// (an index into `sources`, the tracker's interned descriptor sources) against the memory as
+	// it is now. A refused table is decoded in the shader from this translation on, exactly as the
+	// unfoldable channel would have demoted it one translation later.
+	std::function<bool(const Program& program, std::span<const DescriptorSource> sources,
+	                   uint32_t source)>
+	         refuse_indirect_buffer_table;
+	bool     has_address_writes   = false;
+	bool     shader_info_complete = false;
+	Bindings bindings;
 };
 
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory);

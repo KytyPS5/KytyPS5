@@ -134,8 +134,9 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.coherent = (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::Flat ||
 	                   memory.kind == ResourceKind::Global) &&
 	                  !buffer_atomic && (decoded.glc || decoded.dlc);
-	memory.resource      = ResourceIndexFromOperand(decoded.src1);
-	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
+	memory.glc      = decoded.glc;
+	memory.resource = ResourceIndexFromOperand(decoded.src1);
+	memory.sampler  = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
 		memory.resource = ResourceIndexFromOperand(decoded.src0);
 	} else if (IsAddressResourceKind(memory.kind) || memory.kind == ResourceKind::Lds ||

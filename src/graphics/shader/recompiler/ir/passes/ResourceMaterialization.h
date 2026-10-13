@@ -57,12 +57,22 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Whether the materialization would refuse the indirect buffer table `table_source` against guest
+// memory as it is now - too many distinct descriptors, a foreign stride, or too many probes. Run
+// during tracking, before the table is bound: `sources` are the tracker's interned descriptor
+// sources. Evaluates the heap descriptor with the same clean walk the materialization uses and
+// enumerates through the same memoized MaterializeIndirectBuffer, so the answer, and an accepted
+// enumeration, are reused by the materialization that follows. False whenever it cannot tell.
+bool IndirectBufferTableRefused(const Program& program, std::span<const DescriptorSource> sources,
+                                uint32_t table_source, const SrtRuntime& runtime);
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 // Why the last MaterializeResources on this thread refused, for the report that follows it.
 std::string_view LastMaterializeFailure();
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* refused_tables = nullptr);
 
 bool               RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                           ResourceSpecialization& specialization);

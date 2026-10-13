@@ -1442,28 +1442,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		    std::chrono::steady_clock::now() - compile_begin).count());
 	};
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(code.size()));
-
-	Decoder::Program      decoded;
-	std::vector<uint32_t> joined_code;
-	if (!options.back_code.empty()) {
-		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
-	} else if (options.stage == ShaderType::Local) {
-		decoded = Decoder::DecodeFrontProgram(code);
-		// The separately compiled hull half runs in the next Vulkan stage.
-		auto& handoff     = decoded.instructions.back();
-		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
-		handoff.src_count = 0;
-	} else {
-		Decoder::DecodeProgram(code, decoded);
-	}
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
-	     " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
-
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
@@ -1637,7 +1615,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	// is the only pass that reads it: it is what lets a recognizer drop the guards that exist
 	// solely to avoid moving a descriptor that still resolves.
 	ir.unfoldable_pcs.assign(options.unfoldable_pcs.begin(), options.unfoldable_pcs.end());
-	auto            tracking = IR::TrackResources(ir, decoded, native_cfg);
+	ir.refuse_indirect_buffer_table = options.refuse_indirect_buffer_table;
+	auto tracking                   = IR::TrackResources(ir, decoded, native_cfg);
+	ir.refuse_indirect_buffer_table = nullptr;
 	TranslateResult result;
 	if (!tracking.ok) {
 		LOGF("%s resource tracking rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32
@@ -1699,10 +1679,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			const auto op    = inst.GetOpcode();
 			uint32_t   first = 0;
 			if (op == IR::ValueOpcode::GetBufferResource) {
+				// A descriptor the shader decodes for itself keeps every dword it decodes.
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
-					       IR::ResourceKind::IndirectBuffer;
-				})) {
+					    const auto& memory =
+					        ir.memory_info[use.user->Flags<IR::MemoryFlags>().index];
+					    return memory.kind == IR::ResourceKind::IndirectBuffer ||
+					           memory.dynamic_buffer;
+				    })) {
 					continue;
 				}
 				// A buffer table's root carries the runtime key in arg 0, as an image table's does.

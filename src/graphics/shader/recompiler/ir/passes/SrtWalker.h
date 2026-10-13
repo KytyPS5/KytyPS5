@@ -46,6 +46,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Same values as read_specialization_memory, but fails instead of waiting for GPU writes.
+	SrtMemoryReader           try_read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
@@ -68,6 +70,7 @@ public:
 
 private:
 	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool TryReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
 	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
 
 	SrtRuntime                                  m_source;
@@ -164,6 +167,7 @@ private:
 	bool CallCompiledRead(uint32_t entry, std::span<uint32_t> out, bool descriptor = false);
 	bool CompiledWord(uint32_t word, uint32_t& value);
 	bool CompiledRead(uint32_t index, uint32_t& value);
+	bool EvaluateWithoutWaiting(Value value, uint32_t& result);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;

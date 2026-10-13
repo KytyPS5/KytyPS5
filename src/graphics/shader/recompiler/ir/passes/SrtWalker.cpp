@@ -111,8 +111,20 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.userdata = this;
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? ReadStrict : nullptr;
+	runtime.try_read_specialization_memory =
+	    m_source.try_read_specialization_memory != nullptr ? TryReadStrict : nullptr;
 	runtime.read_memory = ReadOrdinary;
 	return runtime;
+}
+
+bool SrtReadCapture::TryReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	if (!capture.m_source.try_read_specialization_memory(capture.m_source.userdata, address,
+	                                                     values)) {
+		return false;
+	}
+	capture.m_ranges.emplace_back(address, values.size_bytes());
+	return true;
 }
 
 bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -1574,9 +1586,15 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			const auto& block = m_program.control_flow[index];
 			uint32_t condition = 0;
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+			// A condition on words with pending GPU writes is not waited for: like any condition
+			// the host cannot evaluate, it follows both edges and keeps the sources of either
+			// active.
 			if (!block.condition.IsEmpty() &&
-			    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
-			    predicate.Evaluate(block.condition, condition)) {
+			    (m_runtime.read_specialization_memory != nullptr ||
+			     !m_program.capture_specialization_reads) &&
+			    (m_clean_evaluator != nullptr
+			         ? predicate.EvaluateWithoutWaiting(block.condition, condition)
+			         : predicate.Evaluate(block.condition, condition))) {
 				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 			} else {
 				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1602,6 +1620,19 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			if (!refresh(slot)) return false;
 	}
 	return true;
+}
+
+bool SrtWalker::EvaluateWithoutWaiting(Value value, uint32_t& result) {
+	if (m_runtime.try_read_specialization_memory == nullptr) return Evaluate(value, result);
+	// Clean evaluators read every DWORD through the specialization reader.
+	const auto runtime    = m_runtime;
+	m_runtime.read_memory = m_runtime.read_specialization_memory =
+	    m_runtime.try_read_specialization_memory;
+	const bool evaluated = Evaluate(value, result);
+	m_runtime            = runtime;
+	// Values unknown only because a read was not waited for stay retryable by waiting reads.
+	if (!evaluated) ResetUnknowns();
+	return evaluated;
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {

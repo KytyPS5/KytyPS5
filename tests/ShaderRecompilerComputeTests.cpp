@@ -5499,7 +5499,15 @@ public:
       const auto gpu_pending = [&] {
         return cache.HasGpuDirtyBytes(base + gpu_offset, sizeof(uint32_t));
       };
+      const auto settled = [&](uint64_t offset) {
+        uint32_t word = 0;
+        return LibKernel::Memory::TryReadSettledBufferBacking(base + offset, &word,
+                                                              sizeof(word));
+      };
       gpu_write(gpu_values[0]);
+      Require(name, "settled word beside a GPU write",
+              settled(cpu_offset) && !settled(gpu_offset),
+              "a settled read ignored a pending GPU write");
       Require(name, "word beside a GPU write",
               read(cpu_offset) == cpu_value && gpu_pending() &&
                   cache.IsRegionGpuModified(base + cpu_offset, sizeof(uint32_t)),
@@ -5508,6 +5516,8 @@ public:
               "a GPU-written word was not downloaded");
       gpu_write(gpu_values[1]);
       cache.NoteAddressWrites();
+      Require(name, "settled read during address writes", !settled(cpu_offset),
+              "a settled read ignored shader address writes in flight");
       Require(name, "address writes in flight",
               read(cpu_offset) == cpu_value && !gpu_pending() &&
                   read(gpu_offset) == gpu_values[1],
@@ -5517,6 +5527,8 @@ public:
               read(cpu_offset) == cpu_value && gpu_pending() &&
                   read(gpu_offset) == gpu_values[2],
               "completed shader address writes still made reads wait");
+      Require(name, "settled read after address writes", settled(cpu_offset),
+              "completed shader address writes still blocked settled reads");
       context.UnmapMemory(base, allocation_size);
       context.GetCommandScheduler().Finish();
     });

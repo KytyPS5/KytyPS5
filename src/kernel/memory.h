@@ -133,9 +133,11 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-// GPU thread: reads a range of a page protected for GPU writes, waiting only when GPU work may
-// change these bytes. False without a backing alias.
+// GPU thread. TryReadProtectedBacking reads a page protected for GPU writes, waiting only when
+// GPU work may change these bytes (false without a backing alias). TryReadSettledBufferBacking
+// is TryReadBufferBacking without the readback: it fails while GPU writes are pending.
 bool                   TryReadProtectedBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   TryReadSettledBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

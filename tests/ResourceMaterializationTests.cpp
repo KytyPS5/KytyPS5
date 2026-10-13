@@ -1404,6 +1404,131 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   }
 }
 
+void TestPendingConditionFollowsBothEdges() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  // B0 branches on a memory word to B1 or B2; B1 falls through to B2. The buffer store sits
+  // in B1 (bound only through the true edge) or in B2 (bound through both).
+  for (const bool store_in_branch : {false, true}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.user_data_count = 1;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &entry = AddValueBlock(program);
+    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+    auto &flag_table = entry.AppendNewInst(ValueOpcode::GetAddressResource,
+                                           {Value(0x2000u), Value(0u)});
+    auto &flag = entry.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&flag_table), Value(0u), Value(0u), Value(true)});
+    flag.SetFlags(MemoryFlags{.index = 0});
+    auto &condition =
+        entry.AppendNewInst(ValueOpcode::INotEqual32, {Value(&flag), Value(0u)});
+    // A planned SRT word read only by B1.
+    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+    auto &slot_table = entry.AppendNewInst(ValueOpcode::GetAddressResource,
+                                           {Value(0x3000u), Value(0u)});
+    auto &slot_read = entry.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&slot_table), Value(0u), Value(0u), Value(true)});
+    slot_read.SetFlags(MemoryFlags{.index = 1});
+    program.srt_reads.push_back({Value(&slot_read), 0});
+    auto &user = entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+    // The written buffer's second DWORD is a clean read that still waits after the condition.
+    auto &stride = entry.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&flag_table), Value(4u), Value(0u), Value(true)});
+    stride.SetFlags(MemoryFlags{.index = 0});
+    DescriptorSource source;
+    source.dwords = {Value(&user), Value(&stride), Value(4u), Value(0u)};
+    source.dword_count = 4;
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = 0, .written = true});
+    auto &branch = AddValueBlock(program);
+    auto &join = AddValueBlock(program);
+    auto &srt = branch.AppendNewInst(ValueOpcode::GetSrtResource);
+    branch.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(0u)});
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+    auto &store_block = store_in_branch ? branch : join;
+    auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,
+        {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+    store_block.AppendNewInst(ValueOpcode::StoreBufferU32,
+        {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+        .SetFlags(MemoryFlags{.index = 2});
+    entry.condition = Value(&condition);
+    entry.terminator.kind = TerminatorKind::ConditionalBranch;
+    entry.terminator.true_block = &branch;
+    entry.terminator.false_block = &join;
+    branch.terminator.kind = TerminatorKind::Branch;
+    branch.terminator.true_block = &join;
+    join.terminator.kind = TerminatorKind::Return;
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.control_flow.size() == 3 && plan.capture_specialization_reads,
+          "memory condition was not kept for the host walk");
+
+    struct Reads {
+      uint32_t flag = 0;
+      bool pending = false;
+      bool slot_fails = false;
+      uint32_t waited = 0;
+      uint32_t tried = 0;
+    } reads;
+    const std::array<uint32_t, 1> user_data{0x1000u};
+    const SrtRuntime runtime{
+        .user_data = user_data,
+        .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+          if (address != 0x3000u || static_cast<Reads *>(data)->slot_fails) return false;
+          words[0] = 0x55u;
+          return true;
+        },
+        .userdata = &reads,
+        .read_specialization_memory =
+            +[](void *data, uint64_t address, std::span<uint32_t> words) {
+              auto &reads = *static_cast<Reads *>(data);
+              ++reads.waited;
+              if (address != 0x2000u && address != 0x2004u) return false;
+              words[0] = address == 0x2000u ? reads.flag : 0u;
+              return true;
+            },
+        .try_read_specialization_memory =
+            +[](void *data, uint64_t address, std::span<uint32_t> words) {
+              auto &reads = *static_cast<Reads *>(data);
+              ++reads.tried;
+              if (address != 0x2000u || reads.pending) return false;
+              words[0] = reads.flag;
+              return true;
+            }};
+    for (const bool pending : {false, true}) {
+      for (const uint32_t flag : {0u, 1u}) {
+        for (const bool slot_fails : {false, true}) {
+          reads = {.flag = flag, .pending = pending, .slot_fails = slot_fails};
+          ResourceSnapshot snapshot;
+          ResourceSpecialization specialization;
+          const bool expected = !(slot_fails && flag != 0u);
+          Check(MaterializeResources(plan, runtime, snapshot, specialization) == expected,
+                "pending edge condition changed materialization success");
+          if (!expected) continue;
+          // A word with pending GPU writes follows both edges; when the extra edge cannot
+          // materialize, the stage is materialized again with the waiting read.
+          const bool retried = pending && slot_fails;
+          const bool both = pending && !slot_fails;
+          const bool visited = flag != 0u || both;
+          const bool bound = !store_in_branch || visited;
+          Check(reads.waited == (retried ? 1u : 0u) + (bound ? 1u : 0u) && reads.tried == 1u,
+                "edge condition used the wrong reader");
+          Check(plan.visited_blocks[1] == (visited ? 1u : 0u) &&
+                    snapshot.flattened_srt[0] == (visited ? 0x55u : 0u),
+                "edge condition visited the wrong blocks");
+          std::vector<std::pair<uint64_t, uint64_t>> captured;
+          if (!both) captured.emplace_back(0x2000u, 4u);
+          if (visited) captured.emplace_back(0x3000u, 4u);
+          if (bound) captured.emplace_back(0x2004u, 4u);
+          Check(snapshot.buffers[0].dwords[0] == (bound ? 0x1000u : 0u) &&
+                    snapshot.specialization_reads == captured,
+                "edge condition changed bound sources or captured reads");
+        }
+      }
+    }
+  }
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -2126,6 +2251,7 @@ int main() {
   for (const bool memory_condition : {false, true})
     TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
+  TestPendingConditionFollowsBothEdges();
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();

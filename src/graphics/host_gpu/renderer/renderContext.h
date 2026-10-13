@@ -59,6 +59,9 @@ public:
 	// `shader_writes_addresses`: the shader about to run stores through device addresses, so it
 	// can write any cached buffer without the buffer cache seeing which.
 	void               PrepareBda(bool shader_writes_addresses);
+	// A guest command list completed: GPU faults are handled and the images it wrote are copied
+	// back to guest memory, so the game can read them before the frame ends.
+	void               FinishList();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

@@ -179,6 +179,14 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 	}
 }
 
+void RenderContext::FinishList() {
+	if (m_fault_process_pending) {
+		m_fault_process_pending = false;
+		m_buffer_cache.ProcessFaultBuffer();
+	}
+	m_texture_cache.ProcessDownloadImages();
+}
+
 void RenderContext::RunGarbageCollector() {
 	// Pages the guest stopped rewriting are protected again after a while.
 	constexpr uint64_t CoolPeriodMs = 5000;
@@ -188,11 +196,7 @@ void RenderContext::RunGarbageCollector() {
 		m_last_heat_cool_ms = now;
 		RegionManager::CoolAllRegions();
 	}
-	if (m_fault_process_pending) {
-		m_fault_process_pending = false;
-		m_buffer_cache.ProcessFaultBuffer();
-	}
-	m_texture_cache.ProcessDownloadImages();
+	FinishList();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
 }

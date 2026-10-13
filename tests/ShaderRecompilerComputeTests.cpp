@@ -2785,6 +2785,39 @@ public:
                 cache_ticks() == initial_cache_ticks,
             "individual graphics or compute lists aged the caches within a frame");
 
+    // A game reads an image the GPU wrote once the list that wrote it completes, often before
+    // the frame ends: the copies back to guest memory are made at the end of each list.
+    ImageId tiny{};
+    gpu.SendCommandSync([&] {
+      ImageInfo info{};
+      info.type = Prospero::ImageType::kColor2D;
+      info.data = {0x0000000208800000ull, 0x10000};
+      info.extent = {1, 1, 1};
+      info.resources = {1, 1};
+      info.samples = 1;
+      info.tile_mode = Prospero::TileMode::kRenderTarget;
+      info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+      info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+      info.bytes_per_block = 4;
+      info.pitch = 1;
+      info.mip_layout = {ImageMipInfo{0, 0x10000, 1, 1}};
+      auto &texture_cache = context.GetTextureCache();
+      tiny = TextureCacheTestAccess::InsertImage(texture_cache, info);
+      texture_cache.GetImage(tiny).MarkGpuModified();
+      TextureCacheTestAccess::TrackDownload(texture_cache, tiny);
+    });
+    gpu.Submit(graphics_list, {});
+    finish();
+    bool still_pending = true;
+    gpu.SendCommandSync([&] {
+      auto &texture_cache = context.GetTextureCache();
+      still_pending = TextureCacheTestAccess::PendingDownload(texture_cache, tiny);
+      texture_cache.GetImage(tiny).ClearGpuModified();
+      TextureCacheTestAccess::DeleteImage(texture_cache, tiny);
+    });
+    Require(name, "read-back at the end of a list", !still_pending,
+            "a completed list left its GPU-written tiny image for the end of the frame");
+
     gpu.SendCommandSync([&] {
       setup.BufferInit();
       SubmitInfo blocked;
@@ -5687,6 +5720,17 @@ public:
         std::printf("[gpu]     %s: %s\n", name, test.what);
         Require(name, "read-back enrolment", false,
                 "an image was enrolled for read-back against imageReadback.h");
+      }
+      if (test.enrolled) {
+        // The pending copies are processed whatever the setting for linear images (off here): a
+        // tiny image is read back on every host. (Its guest memory is not mapped here, so the
+        // copy itself is not made.)
+        texture_cache.ProcessDownloadImages();
+        if (TextureCacheTestAccess::PendingDownload(texture_cache, id)) {
+          std::printf("[gpu]     %s: %s\n", name, test.what);
+          Require(name, "read-back of a tiny image", false,
+                  "an enrolled tiny image was not copied back to guest memory");
+        }
       }
       // No GPU work wrote it: the image is dropped without a read-back.
       texture_cache.GetImage(id).ClearGpuModified();

@@ -628,6 +628,9 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			if (complete) {
+				m_renderer.FinishList();
+			}
 			if (progressed) {
 				m_recorded_tick = m_renderer.GetCommandScheduler().CurrentTick();
 				cp.BufferFlushIfDue();
@@ -650,6 +653,9 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			if (complete) {
+				m_renderer.FinishList();
+			}
 			if (submission.command_execution.MadeProgress()) {
 				m_recorded_tick = m_renderer.GetCommandScheduler().CurrentTick();
 				cp.BufferFlushIfDue();

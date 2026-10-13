@@ -8034,6 +8034,136 @@ void TestNewShaderRecompilerFlatCachePolicyAndScalarSext() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// The shipped waterfall loops over a per-lane T# record, wave64 and wave32.
+void TestWaterfallImageRecord() {
+  using namespace ShaderRecompiler::IR;
+  struct Shape {
+    const char *name;
+    uint32_t wave;
+    uint32_t heap;      // first SGPR of the heap V# the loop reads
+    uint32_t sampler;   // first SGPR of its S#
+    uint32_t index;     // VGPR holding the per-lane record index
+    uint32_t coords;    // first VGPR of the sample address
+    uint32_t result;    // VGPR the sample writes
+    uint32_t guard;     // the shipped V_CMPX that drops lanes with no record (index -1)
+    std::vector<uint32_t> loop;
+  };
+  const std::array<Shape, 2> shapes{{
+      {"wave64 waterfall (cs 05b58beb)", 64u, 88u, 40u, 4u, 8u, 20u, 0x7daa08c1u,
+       {0xe0382020u, 0x80160004u, 0xe0382010u, 0x80160404u, 0xbe9e047eu, 0xbe8f141eu,
+        0xbea0047eu, 0xbf8c3f71u, 0xd760000eu, 0x00001f02u, 0xd760000du, 0x00001f01u,
+        0xd760000cu, 0x00001f00u, 0xbf8c3f70u, 0xd760000bu, 0x00001f07u, 0xd760000au,
+        0x00001f06u, 0xd7600009u, 0x00001f05u, 0xd7600008u, 0x00001f04u, 0xd760000fu,
+        0x00001f03u, 0x7da4060fu, 0x7da4040eu, 0x7da4020du, 0x7da4000cu, 0x7da40e0bu,
+        0x7da40c0au, 0x7da40a09u, 0x7da40808u, 0x7da456f9u, 0x8686002bu, 0x7da454f9u,
+        0x8686002au, 0x7da452f9u, 0x86860029u, 0x7da450f9u, 0x86860028u, 0xbeea047eu,
+        0xbf880003u, 0x7e1402f4u, 0xf0900808u, 0x01421408u, 0x8a9e6a1eu, 0xbefe0420u,
+        0xbf85ffd4u}},
+      {"wave32 waterfall (cs 4c2c31fe)", 32u, 24u, 60u, 10u, 14u, 2u, 0x7daa14c1u,
+       {0xe0382010u, 0x8006060au, 0xe0382020u, 0x80060a0au, 0xbe8d037eu, 0xbe8b130du,
+        0xbeeb037eu, 0xbf8c3f70u, 0xd760000au, 0x0000170cu, 0xd7600009u, 0x0000170bu,
+        0xd7600008u, 0x0000170au, 0xd7600007u, 0x00001709u, 0xd7600006u, 0x00001708u,
+        0xd7600005u, 0x00001707u, 0xd7600004u, 0x00001706u, 0xd760000bu, 0x0000170du,
+        0x7da41a0bu, 0x7da4180au, 0x7da41609u, 0x7da41408u, 0x7da41207u, 0x7da41006u,
+        0x7da40e05u, 0x7da40c04u, 0x7da47ef9u, 0x8686003fu, 0x7da47cf9u, 0x8686003eu,
+        0x7da47af9u, 0x8686003du, 0x7da478f9u, 0x8686003cu, 0xbeea037eu, 0xbf880002u,
+        0xf0900f08u, 0x01e1020eu, 0x8a0d6a0du, 0xbefe036bu, 0xbf85ffd6u}},
+  }};
+
+  std::vector<uint32_t> heap_words(64u * 48u / sizeof(uint32_t));
+  std::vector<uint32_t> output(64u);
+  const auto heap_address = reinterpret_cast<uint64_t>(heap_words.data());
+  const auto output_address = reinterpret_cast<uint64_t>(output.data());
+  const auto heap_v = [&](uint32_t stride, bool swizzle,
+                          Prospero::BufferFormat format = Prospero::BufferFormat::k32Float) {
+    return std::array<uint32_t, 4>{
+        static_cast<uint32_t>(heap_address),
+        static_cast<uint32_t>((heap_address >> 32u) & 0xffffu) | (stride << 16u) |
+            (swizzle ? 1u << 31u : 0u),
+        // Structured bounds (OOB_SELECT 0): the record grid the hardware steps by stride.
+        64u, static_cast<uint32_t>(format) << 12u};
+  };
+
+  for (const auto &shape : shapes) {
+    std::vector<uint32_t> code{
+        EncodeSop1(0x04, shape.heap, 0),          // s_mov_b64 heap[0:1], s[0:1]
+        EncodeSop1(0x04, shape.heap + 2u, 2),     // s_mov_b64 heap[2:3], s[2:3]
+        EncodeSop1(0x04, shape.sampler, 8),       // s_mov_b64 sampler[0:1], s[8:9]
+        EncodeSop1(0x04, shape.sampler + 2u, 10), // s_mov_b64 sampler[2:3], s[10:11]
+        EncodeSop1(0x04, 20, 12),                 // s_mov_b64 s[20:21], s[12:13]
+        EncodeSop1(0x04, 22, 14),                 // s_mov_b64 s[22:23], s[14:15]
+        EncodeVop1(0x01, shape.index, 256),       // v_mov_b32 index, v0
+        EncodeVop1(0x01, shape.coords, 128),      // v_mov_b32 coords.x, 0
+        EncodeVop1(0x01, shape.coords + 1u, 128), // v_mov_b32 coords.y, 0
+        EncodeVop1(0x01, shape.coords + 2u, 128), // v_mov_b32 coords.lod, 0
+    };
+    code.push_back(shape.guard); // v_cmpx_ne_u32 exec, -1, index
+    code.insert(code.end(), shape.loop.begin(), shape.loop.end());
+    code.push_back(EncodeMubuf0(0x1c));
+    code.push_back(EncodeMubuf1(shape.result, 5, 0)); // buffer_store_dword result, v0, s[20:23]
+    code.push_back(EncodeSopp(0x01));
+
+    std::array<uint32_t, 16> user_data{};
+    const auto set_heap = [&](std::array<uint32_t, 4> v) {
+      std::copy(v.begin(), v.end(), user_data.begin());
+    };
+    set_heap(heap_v(48u, false));
+    user_data[12] = static_cast<uint32_t>(output_address);
+    user_data[13] = static_cast<uint32_t>((output_address >> 32u) & 0xffffu) | (4u << 16u);
+    user_data[14] = 64u;
+    user_data[15] = 3u << 28u;
+
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = shape.wave;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.thread_ids_num = 1;
+    compute.wave_size = shape.wave;
+    compute.host_subgroup_size = shape.wave;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    options.wave_size = shape.wave;
+    options.host_subgroup_size = shape.wave;
+    options.user_data = user_data;
+    const std::string name = shape.name;
+
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Check(translated.status.ok,
+          (name + ": the waterfall record was refused: " + translated.status.reason).c_str());
+    const auto &program = translated.program;
+    Check(program.info.images.size() == 1u &&
+              program.descriptor_sources[program.info.images[0].source]
+                  .indirect_descriptor.has_value(),
+          (name + ": expected one indirect image table").c_str());
+    const auto &indirect =
+        *program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+    // The T# ends a 48-byte record whose step is the heap V#'s own stride.
+    Check(indirect.table_record_bytes == 48u && indirect.table_stride == 0u &&
+              !indirect.table_scalar,
+          (name + ": the record did not become a V#-strided heap table at +16")
+              .c_str());
+
+    // The record steps by the heap V#'s own stride.
+    const auto plan = ExtractResourcePlan(program);
+    for (const uint32_t stride : {48u, 64u}) {
+      set_heap(heap_v(stride, false));
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(
+          MaterializeResources(
+              plan,
+              {.user_data = user_data,
+               .read_memory = ReadHostTestMemory,
+               .read_specialization_memory = ReadHostTestMemory},
+              snapshot, specialization),
+          (name + ": the waterfall record table did not materialize").c_str());
+    }
+    set_heap(heap_v(48u, false));
+
+    const auto result = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestNewShaderRecompilerUnbasedFlatUsesBda() {
   const uint32_t shader[] = {
       EncodeFlat0(0x0c, 0, 0),
@@ -18334,6 +18464,7 @@ int main() {
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
   TestNewShaderRecompilerFlatCachePolicyAndScalarSext();
+  TestWaterfallImageRecord();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();
   TestNewShaderRecompilerCfgStraightLine();

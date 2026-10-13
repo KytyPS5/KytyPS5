@@ -4701,7 +4701,6 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				                                                        : ResourceKind::Buffer) ||
 				if (!m_status.ok || TakeIndirectBuffer(inst, flags.index, flags.pc))
 					return m_status.ok;
 				return Reject(

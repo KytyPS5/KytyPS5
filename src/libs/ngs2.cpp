@@ -1519,6 +1519,7 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 int KYTY_SYSV_ABI Ngs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, size_t info_size) {
 	constexpr int32_t ERROR_INVALID_OUT_ADDRESS = static_cast<int32_t>(0x804a8010u);
 	constexpr int32_t ERROR_INVALID_OUT_SIZE    = static_cast<int32_t>(0x804a8011u);
+	constexpr int32_t ERROR_INVALID_RACK_HANDLE = static_cast<int32_t>(0x804a8202u);
 
 	PRINT_NAME();
 
@@ -1526,7 +1527,7 @@ int KYTY_SYSV_ABI Ngs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, siz
 		return ERROR_INVALID_OUT_ADDRESS;
 	}
 	if (rack_handle == 0) {
-		return NGS2_ERROR_INVALID_OUT_ADDRESS;
+		return ERROR_INVALID_RACK_HANDLE;
 	}
 	if (info_size != sizeof(Ngs2RackInfo) && info_size != NGS2_RACK_INFO_V1_1_SIZE) {
 		LOGF("Ngs2RackGetInfo: unsupported info_size = %zu (expected %zu)\n", info_size,
@@ -1535,18 +1536,61 @@ int KYTY_SYSV_ABI Ngs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, siz
 	}
 
 	auto* rack = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
+	Ngs2Internal* ngs = nullptr;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		for (auto* current = g_racks_list; current != nullptr; current = current->next) {
+			if (current == rack) {
+				ngs = current->ngs;
+				break;
+			}
+		}
+	}
+	if (ngs == nullptr) {
+		return ERROR_INVALID_RACK_HANDLE;
+	}
 
-	Common::LockGuard lock(rack->ngs->mutex);
+	Common::LockGuard lock(ngs->mutex);
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		bool registered = false;
+		for (auto* current = g_racks_list; current != nullptr; current = current->next) {
+			if (current == rack && current->ngs == ngs) {
+				registered = true;
+				break;
+			}
+		}
+		if (!registered) {
+			return ERROR_INVALID_RACK_HANDLE;
+		}
+	}
 
 	uint32_t rack_id = 0;
+	uint32_t max_channel_works = 0;
+	uint32_t max_inputs        = 0;
 	switch (rack->type) {
-		case Ngs2RackType::Sampler: rack_id = 0x1000; break;
-		case Ngs2RackType::Submixer: rack_id = 0x2000; break;
+		case Ngs2RackType::Sampler:
+			rack_id           = 0x1000;
+			max_channel_works = rack->option.sampler.max_channel_works;
+			break;
+		case Ngs2RackType::Submixer:
+			rack_id    = 0x2000;
+			max_inputs = rack->option.submixer.max_inputs;
+			break;
 		case Ngs2RackType::Reverb: rack_id = 0x2001; break;
 		case Ngs2RackType::Mastering: rack_id = 0x3000; break;
-		case Ngs2RackType::CustomSubmixer: rack_id = 0x4002; break;
-		case Ngs2RackType::CustomMastering: rack_id = 0x4003; break;
-		case Ngs2RackType::CustomSampler: rack_id = 0x4001; break;
+		case Ngs2RackType::CustomSubmixer:
+			rack_id    = 0x4002;
+			max_inputs = rack->option.custom_submixer.max_inputs;
+			break;
+		case Ngs2RackType::CustomMastering:
+			rack_id    = 0x4003;
+			max_inputs = rack->option.custom_mastering.max_inputs;
+			break;
+		case Ngs2RackType::CustomSampler:
+			rack_id           = 0x4001;
+			max_channel_works = rack->option.custom_sampler.max_channel_works;
+			break;
 	}
 
 	uint32_t active_voice_count = 0;
@@ -1565,6 +1609,8 @@ int KYTY_SYSV_ABI Ngs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, siz
 	info->rack_id              = rack_id;
 	info->max_grain_samples    = rack->option.common.max_grain_samples;
 	info->max_voices           = rack->option.common.max_voices;
+	info->max_channel_works    = max_channel_works;
+	info->max_inputs           = max_inputs;
 	info->max_matrices         = rack->option.common.max_matrices;
 	info->max_ports            = rack->option.common.max_ports;
 	info->state_flags          = 1;
@@ -2256,7 +2302,8 @@ int KYTY_SYSV_ABI Ngs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* 
 	constexpr float pi = 3.14159265358979323846f;
 	for (uint32_t p = 0; p < num_params; p++) {
 		float sum_squares = 0.0f;
-		for (uint32_t c = 0; c < channels; c++) {
+		std::fill_n(out_volume_matrix + p * channels, channels, 0.0f);
+		for (uint32_t c = 0; c < std::min(channels, work->num_speakers); c++) {
 			const float delta =
 			    std::remainder(params[p].angle - work->speaker_angles[c], work->unit_angle);
 			const float level = std::max(0.0f, std::cos(delta * pi / work->unit_angle));

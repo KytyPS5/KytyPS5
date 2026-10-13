@@ -137,9 +137,11 @@ void TestWaveformQueueCapacity() {
 			const auto progress = f.State();
 			Check(f.QueueBlocks(replacement, blocks.data(), 1, 5) == OK &&
 			          f.voice.blocks.size() == 1 && f.voice.sample_phase == 0 &&
+			          f.voice.frame_cursor == 0 && f.voice.frame_samples == 0 &&
+			          f.voice.next_frame_samples == 0 &&
 			          f.voice.decoded_samples == progress.num_decoded_samples &&
 			          f.voice.decoded_bytes == progress.decoded_data_size,
-			      "CLEAR failed to replace a full queue while preserving progress");
+			      "CLEAR failed to replace a full queue and reset staged playback state");
 			f.Render(2);
 			Check(f.voice.samples == std::vector<float> {0.75f, 0.4375f},
 			      "CLEAR retained an old source or fractional playback position");
@@ -1531,12 +1533,26 @@ void TestVoiceChannelsInfo() {
 void TestRackInfo() {
 	Ngs2Internal     system;
 	Ngs2RackInternal rack {};
-	rack.ngs                       = &system;
-	rack.type                      = Ngs2RackType::Sampler;
-	rack.option.common.max_voices  = 0;
-	rack.option.common.max_matrices = 2;
-	rack.option.common.max_ports   = 3;
+	Ngs2RackInternal submixer {};
+	rack.ngs                              = &system;
+	rack.type                             = Ngs2RackType::Sampler;
+	rack.option.common.max_voices        = 0;
+	rack.option.common.max_matrices      = 2;
+	rack.option.common.max_ports         = 3;
+	rack.option.sampler.max_channel_works = 256;
 	std::memcpy(rack.option.common.name, "test-rack", sizeof("test-rack"));
+	submixer.ngs                            = &system;
+	submixer.type                           = Ngs2RackType::Submixer;
+	submixer.option.submixer.max_inputs = 1;
+
+	Ngs2RackInternal* previous_racks = nullptr;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		previous_racks  = g_racks_list;
+		rack.next       = previous_racks;
+		submixer.next   = &rack;
+		g_racks_list    = &submixer;
+	}
 
 	Ngs2RackInfo info {};
 	Check(Ngs2RackGetInfo(reinterpret_cast<uintptr_t>(&rack), &info, sizeof(info)) == OK,
@@ -1544,11 +1560,21 @@ void TestRackInfo() {
 	Check(std::string_view(info.name) == "test-rack" && info.rack_handle == reinterpret_cast<uintptr_t>(&rack) &&
 	          info.owner_system_handle == reinterpret_cast<uintptr_t>(&system) &&
 	          info.rack_id == 0x1000 && info.max_voices == 0 && info.max_matrices == 2 &&
-	          info.max_ports == 3 && info.active_voice_count == 0,
+	          info.max_channel_works == 256 && info.max_inputs == 0 && info.max_ports == 3 &&
+	          info.active_voice_count == 0,
 	      "rack query returned incorrect state");
 	Check(Ngs2RackGetInfo(reinterpret_cast<uintptr_t>(&rack), &info, sizeof(info) - 1) ==
 	          static_cast<int32_t>(0x804a8011u),
 	      "rack query accepted an incompatible output size");
+	Check(Ngs2RackGetInfo(UINTPTR_MAX, &info, sizeof(info)) ==
+	          static_cast<int32_t>(0x804a8202u),
+	      "rack query accepted an unregistered handle");
+
+	Ngs2RackInfo submixer_info {};
+	Check(Ngs2RackGetInfo(reinterpret_cast<uintptr_t>(&submixer), &submixer_info,
+	                     sizeof(submixer_info)) == OK &&
+	          submixer_info.max_inputs == 1 && submixer_info.max_channel_works == 0,
+	      "submixer query returned incorrect rack-specific limits");
 
 	alignas(Ngs2RackInfo) std::array<uint8_t, 232> extended_info {};
 	auto* extended = reinterpret_cast<Ngs2RackInfo*>(extended_info.data());
@@ -1558,6 +1584,10 @@ void TestRackInfo() {
 	          std::ranges::all_of(extended_info.begin() + sizeof(Ngs2RackInfo),
 	                              extended_info.end(), [](uint8_t value) { return value == 0; }),
 	      "extended rack query did not preserve a zeroed extension");
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		g_racks_list = previous_racks;
+	}
 }
 
 } // namespace
@@ -1583,6 +1613,16 @@ void TestStereoPanMatrix() {
 	      "left pan was not routed left");
 	Check(std::abs(matrix[4]) < 0.0001f && std::abs(matrix[5] - 1.0f) < 0.0001f,
 	      "right pan was not routed right");
+
+	Ngs2PanParam center {};
+	float        surround_matrix[6] {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
+	Check(Ngs2PanGetVolumeMatrix(&work, &center, 1, 6, surround_matrix) == OK,
+	      "surround pan matrix failed");
+	Check(std::abs(surround_matrix[0] - std::numbers::sqrt2_v<float> / 2.0f) < 0.0001f &&
+	          std::abs(surround_matrix[1] - std::numbers::sqrt2_v<float> / 2.0f) < 0.0001f &&
+	          std::ranges::all_of(surround_matrix + 2, surround_matrix + 6,
+	                              [](float gain) { return gain == 0.0f; }),
+	      "pan matrix routed audio to unconfigured speakers");
 }
 
 int main() {

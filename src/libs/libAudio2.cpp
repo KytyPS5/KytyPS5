@@ -177,7 +177,7 @@ struct AudioOut2ContextState {
 	uint32_t               queued              = 0;
 	uint32_t               num_grains          = 512;
 	uint64_t               last_update         = 0;
-	int                    object_audio_handle = 0;
+	int                    object_audio_handle = -1;
 	std::vector<float>     object_mix;
 };
 
@@ -191,7 +191,7 @@ struct AudioOut2PortStateEntry {
 	uint32_t               sampling_freq = 48000;
 	uint32_t               samples_num   = 512;
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
-	int                    audio_handle  = 0;
+	int                    audio_handle  = -1;
 	std::array<float, 16>  gains {};
 	uint32_t               ambisonics        = UINT32_MAX;
 	bool                   attributes_locked = false;
@@ -485,7 +485,7 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	const auto num_grains = params->num_grains == 0 ? 512u : params->num_grains;
 	const int  object_audio_handle =
 	    params->max_object_ports == 0
-	        ? 0
+	        ? -1
 	        : AudioInternal::AudioOutOpen(AUDIO_OUT_PORT_TYPE_MAIN, num_grains, 48000,
 	                                      AudioInternal::Format::FloatStereo);
 	if (params->max_object_ports != 0 && object_audio_handle < 0) {
@@ -691,7 +691,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		return AUDIO_OUT2_ERROR_PORT_FULL;
 	}
 
-	int audio_handle = 0;
+	int audio_handle = -1;
 
 	if (audio_format != AudioInternal::Format::Unknown &&
 	    !audioout2_port_type_is_object(params->port_type)) {
@@ -729,7 +729,7 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 	PRINT_NAME();
 	LOGF("\t port = 0x%016" PRIx64 "\n", port);
 
-	int audio_handle = 0;
+	int audio_handle = -1;
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
 		audio_handle = state->audio_handle;

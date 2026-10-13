@@ -171,21 +171,22 @@ namespace AudioInternal {
 
 int AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
 	if (g_audio == nullptr) {
-		return 0;
+		return -1;
 	}
 
 	auto id = g_audio->AudioOutOpen(type, samples_num, freq, format);
-	return id.IsValid() ? id.ToInt() : 0;
+	return id.IsValid() ? id.ToInt() - 1 : -1;
 }
 
 void AudioOutClose(int handle) {
-	if (g_audio != nullptr && handle > 0) {
-		(void)g_audio->AudioOutClose(Audio::Id(handle));
+	if (g_audio != nullptr && handle >= 0) {
+		(void)g_audio->AudioOutClose(Audio::Id(handle + 1));
 	}
 }
 
 bool AudioOutHasDevice(int handle) {
-	return g_audio != nullptr && handle > 0 && g_audio->AudioOutHasDevice(Audio::Id(handle));
+	return g_audio != nullptr && handle >= 0 &&
+	       g_audio->AudioOutHasDevice(Audio::Id(handle + 1));
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
@@ -196,9 +197,10 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	std::vector<Audio::OutputParam> output_params;
 	output_params.reserve(num);
 	for (uint32_t i = 0; i < num; i++) {
-		if (params[i].handle > 0 && params[i].data != nullptr) {
+		if (params[i].handle >= 0 && params[i].data != nullptr) {
 			output_params.push_back(
-			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data, params[i].gains});
+			    Audio::OutputParam {Audio::Id(params[i].handle + 1), params[i].data,
+			                        params[i].gains});
 		}
 	}
 

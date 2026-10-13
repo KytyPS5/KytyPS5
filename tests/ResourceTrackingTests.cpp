@@ -1801,6 +1801,75 @@ void TestGuardedDirectImageTable() {
   }
 }
 
+void TestLaneGuardedBitScanTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // s_cmp_lg_u32 -1, ff1; s_cselect_b64 exec, exec, 0: no branch tests the scan, the
+  // image's EXEC carries ff1 != -1 itself.
+  enum class Lanes { Scan, Exec, Unrelated, Unguarded };
+  const auto make_plan = [](Lanes lanes) {
+    Fixture fixture(ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *sample = fixture.AddBlock();
+    entry->AddBranch(sample);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = sample};
+    sample->terminator.kind = CFG::TerminatorKind::Return;
+    const auto mask = fixture.Emit(ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)}), Value(true)});
+    const auto exec = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(1u), Value(0u)}), Value(0u)});
+    const auto other = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(2u), Value(0u)}), Value(0u)});
+    const auto scan = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const auto valid = fixture.Emit(ValueOpcode::LogicalAnd,
+        {fixture.Emit(ValueOpcode::INotEqual32, {Value(0xffffffffu), scan}), exec});
+    const auto srt = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    std::array<Value, 2> pointer;
+    for (uint32_t word = 0; word < pointer.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      pointer[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {srt, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(memory, 0x20));
+    }
+    fixture.block = sample;
+    const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(344u)});
+    std::array<Value, 8> words;
+    const auto table = fixture.Address(pointer[0], pointer[1]);
+    for (uint32_t word = 0; word < 8u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x100));
+    }
+    const auto image = fixture.Image(words, 0x128);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto active = lanes == Lanes::Scan ? fixture.Emit(ValueOpcode::LogicalAnd, {valid, other})
+                        : lanes == Lanes::Exec ? fixture.Emit(ValueOpcode::LogicalAnd, {exec, other})
+                        : lanes == Lanes::Unrelated ? other
+                                                    : Value(true);
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), active},
+                 fixture.AddMemory(memory, 0x128));
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect && !indirect->selector.has_value() && indirect->table_offset == 344u &&
+              indirect->key_count.Resolve() == Value(32u),
+          "lane-guarded bit scan table lost its pointer or 32-key range");
+  };
+  make_plan(Lanes::Scan);
+  for (const auto lanes : {Lanes::Exec, Lanes::Unrelated, Lanes::Unguarded}) {
+    CheckFatal([&] { make_plan(lanes); }, "not a valid runtime value",
+               "bit scan table accepted lanes that do not exclude an empty mask");
+  }
+}
+
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Clamp { None, Right, Left, Dynamic };
@@ -8267,6 +8336,7 @@ int main() {
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("lane-guarded bit scan table", TestLaneGuardedBitScanTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);

@@ -146,7 +146,6 @@ private:
 	void                     SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
-	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                              bool whole_image = false);
 	[[nodiscard]] bool WriteBackImage(Buffer& buffer, Common::SlotId id, uint64_t size,

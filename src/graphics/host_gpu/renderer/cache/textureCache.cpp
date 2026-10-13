@@ -1624,11 +1624,23 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
+	// The guest may release the metadata under a cached image; that leaves no clear to decode.
+	const auto unreadable = [&](uint64_t address) {
+		static RefusalReporter reports;
+		const auto             occurrences = reports.Observe(address, slice_size, 0);
+		if (occurrences != 0) {
+			char repeat[32] = "";
+			LOGF("TextureCache: color metadata backing unreadable addr=0x%016" PRIx64
+			     ", fast-clear skipped%s\n",
+			     address, RefusalReporter::RepeatSuffix(repeat, occurrences));
+		}
+	};
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read color metadata backing\n");
+			unreadable(address);
+			continue;
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
@@ -1636,7 +1648,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		std::vector<uint8_t> bytes(slice_size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
+			unreadable(address);
+			continue;
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;

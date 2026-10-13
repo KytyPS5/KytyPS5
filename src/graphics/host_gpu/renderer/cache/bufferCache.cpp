@@ -77,6 +77,7 @@ void ForEachCommittedPiece(uint64_t vaddr, uint64_t size, Committed&& committed,
 		hole(hole_begin, end - hole_begin);
 	}
 }
+
 // True when the range starts in a committed mapping and runs into an unmapped hole.
 bool HasUnmappedHole(uint64_t vaddr, uint64_t size) {
 	uint64_t start = 0, bytes = 0;
@@ -90,6 +91,7 @@ bool HasUnmappedHole(uint64_t vaddr, uint64_t size) {
 	}
 	return false;
 }
+
 // Walks the tracked set, which is far smaller than the mapped set.
 template <typename Mark>
 void ForEachBdaMarkRange(const RangeSet& tracked, const RangeSet& mapped, Mark&& mark) {
@@ -1128,7 +1130,6 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer) {
                                     bool is_texel_buffer, bool raw_image_read) {
 	StreamHold                  hold(m_staging_buffer);
 	std::vector<vk::BufferCopy> copies;

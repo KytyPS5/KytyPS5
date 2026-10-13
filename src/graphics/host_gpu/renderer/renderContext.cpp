@@ -96,9 +96,16 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+		m_buffer_cache.QueueBdaSync(vaddr, size);
+	}
+	// New backing changes the bytes without a write fault, so images over it must reload.
+	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_image_heap.InvalidateMemory(vaddr, size);
+}
+
 void RenderContext::ProtectMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
 	m_page_manager.ReapplyProtection(vaddr, size, mode);
 }

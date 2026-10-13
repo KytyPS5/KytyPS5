@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -143,6 +144,7 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 // Clips to the end of the last committed mapping inside the range, holes included.
 [[nodiscard]] uint64_t ClampSparseRangeSize(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool     QueryCommittedRange(uint64_t vaddr, uint64_t* start, uint64_t* size);
+
 // Reports a repeating buffer-range outcome at exponentially sparser intervals with its count.
 class BufferRangeReportPolicy {
 public:
@@ -213,6 +215,7 @@ private:
 	std::array<Slot, SLOT_COUNT> m_slots {};
 	uint64_t                     m_clock = 0;
 };
+
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;

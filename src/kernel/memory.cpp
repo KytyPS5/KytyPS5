@@ -486,6 +486,7 @@ public:
 		}
 		return std::min(last_covered, end) - virtual_addr;
 	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 		return gpu ? m_gpu_page_table_entries : m_cpu_page_table_entries;
@@ -928,19 +929,40 @@ bool HasGpuOwnedBytes(uint64_t vaddr, uint64_t size) {
 	       Graphics::GuestGpu::IsGpuThread() &&
 	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
+
+static Common::Mutex           g_buffer_range_report_mutex;
+static BufferRangeReportPolicy g_buffer_range_reports;
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
-	if (clamped_size == 0) {
-		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
-		     "\n",
-		     vaddr, size);
+	if (clamped_size == size) {
+		return clamped_size;
 	}
-	if (clamped_size != size) {
+
+	BufferRangeReportPolicy::Decision decision {};
+	{
+		Common::LockGuard lock(g_buffer_range_report_mutex);
+		decision = g_buffer_range_reports.Observe(vaddr, size, clamped_size);
+	}
+	char repeat[32] = "";
+	if (decision.report && decision.occurrences > 1) {
+		std::snprintf(repeat, sizeof(repeat), " (x%" PRIu64 ")", decision.occurrences);
+	}
+
+	// A descriptor may point at memory the guest never mapped; callers bind nothing instead.
+	if (clamped_size == 0) {
+		if (decision.report) {
+			LOGF("Memory: unmapped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "%s\n",
+			     vaddr, size, repeat);
+		}
+		return 0;
+	}
+	if (decision.report) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
+		     " to 0x%016" PRIx64 "%s\n",
+		     vaddr, size, clamped_size, repeat);
 	}
 	return clamped_size;
 }

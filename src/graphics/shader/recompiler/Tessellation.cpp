@@ -13,6 +13,7 @@
 #include <optional>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
@@ -85,13 +86,41 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 	};
 	std::array<const Decoder::Instruction*, IR::NumVectorRegs> writer {};
 	uint32_t stride = 0;
+	// Control flow inside the program: a branch joins two paths (or closes a loop) at its target.
+	// At a join a register keeps its value only if neither path redefines it, so every register
+	// written between a branch and its target is unknown from the target on. The ring addresses
+	// are set up before any of that in practice, and one that is not simply fails the affine
+	// check below instead of being guessed.
+	std::unordered_map<uint32_t, std::vector<uint32_t>> join_invalidates;
+	for (const auto& branch: program.instructions) {
+		if (!IsDirectBranch(branch.opcode) ||
+		    branch.branch_target == program.instructions.back().pc) {
+			continue;
+		}
+		const auto lo   = std::min(branch.pc, branch.branch_target);
+		const auto hi   = std::max(branch.pc, branch.branch_target);
+		auto&      regs = join_invalidates[branch.branch_target];
+		for (const auto& body: program.instructions) {
+			if (body.pc < lo || body.pc > hi || body.dst.kind != OperandKind::Vgpr) continue;
+			for (uint32_t index = 0; index < std::max(body.data_dwords, 1u); index++) {
+				regs.push_back(body.dst.reg + index);
+			}
+		}
+	}
 	for (const auto& inst: program.instructions) {
-		// Stage exits preserve the active path's definitions. An internal join
-		// would require merging register definitions.
-		EXIT_NOT_IMPLEMENTED(IsDirectBranch(inst.opcode) &&
-		                     inst.branch_target != program.instructions.back().pc);
+		if (const auto join = join_invalidates.find(inst.pc); join != join_invalidates.end()) {
+			for (const auto reg: join->second) {
+				if (reg < registers.size()) registers[reg] = {};
+			}
+		}
+		// Every LDS store width the frontend lowers: LS programs write whole attribute vectors
+		// (b64/b96/b128 and the two-offset forms), not just dwords, and a stride analysis that
+		// only knew the 32-bit forms found no stride and discarded every tessellated draw.
 		const bool local_store =
-		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32;
+		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
+		    inst.opcode == Opcode::DS_WRITE2ST64_B32 || inst.opcode == Opcode::DS_WRITE_B64 ||
+		    inst.opcode == Opcode::DS_WRITE2_B64 || inst.opcode == Opcode::DS_WRITE2ST64_B64 ||
+		    inst.opcode == Opcode::DS_WRITE_B96 || inst.opcode == Opcode::DS_WRITE_B128;
 		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
@@ -99,10 +128,19 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 		const bool control_store =
 		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
 		const bool control_read =
-		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32);
+		    !local &&
+		    (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
+		     inst.opcode == Opcode::DS_READ2ST64_B32 || inst.opcode == Opcode::DS_READ_B64 ||
+		     inst.opcode == Opcode::DS_READ2_B64 || inst.opcode == Opcode::DS_READ2ST64_B64 ||
+		     inst.opcode == Opcode::DS_READ_B96 || inst.opcode == Opcode::DS_READ_B128);
+		bool continue_after_read = false;
 		if ((local && local_store) || control_store || control_read) {
 			const auto address = read(inst.src0);
-			if (address.kind != Kind::Affine) {
+			// An HS may gather control-point inputs at an address that comes out of memory (bone
+			// or index tables). The stride is fixed by the LS that wrote them, and the lowering
+			// emits the address at run time, so a data-dependent read constrains nothing here.
+			if (control_read && address.kind != Kind::Affine) continue_after_read = true;
+			if (!continue_after_read && address.kind != Kind::Affine) {
 				const auto* from =
 				    inst.src0.kind == OperandKind::Vgpr && inst.src0.reg < writer.size()
 				        ? writer[inst.src0.reg]
@@ -145,6 +183,19 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 				}
 				break;
+			case Opcode::V_AND_B32:
+				// The native packed HS id keeps the patch ordinal in its low byte; masking it out
+				// leaves the logical interface's single patch, i.e. zero.
+				// The same id masked down to its control point field (bits 8-12) is the control
+				// point index scaled by 256, which is how a hull shader addresses its output ring.
+				for (const auto& [packed, mask]: {std::pair {lhs, rhs}, std::pair {rhs, lhs}}) {
+					if (packed.kind == Kind::PackedControlPoint && mask.kind == Kind::Affine &&
+					    mask.coefficient == 0u) {
+						if (mask.constant == 0xffu) value = constant(0u);
+						if (mask.constant == 0x1f00u) value = {Kind::Affine, 256u, 0u};
+					}
+				}
+				break;
 			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
 			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
 			case Opcode::V_LSHL_ADD_U32:
@@ -155,6 +206,8 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 				if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
 					value = multiply(rhs, constant(1u << lhs.constant));
 				break;
+			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
+			case Opcode::V_ADD3_U32: value = add(add(lhs, rhs), third); break;
 			case Opcode::V_SUB_NC_U32:
 				if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
 				    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)

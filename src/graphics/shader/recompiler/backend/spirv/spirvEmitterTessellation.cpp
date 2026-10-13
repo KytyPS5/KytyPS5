@@ -46,10 +46,16 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
-		const auto vertex =
-		    kind == Attribute::ControlOutput
-		        ? EmitLaneId(state)
-		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+		auto vertex = kind == Attribute::ControlOutput
+		                  ? EmitLaneId(state)
+		                  : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+		if (kind == Attribute::ControlInput) {
+			// The guest addresses the LS ring of the whole thread group, and a gather table can
+			// name a vertex of the draw rather than of this patch; Vulkan's input array holds
+			// only this patch.
+			vertex = EmitBinaryU32(state, spv::OpUMod, vertex,
+			                       ConstantU32(state, std::max(tess.input_control_points, 1u)));
+		}
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
 		                          component);
 	}

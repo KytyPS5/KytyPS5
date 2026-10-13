@@ -100,7 +100,9 @@ void TestErrors(CesContext* context) {
 	    {{'A', 0x82, 0x20, 0}, 0, CES_ERROR_INVALID_ENCODE},
 	    {{'A', 0x81, 0xad, 0}, 0, CES_ERROR_UNASSIGNED_CODE},
 	};
-	for (const auto& test: cases) {
+	for (size_t index = 0; index < std::size(cases); ++index) {
+		const auto&             test   = cases[index];
+		const int               before = failures;
 		std::array<uint8_t, 16> output {};
 		uint32_t                consumed = 99;
 		uint32_t                produced = 99;
@@ -111,7 +113,28 @@ void TestErrors(CesContext* context) {
 		CHECK(CesMbcsStrGetUtf8Len(context, test.source.data(), test.limit, &consumed, &produced) ==
 		      test.error);
 		CHECK(consumed == 1 && produced == 1);
+		if (failures != before) {
+			std::fprintf(stderr, "CesTests: error case %zu failed\n", index);
+		}
 	}
+}
+
+// The shape of each character is checked the same on every host, before the host converter sees
+// it: only whether a well-shaped character is assigned depends on the host.
+void TestCharacterShape() {
+	const auto shape = [](std::vector<uint8_t> source, size_t expected_shaped) {
+		size_t     shaped = 99;
+		const auto status = Cp932Shape(reinterpret_cast<const char*>(source.data()), source.size(),
+		                               &shaped);
+		return shaped == expected_shaped ? status : SDL_ICONV_ERROR;
+	};
+	CHECK(shape({'A', 0x82, 0xa0, 'B'}, 4) == 0);
+	CHECK(shape({'A', 0x81, 0xad}, 3) == 0);
+	CHECK(shape({'A', 0x80, 'B'}, 1) == SDL_ICONV_EILSEQ);
+	CHECK(shape({'A', 0x82}, 1) == SDL_ICONV_EINVAL);
+	CHECK(shape({'A', 0x82, 0x20}, 1) == SDL_ICONV_EILSEQ);
+	CHECK(shape({'A', 0xfc, 0x7f}, 1) == SDL_ICONV_EILSEQ);
+	CHECK(shape({0xe0, 0x40, 0xfc, 0xfc}, 4) == 0);
 }
 } // namespace
 
@@ -123,5 +146,6 @@ int main() {
 	TestMappingsAndMeasurement(&context);
 	TestPartialOutput(&context);
 	TestErrors(&context);
+	TestCharacterShape();
 	return failures == 0 ? 0 : 1;
 }

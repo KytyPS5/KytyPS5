@@ -41,7 +41,6 @@ names=(
 	overlay_queue
 	const_ram
 	ime_dialog
-	kernel_file_system
 	lru_cache
 	metadata_fill
 	ngs2_sampler
@@ -83,6 +82,7 @@ ctest_only=(
 
 # Tests that need a GPU. CI builds shader_recompiler_compute_tests but its runners have no GPU to
 # run them: run them locally (ctest -R shader_recompiler_compute and these names).
+# kernel_file_system needs one too: guest memory needs the GPU resources of a Vulkan device.
 local_only=(
 	buffer_cache_dirty_gc
 	buffer_cache_ranges
@@ -95,6 +95,7 @@ local_only=(
 	graphics_pipeline_rasterization
 	host_image_allocation
 	image_transfer_layout
+	kernel_file_system
 	pm4_context_state
 	shader_recompiler_alignbyte
 	shader_recompiler_compute

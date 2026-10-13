@@ -271,6 +271,39 @@ static size_t ConvertCp932ToUtf8(const char** inbuf, size_t* inbytesleft, char**
 
 #endif
 
+// The shape of the CP932 characters at `input`: 0 when all `size` bytes are whole characters, or
+// the error of the first bad one (0x80, a lead byte without its trail byte, a bad trail byte).
+// `shaped` is the size of the well-shaped characters before it. The host converter then decides
+// only whether a character is assigned: converters differ in what else they accept.
+static size_t Cp932Shape(const char* input, size_t size, size_t* shaped) {
+	const auto* in       = reinterpret_cast<const uint8_t*>(input);
+	size_t      position = 0;
+	size_t      status   = 0;
+	while (position < size) {
+		const uint8_t lead = in[position];
+		if (lead == 0x80) {
+			status = SDL_ICONV_EILSEQ;
+			break;
+		}
+		if (!((lead >= 0x81 && lead <= 0x9f) || (lead >= 0xe0 && lead <= 0xfc))) {
+			++position;
+			continue;
+		}
+		if (size - position < 2) {
+			status = SDL_ICONV_EINVAL;
+			break;
+		}
+		const uint8_t trail = in[position + 1];
+		if (!((trail >= 0x40 && trail <= 0x7e) || (trail >= 0x80 && trail <= 0xfc))) {
+			status = SDL_ICONV_EILSEQ;
+			break;
+		}
+		position += 2;
+	}
+	*shaped = position;
+	return status;
+}
+
 static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_t source_max,
                              uint32_t* source_len, uint8_t* destination, uint32_t destination_max,
                              uint32_t* destination_len, bool measure) {
@@ -321,7 +354,16 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 #if defined(_WIN32)
 		const auto status = ConvertCp932ToUtf8(&input, &input_left, &output, &output_left);
 #else
-		const auto status = SDL_iconv(converter, &input, &input_left, &output, &output_left);
+		size_t     shaped      = 0;
+		const auto shape       = Cp932Shape(input, input_left, &shaped);
+		size_t     shaped_left = shaped;
+		auto       status      = SDL_iconv(converter, &input, &shaped_left, &output, &output_left);
+		input_left -= shaped - shaped_left;
+		if (shape != 0 && shaped_left == 0 && status != SDL_ICONV_E2BIG &&
+		    status != SDL_ICONV_EILSEQ && status != SDL_ICONV_ERROR) {
+			// The well-shaped characters are converted; `input` is at the bad one.
+			status = shape;
+		}
 #endif
 		produced += capacity - output_left;
 		if (status == SDL_ICONV_E2BIG) {

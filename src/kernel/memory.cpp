@@ -465,6 +465,27 @@ public:
 		return clamped_size;
 	}
 
+	uint64_t ClampSparseRangeSize(uint64_t virtual_addr, uint64_t size) {
+		Common::LockGuard lock(m_mutex);
+
+		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
+			return 0;
+		}
+
+		auto vma = FindContaining(virtual_addr);
+		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
+			return 0;
+		}
+
+		const auto end          = virtual_addr + size;
+		uint64_t   last_covered = End(vma->second.start, vma->second.size);
+		for (++vma; vma != m_ranges.end() && vma->second.start < end; ++vma) {
+			if (IsCommittedRangeType(vma->second.type)) {
+				last_covered = End(vma->second.start, vma->second.size);
+			}
+		}
+		return std::min(last_covered, end) - virtual_addr;
+	}
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 		return gpu ? m_gpu_page_table_entries : m_cpu_page_table_entries;
@@ -922,6 +943,11 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		     vaddr, size, clamped_size);
 	}
 	return clamped_size;
+}
+
+uint64_t ClampSparseRangeSize(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+	return g_virtual_ranges->ClampSparseRangeSize(vaddr, size);
 }
 
 bool QueryCommittedRange(uint64_t vaddr, uint64_t* start, uint64_t* size) {

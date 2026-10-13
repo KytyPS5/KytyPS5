@@ -140,6 +140,8 @@ bool                   HasGpuOwnedBytes(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Clips to the end of the last committed mapping inside the range, holes included.
+[[nodiscard]] uint64_t ClampSparseRangeSize(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool     QueryCommittedRange(uint64_t vaddr, uint64_t* start, uint64_t* size);
 // Reports a repeating buffer-range outcome at exponentially sparser intervals with its count.
 class BufferRangeReportPolicy {

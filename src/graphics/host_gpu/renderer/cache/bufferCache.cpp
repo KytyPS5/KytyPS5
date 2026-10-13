@@ -48,6 +48,48 @@ void ReportImageBackingSubstitute(uint64_t vaddr, uint64_t size, const char* sub
 	     vaddr, size, substitute, RefusalReporter::RepeatSuffix(repeat, occurrences));
 }
 
+// Splits a range into its committed mappings and the unmapped holes between them.
+template <typename Committed, typename Hole>
+void ForEachCommittedPiece(uint64_t vaddr, uint64_t size, Committed&& committed, Hole&& hole) {
+	constexpr uint64_t GuestPageSize = 0x4000;
+	const auto         end           = vaddr + size;
+	uint64_t           hole_begin    = 0;
+	bool               in_hole       = false;
+	for (auto current = vaddr; current < end;) {
+		uint64_t start = 0, bytes = 0;
+		if (Libs::LibKernel::Memory::QueryCommittedRange(current, &start, &bytes)) {
+			if (in_hole) {
+				hole(hole_begin, current - hole_begin);
+				in_hole = false;
+			}
+			const auto piece_end = std::min(end, start + bytes);
+			committed(current, piece_end - current);
+			current = piece_end;
+		} else {
+			if (!in_hole) {
+				hole_begin = current;
+				in_hole    = true;
+			}
+			current = std::min(end, Common::AlignDown(current, GuestPageSize) + GuestPageSize);
+		}
+	}
+	if (in_hole) {
+		hole(hole_begin, end - hole_begin);
+	}
+}
+// True when the range starts in a committed mapping and runs into an unmapped hole.
+bool HasUnmappedHole(uint64_t vaddr, uint64_t size) {
+	uint64_t start = 0, bytes = 0;
+	if (!Libs::LibKernel::Memory::QueryCommittedRange(vaddr, &start, &bytes)) {
+		return false;
+	}
+	for (auto current = start + bytes; current < vaddr + size; current = start + bytes) {
+		if (!Libs::LibKernel::Memory::QueryCommittedRange(current, &start, &bytes)) {
+			return true;
+		}
+	}
+	return false;
+}
 // Walks the tracked set, which is far smaller than the mapped set.
 template <typename Mark>
 void ForEachBdaMarkRange(const RangeSet& tracked, const RangeSet& mapped, Mark&& mark) {
@@ -1171,17 +1213,41 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	const auto record_write = [&](uint64_t address, uint64_t bytes) {
+		const bool precise = CanTrackPreciseWrite(buffer, address, bytes);
 		RangeSet   before;
 		if (precise) {
+			m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t begin, uint64_t end) {
+				before.Add(begin, end - begin);
+			});
 		}
+		m_gpu_modified_ranges.Add(address, bytes);
 		m_precise_marking = precise;
+		MarkGpuWrite(address, bytes);
 		m_precise_marking = false;
+		NoteHotWrite(address, bytes);
+		ForgetColorMetadataChecks(address, bytes);
 		if (precise) {
+			TrackPreciseWrite(buffer, address, bytes, std::move(before));
 		}
+	};
+	if (is_written && HasUnmappedHole(vaddr, size)) {
+		// A GPU write to an unmapped page is lost on the console, so holes are never written back.
+		ForEachCommittedPiece(
+		    vaddr, size,
+		    [&](uint64_t address, uint64_t bytes) {
+			    (void)SynchronizeBuffer(buffer, address, bytes, true, is_texel_buffer,
+			                            raw_image_read);
+			    record_write(address, bytes);
+		    },
+		    [&](uint64_t address, uint64_t bytes) {
+			    (void)SynchronizeBuffer(buffer, address, bytes, false, false, false);
+		    });
+		return {&buffer, buffer.Offset(vaddr)};
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer, raw_image_read);
 	if (is_written) {
-		m_gpu_modified_ranges.Add(vaddr, size);
-		ForgetColorMetadataChecks(vaddr, size);
+		record_write(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

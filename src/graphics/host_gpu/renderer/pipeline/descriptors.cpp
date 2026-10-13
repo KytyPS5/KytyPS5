@@ -1010,12 +1010,32 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
-				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+				const auto contiguous = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+				if (contiguous != 0 && contiguous < size) {
+					const auto& graphics = m_context.GetGraphics();
 					const auto  limit =
 					    uint64_t {
 					        graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 					    (graphics.StorageMinAlignment() - 1);
+					const auto sparse =
+					    Libs::LibKernel::Memory::ClampSparseRangeSize(address, size);
+					size = std::max(contiguous,
+					                std::min({sparse, uint64_t {256} * 1024 * 1024, limit}));
+					if (program.info.buffers[resource].written) {
+						for (const auto* reader: stages) {
+							for (const auto [read_address, read_size]:
 							     reader->runtime->resources->ScalarReads()) {
+								if (read_size != 0 && read_address >= address + contiguous &&
+								    read_address < address + size) {
+									size = read_address - address;
+								}
+							}
+						}
+					}
+				} else {
+					size = contiguous;
+				}
+			}
 			if (size == 0) {
 				source = {};
 				continue;

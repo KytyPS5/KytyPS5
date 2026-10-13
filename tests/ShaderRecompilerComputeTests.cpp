@@ -18797,6 +18797,39 @@ public:
         render_control.copy_depth_to_color = false;
         registers.SetRenderControl(render_control);
 
+        // Primitive types the CPU path skips (patches without tessellation, line loops) draw
+        // nothing; their GPU-written arguments only latch NUM_INSTANCES. Drawn patches stay on
+        // the CPU.
+        for (const auto prim :
+             {Prospero::PrimitiveType::kPatch, Prospero::PrimitiveType::kLineLoop}) {
+          user_config.SetPrimitiveType(prim);
+          clear_color();
+          write_gpu(arguments_base + 0x3c0, std::array{3u, 6u, 0u, 0u});
+          Require("GpuIndirectDraw", "skipped primitive GPU path",
+                  RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                      {.arguments = arguments_base + 0x3c0, .max_count = 1, .stride = 16}, 1u),
+                  "a draw the CPU path skips read its GPU-written arguments back");
+          Require("GpuIndirectDraw", "skipped primitive without readback",
+                  buffers.IsRegionGpuModified(arguments_base + 0x3c0, 16),
+                  "a skipped draw read its GPU-written arguments back to the CPU");
+          Require("GpuIndirectDraw", "skipped primitive instance count",
+                  RenderExecutorTestAccess::ReadIndirectInstances(executor) == 6,
+                  "a skipped draw did not latch NUM_INSTANCES from its arguments");
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id, {},
+                                              {extent, extent, 1});
+          Require("GpuIndirectDraw", "skipped primitive draws nothing",
+                  std::ranges::all_of(pixels, [](u32 v) { return v == 0; }),
+                  "a draw the CPU path skips wrote the target");
+        }
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kPatch);
+        Config::Load({.tessellation_enabled = true});
+        Require("GpuIndirectDraw", "tessellated patch stays on the CPU",
+                !RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                    {.arguments = arguments_base + 0x3c0, .max_count = 1, .stride = 16}, 1u),
+                "a tessellated draw took the GPU path");
+        Config::Load({});
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+
         // Rewritten fetches keep the base vertex and first instance; the commands follow the
         // arguments and the count at their exact, unaligned addresses.
         {

@@ -1178,8 +1178,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (has_push_data) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
-		                        push_data.dwords.data());
+		// A graphics layout has one range, and a push names all its stages.
+		vk_buffer.pushConstants(pipeline.pipeline_layout,
+		                        pipeline_bind_point == vk::PipelineBindPoint::eGraphics
+		                            ? pipeline.push_constant_stages
+		                            : push_stages,
+		                        0, sizeof(push_data), push_data.dwords.data());
 	}
 
 	if (!m_descriptor_writes.empty()) {

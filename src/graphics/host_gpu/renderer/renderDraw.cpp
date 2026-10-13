@@ -1054,7 +1054,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 // tests against, so a draw that writes depth stops here. A draw that starts with a depth clear
 // tests against the clear value everywhere, so the buffer is filled with it instead of copied.
 void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
-                                              vk::PipelineLayout layout) {
+                                              const PipelineCache::Pipeline& pipeline) {
 	auto&       depth      = state.depth_info;
 	auto&       cache      = m_context.GetTextureCache();
 	const auto& ps         = state.ps_input_info;
@@ -1164,7 +1164,7 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 	    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), extent.width,
 	    std::bit_cast<uint32_t>(min_bounds),
 	    std::bit_cast<uint32_t>(max_bounds)};
-	vk_buffer.pushConstants(layout, vk::ShaderStageFlagBits::eFragment,
+	vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages,
 	                        ps.ps_depth_bounds_dword * sizeof(uint32_t), sizeof(parameters),
 	                        parameters);
 }
@@ -1462,7 +1462,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                                 ? std::span {&descriptor_stages[stage_count - 1], 1u}
 		                                 : std::span<PreparedBindings* const> {};
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, graphics_stages);
-		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0,
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages, 0,
 		                        sizeof(mesh_draw_data), mesh_draw_data.data());
 	} else {
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
@@ -1477,17 +1477,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    static_cast<uint32_t>(index_source.address),
 		    static_cast<uint32_t>(index_source.address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages, 0,
+		                        sizeof(draw_data), draw_data);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
 	if (state.depth_info.depth_bounds_test_enable &&
 	    !m_context.GetGraphics().host.capabilities.depth_bounds) {
-		ApplyDepthBoundsByShader(buffer, state, pipeline.pipeline_layout);
+		ApplyDepthBoundsByShader(buffer, state, pipeline);
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();

@@ -1419,7 +1419,10 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || m_driver_cache_path.empty() || !m_lists_writable) {
+	// The cache stays alive: worker threads may still build with it until the destructor stops
+	// them.
+	if (m_driver_cache == nullptr || m_driver_cache_saved || m_driver_cache_path.empty() ||
+	    !m_lists_writable) {
 		return;
 	}
 
@@ -1470,10 +1473,9 @@ void PipelineCache::Save() {
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
+	m_driver_cache_saved = true;
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(

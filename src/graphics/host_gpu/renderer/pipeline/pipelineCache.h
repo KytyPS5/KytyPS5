@@ -130,6 +130,9 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// The stages of the one push constant range of the layout. Every push to the layout names
+		// exactly these stages (VUID-vkCmdPushConstants-offset-01796).
+		vk::ShaderStageFlags push_constant_stages;
 		// An emulated mesh draw first runs this compute pipeline, with its own layout over the same
 		// descriptor set layout, and `pipeline` then draws what it wrote.
 		vk::Pipeline       mesh_compute        = nullptr;
@@ -204,6 +207,8 @@ private:
 	// (DriverFaults::pipeline_cache_serializes_builds).
 	std::vector<vk::PipelineCache> m_builder_caches;
 	std::filesystem::path         m_driver_cache_path;
+	// Save wrote the driver cache: the destructor does not write it again.
+	bool                          m_driver_cache_saved = false;
 	// A pipeline and whether it is built yet: false while a worker thread is still building it,
 	// and the pipeline is read only once it is true.
 	struct PipelineEntry {

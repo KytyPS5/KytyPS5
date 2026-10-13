@@ -210,7 +210,7 @@ private:
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
 	void ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
-	                              vk::PipelineLayout layout);
+	                              const PipelineCache::Pipeline& pipeline);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,

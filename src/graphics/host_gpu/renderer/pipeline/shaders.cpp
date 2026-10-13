@@ -503,19 +503,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	// An emulated mesh program is bound to the compute pipeline, so the graphics layout pushes to
-	// the pixel shader only, plus the vertex shader's record address.
-	vk::PushConstantRange push_constants[2] {
-	    {mesh_emulated ? vk::ShaderStageFlagBits::eFragment : graphics_stages, 0,
-	     ShaderRecompiler::IR::NativePushConstantSize},
-	    {vk::ShaderStageFlagBits::eVertex, 0,
-	     ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount * sizeof(uint32_t)}};
+	// An emulated mesh program is bound to the compute pipeline: the graphics layout pushes to the
+	// pixel shader, and to the vertex shader its record address. One range covers every stage, so
+	// a push of any of them names the same stages.
+	static_assert(ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount * sizeof(uint32_t) <=
+	              ShaderRecompiler::IR::NativePushConstantSize);
+	pipeline.push_constant_stages =
+	    mesh_emulated ? vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment
+	                  : graphics_stages;
+	const vk::PushConstantRange push_constants {pipeline.push_constant_stages, 0,
+	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.setLayoutCount         = 1;
 	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
-	pipeline_layout_info.pushConstantRangeCount = mesh_emulated ? 2u : 1u;
-	pipeline_layout_info.pPushConstantRanges    = push_constants;
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 

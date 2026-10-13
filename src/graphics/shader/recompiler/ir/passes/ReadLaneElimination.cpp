@@ -230,6 +230,13 @@ void ReportFirstLaneRead(const Program& program) {
 	     what, program.shader_hash, static_cast<unsigned>(program.stage));
 }
 
+// The lane a selector names: the hardware reads only its low bits, so it wraps into the wave.
+template <typename Position>
+Value WaveLane(Block& block, Position at, Value selector, uint32_t wave_size) {
+	return Value(&*block.PrependNewInst(at, ValueOpcode::BitwiseAnd32,
+	                                    {selector, Value(wave_size - 1u)}));
+}
+
 struct LaneLowering {
 	const Program&                         program;
 	const std::unordered_set<const Inst*>& with_lane_writes;
@@ -250,13 +257,14 @@ Value LaneOfUniformRegister(const LaneLowering& lowering, std::unordered_map<Ins
 			const auto selector = inst->Arg(2).Resolve();
 			const auto below    = LaneOfUniformRegister(lowering, known, inst->Arg(0), lane);
 			Value      result;
-			if (selector.IsImmediate()) {
-				result = selector.U32() == lane ? inst->Arg(1) : below;
+			if (selector.IsImmediate() && selector.GetType() == Type::U32) {
+				result = selector.U32() % lowering.program.wave_size == lane ? inst->Arg(1) : below;
 			} else {
 				auto*      block = inst->Parent();
 				const auto at    = PositionOf(inst);
-				const auto hit =
-				    block->PrependNewInst(at, ValueOpcode::IEqual32, {selector, Value(lane)});
+				const auto hit   = block->PrependNewInst(
+				    at, ValueOpcode::IEqual32,
+				    {WaveLane(*block, at, selector, lowering.program.wave_size), Value(lane)});
 				result = Value(&*block->PrependNewInst(at, ValueOpcode::SelectU32,
 				                                       {Value(&*hit), inst->Arg(1), below}));
 			}
@@ -381,12 +389,13 @@ uint32_t LowerLaneOpsToSingleLane(Program& program) {
 				continue;
 			}
 			const auto selector = inst.Arg(2).Resolve();
-			if (selector.IsImmediate()) {
+			if (selector.IsImmediate() && selector.GetType() == Type::U32) {
 				inst.ReplaceUsesWith(selector.U32() % program.wave_size == 0u ? inst.Arg(1)
 				                                                              : inst.Arg(0));
 			} else {
-				const auto hit =
-				    block->PrependNewInst(it, ValueOpcode::IEqual32, {selector, Value(0u)});
+				const auto hit = block->PrependNewInst(
+				    it, ValueOpcode::IEqual32,
+				    {WaveLane(*block, it, selector, program.wave_size), Value(0u)});
 				const auto own = block->PrependNewInst(it, ValueOpcode::SelectU32,
 				                                       {Value(&*hit), inst.Arg(1), inst.Arg(0)});
 				inst.ReplaceUsesWith(Value(&*own));

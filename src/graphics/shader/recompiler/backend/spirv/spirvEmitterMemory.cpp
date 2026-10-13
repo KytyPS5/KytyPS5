@@ -1338,9 +1338,13 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto high   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
-	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
-	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
-	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
+	// With one lane per invocation the ballot repeats the predicate in every bit; an active
+	// invocation is one lane and counts one (the atomic below runs only when it is active).
+	const auto count = state.single_lane
+	                       ? ConstantU32(state, 1)
+	                       : Binary(state, spv::OpIAdd, TypeU32(state),
+	                                Unary(state, spv::OpBitCount, TypeU32(state), low),
+	                                Unary(state, spv::OpBitCount, TypeU32(state), high));
 	auto       first = ctx.FirstLane(ballot);
 	if (state.helper_invocation_variable != 0) {
 		// A helper pixel is a lane of the subgroup like any other, but its atomic changes

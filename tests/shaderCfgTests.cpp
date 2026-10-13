@@ -6591,6 +6591,9 @@ void TestTriangleVertexValueShaders() {
   const auto missing = BuildTriangleVertexValueShaders(vertex, pixel, true);
   CheckSpirvBinaryValidates(missing.control);
   CheckSpirvBinaryValidates(missing.evaluation);
+  Check(DisassembleSpirvBinary(missing.control).find("OpUndef") == std::string::npos &&
+            DisassembleSpirvBinary(missing.evaluation).find("OpUndef") == std::string::npos,
+        "a parameter the vertex shader does not write was left undefined");
 }
 
 // On a host without per-vertex inputs, a pixel shader that reads one parameter both flat and
@@ -8474,6 +8477,28 @@ void TestPixelAppendIsDoneByARealPixel() {
       RecompileForTest(compute_shader, MakeCompileOptions(ShaderType::Compute));
   Check(!SpirvHasDecorationValue(compute.spirv, 11u, kBuiltInHelperInvocation),
         "a compute shader asked for helper pixels");
+}
+
+// In a stage with one lane per invocation (a vertex stage without subgroup operations), each
+// invocation is one lane of the guest's wave: an active one moves an append counter by one.
+void TestSingleLaneAppendMovesTheCounterByOne() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(124, 129),           // m0 = one counter
+      EncodeDs0(0x3e) | (1u << 17u),     // ds_append gds
+      EncodeDs1(0, 0, 0),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.host.capabilities.subgroup_supported_stages = 0x30u; // no vertex
+  Check(ShaderRecompiler::Spirv::UsesSingleLaneModel(ShaderType::Vertex, options.host),
+        "a vertex stage without subgroup operations is not one lane per invocation");
+  const auto result = RecompileForTest(shader, options);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("OpAtomicIAdd") != std::string::npos &&
+            source.find("OpBitCount") == std::string::npos,
+        "a one-lane append counted the bits of its replicated ballot");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
@@ -11011,6 +11036,31 @@ void TestHostFeaturesGateUnavailableCapabilities() {
     Check(SpirvSourceHasInstructionUsing(source, "OpCompositeConstruct", "%uint_5 %uint_7") ||
               source.find("%uint_5 %uint_7 %uint_5 %uint_7") != std::string::npos,
           "the scalars did not come back from the lanes they were put in");
+    CheckSpirvBinaryValidates(lowered.spirv);
+  }
+
+  // A lane selector past the wave wraps into it, as the hardware reads only its low bits: 67 is
+  // lane 3 in a wave of 32 and in a wave of 64.
+  {
+    const uint32_t shader[] = {
+        EncodeSMovB32(9, 133),                                      // s9 = 5
+        EncodeVop3Word0(0x361, 86), EncodeVop3Word1(9, 255, 0), 67u, // v_writelane_b32 v86, s9, 67
+        EncodeSMovB32(10, 135),                                     // s10 = 7
+        EncodeVop3Word0(0x361, 86), EncodeVop3Word1(10, 132, 0),    // v_writelane_b32 v86, s10, 4
+        EncodeVop3Word0(0x360, 11), EncodeVop3Word1(86 + 256, 131, 0), // v_readlane_b32 s11, v86, 3
+        EncodeVop3Word0(0x360, 12), EncodeVop3Word1(86 + 256, 132, 0), // v_readlane_b32 s12, v86, 4
+        EncodeVop1(0x01, 0, 11),                                    // v_mov_b32 v0, s11
+        EncodeVop1(0x01, 1, 12),                                    // v_mov_b32 v1, s12
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 0, 1),              // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.host.capabilities.subgroup_supported_stages = 0x32u; // no vertex
+    const auto lowered = RecompileForTest(shader, options);
+    const auto source = DisassembleSpirvBinary(lowered.spirv);
+    Check(SpirvSourceHasInstructionUsing(source, "OpCompositeConstruct", "%uint_5 %uint_7") ||
+              source.find("%uint_5 %uint_7 %uint_5 %uint_7") != std::string::npos,
+          "a lane selector past the wave did not wrap into it");
     CheckSpirvBinaryValidates(lowered.spirv);
   }
 
@@ -16545,6 +16595,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestPixelAppendIsDoneByARealPixel();
+  TestSingleLaneAppendMovesTheCounterByOne();
   TestSamplerEntryPerTexture();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();

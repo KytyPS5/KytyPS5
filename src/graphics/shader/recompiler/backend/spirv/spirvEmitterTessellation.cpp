@@ -56,7 +56,9 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& tess     = state.input_info.vertex->tess;
 	const auto  variable = state.tess_variables.at(static_cast<uint32_t>(kind));
 	EXIT_IF(variable == 0);
-	const auto input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput;
+	const auto input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput ||
+	                     (kind == Attribute::PatchOutput &&
+	                      state.program.stage == ShaderType::TessellationEvaluation);
 	const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
@@ -97,9 +99,11 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
-		auto vertex = kind == Attribute::ControlOutput
-		                  ? EmitLaneId(state)
-		                  : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+		// The control point comes from the address the guest computed: the patch ordinal is
+		// folded to zero, so the address carries control_point * stride. This covers a hull
+		// shader reading back other invocations' control points (LowerTessellationMemory's
+		// self_read case) as well as its own writes.
+		auto vertex = EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
 		if (kind == Attribute::ControlInput) {
 			// The guest addresses the LS ring of the whole thread group, and a gather table can
 			// name a vertex of the draw rather than of this patch; Vulkan's input array holds
@@ -141,7 +145,9 @@ void DefineTessellationInterfaces(EmitterState& state) {
 	for (uint32_t index = 0; index < used.size(); index++) {
 		if (!used[index]) continue;
 		const auto kind    = static_cast<Attribute>(index);
-		const bool input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput;
+		const bool input = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput ||
+		                   (kind == Attribute::PatchOutput &&
+		                    state.program.stage == ShaderType::TessellationEvaluation);
 		const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 		uint32_t   type;
 		if (kind == Attribute::Factor) {
@@ -149,8 +155,19 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			// them); the inner levels live in their own float[2] variable below.
 			type = array(TypeF32(state), 4u);
 		} else if (kind == Attribute::PatchOutput) {
-			state.tess_patch_base = patch_begin;
-			type = array(TypeU32Vector(state, 4), (patch_end - patch_begin + 15u) / 16u);
+			// The patch-constant region can sit far above the control points (a hull shader that
+			// keeps it at 0x7fc0 would otherwise need a ~2000 element array, far past the host
+			// per-patch output limit). Index it from its own base instead. The HS writes the
+			// region and the TES reads part of it, so both stages take the range reflected from
+			// the HS; the addresses one stage happens to touch would give each its own layout.
+			// Without a reflected range that covers them, fall back to the stage's own accesses.
+			if (tess.patch_size != 0u && patch_begin >= tess.patch_base &&
+			    patch_end <= tess.patch_base + tess.patch_size) {
+				patch_begin = tess.patch_base;
+				patch_end   = tess.patch_base + tess.patch_size;
+			}
+			state.tess_patch_base = patch_begin & ~63u;
+			type = array(TypeU32Vector(state, 4), (patch_end - state.tess_patch_base + 15u) / 16u);
 		} else {
 			const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
 			const auto stride = local ? tess.ls_stride : tess.hs_stride;
@@ -216,7 +233,24 @@ uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& ins
 }
 
 void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
-	EmitIfCondition(ctx.state, ctx.Arg(inst, 3), [&] {
+	auto condition = ctx.Arg(inst, 3);
+	if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::ControlOutput)) {
+		// A hull shader's patch-constant stores sit far above the control points (0x8000 - 96 *
+		// (patch + 1) in My First Gran Turismo) and, when the patch ordinal is not a compile-time
+		// constant, are not recognised as patch outputs. Indexed as a control point they land far
+		// past the array, which is undefined and trashes the first control point's data. Drop them.
+		const auto& tess   = ctx.state.input_info.vertex->tess;
+		const auto  vertex = EmitBinaryU32(ctx.state, spv::OpUDiv, ctx.Arg(inst, 1),
+		                                   ConstantU32(ctx.state, tess.hs_stride));
+		const auto  inside = ctx.state.builder.AllocateId();
+		const auto  both   = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpULessThan, TypeBool(ctx.state), inside, vertex,
+		                              ConstantU32(ctx.state, tess.output_control_points));
+		ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), both, condition,
+		                              inside);
+		condition = both;
+	}
+	EmitIfCondition(ctx.state, condition, [&] {
 		auto value = ctx.Arg(inst, 2);
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor)) {
 			const auto floating = ctx.state.builder.AllocateId();

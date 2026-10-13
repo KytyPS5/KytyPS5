@@ -25,11 +25,17 @@ struct TessellationAddress {
 	uint32_t constant    = 0;
 };
 
+struct TessellationPatchRange {
+	uint32_t begin = UINT32_MAX;
+	uint32_t end   = 0;
+};
+
 // The byte stride of one control point in the ring, or nothing when the addressing is not one
-// the affine analysis below can describe.
+// the affine analysis below can describe. For an HS it also reports the byte range of the
+// per-patch outputs: the constant-address ring stores past the control point records.
 std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& program, bool local,
-                                                  uint32_t control_points,
-                                                  uint32_t input_stride) {
+                                                  uint32_t control_points, uint32_t input_stride,
+                                                  TessellationPatchRange* patch = nullptr) {
 	using namespace Decoder;
 	using Address = TessellationAddress;
 	using Kind    = Address::Kind;
@@ -85,7 +91,8 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 		           : Address {};
 	};
 	std::array<const Decoder::Instruction*, IR::NumVectorRegs> writer {};
-	uint32_t stride = 0;
+	std::vector<TessellationPatchRange>                        constant_stores;
+	uint32_t                                                   stride = 0;
 	// Control flow inside the program: a branch joins two paths (or closes a loop) at its target.
 	// At a join a register keeps its value only if neither path redefines it, so every register
 	// written between a branch and its target is unknown from the target on. The ring addresses
@@ -158,6 +165,10 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 				LOGF("%s tessellation address is not affine at pc 0x%08x (v%u written by: %s)\n",
 				     local ? "LS" : "HS", inst.pc, inst.src0.reg, producer.c_str());
 				return std::nullopt;
+			}
+			if (control_store && address.coefficient == 0u) {
+				const auto begin = address.constant + inst.offset;
+				constant_stores.push_back({begin, begin + 4u * std::max(inst.data_dwords, 1u)});
 			}
 			if (address.coefficient != 0u) {
 				const auto expected = control_read ? input_stride : stride;
@@ -232,6 +243,13 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 	if (stride == 0u) {
 		return std::nullopt;
 	}
+	if (patch != nullptr) {
+		for (const auto& store: constant_stores) {
+			if (store.begin < stride * control_points) continue;
+			patch->begin = std::min(patch->begin, store.begin);
+			patch->end   = std::max(patch->end, store.end);
+		}
+	}
 	return stride;
 }
 
@@ -282,8 +300,9 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 		     info.input_control_points, info.output_control_points);
 		return false;
 	}
-	const auto hs_stride = ReflectTessellationStride(control_program, false,
-	                                                 info.output_control_points, *ls_stride);
+	TessellationPatchRange patch;
+	const auto             hs_stride = ReflectTessellationStride(
+	    control_program, false, info.output_control_points, *ls_stride, &patch);
 	if (!hs_stride) {
 		LOGF("Tessellation analysis failed: HS stride (input_cp=%u output_cp=%u ls_stride=%u)\n",
 		     info.input_control_points, info.output_control_points, *ls_stride);
@@ -291,8 +310,14 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	}
 	info.ls_stride = *ls_stride;
 	info.hs_stride = *hs_stride;
-	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
-	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
+	if (patch.begin < patch.end) {
+		info.patch_base = patch.begin;
+		info.patch_size = patch.end - patch.begin;
+	}
+	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u "
+	     "patch=0x%x+0x%x\n",
+	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
+	     info.patch_base, info.patch_size);
 	return true;
 }
 
@@ -321,6 +346,11 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 		// meaningless.
 		return unsupported("a tessellation interface that was not reflected");
 	}
+	// A tessellation-control barrier must be reached by every invocation of the patch, so it cannot
+	// sit in front of the guest's patch-constant phase, which runs behind a per-lane branch.
+	Block* last_write_block = nullptr;
+	Block* read_block       = nullptr;
+	bool   seen_self_read = false, post_read_barrier = false;
 	// Ring addresses can reuse data VGPRs. Their inactive values are irrelevant to
 	// a store guarded by the same EXEC predicate, but must remain intact elsewhere.
 	for (auto* block: program.blocks) {
@@ -380,20 +410,59 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					kind = TessellationAttribute::Factor;
 					factors += components;
 				} else {
-					kind = write ? TessellationAttribute::ControlOutput
-					             : TessellationAttribute::EvaluationInput;
-					if (write ? options.stage != ShaderType::TessellationControl
-					          : options.stage != ShaderType::TessellationEvaluation) {
+					// A hull shader reads its own control-point outputs back (the patch-constant
+					// phase's OutputPatch parameter). That targets the region ControlOutput writes,
+					// not the evaluation stage's input. The hardware orders the two phases itself;
+					// Vulkan's tessellation-control model needs an explicit barrier before one
+					// invocation may observe another's writes (placed below).
+					const bool self_read =
+					    !write && options.stage == ShaderType::TessellationControl;
+					kind = write || self_read ? TessellationAttribute::ControlOutput
+					                          : TessellationAttribute::EvaluationInput;
+					if (write || self_read ? options.stage != ShaderType::TessellationControl
+					                       : options.stage != ShaderType::TessellationEvaluation) {
 						return unsupported("a control-point access in the wrong stage");
 					}
-					if (address.IsImmediate() &&
-					    address.U32() >= tess.hs_stride * tess.output_control_points) {
-						if (!write) return unsupported("a patch-constant read");
+					// The instruction's own constant offset is part of the address: the
+					// evaluation stage reads patch constants as voffset 0 plus an offset past the
+					// control points.
+					if (address.IsImmediate() && address.U32() + memory.offset >=
+					                                 tess.hs_stride * tess.output_control_points) {
+						// The patch-constant phase writes this region (PatchOutput) and the
+						// evaluation stage reads it back as a patch input. A hull shader reading
+						// its own patch constants has no such interface.
+						if (!write && options.stage != ShaderType::TessellationEvaluation) {
+							return unsupported("a patch-constant read");
+						}
 						kind = TessellationAttribute::PatchOutput;
 					}
 				}
 			} else {
 				continue;
+			}
+			if (kind == TessellationAttribute::ControlOutput) {
+				// Vulkan orders a control-point read after another invocation's write only across a
+				// control barrier. It goes at the end of the last block that writes control points
+				// before the first read (the join point every lane passes), not in front of the
+				// read itself. Writes that follow the reads need the opposite ordering and get one
+				// in front of the first of them.
+				if (write && !seen_self_read) {
+					last_write_block = block;
+				} else if (!write) {
+					if (!seen_self_read) {
+						seen_self_read = true;
+						if (last_write_block != nullptr && last_write_block != block) {
+							last_write_block->PrependNewInst(last_write_block->end(),
+							                                 ValueOpcode::Barrier, {});
+						} else {
+							block->PrependNewInst(it, ValueOpcode::Barrier, {});
+						}
+					}
+					read_block = block;
+				} else if (!post_read_barrier && block != read_block) {
+					block->PrependNewInst(it, ValueOpcode::Barrier, {});
+					post_read_barrier = true;
+				}
 			}
 			const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
 				return Value(&*block->PrependNewInst(it, opcode, args));

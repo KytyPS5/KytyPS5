@@ -7839,6 +7839,195 @@ void TestNewShaderRecompilerFlatCachePolicyAndScalarSext() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// RESIDENT EVIL 2 samples a bindless T# whose heap record index differs per lane. The engine
+// fetches the 48-byte record with two indexed BUFFER_LOAD_DWORDX4 (+16, +32), then waterfalls:
+// V_READLANE the first remaining lane's eight dwords, V_CMPX_EQ every lane against them, sample,
+// retire the matched lanes, loop. The lane is loop-carried, so no host walk folds the T#, and all
+// six ray-traced compute shaders using it were dropped. Both spellings below are the
+// shipped loops verbatim: wave64 (cs 05b58beb, 6878f57d, 572c0df0, b216fc1c) and wave32
+// (cs 4c2c31fe, 9e8a5c4f), behind a prologue that only places their registers.
+void TestWaterfallBindlessImageRecord() {
+  using namespace ShaderRecompiler::IR;
+  struct Shape {
+    const char *name;
+    uint32_t wave;
+    uint32_t heap;      // first SGPR of the heap V# the loop reads
+    uint32_t sampler;   // first SGPR of its S#
+    uint32_t index;     // VGPR holding the per-lane record index
+    uint32_t coords;    // first VGPR of the sample address
+    uint32_t result;    // VGPR the sample writes
+    uint32_t guard;     // the shipped V_CMPX that drops lanes with no record (index -1)
+    uint32_t spare;     // an SGPR the loop never writes
+    std::vector<uint32_t> loop;
+  };
+  const std::array<Shape, 2> shapes{{
+      {"wave64 waterfall (cs 05b58beb)", 64u, 88u, 40u, 4u, 8u, 20u, 0x7daa08c1u, 16u,
+       {0xe0382020u, 0x80160004u, 0xe0382010u, 0x80160404u, 0xbe9e047eu, 0xbe8f141eu,
+        0xbea0047eu, 0xbf8c3f71u, 0xd760000eu, 0x00001f02u, 0xd760000du, 0x00001f01u,
+        0xd760000cu, 0x00001f00u, 0xbf8c3f70u, 0xd760000bu, 0x00001f07u, 0xd760000au,
+        0x00001f06u, 0xd7600009u, 0x00001f05u, 0xd7600008u, 0x00001f04u, 0xd760000fu,
+        0x00001f03u, 0x7da4060fu, 0x7da4040eu, 0x7da4020du, 0x7da4000cu, 0x7da40e0bu,
+        0x7da40c0au, 0x7da40a09u, 0x7da40808u, 0x7da456f9u, 0x8686002bu, 0x7da454f9u,
+        0x8686002au, 0x7da452f9u, 0x86860029u, 0x7da450f9u, 0x86860028u, 0xbeea047eu,
+        0xbf880003u, 0x7e1402f4u, 0xf0900808u, 0x01421408u, 0x8a9e6a1eu, 0xbefe0420u,
+        0xbf85ffd4u}},
+      {"wave32 waterfall (cs 4c2c31fe)", 32u, 24u, 60u, 10u, 14u, 2u, 0x7daa14c1u, 12u,
+       {0xe0382010u, 0x8006060au, 0xe0382020u, 0x80060a0au, 0xbe8d037eu, 0xbe8b130du,
+        0xbeeb037eu, 0xbf8c3f70u, 0xd760000au, 0x0000170cu, 0xd7600009u, 0x0000170bu,
+        0xd7600008u, 0x0000170au, 0xd7600007u, 0x00001709u, 0xd7600006u, 0x00001708u,
+        0xd7600005u, 0x00001707u, 0xd7600004u, 0x00001706u, 0xd760000bu, 0x0000170du,
+        0x7da41a0bu, 0x7da4180au, 0x7da41609u, 0x7da41408u, 0x7da41207u, 0x7da41006u,
+        0x7da40e05u, 0x7da40c04u, 0x7da47ef9u, 0x8686003fu, 0x7da47cf9u, 0x8686003eu,
+        0x7da47af9u, 0x8686003du, 0x7da478f9u, 0x8686003cu, 0xbeea037eu, 0xbf880002u,
+        0xf0900f08u, 0x01e1020eu, 0x8a0d6a0du, 0xbefe036bu, 0xbf85ffd6u}},
+  }};
+
+  std::vector<uint32_t> heap_words(64u * 48u / sizeof(uint32_t));
+  std::vector<uint32_t> output(64u);
+  const auto heap_address = reinterpret_cast<uint64_t>(heap_words.data());
+  const auto output_address = reinterpret_cast<uint64_t>(output.data());
+  const auto heap_v = [&](uint32_t stride, bool swizzle,
+                          Prospero::BufferFormat format = Prospero::BufferFormat::k32Float) {
+    return std::array<uint32_t, 4>{
+        static_cast<uint32_t>(heap_address),
+        static_cast<uint32_t>((heap_address >> 32u) & 0xffffu) | (stride << 16u) |
+            (swizzle ? 1u << 31u : 0u),
+        64u, (3u << 28u) | (static_cast<uint32_t>(format) << 12u)};
+  };
+
+  for (const auto &shape : shapes) {
+    std::vector<uint32_t> code{
+        EncodeSop1(0x04, shape.heap, 0),          // s_mov_b64 heap[0:1], s[0:1]
+        EncodeSop1(0x04, shape.heap + 2u, 2),     // s_mov_b64 heap[2:3], s[2:3]
+        EncodeSop1(0x04, shape.sampler, 8),       // s_mov_b64 sampler[0:1], s[8:9]
+        EncodeSop1(0x04, shape.sampler + 2u, 10), // s_mov_b64 sampler[2:3], s[10:11]
+        EncodeSop1(0x04, 20, 12),                 // s_mov_b64 s[20:21], s[12:13]
+        EncodeSop1(0x04, 22, 14),                 // s_mov_b64 s[22:23], s[14:15]
+        EncodeVop1(0x01, shape.index, 256),       // v_mov_b32 index, v0
+        EncodeVop1(0x01, shape.coords, 128),      // v_mov_b32 coords.x, 0
+        EncodeVop1(0x01, shape.coords + 1u, 128), // v_mov_b32 coords.y, 0
+        EncodeVop1(0x01, shape.coords + 2u, 128), // v_mov_b32 coords.lod, 0
+    };
+    const auto loop_start = code.size() + 1u;
+    code.push_back(shape.guard); // v_cmpx_ne_u32 exec, -1, index
+    code.insert(code.end(), shape.loop.begin(), shape.loop.end());
+    code.push_back(EncodeMubuf0(0x1c));
+    code.push_back(EncodeMubuf1(shape.result, 5, 0)); // buffer_store_dword result, v0, s[20:23]
+    code.push_back(EncodeSopp(0x01));
+
+    std::array<uint32_t, 16> user_data{};
+    const auto set_heap = [&](std::array<uint32_t, 4> v) {
+      std::copy(v.begin(), v.end(), user_data.begin());
+    };
+    set_heap(heap_v(48u, false));
+    user_data[12] = static_cast<uint32_t>(output_address);
+    user_data[13] = static_cast<uint32_t>((output_address >> 32u) & 0xffffu) | (4u << 16u);
+    user_data[14] = 64u;
+    user_data[15] = 3u << 28u;
+
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = shape.wave;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.thread_ids_num = 1;
+    compute.wave_size = shape.wave;
+    compute.host_subgroup_size = shape.wave;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    options.wave_size = shape.wave;
+    options.host_subgroup_size = shape.wave;
+    options.user_data = user_data;
+    const std::string name = shape.name;
+
+    OverrideBindlessImageHeaps(0);
+    const auto refused = ShaderRecompiler::TranslateProgram(code, options);
+    OverrideBindlessImageHeaps(1);
+    Check(!refused.status.ok && ContainsStr(refused.status.reason, "GetImageResource"),
+          (name + ": without the bindless set the per-lane record must still be refused").c_str());
+
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Check(translated.status.ok,
+          (name + ": the waterfall record was refused: " + translated.status.reason).c_str());
+    const auto &program = translated.program;
+    Check(program.info.images.size() == 1u, (name + ": expected one sampled image").c_str());
+    const auto &source = program.descriptor_sources[program.info.images[0].source];
+    Check(source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless &&
+              source.indirect_descriptor->indexed_heap &&
+              source.indirect_descriptor->table_offset == 16u &&
+              source.indirect_descriptor->heap_stride == 1u,
+          (name + ": the record did not become an indexed bindless heap at +16").c_str());
+
+    // The key is the record index at the lane the loop lifted, and a lane the load skipped
+    // names no record.
+    const Inst *image = nullptr;
+    for (const auto *block : program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == ValueOpcode::GetImageResource) image = &inst;
+      }
+    }
+    const auto *key = image != nullptr ? image->Arg(0).ResolveInstruction() : nullptr;
+    const auto *selected = key != nullptr && key->GetOpcode() == ValueOpcode::ReadLane
+                               ? key->Arg(0).ResolveInstruction()
+                               : nullptr;
+    Check(selected != nullptr && selected->GetOpcode() == ValueOpcode::SelectU32 &&
+              selected->Arg(2).Resolve().IsImmediate() &&
+              selected->Arg(2).Resolve().U32() == 0xffffffffu,
+          (name + ": the bindless key is not the lifted lane's record index").c_str());
+
+    // One dword lifted at another lane is not one record any more.
+    auto other_lane = code;
+    auto &lane_operand = other_lane[loop_start + 9u]; // first V_READLANE, VOP3 word 1
+    lane_operand = (lane_operand & ~(0x1ffu << 9u)) | (shape.spare << 9u);
+    Check(!ShaderRecompiler::TranslateProgram(other_lane, options).status.ok,
+          (name + ": a T# whose dwords come from different lanes was served").c_str());
+
+    // Hardware steps an indexed load by the V#'s stride, so the bindless table takes it from the
+    // bound descriptor; a swizzled or strideless heap has no flat record step and is refused.
+    const auto plan = ExtractResourcePlan(program);
+    const auto materialize = [&](std::array<uint32_t, 4> v, ResourceSnapshot &snapshot) {
+      set_heap(v);
+      ResourceSpecialization specialization;
+      return MaterializeResources(plan,
+                                  {.user_data = user_data,
+                                   .read_memory = ReadHostTestMemory,
+                                   .read_specialization_memory = ReadHostTestMemory},
+                                  snapshot, specialization) &&
+             specialization.images.size() == 1u && specialization.images[0].bindless;
+    };
+    for (const uint32_t stride : {48u, 64u}) {
+      ResourceSnapshot snapshot;
+      Check(materialize(heap_v(stride, false), snapshot) &&
+                snapshot.bindless_tables.size() == 1u &&
+                snapshot.bindless_tables[0].stride == stride &&
+                snapshot.bindless_tables[0].record_offset == 16u &&
+                snapshot.bindless_tables[0].heap == heap_v(stride, false),
+            (name + ": the bindless table did not take the heap V#'s stride").c_str());
+    }
+    ResourceSnapshot refused_snapshot;
+    Check(!materialize(heap_v(0u, false), refused_snapshot),
+          (name + ": a strideless indexed heap was served").c_str());
+    Check(!materialize(heap_v(48u, true), refused_snapshot),
+          (name + ": a swizzled indexed heap was served").c_str());
+    // A vector load through a format-0 V# reads zero, so a disabled heap serves null for every key,
+    // whatever its stride.
+    for (const uint32_t stride : {48u, 0u}) {
+      ResourceSnapshot disabled_snapshot;
+      Check(materialize(heap_v(stride, false, Prospero::BufferFormat::kInvalid),
+                        disabled_snapshot) &&
+                disabled_snapshot.bindless_tables.empty(),
+            (name + ": a format-0 indexed heap was sampled or refused").c_str());
+    }
+    set_heap(heap_v(48u, false));
+
+    const auto result = RecompileForTest(code, options);
+    OverrideBindlessImageHeaps(-1);
+    Check(result.program.info.images.size() == 1u && result.program.info.images[0].bindless &&
+              result.resources.bindless_tables.size() == 1u &&
+              result.resources.bindless_tables[0].stride == 48u,
+          (name + ": the compiled shader does not sample through the bindless set").c_str());
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestNewShaderRecompilerUnbasedFlatUsesBda() {
   const uint32_t shader[] = {
       EncodeFlat0(0x0c, 0, 0),
@@ -15535,7 +15724,23 @@ void TestBoundedScalarMaterialImageKeys() {
   user_data[12] = 0x1000u;
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
+  // The bindless heap serves these tables; the host enumeration below is the fallback for an
+  // access it cannot serve.
+  OverrideBindlessImageHeaps(1);
+  auto bindless_translated = ShaderRecompiler::TranslateProgram(shader, options);
+  OverrideBindlessImageHeaps(0);
   auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  OverrideBindlessImageHeaps(-1);
+  const auto bindless_plan = ExtractResourcePlan(bindless_translated.program);
+  Check(bindless_plan.info.images.size() == 2 &&
+            std::ranges::all_of(bindless_plan.info.images,
+                                [&](const auto &image) {
+                                  const auto &source =
+                                      bindless_plan.descriptor_sources[image.source]
+                                          .indirect_descriptor;
+                                  return source && source->bindless;
+                                }),
+        "scalar material image tables were not served from the bindless heap");
   auto plan = ExtractResourcePlan(translated.program);
   Check(plan.info.images.size() == 2 && plan.capture_specialization_reads,
         "scalar material fields lost their distinct image roots or clean read capture");
@@ -15654,6 +15859,14 @@ void TestBoundedScalarMaterialImageKeys() {
   memory = {.mixed = true};
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "selected material fields bypassed image compatibility");
+  // The bindless heap neither probes the loop nor needs one numeric class across its records.
+  memory = {.mixed = true};
+  Check(MaterializeResources(bindless_plan, runtime, snapshot, specialization) &&
+            memory.keys == 0 && memory.images == 0 && snapshot.bindless_tables.size() == 2 &&
+            std::ranges::all_of(specialization.images, [](const auto &image) {
+              return image.bindless;
+            }),
+        "bindless scalar material tables probed the heap or refused mixed numeric classes");
   memory = {};
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "native scalar material image selection did not recover after rejected candidates");
@@ -17241,6 +17454,7 @@ int main() {
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
   TestNewShaderRecompilerFlatCachePolicyAndScalarSext();
+  TestWaterfallBindlessImageRecord();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();
   TestNewShaderRecompilerCfgStraightLine();

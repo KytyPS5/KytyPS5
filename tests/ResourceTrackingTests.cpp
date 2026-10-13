@@ -266,7 +266,7 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
                          bool memory_backed_material = false, uint32_t member_offset = 0,
                          uint32_t material_stride = 224, uint32_t heap_stride = 32u,
                          uint32_t heap_record_offset = 0u,
-                         uint32_t selector_bits = UINT32_MAX) {
+                         uint32_t selector_bits = UINT32_MAX, uint32_t selector_shift = 0u) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -318,6 +318,8 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
   auto key =
       fixture->Emit(ValueOpcode::ReadConstBuffer, {material, member},
                     fixture->AddMemory(material_scalar, 0x10d8));
+  if (selector_shift != 0u)
+    key = fixture->Emit(ValueOpcode::ShiftRightLogical32, {key, Value(selector_shift)});
   if (selector_bits != UINT32_MAX)
     key = fixture->Emit(ValueOpcode::BitwiseAnd32, {key, Value(selector_bits)});
   // A heap of plain T# strides by 32 and the shader shifts; a heap that keeps a T# inside a
@@ -1098,6 +1100,23 @@ void TestInvariantIndirectImageMaterialization() {
   packed_memory.fail_address = 0x205cu;
   Check(!MaterializeResources(packed_plan, packed_runtime, snapshot, specialization),
         "unreadable in-range DWORD in a 48-byte descriptor record was accepted");
+  // The bindless heap is indexed by the key the shader unpacks, so a shifted and masked key is
+  // served without the host ever reading the material word.
+  OverrideBindlessImageHeaps(1);
+  auto shifted = MakeIndirectImageFixture(false, 60u, false, 0u, 64u, 48u, 16u, 0x7fffu, 4u);
+  shifted->PlanAndTrack();
+  OverrideBindlessImageHeaps(0);
+  const auto shifted_plan = ExtractResourcePlan(shifted->program);
+  const auto &shifted_table =
+      shifted_plan.descriptor_sources[shifted_plan.info.images[0].source].indirect_descriptor;
+  packed_memory.fail_address = 0x1000u + 60u;
+  Check(shifted_table && shifted_table->bindless && shifted_table->selector_shift == 4u &&
+            MaterializeResources(shifted_plan, packed_runtime, snapshot, specialization) &&
+            specialization.images[0].bindless && snapshot.bindless_tables.size() == 1u &&
+            snapshot.bindless_tables[0].stride == 48u &&
+            snapshot.bindless_tables[0].record_offset == 16u,
+        "a shifted material key was not served from the bindless heap");
+  packed_memory.fail_address = UINT64_MAX;
   // The record offset wraps in U32 and the scalar immediate is added after it, so an
   // unmasked key at a nonzero record offset still plans.
   auto overflowing = MakeIndirectImageFixture(false, 60u, false, 0u, 64u, 48u, 16u);

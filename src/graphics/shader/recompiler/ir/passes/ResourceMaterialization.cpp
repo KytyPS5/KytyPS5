@@ -424,6 +424,17 @@ size_t IndirectMappingSlot(const ResourcePlan& program, uint32_t image_index) {
 	       static_cast<size_t>(image_index) * IndirectDirectoryStride;
 }
 
+size_t IndirectBufferMappingSlot(const ResourcePlan& program, uint32_t buffer_index) {
+	return IndirectDirectoryBase(program) +
+	       (program.info.images.size() + static_cast<size_t>(buffer_index)) *
+	           IndirectDirectoryStride;
+}
+
+bool BindlessTwoDimensional(Decoder::ImageDimension dimension) {
+	return dimension == Decoder::ImageDimension::Dim2D ||
+	       dimension == Decoder::ImageDimension::Dim2DArray;
+}
+
 bool ServedBindless(const ResourcePlan& program, uint32_t image_index) {
 	const auto& image  = program.info.images[image_index];
 	const auto* source = Source(program, image.source);
@@ -453,12 +464,6 @@ bool BindlessServesOp(ValueOpcode opcode, const MemoryInfo& memory) {
 	return opcode == ValueOpcode::ImageGatherRaw &&
 	       BindlessTwoDimensional(memory.image_dimension) &&
 	       (memory.image_sample_flags & Decoder::ImageSampleFlagLod) == 0u;
-}
-
-size_t IndirectBufferMappingSlot(const ResourcePlan& program, uint32_t buffer_index) {
-	return IndirectDirectoryBase(program) +
-	       (program.info.images.size() + static_cast<size_t>(buffer_index)) *
-	           IndirectDirectoryStride;
 }
 // Why an indirect image table could not be enumerated. Every clause below refuses for a different
 // reason with a different fix - a handle the host cannot decode, a probe budget the table outgrows,
@@ -634,7 +639,7 @@ RefusedIndirectTables& RefusedTables() {
 // the two descriptors as bound for this dispatch, and the plan's own view of how the shader indexes
 // them.
 uint64_t IndirectTableSignature(const DescriptorSource::IndirectDescriptor& indirect,
-                                const DescriptorValue&                 material_value,
+                                const DescriptorValue&                      material_value,
                                 const DescriptorValue& table_value, uint32_t image_index,
                                 uint64_t readable_extent, uint32_t workgroup_keys) {
 	struct Key {
@@ -715,9 +720,9 @@ void SortUniqueKeys(std::vector<uint32_t>& keys) {
 	}
 }
 
-bool EnumerateIndirectImage(const ResourcePlan&                    program,
+bool EnumerateIndirectImage(const ResourcePlan&                         program,
                             const DescriptorSource::IndirectDescriptor& indirect,
-                            const DescriptorValue&                 material_value,
+                            const DescriptorValue&                      material_value,
                             const DescriptorValue& table_value, uint32_t image_index,
                             const SrtRuntime& runtime, SrtWalker& clean, ResourceSnapshot& snapshot,
                             ResourceSpecialization& specialization, IndirectImageFailure& failure) {
@@ -740,18 +745,25 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 	auto& keys = program.material_keys;
 	keys.clear();
 	if (indirect.material_source == UINT32_MAX) {
-		uint32_t   key_count = 0;
-		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
-		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
-		if (table_value.dword_count != 2u || !evaluated) {
-			return Refuse(IndirectImageFailure::Stage::KeyCountUnevaluable);
+		uint32_t key_count = 0;
+		if (indirect.workgroup_axis != UINT32_MAX) {
+			if (indirect.workgroup_axis >= runtime.workgroup_counts.size() ||
+			    runtime.workgroup_counts[indirect.workgroup_axis] == 0u) {
+				return Refuse(IndirectImageFailure::Stage::KeyCountUnevaluable);
+			}
+			key_count = runtime.workgroup_counts[indirect.workgroup_axis];
+		} else {
+			const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
+			if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
+			if (table_value.dword_count != 2u || !evaluated) {
+				return Refuse(IndirectImageFailure::Stage::KeyCountUnevaluable);
+			}
 		}
 		failure.key_count    = key_count;
 		failure.probe_budget = MaxIndirectImageProbes;
 		if (key_count > MaxIndirectImageProbes ||
 		    (key_count != 0u && uint64_t {indirect.table_offset} +
-		                                uint64_t {key_count - 1u} * indirect.heap_stride +
-		                                32u >
+		                                uint64_t {key_count - 1u} * indirect.heap_stride + 32u >
 		                            UINT32_MAX + 1ull)) {
 			return Refuse(IndirectImageFailure::Stage::KeyCountOverBudget);
 		}
@@ -780,10 +792,8 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 		                : 0u;
 		failure.probe_count  = count;
 		failure.probe_budget = MaxIndirectImageProbes;
-		if (count > MaxIndirectImageProbes ||
-		    (count != 0u && (uint64_t {first} + count - 1u) * material.Stride() +
-		                            indirect.selector_offset + 4u >
-		                        uint64_t {UINT32_MAX} + 1u)) {
+		if (count > MaxIndirectImageProbes || end > uint64_t {UINT32_MAX} + 1u ||
+		    (scalar_stride && end > material.GetSize())) {
 			return Refuse(IndirectImageFailure::Stage::ProbeCountOverBudget);
 		}
 		keys.resize(count);
@@ -884,7 +894,9 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 		static thread_local std::vector<uint32_t> span_words;
 		const uint64_t                            words_per_probe = step / sizeof(uint32_t);
 		const uint64_t                            span_probes =
-		    program.capture_specialization_reads ? 1u : std::max<uint64_t>(1u, MaxSpanBytes / step);
+		    program.capture_specialization_reads && step != sizeof(uint32_t)
+		        ? 1u
+		        : std::max<uint64_t>(1u, MaxSpanBytes / step);
 		for (uint64_t probe = 0, offset = first; probe < probe_count;) {
 			const auto count   = std::min(span_probes, probe_count - probe);
 			bool       spanned = false;
@@ -920,8 +932,9 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 	snapshot.flattened_srt.resize(mapping_offset + 1u + keys.size() * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(keys.size());
 	const auto record_at                   = [&](size_t entry) {
-		return static_cast<uint64_t>(keys[entry]) * indirect.heap_stride + indirect.table_offset +
-		       indirect.record_offset;
+		// The shader scales the key in 32-bit arithmetic, so the record offset wraps with it.
+		return uint64_t {static_cast<uint32_t>(keys[entry] * indirect.heap_stride)} +
+		       indirect.table_offset + indirect.record_offset;
 	};
 	// Heap records likewise; a record the table bound truncates is never windowed.
 	KYTY_PROFILER_BLOCK("EnumerateIndirectImage heap records");
@@ -1096,9 +1109,9 @@ bool WriteIndirectImageSlots(const ResourcePlan& program, ResourceSnapshot& snap
 
 // A finite table's key is the index of the candidate source the shader selected, so every key is
 // enumerated and ordinal 0 can name the first candidate.
-bool MaterializeFiniteImage(const ResourcePlan&                    program,
-                            const DescriptorSource::IndirectDescriptor& indirect, uint32_t image_index,
-                            SrtWalker& clean, ResourceSnapshot& snapshot,
+bool MaterializeFiniteImage(const ResourcePlan&                         program,
+                            const DescriptorSource::IndirectDescriptor& indirect,
+                            uint32_t image_index, SrtWalker& clean, ResourceSnapshot& snapshot,
                             ResourceSpecialization& specialization, IndirectImageFailure& failure) {
 	const auto Refuse = [&failure](IndirectImageFailure::Stage stage) {
 		failure.stage = stage;
@@ -1171,9 +1184,9 @@ bool MaterializeFiniteImage(const ResourcePlan&                    program,
 // answer and they move - but a dispatch that refuses pays it to reach a conclusion the last one
 // already reached. So refusals, and only refusals, are memoed against the descriptors that produced
 // them.
-bool MaterializeIndirectImage(const ResourcePlan&                    program,
+bool MaterializeIndirectImage(const ResourcePlan&                         program,
                               const DescriptorSource::IndirectDescriptor& indirect,
-                              const DescriptorValue&                 material_value,
+                              const DescriptorValue&                      material_value,
                               const DescriptorValue& table_value, uint32_t image_index,
                               const SrtRuntime& runtime, SrtWalker& clean,
                               ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
@@ -1190,10 +1203,9 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 	        ? runtime.readable_extent(runtime.userdata, signature_material.Base48(),
 	                                  signature_material.GetSize())
 	        : 0u;
-	const auto workgroup_keys =
-	    indirect.workgroup_axis < runtime.workgroup_counts.size()
-	        ? runtime.workgroup_counts[indirect.workgroup_axis]
-	        : 0u;
+	const auto workgroup_keys = indirect.workgroup_axis < runtime.workgroup_counts.size()
+	                                ? runtime.workgroup_counts[indirect.workgroup_axis]
+	                                : 0u;
 	const auto signature = IndirectTableSignature(indirect, material_value, table_value,
 	                                              image_index, signature_extent, workgroup_keys);
 	if (const auto* remembered = RefusedTables().Find(signature, runtime)) {
@@ -1506,6 +1518,65 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 	return true;
 }
 
+// Binds every record the table can select and writes the key -> ordinal mapping the search reads.
+// Layout is the indirect image table's: a directory slot, the key count, then key/ordinal pairs.
+bool ExpandIndirectBuffer(const ResourcePlan& program, uint32_t root_index,
+                          const IndirectBuffer& resolved, ResourceSnapshot& snapshot,
+                          ResourceSpecialization& specialization) {
+	KYTY_PROFILER_FUNCTION();
+	const auto keys = resolved.keys.size();
+	if (keys == 0 || resolved.candidates.size() != keys ||
+	    root_index >= specialization.buffers.size() || root_index >= snapshot.buffers.size()) {
+		return false;
+	}
+	DescriptorValue null_descriptor;
+	null_descriptor.dword_count = 4u;
+	null_descriptor.dwords.fill(0);
+
+	const auto slot           = IndirectBufferMappingSlot(program, root_index);
+	const auto directory_end  = IndirectDirectoryBase(program) + IndirectDirectoryWords(program);
+	auto       mapping_offset = snapshot.flattened_srt.size();
+	if (mapping_offset < directory_end) {
+		mapping_offset = directory_end;
+	}
+	if (slot >= mapping_offset) {
+		return false;
+	}
+	const auto children_begin = snapshot.buffers.size();
+	if (children_begin + resolved.descriptors.size() > ShaderInfo::MaxDenseBuffers) {
+		return false;
+	}
+	if (resolved.mapping.size() != keys * 2u) {
+		return false;
+	}
+	snapshot.flattened_srt.resize(mapping_offset + 1u + keys * 2u);
+	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(keys);
+	// Ordinal 0 is the default arm, so the root names nothing rather than the first enumerated
+	// record.
+	snapshot.buffers[root_index] = null_descriptor;
+	std::ranges::copy(resolved.mapping,
+	                  snapshot.flattened_srt.begin() + static_cast<ptrdiff_t>(mapping_offset + 1u));
+	for (const auto candidate: resolved.children) {
+		snapshot.buffers.push_back(resolved.descriptors[candidate]);
+		auto child                       = specialization.buffers[root_index];
+		child.indirect_root              = root_index;
+		child.indirect_mapping_offset    = 0;
+		child.indirect_search_iterations = 0;
+		specialization.buffers.push_back(child);
+	}
+	if (snapshot.buffers.size() == children_begin) {
+		// Every record was null: nothing to select between, and the root already reads nothing.
+		snapshot.flattened_srt.resize(mapping_offset);
+		return true;
+	}
+	snapshot.flattened_srt[slot]    = static_cast<uint32_t>(mapping_offset);
+	auto& root                      = specialization.buffers[root_index];
+	root.indirect_root              = root_index;
+	root.indirect_mapping_offset    = static_cast<uint32_t>(slot);
+	root.indirect_search_iterations = std::bit_width(keys);
+	return true;
+}
+
 // Powers of two first; quarter-octave steps when the tables cannot all afford them.
 size_t IndirectImageBucket(size_t count, bool fine) {
 	if (count < 2u) {
@@ -1769,8 +1840,8 @@ struct ImageRemap {
 
 private:
 	std::vector<uint32_t> indices;
-	uint32_t                                    source_count;
-	uint32_t                                    count = 0;
+	uint32_t              source_count;
+	uint32_t              count = 0;
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
@@ -2004,7 +2075,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
-	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
+	CompactImages(snapshot.images,
+	              [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
 }
 
@@ -2121,7 +2193,8 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program&   program,
 		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
 		                    block.sources.end());
 	}
-	for (auto& block: blocks) block.condition = predicate(block.condition);
+	for (auto& block: blocks)
+		block.condition = predicate(block.condition);
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
 		return {};
@@ -2146,7 +2219,7 @@ static bool IsFullDispatchPredicate(Value value, uint32_t depth = 0) {
 // Nonnegative affine coefficients for constant, local and workgroup coordinates. Reject modular
 // arithmetic that could wrap; runtime coverage also bounds the largest invocation index.
 static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t axis, Value guard,
-                                                      uint32_t depth = 0) {
+                                                        uint32_t depth = 0) {
 	value = ResolveActiveU32(value, guard);
 	if (depth > 32 || value.GetType() != Type::U32) {
 		return {};
@@ -2263,8 +2336,8 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 			return {};
 		guard = store->Arg(5).Resolve();
 		if (!IsFullDispatchPredicate(guard)) return {};
-		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
-		    memory.data_bits != 32 ||
+		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen ||
+		    memory.offset != 0 || memory.data_bits != 32 ||
 		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
 			return {};
 		const auto address = FillIndex(store->Arg(1), 0, guard);
@@ -2274,7 +2347,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		result.fill.words           = memory.data_dwords;
 		data                        = store->Arg(4);
 	}
-	data = ResolveActiveU32(data, guard);
+	data                        = ResolveActiveU32(data, guard);
 	const auto*          vector = data.TryInstruction();
 	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
 	                                 ValueOpcode::CompositeConstructU32x3,
@@ -2616,8 +2689,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
 	for (const auto& source: program.descriptor_sources) {
-		auto& target          = plan.descriptor_sources.emplace_back();
-		target.dword_count    = source.dword_count;
+		auto& target               = plan.descriptor_sources.emplace_back();
+		target.dword_count         = source.dword_count;
 		target.indirect_descriptor = source.indirect_descriptor;
 		// Plain indices and offsets, so it needs no cloning - but it does need carrying, or the
 		// plan binds the heap V# in place of the record the table selects.
@@ -2976,8 +3049,7 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 		}
 		if (!evaluate(buffer.source, snapshot.buffers[i], buffer.written)) {
 			// An unprovable loop-carried descriptor is decoded in-shader on rebuild, not dropped.
-			if (refused_tables != nullptr &&
-			    (buffer.written ? clean : walker).RefusedOnPhi()) {
+			if (refused_tables != nullptr && (buffer.written ? clean : walker).RefusedOnPhi()) {
 				refused_tables->push_back(buffer.first_use_pc);
 				table_refused = true;
 				continue;
@@ -3039,8 +3111,28 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 				return false;
 			}
 			BindlessImageTable entry;
-			entry.srt_offset    = static_cast<uint32_t>(slot);
-			entry.stride        = indirect.heap_stride;
+			entry.srt_offset = static_cast<uint32_t>(slot);
+			entry.stride     = indirect.heap_stride;
+			if (indirect.indexed_heap) {
+				// A vector load through a V# with format 0 reads zero, so every key of a disabled
+				// heap is null; the zeroed slot count already selects the null arm.
+				if (((table.dwords[3] >> 12u) & 0x7fu) == 0u) {
+					continue;
+				}
+				// A swizzled or ADD_TID heap has no flat record step.
+				const auto stride  = (table.dwords[1] >> 16u) & 0x3fffu;
+				const bool swizzle = ((table.dwords[1] >> 31u) & 1u) != 0u;
+				const bool add_tid = ((table.dwords[3] >> 23u) & 1u) != 0u;
+				const auto step    = uint64_t {stride} * indirect.heap_stride;
+				if (stride == 0u || swizzle || add_tid || step > UINT32_MAX) {
+					MaterializeFailure() = fmt::format(
+					    "bindless image table at pc 0x{:08x}: indexed heap V# has stride {}{}{}",
+					    image.first_use_pc, stride, swizzle ? " (swizzled)" : "",
+					    add_tid ? " (add_tid)" : "");
+					return false;
+				}
+				entry.stride = static_cast<uint32_t>(step);
+			}
 			entry.record_offset = indirect.table_offset + indirect.record_offset;
 			std::copy_n(table.dwords.begin(), 4u, entry.heap.begin());
 			snapshot.bindless_tables.push_back(entry);

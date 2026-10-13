@@ -5,6 +5,50 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+// Triangles store outer[3] + inner[1]; quads store outer[4] + inner[2]. A compile-time-known
+// index picks its array and element directly. A dynamic one (e.g. a loop writing TF[i]) can't
+// be routed to one of the two separate builtin arrays at compile time, so branch on which side
+// it lands in at runtime and use the value as the access chain's index into that array -- SPIR-V
+// access chains accept a non-constant index, just not a non-constant choice of *which* variable.
+void EmitSetTessellationFactor(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t value) {
+	auto&      state = ctx.state;
+	const auto variable =
+	    state.tess_variables.at(static_cast<uint32_t>(IR::TessellationAttribute::Factor));
+	EXIT_IF(variable == 0);
+	const bool     quad     = state.input_info.vertex->tess.domain == 2u;
+	const uint32_t outer    = quad ? 4u : 3u;
+	const uint32_t inner    = quad ? 2u : 1u;
+	const auto     type     = TypePointer(state, spv::StorageClassOutput, TypeF32(state));
+	const auto     store_at = [&](uint32_t array_variable, uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, type, pointer, array_variable,
+		                          ConstantU32(state, index));
+		state.builder.AddFunction(spv::OpStore, pointer, value);
+	};
+	if (inst.Arg(1).IsImmediate()) {
+		const auto index = inst.Arg(1).U32() / 4u;
+		EXIT_NOT_IMPLEMENTED(index >= outer + inner);
+		index < outer ? store_at(variable, index)
+		              : store_at(state.tess_inner_variable, index - outer);
+		return;
+	}
+	const auto store_below = [&](uint32_t array_variable, uint32_t element, uint32_t count) {
+		const auto inside = EmitCompareU32Constant(state, spv::OpULessThan, element, count);
+		EmitIfCondition(state, inside, [&] {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer, array_variable, element);
+			state.builder.AddFunction(spv::OpStore, pointer, value);
+		});
+	};
+	// For an outer index the inner index wraps around and fails its bound; an index past the
+	// inner factors writes nothing.
+	const auto index =
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, ctx.Arg(inst, 1), ConstantU32(state, 2));
+	store_below(variable, index, outer);
+	store_below(state.tess_inner_variable,
+	            EmitBinaryU32(state, spv::OpISub, index, ConstantU32(state, outer)), inner);
+}
+
 uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state          = ctx.state;
 	using Attribute      = IR::TessellationAttribute;
@@ -16,13 +60,20 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
+		// Only a compile-time-known Factor index reaches here (GetTessellationAttribute, or a
+		// SetTessellationAttribute whose dynamic index EmitSetTessellationAttribute already
+		// special-cased below); it still needs a single pointer for a Load/Store the caller
+		// performs itself.
 		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
-		const auto index = inst.Arg(1).U32() / 4u;
-		const auto outer = index < 3u;
-		EXIT_NOT_IMPLEMENTED(index >= 4u);
+		// Triangles store outer[3] + inner[1]; quads store outer[4] + inner[2].
+		const bool     quad  = tess.domain == 2u;
+		const uint32_t outer = quad ? 4u : 3u;
+		const auto     index = inst.Arg(1).U32() / 4u;
+		EXIT_NOT_IMPLEMENTED(index >= outer + (quad ? 2u : 1u));
+		const bool is_outer = index < outer;
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
-		                          pointer, outer ? variable : state.tess_inner_variable,
-		                          ConstantU32(state, outer ? index : index - 3u));
+		                          pointer, is_outer ? variable : state.tess_inner_variable,
+		                          ConstantU32(state, is_outer ? index : index - outer));
 		return pointer;
 	}
 	auto address = ctx.Arg(inst, 1);
@@ -94,6 +145,8 @@ void DefineTessellationInterfaces(EmitterState& state) {
 		const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 		uint32_t   type;
 		if (kind == Attribute::Factor) {
+			// BuiltInTessLevelOuter is exactly float[4] whatever the domain (triangles use three of
+			// them); the inner levels live in their own float[2] variable below.
 			type = array(TypeF32(state), 4u);
 		} else if (kind == Attribute::PatchOutput) {
 			state.tess_patch_base = patch_begin;
@@ -130,16 +183,26 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u || tess.partitioning != 2u ||
-	                     tess.output_topology != 2u);
+	// LowerTessellationMemory rejects domains and output topologies this emitter has no mode for.
+	EXIT_NOT_IMPLEMENTED((tess.domain != 1u && tess.domain != 2u) ||
+	                     (tess.output_topology != 2u && tess.output_topology != 3u));
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               tess.output_control_points);
 	} else {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeTriangles);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSpacingFractionalOdd);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeVertexOrderCw);
+		state.builder.AddExecutionMode(state.main_func, tess.domain == 2u
+		                                                    ? spv::ExecutionModeQuads
+		                                                    : spv::ExecutionModeTriangles);
+		// VGT_TF_PARAM partitioning: 0 integer, 1 pow2 (no Vulkan equivalent; equal spacing is the
+		// nearest), 2 fractional odd, 3 fractional even.
+		state.builder.AddExecutionMode(
+		    state.main_func, tess.partitioning == 3u   ? spv::ExecutionModeSpacingFractionalEven
+		                     : tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd
+		                                               : spv::ExecutionModeSpacingEqual);
+		state.builder.AddExecutionMode(state.main_func, tess.output_topology == 3u
+		                                                    ? spv::ExecutionModeVertexOrderCcw
+		                                                    : spv::ExecutionModeVertexOrderCw);
 	}
 }
 
@@ -158,7 +221,9 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor)) {
 			const auto floating = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
-			value = floating;
+			// Factor stores go through the helper: it also handles an index only known at runtime.
+			EmitSetTessellationFactor(ctx, inst, floating);
+			return;
 		}
 		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
 	});

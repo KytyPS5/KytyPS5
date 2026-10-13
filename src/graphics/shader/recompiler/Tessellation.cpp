@@ -311,6 +311,11 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 		return false;
 	};
 	const auto& tess = options.input_info.vertex->tess;
+	if ((tess.domain != 1u && tess.domain != 2u) ||
+	    (tess.output_topology != 2u && tess.output_topology != 3u)) {
+		// Isolines and point/line output have no mode in the emitter.
+		return unsupported("a tessellation domain or output topology without an emitter mode");
+	}
 	if (tess.ls_stride == 0u || tess.hs_stride == 0u) {
 		// The LS/HS interface could not be reflected, so every ring address below would be
 		// meaningless.

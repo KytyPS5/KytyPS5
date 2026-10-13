@@ -1341,14 +1341,6 @@ static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI KernelFsync(int fd) {
-	PRINT_NAME();
-
-	LOGF("\t fd = %d\n", fd);
-
-	return OK;
-}
-
 static void KYTY_SYSV_ABI KernelSync() {
 	PRINT_NAME();
 }
@@ -3118,6 +3110,7 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
 	LIB_FUNC("kBwCPsYX-m4", FileSystem::KernelFstat);
 	LIB_FUNC("VW3TVZiM4-E", FileSystem::KernelFtruncate);
+	LIB_FUNC("fTx66l5iWIA", FileSystem::KernelFsync);
 	LIB_FUNC("AUXVxWeJU-A", FileSystem::KernelUnlink);
 	LIB_FUNC("52NcYU9+lEo", FileSystem::KernelRename);
 	LIB_FUNC("taRWhTJFTgE", FileSystem::KernelGetdirentries);
@@ -3386,7 +3379,6 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
 	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
-	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);
 	LIB_FUNC("9BcDykPmo1I", LibKernel::get_error_addr);

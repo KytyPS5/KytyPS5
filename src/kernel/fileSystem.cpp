@@ -1238,6 +1238,38 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelFsync(int d) {
+	PRINT_NAME();
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto* file = g_files->GetFile(d);
+
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (!file->writable || file->directory || file->special != SpecialFile::None) {
+		return OK;
+	}
+
+	Common::LockGuard lock(file->mutex);
+
+	if (file->f.IsInvalid() || !file->f.Flush()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tFsync file: %s\n", Common::PathToString(file->real_name).c_str());
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	PRINT_NAME();
 

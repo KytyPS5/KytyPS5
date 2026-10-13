@@ -30,8 +30,17 @@ public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	// The entry after the last page holds the address of a zeroed page that missing pages read.
+	static constexpr uint64_t BDA_ZERO_PAGE_SLOT = CACHING_NUMPAGES;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	    (CACHING_NUMPAGES + 1) * sizeof(vk::DeviceAddress);
+	// One fault bit per page, followed by one summary bit per FAULT_SUMMARY_SPAN bitmap words.
+	static constexpr uint64_t FAULT_BITMAP_WORDS  = CACHING_NUMPAGES / 32;
+	static constexpr uint32_t FAULT_SUMMARY_SPAN  = 64;
+	static constexpr uint64_t FAULT_SUMMARY_WORDS = FAULT_BITMAP_WORDS / FAULT_SUMMARY_SPAN / 32;
+	static constexpr uint64_t FAULT_BUFFER_SIZE =
+	    (FAULT_BITMAP_WORDS + FAULT_SUMMARY_WORDS) * sizeof(uint32_t);
+	static_assert(CACHING_NUMPAGES % (32 * FAULT_SUMMARY_SPAN * 32) == 0);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -69,6 +78,8 @@ public:
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	// Before the first BDA access: zeroes the zero page and publishes its address.
+	void                  PrepareBdaZeroPage();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
@@ -126,6 +137,8 @@ private:
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	Buffer                                             m_bda_zero_page;
+	bool                                               m_bda_zero_page_ready = false;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;

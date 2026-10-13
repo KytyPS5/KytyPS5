@@ -5482,6 +5482,14 @@ public:
                   Resolve(base).image_id == first.image_id,
               "a different descriptor reused another binding");
 
+      // A registration on other pages leaves the lookups of this one valid.
+      const auto elsewhere = Resolve(base + moved_offset + 0x8000);
+      const auto unrelated_epoch = TextureCacheTestAccess::QueryEpoch(texture_cache);
+      Require(name, "unrelated registration",
+              elsewhere.image_id && Resolve(base).image_id == first.image_id &&
+                  TextureCacheTestAccess::QueryEpoch(texture_cache) == unrelated_epoch,
+              "a registration on another page made a lookup search again");
+
       // Re-associating a stencil plane re-describes a registered image: a
       // plane read with the old depth's sample count stops matching it.
       constexpr uint64_t stencil_offset = 0x180000;
@@ -5552,6 +5560,40 @@ public:
               texture_cache.FindImage(bc) == bc_image &&
                   !TextureCacheTestAccess::Contains(texture_cache, raw_image),
               "a lookup skipped merging a raw alias written by the GPU");
+
+      // The same holds for a BC image across a page boundary and an alias
+      // registered on its second page only.
+      constexpr uint64_t straddle_offset = moved_offset - 0x800;
+      auto straddle = MakeLinearDesc(
+          base + straddle_offset, 0, vk::Format::eBc7UnormBlock,
+          Prospero::BufferFormat::kBc7UNorm, Prospero::ImageType::kColor2D,
+          {width, height, 1}, 1, 16, 1);
+      auto second_page = MakeLinearDesc(
+          base + moved_offset, 0, vk::Format::eR32G32B32A32Uint,
+          Prospero::BufferFormat::k32_32_32_32UInt, Prospero::ImageType::kColor2D,
+          {width / 4, height / 4, 1}, 1, 16, 1);
+      straddle.info.UpdateSize();
+      second_page.info.UpdateSize();
+      const auto straddle_image =
+          TextureCacheTestAccess::InsertImage(texture_cache, straddle.info);
+      Require(name, "page-crossing lookup",
+              straddle.info.data.End() > base + moved_offset &&
+                  texture_cache.FindImage(straddle) == straddle_image,
+              "a page-crossing BC image was not found");
+      const auto second_page_raw =
+          TextureCacheTestAccess::InsertImage(texture_cache, second_page.info);
+      Require(name, "second-page alias lookup",
+              texture_cache.FindImage(straddle) == straddle_image &&
+                  TextureCacheTestAccess::Contains(texture_cache, second_page_raw),
+              "a BC image lookup merged a second-page alias without GPU writes");
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), second_page_raw,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, raw_clear);
+      texture_cache.MarkGpuWritten(second_page_raw);
+      Require(name, "second-page alias merge",
+              texture_cache.FindImage(straddle) == straddle_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache, second_page_raw),
+              "a lookup skipped a raw alias registered on its second page");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       context.UnmapMemory(base, allocation_size);

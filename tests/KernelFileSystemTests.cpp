@@ -295,6 +295,13 @@ void TestFsyncVisibility() {
   constexpr char Payload[] = "synced progress";
   constexpr auto PayloadSize = sizeof(Payload) - 1;
 
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto* symbol = symbols.Find(
+      {"juWbTNM+8hw", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  Check(symbol != nullptr, "POSIX fsync export resolves");
+  const auto fsync = reinterpret_cast<int (KYTY_SYSV_ABI *)(int)>(symbol->vaddr);
+
   const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
   Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, PayloadSize) == PayloadSize,
         "write save file before fsync");
@@ -308,10 +315,13 @@ void TestFsyncVisibility() {
             std::memcmp(bytes.data(), Payload, PayloadSize) == 0,
         "fsynced data is readable through another descriptor before close");
   Check(FileSystem::KernelFsync(reader) == OK, "fsync a read-only descriptor");
+  Check(fsync(fd) == 0 && fsync(reader) == 0, "POSIX fsync of open descriptors");
   Check(FileSystem::KernelClose(reader) == OK && FileSystem::KernelClose(fd) == OK,
         "close fsync descriptors");
   Check(FileSystem::KernelFsync(fd) == Libs::LibKernel::KERNEL_ERROR_EBADF,
         "fsync rejects a closed descriptor");
+  Check(fsync(fd) == -1 && *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "POSIX fsync of a closed descriptor reports EBADF");
 }
 
 void TestAioBatches() {

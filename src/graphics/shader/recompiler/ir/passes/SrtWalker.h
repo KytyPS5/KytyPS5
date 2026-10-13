@@ -22,8 +22,8 @@ struct SrtRuntime {
 
 class SrtReadCapture {
 public:
-	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
-	    m_source(source), m_ranges(ranges) {}
+	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges)
+	    : m_source(source), m_ranges(ranges) {}
 	SrtRuntime ObservedRuntime();
 
 private:
@@ -44,10 +44,13 @@ struct SrtReadFlags {
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
-void CompileSrtWalker(ResourcePlan& program);
+                          RuntimeValueType type          = RuntimeValueType::Any,
+                          const Inst*      free_variable = nullptr);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+
+// Compiles SRT reads into a more efficient form for evaluation.
+void CompileSrtWalker(ResourcePlan& program);
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
@@ -62,22 +65,29 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// Evaluates `inst` as `value` (free variable). For walkers without `clean_evaluator`.
+	void SetOverride(const Inst* inst, uint64_t value) {
+		m_override_inst  = inst;
+		m_override_value = value;
+	}
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
-	static float Float32(uint64_t bits);
-	bool EvaluateWide(Value value, uint64_t& result);
-	bool Arg(const Inst& inst, size_t index, uint64_t& result);
-	bool EvaluatePhi(const Inst& inst, uint64_t& result);
-	bool EvaluateExtract(const Inst& inst, uint64_t& result);
-	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
-	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	static float                            Float32(uint64_t bits);
+	bool                                    EvaluateWide(Value value, uint64_t& result);
+	bool                                    Arg(const Inst& inst, size_t index, uint64_t& result);
+	bool                                    EvaluatePhi(const Inst& inst, uint64_t& result);
+	bool                                    EvaluateExtract(const Inst& inst, uint64_t& result);
+	bool                                    EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool                                    EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
-	SrtRuntime                      m_runtime;
-	SrtWalker*                      m_clean_evaluator = nullptr;
-	Value                           m_active_mask;
+	SrtRuntime                       m_runtime;
+	SrtWalker*                       m_clean_evaluator = nullptr;
+	Value                            m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	const Inst*                      m_override_inst  = nullptr;
+	uint64_t                         m_override_value = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

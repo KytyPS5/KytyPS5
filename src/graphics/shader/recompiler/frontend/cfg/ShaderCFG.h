@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include <functional>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
@@ -55,22 +56,25 @@ struct Terminator {
 	std::vector<uint32_t> indirect_targets;
 	std::vector<uint32_t> indirect_selector_values;
 	std::vector<uint32_t> indirect_selector_targets;
-	uint32_t              expression    = UINT32_MAX;
-	bool                  loop_header   = false;
+	uint32_t              expression  = UINT32_MAX;
+	bool                  loop_header = false;
 };
 
 struct BasicBlock {
-	uint32_t              id         = 0;
-	uint32_t              start_pc   = 0;
-	uint32_t              end_pc     = 0;
-	uint32_t              inst_begin = 0;
-	uint32_t              inst_end   = 0;
-	struct Assignment { uint32_t variable; uint32_t expression; };
+	uint32_t id         = 0;
+	uint32_t start_pc   = 0;
+	uint32_t end_pc     = 0;
+	uint32_t inst_begin = 0;
+	uint32_t inst_end   = 0;
+	struct Assignment {
+		uint32_t variable;
+		uint32_t expression;
+	};
 	std::vector<Assignment> assignments;
-	std::vector<uint32_t> predecessors;
-	std::vector<uint32_t> successors;
-	std::vector<uint32_t> dominators;
-	Terminator            terminator;
+	std::vector<uint32_t>   predecessors;
+	std::vector<uint32_t>   successors;
+	std::vector<uint32_t>   dominators;
+	Terminator              terminator;
 };
 
 struct BackEdge {
@@ -112,16 +116,20 @@ struct Graph {
 	bool              Dominates(uint32_t dominator, uint32_t block) const;
 };
 
-Graph       BuildGraph(const Decoder::Program& program);
-bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code);
+Graph    BuildGraph(const Decoder::Program& program);
+bool     MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
+uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph, uint32_t before,
+                              uint32_t code, const std::function<bool(uint32_t)>& confirm = {});
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);
 std::string BranchConditionToString(BranchCondition condition);
 std::string FailureKindToString(FailureKind kind);
 std::string GraphToString(const Graph& graph);
+// Sentinel value detection for invalid/uninitialized memory reads
+bool IsSentinelValue(uint32_t value);
+// Check if an address is invalid (NULL or AGC placeholder)
+bool IsInvalidAddress(uint64_t address);
 
 } // namespace Libs::Graphics::ShaderRecompiler::CFG
 

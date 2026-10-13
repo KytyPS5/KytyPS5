@@ -10470,8 +10470,8 @@ void TestMemoryFedScalarLeafCall() {
   IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
   const auto options = MakeCompileOptions(ShaderType::Compute);
   auto source = PrepareShaderSource(shader, options);
-  Check(source.call && source.decoded.has_swap_pc &&
-            source.decoded.instructions[source.call->instruction].branch_target == UINT32_MAX,
+  Check(!source.calls.empty() && source.decoded.has_swap_pc &&
+            source.decoded.instructions[source.calls.front().instruction].branch_target == UINT32_MAX,
         "memory-fed SWAPPC did not retain an unresolved target");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal([&] { (void)TranslateProgram(source.decoded, options); },
@@ -10479,7 +10479,7 @@ void TestMemoryFedScalarLeafCall() {
 #endif
   const auto& linked = RefreshShaderSource(source, runtime);
   Check(linked.has_swap_pc && source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
-            linked.instructions[source.call->instruction].branch_target == 0x44 &&
+            linked.instructions[source.calls.front().instruction].branch_target == 0x44 &&
             source.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x100, 12},
         "aliased call target, exact leaf range, or continuation was lost");
   const auto* storage = linked.instructions.data();
@@ -10571,7 +10571,7 @@ void TestMemoryFedScalarLeafCall() {
   auto pair_source = PrepareShaderSource(high_writer, options);
   IR::SrtWalker pair_walker(pair_source.call_targets, runtime);
   uint32_t high = 1;
-  Check(pair_walker.Evaluate(pair_source.call->target[1], high) && high == 0,
+  Check(pair_walker.Evaluate(pair_source.calls.front().target[1], high) && high == 0,
         "scalar pair producer used a stale preceding high-half definition");
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
@@ -10627,7 +10627,7 @@ void TestFusedShaderHandoffPreservesRegisters() {
   for (const auto handoff: {EncodeSop1(0x20, 0, 6), 0xbefd2106u}) {
     front[2] = handoff; // SETPC or captured SWAPPC with NULL destination
     auto source = PrepareShaderSource(front, options);
-    Check(!source.decoded.has_swap_pc && !source.call,
+    Check(!source.decoded.has_swap_pc && source.calls.empty(),
           "fused SETPC handoff entered scalar call preparation");
     auto translated = TranslateProgram(source.decoded, options);
     uint32_t allocations = 0;

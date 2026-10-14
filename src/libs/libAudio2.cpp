@@ -403,6 +403,7 @@ static void audioout2_mix_object(AudioOut2ContextState&         context,
 	}
 }
 
+// Queues the completed PCM buffers for all active ports in a context.
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue.
 	// Keep both PCM storage and port handles alive until it returns.
@@ -432,6 +433,8 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 		                                     blocking);
 	}
 }
+
+// Closes a valid zero-based audio handle; negative values represent no handle.
 static void audioout2_close_audio_handle(int audio_handle) {
 	if (audio_handle >= 0) {
 		AudioInternal::AudioOutClose(audio_handle);
@@ -475,6 +478,7 @@ int KYTY_SYSV_ABI AudioOut2ContextQueryMemory(const AudioOut2ContextParam* param
 	return OK;
 }
 
+// Creates an AudioOut2 context and opens its object-mix output when requested.
 int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, void* buffer,
                                          size_t buffer_size, AudioOut2ContextHandle* ctx) {
 	PRINT_NAME();
@@ -520,6 +524,8 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 
 	return OK;
 }
+
+// Destroys a context, releases its ports, and closes its associated audio handles.
 int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 "\n", ctx);
@@ -635,6 +641,7 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 	return OK;
 }
 
+// Creates a context port and opens a host output handle for supported bed formats.
 int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params,
                                       AudioOut2PortHandle* port) {
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
@@ -725,6 +732,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	return OK;
 }
 
+// Destroys a port and closes its associated host audio handle.
 int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 	PRINT_NAME();
 	LOGF("\t port = 0x%016" PRIx64 "\n", port);

@@ -1140,6 +1140,7 @@ LIB_VERSION("Ngs2", 1, "Ngs2", 1, 1);
 
 namespace Ngs2 = Audio::Ngs2;
 
+// Registers the NGS2 system, rack, voice, rendering, and geometry functions.
 LIB_DEFINE(InitAudio_1_Ngs2) {
 	LIB_FUNC("AQkj7C0f3PY", Ngs2::Ngs2SystemResetOption);
 	LIB_FUNC("pgFAiLR5qT4", Ngs2::Ngs2SystemQueryBufferSize);

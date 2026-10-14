@@ -605,6 +605,7 @@ void TestObjectBusRouting() {
 	Check(LiveDeviceCount() == 0, "object bus device leaked");
 }
 
+// Verifies handle zero remains valid for output, context teardown, and device cleanup.
 void TestZeroAudioHandleIsValid() {
 	Check(LiveDeviceCount() == 0, "zero-handle test started with a live device");
 	g_next_device = 0;

@@ -666,6 +666,7 @@ struct Ngs2VoiceInternal {
 		}
 	}
 
+	// Validates and appends waveform blocks, optionally replacing the current stream.
 	int AddWaveformBlocks(const uint8_t* data, uint32_t flags, uint32_t count,
 	                      const Ngs2WaveformBlock* waveform_blocks) {
 		const auto capacity = rack->type == Ngs2RackType::Sampler
@@ -1516,6 +1517,7 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 	return OK;
 }
 
+// Retrieves rack properties and active-voice counts into the requested info structure.
 int KYTY_SYSV_ABI Ngs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, size_t info_size) {
 	constexpr int32_t ERROR_INVALID_OUT_ADDRESS = static_cast<int32_t>(0x804a8010u);
 	constexpr int32_t ERROR_INVALID_OUT_SIZE    = static_cast<int32_t>(0x804a8011u);
@@ -1899,6 +1901,7 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	voice.has_samples = output != 0;
 }
 
+// Renders one voice and recursively mixes connected source voices into it.
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
@@ -1997,6 +2000,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 	voice.rendered  = true;
 }
 
+// Renders all active voices in a system into the requested output buffers.
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
@@ -2285,6 +2289,7 @@ int KYTY_SYSV_ABI Ngs2PanInit(Ngs2PanWork* work, const float* speaker_angles, fl
 	return OK;
 }
 
+// Calculates normalized speaker gains for each supplied panning angle.
 int KYTY_SYSV_ABI Ngs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* params,
                                          uint32_t num_params, uint32_t matrix_format,
                                          float* out_volume_matrix) {
@@ -2433,6 +2438,7 @@ int KYTY_SYSV_ABI Ngs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_i
 	return OK;
 }
 
+// Applies a linked list of setup, routing, and control parameters to a voice.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamHeader* param_list) {
 	PRINT_NAME();
@@ -2855,6 +2861,7 @@ int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state
 	return OK;
 }
 
+// Retrieves the routing, gain, matrix, and destination handle for a voice port.
 int KYTY_SYSV_ABI Ngs2VoiceGetPortInfo(uintptr_t voice_handle, uint32_t port,
                                        Ngs2VoicePortInfo* info, size_t info_size) {
 	PRINT_NAME();
@@ -2876,6 +2883,7 @@ int KYTY_SYSV_ABI Ngs2VoiceGetPortInfo(uintptr_t voice_handle, uint32_t port,
 	return OK;
 }
 
+// Retrieves voice metadata selected by an NGS2 information identifier.
 int KYTY_SYSV_ABI Ngs2VoiceQueryInfo(uintptr_t voice_handle, uint32_t info_id, void* info,
                                      size_t info_size) {
 	PRINT_NAME();

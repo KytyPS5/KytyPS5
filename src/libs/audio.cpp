@@ -169,6 +169,7 @@ static Audio* g_audio = nullptr;
 
 namespace AudioInternal {
 
+// Opens a host audio port and returns its zero-based handle, or -1 on failure.
 int AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
 	if (g_audio == nullptr) {
 		return -1;
@@ -178,17 +179,20 @@ int AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
 	return id.IsValid() ? id.ToInt() - 1 : -1;
 }
 
+// Closes a zero-based host audio port handle.
 void AudioOutClose(int handle) {
 	if (g_audio != nullptr && handle >= 0 && handle < OUT_PORTS_MAX) {
 		(void)g_audio->AudioOutClose(Audio::Id(handle + 1));
 	}
 }
 
+// Reports whether the host audio port for a zero-based handle is available.
 bool AudioOutHasDevice(int handle) {
 	return g_audio != nullptr && handle >= 0 && handle < OUT_PORTS_MAX &&
 	       g_audio->AudioOutHasDevice(Audio::Id(handle + 1));
 }
 
+// Submits valid host audio output buffers and returns the number of consumed buffers.
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
 	if (g_audio == nullptr || params == nullptr || num == 0) {
 		return 0;

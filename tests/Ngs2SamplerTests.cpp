@@ -94,6 +94,7 @@ struct Fixture {
 	}
 };
 
+// Checks queue limits and verifies CLEAR resets staged playback without losing counters.
 void TestWaveformQueueCapacity() {
 	constexpr int32_t full = static_cast<int32_t>(0x804a8054u);
 	constexpr int32_t invalid_count = static_cast<int32_t>(0x804a8053u);
@@ -525,6 +526,7 @@ void TestSubmixerSetupAndRouting() {
 	}
 }
 
+// Verifies sampler routing, mastering patches, PCM16 mixing, and output saturation.
 void TestPcm16RenderOutput() {
 	Ngs2Internal system;
 	system.option                   = Ngs2DefaultSystemOption();
@@ -695,6 +697,7 @@ void TestCustomPcmStillPlays() {
 	      "custom PCM sampler regressed");
 }
 
+// Verifies configured reverb voices pass their dry signal to the mastering voice.
 void TestReverbSetupRoutesDrySignal() {
 	Fixture source(48000, 2);
 	source.voice.ports.resize(1);
@@ -1468,6 +1471,7 @@ void TestFiniteFilterTail() {
 	Check(!split.voice.has_samples, "completed finite filter tail still produced samples");
 }
 
+// Checks mastering gain controls and setup state.
 void TestMasteringGainControl() {
 	Ngs2Internal      system;
 	Ngs2RackInternal  rack {};
@@ -1494,18 +1498,29 @@ void TestMasteringGainControl() {
 	      "mastering setup did not activate the mixing bus");
 }
 
+// Verifies CLEAR replaces a closed stream and discards samples staged by a partial render.
 void TestWaveformResetReopensClosedStream() {
 	Fixture f(48000);
-	const int16_t first[] = {8192};
-	const int16_t replacement[] = {16384};
-	f.Queue(first, 1, 0);
+	const int16_t first[]       = {8192, 16384};
+	const int16_t replacement[] = {24576, 4096};
+	f.Queue(first, 2, 0);
 	Check(!f.voice.accepts_blocks, "waveform submission did not close stream");
+	f.Render(1);
+	Check(f.voice.frame_cursor == 1 && f.voice.frame_samples == 2 &&
+	          f.voice.samples == std::vector<float> {0.25f},
+	      "partial render did not stage the remaining closed-stream sample");
 	f.Queue(replacement, 1, 4);
 	Check(f.voice.accepts_blocks == false && f.voice.blocks.size() == 1 &&
-	          f.voice.blocks.front().data == reinterpret_cast<const uint8_t*>(replacement),
-	      "waveform reset did not replace closed stream");
+	          f.voice.blocks.front().data == reinterpret_cast<const uint8_t*>(replacement) &&
+	          f.voice.frame_cursor == 0 && f.voice.frame_samples == 0 &&
+	          f.voice.next_frame_samples == 0,
+	      "waveform reset did not replace closed stream and discard staged samples");
+	f.Render(1);
+	Check(f.voice.samples == std::vector<float> {0.75f},
+	      "clear after a partial render played a staged sample from the old stream");
 }
 
+// Checks that voice-port queries report routing and gain state.
 void TestVoicePortInfo() {
 	Fixture source(48000), destination(48000);
 	source.voice.ports.resize(1);
@@ -1521,6 +1536,7 @@ void TestVoicePortInfo() {
 	      "voice port query returned incorrect routing state");
 }
 
+// Checks that voice metadata queries report the configured channel count.
 void TestVoiceChannelsInfo() {
 	Fixture f(48000, 2);
 	Ngs2VoiceChannelsInfo info {};
@@ -1531,6 +1547,7 @@ void TestVoiceChannelsInfo() {
 	      "voice channel query returned incorrect channel count");
 }
 
+// Checks rack metadata for rack types, handles, limits, and versioned output sizes.
 void TestRackInfo() {
 	Ngs2Internal     system;
 	Ngs2RackInternal rack {};
@@ -1593,6 +1610,7 @@ void TestRackInfo() {
 
 } // namespace
 
+// Verifies normalized panning gains for stereo and wider output formats.
 void TestStereoPanMatrix() {
 	Ngs2PanWork work {};
 	work.speaker_angles[0] = -90.0f;

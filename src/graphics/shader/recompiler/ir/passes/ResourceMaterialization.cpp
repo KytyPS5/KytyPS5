@@ -1063,6 +1063,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim1D ||
 			       dimension == Decoder::ImageDimension::Dim2D;
 		};
+		const bool level_zero_sample = base.resource_class == ImageResourceClass::Sampled &&
+		    !base.depth_compare && !base.gather &&
+		    std::ranges::all_of(program.memory_info, [&](const MemoryInfo& memory) {
+			    return memory.kind != ResourceKind::Image || memory.resource != root_index ||
+			           memory.image_sample_flags == Decoder::ImageSampleFlagLevelZero;
+		    });
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -1082,7 +1088,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    base.dimension == Decoder::ImageDimension::Dim2D &&
 			    !image.cube && !image_class.cube && is_1d_or_2d(image.dimension) &&
 			    is_1d_or_2d(image_class.dimension);
-			if ((!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
+			const bool volume_sample = level_zero_sample && !image.cube && !image_class.cube &&
+			    (image.dimension == Decoder::ImageDimension::Dim2D || image.dimension == Decoder::ImageDimension::Dim3D) &&
+			    (image_class.dimension == Decoder::ImageDimension::Dim2D || image_class.dimension == Decoder::ImageDimension::Dim3D);
+			if ((!same_coordinates && !volume_sample && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
 			     !unfiltered_coordinates) ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {

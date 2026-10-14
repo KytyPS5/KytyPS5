@@ -164,6 +164,7 @@ struct ImageResource {
 	bool                          atomic64          = false;
 	bool                          unfiltered_access_only = true;
 	bool                          depth_compare     = false;
+	bool                          gather            = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.

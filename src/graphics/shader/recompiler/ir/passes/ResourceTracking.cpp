@@ -3910,6 +3910,7 @@ private:
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
 		image.unfiltered_access_only &= op == ValueOpcode::ImageRead || op == ValueOpcode::ImageWrite;
+		image.gather       = image.gather || op == ValueOpcode::ImageGatherRaw;
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

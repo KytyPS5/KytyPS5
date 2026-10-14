@@ -501,10 +501,14 @@ enum class ImageKeyCase {
   MissingSaturation,
   InvalidNan,
   UnrelatedPredicate,
+  MixedDimensions,
+  MixedGather,
 };
 
 void CheckImageTableKey(ImageKeyCase test_case) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const bool mixed_dimensions = test_case == ImageKeyCase::MixedDimensions ||
+                                test_case == ImageKeyCase::MixedGather;
   Fixture fixture;
   auto *entry = fixture.block;
   auto *body = fixture.AddBlock();
@@ -557,13 +561,17 @@ void CheckImageTableKey(ImageKeyCase test_case) {
     }
     MemoryInfo memory;
     memory.kind = ResourceKind::Image;
-    memory.image_dimension = Decoder::ImageDimension::Dim3D;
+    memory.image_dimension = test_case == ImageKeyCase::MixedGather
+                                 ? Decoder::ImageDimension::Dim2D : Decoder::ImageDimension::Dim3D;
     memory.image_sample_flags = Decoder::ImageSampleFlagLevelZero;
     const auto image = fixture.Image(words);
     const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
     const auto address = fixture.ImageAddress();
     const auto flags = fixture.AddMemory(memory, 24u);
-    const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address, guard}, flags);
+    const auto sampled = test_case == ImageKeyCase::MixedGather
+        ? fixture.Emit(ValueOpcode::ImageGatherRaw,
+            {image, sampler, address, words[1], words[3], Value(0u), Value(0u), guard}, flags)
+        : fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address, guard}, flags);
     fixture.Emit(ValueOpcode::ReferenceU32,
         {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
   }
@@ -589,7 +597,9 @@ void CheckImageTableKey(ImageKeyCase test_case) {
     descriptor[0] = 0x20u + key;
     descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u;
     descriptor[2] = 3u | (3u << 14u);
-    const auto type = Libs::Graphics::Prospero::ImageType::kColor2D;
+    const auto type = !mixed_dimensions || key == 0u
+                          ? Libs::Graphics::Prospero::ImageType::kColor2D
+                          : Libs::Graphics::Prospero::ImageType::kColor3D;
     descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u);
     std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x80u / 4u + key * 8u);
   }
@@ -598,8 +608,18 @@ void CheckImageTableKey(ImageKeyCase test_case) {
   ResourceSpecialization specialization;
   const SrtRuntime runtime {.user_data = data, .userdata = &memory,
       .read_specialization_memory = ReadLinearTestMemory};
+  if (test_case == ImageKeyCase::MixedGather) {
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "mixed dimensions admitted a 3D gather");
+    return;
+  }
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
       "image table keys did not materialize");
+  if (test_case == ImageKeyCase::MixedDimensions)
+    Check(specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
+            std::ranges::any_of(specialization.images, [](const auto &image) {
+              return image.dimension == Decoder::ImageDimension::Dim3D;
+            }), "mixed samples lost their individual Vulkan image dimensions");
 }
 
 void TestBoundedFloatImageKey() {
@@ -9216,6 +9236,8 @@ int main() {
     Run("workgroup image key", TestWorkgroupImageKey);
     Run("bounded workgroup image key", TestBoundedWorkgroupImageKey);
     Run("bounded float image key", TestBoundedFloatImageKey);
+    Run("mixed image dimensions", [] { CheckImageTableKey(ImageKeyCase::MixedDimensions); });
+    Run("mixed gather rejection", [] { CheckImageTableKey(ImageKeyCase::MixedGather); });
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);

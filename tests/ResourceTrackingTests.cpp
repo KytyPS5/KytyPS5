@@ -504,6 +504,8 @@ enum class ImageKeyCase {
   MixedDimensions,
   MixedGather,
   PackedHalf,
+  UnsignedBound,
+  GuardedUnsignedBound,
 };
 
 void CheckImageTableKey(ImageKeyCase test_case) {
@@ -511,6 +513,8 @@ void CheckImageTableKey(ImageKeyCase test_case) {
   const bool material_key = test_case == ImageKeyCase::PackedHalf;
   const bool mixed_dimensions = test_case == ImageKeyCase::MixedDimensions ||
                                 test_case == ImageKeyCase::MixedGather;
+  const bool unsigned_key = test_case == ImageKeyCase::UnsignedBound ||
+                            test_case == ImageKeyCase::GuardedUnsignedBound;
   Fixture fixture;
   auto *entry = fixture.block;
   auto *body = fixture.AddBlock();
@@ -559,8 +563,18 @@ void CheckImageTableKey(ImageKeyCase test_case) {
   }
   const auto local = fixture.Emit(ValueOpcode::SelectU32, {write_mask, integer, Value(0u)});
   auto key = fixture.Emit(ValueOpcode::ReadLane, {local, Value(0u)});
+  if (unsigned_key) {
+    const auto global = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+    key = test_case == ImageKeyCase::GuardedUnsignedBound
+              ? global : fixture.Emit(ValueOpcode::UMin32, {global, Value(20u)});
+  }
   const auto equal = fixture.Emit(ValueOpcode::IEqual32, {key, local});
-  const auto guard = fixture.Emit(ValueOpcode::LogicalAnd, {active, equal});
+  auto guard = fixture.Emit(ValueOpcode::LogicalAnd, {active, equal});
+  if (test_case == ImageKeyCase::GuardedUnsignedBound) {
+    guard = fixture.Emit(ValueOpcode::LogicalAnd,
+        {guard, fixture.Emit(ValueOpcode::ULessThanEqual32, {key, Value(20u)})});
+  }
   entry->condition = guard;
   entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
       .true_block = body, .false_block = exit};
@@ -604,11 +618,15 @@ void CheckImageTableKey(ImageKeyCase test_case) {
   }
   fixture.PlanAndTrack();
   auto plan = ExtractResourcePlan(fixture.program);
+  if (unsigned_key)
+    Check(plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->key_count == Value(21u),
+        "unsigned minimum lost its upper bound");
   for (const auto &image : plan.info.images) {
     const auto &source = plan.descriptor_sources[image.source];
     Check(source.indirect_descriptor &&
               (material_key ? source.indirect_descriptor->selector.has_value()
-                             : source.indirect_descriptor->key_count == Value(8u)),
+                             : source.indirect_descriptor->key_count == Value(8u) ||
+                                   (unsigned_key && source.indirect_descriptor->key_count == Value(21u))),
         "float key lost its bounded range or material selector");
   }
   EliminateDeadCode(fixture.program.blocks);
@@ -9322,6 +9340,8 @@ int main() {
     Run("mixed image dimensions", [] { CheckImageTableKey(ImageKeyCase::MixedDimensions); });
     Run("mixed gather rejection", [] { CheckImageTableKey(ImageKeyCase::MixedGather); });
     Run("packed half image key", [] { CheckImageTableKey(ImageKeyCase::PackedHalf); });
+    Run("unsigned image key", [] { CheckImageTableKey(ImageKeyCase::UnsignedBound); });
+    Run("guarded unsigned image key", [] { CheckImageTableKey(ImageKeyCase::GuardedUnsignedBound); });
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);

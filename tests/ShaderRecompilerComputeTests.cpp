@@ -42401,6 +42401,79 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   }
 }
 
+void CheckGuardedScalarImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 table = 256u, material = 1024u;
+  for (const bool valid : {false, true})
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = "GuardedScalarImageTable";
+    test.initial.resize(material / 4u + 2u);
+    test.initial[material / 4u] = valid ? 1u : 0x3f800000u;
+    test.initial[material / 4u + 1u] = 1u;
+    test.user_data[0] = table;
+    const auto source = MakeStructuredStorageBufferData(4u, 2u);
+    std::copy_n(source.begin(), 4u, test.user_data.begin() + 4u);
+    test.user_data[4] = material;
+    const auto output = MakeStructuredStorageBufferData(0u, wave * 4u);
+    std::copy_n(output.begin(), 4u, test.user_data.begin() + 48u);
+    for (u32 index = 0; index < 16u; ++index) {
+      auto descriptor = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      descriptor[0] = index + 1u;
+      descriptor[3] |= DstSel(4, 0, 0, 1);
+      std::copy_n(descriptor.begin(), 8u, test.initial.begin() + table / 4u + index * 8u);
+    }
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1u;
+    auto &code = test.code;
+    AppendVMovLiteral(&code, 4, 0u);
+    AppendVMovLiteral(&code, 20, 0x3f000000u);
+    AppendVMovLiteral(&code, 21, 0x3f000000u);
+    code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    code.insert(code.end(), {EncodeSop2(0x0e, 20, 20, InlineU32(1)),
+        EncodeSop2(0x1e, 20, 20, InlineU32(2)),
+        EncodeSmem0(0x08, 20, 2), EncodeSmem1(0, 20),
+        EncodeSopc(0x0b, 20, InlineU32(15))});
+    const auto skip = code.size(); code.push_back(0u);
+    code.insert(code.end(), {EncodeSop2(0x1e, 21, 20, InlineU32(5)),
+        EncodeSmem0(0x03, 8), EncodeSmem1(0, 21),
+        EncodeMimg0(0x27, 1), EncodeMimg1(4, 20, 2, 10)});
+    code[skip] = EncodeSopp(0x04, code.size() - skip - 1u);
+    code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+    AppendBufferStoreDword(&code, 4, 30);
+    AppendEnd(&code);
+    test.opcodes = {O::S_BUFFER_LOAD_DWORD, O::S_LOAD_DWORDX8, O::S_CMP_LE_U32,
+        O::S_CBRANCH_SCC0, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "guarded image candidates", compiled.resources.images.size() == 16u,
+        "material fields outside the image guard entered descriptor probes");
+    for (const auto &buffer : compiled.resources.buffers) {
+      ShaderBufferResource descriptor{};
+      std::copy_n(buffer.dwords.begin(), 4u, descriptor.fields);
+      test.storage_buffer_ranges.emplace_back(static_cast<u32>(descriptor.Base48()),
+                                              static_cast<u32>(descriptor.GetSize()));
+    }
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1u, 1u, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1u,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    auto sampler = vulkan.CreateSampler(test.name);
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
+    CompareWords(test, "invalid selector skipped, valid selector sampled",
+        std::vector<u32>(wave, valid ? 0x40000000u : 0u),
+        vulkan.ReadBuffer(test.name, buffer, wave));
+    vulkan.DestroyBuffer(&buffer);
+    vulkan.Device().destroySampler(sampler);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s wave=%u valid=%u ok\n", test.name, wave, valid);
+  }
+}
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   using O = ShaderOpcode;
 
@@ -51555,6 +51628,11 @@ int main(int argc, char **argv) {
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--guarded-scalar-image-only") == 0) {
+    VulkanHarness vulkan;
+    CheckGuardedScalarImageTable(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
@@ -51565,6 +51643,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    CheckGuardedScalarImageTable(vulkan);
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
@@ -51742,6 +51821,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  CheckGuardedScalarImageTable(vulkan);
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);

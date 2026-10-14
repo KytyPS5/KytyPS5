@@ -1830,6 +1830,10 @@ private:
 		const auto guard = PositiveLaneWitness(image.Parent());
 		if (guard.IsEmpty()) return UINT32_MAX;
 		uint32_t constant;
+		if (ImmediateU32(UnsignedBound(guard, value, true, false, {}, true), constant) &&
+		    constant > 0u && constant - 1u <= INT32_MAX) {
+			return constant - 1u;
+		}
 		const auto* inst = value.Resolve().TryInstruction();
 		if (inst == nullptr) return UINT32_MAX;
 		if (inst->GetOpcode() == ValueOpcode::IAdd32 && ImmediateU32(inst->Arg(1), constant)) {
@@ -2068,22 +2072,27 @@ private:
 	}
 
 	Value UnsignedBound(Value guard, Value value, bool positive = true,
-	                    bool finite_bitscan = false, Value witness = {}) const {
+	                    bool finite_bitscan = false, Value witness = {},
+	                    bool allow_inclusive = false) const {
 		const auto* test = SimplifyGuard(guard).TryInstruction();
 		if (test == nullptr) return {};
 		const auto op = test->GetOpcode();
 		if (op == ValueOpcode::LogicalNot)
-			return UnsignedBound(test->Arg(0), value, !positive, finite_bitscan, witness);
+			return UnsignedBound(test->Arg(0), value, !positive, finite_bitscan, witness, allow_inclusive);
 		if ((op == ValueOpcode::LogicalAnd && positive) ||
 		    (op == ValueOpcode::LogicalOr && !positive)) {
-			const auto left = UnsignedBound(test->Arg(0), value, positive, finite_bitscan, witness);
-			return left.IsEmpty() ? UnsignedBound(test->Arg(1), value, positive, finite_bitscan, witness) : left;
+			const auto left = UnsignedBound(test->Arg(0), value, positive, finite_bitscan, witness, allow_inclusive);
+			const auto right = UnsignedBound(test->Arg(1), value, positive, finite_bitscan, witness, allow_inclusive);
+			uint32_t left_imm = 0, right_imm = 0;
+			if (ImmediateU32(left, left_imm) && ImmediateU32(right, right_imm))
+				return Value(std::min(left_imm, right_imm));
+			return left.IsEmpty() ? right : left;
 		}
 		if (op == ValueOpcode::LogicalAnd && !positive && !witness.IsEmpty()) {
 			// !(A & Q) proves !Q only for accesses whose EXEC also proves A.
 			for (uint32_t arm = 0; arm < 2u; ++arm) {
 				if (!Implies(witness, test->Arg(arm))) continue;
-				const auto bound = UnsignedBound(test->Arg(arm ^ 1u), value, false, finite_bitscan, witness);
+				const auto bound = UnsignedBound(test->Arg(arm ^ 1u), value, false, finite_bitscan, witness, allow_inclusive);
 				if (!bound.IsEmpty()) return bound;
 			}
 		}
@@ -2091,6 +2100,16 @@ private:
 		    EquivalentValue(m_program, test->Arg(0), value)) return test->Arg(1);
 		if ((positive ? op == ValueOpcode::UGreaterThan32 : op == ValueOpcode::ULessThanEqual32) &&
 		    EquivalentValue(m_program, test->Arg(1), value)) return test->Arg(0);
+		uint32_t limit = 0;
+		if (allow_inclusive &&
+		    (((positive ? op == ValueOpcode::ULessThanEqual32 : op == ValueOpcode::UGreaterThan32) &&
+		      EquivalentValue(m_program, test->Arg(0), value) &&
+		      ImmediateU32(test->Arg(1), limit)) ||
+		     ((positive ? op == ValueOpcode::UGreaterThanEqual32 : op == ValueOpcode::ULessThan32) &&
+		      ImmediateU32(test->Arg(0), limit) &&
+		      EquivalentValue(m_program, test->Arg(1), value)))) {
+			if (limit < UINT32_MAX) return Value(limit + 1u);
+		}
 		const auto* scan = value.Resolve().TryInstruction();
 		if (finite_bitscan && scan != nullptr && scan->GetOpcode() == ValueOpcode::FindILsb32 &&
 		    (positive ? op == ValueOpcode::INotEqual32 : op == ValueOpcode::IEqual32)) {
@@ -2117,7 +2136,8 @@ private:
 			return definition != nullptr && current == definition->Parent();
 		}, [&](const EdgePredicate& edge) {
 			if (edge.lanes != LaneQuantifier::All) return false;
-			const auto candidate = UnsignedBound(edge.condition, key, edge.positive, finite_bitscan, witness);
+			const auto candidate = UnsignedBound(edge.condition, key, edge.positive,
+			                                     finite_bitscan, witness, true);
 			// Every incoming path must prove the same bound for this key definition.
 			if (candidate.IsEmpty() || (!bound.IsEmpty() &&
 			    !EquivalentValue(m_program, candidate, bound)) || !accepts_bound(candidate)) return false;
@@ -3120,7 +3140,15 @@ private:
 		indirect.table_offset = table_offset;
 		indirect.table_immediate = table_immediate;
 		indirect.table_stride = table_stride;
-		const auto* key_inst = key.Resolve().TryInstruction();
+		Value guarded_count;
+		if (table_source.dword_count == 2u) {
+			guarded_count = UnsignedBoundOnEntry(key, handle.Parent());
+			if (guarded_count.IsEmpty()) guarded_count = UnsignedResourceBound(key, handle);
+			// A runtime count can describe fewer rows than the mask's static bit range.
+			if (guarded_count.IsEmpty())
+				guarded_count = UnsignedBoundOnEntry(key, handle.Parent(), true);
+		}
+		const auto* key_inst         = key.Resolve().TryInstruction();
 		const bool direct_workgroup = key_inst != nullptr &&
 		                              key_inst->GetOpcode() == ValueOpcode::GetBuiltin;
 		if (!plan.table_indexed && direct_workgroup)
@@ -3134,7 +3162,7 @@ private:
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.retain_reads = true;
-		} else if (!plan.table_indexed &&
+		} else if (!plan.table_indexed && guarded_count.IsEmpty() &&
 		           MatchScalarMaterialKey(key, indirect, material_source,
 		                                  !sampler && table_source.dword_count == 4u, sampler)) {
 			// Keep live descriptor payloads, but project descriptor-only SMEM onto
@@ -3152,10 +3180,6 @@ private:
 			indirect.table_scalar = true;
 			plan.retain_reads = true;
 		} else if (table_source.dword_count == 2u) {
-			auto guarded_count = UnsignedBoundOnEntry(key, handle.Parent());
-			if (guarded_count.IsEmpty()) guarded_count = UnsignedResourceBound(key, handle);
-			// A runtime count can describe fewer rows than the mask's static bit range.
-			if (guarded_count.IsEmpty()) guarded_count = UnsignedBoundOnEntry(key, handle.Parent(), true);
 			if (!guarded_count.IsEmpty()) {
 				if (table_stride < plan.read_dwords * 4u || (table_stride & 3u) != 0u) return false;
 				// Materialization captures the count and descriptor reads; renderer alias

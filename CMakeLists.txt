@@ -681,6 +681,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --float-min-max-only)
+	add_test(NAME shader_guarded_scalar_image
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guarded-scalar-image-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization

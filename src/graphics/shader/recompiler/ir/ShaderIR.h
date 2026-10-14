@@ -581,6 +581,9 @@ struct DescriptorSource {
 			uint32_t f16_shift = UINT32_MAX;
 			uint32_t local_axis = UINT32_MAX;
 			uint32_t key_add = 0;
+			uint32_t mask_source = UINT32_MAX;
+			uint32_t mask_stride = 0;
+			uint32_t mask_offset = 0;
 			bool global = false;
 			// Four DWORD bitmap words per record; set-bit ranks subtract from the last key.
 			bool bitset = false;

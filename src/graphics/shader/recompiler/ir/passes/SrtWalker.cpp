@@ -477,6 +477,7 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 			add(indirect->table_source);
 			if (indirect->selector) {
 				add(indirect->selector->source);
+				add(indirect->selector->mask_source);
 				if (indirect->selector->rows) add(indirect->selector->rows->source);
 			}
 		}

@@ -4606,7 +4606,7 @@ void TestCompactScalarImageTable() {
 
 void TestBitScanScalarImageSelector() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  const auto make = [](bool guarded, bool wrapping) {
+  const auto make = [](bool guarded, bool wrapping, bool bitmap = false) {
     Fixture fixture;
     auto *entry = fixture.block;
     auto *body = fixture.AddBlock();
@@ -4614,10 +4614,20 @@ void TestBitScanScalarImageSelector() {
     entry->AddBranch(body);
     entry->AddBranch(done);
     body->AddBranch(done);
-    const auto mask = fixture.Emit(
+    auto mask = fixture.Emit(
         ValueOpcode::GetBuiltin,
         {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
          Value(0u)});
+    if (bitmap) {
+      const auto offset = fixture.Emit(ValueOpcode::ReadFirstLane,
+          {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {mask, Value(3u)}), Value(true)});
+      const auto source = fixture.Buffer({Value(0x3000u), Value(8u << 16u), Value(3u), Value(0u)});
+      MemoryInfo scalar;
+      scalar.kind = ResourceKind::ScalarBuffer;
+      scalar.offset = 11u;
+      mask = fixture.Emit(ValueOpcode::ReadConstBuffer, {source, offset},
+                          fixture.AddMemory(scalar, 4u));
+    }
     entry->condition =
         guarded ? fixture.Emit(ValueOpcode::INotEqual32, {mask, Value(0u)})
                 : Value(true);
@@ -4701,11 +4711,47 @@ void TestBitScanScalarImageSelector() {
             snapshot.images[2].dwords[0] == 0x102u,
         "bounded material selector lost the OOB zero key or read beyond V# "
         "bounds");
+  const auto bitmap_plan = make(true, false, true);
+  const auto &bitmap_selector = *bitmap_plan.descriptor_sources[
+      bitmap_plan.info.images[0].source].indirect_descriptor->selector;
+  Check(bitmap_selector.mask_source != UINT32_MAX && bitmap_selector.mask_stride == 8u &&
+            bitmap_selector.mask_offset == 8u,
+        "scalar bitmap scan lost its initial mask source or byte stride");
+  memory.words[208u / 4u + 1u] = 0x344afb6bu;
+  memory.words[0x2000u / 4u] = UINT32_MAX;
+  memory.words[0x2000u / 4u + 1u] = UINT32_MAX;
+  memory.words[0x2000u / 4u + 2u] = 1u;
+  memory.words[0x2000u / 4u + 3u] = UINT32_MAX;
+  memory.words[0x2000u / 4u + 4u] = 4u;
+  memory.words[0x2000u / 4u + 5u] = UINT32_MAX;
+  Check(MaterializeResources(bitmap_plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && snapshot.images[0].dwords[0] == 0x100u &&
+            snapshot.images[1].dwords[0] == 0x101u,
+        "scalar bitmap scan probed unselected material data or bitmap padding");
+  memory.words[0x2000u / 4u + 2u] |= 2u;
+  Check(!MaterializeResources(bitmap_plan, runtime, snapshot, specialization),
+        "active invalid material key was silently discarded");
+  memory.words[0x2000u / 4u + 2u] &= ~2u;
+  Check(MaterializeResources(bitmap_plan, runtime, snapshot, specialization),
+        "selector bitmap retained an earlier dispatch value");
 }
 
 void TestScalarBufferSelectorDomain() {
-  const auto make_plan = [](bool active = true, bool sparse = false, bool uniformize_first = false) {
+  const auto make_plan = [](bool active = true, bool sparse = false,
+                            bool uniformize_first = false,
+                            bool sample_witness = false,
+                            bool wrong_mask = false, bool multiply = false) {
     Fixture fixture;
+    const auto mask =
+        sample_witness
+            ? fixture.Emit(
+                  ValueOpcode::INotEqual32,
+                  {fixture.Emit(ValueOpcode::GetBuiltin,
+                                {Value(static_cast<uint32_t>(
+                                     StageInputKind::LocalInvocationId)),
+                                 Value(0u)}),
+                   Value(0u)})
+            : Value(active);
     const auto material = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
                                           fixture.UserData(2), fixture.UserData(3)});
     MemoryInfo lds;
@@ -4713,15 +4759,17 @@ void TestScalarBufferSelectorDomain() {
     auto index = fixture.Emit(ValueOpcode::LoadSharedU32,
         {Value(8u), Value(true)}, fixture.AddMemory(lds, 0x10));
     if (uniformize_first)
-      index = fixture.Emit(ValueOpcode::ReadFirstLane, {index, Value(active)});
+      index = fixture.Emit(ValueOpcode::ReadFirstLane, {index, mask});
     auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
         {index, Value(sparse ? 31u : 5u)});
-    if (!sparse)
+    if (multiply)
+      offset = fixture.Emit(ValueOpcode::IMul32, {index, Value(160u)});
+    else if (!sparse)
       offset = fixture.Emit(ValueOpcode::IAdd32,
           {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {offset, Value(2u)}), offset});
     offset = fixture.Emit(ValueOpcode::IAdd32, {offset, Value(3u)});
     if (!uniformize_first)
-      offset = fixture.Emit(ValueOpcode::ReadFirstLane, {offset, Value(active)});
+      offset = fixture.Emit(ValueOpcode::ReadFirstLane, {offset, mask});
     MemoryInfo scalar;
     scalar.kind = ResourceKind::ScalarBuffer;
     scalar.offset = 147u;
@@ -4741,8 +4789,11 @@ void TestScalarBufferSelectorDomain() {
     sample.kind = ResourceKind::Image;
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
     fixture.Emit(ValueOpcode::ImageSampleRaw,
-        {fixture.Image(words), fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
-         fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x40));
+                 {fixture.Image(words),
+                  fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
+                  fixture.ImageAddress(),
+                  sample_witness && !wrong_mask ? mask : Value(true)},
+                 fixture.AddMemory(sample, 0x40));
     fixture.PlanAndTrack();
     const auto &indirect = fixture.program.descriptor_sources[
         fixture.program.info.images[0].source].indirect_descriptor;
@@ -4761,6 +4812,13 @@ void TestScalarBufferSelectorDomain() {
     return ExtractResourcePlan(fixture.program);
   };
   auto plan = make_plan();
+  make_plan(true, false, false, true);
+  make_plan(true, false, true, true);
+  make_plan(true, false, true, true, false, true);
+  CheckFatal(
+      [&] { make_plan(true, false, false, true, true); },
+      "not a valid runtime value",
+      "image sample under a different mask witnessed an empty lane read");
   CheckFatal([&] { make_plan(false); }, "not a valid runtime value",
              "scalar selector accepted an empty EXEC lane read");
   make_plan(false, false, true);

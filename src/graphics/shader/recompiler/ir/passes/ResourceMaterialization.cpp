@@ -365,6 +365,14 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		keys.resize(count);
 		return true;
 	};
+	const auto congruence_count = [](const ShaderBufferResource& buffer, uint32_t offset,
+	                                 uint32_t stride, uint64_t& domain_count) -> uint64_t {
+		if (stride < 4u || !std::has_single_bit(stride) || (offset & 3u) != 0u)
+			return MaxIndirectDescriptorProbes + 1u;
+		domain_count = (uint64_t {1} << 32u) / stride;
+		const auto available = buffer.GetSize() > offset ? buffer.GetSize() - offset : 0u;
+		return std::min(domain_count, available < 4u ? 0u : (available - 4u) / stride + 1u);
+	};
 	if (selector->rows) {
 		const auto& rows = *selector->rows;
 		DescriptorValue count_value;
@@ -539,8 +547,35 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		const auto end = count != 0u ? last * step + selector->offset + 4u : 0u;
 		if (end > uint64_t {UINT32_MAX} + 1u)
 			return false;
-		if (!read_keys(base, size, uint64_t {first} * step + selector->offset, step, count))
+		uint32_t selected_mask = UINT32_MAX;
+		if (selector->mask_source != UINT32_MAX && first < 32u && count <= 32u - first) {
+			DescriptorValue mask_value;
+			ShaderBufferResource mask_descriptor;
+			if (!WalkedDescriptor(program, selector->mask_source, mask_value) ||
+			    !DecodeBufferDescriptor(mask_value, mask_descriptor)) return false;
+			uint64_t domain_count = 0u;
+			const auto mask_count = congruence_count(
+			    mask_descriptor, selector->mask_offset, selector->mask_stride, domain_count);
+			if (mask_count <= MaxIndirectDescriptorProbes) {
+				if (!read_keys(mask_descriptor.Base48(), mask_descriptor.GetSize(),
+				               selector->mask_offset, selector->mask_stride, mask_count))
+					return false;
+				selected_mask = 0u;
+				for (const auto mask: keys) selected_mask |= mask;
+				keys.clear();
+			}
+		}
+		if (selected_mask != UINT32_MAX) {
+			for (uint32_t index = first; index < first + count; ++index) {
+				if ((selected_mask & (1u << index)) == 0u) continue;
+				uint32_t key = 0u;
+				if (!read_selector(base, size, uint64_t {index} * step + selector->offset, {&key, 1})) return false;
+				keys.push_back(key);
+			}
+		} else if (!read_keys(base, size, uint64_t {first} * step + selector->offset, step, count)) {
 			return false;
+		}
+
 	} else if (!indirect.selector_mask.IsEmpty()) {
 		uint32_t mask = 0;
 		uint32_t count = 0;
@@ -575,16 +610,12 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		keys.push_back(0u); // Every out-of-bounds indexed load returns zero.
 	} else {
 		ShaderBufferResource material;
-		if (!DecodeBufferDescriptor(material_value, material) || selector->stride < 4u ||
-		    !std::has_single_bit(selector->stride) || (selector->offset & 3u) != 0u)
-			return false;
+		uint64_t domain_count = 0u;
+		if (!DecodeBufferDescriptor(material_value, material)) return false;
 		// Empty selector bounds denote the complete U32 congruence class. SMEM
 		// adds its aligned immediate after the dynamic offset, without U32 wrap.
-		const auto domain_count = (uint64_t {1} << 32u) / selector->stride;
-		const auto available = material.GetSize() > selector->offset
-		    ? material.GetSize() - selector->offset : 0u;
-		const auto count = std::min(domain_count,
-		    available < 4u ? 0u : (available - 4u) / selector->stride + 1u);
+		const auto count =
+		    congruence_count(material, selector->offset, selector->stride, domain_count);
 		if (count > MaxIndirectDescriptorProbes ||
 		    !read_keys(material.Base48(), material.GetSize(), selector->offset, selector->stride, count)) return false;
 		if (count < domain_count) keys.push_back(0u); // An out-of-bounds scalar read returns zero.

@@ -115,7 +115,8 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 /// corrupt table from growing the set without limit.
 void ReportRejectedImageDescriptor(const ResourcePlan& program, uint32_t index,
                                    const DescriptorValue& descriptor) {
-	if (NullImageDescriptor(descriptor)) {
+	if (std::all_of(descriptor.dwords.begin(), descriptor.dwords.end(),
+	                [](uint32_t w) { return w == 0u; })) {
 		return;
 	}
 	static std::mutex reported_mutex;

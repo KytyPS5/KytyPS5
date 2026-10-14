@@ -50578,7 +50578,7 @@ void CheckWaitUntilSafeForRendering() {
   };
   const auto address = [](const void *value) { return reinterpret_cast<uint64_t>(value); };
 
-  // Hold the graphics queue so the CPU flip of BLACK, prepared behind it, stays pending.
+  // Blank CPU flips must progress while the graphics queue is blocked.
   std::atomic_uint32_t gate{0};
   std::array<uint32_t, 7> hold{};
   hold[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
@@ -50591,6 +50591,9 @@ void CheckWaitUntilSafeForRendering() {
   Require(name, "flip black",
           VideoOut::VideoOutSubmitFlip(handle, index_black, flip_mode_vsync, 0) == 0,
           "CPU flip failed");
+  Require(name, "blank flip bypasses blocked graphics",
+          wait_until([handle] { return VideoOut::VideoOutIsFlipPending(handle) == 0; }),
+          "the BLACK flip waited for blocked graphics work");
 
   std::atomic_uint32_t rendered{0};
   std::array<uint32_t, 12> render{};
@@ -50610,12 +50613,10 @@ void CheckWaitUntilSafeForRendering() {
   });
   Require(name, "command lane", lane.try_acquire_for(std::chrono::seconds(2)),
           "a busy display buffer blocked the GPU thread");
-  Require(name, "pending", rendered.load() == 0,
-          "rendering started while its display buffer had a pending flip");
+  Require(name, "displayed before graphics completion", rendered.load() == 0,
+          "rendering started while its display buffer was on screen");
 
   gate.store(1);
-  Require(name, "flip shown", wait_until([handle] { return VideoOut::VideoOutIsFlipPending(handle) == 0; }),
-          "the BLACK flip was not presented");
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   Require(name, "displayed", rendered.load() == 0,
           "rendering started while its display buffer was on screen");

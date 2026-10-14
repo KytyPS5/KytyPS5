@@ -1087,14 +1087,6 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
-	if (g_current_processor != nullptr) {
-		EXIT("invalid graphics-thread CPU flip preparation\n");
-	}
-	struct ProcessorScope {
-		explicit ProcessorScope(CommandProcessor& processor) { g_current_processor = &processor; }
-		~ProcessorScope() { g_current_processor = nullptr; }
-	};
-	ProcessorScope processor_scope(*this);
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(

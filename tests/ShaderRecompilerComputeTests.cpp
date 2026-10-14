@@ -34958,6 +34958,87 @@ TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   return test;
 }
 
+TestCase ImageLoadPackedUnormConvertsToFloat() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 component = 0; component < 4; component++) {
+    AppendStoreVgpr(&code, component, component);
+  }
+  AppendEnd(&code);
+
+  const auto unorm = [](u32 field, u32 bits) {
+    return std::bit_cast<u32>(static_cast<float>(field) *
+                              (1.0f / static_cast<float>((1u << bits) - 1u)));
+  };
+  TestCase test;
+  test.name = "ImageLoadPackedUnormConvertsToFloat";
+  test.code = std::move(code);
+  // Fields 1023 and 2047 (11 bits), 512 (10 bits); a 1 swizzle reads 1.0.
+  test.expected = {unorm(1023u, 11), unorm(2047u, 11), unorm(512u, 10), 0x3f800000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[6] = 1023u | (2047u << 11) | (512u << 22);
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k11_11_10UNorm);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(4, 5, 6, 1);
+  test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract", "OpConvertUToF"};
+  return test;
+}
+
+TestCase ImageGatherPackedUnormConvertsToFloat() {
+  using O = ShaderOpcode;
+  // Texels (0, 0), (1, 0), (0, 1), (1, 1); a gather returns (0, 1), (1, 1), (1, 0), (0, 0).
+  constexpr u32 channels[4][3] = {{0, 0, 0}, {2047, 0, 512}, {0, 2047, 1023}, {1023, 2047, 256}};
+  constexpr u32 order[4] = {2, 3, 1, 0};
+  TestCase test;
+  test.name = "ImageGatherPackedUnormConvertsToFloat";
+  test.image_width = test.image_height = 2;
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  for (const auto &pixel : channels) {
+    test.sampled_image_rgba.push_back(pixel[0] | (pixel[1] << 11u) | (pixel[2] << 22u));
+  }
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k11_11_10UNorm);
+  test.user_data[1] |= 1u << 30u;
+  test.user_data[2] = 1u << 14u;
+  test.user_data[8] = 0x92u;
+  test.user_data[9] = 0x00fff000u;
+  test.user_data[10] = 0x0a500000u;
+  test.has_user_data = true;
+  // X reads the 10-bit field, Y the first 11-bit field, W the constant 1.
+  test.image_descriptor_swizzle = DstSel(6, 4, 5, 1);
+  test.expected_force_point_sampler = true;
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.5f));
+  for (const u32 dmask : {0x1u, 0x2u, 0x8u}) {
+    code.push_back(EncodeMimg0(0x47, dmask));
+    code.push_back(EncodeMimg1(0, 20, 0, 2));
+    const u32 field = dmask == 0x1u ? 2u : 0u;
+    const float scale = 1.0f / (field == 2u ? 1023.0f : 2047.0f);
+    for (u32 texel = 0; texel < 4; ++texel) {
+      AppendStoreVgpr(&code, texel, test.expected.size());
+      const float value = dmask == 0x8u
+                              ? 1.0f
+                              : static_cast<float>(channels[order[texel]][field]) * scale;
+      test.expected.push_back(std::bit_cast<u32>(value));
+    }
+  }
+  AppendEnd(&code);
+  test.user_data[50] = test.expected.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_LZ, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpImageGather", "OpBitFieldUExtract", "OpConvertUToF"};
+  return test;
+}
+
 TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   using O = ShaderOpcode;
 
@@ -39338,6 +39419,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
+  AddCase(ImageLoadPackedUnormConvertsToFloat);
+  AddCase(ImageGatherPackedUnormConvertsToFloat);
   AddCase(ImageSamplePackedUnormBilinear<false>);
   AddCase(ImageSamplePackedUnormBilinear<true>);
   AddCase(ImageSamplePacked8<false>);
@@ -44987,6 +45070,8 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
     RunCase(&vulkan, ImageSamplePackedUintConvertsSampleAndGather());
+    RunCase(&vulkan, ImageLoadPackedUnormConvertsToFloat());
+    RunCase(&vulkan, ImageGatherPackedUnormConvertsToFloat());
     RunCase(&vulkan, ImageSamplePackedUnormBilinear<false>());
     RunCase(&vulkan, ImageSamplePackedUnormBilinear<true>());
     RunCase(&vulkan, ImageStorePackedUintSaturatesChannels());

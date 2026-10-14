@@ -399,6 +399,31 @@ uint32_t ExtractPackedImageComponent(EmitterState& state, const Format::BufferFo
 	return result;
 }
 
+// Packed UNorm fields come from a UINT backing and are returned as floats.
+bool PackedUnormConversion(const Format::BufferFormatInfo& info) {
+	return info.packed_bitfield && info.type == Format::ComponentType::Unorm;
+}
+
+Prospero::TextureNumericClass ImageResultClass(const EmitterState& state, uint32_t resource) {
+	const auto& image = state.program.info.images[resource];
+	return image.conversion_format != Prospero::BufferFormat::kInvalid &&
+	               PackedUnormConversion(Format::GetFormatInfo(image.conversion_format))
+	           ? Prospero::TextureNumericClass::Float
+	           : image.numeric_class;
+}
+
+uint32_t UnormFieldsToFloat(EmitterState& state, const Format::BufferFormatInfo& info,
+                            uint32_t fields, uint32_t component, uint32_t count) {
+	const auto scale = ConstantF32Value(
+	    state, 1.0f / static_cast<float>((1u << info.component_bits[component]) - 1u));
+	if (count == 1u) {
+		return Binary(state, spv::OpFMul, TypeF32(state),
+		              Unary(state, spv::OpConvertUToF, TypeF32(state), fields), scale);
+	}
+	return Binary(state, spv::OpVectorTimesScalar, TypeF32Vector(state, count),
+	              Unary(state, spv::OpConvertUToF, TypeF32Vector(state, count), fields), scale);
+}
+
 uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem) {
 	const auto component = ImageGatherComponent(mem.dmask);
 	const auto info      = ImageConversionFormat(state, mem);
@@ -415,6 +440,8 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 
 	const auto numeric_class = ctx.state.program.info.images[mem.resource].numeric_class;
 	const auto scalar_type   = ImageScalarType(ctx.state, numeric_class);
+	const bool unorm         = PackedUnormConversion(info);
+	const bool raw_fields    = info.packed_bitfield && !unorm;
 	uint32_t   packed        = 0;
 	if (info.packed_bitfield) {
 		packed = ctx.state.builder.AllocateId();
@@ -425,6 +452,10 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 		if (info.packed_bitfield) {
 			components[component] =
 			    ExtractPackedImageComponent(ctx.state, info, packed, scalar_type, component);
+			if (unorm) {
+				components[component] =
+				    UnormFieldsToFloat(ctx.state, info, components[component], component, 1u);
+			}
 		} else {
 			components[component] = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(spv::OpCompositeExtract, scalar_type,
@@ -443,19 +474,19 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 	for (uint32_t component = 0; component < 4u; component++) {
 		const auto selector = (swizzle >> (component * 3u)) & 7u;
 		if (selector == 1u) {
-			selected[component] = info.packed_bitfield ? ConstantU32(ctx.state, 1u)
-			                                          : ConstantF32Value(ctx.state, 1.0f);
+			selected[component] =
+			    raw_fields ? ConstantU32(ctx.state, 1u) : ConstantF32Value(ctx.state, 1.0f);
 		} else if (selector >= 4u) {
 			selected[component] = components[selector - 4u];
 		} else {
-			selected[component] = info.packed_bitfield ? ConstantU32(ctx.state, 0u)
-			                                          : ZeroF32(ctx.state);
+			selected[component] = raw_fields ? ConstantU32(ctx.state, 0u) : ZeroF32(ctx.state);
 		}
 	}
 	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeConstruct,
-	                              ImageVectorType(ctx.state, numeric_class, 4), result, selected[0],
-	                              selected[1], selected[2], selected[3]);
+	ctx.state.builder.AddFunction(
+	    spv::OpCompositeConstruct,
+	    ImageVectorType(ctx.state, unorm ? Prospero::TextureNumericClass::Float : numeric_class, 4),
+	    result, selected[0], selected[1], selected[2], selected[3]);
 	return result;
 }
 
@@ -466,12 +497,13 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	const auto component = ImageGatherComponent(mem.dmask);
 	const auto selector =
 	    (ctx.state.program.info.images[mem.resource].shader_swizzle >> (component * 3u)) & 7u;
-	const auto numeric_class = ctx.state.program.info.images[mem.resource].numeric_class;
+	const auto numeric_class = ImageResultClass(ctx.state, mem.resource);
 	const auto vector_type   = ImageVectorType(ctx.state, numeric_class, 4);
 	if (selector < 4u) {
 		uint32_t value;
 		switch (info.type) {
 			case Format::ComponentType::Uscaled:
+			case Format::ComponentType::Unorm:
 				value = ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
 				break;
 			default: value = ConstantU32(ctx.state, selector == 1u ? 1u : 0u); break;
@@ -486,8 +518,11 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 		return Binary(ctx.state, spv::OpFMul, vector_type, gathered, scales);
 	}
 
-	return ExtractPackedImageComponent(ctx.state, info, gathered, TypeU32Vector(ctx.state, 4),
-	                                   (selector - 4u) % info.component_count);
+	const auto physical = (selector - 4u) % info.component_count;
+	const auto fields   = ExtractPackedImageComponent(ctx.state, info, gathered,
+	                                                  TypeU32Vector(ctx.state, 4), physical);
+	return PackedUnormConversion(info) ? UnormFieldsToFloat(ctx.state, info, fields, physical, 4u)
+	                                   : fields;
 }
 
 uint32_t SamplePackedUnormLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t coord) {
@@ -768,7 +803,7 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 		}
 		return ResultVector(ctx, value,
 		                    dref ? Prospero::TextureNumericClass::Float
-		                         : state.program.info.images[resource].numeric_class,
+		                         : ImageResultClass(state, resource),
 		                    scalar, candidate_mem, gather);
 	};
 	// RDNA returns register bits. Convert per typed run only when the join mixes
@@ -840,8 +875,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, QueryDimensions(ctx, mem, *address));
 		return;
 	}
+	// Loads and gathers convert each texel; only filtered samples need the packed bilinear path.
 	if (image.resource_class == IR::ImageResourceClass::Sampled &&
-	    image.conversion_format == Prospero::BufferFormat::k11_11_10UNorm) {
+	    image.conversion_format == Prospero::BufferFormat::k11_11_10UNorm &&
+	    op != IR::ValueOpcode::ImageRead && op != IR::ValueOpcode::ImageGatherRaw) {
 		if (op != IR::ValueOpcode::ImageSampleRaw ||
 		    image.dimension != ImageDimension::Dim2D ||
 		    mem.image_dimension != ImageDimension::Dim2D || mem.data_bits != 32u ||
@@ -954,8 +991,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto coord = CoordF32(ctx, mem, *address, layout.coord,
 				                            dimension_info.coordinate_components, image.cube);
 				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class);
-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-				                              numeric_class, false, mem, true));
+				ctx.Define(inst,
+				           ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+				                        ImageResultClass(state, mem.resource), false, mem, true));
 				return;
 			}
 			if (dimension == ImageDimension::Dim1DArray) {

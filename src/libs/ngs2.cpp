@@ -2515,6 +2515,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
 								if (reinterpret_cast<uintptr_t>(rack) == patch->dest_handle &&
 								    rack->type == Ngs2RackType::Mastering) {
+									EXIT_NOT_IMPLEMENTED(rack->option.common.max_voices == 0);
 									dest = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
 									break;
 								}

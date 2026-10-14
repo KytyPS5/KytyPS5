@@ -1413,6 +1413,86 @@ void TestShaderCacheRecords() {
         "damaged resource plan was accepted");
 }
 
+void TestArrayColorComparison() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
+  enum class Variant { Valid, Offset, Volume, Cube, Corner, Mip, Point };
+  for (const auto variant : {Variant::Valid, Variant::Offset, Variant::Volume, Variant::Cube,
+                             Variant::Corner, Variant::Mip, Variant::Point}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource image;
+    image.dword_count = 8u;
+    image.dwords = {Value(0x100u), Value(56u << 20u), Value(1u | (1u << 14u)),
+                    Value(((variant == Variant::Cube ? 11u : variant == Variant::Volume ? 10u : 13u) << 28u) |
+                          0xfacu | (variant == Variant::Mip ? 1u << 16u : 0u)),
+                    Value(variant == Variant::Cube ? 5u : 3u | (1u << 16u)),
+                    Value(variant == Variant::Corner ? 1u << 23u : 0u), Value(0u), Value(0u)};
+    program.descriptor_sources.push_back(image);
+    DescriptorSource sampler;
+    sampler.dword_count = 4u;
+    sampler.dwords = {Value(0x1092u), Value(0u), Value(variant == Variant::Point ? 0u : 0x00500000u), Value(0u)};
+    program.descriptor_sources.push_back(sampler);
+    program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Sampled,
+        .dimension = variant == Variant::Volume ? Dimension::Dim3D : Dimension::Dim2DArray,
+        .read = true, .depth_compare = true});
+    program.info.samplers.push_back({.source = 1u});
+    program.info.sampled_pairs.push_back({0u, 0u, 0u});
+    program.memory_info.push_back({.kind = ResourceKind::Image,
+        .image_sample_flags = Decoder::ImageSampleFlagCompare | Decoder::ImageSampleFlagLevelZero |
+                             (variant == Variant::Offset ? Decoder::ImageSampleFlagOffset : 0u)});
+    const auto plan = Extract(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {}, snapshot, specialization) == (variant == Variant::Valid),
+          "array color comparison accepted unsupported coordinates or rejected a valid view");
+    if (variant == Variant::Valid) {
+      Check(specialization.images[0].dimension == Dimension::Dim2DArray &&
+                specialization.images[0].software_compare_func == 1u,
+            "array color comparison lost its dimension or comparison function");
+      auto child = image;
+      child.dwords[0] = Value(0x200u);
+      program.descriptor_sources.push_back(child);
+      DescriptorSource root;
+      root.dword_count = 8u;
+      root.dwords.fill(Value(0u));
+      root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0u, 2u};
+      program.descriptor_sources.push_back(root);
+      program.info.images[0].source = 3u;
+      program.info.images[0].first_use_pc = 0x2200u;
+      for (const auto format : {Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm,
+                                Libs::Graphics::Prospero::BufferFormat::k32Float}) {
+        program.descriptor_sources[2].dwords[1] = Value(static_cast<uint32_t>(format) << 20u);
+        auto indirect_plan = Extract(program);
+        uint32_t reads = 0;
+        const SrtRuntime runtime{.userdata = &reads,
+            .read_specialization_memory = RejectSpecializationRead};
+        Check(MaterializeResources(indirect_plan, runtime, snapshot, specialization),
+              "indirect comparison rejected mixed native and software candidates");
+        Check(specialization.images.size() == 2u &&
+                  specialization.images[0].software_compare_func == 1u &&
+                  specialization.images[1].software_compare_func ==
+                      (format == Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm
+                           ? 1u : UINT32_MAX),
+              "indirect comparison lost a candidate's comparison mode");
+        ApplyResourceSpecialization(program, specialization);
+        Check(program.info.samplers[0].depth_compare ==
+                  (format == Libs::Graphics::Prospero::BufferFormat::k32Float),
+              "software-only comparison enabled native sampler comparison");
+        Check((DescriptorBindingForImage(program.info.images[0]) ==
+               DescriptorBindingForImage(program.info.images[1])) ==
+                  (format == Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm),
+              "mixed comparison candidates shared a binding kind");
+        program.info.images.resize(1u);
+        program.info.samplers[0].depth_compare = false;
+      }
+    }
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -1430,6 +1510,7 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestArrayColorComparison();
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();

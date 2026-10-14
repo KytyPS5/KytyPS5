@@ -158,6 +158,7 @@ struct ImageResource {
 	uint32_t                      mip_count         = 1;
 	Prospero::BufferFormat        conversion_format = Prospero::BufferFormat::kInvalid;
 	uint32_t                      shader_swizzle    = ShaderImageIdentitySwizzle;
+	uint32_t                      software_compare_func = UINT32_MAX;
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
@@ -417,6 +418,10 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	return static_cast<uint32_t>(kind) - FirstImageBinding;
 }
 
+[[nodiscard]] constexpr bool UsesNativeDepthCompare(const ImageResource& image) {
+	return image.depth_compare && image.software_compare_func == UINT32_MAX;
+}
+
 [[nodiscard]] constexpr std::optional<DescriptorBindingKind>
 DescriptorBindingForImage(const ImageResource& image) {
 	constexpr uint32_t SampledFloatBinding = 1u;
@@ -435,7 +440,8 @@ DescriptorBindingForImage(const ImageResource& image) {
 		sampled = true;
 		switch (image.numeric_class) {
 			case Prospero::TextureNumericClass::Float:
-				base = image.depth_compare ? FirstComparisonImageBinding : SampledFloatBinding;
+				base = UsesNativeDepthCompare(image) ? FirstComparisonImageBinding
+				                                     : SampledFloatBinding;
 				break;
 			case Prospero::TextureNumericClass::Uint: base = SampledUintBinding; break;
 			case Prospero::TextureNumericClass::Sint: base = SampledSintBinding; break;

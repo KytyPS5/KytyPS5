@@ -39392,6 +39392,56 @@ void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+float ColorCompareBilinearExpected(u32 compare, float white) {
+  return compare == 0u || compare == 2u ? 0.0f :
+      compare == 1u || compare == 3u ? white :
+      compare == 4u || compare == 6u ? 1.0f - white : 1.0f;
+}
+
+TestCase ImageColorCompareBilinear(u32 compare) {
+  constexpr std::array names{
+      "ImageColorCompareNever",        "ImageColorCompareLess",
+      "ImageColorCompareEqual",        "ImageColorCompareLessEqual",
+      "ImageColorCompareGreater",      "ImageColorCompareNotEqual",
+      "ImageColorCompareGreaterEqual", "ImageColorCompareAlways"};
+  TestCase test;
+  test.name = names[compare];
+  test.image_width = 2;
+  test.image_height = 2;
+  test.sampled_image_format = vk::Format::eR8G8B8A8Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.sampled_image_rgba = {0xff000000u, 0xff0000ffu, 0xff0000ffu,
+                             0xff0000ffu};
+  test.user_data =
+      MakeSampledTextureData(Prospero::BufferFormat::k8_8_8_8UNorm);
+  test.user_data[2] = 1u | (1u << 14u);
+  test.user_data[8] = 2u | (2u << 3u) | (2u << 6u) | (compare << 12u);
+  test.user_data[9] = 0u;
+  test.user_data[10] = (1u << 20u) | (1u << 22u);
+  test.has_user_data = true;
+  constexpr std::array<std::array<float, 3>, 4> samples{{{0.5f, 0.5f, 0.75f},
+                                                         {0.5f, 0.25f, 0.5f},
+                                                         {-1.f, -1.f, 0.f},
+                                                         {2.f, 2.f, 1.f}}};
+  for (const auto &sample : samples) {
+    AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(sample[0]));
+    AppendVMovLiteral(&test.code, 22, std::bit_cast<u32>(sample[1]));
+    test.code.push_back(EncodeMimg0(0x2f, 1));
+    test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    AppendStoreVgpr(&test.code, 0, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(
+        std::bit_cast<u32>(ColorCompareBilinearExpected(compare, sample[2])));
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.forbidden_spirv = {"OpImageSampleDref", "OpSampledImage", "OpLoad %sampler"};
+  if (compare != 0u && compare != 7u)
+    test.required_spirv = {"OpImageFetch"};
+  return test;
+}
+
 TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   using O = ShaderOpcode;
 
@@ -42401,6 +42451,223 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   }
 }
 
+TestCase ImageColorCompareArrayBilinear(u32 compare) {
+  constexpr std::array names{
+      "ImageColorCompareArrayNever",        "ImageColorCompareArrayLess",
+      "ImageColorCompareArrayEqual",        "ImageColorCompareArrayLessEqual",
+      "ImageColorCompareArrayGreater",      "ImageColorCompareArrayNotEqual",
+      "ImageColorCompareArrayGreaterEqual", "ImageColorCompareArrayAlways"};
+  auto test = ImageColorCompareBilinear(compare);
+  test.name = names[compare];
+  test.code.clear();
+  test.expected.clear();
+  test.sampled_image_view_type = vk::ImageViewType::e2DArray;
+  test.sampled_image_layers = 4u;
+  test.sampled_image_view_base_layer = 1u;
+  test.sampled_image_view_layers = 3u;
+  test.user_data[3] = (test.user_data[3] & 0x0fffffffu) |
+      (static_cast<u32>(Prospero::ImageType::kColor2DArray) << 28u);
+  test.user_data[4] = 3u | (1u << 16u);
+  constexpr std::array masks{0u, 14u, 1u, 15u};
+  test.sampled_image_rgba.clear();
+  for (const auto mask : masks)
+    for (u32 texel = 0; texel < 4u; ++texel)
+      test.sampled_image_rgba.push_back(0xff000000u | (((mask >> texel) & 1u) * 255u));
+  constexpr std::array layers{-2.0f, 0.49f, 0.5f, 0.51f, 1.49f, 1.5f, 2.5f, 20.0f};
+  constexpr std::array selected{0u, 0u, 0u, 1u, 1u, 2u, 2u, 2u};
+  for (u32 sample = 0; sample < layers.size(); ++sample) {
+    AppendVMovLiteral(&test.code, 20u, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&test.code, 21u, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&test.code, 22u, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&test.code, 23u, std::bit_cast<u32>(layers[sample]));
+    test.code.push_back(EncodeMimg0(0x2f, 1u, 0u, false, 5u));
+    test.code.push_back(EncodeMimg1(0u, 20u, 0u, 2u));
+    AppendStoreVgpr(&test.code, 0u, sample);
+    const float white = float(std::popcount(masks[selected[sample] + 1u])) * 0.25f;
+    test.expected.push_back(
+        std::bit_cast<u32>(ColorCompareBilinearExpected(compare, white)));
+  }
+  AppendEnd(&test.code);
+  return test;
+}
+
+void CheckIndirectColorCompare(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = "IndirectColorCompare";
+    test.has_compute_info = true;
+    auto &compute = test.compute_info;
+    compute.wave_size = wave;
+    compute.host_subgroup_size = vulkan.SubgroupSize();
+    compute.threads_num[0] = wave;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+
+    Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = wave;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+      return Value(&block->AppendNewInst(opcode, args));
+    };
+    const auto lane = emit(ValueOpcode::LaneId, {});
+    const auto key = emit(ValueOpcode::BitwiseAnd32, {lane, Value(3u)});
+    const auto image = emit(ValueOpcode::GetImageResource,
+        {key, Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+    image.Instruction()->SetFlags<u32>(0u);
+    const auto sampler = emit(ValueOpcode::GetSamplerResource,
+        {Value(0u), Value(0u), Value(0u), Value(0u)});
+    sampler.Instruction()->SetFlags<u32>(0u);
+    const auto half = Value(std::bit_cast<u32>(0.5f));
+    const auto address = emit(ValueOpcode::MakeImageAddress,
+        {half, half, half, Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto sample = emit(ValueOpcode::ImageSampleRaw, {image, sampler, address, Value(true)});
+    sample.Instruction()->SetFlags(MemoryFlags{0u, 0x100u});
+    const auto result = emit(ValueOpcode::CompositeExtractU32x4, {sample, Value(0u)});
+    program.memory_info.push_back({.kind = ResourceKind::Image, .dmask = 1u,
+        .image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagCompare |
+                              ShaderRecompiler::Decoder::ImageSampleFlagLevelZero,
+        .image_dimension = Dimension::Dim2D, .image_address_components = 3u});
+    const auto output = emit(ValueOpcode::GetBufferResource,
+        {Value(0u), Value(0u), Value(0u), Value(0u)});
+    output.Instruction()->SetFlags<u32>(0u);
+    const auto offset = emit(ValueOpcode::IMul32, {lane, Value(4u)});
+    const auto store = emit(ValueOpcode::StoreBufferU32,
+        {output, Value(0u), offset, Value(0u), result, Value(true)});
+    store.Instruction()->SetFlags(MemoryFlags{1u, 0u});
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
+
+    for (u32 index = 0; index < 4u; ++index) {
+      auto descriptor = MakeSampledTextureData(Prospero::BufferFormat::k8_8_8_8UNorm);
+      descriptor[0] = 0x100u + index;
+      descriptor[2] = 1u | (1u << 14u);
+      descriptor[3] |= DstSel(4, 4, 4, 4);
+      DescriptorSource source;
+      source.dword_count = 8u;
+      for (u32 word = 0; word < 8u; ++word) source.dwords[word] = Value(descriptor[word]);
+      program.descriptor_sources.push_back(source);
+    }
+    DescriptorSource table;
+    table.dword_count = 8u;
+    table.indirect_descriptor.emplace().sources = {0u, 1u, 2u, 3u};
+    program.descriptor_sources.push_back(table);
+    DescriptorSource sampler_source;
+    sampler_source.dword_count = 4u;
+    sampler_source.dwords = {Value(0x1092u), Value(0u), Value(0x00500000u), Value(0u)};
+    program.descriptor_sources.push_back(sampler_source);
+    ImageResource root;
+    root.source = 4u;
+    root.resource_class = ImageResourceClass::Sampled;
+    root.dimension = Dimension::Dim2D;
+    root.read = root.depth_compare = true;
+    program.info.images.push_back(root);
+    program.info.samplers.push_back({.source = 5u});
+    program.info.sampled_pairs.push_back({0u, 0u, 0x100u});
+    const auto output_data = MakeStructuredStorageBufferData(1u, wave * 4u);
+    DescriptorSource output_source;
+    output_source.dword_count = 4u;
+    for (u32 word = 0; word < 4u; ++word) output_source.dwords[word] = Value(output_data[word]);
+    program.descriptor_sources.push_back(output_source);
+    program.info.buffers.push_back({.source = 6u, .packed_stride = 1u, .written = true});
+    auto plan = LoadedResourcePlan(test.name, program);
+    CompiledShader compiled;
+    ResourceSpecialization specialization;
+    Require(test.name, "color comparison materialization",
+        MaterializeResources(plan, {.read_specialization_memory = ReadTestMemory},
+                             compiled.resources, specialization),
+        "indirect color comparison candidates failed to materialize");
+    ApplyResourceSpecialization(program, specialization);
+    CollectShaderInfo(program, {.compute = &compute});
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv(test.name, compiled.spirv);
+    compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
+    compiled.program = std::move(program);
+    std::vector<VulkanHarness::Image> textures;
+    constexpr std::array masks{14u, 1u, 0u, 15u};
+    for (u32 index = 0; index < masks.size(); ++index) {
+      std::vector<u32> pixels(4u);
+      for (u32 texel = 0; texel < 4u; ++texel)
+        pixels[texel] = ((masks[index] >> texel) & 1u) != 0u ? 255u : 0u;
+      textures.push_back(vulkan.CreateImage2D(test.name, 2u, 2u,
+          vk::Format::eR8G8B8A8Unorm,
+          vk::ImageUsageFlagBits::eSampled, pixels, 1u, vk::ImageLayout::eShaderReadOnlyOptimal));
+    }
+    const auto native_sampler = vulkan.CreateSampler(test.name);
+    auto buffer = vulkan.CreateStorageBuffer(test.name, std::vector<u32>(wave), wave);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                    native_sampler, textures);
+    std::vector<u32> expected(wave);
+    for (u32 index = 0; index < wave; ++index)
+      expected[index] = std::bit_cast<u32>(float(std::popcount(masks[index & 3u])) * 0.25f);
+    CompareWords(test, "color runs and dynamic descriptor indices", expected,
+                  vulkan.ReadBuffer(test.name, buffer, wave));
+    for (const u32 native : {0u, 1u, 3u}) {
+      constexpr uint64_t page = 0x10000;
+      RenderContext context(vulkan.RuntimeContext());
+      const auto base = LibKernel::Memory::AllocateRuntimeMemory(
+          0, page, Common::VirtualMemory::Mode::ReadWrite, "mixed_compare_depth");
+      Require(test.name, "depth allocation", base != 0, "depth allocation failed");
+      const auto depth = native == 1u ? 1.0f : 0.0f;
+      std::fill_n(reinterpret_cast<u32 *>(base), page / sizeof(u32), std::bit_cast<u32>(depth));
+      context.MapMemory(base, page);
+      auto descriptor = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      descriptor[0] = static_cast<u32>(base >> 8u);
+      descriptor[1] |= static_cast<u32>(base >> 40u);
+      descriptor[2] = 1u | (1u << 14u);
+      descriptor[3] |= DstSel(4, 4, 4, 4);
+      const auto original = plan.descriptor_sources[native].dwords;
+      for (u32 word = 0; word < 8u; ++word)
+        plan.descriptor_sources[native].dwords[word] = Value(descriptor[word]);
+      CompileSrtWalker(plan);
+      Require(test.name, "mixed comparison materialization",
+          MaterializeResources(plan, {.read_specialization_memory = ReadTestMemory},
+                               compiled.resources, specialization),
+          "mixed depth/color comparison candidates failed to materialize");
+      compiled.program.info.images.resize(1u);
+      compiled.program.shader_info_complete = false;
+      ApplyResourceSpecialization(compiled.program, specialization);
+      CollectShaderInfo(compiled.program, {.compute = &compute});
+      compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+      ValidateSpirv("IndirectMixedDepthColorCompare", compiled.spirv);
+      compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetTextureCache();
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(
+          context.GetRenderExecutor(), compiled.program.info.images[native], compiled.resources.images[native]);
+      const auto original_texture = textures[native];
+      textures[native].view = cache.FindTexture(binding.image_id, binding.desc);
+      textures[native].layout = cache.GetImage(binding.image_id).backing.state.layout;
+      scheduler.Finish();
+      const ShaderSamplerResource sampler_descriptor{{0x1092u, 0, 0x00500000u, 0}};
+      const auto sampler = context.GetSamplerCache().GetSampler(sampler_descriptor, false);
+      vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, textures);
+      auto mixed_expected = expected;
+      for (u32 index = native; index < wave; index += 4u)
+        mixed_expected[index] = std::bit_cast<u32>(depth);
+      CompareWords(test, "mixed native/software comparison results", mixed_expected,
+                    vulkan.ReadBuffer(test.name, buffer, wave));
+      textures[native] = original_texture;
+      plan.descriptor_sources[native].dwords = original;
+      context.UnmapMemory(base, page);
+      Require(test.name, "depth release", LibKernel::Memory::FreeGuestMemory(base, page),
+              "depth allocation release failed");
+    }
+    vulkan.DestroyBuffer(&buffer);
+    vulkan.Device().destroySampler(native_sampler);
+    for (auto &texture : textures) vulkan.DestroyImage(&texture);
+    std::printf("[compute] %s wave=%u ok\n", test.name, wave);
+  }
+}
+
 void CheckGuardedScalarImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 table = 256u, material = 1024u;
@@ -44678,6 +44945,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleOffsetsReadFourNeighbors<32>);
   AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
+  for (u32 compare = 0; compare < 8u; ++compare) {
+    cases.push_back(ImageColorCompareBilinear(compare));
+    cases.push_back(ImageColorCompareArrayBilinear(compare));
+  }
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
@@ -51628,6 +51899,15 @@ int main(int argc, char **argv) {
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--color-compare-only") == 0) {
+    VulkanHarness vulkan;
+    for (u32 compare = 0; compare < 8u; ++compare) {
+      RunCase(&vulkan, ImageColorCompareBilinear(compare));
+      RunCase(&vulkan, ImageColorCompareArrayBilinear(compare));
+    }
+    CheckIndirectColorCompare(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--guarded-scalar-image-only") == 0) {
     VulkanHarness vulkan;
     CheckGuardedScalarImageTable(vulkan);
@@ -51643,6 +51923,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    CheckIndirectColorCompare(vulkan);
     CheckGuardedScalarImageTable(vulkan);
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
@@ -51821,6 +52102,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  CheckIndirectColorCompare(vulkan);
   CheckGuardedScalarImageTable(vulkan);
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);

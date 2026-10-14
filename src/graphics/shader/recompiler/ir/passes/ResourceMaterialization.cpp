@@ -118,36 +118,68 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
-bool ValidatePackedUnormSampling(const ResourcePlan& program, const ResourceSnapshot& snapshot,
-                                 uint32_t image_index) {
+bool ValidateBilinearSampling(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                              uint32_t image_index, uint32_t* compare_func = nullptr,
+                              uint32_t root_index = UINT32_MAX) {
+	if (root_index == UINT32_MAX) root_index = image_index;
 	ShaderTextureResource texture;
 	std::copy_n(snapshot.images[image_index].dwords.begin(), std::size(texture.fields),
 	            texture.fields);
-	if (texture.Type() != Prospero::ImageType::kColor2D ||
-	    texture.BaseLevel() != texture.LastLevel() || texture.MinLod() != 0u ||
-	    texture.CornerSample()) {
-		return SpecializationFail("packed UNorm sampling requires a centered, single-mip 2D image");
+	const bool invalid_compare =
+	    compare_func != nullptr &&
+	    ((texture.Type() != Prospero::ImageType::kColor2D &&
+	      texture.Type() != Prospero::ImageType::kColor2DArray) ||
+	     texture.BaseLevel() != 0u || program.info.images[root_index].gather ||
+	     std::ranges::any_of(program.memory_info, [&](const MemoryInfo& memory) {
+		     return memory.kind == ResourceKind::Image && memory.resource == root_index &&
+		            memory.image_sample_flags !=
+		                (Decoder::ImageSampleFlagCompare | Decoder::ImageSampleFlagLevelZero);
+	     }));
+	if (texture.BaseLevel() != texture.LastLevel() || texture.MinLod() != 0u ||
+	    texture.CornerSample() ||
+	    (compare_func != nullptr ? invalid_compare
+	                             : texture.Type() != Prospero::ImageType::kColor2D)) {
+		return SpecializationFail(
+		    compare_func != nullptr
+		        ? "color comparison requires a 2D or 2D-array sample_c_lz at mip zero"
+		        : "packed UNorm sampling requires a centered, single-mip 2D image");
 	}
 	for (const auto& pair: program.info.sampled_pairs) {
-		if (pair.image != image_index) continue;
+		if (pair.image != root_index) continue;
 		if (pair.sampler >= snapshot.samplers.size() ||
 		    program.descriptor_sources[program.info.samplers[pair.sampler].source].indirect_descriptor) {
-			return SpecializationFail("packed UNorm sampling requires a direct sampler");
+			return SpecializationFail(compare_func != nullptr
+			                              ? "color comparison requires a direct sampler"
+			                              : "packed UNorm sampling requires a direct sampler");
 		}
 		ShaderSamplerResource sampler;
 		std::copy_n(snapshot.samplers[pair.sampler].dwords.begin(), std::size(sampler.fields),
 		            sampler.fields);
 		const auto linear = static_cast<uint32_t>(Prospero::SamplerFilter::kBilinear);
-		const auto clamp = static_cast<uint32_t>(Prospero::SamplerClampMode::kClampLastTexel);
+		const auto clamp  = static_cast<uint32_t>(Prospero::SamplerClampMode::kClampLastTexel);
 		if (sampler.XyMagFilter() != linear || sampler.XyMinFilter() != linear ||
 		    sampler.ClampX() != clamp || sampler.ClampY() != clamp ||
-		    sampler.ForceUnormCoords() || sampler.MaxAnisoRatio() != 0u ||
+		    sampler.ForceUnormCoords() ||
+		    (compare_func == nullptr && sampler.MaxAnisoRatio() != 0u) ||
 		    sampler.FilterMode() != 0u || sampler.MinLod() != 0u || sampler.ForceSrgb() ||
 		    sampler.TruncCoord() || (sampler.fields[0] & (1u << 19u)) != 0u) { // MC_COORD_TRUNC
-			return SpecializationFail(fmt::format(
-			    "packed UNorm image {} requires normalized bilinear clamp sampling (sampler {})",
-			    image_index, pair.sampler));
+			return SpecializationFail(
+			    compare_func != nullptr
+			        ? "color comparison requires normalized bilinear clamp sampling"
+			        : fmt::format("packed UNorm image {} requires normalized bilinear clamp "
+			                      "sampling (sampler {})",
+			                      image_index, pair.sampler));
 		}
+		if (compare_func != nullptr) {
+			if (*compare_func != UINT32_MAX && *compare_func != sampler.DepthCompareFunc()) {
+				return SpecializationFail(
+				    "color comparison requires matching sampler compare functions");
+			}
+			*compare_func = sampler.DepthCompareFunc();
+		}
+	}
+	if (compare_func != nullptr && *compare_func == UINT32_MAX) {
+		return SpecializationFail("color comparison requires a sampled image");
 	}
 	return true;
 }
@@ -718,6 +750,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				ImageHeapView view;
 				if (image_heap && runtime.image_heap != nullptr &&
 				    image.resource_class == ImageResourceClass::Sampled &&
+				    !image.depth_compare &&
 				    image.mip_mode != ImageMipMode::Dynamic &&
 				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
 				                                view)) {
@@ -1028,7 +1061,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			if (std::ranges::any_of(program.info.sampled_pairs,
 			                       [&](const auto& pair) { return pair.image == i; }) &&
-			    !ValidatePackedUnormSampling(program, snapshot, i)) return false;
+			    !ValidateBilinearSampling(program, snapshot, i)) return false;
+		}
+		if (!storage && base.depth_compare && format == Prospero::BufferFormat::k8_8_8_8UNorm &&
+		    !ValidateBilinearSampling(program, snapshot, i, &image.software_compare_func, base_index)) {
+			return false;
 		}
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
@@ -1139,6 +1176,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.conversion_format = image_class.conversion_format;
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
+				image.software_compare_func = image_class.software_compare_func;
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
@@ -1900,6 +1938,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.mip_count                  = source.mip_count;
 		image.conversion_format          = source.conversion_format;
 		image.shader_swizzle             = source.shader_swizzle;
+		image.software_compare_func      = source.software_compare_func;
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
@@ -1961,9 +2000,14 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));
 		pair.sampler = sampler_plan.mapping[pair.sampler][type];
 		EXIT_IF(pair.sampler == UINT32_MAX);
-		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
+		const bool depth_compare =
+		    UsesNativeDepthCompare(images[pair.image]) ||
+		    std::ranges::any_of(images[pair.image].indirect_resources, [&](uint32_t candidate) {
+			    return UsesNativeDepthCompare(images[candidate]);
+		    });
+		samplers[pair.sampler].depth_compare |= depth_compare;
 		for (const auto candidate: samplers[pair.sampler].indirect_resources)
-			samplers[candidate].depth_compare |= images[pair.image].depth_compare;
+			samplers[candidate].depth_compare |= depth_compare;
 	}
 
 	auto& memory_info = program.memory_info;

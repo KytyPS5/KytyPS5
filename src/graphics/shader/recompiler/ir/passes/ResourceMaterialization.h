@@ -26,6 +26,7 @@ struct ResourceSpecialization {
 		uint32_t                      mip_count     = 1;
 		Prospero::BufferFormat        conversion_format          = Prospero::BufferFormat::kInvalid;
 		uint32_t                      shader_swizzle             = ShaderImageIdentitySwizzle;
+		uint32_t                      software_compare_func      = UINT32_MAX;
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;

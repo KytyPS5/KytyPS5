@@ -512,28 +512,29 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	                                   (selector - 4u) % info.component_count);
 }
 
-uint32_t SamplePackedUnormLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t coord) {
-	auto& state = ctx.state;
-	const auto& image = state.program.info.images[mem.resource];
-	const auto info = ImageConversionFormat(state, mem);
-	const auto sampled = MakeSampledImage(state, mem.resource,
-	                                     LoadSamplerDescriptor(state, mem.sampler));
-	const auto gathered = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpImageGather, TypeU32Vector(state, 4), gathered, sampled,
-	                          coord, ConstantU32(state, 0u));
+uint32_t BilinearPosition(EmitterState& state, uint32_t image, uint32_t coord,
+                          uint32_t* size_f32_out = nullptr, uint32_t* layers_out = nullptr) {
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
 	const auto size = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 2), size,
-	                          LoadImageDescriptor(state, mem.resource), ConstantU32(state, 0u));
-	const auto size_f32 = Unary(state, spv::OpConvertUToF, TypeF32Vector(state, 2), size);
-	const auto half = ConstantF32Value(state, 0.5f);
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, layers_out ? 3u : 2u), size, image,
+	                          ConstantU32(state, 0u));
+	auto extent = size;
+	if (layers_out != nullptr) {
+		*layers_out = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), *layers_out, size, 2u);
+		extent = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVectorShuffle, TypeU32Vector(state, 2), extent, size, size, 0u, 1u);
+	}
+	const auto size_f32 = Unary(state, spv::OpConvertUToF, TypeF32Vector(state, 2), extent);
+	if (size_f32_out != nullptr) *size_f32_out = size_f32;
+	const auto half   = ConstantF32Value(state, 0.5f);
 	const auto halves = state.builder.Constant(spv::OpConstantComposite,
 	                                           TypeF32Vector(state, 2), half, half);
-	const auto fractions = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    spv::OpExtInst, TypeF32Vector(state, 2), fractions, GlslStd450(state), GLSLstd450Fract,
-	    Binary(state, spv::OpFSub, TypeF32Vector(state, 2),
-	           Binary(state, spv::OpFMul, TypeF32Vector(state, 2), coord, size_f32), halves));
+	return Binary(state, spv::OpFSub, TypeF32Vector(state, 2),
+	              Binary(state, spv::OpFMul, TypeF32Vector(state, 2), coord, size_f32), halves);
+}
+
+uint32_t BilinearWeights(EmitterState& state, uint32_t fractions) {
 	uint32_t fraction[2];
 	uint32_t complement[2];
 	for (uint32_t axis = 0; axis < 2u; axis++) {
@@ -551,6 +552,21 @@ uint32_t SamplePackedUnormLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, u
 	    Binary(state, spv::OpFMul, TypeF32(state), fraction[0], fraction[1]),
 	    Binary(state, spv::OpFMul, TypeF32(state), fraction[0], complement[1]),
 	    Binary(state, spv::OpFMul, TypeF32(state), complement[0], complement[1]));
+	return weights;
+}
+
+uint32_t SamplePackedUnormLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t coord) {
+	auto& state = ctx.state;
+	const auto& image = state.program.info.images[mem.resource];
+	const auto info = ImageConversionFormat(state, mem);
+	const auto sampled = MakeSampledImage(state, mem.resource,
+	                                     LoadSamplerDescriptor(state, mem.sampler));
+	const auto gathered = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageGather, TypeU32Vector(state, 4), gathered, sampled,
+	                          coord, ConstantU32(state, 0u));
+	const auto position  = BilinearPosition(state, LoadImageDescriptor(state, mem.resource), coord);
+	const auto fractions = EmitGlsl<GLSLstd450Fract, IR::Type::F32x2>(state, position);
+	const auto weights   = BilinearWeights(state, fractions);
 	uint32_t decoded[4] {};
 	uint32_t selected[4] {ZeroF32(state), ZeroF32(state), ZeroF32(state), ZeroF32(state)};
 	for (uint32_t component = 0; component < 4u; component++) {
@@ -577,6 +593,77 @@ uint32_t SamplePackedUnormLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, u
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), result,
 	                          selected[0], selected[1], selected[2], selected[3]);
 	return result;
+}
+
+uint32_t SampleColorCompareLz(EmitterState& state, uint32_t resource_index, uint32_t coord,
+                              uint32_t reference, uint32_t array_index, uint32_t layer_coord) {
+	const auto& resource = state.program.info.images[resource_index];
+	const auto function = resource.software_compare_func;
+	if (function == 0u || function == 7u)
+		return ConstantF32Value(state, function == 7u ? 1.0f : 0.0f);
+	const auto image    = LoadImageDescriptor(state, resource_index, 0u, array_index);
+	uint32_t   size_f32 = 0u;
+	uint32_t   layers = 0u;
+	const bool array = resource.dimension == ImageDimension::Dim2DArray;
+	const auto position = BilinearPosition(state, image, coord, &size_f32, array ? &layers : nullptr);
+	const auto lower    = EmitGlsl<GLSLstd450Floor, IR::Type::F32x2>(state, position);
+	const auto weights =
+	    BilinearWeights(state, Binary(state, spv::OpFSub, TypeF32Vector(state, 2), position, lower));
+	const auto zero  = ZeroF32(state);
+	const auto one   = ConstantF32Value(state, 1.0f);
+	uint32_t layer = 0u;
+	if (array) {
+		const auto last_layer = Binary(state, spv::OpFSub, TypeF32(state),
+		    Unary(state, spv::OpConvertUToF, TypeF32(state), layers), one);
+		layer = Unary(state, spv::OpConvertFToU, TypeU32(state),
+		    EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(state,
+		        EmitGlsl<GLSLstd450RoundEven, IR::Type::F32>(state, layer_coord), zero, last_layer));
+	}
+	const auto zeros = state.builder.Constant(spv::OpConstantComposite, TypeF32Vector(state, 2),
+	                                          zero, zero);
+	const auto ones  = state.builder.Constant(spv::OpConstantComposite, TypeF32Vector(state, 2),
+	                                          one, one);
+	const auto last  = Binary(state, spv::OpFSub, TypeF32Vector(state, 2), size_f32, ones);
+	const auto i0 = Unary(
+	    state, spv::OpConvertFToU, TypeU32Vector(state, 2),
+	    EmitGlsl<GLSLstd450FClamp, IR::Type::F32x2>(state, lower, zeros, last));
+	const auto i1 = Unary(
+	    state, spv::OpConvertFToU, TypeU32Vector(state, 2),
+	    EmitGlsl<GLSLstd450FClamp, IR::Type::F32x2>(
+	        state, Binary(state, spv::OpFAdd, TypeF32Vector(state, 2), lower, ones), zeros, last));
+	constexpr std::array compare_ops {spv::OpNop,
+	                                  spv::OpFOrdLessThan,
+	                                  spv::OpFOrdEqual,
+	                                  spv::OpFOrdLessThanEqual,
+	                                  spv::OpFOrdGreaterThan,
+	                                  spv::OpFUnordNotEqual,
+	                                  spv::OpFOrdGreaterThanEqual};
+	constexpr std::array<std::pair<uint32_t, uint32_t>, 4> corners {
+	    {{0u, 3u}, {2u, 3u}, {2u, 1u}, {0u, 1u}}};
+	uint32_t compared[4];
+	for (uint32_t corner = 0; corner < 4u; ++corner) {
+		const auto at = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVectorShuffle, TypeU32Vector(state, 2), at, i0, i1,
+		                          corners[corner].first, corners[corner].second);
+		auto fetch_coord = at;
+		if (array) {
+			fetch_coord = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), fetch_coord,
+			                          at, layer);
+		}
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpImageFetch, TypeF32Vector(state, 4), texel, image, fetch_coord,
+		                          spv::ImageOperandsLodMask, ConstantU32(state, 0u));
+		const auto depth = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), depth, texel, 0u);
+		const auto passed =
+		    Binary(state, compare_ops[function], TypeBool(state), reference, depth);
+		compared[corner] = Select(state, TypeF32(state), passed, one, zero);
+	}
+	const auto samples = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), samples,
+	                          compared[0], compared[1], compared[2], compared[3]);
+	return Binary(state, spv::OpDot, TypeF32(state), samples, weights);
 }
 
 uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
@@ -721,6 +808,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		const auto& first = state.program.info.images[lhs];
 		const auto& second = state.program.info.images[rhs];
 		return first.dimension == second.dimension && first.cube == second.cube &&
+		       first.software_compare_func == second.software_compare_func &&
 		       IR::DescriptorBindingForImage(first) == IR::DescriptorBindingForImage(second) &&
 		       (inst.GetOpcode() != IR::ValueOpcode::ImageWrite ||
 		        first.shader_swizzle == second.shader_swizzle) &&
@@ -822,6 +910,7 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 	const auto& root = samplers.at(mem.sampler);
 	std::array<ImageSampler, 2> result {};
 	const auto load = [&](const IR::ImageResource& image) {
+		if (image.software_compare_func != UINT32_MAX) return;
 		const bool integer = image.numeric_class != Prospero::TextureNumericClass::Float;
 		auto& sampler = result[integer];
 		if (sampler.id != 0u) return;
@@ -1019,6 +1108,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto samplers = LoadImageSamplers(ctx, inst);
 			const auto EmitGather = [&](uint32_t resource, uint32_t array_index, uint32_t result_type) {
 				const auto& candidate = state.program.info.images[resource];
+				if (candidate.software_compare_func != UINT32_MAX) {
+					ctx.Fail(inst, "color comparison requires sample_c_lz");
+				}
 				const auto sampler = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
 				const auto dimension = candidate.dimension;
 				const auto coord = CoordF32(
@@ -1096,6 +1188,18 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto samplers = LoadImageSamplers(ctx, inst);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index, uint32_t result_type) {
 			const auto& candidate = state.program.info.images[resource];
+			if (candidate.software_compare_func != UINT32_MAX) {
+				if (!dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
+				    layout.offset != NoImageComponent ||
+				    (candidate.dimension != ImageDimension::Dim2D &&
+				     candidate.dimension != ImageDimension::Dim2DArray))
+					ctx.Fail(inst, "color comparison requires a 2D or 2D-array sample_c_lz without offset");
+				return SampleColorCompareLz(
+				    state, resource, CoordF32(ctx, mem, *address, layout.coord, 2u),
+				    dref_value, array_index,
+				    ImageDimensionInfoFor(mem.image_dimension).coordinate_components > 2u
+				        ? AddressF32(ctx, mem, *address, layout.coord + 2u) : ZeroF32(state));
+			}
 			const auto sampler = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
 			auto sample_operands = operands;
 			auto sample_operand_count = operand_count;

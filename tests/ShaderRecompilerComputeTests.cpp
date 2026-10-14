@@ -11837,6 +11837,44 @@ public:
               name, "texture view sees metadata clear",
               read_texel() == expected,
               "a texture binding read drawn texels of a fast-cleared target");
+          // A cached texture binding sees a clear that arrived after its lookup.
+          paint();
+          registers.SetColorBase(0, {.addr = 0});
+          fill_metadata(metadata_words);
+          registers.SetColorBase(0, {.addr = base});
+          ShaderRecompiler::IR::CompiledShaderInfo view_program{};
+          view_program.stage = ShaderType::Compute;
+          ShaderRecompiler::IR::ImageResource view_resource{};
+          view_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+          view_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          view_resource.read = true;
+          view_program.info.images.push_back(view_resource);
+          ShaderRecompiler::IR::ResourceSnapshot view_snapshot{};
+          view_snapshot.images.resize(1);
+          ShaderStageRuntime view_runtime{&view_program, &view_snapshot};
+          PreparedBindings cached;
+          cached.runtime = &view_runtime;
+          cached.images.resize(1);
+          cached.images[0].image_id = sampled_id;
+          cached.images[0].desc = sampled;
+          executor.RebindImages(cached);
+          Require(name, "cached texture binding sees metadata clear",
+                  read_texel() == expected,
+                  "a cached texture binding missed a later fast clear");
+          // A view in another format, such as UINT, decodes the clear as the target does.
+          if (layout == Prospero::ChannelLayout::k16_16 && type == Prospero::ChannelType::kFloat) {
+            paint();
+            registers.SetColorBase(0, {.addr = 0});
+            fill_metadata(metadata_words);
+            registers.SetColorBase(0, {.addr = base});
+            ImageDesc uint_view = sampled;
+            uint_view.view_info.format = vk::Format::eR16G16Uint;
+            RenderExecutorTestAccess::ResetBindings(executor);
+            (void)texture_cache.FindTexture(texture_cache.FindImage(uint_view), uint_view);
+            Require(name, "texture view decodes target format",
+                    read_texel() == expected,
+                    "a texture view decoded the clear registers in its own format");
+          }
         }
         bind();
         // A texture view carrying the target's metadata, without the clear

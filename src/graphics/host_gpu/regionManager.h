@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/writeHeat.h"
 
 #include <atomic>
 #include <mutex>
@@ -101,12 +102,32 @@ public:
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
+		ForgetOldHeat();
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
+			// A write to a clean page: the page came back after an upload.
+			for (size_t page = start; page < end; page++) {
+				if (!m_cpu_dirty.Get(page)) {
+					m_write_heat.NoteWrite(page, page + 1, Frame());
+				}
+			}
+		}
+		if constexpr (source == DirtySource::Cpu && !enable) {
+			m_write_heat.Cool(start, end);
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
+			// A hot page is kept dirty only so that it is uploaded at every use. The caller has
+			// just uploaded it; from here the GPU owns it.
+			for (size_t page = start; page < end; page++) {
+				if (m_write_heat.IsHot(page)) {
+					m_cpu_dirty.UnsetRange(page, page + 1);
+				}
+			}
+			if (m_write_heat.Cool(start, end)) {
+				UpdateProtection<true, false>();
+			}
 			if (RegionBits(m_cpu_dirty, start, end).Any()) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
@@ -135,6 +156,8 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				ForgetOldHeat();
+				m_write_heat.KeepHotDirty(bits, start, end, Frame());
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -147,7 +170,24 @@ public:
 
 	TrackingSpinLock lock;
 
+	// Ends the heat of every region, at its next use. Called from time to time, so that a page
+	// the guest has stopped writing is protected again.
+	static void CoolAllRegions() noexcept { s_heat_epoch.fetch_add(1, std::memory_order_relaxed); }
+
+	// A guest frame ended (a flip). Hot pages count their lease in these (writeHeat.h).
+	static void NoteFrame() noexcept { s_frame.fetch_add(1, std::memory_order_relaxed); }
+
 private:
+	static uint32_t Frame() noexcept { return s_frame.load(std::memory_order_relaxed); }
+
+	void ForgetOldHeat() {
+		const auto epoch = s_heat_epoch.load(std::memory_order_relaxed);
+		if (m_heat_epoch != epoch) {
+			m_heat_epoch = epoch;
+			m_write_heat.CoolAll();
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -194,6 +234,11 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// Pages the guest writes again and again stay open and dirty (see writeHeat.h).
+	WriteHeat<TRACKER_REGION_PAGES>     m_write_heat;
+	uint32_t                            m_heat_epoch = 0;
+	static inline std::atomic<uint32_t> s_heat_epoch {0};
+	static inline std::atomic<uint32_t> s_frame {0};
 };
 
 } // namespace Libs::Graphics

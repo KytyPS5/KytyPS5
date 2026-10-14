@@ -47,7 +47,13 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
-// Applies an already-derived specialization to native IR before layout and emission.
+// True when `specialization` can be applied to a program with these resources. A specialization
+// kept from another build of the translator may not fit what this build finds in the shader.
+[[nodiscard]] bool ResourceSpecializationFits(const ShaderInfo&             info,
+                                              const ResourceSpecialization& specialization);
+
+// Applies an already-derived specialization to native IR before layout and emission. The
+// specialization must fit (see ResourceSpecializationFits).
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

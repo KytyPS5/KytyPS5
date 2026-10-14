@@ -31,6 +31,9 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// The same, for a caller that comes back with a second part of work it has begun: when the
+	// GPU thread no longer takes commands (shutdown), nothing runs and the result is false.
+	[[nodiscard]] bool TrySendCommandSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,
@@ -69,6 +72,7 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	void              SubmitRecordedBeforeWaiting();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -95,6 +99,10 @@ private:
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
+	// The host submission (scheduler tick) that this thread last recorded guest work into. The
+	// thread submits before it waits only when that submission is still open: what others
+	// record into the scheduler (the test harness does) is theirs to submit.
+	uint64_t        m_recorded_tick = UINT64_MAX;
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;

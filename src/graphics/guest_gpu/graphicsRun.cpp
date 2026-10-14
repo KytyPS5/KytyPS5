@@ -105,6 +105,13 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_work_available.Signal();
 }
 
+void GuestGpu::SubmitRecordedBeforeWaiting() {
+	auto& scheduler = m_renderer.GetCommandScheduler();
+	if (scheduler.CurrentTick() == m_recorded_tick) {
+		scheduler.SubmitIfDue(CommandScheduler::SubmitPoint::Wait);
+	}
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -132,6 +139,29 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		done.release();
 	});
 	done.acquire();
+}
+
+bool GuestGpu::TrySendCommandSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	std::binary_semaphore done {0};
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		if (!m_accepting) {
+			return false;
+		}
+		m_commands.push_back([operation = std::move(command), &done]() mutable {
+			operation();
+			done.release();
+		});
+		m_pending_commands.fetch_add(1, std::memory_order_release);
+		m_work_available.Signal();
+	}
+	done.acquire();
+	return true;
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
@@ -245,6 +275,10 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+void CommandProcessor::BufferFlushIfDue() {
+	GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::GuestSubmission);
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -288,7 +322,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
-	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
+	WriteGuest(dst, m_const_ram + offset / 4, static_cast<uint64_t>(dw_num) * 4u);
 }
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
@@ -343,12 +377,20 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 
 	if (write_one_address) {
-		for (uint32_t i = 0; i < dw_num; i++) {
-			dst[0] = src[i];
-		}
+		// Each dword goes to the same address: the last one stays.
+		WriteGuest(dst, src + (dw_num - 1u), sizeof(uint32_t));
 	} else {
-		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+		WriteGuest(dst, src, static_cast<uint64_t>(dw_num) * sizeof(uint32_t));
 	}
+}
+
+void CommandProcessor::WriteGuest(void* dst, const void* src, uint64_t size) {
+	std::memcpy(dst, src, size);
+	NoteGuestWrite(dst, size);
+}
+
+void CommandProcessor::NoteGuestWrite(const void* dst, uint64_t size) {
+	m_renderer.GetBufferCache().RecordGpuThreadWrite(reinterpret_cast<uint64_t>(dst), size);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -358,7 +400,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	WriteGuest(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -453,6 +495,12 @@ void GuestGpu::ThreadRun(void* data) {
 		bool                         should_stop    = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// Nothing more to record: what this thread recorded goes to the GPU now.
+				gpu->m_queue_mutex.Unlock();
+				gpu->SubmitRecordedBeforeWaiting();
+				gpu->m_queue_mutex.Lock();
+			}
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
@@ -477,6 +525,10 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
+					// Every queue waits for the guest or the GPU: submit what this thread recorded.
+					gpu->m_queue_mutex.Unlock();
+					gpu->SubmitRecordedBeforeWaiting();
+					gpu->m_queue_mutex.Lock();
 					gpu->m_processing = false;
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
@@ -543,6 +595,7 @@ bool GuestGpu::Process(Submission& submission) {
 	if (first_slice) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
+		m_renderer.GetBufferCache().BeginSubmission();
 		cp.ResetDeCe();
 		cp.SetFlip({});
 	}
@@ -575,8 +628,12 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			if (complete) {
+				m_renderer.FinishList();
+			}
 			if (progressed) {
-				cp.BufferFlush();
+				m_recorded_tick = m_renderer.GetCommandScheduler().CurrentTick();
+				cp.BufferFlushIfDue();
 			}
 			break;
 		}
@@ -596,8 +653,12 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			if (complete) {
+				m_renderer.FinishList();
+			}
 			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
+				m_recorded_tick = m_renderer.GetCommandScheduler().CurrentTick();
+				cp.BufferFlushIfDue();
 			}
 			break;
 		}
@@ -741,6 +802,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		// Whatever the packet prepared buffers for has been recorded by now.
+		m_renderer.GetBufferCache().SettleGpuWrites();
+		GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::Packet);
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1077,7 +1141,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		std::memcpy(dst, &data, sizeof(data));
+		WriteGuest(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			TriggerEopEventAtEndOfPipe(interrupt_context_id);
@@ -1092,6 +1156,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					SynchronizeGpu();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
+					NoteGuestWrite(dst, uint64_t {value >> 16u} * sizeof(uint32_t));
 					if (with_interrupt) {
 						m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
 					}
@@ -1120,7 +1185,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					std::memcpy(dst, &value, sizeof(value));
+					WriteGuest(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						TriggerEopEventAtEndOfPipe(interrupt_context_id);
@@ -1223,18 +1288,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
-
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	CurrentBuffer().RequestGlobalBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
@@ -1316,6 +1370,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
+			NoteGuestWrite(reinterpret_cast<const void*>(event_address), 16u * 2u * sizeof(uint64_t));
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}
@@ -1349,7 +1404,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	WriteGuest(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
@@ -1375,7 +1430,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	WriteGuest(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
@@ -1399,6 +1454,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	ProcessorScope processor_scope(*this);
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
+	m_renderer.GetRenderExecutor().NoteFlip();
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();

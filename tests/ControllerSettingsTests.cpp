@@ -17,6 +17,8 @@ void Check(bool condition, const char* text) {
 struct Rumble {
 	Uint16 large, small;
 	Uint32 duration;
+	// The host gamepad id of the pad that rumbled.
+	int pad = 0;
 };
 Uint64                             now = 1000;
 std::vector<Rumble>                rumble;
@@ -29,15 +31,18 @@ namespace Fake {
 Uint64 GetTicks() {
 	return now;
 }
-SDL_Gamepad* GetGamepadFromID(SDL_JoystickID id) {
-	return id == 1 || id == 2 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
-	                          : nullptr;
+// One more pad than 1 and 2, for a test that needs a third.
+SDL_JoystickID extra_pad = 0;
+SDL_Gamepad*   GetGamepadFromID(SDL_JoystickID id) {
+	return id == 1 || id == 2 || (id != 0 && id == extra_pad)
+	           ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
+	           : nullptr;
 }
 SDL_GamepadType GetGamepadType(SDL_Gamepad*) {
 	return SDL_GAMEPAD_TYPE_PS5;
 }
-bool RumbleGamepad(SDL_Gamepad*, Uint16 large, Uint16 small, Uint32 duration) {
-	rumble.push_back({large, small, duration});
+bool RumbleGamepad(SDL_Gamepad* pad, Uint16 large, Uint16 small, Uint32 duration) {
+	rumble.push_back({large, small, duration, static_cast<int>(reinterpret_cast<uintptr_t>(pad))});
 	return true;
 }
 bool SendGamepadEffect(SDL_Gamepad*, const void* data, int size) {
@@ -105,6 +110,12 @@ double GetTimeMs() {
 namespace {
 using namespace Libs::Controller;
 
+// A press and release of a button: a gamepad's first press gives it a seat.
+void Press(int pad) {
+	SetButton(pad, PAD_BUTTON_L3, true);
+	SetButton(pad, PAD_BUTTON_L3, false);
+}
+
 struct Controller {
 	Controller() {
 		now                    = 1000;
@@ -113,6 +124,7 @@ struct Controller {
 		Check(PadInit() == 0 && PadOpen(Config::GetUserId(), 0, 0, nullptr) == 1,
 		      "the standard controller port did not open");
 		Connect(1);
+		Press(1);
 		Check(GetSettingScale(Setting::SpeakerVolume) ==
 		              Config::GetControllerSpeakerVolume() / 50.0f &&
 		          GetSettingScale(Setting::VibrationIntensity) ==
@@ -368,6 +380,7 @@ void TestIndependentOutputsAndPadSwitch() {
 	      "speaker volume resent controller effects");
 	Connect(2);
 	Disconnect(1);
+	Press(2);
 	Check(GetActiveControllerId() == 2, "active controller did not change");
 	haptics.clear();
 	effects.clear();
@@ -392,6 +405,160 @@ void TestIndependentOutputsAndPadSwitch() {
 		Check(request.large == 0 && request.small == 0,
 		      "released controller retained a cached vibration");
 	}
+}
+
+// The first press of a second pad logs player 2 in: its own user, port, input and outputs.
+void TestASecondPadIsPlayerTwo() {
+	Controller controller;
+	const int  user = Config::GetUserId();
+	bool       login = false;
+	int        event_user = 0;
+	Check(TakePlayerEvent(&login, &event_user) && login && event_user == user &&
+	          !TakePlayerEvent(&login, &event_user),
+	      "player 1 did not log in alone");
+	Connect(2);
+	PadData data {};
+	SetButton(2, PAD_BUTTON_CIRCLE, true);
+	std::array<int, 4> users {};
+	GetLoggedInUsers(users.data());
+	Check(TakePlayerEvent(&login, &event_user) && login && event_user == users[1] &&
+	          users[0] == user && users[1] != user && users[2] == -1 && users[3] == -1 &&
+	          GetPlayerOfUser(users[1]) == 1,
+	      "the first press of a second pad did not log player 2 in");
+	Check(PadReadState(1, &data) == 0 && data.buttons == 0,
+	      "player 1 read the press of player 2's pad");
+	SetButton(2, PAD_BUTTON_CIRCLE, false);
+	const int handle = PadOpen(users[1], 0, 0, nullptr);
+	Check(handle == 2 && PadGetHandle(users[1], 0, 0) == handle,
+	      "player 2 did not get a port of its own");
+	SetButton(2, PAD_BUTTON_CROSS, true);
+	SetButton(1, PAD_BUTTON_CIRCLE, true);
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_SQUARE, true);
+	Check(PadReadState(handle, &data) == 0 && data.connected && data.buttons == PAD_BUTTON_CROSS,
+	      "player 2 did not read its own pad alone");
+	Check(PadReadState(1, &data) == 0 &&
+	          data.buttons == (PAD_BUTTON_CIRCLE | PAD_BUTTON_SQUARE),
+	      "player 1 read the pad of player 2, or lost its own");
+	rumble.clear();
+	const PadVibrationParam param {200, 100};
+	Check(PadSetVibration(handle, &param) == 0 && !rumble.empty() && rumble.back().pad == 2,
+	      "the vibration of player 2 did not reach its pad");
+	Disconnect(2);
+	Check(TakePlayerEvent(&login, &event_user) && !login && event_user == users[1] &&
+	          GetPlayerOfUser(users[1]) == -1,
+	      "player 2 did not log out with its pad");
+	Check(PadReadState(handle, &data) == 0 && !data.connected,
+	      "player 2 stayed connected without its pad");
+}
+
+// A player's port outlives its pad: a game that holds the handle reads no controller, and the next
+// pad of that player plays on the same port from a fresh state.
+void TestALoggedOutPlayerKeepsItsPortAndStartsAfresh() {
+	Controller controller;
+	bool       login = false;
+	int        event_user = 0;
+	(void)TakePlayerEvent(&login, &event_user);
+	Connect(2);
+	Press(2);
+	(void)TakePlayerEvent(&login, &event_user);
+	const int user   = event_user;
+	const int handle = PadOpen(user, 0, 0, nullptr);
+	Check(handle == 2 && PadSetMotionSensorState(handle, false) == 0, "player 2 did not open");
+	Disconnect(2);
+	PadData data {};
+	Check(PadReadState(handle, &data) == 0 && !data.connected,
+	      "the port of a logged-out player did not read as no controller");
+	Connect(2);
+	Press(2);
+	Check(PadGetHandle(user, 0, 0) == handle &&
+	          PadOpen(user, 0, 0, nullptr) == static_cast<int32_t>(0x80920004u),
+	      "the next pad of player 2 did not find its port");
+	// Gravity along x: the default reading has it along y.
+	const std::array<float, 3> accel {SDL_STANDARD_GRAVITY, 0.0f, 0.0f};
+	SetSensor(2, Sensor::Accel, accel.data(), 1000);
+	Check(PadReadState(handle, &data) == 0 && data.connected && data.acceleration_x == 1.0f,
+	      "the next pad of player 2 kept the motion setting of the last");
+}
+
+// A pad without a seat plays as nobody, and a stick move or a release does not give it a seat: a
+// copy of a pad that the host reports twice never presses.
+void TestAPadWithoutASeatPlaysAsNobody() {
+	Controller controller;
+	bool       login = false;
+	int        event_user = 0;
+	(void)TakePlayerEvent(&login, &event_user);
+	Connect(2);
+	SetAxis(2, Axis::LeftX, 0);
+	SetButton(2, PAD_BUTTON_CROSS, false);
+	PadData data {};
+	Check(PadReadState(1, &data) == 0 && data.left_stick_x != 0 && data.buttons == 0 &&
+	          !TakePlayerEvent(&login, &event_user),
+	      "a pad without a seat moved player 1, or a stick move gave it a seat");
+	rumble.clear();
+	SetRumble(200, 100);
+	for (const auto& request: rumble) {
+		Check(request.pad == 1, "player 1's vibration reached a pad without a seat");
+	}
+}
+
+// The logged-in users come first in the list, in seat order, with no gap for a player who left.
+void TestTheLoginListHasNoGaps() {
+	Controller controller;
+	Connect(2);
+	Press(2);
+	Fake::extra_pad = 3;
+	Connect(3);
+	Press(3);
+	std::array<int, 4> users {};
+	GetLoggedInUsers(users.data());
+	const int third = users[2];
+	Disconnect(2);
+	GetLoggedInUsers(users.data());
+	Fake::extra_pad = 0;
+	Check(users[0] == Config::GetUserId() && users[1] == third && users[2] == -1 && users[3] == -1,
+	      "the login list kept a gap for a player who left");
+}
+
+// Only a gamepad takes a seat: the keyboard stays with player 1.
+void TestTheKeyboardIsNeverSeated() {
+	Controller controller;
+	bool       login = false;
+	int        event_user = 0;
+	(void)TakePlayerEvent(&login, &event_user);
+	SeatGamepad(HOST_INPUT_CONTROLLER_ID);
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_CROSS, true);
+	Check(!TakePlayerEvent(&login, &event_user), "the keyboard logged a player in");
+}
+
+// A game may open a player's standard port and special port (arcade sticks and the like) and read
+// both: each press would count twice if both handles read the same gamepad.
+void TestTheSpecialPortIsAPortOfItsOwn() {
+	Controller controller;
+	const int  user    = Config::GetUserId();
+	const int  special = PadOpen(user, 2, 0, nullptr);
+	Check(special > 0 && special != 1 && PadGetHandle(user, 2, 0) == special &&
+	          PadOpen(user, 2, 0, nullptr) == static_cast<int32_t>(0x80920004u),
+	      "the special port did not get a handle of its own");
+	SetButton(1, PAD_BUTTON_DOWN, true);
+	PadData data {};
+	Check(PadReadState(1, &data) == 0 && data.connected && data.buttons == PAD_BUTTON_DOWN,
+	      "the standard port did not read the gamepad");
+	data = {};
+	Check(PadReadState(special, &data) == 0 && !data.connected && data.buttons == 0,
+	      "the special port read the gamepad");
+	std::array<PadData, 4> states {};
+	Check(PadRead(special, states.data(), 4) == 1 && !states[0].connected &&
+	          states[0].buttons == 0,
+	      "buffered reads of the special port held presses");
+	PadControllerInformation info {};
+	Check(PadGetControllerInformation(special, &info) == 0 && !info.connected,
+	      "the special port reported a controller");
+	rumble.clear();
+	const PadVibrationParam param {200, 100};
+	Check(PadSetVibration(special, &param) == 0 && rumble.empty(),
+	      "the special port rumbled the gamepad");
+	Check(PadClose(special) == 0 && PadGetHandle(user, 2, 0) == static_cast<int32_t>(0x80920008u),
+	      "the special port did not close");
 }
 
 void TestTriggerEffectState() {
@@ -470,6 +637,8 @@ void TestTriggerEffectState() {
 	check_state(1, 5, "feedback position 9 activated before full travel");
 	SetAxis(HOST_INPUT_CONTROLLER_ID, Axis::TriggerLeft, 255);
 	check_state(2, 5, "keyboard trigger travel did not activate feedback");
+	// The key is released: the keyboard holds its trigger apart from the gamepad's.
+	SetAxis(HOST_INPUT_CONTROLLER_ID, Axis::TriggerLeft, 0);
 	param.command[0].data[0] = 0;
 	set_effect();
 	SetAxis(1, Axis::TriggerLeft, 0);
@@ -560,6 +729,12 @@ int main() {
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
+	TestASecondPadIsPlayerTwo();
+	TestTheSpecialPortIsAPortOfItsOwn();
+	TestALoggedOutPlayerKeepsItsPortAndStartsAfresh();
+	TestAPadWithoutASeatPlaysAsNobody();
+	TestTheKeyboardIsNeverSeated();
+	TestTheLoginListHasNoGaps();
 	TestTriggerEffectState();
 	Config::Shutdown();
 	return 0;

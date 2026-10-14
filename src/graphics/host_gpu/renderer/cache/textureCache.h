@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/writeWatchSet.h"
 
 #include <map>
 #include <type_traits>
@@ -68,12 +69,22 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// A guest thread is about to write CPU memory in the range. An image the GPU wrote there is
+	// copied to guest memory first, and the caller waits for the copy: after the write the image
+	// is uploaded again from that memory, which must hold what the GPU wrote.
+	void               SaveGpuWrites(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	// A guest uniform-fill dispatch wrote `value` over [address, address + size). If the value is a
+	// metadata code, the next colour clear resolution for that range uses it instead of reading the
+	// bytes back from the GPU. Call after the dispatch is recorded, so its own write is counted.
+	void RecordColorMetadataFill(uint64_t address, uint64_t size, uint32_t value);
+	// Voids every record: a GPU write is coming that no write watch will see.
+	void DropColorMetadataFills();
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -177,6 +188,35 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Colour metadata codes the guest wrote with a fill dispatch, by metadata block address. Valid
+	// while the write generation of the range is unchanged.
+	struct ColorMetadataFill {
+		uint64_t          size       = 0;
+		uint8_t           code       = 0;
+		WriteWatchSet::Id watch      = 0;
+		uint64_t          generation = 0;
+		// Sub-ranges (offset, size) the renderer has since made CPU memory holding 0xff, the code
+		// for "no clear", when it consumed a slice's clear. The record does not speak for them:
+		// a guest write to CPU memory is not seen by the watch.
+		std::vector<std::pair<uint64_t, uint64_t>> consumed;
+
+		// True when any byte of the sub-range was consumed.
+		[[nodiscard]] bool IsConsumed(uint64_t offset, uint64_t bytes) const {
+			for (const auto& [begin, length]: consumed) {
+				if (offset < begin + length && begin < offset + bytes) {
+					return true;
+				}
+			}
+			return false;
+		}
+	};
+	std::map<uint64_t, ColorMetadataFill> m_color_metadata_fills;
+	// A record is a cache: dropping one costs a read-back, so the map is simply emptied when a
+	// guest fills more distinct ranges than any set of render targets needs.
+	static constexpr size_t MaxColorMetadataFills = 1024;
+	using ColorMetadataFillMap                    = std::map<uint64_t, ColorMetadataFill>;
+	ColorMetadataFillMap::iterator DropColorMetadataFill(ColorMetadataFillMap::iterator fill);
+	void                           DropColorMetadataFillsLocked();
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

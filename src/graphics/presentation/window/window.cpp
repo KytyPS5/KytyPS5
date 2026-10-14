@@ -18,15 +18,20 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window/benchScript.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
+#include "libs/padInput.h"
 #include "loader/systemContent.h"
 
 #include <cstdlib>
 #include <fmt/format.h>
+#include <fstream>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -286,9 +291,21 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #endif
 }
 
-static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+// Which device SDL opened, for the log: its name, vendor, product, device path, and the driver
+// that opened it ('m' for Apple's GameController framework). One device can show up as two
+// gamepads: that framework reports a Logitech Cordless RumblePad 2 twice.
+static void LogGamepad(SDL_Gamepad* pad, int id) {
+	const auto  guid   = SDL_GetGamepadGUIDForID(static_cast<SDL_JoystickID>(id));
+	const char  driver = guid.data[14] >= ' ' && guid.data[14] < 127 ? static_cast<char>(guid.data[14])
+	                                                                 : '-';
+	const char* name   = SDL_GetGamepadName(pad);
+	const char* path   = SDL_GetGamepadPath(pad);
+	LOGF("Controller: gamepad %d \"%s\": vendor %04x product %04x, driver '%c', path %s\n", id,
+	     name != nullptr ? name : "gamepad", SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad),
+	     driver, path != nullptr ? path : "none");
+}
 
+static void GameEventController([[maybe_unused]] const EventController& f) {
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
@@ -304,21 +321,29 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 #endif
 
-	if (f.added) {
-		auto* pad = SDL_OpenGamepad(f.id);
-		if (pad == nullptr) {
-			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
-			     SDL_GetError());
-			return;
-		}
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
-	}
-
-	if (f.removed) {
-		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
-			Controller::Disconnect(f.id);
-			SDL_CloseGamepad(pad);
+	if (f.added || f.removed || f.remapped) {
+		using Controller::GamepadDeviceEvent;
+		const auto event = f.added     ? GamepadDeviceEvent::Added
+		                   : f.removed ? GamepadDeviceEvent::Removed
+		                               : GamepadDeviceEvent::Remapped;
+		auto*      open  = SDL_GetGamepadFromID(f.id);
+		switch (Controller::PlanGamepadDeviceEvent(event, open != nullptr)) {
+			case Controller::GamepadDeviceStep::Open:
+				if (auto* pad = SDL_OpenGamepad(f.id); pad != nullptr) {
+					LogGamepad(pad, f.id);
+				} else {
+					LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
+					     SDL_GetError());
+					return;
+				}
+				Controller::Connect(f.id);
+				break;
+			case Controller::GamepadDeviceStep::Close:
+				HostInputGamepadRemoved(f.id);
+				Controller::Disconnect(f.id);
+				SDL_CloseGamepad(open);
+				break;
+			case Controller::GamepadDeviceStep::Nothing: break;
 		}
 	}
 
@@ -326,6 +351,12 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
+		} else if (f.button == SDL_GAMEPAD_BUTTON_GUIDE) {
+			// The PS button never reaches the game. A press of it seats the pad like any first
+			// press (playerSeats.h); a hold on player 1's pad closes the game.
+			if (HostInputGamepadGuide(f.id, f.down)) {
+				Controller::SeatGamepad(f.id);
+			}
 		} else if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
 			// Pads without a touchpad (Switch, Xbox, ...) have no way to click it, which
 			// blocks games that require it. Use their Back/Select button as a centered click.
@@ -347,6 +378,11 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		if (axis != Controller::Axis::AxisMax) {
 			Controller::SetAxis(f.id, axis,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+		}
+		const bool right_trigger = f.axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+		if (right_trigger || f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
+			// A hold of both triggers closes the game, for pads without a PS button.
+			HostInputGamepadTrigger(f.id, right_trigger, f.axis_value);
 		}
 	}
 }
@@ -727,9 +763,41 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+// The benchmark script of --bench-script, or nullopt without one. Stops the emulator when the
+// file cannot be read or a step is wrong, so a measured run never goes on without its input.
+static std::optional<BenchScript> LoadBenchScript() {
+	const auto path = Config::GetBenchScript();
+	if (path.empty()) {
+		return std::nullopt;
+	}
+	std::ifstream file(path);
+	if (!file) {
+		EXIT("--bench-script %s: the file cannot be read\n", Common::PathToString(path).c_str());
+	}
+	std::stringstream text;
+	text << file.rdbuf();
+	std::string error;
+	auto        steps = ParseBenchScript(text.str(), error);
+	if (!steps) {
+		EXIT("--bench-script %s: %s\n", Common::PathToString(path).c_str(), error.c_str());
+	}
+	for (const auto& step: *steps) {
+		if (!step.quit && SDL_GetKeyFromName(step.key.c_str()) == SDLK_UNKNOWN) {
+			EXIT("--bench-script %s: unknown key \"%s\"\n", Common::PathToString(path).c_str(),
+			     step.key.c_str());
+		}
+	}
+	std::printf("Bench: %zu step(s) from %s\n", steps->size(), Common::PathToString(path).c_str());
+	return BenchScript(std::move(*steps));
+}
+
 void WindowContext::Run() {
 	Common::Timer timer;
 	timer.Start();
+
+	auto bench = LoadBenchScript();
+	// A step that waits for a frame is checked this often.
+	constexpr int bench_frame_poll_ms = 4;
 
 	loop.event     = {};
 	loop.need_exit = false;
@@ -753,18 +821,45 @@ void WindowContext::Run() {
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			const auto fps =
+			    static_cast<double>(frames - title_frames) * 1000.0 / static_cast<double>(elapsed);
 			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+				UpdateTitle(frames, fps);
+			}
+			if (bench) {
+				std::printf("Bench: %llu ms, frame %llu, fps %.1f\n",
+				            static_cast<unsigned long long>(now),
+				            static_cast<unsigned long long>(frames), fps);
+				std::fflush(stdout);
 			}
 			title_time   = now;
 			title_frames = frames;
 		}
-		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
-		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
-			continue;
+		auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
+		if (bench) {
+			bench->Advance(loop.presented_frames.load(std::memory_order_relaxed), now,
+			               [&](const BenchStep& step) {
+				               std::printf("Bench: %llu ms, step %s %s\n",
+				                           static_cast<unsigned long long>(now),
+				                           step.quit ? "quit" : step.key.c_str(),
+				                           step.quit ? "" : (step.down ? "down" : "up"));
+				               std::fflush(stdout);
+				               if (step.quit) {
+					               LOGF("Event: quit (bench script)\n");
+					               loop.need_exit = true;
+				               } else {
+					               HostInputKey(SDL_GetKeyFromName(step.key.c_str()), step.down);
+				               }
+			               });
+			wait_ms = bench->WaitMs(SDL_GetTicks(), bench_frame_poll_ms, wait_ms);
 		}
-		ProcessEvent(timer.GetTimeS());
+		if (HostInputWaitEvent(&loop.event, wait_ms)) {
+			ProcessEvent(timer.GetTimeS());
+		}
+		if (HostInputQuitRequested()) {
+			LOGF("Event: quit (player 1 held the PS button or both triggers)\n");
+			loop.need_exit = true;
+		}
 	}
 }
 
@@ -968,6 +1063,10 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	// While the pipelines of the game's list are built ahead, say so: the start is at work.
+	if (const auto ahead = render_context->GetPipelineCache().BuiltAhead().Building()) {
+		text += fmt::format(", building pipelines {}/{}", ahead->built, ahead->total);
+	}
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

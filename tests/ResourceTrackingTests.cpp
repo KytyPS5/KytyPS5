@@ -441,6 +441,43 @@ void TestBoundedImageViewEligibility() {
         "explicitly selected incompatible descriptor was silently normalized to null");
 }
 
+// A V# image table indexed by the workgroup. An image store keeps one descriptor per dispatch:
+// only a sample can read through a native array root.
+void TestWorkgroupImageTableStore() {
+  Fixture fixture;
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4; dword++) heap_words[dword] = fixture.UserData(dword);
+  const auto heap = fixture.Buffer(heap_words, 0x10d8);
+  const auto group = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(2u)});
+  const auto heap_offset = fixture.Emit(ValueOpcode::IMul32, {group, Value(32u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    MemoryInfo component;
+    component.kind = ResourceKind::ScalarBuffer;
+    component.offset = dword * sizeof(uint32_t);
+    image_words[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
+                                      fixture.AddMemory(component, 0x10d8));
+  }
+  const auto image = fixture.Image(image_words, 0x10f0);
+  MemoryInfo access;
+  access.kind = ResourceKind::Image;
+  access.image_dimension = Decoder::ImageDimension::Dim2D;
+  access.image_address_components = 2u;
+  const auto data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+                                 {Value(1u), Value(2u), Value(3u), Value(4u)});
+  fixture.Emit(ValueOpcode::ImageWrite, {image, fixture.ImageAddress(), data, Value(true)},
+               fixture.AddMemory(access, 0x10f0));
+  fixture.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture.program);
+  Check(plan.info.images.size() == 1u &&
+            plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor.has_value(),
+        "the workgroup image table was not tracked");
+  Check(plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->workgroup_axis == 2u,
+        "an image store through a V# table became a native array root");
+}
+
 void TestWaterfallImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   const auto make = [](bool equality, bool scalar) {
@@ -5799,6 +5836,7 @@ int main() {
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+    Run("workgroup image table store", TestWorkgroupImageTableStore);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

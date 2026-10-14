@@ -32,6 +32,13 @@ struct GuestRange {
 	auto                             operator<=>(const GuestRange&) const = default;
 };
 
+// [begin, end) of guest addresses, with no validity rule (GuestRange has one); empty when
+// begin == end.
+struct GuestSpan {
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+};
+
 enum class DirtySource { Cpu, Gpu };
 using RegionBits = Common::BitArray<TRACKER_REGION_PAGES>;
 static_assert(sizeof(RegionBits) == TRACKER_REGION_PAGES / 8);

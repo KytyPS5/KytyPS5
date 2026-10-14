@@ -57,4 +57,20 @@ struct Lifecycle {
 
 #define KYTY_PROFILER_THREAD(name) Profiler::SetThreadName(name)
 
+// One guest frame ends at every flip. Tracy starts only with --profile (manual lifetime):
+// FrameMark and messages reach the profiler object directly, so they run only when it is up.
+#define KYTY_PROFILER_FRAME()                                                                      \
+	do {                                                                                           \
+		if (tracy::ProfilerAvailable()) {                                                          \
+			FrameMark;                                                                             \
+		}                                                                                          \
+	} while (false)
+// A short note on the timeline, from a string literal.
+#define KYTY_PROFILER_MESSAGE(literal)                                                             \
+	do {                                                                                           \
+		if (tracy::ProfilerAvailable()) {                                                          \
+			TracyMessageL(literal);                                                                \
+		}                                                                                          \
+	} while (false)
+
 #endif /* KYTY_COMMON_PROFILER_H_ */

@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -514,6 +515,7 @@ static void SchedulerBackoffOnce() {
 
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
+		PerfCounters::Add(PerfCounters::Counter::ZeroSleeps);
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}
@@ -528,6 +530,7 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	if (nanoseconds == 0) {
+		PerfCounters::Add(PerfCounters::Counter::ZeroSleeps);
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}

@@ -1,12 +1,12 @@
 #ifndef EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 
-#include <SDL3/SDL.h>
-
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/window/deviceSuitability.h"
 
+#include <SDL3/SDL.h>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -38,6 +38,10 @@ struct WindowContext {
 	[[nodiscard]] static vk::PhysicalDeviceVulkan11Features RequiredVulkan11Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan12Features RequiredVulkan12Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features RequiredVulkan13Features() noexcept;
+	// What `device` reports, as plain data for EvaluateDeviceSuitability.
+	[[nodiscard]] static DeviceFacts
+	ReadDeviceFacts(vk::PhysicalDevice                          device,
+	                const std::vector<vk::ExtensionProperties>& extensions);
 	[[nodiscard]] static uint32_t InitialWindowFlags(bool fullscreen) noexcept;
 	void                                                    CreateVulkan();
 	void                                                    RecreateSurface();

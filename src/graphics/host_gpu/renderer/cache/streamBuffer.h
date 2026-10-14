@@ -22,6 +22,9 @@ struct GraphicContext;
 
 enum class MemoryUsage : uint8_t {
 	DeviceLocal,
+	// A guest buffer: device memory that the CPU can also read where that costs nothing, as on a
+	// device with one memory for both. Elsewhere it is plain device memory and has no mapping.
+	Guest,
 	Upload,
 	Download,
 	Stream,
@@ -68,6 +71,13 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
+	// The submission that holds the last GPU-side write of this buffer. Once the host GPU has
+	// finished it, the buffer's bytes are final until the next write. Whoever records a command
+	// that writes the buffer notes it when the command is recorded, not when it is prepared: a
+	// submission can happen in between.
+	void               NoteGpuWrite() noexcept;
+	[[nodiscard]] uint64_t LastGpuWriteTick() const noexcept { return m_last_gpu_write_tick; }
+
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
 	int    stream_score = 0;
@@ -91,6 +101,7 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	uint64_t                      m_last_gpu_write_tick = 0;
 	std::span<uint8_t>            m_mapped;
 };
 

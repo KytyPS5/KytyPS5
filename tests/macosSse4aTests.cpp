@@ -289,6 +289,74 @@ void TestMwaitxEmulated() {
 	Check(IllegalHits() > before, "host raises SIGILL for MWAITX");
 }
 
+// ADX: Rosetta 2 has no ADCX. The blob stores the result and RFLAGS. It also covers a 32-bit
+// destination with a memory source.
+constexpr uint8_t kAdcxRaxRdx[] = {
+	0x45, 0x31, 0xc0,                   // xor r8d, r8d (ZF=1, CF=0)
+	0xf9,                               // stc
+	0x48, 0x8b, 0x06,                   // mov rax, [rsi]
+	0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc2, // adcx rax, rdx
+	0x9c, 0x59,                         // pushfq; pop rcx
+	0x48, 0x89, 0x07,                   // mov [rdi], rax
+	0x48, 0x89, 0x4f, 0x08,             // mov [rdi+8], rcx
+	0xc3,
+};
+
+constexpr uint8_t kAdcxEaxMemory[] = {
+	0xf9,                         // stc
+	0x48, 0x89, 0xd0,             // mov rax, rdx
+	0x66, 0x0f, 0x38, 0xf6, 0x06, // adcx eax, [rsi]
+	0x9c, 0x59,                   // pushfq; pop rcx
+	0x48, 0x89, 0x07,             // mov [rdi], rax
+	0x48, 0x89, 0x4f, 0x08,       // mov [rdi+8], rcx
+	0xc3,
+};
+
+using AdxBlobFn = void (*)(uint64_t *out, const uint64_t *memory, uint64_t value);
+
+constexpr uint64_t kCarryFlag    = 1u << 0u;
+constexpr uint64_t kZeroFlag     = 1u << 6u;
+constexpr uint64_t kOverflowFlag = 1u << 11u;
+
+// ADOX is not emulated: the stop names it, and why.
+void TestAdoxIsNamedAsUnsupported() {
+	constexpr uint8_t kAdoxRaxRdx[] = {0xf3, 0x48, 0x0f, 0x38, 0xf6, 0xc2}; // adox rax, rdx
+	const char*       reason = Loader::X64InstructionEmulator::UnsupportedReason(kAdoxRaxRdx);
+	Check(reason != nullptr && std::strstr(reason, "ADOX") != nullptr,
+	      "an illegal ADOX gives no reason that names it");
+	constexpr uint8_t kAdcx[] = {0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc2}; // adcx rax, rdx
+	Check(Loader::X64InstructionEmulator::UnsupportedReason(kAdcx) == nullptr,
+	      "ADCX, which is emulated, was given a reason");
+}
+
+void TestAdcx() {
+	auto           fn = MapCode<AdxBlobFn>(kAdcxRaxRdx);
+	uint64_t       out[2] {};
+	const uint64_t all_ones = UINT64_MAX;
+	const int      before   = IllegalHits();
+	fn(out, &all_ones, 0);
+	Check(IllegalHits() > before, "host raises SIGILL for ADCX");
+	Check(out[0] == 0, "adcx adds the carry in: ~0 + 0 + 1 wraps to 0");
+	Check((out[1] & kCarryFlag) != 0, "adcx sets CF on a carry out");
+	Check((out[1] & kZeroFlag) != 0 && (out[1] & kOverflowFlag) == 0,
+	      "adcx leaves ZF and OF as they were");
+	const uint64_t five = 5;
+	fn(out, &five, 7);
+	Check(out[0] == 13, "adcx: 5 + 7 + 1");
+	Check((out[1] & kCarryFlag) == 0, "adcx clears CF without a carry out");
+}
+
+void TestAdcx32Memory() {
+	auto           fn     = MapCode<AdxBlobFn>(kAdcxEaxMemory);
+	uint64_t       out[2] {};
+	const uint64_t memory = 0xdeadbeef0000000full;
+	const int      before = IllegalHits();
+	fn(out, &memory, 0xaaaaaaaafffffff0ull);
+	Check(IllegalHits() > before, "host raises SIGILL for a 32-bit ADCX");
+	Check(out[0] == 0, "adcx eax: 0xfffffff0 + 0xf + 1 wraps, and the upper half is cleared");
+	Check((out[1] & kCarryFlag) != 0, "32-bit adcx sets CF on a carry out");
+}
+
 void TestUnknownInstructionRefused() {
 	g_refused.store(false, std::memory_order_relaxed);
 	g_refuse_skip.store(2, std::memory_order_relaxed);
@@ -476,6 +544,9 @@ int main() {
 	TestRexHighRegisterInsertqWithIndex();
 	TestInsertqRegister();
 	TestMwaitxEmulated();
+	TestAdcx();
+	TestAdcx32Memory();
+	TestAdoxIsNamedAsUnsupported();
 	TestUnknownInstructionRefused();
 	TestPatchedExtrqImmediate();
 	TestPatchedExtrqRexHigh();

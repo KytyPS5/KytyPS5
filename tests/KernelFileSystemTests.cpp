@@ -1692,8 +1692,19 @@ void CheckSocketWakeup() {
     uint32_t size = sizeof(actual);
     Check(net_setsockopt(datagram, 0xffff, 0x20, &value, sizeof(value)) == 0 &&
               net_getsockopt(datagram, 0xffff, 0x20, &actual, &size) == 0 &&
-              actual == value && size == sizeof(actual),
-          "Net UDP broadcast option can be enabled and disabled");
+              actual == (value != 0 ? 0x20 : 0) && size == sizeof(actual),
+          "Net UDP broadcast option returns its FreeBSD flag bit when enabled");
+  }
+  // A P2P datagram socket keeps its options itself: the same flag bit.
+  const int p2p = Net::Socket(2, 6, 0);
+  Check(p2p >= 0, "create a P2P datagram socket");
+  for (const int value : {1, 0}) {
+    int actual = -1;
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(p2p, 0xffff, 0x20, &value, sizeof(value)) == 0 &&
+              net_getsockopt(p2p, 0xffff, 0x20, &actual, &size) == 0 &&
+              actual == (value != 0 ? 0x20 : 0) && size == sizeof(actual),
+          "P2P broadcast option returns its FreeBSD flag bit when enabled");
   }
   int timeout = 0;
   int *timeout_value = &timeout;
@@ -1762,6 +1773,17 @@ void CheckSocketWakeup() {
                    address.data(), address_size) == sizeof(payload) &&
             *net_errno == Libs::Posix::POSIX_EINVAL,
         "Net sendto delivers to a guest sockaddr and preserves errno on success");
+  // Loopback delivery is not synchronous on every host (macOS): wait until the datagram
+  // arrives before the nonblocking receive.
+  const auto datagram_readable = [&] {
+    std::array<uint64_t, 16> ready {};
+    const uint64_t ready_bit = uint64_t {1} << (datagram % 64);
+    ready[datagram / 64] = ready_bit;
+    const std::array<int64_t, 2> wait {1, 0};
+    return Net::Select(datagram + 1, ready.data(), nullptr, nullptr, wait.data()) == 1 &&
+           ready[datagram / 64] == ready_bit;
+  };
+  Check(datagram_readable(), "the sent datagram arrives on loopback");
   Check(net_recvfrom(datagram, received.data(), received.size(), 0,
                      peer.data(), &peer_size) == sizeof(payload) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
@@ -1777,6 +1799,7 @@ void CheckSocketWakeup() {
             *net_errno == Libs::Posix::POSIX_EINVAL &&
             net_sendto(datagram_writer, payload, sizeof(payload), 0, nullptr, 0) ==
                 sizeof(payload) && *net_errno == Libs::Posix::POSIX_EINVAL &&
+            datagram_readable() &&
             net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
                 sizeof(payload) && std::memcmp(received.data(), payload, sizeof(payload)) == 0,
         "Net connect selects the peer used by sendto with an omitted destination");
@@ -1786,6 +1809,7 @@ void CheckSocketWakeup() {
   Check(net_sendto(-1, payload, sizeof(payload), 0, address.data(), address_size) ==
             Libs::Network::NET_ERROR_EBADF && *net_errno == Libs::Posix::POSIX_EBADF,
         "Net sendto translates an invalid socket");
+  Check(Net::SocketClose(p2p) == 0, "close the P2P datagram socket");
   Check(Net::SocketClose(datagram) == 0 && Net::SocketClose(datagram_writer) == 0,
         "close Net loopback datagrams");
   Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&

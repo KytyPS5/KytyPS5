@@ -47,12 +47,14 @@ public:
 	    : m_window(window), m_scheduler(scheduler) {}
 	~FramePool() {
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
-		for (auto& frame: m_frames) {
-			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
-			if (frame->image.image != nullptr) {
-				m_window.graphic_ctx.DeleteImage(frame->image);
+		m_window.graphic_ctx.WithQueueIdle([this] {
+			for (auto& frame: m_frames) {
+				m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
+				if (frame->image.image != nullptr) {
+					m_window.graphic_ctx.DeleteImage(frame->image);
+				}
 			}
-		}
+		});
 	}
 	KYTY_CLASS_NO_COPY(FramePool);
 
@@ -172,9 +174,12 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 
 	if (dst.image != nullptr) {
-		graphics.device.destroyImageView(view, nullptr);
-		view = nullptr;
-		graphics.DeleteImage(dst);
+		// Every command buffer committed while the image lived holds it (see queueCommits.h).
+		graphics.WithQueueIdle([&] {
+			graphics.device.destroyImageView(view, nullptr);
+			view = nullptr;
+			graphics.DeleteImage(dst);
+		});
 	}
 
 	vk::ImageCreateInfo create {};
@@ -527,10 +532,11 @@ void Swapchain::Destroy() {
 	}
 	auto& graphics = m_window.graphic_ctx;
 
-	{
-		Common::LockGuard queue_lock(graphics.queue_mutex);
-		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
-	}
+	// Nothing may be committed until these objects are gone: each command buffer committed while
+	// they live holds them (see queueCommits.h).
+	Common::LockGuard queue_lock(graphics.queue_mutex);
+	RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+	graphics.queue_commits.NoteIdle();
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
@@ -893,6 +899,7 @@ Swapchain::Status Swapchain::Present() {
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		m_window.graphic_ctx.queue_commits.NotePresent();
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;

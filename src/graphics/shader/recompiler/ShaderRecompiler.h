@@ -21,11 +21,12 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
-	bool                        maintenance8_enabled       = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// The renderer passes what its device enabled. The default is for tests and offline use.
+	HostGpu host = HostGpu::Full();
 };
 
 struct TranslateResult {
@@ -36,6 +37,9 @@ struct TranslateResult {
 
 struct CompileResult {
 	std::vector<uint32_t>  spirv;
+	// An emulated mesh program also needs a vertex shader and the size of its records.
+	std::vector<uint32_t>  mesh_vertex_spirv;
+	uint32_t               mesh_slot_words = 0;
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;

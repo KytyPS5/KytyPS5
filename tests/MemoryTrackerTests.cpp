@@ -302,6 +302,18 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+  // ranges is now [0x1000, 0x1040) and [0x1220, 0x1240).
+  const auto found_second = ranges.Find(0x1230);
+  const auto found_first = ranges.Find(0x1000);
+  Check(found_second.begin == 0x1220 && found_second.end == 0x1240 &&
+            found_first.begin == 0x1000 && found_first.end == 0x1040,
+        "range set did not find the range that holds an address");
+  const auto between = ranges.Find(0x1100);
+  const auto at_end = ranges.Find(0x1040);
+  const auto below = ranges.Find(0x0fff);
+  Check(between.begin == between.end && at_end.begin == at_end.end &&
+            below.begin == below.end,
+        "range set found a range for an address between ranges, at an end, or below all");
 }
 
 void TestGuestRange() {

@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/constRam.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -68,6 +69,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Submits the open host command buffer only when PlanSubmit says so.
+	void            BufferFlushIfDue();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
@@ -130,6 +133,11 @@ public:
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
+	// The GPU thread writes guest memory (a packet's data, a label): a later shader of the same
+	// submission must see it, also on a page the buffer cache keeps open (guestWriteLog.h).
+	// WriteGuest copies and logs. NoteGuestWrite only logs, for a write made in place.
+	void WriteGuest(void* dst, const void* src, uint64_t size);
+	void NoteGuestWrite(const void* dst, uint64_t size);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
 	             uint64_t dst_address_or_offset, uint8_t src_sel, uint8_t src_cache_policy,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
@@ -177,7 +185,7 @@ private:
 	uint32_t m_ce_count    = 0;
 	bool     m_ce_complete = false;
 
-	uint32_t m_const_ram[0x3000] = {0};
+	uint32_t m_const_ram[CONST_RAM_DWORDS] = {0};
 
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;

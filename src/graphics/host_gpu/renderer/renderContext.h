@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -51,9 +52,16 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// The guest mapping that holds `vaddr`; empty when none holds it.
+	[[nodiscard]] GuestSpan MappingAt(uint64_t vaddr) const;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	void               PrepareBda();
+	// `shader_writes_addresses`: the shader about to run stores through device addresses, so it
+	// can write any cached buffer without the buffer cache seeing which.
+	void               PrepareBda(bool shader_writes_addresses);
+	// A guest command list completed: GPU faults are handled and the images it wrote are copied
+	// back to guest memory, so the game can read them before the frame ends.
+	void               FinishList();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -78,6 +86,8 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	std::vector<GuestRange>   m_bda_guest_writes; // scratch for PrepareBda
+	uint64_t                  m_last_heat_cool_ms = 0;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

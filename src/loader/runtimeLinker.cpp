@@ -680,6 +680,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
+		if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+		    IsReadableRange(info->exception_address, 15)) {
+			if (const auto* reason = Loader::X64InstructionEmulator::UnsupportedReason(
+			        reinterpret_cast<const void*>(info->exception_address));
+			    reason != nullptr) {
+				std::printf("illegal instruction: %s\n", reason);
+			}
+		}
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"

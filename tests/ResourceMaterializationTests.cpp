@@ -1069,7 +1069,7 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   DescriptorSource root;
   root.dword_count = 8;
   root.dwords.fill(Value(0u));
-  root.indirect_descriptor.emplace().sources = {0, 1, 0};
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1, 0};
   program.info.images.resize(1);
   program.info.images[0].source = static_cast<uint32_t>(program.descriptor_sources.size());
   program.descriptor_sources.push_back(root);

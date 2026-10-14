@@ -63,6 +63,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+	features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
 
@@ -242,6 +243,8 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	facts.storage_buffer_8bit_access   = features12.storageBuffer8BitAccess == VK_TRUE;
 	facts.shader_sampled_image_array_non_uniform_indexing =
 	    features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE;
+	facts.shader_storage_buffer_array_non_uniform_indexing =
+	    features12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE;
 	facts.shader_buffer_int64_atomics = features12.shaderBufferInt64Atomics == VK_TRUE;
 	facts.shader_shared_int64_atomics = features12.shaderSharedInt64Atomics == VK_TRUE;
 	facts.robust_image_access         = features13.robustImageAccess == VK_TRUE;
@@ -581,7 +584,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// Decided by the device decision; on only when the extensions are among the enabled ones.
 	caps.provoking_vertex_last    = caps.provoking_vertex_last && provoking_extension;
 	caps.attachment_feedback_loop = caps.attachment_feedback_loop && feedback_extensions;
-	caps.depth_color_copy         = caps.depth_color_copy && maintenance8_extension;
+	caps.maintenance8             = caps.maintenance8 && maintenance8_extension;
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.host.capabilities.attachment_feedback_loop ? "true" : "false");
 	if (caps.mesh_shader) {
@@ -659,7 +662,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
-	if (caps.depth_color_copy) {
+	if (caps.maintenance8) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
@@ -1042,7 +1045,7 @@ void WindowContext::CreateVulkan() {
 		    {caps.color_write_enable, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME},
 		    {caps.fragment_barycentric, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME},
 		    {caps.compute_derivatives, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME},
-		    {caps.depth_color_copy, VK_KHR_MAINTENANCE_8_EXTENSION_NAME},
+		    {caps.maintenance8, VK_KHR_MAINTENANCE_8_EXTENSION_NAME},
 		};
 		for (const auto& [enabled, extension]: capability_extensions) {
 			if (enabled) {

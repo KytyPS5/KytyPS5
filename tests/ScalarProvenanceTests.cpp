@@ -550,29 +550,51 @@ void TestConstantBufferBounds() {
   struct Case {
     uint32_t offset;
     uint32_t immediate;
+    uint32_t stride;
+    uint32_t records;
     bool valid;
     uint32_t expected;
+    uint32_t reads;
   };
-  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u},
-                           Case{3u, 1u, true, 0x12345678u},
-                           Case{0xfffffffcu, 4u, false, 0u},
-                           Case{16u, 0u, false, 0u}}) {
+  struct MemoryProbe {
+    TestMemory memory{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
+    uint32_t attempts = 0;
+  };
+  const auto read_memory = [](void *userdata, uint64_t address,
+                              std::span<uint32_t> values) {
+    auto &probe = *static_cast<MemoryProbe *>(userdata);
+    ++probe.attempts;
+    return ReadMemory(&probe.memory, address, values);
+  };
+  // PS5 scalar-buffer loads return zero per out-of-range DWORD; an unreadable
+  // in-range address remains a failed memory read.
+  for (const auto &test : {Case{12u, 0u, 0u, 16u, true, 0xa5a5a5a5u, 1u},
+                           Case{3u, 1u, 0u, 16u, true, 0x12345678u, 1u},
+                           Case{0xfffffffcu, 4u, 0u, 16u, true, 0u, 0u},
+                           Case{16u, 0u, 0u, 16u, true, 0u, 0u},
+                           Case{12u, 0u, 0u, 14u, true, 0u, 0u},
+                           Case{0u, 0u, 0u, 0u, true, 0u, 0u},
+                           Case{8u, 0u, 0u, 16u, false, 0u, 1u},
+                           Case{12u, 0u, 48u, 32768u, true, 0xa5a5a5a5u, 1u},
+                           Case{0x6339c0u, 16u, 48u, 32768u, true, 0u, 0u}}) {
     Fixture fixture;
     const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, test.immediate);
     const auto buffer =
         fixture.Emit(ValueOpcode::GetBufferResource,
-                     {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
+                     {Value(0x3000u), Value(test.stride << 16u),
+                      Value(test.records), Value(0u)});
     const auto read = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
                                          {buffer, Value(test.offset)}, memory);
     LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
     fixture.Plan();
 
-    TestMemory memory_image{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
-    SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
+    MemoryProbe memory_image;
+    SrtRuntime runtime{.read_memory = read_memory, .userdata = &memory_image};
     std::vector<uint32_t> flat;
     Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat) == test.valid,
           "constant-buffer walk misaligned or wrapped its offset components");
-    Check(test.valid ? flat == std::vector<uint32_t>{test.expected} : memory_image.reads == 0,
+    Check((!test.valid || flat == std::vector<uint32_t>{test.expected}) &&
+              memory_image.attempts == test.reads,
           "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
   }
 }

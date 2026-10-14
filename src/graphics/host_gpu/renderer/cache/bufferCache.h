@@ -157,6 +157,9 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> MapStaging(uint64_t size);
+	// Copies guest memory that can have unmapped pages (a sparse mapping reads as zeros there).
+	// The copy function of m_copy_workers.
+	static void CopyGuestMemory(void* destination, const void* source, size_t size);
 	// Copies the guest bytes of the open upload batch to the staging buffer.
 	void RunBatchCopies();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -210,7 +213,8 @@ private:
 	// copy workers run them all at once before the batch ends: the upload passes of a frame make
 	// about a thousand uploads of about 140 KB each, too small to share one by one. The guest
 	// memory stays mapped until then: PrepareBda ends the batch before it unlocks the mapping.
-	CopyWorkers                                       m_copy_workers {BatchCopyWorkers};
+	CopyWorkers                                       m_copy_workers {BatchCopyWorkers,
+	                                                                 CopyGuestMemory};
 	std::vector<CopyWorkers::Copy>                    m_batch_copies;
 	std::vector<StagingFlush>                         m_batch_flushes;
 	StreamBuffer                                      m_stream_buffer;

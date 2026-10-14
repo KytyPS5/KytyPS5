@@ -90,6 +90,7 @@ DeviceFacts FullFacts() {
 	f.buffer_device_address                           = true;
 	f.storage_buffer_8bit_access                      = true;
 	f.shader_sampled_image_array_non_uniform_indexing = true;
+	f.shader_storage_buffer_array_non_uniform_indexing = true;
 	f.shader_buffer_int64_atomics                     = true;
 	f.shader_shared_int64_atomics                     = true;
 	f.float64_preserves_special_values                = true;
@@ -361,6 +362,8 @@ void TestEveryMandatoryFeatureRejectsByName() {
 	    {&DeviceFacts::storage_buffer_8bit_access, "storageBuffer8BitAccess"},
 	    {&DeviceFacts::shader_sampled_image_array_non_uniform_indexing,
 	     "shaderSampledImageArrayNonUniformIndexing"},
+	    {&DeviceFacts::shader_storage_buffer_array_non_uniform_indexing,
+	     "shaderStorageBufferArrayNonUniformIndexing"},
 	    {&DeviceFacts::depth_clip_control, "depthClipControl"},
 	    {&DeviceFacts::buffer_device_address, "bufferDeviceAddress"},
 	    {&DeviceFacts::tessellation_shader, "tessellationShader"},
@@ -399,14 +402,14 @@ void TestFeedbackLoopsNeedBothFeatures() {
 // Copies between depth and color images need maintenance8 and its extension.
 void TestDepthColorCopyNeedsMaintenance8() {
 	auto f = FullFacts();
-	Check(EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.depth_color_copy,
+	Check(EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.maintenance8,
 	      "a device with maintenance8 got no depth/color copy");
 	f.maintenance8 = false;
-	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.depth_color_copy,
+	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.maintenance8,
 	      "depth/color copy was taken without the maintenance8 feature");
 	f            = FullFacts();
 	f.extensions.pop_back();
-	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.depth_color_copy,
+	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.maintenance8,
 	      "depth/color copy was taken without VK_KHR_maintenance8");
 }
 

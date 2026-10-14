@@ -1211,7 +1211,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		const auto& command = *payload;
 		int         result  = OK;
 		if (command.kind == AmmCommandKind::Unmap) {
-			result = LibKernel::Memory::KernelMunmap(command.va, command.size);
+			result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
 		} else {
 			result = ExecuteAmmMapCommand(command);
 		}

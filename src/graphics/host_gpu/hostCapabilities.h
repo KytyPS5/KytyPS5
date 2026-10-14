@@ -47,8 +47,9 @@ struct HostCapabilities {
 	// A block-compressed image can have an uncompressed view of one block per texel
 	// (VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT).
 	bool block_texel_view = false;
-	// Images can be copied between depth and color formats (maintenance8).
-	bool depth_color_copy = false;
+	// VK_KHR_maintenance8: images can be copied between depth and color formats, and a sample
+	// can take a texel offset that is not a constant.
+	bool maintenance8 = false;
 	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedStages, as VkShaderStageFlagBits values.
 	uint32_t subgroup_supported_stages = 0;
@@ -79,7 +80,7 @@ struct HostCapabilities {
 		all.attachment_feedback_loop      = true;
 		all.compute_subgroup_size_control = true;
 		all.block_texel_view              = true;
-		all.depth_color_copy              = true;
+		all.maintenance8                  = true;
 		all.subgroup_supported_stages     = ~0u;
 		all.subgroup_supported_operations = ~0u;
 		return all;

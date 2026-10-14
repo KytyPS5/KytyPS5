@@ -2,7 +2,9 @@
 
 #include "graphics/host_gpu/copyWorkers.h"
 
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -75,6 +77,28 @@ void TestRunsBackToBack() {
 	}
 }
 
+// The copy function of the workers copies every byte, in pieces, on the calling thread and on the
+// workers: a reader of guest memory replaces memcpy this way.
+std::atomic<size_t> g_function_bytes {0};
+
+void CountingCopy(void* destination, const void* source, size_t size) {
+	std::memcpy(destination, source, size);
+	g_function_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+void TestTheCopyFunctionCopiesEveryByte() {
+	for (const size_t size: {size_t {100}, size_t {3} << 20}) {
+		CopyWorkers workers(3, CountingCopy);
+		const auto  source = Pattern(size, 5);
+		std::vector<uint8_t>           target(size, 0);
+		std::vector<CopyWorkers::Copy> copies {{target.data(), source.data(), size}};
+		g_function_bytes = 0;
+		workers.Run(copies);
+		Check(target == source, "the copy function left a byte wrong");
+		Check(g_function_bytes == size, "a byte did not go through the copy function");
+	}
+}
+
 // A run with no copies returns at once.
 void TestEmptyRun() {
 	CopyWorkers workers(2);
@@ -88,6 +112,7 @@ int main() {
 	TestEveryCopyLandsInPlace(1);
 	TestEveryCopyLandsInPlace(3);
 	TestRunsBackToBack();
+	TestTheCopyFunctionCopiesEveryByte();
 	TestEmptyRun();
 	if (g_failures != 0) {
 		return 1;

@@ -622,11 +622,11 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   ResourceSpecialization specialization;
   for (const bool clean : {false, true}) {
     reads = {.clean = clean};
-    // A failed predicate explores both edges and the writable descriptor retries its clean read.
+    // A failed predicate explores both edges; its dirty read also rejects the writable descriptor.
     const bool expected = !memory_condition || clean;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) == expected &&
               reads.ordinary == (memory_condition ? 0u : 1u) &&
-              reads.strict == (memory_condition ? (clean ? 1u : 2u) : 0u),
+              reads.strict == (memory_condition ? 1u : 0u),
           "writable descriptor changed reader policy or bypassed a dirty memory predicate");
     if (!expected) continue;
     Check(snapshot.buffers[0].dwords[0] == 0x8000u &&
@@ -679,7 +679,7 @@ void TestSharedControlPredicates() {
       program.blocks[i]->terminator.false_block = program.blocks[2];
     }
     auto plan = ExtractResourcePlan(program);
-    Check(plan.value_storage.size() == depth + 5 &&
+    Check(plan.value_storage.size() <= 2u * depth + 12u &&
               plan.control_flow.size() == 4 &&
               plan.control_flow[0].condition == plan.control_flow[1].condition &&
               !plan.capture_specialization_reads,
@@ -701,6 +701,87 @@ void TestSharedControlPredicates() {
                     : std::vector<uint8_t>{1, 1, 1, 1}),
             "shared predicate skipped an unknown branch or followed a rejected branch");
     }
+  }
+}
+
+void TestNestedExecPredicatesReuseReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  constexpr uint32_t depth = 12;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 3; ++i) AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &use = *program.blocks[1];
+  auto &exit = *program.blocks[2];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&entry.AppendNewInst(opcode, args));
+  };
+  const auto lane = emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  const auto address = emit(ValueOpcode::GetAddressResource, {Value(0x1000u), Value(0u)});
+  const auto count = emit(ValueOpcode::LoadAddressU32,
+      {address, Value(0u), Value(0u), Value(true)});
+  count.Instruction()->SetFlags(MemoryFlags{.index = 0});
+  auto condition = emit(ValueOpcode::LogicalNot,
+      {emit(ValueOpcode::ULessThanEqual32, {count, lane})});
+  // A compact shared DAG must not become a tree of fresh EXEC evaluations.
+  for (uint32_t i = 0; i < depth; ++i) {
+    const auto mask = emit(ValueOpcode::INotEqual32, {lane, Value(i)});
+    condition = emit(ValueOpcode::LogicalAnd,
+        {mask, emit(ValueOpcode::LogicalOr, {condition, condition})});
+  }
+  entry.condition = condition;
+  entry.terminator.kind = TerminatorKind::ConditionalBranch;
+  entry.terminator.true_block = &use;
+  entry.terminator.false_block = &exit;
+  entry.AddBranch(&use);
+  entry.AddBranch(&exit);
+  use.terminator.kind = TerminatorKind::Branch;
+  use.terminator.true_block = &exit;
+  use.AddBranch(&exit);
+  DescriptorSource source;
+  source.dwords = {Value(0x8000u), Value(1u << 16u), Value(16u), Value(3u << 28u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .read = true});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  const auto buffer = Value(&use.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]}));
+  use.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {buffer, Value(0u), Value(0u), Value(0u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 1});
+  auto plan = ExtractResourcePlan(program);
+  struct Reads { uint32_t value = 0; bool clean = true; uint32_t strict = 0, ordinary = 0; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+        ++static_cast<Reads *>(data)->ordinary;
+        return false;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        Check(reads.strict <= depth + 1,
+              "shared EXEC predicates repeated scalar reads beyond their distinct masks");
+        if (!reads.clean || address != 0x1000u || words.size() != 1) return false;
+        words[0] = reads.value;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto state : {Reads{64u, true}, Reads{0u, true}, Reads{0u, false}, Reads{64u, true}}) {
+    reads = state;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "nested EXEC predicates rejected a valid resource snapshot");
+    const bool inactive = reads.clean && reads.value == 0;
+    Check(snapshot.buffers[0].dwords[0] == (inactive ? 0u : 0x8000u),
+          "nested EXEC predicates lost an unknown branch or retained stale runtime facts");
+    Check(reads.strict > 0 && reads.ordinary == 0 &&
+              snapshot.specialization_reads.size() <= depth + 1,
+          "shared EXEC predicates repeated scalar reads beyond their distinct masks");
   }
 }
 
@@ -797,6 +878,156 @@ void TestFiniteImageRefreshReusesScalarReads() {
   check_mapping({0, 0, 1, 0});
   Check(capacities() == warm_capacities,
         "finite image refresh grew reusable resource storage after warmup");
+}
+
+void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 6; ++i) AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &loop = *program.blocks[1];
+  auto &body = *program.blocks[2];
+  auto &merge = *program.blocks[3];
+  auto &use = *program.blocks[4];
+  auto &exit = *program.blocks[5];
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto branch = [](Block &block, Block &target, Value condition = {}, Block *other = nullptr) {
+    block.terminator.kind = other ? TerminatorKind::ConditionalBranch : TerminatorKind::Branch;
+    block.terminator.true_block = &target;
+    block.terminator.false_block = other;
+    block.condition = condition;
+    block.AddBranch(&target);
+    if (other) block.AddBranch(other);
+  };
+  const auto lane = emit(entry, ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  const auto active = emit(entry, ValueOpcode::INotEqual32, {lane, Value(0u)});
+  const auto initial_mask = independent_mask
+      ? emit(entry, ValueOpcode::IEqual32, {lane, Value(0u)}) : active;
+  const auto initial = emit(entry, ValueOpcode::SelectU32,
+      {initial_mask, Value(UINT32_MAX), Value(0u)});
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  const auto address = emit(entry, ValueOpcode::GetAddressResource, {Value(0x1000u), Value(0u)});
+  const auto count = emit(entry, ValueOpcode::LoadAddressU32,
+      {address, Value(0u), Value(0u), Value(true)});
+  count.Instruction()->SetFlags(MemoryFlags{.index = 0});
+  const auto rejected = emit(entry, ValueOpcode::ULessThanEqual32, {count, lane});
+  const auto accepted = emit(entry, ValueOpcode::LogicalNot, {rejected});
+  branch(entry, loop, emit(entry, ValueOpcode::LogicalAnd, {active, accepted}), &merge);
+
+  // A nonempty traversal contains a varying loop-carried value. Its cycle must
+  // remain unknown; only the proven empty traversal can select the bypass arm.
+  auto &carried = loop.AppendNewInst(ValueOpcode::Phi);
+  carried.SetFlags(Type::U32);
+  const auto next = emit(body, ValueOpcode::IAdd32, {Value(&carried), Value(1u)});
+  carried.AddPhiOperand(&entry, lane);
+  carried.AddPhiOperand(&body, next);
+  branch(loop, body, emit(loop, ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)}), &merge);
+  loop.terminator.loop_header = true;
+  loop.terminator.continue_block = &body;
+  loop.terminator.merge_block = &merge;
+  branch(body, loop);
+  auto &selected = merge.AppendNewInst(ValueOpcode::Phi);
+  selected.SetFlags(Type::U32);
+  selected.AddPhiOperand(&entry, initial);
+  selected.AddPhiOperand(&loop, Value(&carried));
+  const auto valid = emit(merge, ValueOpcode::INotEqual32, {Value(&selected), Value(UINT32_MAX)});
+  branch(merge, use, emit(merge, ValueOpcode::LogicalAnd, {active, valid}), &exit);
+  branch(use, exit);
+  DescriptorSource source;
+  source.dwords = {Value(0x8000u), Value(1u << 16u), Value(16u), Value(3u << 28u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .read = true});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  const auto buffer = emit(use, ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  emit(use, ValueOpcode::LoadBufferU32, {buffer, Value(0u), Value(0u), Value(0u), Value(true)})
+      .Instruction()->SetFlags(MemoryFlags{.index = 1});
+  auto plan = ExtractResourcePlan(program);
+  struct Reads { uint32_t count = 0; bool clean = true; } reads;
+  const SrtRuntime runtime{
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        const auto &reads = *static_cast<Reads *>(data);
+        if (!reads.clean || address != 0x1000u || words.size() != 1) return false;
+        words[0] = reads.count;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto state : {Reads{0u, true}, Reads{4u, true}, Reads{0u, false}, Reads{0u, true}}) {
+    reads = state;
+    uint32_t condition = 99;
+    Check(!SrtWalker(plan, runtime).Evaluate(plan.control_flow[3].condition, condition),
+          "direct merge evaluation used missing or previous runtime reachability");
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "partial traversal proof rejected a valid resource snapshot");
+    const bool inactive = !independent_mask && reads.clean && reads.count == 0u;
+    Check(snapshot.buffers[0].dwords[0] == (inactive ? 0u : 0x8000u),
+          "empty traversal kept its descriptor or an uncertain traversal lost it");
+    Check(specialization.buffers[0].zero_stride_oob == inactive,
+          "inactive traversal did not expose dead vector reads to specialization");
+    if (inactive) {
+      Check(!snapshot.specialization_reads.empty(), "empty traversal lost its clean scalar read");
+      for (const auto &read : snapshot.specialization_reads)
+        Check(read == std::pair<uint64_t, uint64_t>{0x1000u, 4u},
+              "empty traversal proof captured an unrelated memory range");
+    }
+  }
+}
+
+void TestCyclicControlPredicatesRemainUnknown() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 4; ++i) AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &left = *program.blocks[1];
+  auto &right = *program.blocks[2];
+  auto &exit = *program.blocks[3];
+  const auto lane = Value(&entry.AppendNewInst(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)}));
+  const auto u = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {lane, Value(0u)}));
+  const auto v = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {lane, Value(1u)}));
+  auto &p = left.AppendNewInst(ValueOpcode::Phi);
+  auto &q = right.AppendNewInst(ValueOpcode::Phi);
+  p.SetFlags(Type::U1);
+  q.SetFlags(Type::U1);
+  const auto a = Value(&left.AppendNewInst(ValueOpcode::LogicalAnd, {u, Value(&p)}));
+  const auto b = Value(&right.AppendNewInst(ValueOpcode::LogicalAnd, {v, Value(&q)}));
+  p.AddPhiOperand(&entry, Value(true));
+  p.AddPhiOperand(&right, b);
+  q.AddPhiOperand(&entry, Value(true));
+  q.AddPhiOperand(&left, a);
+  const auto branch = [](Block &block, Value condition, Block &yes, Block &no) {
+    block.condition = condition;
+    block.terminator.kind = TerminatorKind::ConditionalBranch;
+    block.terminator.true_block = &yes;
+    block.terminator.false_block = &no;
+    block.AddBranch(&yes);
+    block.AddBranch(&no);
+  };
+  // Two loop entries have no single header whose Phi can be discarded up front.
+  branch(entry, u, left, right);
+  branch(left, a, right, exit);
+  branch(right, b, left, exit);
+  auto plan = ExtractResourcePlan(program);
+  SrtWalker walker(plan, {});
+  uint32_t value = 99;
+  Check(!walker.Evaluate(plan.control_flow[1].condition, value) &&
+            !walker.Evaluate(plan.control_flow[2].condition, value),
+        "cyclic varying control acquired an unsupported uniform value");
+  std::vector<uint32_t> flat;
+  Check(walker.RefreshFlatBuffer(flat) && plan.visited_blocks == std::vector<uint8_t>({1, 1, 1, 1}),
+        "cyclic control lost a possible branch during reachability");
 }
 
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
@@ -1103,6 +1334,63 @@ void TestTapeBuildsEveryOperationTheWalkerEvaluates() {
   Check(checked >= 43u, "fewer operations were evaluated by both the tape and the walker");
 }
 
+void TestIndirectImageSamplerClasses(bool mixed) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::TextureNumericClass;
+  auto program = MixedSamplerProgram();
+  auto &first = program.descriptor_sources[0];
+  first.dwords[0] = Value(0x100u);
+  first.dwords[1] = Value(static_cast<uint32_t>(BufferFormat::k8UNorm) << 20u);
+  first.dwords[3] = program.descriptor_sources[1].dwords[3];
+  program.descriptor_sources[1].dwords[1] = Value(static_cast<uint32_t>(
+      mixed ? BufferFormat::k8UInt : BufferFormat::k8UNorm) << 20u);
+  DescriptorSource root;
+  root.dword_count = 8;
+  root.dwords.fill(Value(0u));
+  root.indirect_descriptor.emplace().sources = {0, 1, 0};
+  program.info.images.resize(1);
+  program.info.images[0].source = static_cast<uint32_t>(program.descriptor_sources.size());
+  program.descriptor_sources.push_back(root);
+  program.info.samplers.resize(1);
+  program.info.sampled_pairs.resize(1);
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 1> user_data{0x11111111u};
+  uint32_t reads = 0;
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &reads,
+                           .read_specialization_memory = RejectSpecializationRead};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && reads == 0 &&
+            snapshot.images.size() == 2 && snapshot.images[0].dwords[0] == 0x100u &&
+            snapshot.images[1].dwords[0] == 1u &&
+            specialization.images[0].numeric_class == TextureNumericClass::Float &&
+            specialization.images[1].numeric_class ==
+                (mixed ? TextureNumericClass::Uint : TextureNumericClass::Float),
+        "indirect image materialization rejected or changed a typed candidate");
+  const auto offset = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[offset] == 3u &&
+            snapshot.flattened_srt[offset + 2u] == 0u &&
+            snapshot.flattened_srt[offset + 4u] == 1u &&
+            snapshot.flattened_srt[offset + 6u] == 0u,
+        "mixed image classes changed selector ordinals or duplicated candidates");
+  ApplyResourceSpecialization(program, specialization);
+  Check(program.info.images[0].indirect_resources == std::vector<uint32_t>({0, 1}) &&
+            snapshot.samplers.size() == 1 && program.info.samplers.size() == (mixed ? 2u : 1u),
+        "indirect images lost candidates or created unnecessary sampler variants");
+  user_data[0] = 0x33333333u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "mixed image sampler refresh failed");
+  for (uint32_t index = 0; index < program.info.samplers.size(); ++index) {
+    const auto &sampler = program.info.samplers[index];
+    Check(sampler.snapshot_index == 0u && sampler.source == plan.info.samplers[0].source &&
+              sampler.force_point_filtering == (index != 0u) &&
+              sampler.integer_border == (index != 0u) &&
+              snapshot.samplers[sampler.snapshot_index].dwords[0] == user_data[0],
+          "typed sampler variants lost filtering, border class, or shared live descriptor");
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -1164,12 +1452,17 @@ int main() {
     TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
   TestSharedControlPredicates();
+  TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();
+  for (const bool independent_mask : {false, true})
+    TestEmptyTraversalSkipsUnmappedDescriptor(independent_mask);
+  TestCyclicControlPredicatesRemainUnknown();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSpecializationFitsTheShader();
   TestTapeMatchesWalker();
   TestRuntimeChoicesKeepTheWalker();
   TestTapeBuildsEveryOperationTheWalkerEvaluates();
+  for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

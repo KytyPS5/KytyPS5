@@ -47,6 +47,8 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	require(facts.buffer_device_address, "bufferDeviceAddress");
 	require(facts.shader_sampled_image_array_non_uniform_indexing,
 	        "shaderSampledImageArrayNonUniformIndexing");
+	require(facts.shader_storage_buffer_array_non_uniform_indexing,
+	        "shaderStorageBufferArrayNonUniformIndexing");
 	require(facts.robust_image_access, "robustImageAccess");
 	require(facts.dynamic_rendering, "dynamicRendering");
 	require(facts.synchronization2, "synchronization2");
@@ -112,7 +114,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	    facts.subgroup_size_control && (facts.required_subgroup_size_stages & compute_stage) != 0u &&
 	    facts.min_subgroup_size <= 64u && facts.max_subgroup_size >= 64u;
 	caps.block_texel_view          = facts.block_texel_view;
-	caps.depth_color_copy          = with_extension(facts.maintenance8, kMaintenance8Extension);
+	caps.maintenance8              = with_extension(facts.maintenance8, kMaintenance8Extension);
 	caps.subgroup_supported_stages = facts.subgroup_supported_stages;
 	caps.subgroup_supported_operations = facts.subgroup_supported_operations;
 
@@ -152,7 +154,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.attachment_feedback_loop, "attachment feedback loops");
 	note(caps.compute_subgroup_size_control, "a compute subgroup size of 64");
 	note(caps.block_texel_view, "block texel views");
-	note(caps.depth_color_copy, "depth/color image copies");
+	note(caps.maintenance8, "depth/color image copies and dynamic sample offsets");
 	note(!decision.faults.pushed_buffers_have_no_size,
 	     "a buffer size table for pushed descriptors (driver defect)");
 	note(!decision.faults.no_per_vertex_inputs, "per-vertex pixel shader inputs (driver defect)");

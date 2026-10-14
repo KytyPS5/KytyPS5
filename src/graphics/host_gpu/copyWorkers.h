@@ -20,6 +20,9 @@
 // waking the workers costs more. Runs come in bursts, so a worker spins for a short time after its
 // work before it sleeps, and the next run of a burst does not wait for it to wake up.
 //
+// Each piece is copied by the copy function, memcpy by default. A reader of guest memory replaces it
+// where a source range can have unmapped pages.
+//
 // One thread calls Run at a time.
 
 namespace Libs::Graphics {
@@ -32,10 +35,12 @@ public:
 		size_t      size        = 0;
 	};
 
+	using CopyFunction = void (*)(void* destination, const void* source, size_t size);
+
 	// A copy is split into pieces of this size, so the threads share a large copy.
 	static constexpr size_t PieceSize = size_t {256} << 10;
 
-	explicit CopyWorkers(uint32_t worker_count) {
+	explicit CopyWorkers(uint32_t worker_count, CopyFunction copy = CopyBytes): m_copy(copy) {
 		m_workers.reserve(worker_count);
 		for (uint32_t i = 0; i < worker_count; i++) {
 			m_workers.emplace_back([this] { Work(); });
@@ -63,7 +68,7 @@ public:
 		}
 		if (total < InlineMax) {
 			for (const auto& copy: copies) {
-				std::memcpy(copy.destination, copy.source, copy.size);
+				m_copy(copy.destination, copy.source, copy.size);
 			}
 			return;
 		}
@@ -96,12 +101,16 @@ private:
 	// About 50 µs: longer than the gap between two runs of a burst.
 	static constexpr int SpinRounds = 2000;
 
+	static void CopyBytes(void* destination, const void* source, size_t size) {
+		std::memcpy(destination, source, size);
+	}
+
 	void CopyPieces() {
 		const auto count = m_pieces.size();
 		for (auto i = m_next.fetch_add(1, std::memory_order_relaxed); i < count;
 		     i      = m_next.fetch_add(1, std::memory_order_relaxed)) {
 			const auto& piece = m_pieces[i];
-			std::memcpy(piece.destination, piece.source, piece.size);
+			m_copy(piece.destination, piece.source, piece.size);
 			m_done.fetch_add(1, std::memory_order_release);
 		}
 	}
@@ -135,6 +144,7 @@ private:
 		}
 	}
 
+	CopyFunction             m_copy;
 	std::vector<std::thread> m_workers;
 	std::mutex               m_mutex;
 	std::condition_variable  m_wake;

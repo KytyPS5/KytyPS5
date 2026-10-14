@@ -58,6 +58,7 @@ struct DeviceFacts {
 	bool buffer_device_address                           = false;
 	bool storage_buffer_8bit_access                      = false;
 	bool shader_sampled_image_array_non_uniform_indexing = false;
+	bool shader_storage_buffer_array_non_uniform_indexing = false;
 	bool shader_buffer_int64_atomics                     = false;
 	bool shader_shared_int64_atomics                     = false;
 	// The device keeps signed zero, infinity and NaN in 64-bit float operations

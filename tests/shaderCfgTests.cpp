@@ -8194,6 +8194,29 @@ void TestNewShaderRecompilerDsAddtidTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestDsReturningAtomic64Decoder() {
+  using namespace ShaderRecompiler::Decoder;
+  // CS23e96bf5029f62fd: native DATA is the comparison and DATA2 the replacement.
+  const uint32_t max_words[] = {0xd9a00008u, 0x00000400u};
+  const uint32_t cmp_words[] = {0xd9c00010u, 0x0202003fu};
+  Instruction decoded;
+  DecodeInstruction(max_words, 0u, decoded);
+  Check(decoded.opcode == Opcode::DS_MAX_RTN_U64 &&
+            decoded.word_count == 2u && decoded.data_dwords == 2u &&
+            decoded.data_bits == 32u && decoded.src_count == 2u &&
+            decoded.src0.reg == 0u && decoded.src1.reg == 4u &&
+            decoded.dst.reg == 0u && decoded.offset == 8u && !decoded.gds,
+        "captured DS_MAX_RTN_U64 lost its QWORD width, byte offset, or aliases");
+  DecodeInstruction(cmp_words, 0u, decoded);
+  Check(decoded.opcode == Opcode::DS_CMPST_RTN_B64 &&
+            decoded.word_count == 2u && decoded.data_dwords == 2u &&
+            decoded.data_bits == 32u && decoded.src_count == 3u &&
+            decoded.src0.reg == 63u && decoded.src1.reg == 0u &&
+            decoded.src2.reg == 2u && decoded.dst.reg == 2u &&
+            decoded.offset == 16u && !decoded.gds,
+        "captured DS_CMPST_RTN_B64 lost its comparison/replacement pairs or aliases");
+}
+
 void TestDsFloatMinMaxDecoder() {
   using namespace ShaderRecompiler::Decoder;
   for (bool max_value : {false, true}) {
@@ -13306,7 +13329,7 @@ void TestValuePhiValidation() {
 #endif
 }
 
-void TestWave32MaskProjection() {
+void TestLaneMaskProjection() {
   using namespace ShaderRecompiler::IR;
   for (const uint32_t wave_size : {32u, 64u}) {
     Program program;
@@ -13345,6 +13368,19 @@ void TestWave32MaskProjection() {
           : U32(Value(3u));
       return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, bit), U32(Value(1u))), zero);
     };
+    const auto low_half = e.ULessThan(U32(e.Emit(ValueOpcode::LaneId)), U32(Value(32u)));
+    const auto mask_bit = [&](uint32_t low, uint32_t high) {
+      const auto word = wave_size == 64u ? e.Select(low_half, U32(Value(low)), U32(Value(high)))
+                                        : U32(Value(low));
+      return thread_bit(e, word);
+    };
+    const auto full = mask_bit(UINT32_MAX, UINT32_MAX);
+    const auto empty = mask_bit(0u, 0u);
+    const auto low_only = mask_bit(UINT32_MAX, 0u);
+    const auto high_only = mask_bit(0u, UINT32_MAX);
+    const auto partial = mask_bit(0x80000000u, 0x80000000u);
+    const auto full_write = e.Select(full, U32(Value(42u)), raw);
+    const auto empty_write = e.Select(empty, U32(Value(42u)), raw);
     const auto active_mask = ballot(e, active);
     const auto direct = thread_bit(e, active_mask);
     const auto arbitrary = thread_bit(e, raw);
@@ -13387,7 +13423,14 @@ void TestWave32MaskProjection() {
     program.blocks[1]->condition = remaining_predicate;
 
     ConstantPropagationPass(program.blocks, wave_size);
+    Check(full.Resolve() == Value(true) && empty.Resolve() == Value(false) &&
+              full_write.Resolve() == Value(42u) && empty_write.Resolve() == raw.Resolve(),
+          "constant EXEC mask retained lane extraction or register predication");
+    Check(partial.Resolve().TryInstruction() != nullptr,
+          "partial mask was incorrectly folded to a constant predicate");
     if (wave_size == 32u) {
+      Check(low_only.Resolve() == Value(true) && high_only.Resolve() == Value(false),
+            "wave32 constant mask incorrectly consumed the high half");
       Check(direct.Resolve() == active.Resolve(), "wave32 ballot round trip lost its predicate");
       Check(EquivalentValue(program, combined, combined_predicate),
             "wave32 OR mask projection changed a lane predicate");
@@ -13407,6 +13450,9 @@ void TestWave32MaskProjection() {
                 projected->PhiBlock(1) == loop,
             "mask projection lost loop Phi type or predecessor order");
     } else {
+      Check(low_only.Resolve().TryInstruction() != nullptr &&
+                high_only.Resolve().TryInstruction() != nullptr,
+            "wave64 mixed halves were incorrectly folded to a constant predicate");
       Check(direct.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
                 live.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
                 combined.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
@@ -13425,6 +13471,86 @@ void TestWave32MaskProjection() {
     RemoveIdentities(program.blocks);
     ValidateProgram(program, true);
   }
+}
+
+void TestLateConstantPropagation() {
+  using namespace ShaderRecompiler::IR;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    for (const bool reverse : {false, true}) {
+      Program program;
+      program.stage = ShaderType::Compute;
+      program.wave_size = wave_size;
+      for (uint32_t id = 0; id < 4; ++id) {
+        program.block_storage.push_back(std::make_unique<Block>());
+        program.blocks.push_back(program.block_storage.back().get());
+        program.blocks.back()->id = id;
+      }
+      auto *entry = program.blocks[0];
+      auto *header = program.blocks[1];
+      auto *latch = program.blocks[2];
+      auto *exit = program.blocks[3];
+      entry->AddBranch(header);
+      header->AddBranch(latch);
+      header->AddBranch(exit);
+      latch->AddBranch(header);
+      entry->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+      entry->terminator.true_block = header;
+      header->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+      header->terminator.true_block = latch;
+      header->terminator.false_block = exit;
+      latch->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+      latch->terminator.true_block = header;
+      IREmitter e(entry);
+      const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+      const auto active = e.INotEqual(raw, U32(Value(0u)));
+      header->condition = active;
+      auto &predicate = header->AppendNewInst(ValueOpcode::Phi);
+      predicate.SetFlags(Type::U1);
+      auto &mask = header->AppendNewInst(ValueOpcode::Phi);
+      mask.SetFlags(Type::U32);
+      const auto thread_bit = [](IREmitter &ir, U32 word) {
+        const auto lane = ir.BitwiseAnd(U32(ir.Emit(ValueOpcode::LaneId)), U32(Value(31u)));
+        return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, lane), U32(Value(1u))),
+                           U32(Value(0u)));
+      };
+      IREmitter body(header);
+      const auto live = thread_bit(body, U32(Value(&mask)));
+      const auto selected = body.Select(live, U32(Value(42u)), raw);
+      const auto projected = body.Emit(ValueOpcode::SelectU1,
+                                      {Value(&predicate), live, Value(false)});
+      const auto absorbed = body.LogicalAnd(active,
+          body.LogicalOr(body.LogicalNot(active), U1(Value(&predicate))));
+      IREmitter tail(latch);
+      const auto full = thread_bit(tail, U32(Value(UINT32_MAX)));
+      const auto full_word = tail.Select(full, U32(Value(UINT32_MAX)), U32(Value(0u)));
+      predicate.AddPhiOperand(entry, Value(true));
+      predicate.AddPhiOperand(latch, full);
+      mask.AddPhiOperand(entry, Value(UINT32_MAX));
+      mask.AddPhiOperand(latch, full_word);
+      exit->condition = projected;
+      if (reverse) std::ranges::reverse(program.blocks);
+
+      ConstantPropagationPass(program.blocks, wave_size);
+      if (reverse) std::ranges::reverse(program.blocks);
+      Check(Value(&predicate).Resolve() == Value(true) &&
+                Value(&mask).Resolve() == Value(UINT32_MAX) && live.Resolve() == Value(true) &&
+                selected.Resolve() == Value(42u) && projected.Resolve() == Value(true) &&
+                absorbed.Resolve() == active.Resolve(),
+            "late constants did not reach Phi, nested mask patterns or new logical nodes");
+      ResolveControlFlowIdentities(program);
+      Check(exit->condition == Value(true), "late constant lost its control-flow use");
+      RemoveIdentities(program.blocks);
+      ValidateProgram(program, true);
+    }
+  }
+
+  Block cycle;
+  auto &phi = cycle.AppendNewInst(ValueOpcode::Phi);
+  phi.SetFlags(Type::U32);
+  phi.AddPhiOperand(&cycle, Value(&phi));
+  ConstantPropagationPass({&cycle});
+  Check(phi.GetOpcode() == ValueOpcode::Phi && phi.Arg(0).TryInstruction() == &phi,
+        "an ungrounded Phi cycle acquired a constant");
 }
 
 void TestU64ShiftConstantPropagation() {
@@ -15195,8 +15321,15 @@ void TestBoundedScalarMaterialImageKeys() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.keys == 0,
         "scalar material byte range escaped V# bounds");
   memory = {.mixed = true};
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "selected material fields bypassed image compatibility");
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 4 && specialization.images.size() == 4,
+        "selected material fields rejected mixed native numeric classes");
+  for (uint32_t i = 0; i < snapshot.images.size(); ++i) {
+    Check(specialization.images[i].numeric_class ==
+              (snapshot.images[i].dwords[0] == 5588u
+                  ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float),
+          "selected material fields lost a candidate's native numeric class");
+  }
   memory = {};
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "native scalar material image selection did not recover after rejected candidates");
@@ -15431,7 +15564,8 @@ void TestSrtWalkerRealSBufferTranslation() {
 
   user_data[10] = 3 * sizeof(uint32_t);
   const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(plan, runtime).RefreshFlatBuffer(flat);
-  Check(!bounds_walked, "real S_BUFFER_LOAD walk ignored descriptor bounds");
+  Check(bounds_walked && flat == std::vector<uint32_t>{table[0], table[1], table[2], 0u},
+        "real S_BUFFER_LOAD walk did not zero only the out-of-bounds DWORD");
   CheckFlattenedReadSlots(
       ir, 4, "real S_BUFFER_LOAD patch used the wrong flat offsets");
 
@@ -16568,6 +16702,7 @@ int main() {
   // here.
   TestScalarAshrI64Decoder();
   TestImageAtomicWidthDecoder();
+  TestDsReturningAtomic64Decoder();
   TestDsFloatMinMaxDecoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
@@ -16669,7 +16804,8 @@ int main() {
   TestFinalSsaRejectsRegisterStatePseudos();
 #endif
   TestValuePhiValidation();
-  TestWave32MaskProjection();
+  TestLaneMaskProjection();
+  TestLateConstantPropagation();
   TestU64ShiftConstantPropagation();
   TestU64RegisterPairRoundTrip();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS

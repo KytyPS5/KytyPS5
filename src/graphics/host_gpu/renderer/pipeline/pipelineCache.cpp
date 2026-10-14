@@ -183,7 +183,7 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
+                         const std::vector<uint32_t>& spirv, bool maintenance8) {
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
@@ -195,7 +195,9 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        static_cast<int>(position.column), static_cast<int>(position.index),
 		                        message);
 	});
-	if (tools.Validate(spirv)) {
+	spvtools::ValidatorOptions validator_options;
+	validator_options.SetAllowOffsetTextureOperand(maintenance8);
+	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -336,7 +338,8 @@ struct PipelineCache::ProgramCache {
 	               uint32_t                                            push_data_start_dword) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+		                         options.host.capabilities.maintenance8)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -344,7 +347,8 @@ struct PipelineCache::ProgramCache {
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 		if (!result.mesh_vertex_spirv.empty()) {
 			if (!ValidateShaderSpirv(options.dump_label, options.shader_hash,
-			                         result.mesh_vertex_spirv)) {
+			                         result.mesh_vertex_spirv,
+			                         options.host.capabilities.maintenance8)) {
 				DumpShaderSpirv("mesh_vs", options.shader_hash, result.mesh_vertex_spirv);
 				EXIT("%s failed hash=0x%016" PRIx64 ": emulated mesh vertex shader is invalid\n",
 				     options.dump_label, options.shader_hash);
@@ -673,7 +677,7 @@ struct PipelineCache::ProgramCache {
 		    c.attachment_feedback_loop,
 		    c.compute_subgroup_size_control,
 		    c.block_texel_view,
-		    c.depth_color_copy,
+		    c.maintenance8,
 		    c.subgroup_supported_stages,
 		    c.subgroup_supported_operations,
 		    f.pushed_buffers_have_no_size,

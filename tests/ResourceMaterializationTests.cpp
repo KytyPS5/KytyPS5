@@ -1304,7 +1304,7 @@ void TestIndirectImageSamplerClasses(bool mixed) {
 void TestAddressRangesFollowAccessGuards() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   constexpr uint64_t base = 0x0000001234560000ull;
-  const auto plan_for = [](bool guarded, bool scaled) {
+  const auto plan_for = [](bool guarded, bool scaled, bool buffered = false) {
     Program program;
     program.stage = Libs::Graphics::ShaderType::Compute;
     program.srt_plan_complete = true;
@@ -1323,7 +1323,21 @@ void TestAddressRangesFollowAccessGuards() {
     };
     const auto low = user(0);
     const auto high = user(1);
-    const auto limit = user(2);
+    auto limit = user(2);
+    if (buffered) {
+      DescriptorSource source;
+      source.dword_count = 4;
+      source.dwords = {Value(0x1000u), Value(4u << 16u), Value(1u), Value(0x16204u)};
+      program.descriptor_sources.push_back(source);
+      program.info.buffers.push_back({.source = 0, .read = true});
+      program.memory_info.push_back({.kind = ResourceKind::Buffer});
+      const auto buffer = emit(ValueOpcode::GetBufferResource,
+                               {source.dwords[0], source.dwords[1], source.dwords[2],
+                                source.dwords[3]});
+      limit = emit(ValueOpcode::LoadBufferU32,
+                   {buffer, Value(0u), Value(0u), Value(0u), Value(true)});
+      limit.Instruction()->SetFlags(MemoryFlags{.index = 1});
+    }
     const auto row = emit(ValueOpcode::ISub32, {user(3), emit(ValueOpcode::LaneId, {})});
     const auto inside = emit(ValueOpcode::ULessThan32, {row, limit});
     const auto offset =
@@ -1369,6 +1383,31 @@ void TestAddressRangesFollowAccessGuards() {
             std::vector<std::pair<uint64_t, uint64_t>>{{base + 0x10u, 99u * 0x10000u + 8u}},
         "a scaled guarded offset had the wrong range");
   Check(ranges(scaled, 0x20000u).empty(), "an offset that may wrap kept a range");
+  // A limit read from a buffer only bounds the range: it must not make the shader depend on
+  // specialization memory or capture reads.
+  const auto buffered = plan_for(true, false, true);
+  Check(buffered.address_ranges.size() == 1u && !buffered.requires_specialization_memory &&
+            !buffered.capture_specialization_reads,
+        "a buffered range limit changed the specialization requirements");
+  Check(ranges(buffered, 0u).empty(), "a range used a limit no strict reader could read");
+  const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(base),
+                                          static_cast<uint32_t>(base >> 32u), 0u, 40u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(
+            buffered,
+            {.user_data = user_data,
+             .read_specialization_memory =
+                 +[](void *, uint64_t address, std::span<uint32_t> words) {
+                   if (address != 0x1000u || words.size() != 1u) return false;
+                   words[0] = 100u;
+                   return true;
+                 }},
+            snapshot, specialization) &&
+            snapshot.address_ranges ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{base + 0x10u, 0xb0u + 8u}},
+        "a strict reader did not bound the range with the buffered limit");
+  Check(snapshot.specialization_reads.empty(), "a range limit read was captured");
 }
 
 } // namespace

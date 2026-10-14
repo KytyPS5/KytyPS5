@@ -1760,7 +1760,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
-	plan.address_ranges = AddressRangePlanner(program, Clone).Run();
+	// Ranges are best effort and read through their own strict walker: their raw reads
+	// neither require specialization memory nor get captured.
+	const auto requires_memory          = plan.requires_specialization_memory;
+	const auto capture_reads            = plan.capture_specialization_reads;
+	plan.address_ranges                 = AddressRangePlanner(program, Clone).Run();
+	plan.requires_specialization_memory = requires_memory;
+	plan.capture_specialization_reads   = capture_reads;
 	CompileSrtWalker(plan);
 	return plan;
 }

@@ -294,7 +294,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		case 6: break;
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
-	if (dw_num == 0) {
+	if (dw_num == 0 || !WaitForPendingEndOfPipe()) {
 		return;
 	}
 
@@ -311,6 +311,9 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	    (dst_address & (num_bytes - 1u)) != 0) {
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
+	}
+	if (!WaitForPendingEndOfPipe()) {
+		return;
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
@@ -358,6 +361,9 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	bool dst_gds = false;
 	if (!decode_gds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+	}
+	if (!dst_gds && !WaitForPendingEndOfPipe()) {
+		return;
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	if (src_sel == 2) {
@@ -960,35 +966,50 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	if (data_sel == 0 && !interrupt) {
 		return;
 	}
+	const auto label_size = data_sel == 1 ? sizeof(uint32_t) : sizeof(uint64_t);
+	const auto label_address = reinterpret_cast<uint64_t>(address);
+	const bool mapped_label = data_sel >= 1 && data_sel <= 3 &&
+	                          m_renderer.IsMapped(label_address, label_size);
+	// Mapped pages can become cache-owned before deferred publication completes.
+	if ((mapped_label || g_current_execution->m_wait_tick != 0) && !WaitForEndOfPipe()) {
+		return;
+	}
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
+	auto write_label = [address, data_sel, data]() mutable {
+		switch (data_sel) {
+			case 0: break;
+			case 1: {
+				const auto value = static_cast<uint32_t>(data);
+				std::memcpy(address, &value, sizeof(value));
+				break;
+			}
+			case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
+			case 2: std::memcpy(address, &data, sizeof(data)); break;
+		}
+	};
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
-	switch (data_sel) {
-		case 0: break;
-		case 1: {
-			const auto value = static_cast<uint32_t>(data);
-			std::memcpy(address, &value, sizeof(value));
-			break;
-		}
-		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
-		case 2: std::memcpy(address, &data, sizeof(data)); break;
-		case 5: {
-			GetScheduler().Finish();
-			const auto gds = static_cast<uint32_t>(data);
-			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
-			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
-			break;
-		}
-		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
+	if (data_sel == 5) {
+		GetScheduler().Finish();
+		const auto gds = static_cast<uint32_t>(data);
+		Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
+		              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
+	} else if (data_sel > 3) {
+		EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
+	} else if (mapped_label) {
+		write_label();
 	}
 
-	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
-	if (interrupt) {
+	// GuestGpu::Process's end-of-slice flush submits the work this signal waits on.
+	if (interrupt || (!mapped_label && data_sel >= 1 && data_sel <= 3)) {
 		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
-			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id,
+		     interrupt, mapped_label, write_label, gpu = g_gpu_state]() mutable {
+			    if (!mapped_label) write_label();
+			    if (interrupt) renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			    if (gpu != nullptr) gpu->Wake();
 		    });
 	}
 }
@@ -1010,7 +1031,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: break;
+		case 0x00000010:
+			// Defer CPU-visible writes until the preceding GPU work completes.
+			g_current_execution->m_eop_pending = true;
+			break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
 		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x00000016:
@@ -1046,6 +1070,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			if (auto& queries = m_renderer.GetOcclusionQueries(); queries.Enabled()) {
 				queries.Dump(event_address);
 				break;
+			}
+			if (!WaitForPendingEndOfPipe()) {
+				return;
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
@@ -1092,6 +1119,30 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
+}
+
+bool CommandProcessor::WaitForPendingEndOfPipe() {
+	return !g_current_execution->m_eop_pending || WaitForEndOfPipe();
+}
+
+bool CommandProcessor::WaitForEndOfPipe() {
+	EXIT_IF(g_current_execution == nullptr);
+	auto& tick = g_current_execution->m_wait_tick;
+	if (tick == 0) {
+		tick = GetScheduler().CurrentTick();
+		if (g_gpu_state != nullptr) {
+			GetScheduler().DeferPriorityOperation([gpu = g_gpu_state] { gpu->Wake(); });
+		}
+		BufferFlush();
+	}
+	if (!GetScheduler().IsFree(tick)) {
+		SuspendPm4();
+		return false;
+	}
+	GetScheduler().WaitPriorityOperations(tick);
+	tick = 0;
+	g_current_execution->m_eop_pending = false;
+	return true;
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

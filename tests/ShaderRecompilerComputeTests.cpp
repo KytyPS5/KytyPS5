@@ -203,6 +203,14 @@ struct BufferCacheTestAccess {
     return owner == nullptr ? BufferId{} : *owner;
   }
 
+  static void RetireBuffer(BufferCache &cache, uint64_t address) {
+    const auto id = PageOwner(cache, address);
+    auto &buffer = cache.GetBuffer(id);
+    cache.ReadMemory(buffer.CpuAddress(), buffer.Size(), true);
+    cache.m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+    cache.DeleteBuffer(id);
+  }
+
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
@@ -2054,6 +2062,15 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
 
 } // namespace TestSpv
 
+void WriteDataPacket(uint32_t *packet, uint32_t *destination, uint32_t value) {
+  const auto address = reinterpret_cast<uint64_t>(destination);
+  packet[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  packet[1] = 0;
+  packet[2] = static_cast<uint32_t>(address);
+  packet[3] = static_cast<uint32_t>(address >> 32u);
+  packet[4] = value;
+}
+
 class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
@@ -2996,6 +3013,21 @@ public:
                   blocked_timeline != nullptr,
               "failed to create the blocked GPU timeline");
 
+      constexpr uint64_t label_base = 0x0000000204d00000ull;
+      constexpr uint64_t label_size = 0x10000;
+      constexpr uint64_t label_address = label_base + 0x1000;
+      constexpr uint64_t label_value = 0x1122334455667788ull;
+      int64_t direct_offset = -1;
+      Require("GpuCommandLane", "EOP label allocation",
+              LibKernel::Memory::KernelAllocateDirectMemory(0,
+                  LibKernel::Memory::KernelGetDirectMemorySize(), label_size, label_size, 0,
+                  &direct_offset) == 0, "label allocation failed");
+      void *mapped = reinterpret_cast<void *>(label_base);
+      Require("GpuCommandLane", "EOP label mapping",
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, label_size, 0x3, 0x10,
+                  direct_offset, label_size) == 0 && mapped == reinterpret_cast<void *>(label_base),
+              "label mapping failed");
+
       constexpr uint64_t release_tick = 1;
       auto &gpu_scheduler = context.GetCommandScheduler();
       auto processor = std::make_unique<CommandProcessor>(context, 0);
@@ -3009,7 +3041,49 @@ public:
       std::binary_semaphore parser_complete{0};
       alignas(uint64_t) uint64_t interrupt_only_gds_label = UINT64_MAX;
       alignas(uint64_t) uint64_t cb_db_release_label = UINT64_MAX;
+      std::array<uint64_t, 2> timestamp_labels{UINT64_MAX, UINT64_MAX};
+      const auto clock_before_release = Sync::ReadReferenceClock();
+      std::array release_packets{
+          make_release_mem(2, 0, &cb_db_release_label, 0, 0x14u, 0),
+          make_release_mem(3, 0, &timestamp_labels[0], UINT64_MAX, 0x14u, 0),
+          make_release_mem(3, 0, &timestamp_labels[1], UINT64_MAX, 0x14u, 1u << 9u)};
+      std::array<Pm4Execution, 3> release_executions;
+      std::array<uint32_t, 3> partial_flush_labels{};
+      std::array<std::array<uint32_t, 14>, 3> partial_flush_packets{};
+      std::array<Pm4Execution, 3> partial_flush_executions;
+      constexpr std::array partial_flush_events{0x07u, 0x0fu, 0x10u};
+      for (size_t i = 0; i < partial_flush_events.size(); ++i) {
+        partial_flush_packets[i] = {
+            KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), partial_flush_events[i] | 0x400u,
+            KYTY_PM4(2, Pm4::IT_PFP_SYNC_ME, 0), 0};
+        WriteDataPacket(partial_flush_packets[i].data() + 4, &partial_flush_labels[i], 1);
+        WriteDataPacket(partial_flush_packets[i].data() + 9, &partial_flush_labels[i], 2);
+      }
+      auto &copy_labels = *reinterpret_cast<std::array<uint64_t, 4> *>(mapped);
+      copy_labels.fill(0);
+      *reinterpret_cast<uint32_t *>(label_address) = 1;
+      const auto copy_address = [&](size_t i) { return reinterpret_cast<uint64_t>(&copy_labels[i]); };
+      const auto low = [](uint64_t address) { return static_cast<uint32_t>(address); };
+      const auto high = [](uint64_t address) { return static_cast<uint32_t>(address >> 32u); };
+      std::array<std::vector<uint32_t>, 4> copy_packets{{
+          {KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x407u,
+           KYTY_PM4(6, Pm4::IT_COPY_DATA, 0), 5u | (1u << 8u), 1, 0,
+           low(copy_address(0)), high(copy_address(0))},
+          {KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x407u,
+           KYTY_PM4(6, Pm4::IT_COPY_DATA, 0), 4u | (1u << 8u) | (1u << 16u) | (1u << 30u),
+           0, 0, low(copy_address(1)), high(copy_address(1))},
+          {KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x407u,
+           KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, 1, 0,
+           low(copy_address(2)), high(copy_address(2)), 4},
+          {KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x407u,
+           KYTY_PM4(6, Pm4::IT_COPY_DATA, 0), 1u | (1u << 8u),
+           low(label_address), high(label_address), low(copy_address(3)), high(copy_address(3))}}};
+      std::array<Pm4Execution, 4> copy_executions;
+
       bool parser_kept_nonblocking_boundaries = false;
+      bool partial_flushes_batched = false;
+      bool partial_flushes_suspended = false;
+      bool copies_suspended = false;
       bool host_resource_retired = false;
       bool cpu_unmap_did_not_submit = false;
       std::jthread no_gpu_wait([&] {
@@ -3032,32 +3106,44 @@ public:
               result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == tick_before;
 
-          const auto cb_db_tick = gpu_scheduler.CurrentTick();
-          auto cb_db_release =
-              make_release_mem(2, 0, &cb_db_release_label, 0, 0x14u, 0);
-          Pm4Execution cb_db_execution;
-          const auto cb_db_result =
-              processor->Process(cb_db_execution, cb_db_release);
-          const bool cb_db_release_did_not_submit =
-              cb_db_result == Pm4ProcessResult::Complete &&
-              cb_db_release_label == 0 &&
-              gpu_scheduler.CurrentTick() == cb_db_tick;
-
-          for (const auto gcr : {0u, 1u << 9u}) {
-            const auto before = Sync::ReadReferenceClock();
-            auto timestamp =
-                make_release_mem(3, 0, &cb_db_release_label, UINT64_MAX, 0x14u, gcr);
-            Pm4Execution timestamp_execution;
-            const auto timestamp_result =
-                processor->Process(timestamp_execution, timestamp);
-            Require("GpuCommandLane", "timestamp write",
-                    timestamp_result == Pm4ProcessResult::Complete &&
-                        cb_db_release_label >= before &&
-                        cb_db_release_label <= Sync::ReadReferenceClock() &&
-                        gpu_scheduler.CurrentTick() == cb_db_tick,
-                    "timestamp write failed, returned an invalid time, or "
-                    "submitted extra GPU work");
+          const auto expect_suspended = [&](auto &executions, const auto &packets, bool retry) {
+            bool ok = true;
+            for (size_t i = 0; i < packets.size(); ++i) {
+              const auto before = gpu_scheduler.CurrentTick();
+              ok &= processor->Process(executions[i], packets[i]) == Pm4ProcessResult::Blocked &&
+                    gpu_scheduler.CurrentTick() == before + 1 &&
+                    (!retry || (processor->Process(executions[i], packets[i]) ==
+                                    Pm4ProcessResult::Blocked &&
+                                gpu_scheduler.CurrentTick() == before + 1));
+            }
+            return ok;
+          };
+          bool labels_deferred = true;
+          for (size_t i = 0; i < release_packets.size(); ++i) {
+            const auto before = gpu_scheduler.CurrentTick();
+            labels_deferred &= processor->Process(release_executions[i], release_packets[i]) ==
+                                   Pm4ProcessResult::Complete &&
+                               gpu_scheduler.CurrentTick() == before;
           }
+          labels_deferred &= cb_db_release_label == UINT64_MAX &&
+              timestamp_labels == std::array<uint64_t, 2>{UINT64_MAX, UINT64_MAX};
+
+          constexpr std::array<uint32_t, 6> flush_only{
+              KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x407u,
+              KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x40fu,
+              KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x410u};
+          Pm4Execution flush_execution;
+          const auto flush_tick = gpu_scheduler.CurrentTick();
+          partial_flushes_batched =
+              processor->Process(flush_execution, flush_only) == Pm4ProcessResult::Complete &&
+              gpu_scheduler.CurrentTick() == flush_tick;
+
+          partial_flushes_suspended =
+              expect_suspended(partial_flush_executions, partial_flush_packets, true) &&
+              partial_flush_labels == std::array<uint32_t, 3>{};
+          copies_suspended =
+              expect_suspended(copy_executions, copy_packets, true) &&
+              copy_labels == std::array<uint64_t, 4>{};
 
           auto gds_interrupt_only =
               make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
@@ -3067,7 +3153,7 @@ public:
               processor->Process(gds_interrupt_execution, gds_interrupt_only);
           parser_kept_nonblocking_boundaries =
               cache_event_did_not_submit &&
-              cb_db_release_did_not_submit &&
+              labels_deferred &&
               interrupt_result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == interrupt_tick &&
               interrupt_only_gds_label == UINT64_MAX;
@@ -3086,8 +3172,45 @@ public:
                   vk::Result::eSuccess,
               "failed to release the blocked GPU timeline");
       no_gpu_wait.join();
-      gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
-      m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
+      Require("GpuCommandLane", "partial flush batching",
+              parser_did_not_wait_gpu && partial_flushes_batched,
+              "partial flushes submitted or suspended without a CPU-visible write");
+      Require("GpuCommandLane", "partial flush completion ordering",
+              parser_did_not_wait_gpu && partial_flushes_suspended,
+              "partial flush published a CPU reuse label before native GPU completion");
+      Require("GpuCommandLane", "partial flush copy ordering",
+              parser_did_not_wait_gpu && copies_suspended,
+              "copy published a CPU label before native GPU completion");
+      gpu.SendCommandSync([&] {
+        gpu_scheduler.Finish();
+        const auto resume_tick = gpu_scheduler.CurrentTick();
+        const auto resume_all = [&](auto &executions, const auto &packets, const char *check,
+                                    const char *reason) {
+          for (size_t i = 0; i < packets.size(); ++i)
+            Require("GpuCommandLane", check,
+                    processor->Process(executions[i], packets[i]) == Pm4ProcessResult::Complete,
+                    reason);
+        };
+        resume_all(partial_flush_executions, partial_flush_packets, "resume partial flush label",
+                   "completed partial flush did not resume its following label write");
+        Require("GpuCommandLane", "completed partial flush labels",
+                partial_flush_labels == std::array<uint32_t, 3>{2, 2, 2},
+                "completed partial flush did not publish its final label");
+        resume_all(copy_executions, copy_packets, "resume partial flush copy",
+                   "completed partial flush did not resume its following copy");
+        Require("GpuCommandLane", "completed partial flush copies",
+                copy_labels[0] == 1 && copy_labels[2] == 1 && copy_labels[3] == 1 &&
+                    copy_labels[1] >= clock_before_release &&
+                    copy_labels[1] <= Sync::ReadReferenceClock() &&
+                    gpu_scheduler.CurrentTick() == resume_tick,
+                "resumed CPU writes lost their data or submitted another host buffer");
+        Require("GpuCommandLane", "completed EOP labels",
+                cb_db_release_label == 0 &&
+                    std::ranges::all_of(timestamp_labels, [&](uint64_t value) {
+                      return value >= clock_before_release && value <= Sync::ReadReferenceClock();
+                    }),
+                "completed work did not publish its label and timestamps");
+      });
       Require("GpuCommandLane", "CPU-only unmap with pending host retirement",
               parser_did_not_wait_gpu && cpu_unmap_did_not_submit &&
                   host_resource_retired,
@@ -3103,8 +3226,7 @@ public:
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
-        // Every end-of-pipe and end-of-shader action, with or without GL2
-        // writeback, writes each label size and submits nothing for its interrupt.
+        // Labels are published after completion without suspending PM4 parsing.
         for (const uint32_t action : {0x04u, 0x14u, 0x28u, 0x2bu, 0x2du, 0x2fu, 0x30u}) {
           for (const uint32_t gcr : {0u, 1u << 9u}) {
             for (const uint32_t data_sel : {1u, 2u, 3u}) {
@@ -3115,8 +3237,12 @@ public:
               release[3] |= 1u; // ADDRESS_LO starts at bit 2.
               Pm4Execution release_execution;
               const auto release_tick = gpu_scheduler.CurrentTick();
-              const auto release_result =
-                  processor->Process(release_execution, release);
+              const auto release_result = processor->Process(release_execution, release);
+              Require("GpuCommandLane", "asynchronous release parsing",
+                      release_result == Pm4ProcessResult::Complete &&
+                          gpu_scheduler.CurrentTick() == release_tick,
+                      "RELEASE_MEM suspended parsing or submitted a buffer");
+              gpu_scheduler.Finish();
               bool label_written =
                   release_label == (data_sel == 1 ? 0x55667788ull : 0x1122334455667788ull);
               if (data_sel == 3) {
@@ -3126,8 +3252,8 @@ public:
               Require("GpuCommandLane", "release with write-confirm interrupt",
                       release_result == Pm4ProcessResult::Complete &&
                           label_written &&
-                          gpu_scheduler.CurrentTick() == release_tick,
-                      "an end-of-pipe action lost its label or submitted work");
+                          gpu_scheduler.CurrentTick() == release_tick + 1,
+                      "an end-of-pipe action lost its label or completion boundary");
             }
           }
         }
@@ -3152,32 +3278,110 @@ public:
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
       });
-      gpu.SendCommandSync([&] {
-        gpu_scheduler.Finish();
-        gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
-      });
+      gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
                   static_cast<uint32_t>(gds_label) == 0,
-              "RELEASE_MEM lost its GDS readback or retained a redundant GPU "
-              "wait");
+              "RELEASE_MEM lost its required split/readback or retained a "
+              "redundant GPU wait");
+
+      std::memset(mapped, 0xa5, label_size);
+      context.MapMemory(label_base, label_size);
+      LibKernel::Memory::InstallGpuResources(&context);
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        auto &cache = context.GetBufferCache();
+        auto uncached_release = make_release_mem(2, 0, reinterpret_cast<void *>(label_address), label_value);
+        Pm4Execution uncached_execution;
+        const auto uncached_tick = gpu_scheduler.CurrentTick();
+        auto uncached_result = processor->Process(uncached_execution, uncached_release);
+        Require("GpuCommandLane", "uncached mapped release boundary",
+                gpu_scheduler.CurrentTick() == uncached_tick + 1 &&
+                    (uncached_result == Pm4ProcessResult::Blocked ||
+                     uncached_result == Pm4ProcessResult::Complete),
+                "mapped label did not establish a completion boundary");
+        (void)cache.ObtainBuffer(label_base, label_size, true, true);
+        cache.FillBuffer(label_address + 8, sizeof(uint64_t), 0x89abcdefu, false);
+        gpu_scheduler.Finish();
+        if (uncached_result == Pm4ProcessResult::Blocked)
+          uncached_result = processor->Process(uncached_execution, uncached_release);
+        uint64_t uncached_label = 0, uncached_adjacent = 0;
+        cache.ReadMemory(label_address, 2 * sizeof(uint64_t));
+        Require("GpuCommandLane", "release with later cache registration",
+                uncached_result == Pm4ProcessResult::Complete &&
+                    LibKernel::Memory::TryReadBacking(label_address, &uncached_label, sizeof(uncached_label)) &&
+                    LibKernel::Memory::TryReadBacking(label_address + 8, &uncached_adjacent, sizeof(uncached_adjacent)) &&
+                    uncached_label == label_value && uncached_adjacent == 0x89abcdef89abcdefull,
+                "later cache registration lost the label or adjacent GPU writes");
+        cache.FillBuffer(label_base, label_size, 0x89abcdefu, false);
+        auto release = make_release_mem(2, 0, reinterpret_cast<void *>(label_address), label_value);
+        Pm4Execution execution;
+        auto result = processor->Process(execution, release);
+        if (result == Pm4ProcessResult::Blocked) {
+          gpu_scheduler.Finish();
+          result = processor->Process(execution, release);
+        }
+        uint64_t label = 0, adjacent = 0;
+        Require("GpuCommandLane", "EOP GPU-owned label page",
+                result == Pm4ProcessResult::Complete &&
+                    LibKernel::Memory::TryReadBacking(label_address, &label, sizeof(label)) &&
+                    LibKernel::Memory::TryReadBacking(label_address + 8, &adjacent, sizeof(adjacent)) &&
+                    label == label_value && adjacent == 0x89abcdef89abcdefull,
+                "EOP label lost its value, neighboring GPU writes, or GPU-thread ownership");
+        cache.CopyBuffer(label_base + 0x8000, label_address, sizeof(label), false, false);
+        cache.ReadMemory(label_base + 0x8000, sizeof(label));
+        Require("GpuCommandLane", "EOP label upload",
+                LibKernel::Memory::TryReadBacking(label_base + 0x8000, &label, sizeof(label)) &&
+                    label == label_value, "subsequent GPU work read a stale EOP label");
+        gpu_scheduler.Finish();
+        SubmitInfo gated;
+        gated.AddWait(blocked_timeline, 2);
+        gpu_scheduler.Flush(gated);
+        Pm4Execution retired_release;
+        Require("GpuCommandLane", "tracked release suspension",
+                processor->Process(retired_release, release) == Pm4ProcessResult::Blocked,
+                "tracked label did not wait for the gated submission");
+        vk::SemaphoreSignalInfo signal_retired{};
+        signal_retired.semaphore = blocked_timeline;
+        signal_retired.value = 2;
+        RequireVk("GpuCommandLane", "release retirement gate",
+                  m_runtime_context.device.signalSemaphore(&signal_retired), "vkSignalSemaphore");
+        gpu_scheduler.Finish();
+        BufferCacheTestAccess::RetireBuffer(cache, label_address);
+        Require("GpuCommandLane", "retired release resume",
+                processor->Process(retired_release, release) == Pm4ProcessResult::Complete,
+                "completed release did not resume after its cached label was retired");
+        uint32_t retirement_marker = 0;
+        std::array<uint32_t, 7> later_write{KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x407u};
+        WriteDataPacket(later_write.data() + 2, &retirement_marker, 1);
+        Pm4Execution later_execution;
+        const auto later_tick = gpu_scheduler.CurrentTick();
+        auto later_result = processor->Process(later_execution, later_write);
+        Require("GpuCommandLane", "fresh EOP after label retirement",
+                gpu_scheduler.CurrentTick() == later_tick + 1,
+                "a retired release left a stale completion tick for the next EOP wait");
+        gpu_scheduler.Finish();
+        if (later_result == Pm4ProcessResult::Blocked)
+          later_result = processor->Process(later_execution, later_write);
+        Require("GpuCommandLane", "later EOP completion",
+                later_result == Pm4ProcessResult::Complete && retirement_marker == 1,
+                "later EOP write did not finish");
+        context.UnmapMemory(label_base, label_size);
+      });
+      m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      Require("GpuCommandLane", "EOP label release",
+              LibKernel::Memory::KernelMunmap(label_base, label_size) == 0 &&
+                  LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, label_size) == 0,
+              "label mapping or allocation release failed");
     }
 
     alignas(uint32_t) uint32_t packet_marker_a = 0;
     alignas(uint32_t) uint32_t packet_marker_b = 0;
-    const auto write_packet = [](uint32_t *packet, uint32_t *destination,
-                                 uint32_t value) {
-      const auto destination_address = reinterpret_cast<uint64_t>(destination);
-      packet[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
-      packet[1] = 0;
-      packet[2] = static_cast<uint32_t>(destination_address);
-      packet[3] = static_cast<uint32_t>(destination_address >> 32u);
-      packet[4] = value;
-    };
 
     uint32_t live_graphics_value = 0;
     std::array<uint32_t, 5> live_graphics_commands{};
-    write_packet(live_graphics_commands.data(), &live_graphics_value, 11);
+    WriteDataPacket(live_graphics_commands.data(), &live_graphics_value, 11);
     std::binary_semaphore graphics_gate_entered{0};
     std::binary_semaphore graphics_gate_release{0};
     gpu.SendCommand([&] {
@@ -3195,7 +3399,7 @@ public:
 
     uint32_t live_compute_value = 0;
     std::array<uint32_t, 5> live_compute_commands{};
-    write_packet(live_compute_commands.data(), &live_compute_value, 33);
+    WriteDataPacket(live_compute_commands.data(), &live_compute_value, 33);
     std::binary_semaphore compute_gate_entered{0};
     std::binary_semaphore compute_gate_release{0};
     gpu.SendCommand([&] {
@@ -3392,11 +3596,15 @@ public:
 
     // A GDS release interrupt follows the interrupts queued before it, so
     // neither arrives while the priority thread is parked.
+    std::binary_semaphore gds_priority_entered{0};
     std::binary_semaphore priority_parked{0};
     gpu.SendCommandSync([&] {
       auto &scheduler = context.GetCommandScheduler();
       scheduler.Finish();
-      scheduler.DeferPriorityOperation([&] { priority_parked.acquire(); });
+      scheduler.DeferPriorityOperation([&] {
+        gds_priority_entered.release();
+        priority_parked.acquire();
+      });
     });
     uint32_t ordered_gds_label = 0;
     const auto ordered_first = make_interrupt_packet(0, 2, nullptr, 0, 0xa1u);
@@ -3406,10 +3614,13 @@ public:
     std::copy(ordered_first.begin(), ordered_first.end(), ordered_commands.begin());
     std::copy(ordered_gds.begin(), ordered_gds.end(), ordered_commands.begin() + 8);
     gpu.SubmitCompute(0x20, ordered_commands);
-    gpu.WaitForIdle();
+    Require("GpuCommandLane", "priority operation entered",
+            gds_priority_entered.try_acquire_for(std::chrono::seconds(2)),
+            "the deferred priority operation never entered");
     interrupt_count = 0;
     const auto parked_wait = wait_for_interrupt(interrupt_event, interrupt_count);
     priority_parked.release();
+    gpu.WaitForIdle();
     finish_gpu();
     LibKernel::EventQueue::KernelEvent second_event{};
     int second_count = 0;
@@ -3451,13 +3662,13 @@ public:
         0x0f200000u | static_cast<uint32_t>(polling_loop.size());
 
     std::array<uint32_t, 14> polling_commands{};
-    write_packet(polling_commands.data(), &packet_marker_a, 11);
+    WriteDataPacket(polling_commands.data(), &packet_marker_a, 11);
     polling_commands[5] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
     polling_commands[6] = static_cast<uint32_t>(loop_address);
     polling_commands[7] = static_cast<uint32_t>(loop_address >> 32u);
     polling_commands[8] =
         0x0f200000u | static_cast<uint32_t>(polling_loop.size());
-    write_packet(polling_commands.data() + 9, &packet_marker_b, 22);
+    WriteDataPacket(polling_commands.data() + 9, &packet_marker_b, 22);
     std::binary_semaphore stream_gate_entered{0};
     std::binary_semaphore stream_gate_release{0};
     gpu.SendCommand([&] {

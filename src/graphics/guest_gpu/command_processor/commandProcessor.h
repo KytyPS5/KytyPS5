@@ -46,6 +46,8 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	bool                      m_eop_pending   = false;
+	uint64_t                  m_wait_tick     = 0;
 };
 
 class CommandProcessor {
@@ -119,6 +121,8 @@ private:
 	void SuspendPm4();
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
+	[[nodiscard]] bool  WaitForPendingEndOfPipe();
+	[[nodiscard]] bool  WaitForEndOfPipe();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 

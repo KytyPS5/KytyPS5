@@ -72,6 +72,10 @@ bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
 }
 
+bool HdrEnabled() {
+	return g_config->hdr_enabled;
+}
+
 bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }
@@ -94,6 +98,10 @@ uint32_t GetConsoleLanguage() {
 
 bool VulkanValidationEnabled() {
 	return g_config->vulkan_validation_enabled;
+}
+
+bool IsNetworkConnected() {
+	return g_config->network_connected;
 }
 
 bool ShaderValidationEnabled() {
@@ -180,6 +188,10 @@ bool RedZoneProtectionEnabled() {
 
 const Keymap& GetKeymap() {
 	return g_config->keymap;
+}
+
+const std::vector<std::string>& GetGuestArguments() {
+	return g_config->guest_arguments;
 }
 
 } // namespace Config

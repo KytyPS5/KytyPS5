@@ -708,6 +708,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_MIN_RTN_U32:
 		case Opcode::DS_MAX_U32:
 		case Opcode::DS_MAX_RTN_U32:
+		case Opcode::DS_MAX_RTN_U64:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:

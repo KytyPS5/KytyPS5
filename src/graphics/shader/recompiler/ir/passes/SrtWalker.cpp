@@ -1,12 +1,17 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include "common/abi.h"
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+
+#include <xbyak/xbyak.h>
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -136,6 +141,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IMul64:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -172,8 +178,9 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type)
-	    : m_program(program), m_type(type) {}
+	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
+	                          bool wave_uniform = false)
+	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -272,6 +279,12 @@ private:
 			}
 			return finish(true);
 		}
+		if (m_wave_uniform && op == ValueOpcode::GetBuiltin) {
+			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
+			return finish(m_program.stage == ShaderType::Compute && inst->NumArgs() == 2u &&
+			              inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
+			              axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
+		}
 		if (op == ValueOpcode::Phi) {
 			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
 				return finish(false);
@@ -351,6 +364,7 @@ private:
 
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
+	bool                            m_wave_uniform;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
@@ -359,13 +373,150 @@ private:
 
 } // namespace
 
-SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
-                     SrtWalker* clean_evaluator, Value active_mask)
-    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
-      m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {}
+void CompileSrtWalker(ResourcePlan& program) {
+	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
+	    program.capture_specialization_reads || !program.control_flow.empty() ||
+	    program.srt_reads.empty()) return;
 
-SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
+	using Reads = std::map<int32_t, const SrtRead*>;
+	std::map<uint32_t, Reads> roots;
+	std::unordered_map<const Inst*, Reads> pointer_uses;
+	std::unordered_map<const Inst*, int32_t> offsets;
+	for (const auto& read: program.srt_reads) {
+		const auto* inst = read.value.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+		    inst->NumArgs() < 2 || !IsRawRead(program, *inst) ||
+		    read.flat_offset >= program.srt_reads.size()) return;
+		const auto offset = inst->Arg(1).Resolve();
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
+		const auto& memory = program.memory_info[inst->Flags<SrtReadFlags>().index];
+		const auto relative =
+		    (static_cast<int64_t>(static_cast<int32_t>(memory.offset)) & ~int64_t {3}) +
+		    static_cast<int64_t>(offset.U32() & ~3u);
+		if (relative < INT32_MIN || relative > INT32_MAX ||
+		    !offsets.emplace(inst, static_cast<int32_t>(relative)).second) return;
+	}
+	uint32_t user_data_count = 0;
+	for (const auto& read: program.srt_reads) {
+		const auto* inst = read.value.ResolveInstruction();
+		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2) return;
+		const auto* low = handle->Arg(0).Resolve().TryInstruction();
+		const auto* high = handle->Arg(1).Resolve().TryInstruction();
+		if (low == nullptr || high == nullptr) return;
+		Reads* uses = nullptr;
+		if (low->GetOpcode() == ValueOpcode::GetUserData &&
+		    high->GetOpcode() == ValueOpcode::GetUserData && low->NumArgs() == 1 &&
+		    high->NumArgs() == 1 && low->Arg(0).GetType() == Type::ScalarReg &&
+		    high->Arg(0).GetType() == Type::ScalarReg) {
+			const auto reg = RegIndex(low->Arg(0).ScalarRegister());
+			if (reg < program.user_data_base ||
+			    RegIndex(high->Arg(0).ScalarRegister()) != reg + 1u) return;
+			const auto base = reg - program.user_data_base;
+			user_data_count = std::max(user_data_count, base + 2u);
+			uses = &roots[base];
+		} else {
+			const auto lo = offsets.find(low);
+			const auto hi = offsets.find(high);
+			if (lo == offsets.end() || hi == offsets.end() ||
+			    static_cast<int64_t>(lo->second) + 4 != hi->second ||
+			    !EquivalentValue(program, low->Arg(0), high->Arg(0))) return;
+			uses = &pointer_uses[low];
+		}
+		if (!uses->emplace(offsets.at(inst), &read).second) return;
+	}
+	std::unordered_set<const Inst*> visited;
+	const auto reachable = [&](auto&& self, const Reads& reads) -> bool {
+		for (const auto& [offset, read]: reads) {
+			const auto* inst = read->value.ResolveInstruction();
+			const auto child = pointer_uses.find(inst);
+			if (child != pointer_uses.end() &&
+			    (!visited.insert(inst).second || !self(self, child->second))) return false;
+		}
+		return true;
+	};
+	for (const auto& [reg, reads]: roots) {
+		if (!reachable(reachable, reads)) return;
+	}
+	if (visited.size() != pointer_uses.size()) return;
+
+	program.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+	auto& code = *program.srt_code;
+	Xbyak::Label failed, finished;
+	code.push(code.rbp);
+	code.mov(code.rbp, code.rsp);
+	code.cmp(code.r8, user_data_count);
+	code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+	code.mov(code.r9, AddressMask & ~uint64_t {3});
+	// Follow shadPS4's VisitPointer: copy one table level in offset order, then
+	// descend through its child pointers. Seed the descriptor evaluator's memo.
+	const auto visit = [&](auto&& self, int32_t pointer_offset, const Reads& reads) -> void {
+		code.push(code.rdi);
+		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
+		code.and_(code.rdi, code.r9);
+		const auto first = reads.begin()->first;
+		const auto last = reads.rbegin()->first;
+		if (first < 0) {
+			code.mov(code.r10, -static_cast<int64_t>(first));
+			code.cmp(code.rdi, code.r10);
+			code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+		}
+		if (last > 0) {
+			code.mov(code.r10, AddressMask - last);
+			code.cmp(code.rdi, code.r10);
+			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
+			using Entry = ResourcePlan::EvaluationContext::Entry;
+			const auto slot = code.rdx + index * sizeof(Entry);
+			code.mov(code.r10d, code.dword[code.rdi + offset]);
+			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], code.r10d);
+			code.mov(code.qword[slot + offsetof(Entry, value)], code.r10);
+			code.mov(code.qword[slot + offsetof(Entry, generation)], code.rcx);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto child = pointer_uses.find(read->value.ResolveInstruction());
+			if (child == pointer_uses.end()) continue;
+			self(self, offset, child->second);
+		}
+		code.pop(code.rdi);
+	};
+	for (const auto& [reg, reads]: roots) {
+		visit(visit, reg * sizeof(uint32_t), reads);
+	}
+	code.mov(code.eax, 1);
+	code.jmp(finished, Xbyak::CodeGenerator::T_NEAR);
+	code.L(failed);
+	code.xor_(code.eax, code.eax);
+	code.L(finished);
+	code.mov(code.rsp, code.rbp);
+	code.pop(code.rbp);
+	code.ret();
+	code.readyRE();
+	EXIT_IF(Xbyak::GetError() != 0);
+}
+
+SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
+                     SrtWalker* clean_evaluator)
+    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
+      m_session(this),
+      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {}
+
+SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
+                     SrtWalker* clean_evaluator)
+    : m_program(parent.m_program), m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
+      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+      m_reachable_blocks(parent.m_reachable_blocks), m_session(parent.m_session),
+      m_read_policy((parent.m_read_policy & 1u) | (clean ? 1u : 0u) |
+                    (clean_evaluator != nullptr ? 2u : 0u)), m_context(AcquireContext()) {}
+
+SrtWalker::~SrtWalker() {
+	if (m_session != this) return;
+	for (auto& context: m_program.evaluation_contexts)
+		if (context.session == this) context.session = nullptr;
+}
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
@@ -376,13 +527,27 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	return true;
 }
 
-ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& program) {
-	if (program.evaluation_depth == program.evaluation_contexts.size()) {
-		program.evaluation_contexts.emplace_back();
+ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
+	ResourcePlan::EvaluationContext* unused = nullptr;
+	for (auto& context: m_program.evaluation_contexts) {
+		if (context.session == m_session && context.active_mask == m_active_mask &&
+		    context.read_policy == m_read_policy) return context;
+		if (context.session == nullptr && unused == nullptr) unused = &context;
 	}
-	auto& context = program.evaluation_contexts[program.evaluation_depth++];
-	context.generation += 2;
+	auto& context = unused != nullptr ? *unused : m_program.evaluation_contexts.emplace_back();
+	context.session = m_session;
+	context.active_mask = m_active_mask;
+	context.read_policy = m_read_policy;
+	context.generation += 4;
 	return context;
+}
+
+void SrtWalker::ResetUnknowns() {
+	for (auto& context: m_program.evaluation_contexts) {
+		if (context.session != m_session) continue;
+		for (auto& entry: context.values)
+			if (entry.generation == (context.generation | 2u)) entry.generation = 0;
+	}
 }
 
 float SrtWalker::Float32(uint64_t bits) {
@@ -422,8 +587,10 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		result = m_context.values[index].value;
 		return true;
 	}
-	// The low generation bit marks an instruction that is still being evaluated.
-	if (m_context.values[index].generation == (m_context.generation | 1u)) {
+	// Visiting and completed-unknown entries both stop repeated evaluation in this
+	// context. Only completed unknowns are retried when reachability becomes tighter.
+	if (m_context.values[index].generation == (m_context.generation | 1u) ||
+	    m_context.values[index].generation == (m_context.generation | 2u)) {
 		return false;
 	}
 	m_context.values[index].generation = m_context.generation | 1u;
@@ -432,7 +599,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
-		memo.generation = 0;
+		memo.generation = m_context.generation | 2u;
 		return false;
 	}
 	memo.value      = out;
@@ -446,6 +613,19 @@ bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 }
 
 bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
+	if (const auto control = m_program.control_phi_predecessors.find(&inst);
+	    control != m_program.control_phi_predecessors.end()) {
+		bool found = false;
+		for (size_t index = 0; index < inst.NumArgs(); ++index) {
+			if (m_reachable_blocks != nullptr &&
+			    !m_reachable_blocks->at(control->second[index])) continue;
+			uint64_t incoming = 0;
+			if (!Arg(inst, index, incoming) || (found && incoming != result)) return false;
+			result = incoming;
+			found = true;
+		}
+		return found;
+	}
 	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
 	return !value.IsEmpty() && EvaluateWide(value, result);
 }
@@ -543,7 +723,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			return false;
+			result = 0u;
+			return true;
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
@@ -591,9 +772,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			if (!m_active_mask.IsEmpty() && inst.Arg(1).Resolve() == m_active_mask) {
 				return EvaluateWide(inst.Arg(0), result);
 			}
-			const auto clean_runtime = CleanRuntime(m_runtime);
-			SrtWalker  clean_active(m_program, clean_runtime, nullptr, inst.Arg(1));
-			SrtWalker  active(m_program, m_runtime, &clean_active, inst.Arg(1));
+			SrtWalker clean_active(*this, inst.Arg(1), true);
+			SrtWalker active(*this, inst.Arg(1), false, &clean_active);
 			return active.EvaluateWide(inst.Arg(0), result);
 		}
 		case ValueOpcode::BitCastU32F32:
@@ -663,8 +843,11 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
 			if (binary()) {
-				result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				result = inst.GetOpcode() == ValueOpcode::UMin32
+				    ? std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b))
+				    : std::max(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
 				return true;
 			}
 			return false;
@@ -877,7 +1060,13 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::ULessThanEqual32:
-			if (binary()) {
+			// A zero lower bound accepts every U32, including a varying lane value.
+			if (!Arg(inst, 0, a)) return false;
+			if (a == 0u) {
+				result = 1u;
+				return true;
+			}
+			if (Arg(inst, 1, b)) {
 				result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
 				return true;
 			}
@@ -901,9 +1090,21 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				result = 0u;
 				return true;
 			}
-			if (!Arg(inst, 1, b) || (b != 0u && !left)) return false;
-			result = b != 0u;
-			return true;
+			if (Arg(inst, 1, b) && (b == 0u || left)) {
+				result = b != 0u;
+				return true;
+			}
+			if (!left) {
+				// Only lanes satisfying the left EXEC factor can make the conjunction
+				// true. Use a separate memo so this assumption cannot escape its RHS.
+				SrtWalker active(m_clean_evaluator != nullptr ? *m_clean_evaluator : *this,
+				                 inst.Arg(0));
+				if (active.EvaluateWide(inst.Arg(1), b) && b == 0u) {
+					result = 0u;
+					return true;
+				}
+			}
+			return false;
 		}
 		case ValueOpcode::LogicalOr: {
 			const bool left = Arg(inst, 0, a);
@@ -954,6 +1155,15 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
+	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
+		flat.resize(m_program.srt_reads.size());
+		m_program.active_sources.clear();
+		m_context.values.resize(m_program.evaluation_value_count);
+		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
+		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
+		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
+		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
@@ -973,41 +1183,64 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		return true;
 	}
+	auto& visited = m_program.visited_blocks;
+	auto& reachable = m_program.reachable_blocks;
+	auto& pending = m_program.pending_blocks;
+	visited.assign(m_program.control_flow.size(), 1u);
+	ResetUnknowns();
+	m_reachable_blocks = &visited;
+	if (m_clean_evaluator != nullptr) {
+		m_clean_evaluator->ResetUnknowns();
+		m_clean_evaluator->m_reachable_blocks = &visited;
+	}
+	for (;;) {
+		reachable.assign(m_program.control_flow.size(), 0u);
+		pending.clear();
+		pending.push_back(0u);
+		while (!pending.empty()) {
+			const auto index = pending.back();
+			pending.pop_back();
+			if (reachable.at(index)) continue;
+			reachable[index] = 1u;
+			const auto& block = m_program.control_flow[index];
+			uint32_t condition = 0;
+			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+			if (!block.condition.IsEmpty() &&
+			    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
+			    predicate.Evaluate(block.condition, condition)) {
+				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+			} else {
+				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+			}
+		}
+		if (reachable == visited) break;
+		visited.swap(reachable);
+		if (m_program.control_phi_predecessors.empty()) break;
+		// Only unknown values need another evaluation: successful Phi facts remain
+		// true as their possible predecessors shrink. Keep uniform-read memos stable.
+		ResetUnknowns();
+		if (m_clean_evaluator != nullptr) m_clean_evaluator->ResetUnknowns();
+	}
 	flat.assign(m_program.srt_reads.size(), 0u);
 	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow) {
+	for (const auto& block: m_program.control_flow)
 		for (const auto source: block.sources) active.at(source) = 0u;
-	}
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
-	visited.assign(m_program.control_flow.size(), 0u);
-	pending.clear();
-	pending.push_back(0u);
-	while (!pending.empty()) {
-		const auto index = pending.back();
-		pending.pop_back();
-		if (visited.at(index)) continue;
-		visited[index] = 1u;
+	for (uint32_t index = 0; index < visited.size(); ++index) {
+		if (!visited[index]) continue;
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) active[source] = 1u;
-		for (const auto slot: block.srt_reads) {
+		for (const auto slot: block.srt_reads)
 			if (!refresh(slot)) return false;
-		}
-		uint32_t condition = 0;
-		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-		if (!block.condition.IsEmpty() &&
-		    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
-		    predicate.Evaluate(block.condition, condition)) {
-			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
-		} else {
-			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
-		}
 	}
 	return true;
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
+}
+
+bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
+	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
 }
 
 

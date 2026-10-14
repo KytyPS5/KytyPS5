@@ -15,6 +15,9 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <net/route.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
@@ -41,10 +44,12 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -3386,7 +3391,6 @@ constexpr int NET_CTL_STATE_DISCONNECTED  = 0;
 constexpr int NET_CTL_STATE_IPOBTAINED    = 3;
 constexpr int NET_CTL_DEVICE_WIRED        = 0;
 constexpr int NET_CTL_DEVICE_WIRELESS     = 1;
-constexpr int NET_CTL_LINK_DISCONNECTED   = 0;
 constexpr int NET_CTL_LINK_CONNECTED      = 1;
 constexpr int NET_CTL_EVENT_DISCONNECTED  = 1;
 constexpr int NET_CTL_EVENT_IPOBTAINED    = 3;
@@ -3448,8 +3452,6 @@ struct NetCtlCallbackSlot {
 
 static Common::Mutex                     g_net_ctl_callbacks_mutex;
 static std::array<NetCtlCallbackSlot, 8> g_net_ctl_callbacks;
-static std::atomic_bool                  g_net_ctl_connected          = false;
-static std::atomic_bool                  g_net_ctl_status_initialized = false;
 
 struct HostNetworkInfo {
 	bool         connected = false;
@@ -3463,22 +3465,16 @@ struct HostNetworkInfo {
 };
 
 static void CopyIpv4String(char* dst, size_t dst_size, const sockaddr* addr) {
-#if defined(_WIN32)
 	if (dst == nullptr || dst_size == 0 || addr == nullptr || addr->sa_family != AF_INET) {
 		return;
 	}
 
 	const auto* in = reinterpret_cast<const sockaddr_in*>(addr);
 	inet_ntop(AF_INET, &in->sin_addr, dst, static_cast<socklen_t>(dst_size));
-#else
-	(void)dst;
-	(void)dst_size;
-	(void)addr;
-#endif
 }
 
-static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
 #if defined(_WIN32)
+static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
 	if (dst == nullptr || dst_size == 0 || prefix_len > 32) {
 		return;
 	}
@@ -3487,26 +3483,22 @@ static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
 	in_addr        in {};
 	in.S_un.S_addr = htonl(mask);
 	inet_ntop(AF_INET, &in, dst, static_cast<socklen_t>(dst_size));
-#else
-	(void)dst;
-	(void)dst_size;
-	(void)prefix_len;
-#endif
 }
+#endif
 
 static HostNetworkInfo QueryHostNetworkInfo() {
 	HostNetworkInfo info;
 #if defined(_WIN32)
-	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS;
 	ULONG size  = 0;
-	auto  ret   = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, nullptr, &size);
+	auto  ret   = GetAdaptersAddresses(AF_INET, flags, nullptr, nullptr, &size);
 	if (ret != ERROR_BUFFER_OVERFLOW || size == 0) {
 		return info;
 	}
 
 	std::vector<uint8_t> buffer(size);
 	auto*                adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
-	ret = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, adapters, &size);
+	ret = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &size);
 	if (ret != NO_ERROR) {
 		return info;
 	}
@@ -3557,39 +3549,75 @@ static HostNetworkInfo QueryHostNetworkInfo() {
 					}
 					return info;
 				}
-			} else if (addr->sa_family == AF_INET6) {
-				const auto* in6 = reinterpret_cast<const sockaddr_in6*>(addr);
-				if (!IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) &&
-				    !IN6_IS_ADDR_UNSPECIFIED(&in6->sin6_addr)) {
-					info.connected = true;
-				}
 			}
 		}
 	}
 
 	return info;
 #else
-	info.connected = true;
+	ifaddrs* addresses = nullptr;
+	if (getifaddrs(&addresses) != 0) {
+		return info;
+	}
+	const auto usable = [](const ifaddrs* address) {
+		return address->ifa_addr != nullptr && address->ifa_addr->sa_family == AF_INET &&
+		       (address->ifa_flags & (IFF_UP | IFF_RUNNING | IFF_LOOPBACK)) ==
+		           (IFF_UP | IFF_RUNNING) &&
+		       reinterpret_cast<const sockaddr_in*>(address->ifa_addr)->sin_addr.s_addr != 0;
+	};
+	const ifaddrs* selected = nullptr;
+	for (auto* address = addresses; address != nullptr; address = address->ifa_next) {
+		if (usable(address)) {
+			selected = address;
+			break;
+		}
+	}
+	std::ifstream routes("/proc/net/route");
+	std::string line;
+	uint32_t best_metric = std::numeric_limits<uint32_t>::max();
+	uint32_t gateway = 0;
+	bool has_default_route = false;
+	while (std::getline(routes, line)) {
+		std::istringstream fields(line);
+		std::string name;
+		uint32_t destination = 0, candidate_gateway = 0, flags = 0, refs = 0, uses = 0;
+		uint32_t metric = 0, mask = 0;
+		if (!(fields >> name >> std::hex >> destination >> candidate_gateway >> flags >>
+		      std::dec >> refs >> uses >> metric >> std::hex >> mask) ||
+		    destination != 0 || mask != 0 || (flags & (RTF_UP | RTF_REJECT)) != RTF_UP ||
+		    (has_default_route && metric >= best_metric)) {
+			continue;
+		}
+		for (auto* address = addresses; address != nullptr; address = address->ifa_next) {
+			if (usable(address) && name == address->ifa_name) {
+				selected = address;
+				gateway = candidate_gateway;
+				best_metric = metric;
+				has_default_route = true;
+				break;
+			}
+		}
+	}
+	if (selected != nullptr) {
+		CopyIpv4String(info.ip_address, sizeof(info.ip_address), selected->ifa_addr);
+		CopyIpv4String(info.netmask, sizeof(info.netmask), selected->ifa_netmask);
+		info.connected = info.ip_address[0] != '\0';
+		if (has_default_route) {
+			in_addr address {gateway};
+			inet_ntop(AF_INET, &address, info.default_route, sizeof(info.default_route));
+		}
+	}
+	freeifaddrs(addresses);
 	return info;
 #endif
 }
 
 static bool NetCtlConnected() {
-	if (!g_net_ctl_status_initialized.load()) {
-		g_net_ctl_connected          = false;
-		g_net_ctl_status_initialized = true;
-		LOGF("\t host network connected = false (forced offline)\n");
-	}
-
-	return g_net_ctl_connected.load();
+	return Config::IsNetworkConnected() && QueryHostNetworkInfo().connected;
 }
 
 int KYTY_SYSV_ABI NetCtlInit() {
 	PRINT_NAME();
-
-	g_net_ctl_connected          = false;
-	g_net_ctl_status_initialized = true;
-	LOGF("\t host network connected = false (forced offline)\n");
 
 	return OK;
 }
@@ -3651,7 +3679,7 @@ int KYTY_SYSV_ABI NetCtlGetStateV6(int* state) {
 		return NET_CTL_ERROR_INVALID_ADDR;
 	}
 
-	*state = (NetCtlConnected() ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED);
+	*state = NET_CTL_STATE_DISCONNECTED;
 
 	return OK;
 }
@@ -3720,24 +3748,28 @@ int KYTY_SYSV_ABI NetCtlGetResult(int event_type, int* error_code) {
 int KYTY_SYSV_ABI NetCtlGetInfo(int code, NetCtlInfo* info) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
-
+	if (info == nullptr) {
+		return NET_CTL_ERROR_INVALID_ADDR;
+	}
+	if (code < 1 || code > 21) {
+		return NET_CTL_ERROR_INVALID_CODE;
+	}
+	if (!Config::IsNetworkConnected()) {
+		return NET_CTL_ERROR_NOT_CONNECTED;
+	}
+	const auto host = QueryHostNetworkInfo();
+	if (!host.connected || (code == 16 && host.default_route[0] == '\0')) {
+		return NET_CTL_ERROR_NOT_CONNECTED;
+	}
 	memset(info, 0, sizeof(NetCtlInfo));
-
-	// Online/host-backed info responses are left below for testing, but disabled
-	// to preserve the disconnected-console behavior.
-	return NET_CTL_ERROR_NOT_CONNECTED;
 
 	switch (code) {
 		case 1:
-			info->device =
-			    (QueryHostNetworkInfo().wireless ? NET_CTL_DEVICE_WIRELESS : NET_CTL_DEVICE_WIRED);
+			info->device = (host.wireless ? NET_CTL_DEVICE_WIRELESS : NET_CTL_DEVICE_WIRED);
 			break;
-		case 2: info->ether_addr = QueryHostNetworkInfo().ether_addr; break;
+		case 2: info->ether_addr = host.ether_addr; break;
 		case 3: info->mtu = 1500; break;
-		case 4:
-			info->link = (NetCtlConnected() ? NET_CTL_LINK_CONNECTED : NET_CTL_LINK_DISCONNECTED);
-			break;
+		case 4: info->link = NET_CTL_LINK_CONNECTED; break;
 		case 5: break;
 		case 6: break;
 		case 7: info->wifi_security = 0; break;
@@ -3748,28 +3780,25 @@ int KYTY_SYSV_ABI NetCtlGetInfo(int code, NetCtlInfo* info) {
 		case 12: break;
 		case 13: break;
 		case 14:
-			std::strncpy(info->ip_address, QueryHostNetworkInfo().ip_address,
+			std::strncpy(info->ip_address, host.ip_address,
 			             sizeof(info->ip_address) - 1);
 			break;
 		case 15:
-			std::strncpy(info->netmask, QueryHostNetworkInfo().netmask, sizeof(info->netmask) - 1);
+			std::strncpy(info->netmask, host.netmask, sizeof(info->netmask) - 1);
 			break;
 		case 16:
-			std::strncpy(info->default_route, QueryHostNetworkInfo().default_route,
+			std::strncpy(info->default_route, host.default_route,
 			             sizeof(info->default_route) - 1);
 			break;
 		case 17:
-			std::strncpy(info->primary_dns, QueryHostNetworkInfo().primary_dns,
-			             sizeof(info->primary_dns) - 1);
+			std::strncpy(info->primary_dns, host.primary_dns, sizeof(info->primary_dns) - 1);
 			break;
 		case 18:
-			std::strncpy(info->secondary_dns, QueryHostNetworkInfo().secondary_dns,
-			             sizeof(info->secondary_dns) - 1);
+			std::strncpy(info->secondary_dns, host.secondary_dns, sizeof(info->secondary_dns) - 1);
 			break;
 		case 19: info->http_proxy_config = NET_CTL_HTTP_PROXY_OFF; break;
 		case 20: break;
 		case 21: info->http_proxy_port = 0; break;
-		default: LOGF("\t unknown NetCtl info code: %d\n", code); return NET_CTL_ERROR_INVALID_CODE;
 	}
 
 	return OK;

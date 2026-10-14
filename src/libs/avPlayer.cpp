@@ -978,11 +978,7 @@ public:
 			return false;
 		}
 		if (current_video) {
-			retired_video.push_back(std::move(current_video->buffer));
-			if (retired_video.size() >= static_cast<size_t>(max_video_buffers - 1)) {
-				video_buffers.Push(std::move(retired_video.front()));
-				retired_video.pop_front();
-			}
+			video_buffers.Push(std::move(current_video->buffer));
 		}
 		current_video = std::move(*frame);
 		*out          = current_video->info;
@@ -1060,7 +1056,6 @@ private:
 		video_buffers.Clear();
 		audio_buffers.Clear();
 		if (!retain_output_buffers) {
-			retired_video.clear();
 			current_video.reset();
 			current_audio.reset();
 		}
@@ -1154,7 +1149,7 @@ private:
 	bool AllocateBuffers() {
 		if (video_id) {
 			auto size     = VideoBufferSize(fmt->streams[video_id.value()]);
-			auto retained = retired_video.size() + (current_video ? 1u : 0u);
+			auto retained = current_video ? 1u : 0u;
 			for (size_t i = retained; i < static_cast<size_t>(max_video_buffers); i++) {
 				auto buffer = std::make_unique<GuestBuffer>(mem, 0x100, size, true);
 				if (!buffer->Valid()) {
@@ -1676,7 +1671,6 @@ private:
 	WorkQueue<ReadyFrame>                    audio_frames;
 	std::optional<ReadyFrame>                current_video;
 	std::optional<ReadyFrame>                current_audio;
-	std::deque<std::unique_ptr<GuestBuffer>> retired_video;
 	LibKernel::Pthread                       demux_thread = nullptr;
 	LibKernel::Pthread                       video_thread = nullptr;
 	LibKernel::Pthread                       audio_thread = nullptr;

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -87,16 +88,6 @@ ThreadLocalStorage::~ThreadLocalStorage() {
 		FreeTlsBlock(&block);
 	}
 }
-
-#pragma pack(1)
-
-struct EntryParams {
-	int         argc;
-	uint32_t    pad;
-	const char* argv[3];
-};
-
-#pragma pack()
 
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
 using entry_func_t  = KYTY_SYSV_ABI void (*)(EntryParams* params, atexit_func_t atexit_func);
@@ -1283,11 +1274,16 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
+		const auto& arguments = Config::GetGuestArguments();
+		const auto params_size = offsetof(EntryParams, argv) +
+		                         (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
-		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
-		std::memset(params, 0, sizeof(EntryParams));
-		params->argc    = 1;
-		params->argv[0] = "KytyEmu";
+		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
+		    ~static_cast<uintptr_t>(0x0f));
+		std::memset(params, 0, params_size);
+		for (const auto& argument: arguments) {
+			params->argv[params->argc++] = argument.c_str();
+		}
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 

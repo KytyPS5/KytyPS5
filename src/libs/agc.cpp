@@ -57,7 +57,6 @@ struct DriverDmem {
 };
 
 static DriverDmem g_driver_dmem;
-static int InitializeDmem();
 static void ReleaseDmem();
 
 } // namespace Gen5Driver
@@ -82,6 +81,8 @@ void Initialize() {
 	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
+	// Native driver module startup reserves its DMEM before the guest can allocate it.
+	EXIT_IF(Gen5Driver::Initialize() != OK);
 	ShaderInit();
 }
 
@@ -258,29 +259,6 @@ struct CommandBuffer {
 	void*     user_data;
 	uint32_t  reserved_dw;
 
-	void DbgDump() const {
-		if (!Config::GraphicsDebugDumpEnabled() ||
-		    Config::GetPrintfDirection() == Config::LogDirection::Silent) {
-			return;
-		}
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) >= 64) {
-			return;
-		}
-
-		LOGF("\t bottom      = 0x%016" PRIx64 "\n"
-		     "\t top         = 0x%016" PRIx64 "\n"
-		     "\t cursor_up   = 0x%016" PRIx64 "\n"
-		     "\t cursor_down = 0x%016" PRIx64 "\n"
-		     "\t callback    = 0x%016" PRIx64 "\n"
-		     "\t user_data   = 0x%016" PRIx64 "\n"
-		     "\t reserved_dw = %" PRIu32 "\n",
-		     reinterpret_cast<uint64_t>(bottom), reinterpret_cast<uint64_t>(top),
-		     reinterpret_cast<uint64_t>(cursor_up), reinterpret_cast<uint64_t>(cursor_down),
-		     reinterpret_cast<uint64_t>(callback), reinterpret_cast<uint64_t>(user_data),
-		     reserved_dw);
-	}
-
 	[[nodiscard]] KYTY_SYSV_ABI uint64_t GetAvailableSizeDW() const {
 		// Interpret the signed cursor distance as an unsigned 64-bit DWORD count.
 		const auto distance = static_cast<int64_t>(reinterpret_cast<uintptr_t>(cursor_down) -
@@ -301,7 +279,6 @@ struct CommandBuffer {
 				    "\t command buffer exhausted and has no grow callback: requested = %" PRIu32
 				    ", remaining = %" PRIu64 ", reserved_dw = %" PRIu32 "\n",
 				    num_dw, remaining, reserved_dw);
-				DbgDump();
 				return false;
 			}
 
@@ -311,7 +288,6 @@ struct CommandBuffer {
 				           "\t command buffer grow callback failed: requested = %" PRIu32
 				           ", remaining = %" PRIu64 ", reserved_dw = %" PRIu32 "\n",
 				           num_dw, remaining, reserved_dw);
-				DbgDump();
 				return false;
 			}
 			if (GetAvailableSizeDW() < num_dw) {
@@ -320,7 +296,6 @@ struct CommandBuffer {
 				           "requested = %" PRIu32 ", remaining = %" PRIu64
 				           ", reserved_dw = %" PRIu32 "\n",
 				           num_dw, GetAvailableSizeDW(), reserved_dw);
-				DbgDump();
 				return false;
 			}
 		}
@@ -356,38 +331,6 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	}
 
 	printf("version = %u\n", ver);
-	std::scoped_lock lock {Gen5Driver::g_driver_dmem.mutex};
-	if (Gen5Driver::g_driver_dmem.physical_offset >= 0) {
-		return OK;
-	}
-	if (const auto result = Gen5Driver::InitializeDmem(); result != OK) {
-		return result;
-	}
-	struct FunctionShaderBindings {
-		uint64_t code;
-		uint32_t user_data[2];
-	};
-	static_assert(sizeof(FunctionShaderBindings) == 16);
-	// Ordered-count queue validator, including its return to the caller.
-	static constexpr std::array<uint32_t, 16> validator {
-	    0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,
-	    0xbf800000, 0x8590807e, 0xb96a0a18, 0xbf066a80,
-	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
-	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
-	};
-	const auto base = Gen5Driver::DriverDmemBase + Gen5Driver::AgcDmemOffset;
-	const auto function_table = base + 0x60;
-	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
-	std::array<FunctionShaderBindings, 8> functions {};
-	functions[2].code = code_address;
-	const std::array<uint32_t, 4> descriptor {
-	    static_cast<uint32_t>(function_table),
-	    static_cast<uint32_t>(function_table >> 32u) | 0x00100000u,
-	    static_cast<uint32_t>(functions.size()), 0x5204u,
-	};
-	std::memcpy(reinterpret_cast<void*>(function_table), functions.data(), sizeof(functions));
-	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
-	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
 
 	return OK;
 }
@@ -1629,8 +1572,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operat
 		return nullptr;
 	}
 
-	buf->DbgDump();
-
 	uint32_t*  first  = nullptr;
 	const auto append = [&](uint32_t segment_size_dw) {
 		auto* segment = buf->AllocateDW(segment_size_dw);
@@ -1933,8 +1874,6 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(num_values + 2);
 
 	if (cmd == nullptr) {
@@ -1975,8 +1914,6 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
-
-	buf->DbgDump();
 
 	std::vector<ShaderRegister> local_regs(num_regs);
 	for (uint32_t i = 0; i < num_regs; i++) {
@@ -2042,8 +1979,6 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
-
-	buf->DbgDump();
 
 	// Original implementation stages register values in a temporary DWORD array. It reads each new run only
 	// after the preceding run has been allocated, so preserve that ordering around grow callbacks.
@@ -2135,8 +2070,6 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
 	                     data_sel != 5);
 	EXIT_NOT_IMPLEMENTED(interrupt > 4);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(8);
 
 	if (cmd == nullptr) {
@@ -2189,8 +2122,6 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((op & ~0x1c2u) != 0);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(2);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2210,8 +2141,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((op & ~0xfffu) != 0);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(2);
 
@@ -2233,8 +2162,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
 	     video_out_handle, display_buffer_index);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(7);
 
@@ -2288,8 +2215,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t st
 		}
 	}
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(WORKLOAD_ACTIVE_PACKET_SIZE_DW);
 	if (cmd == nullptr) {
 		return nullptr;
@@ -2325,8 +2250,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t s
 		}
 	}
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(WORKLOAD_COMPLETE_PACKET_SIZE_DW);
 	if (cmd == nullptr) {
 		return nullptr;
@@ -2350,8 +2273,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegi
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(3);
 
 	if (cmd == nullptr) {
@@ -2370,8 +2291,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegisterDirect(CommandBuffer* buf, ShaderRegi
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(3);
 
@@ -2398,8 +2317,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegi
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(3);
 
 	if (cmd == nullptr) {
@@ -2424,8 +2341,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*             
 	     reinterpret_cast<uint64_t>(regs), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(RegIndirectPacketSizeDw);
 
@@ -2453,8 +2368,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 	     reinterpret_cast<uint64_t>(regs), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(RegIndirectPacketSizeDw);
 
@@ -2484,8 +2397,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*             
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(RegIndirectPacketSizeDw);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2506,8 +2417,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize(CommandBuffer* buf, uint8_t index_siz
 	     index_size, cache_policy);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2527,8 +2436,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexBuffer(CommandBuffer* buf, uint64_t index_
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((index_addr & 1u) != 0);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2546,8 +2453,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_c
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n", index_count);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(2);
 
@@ -2567,8 +2472,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetNumInstances(CommandBuffer* buf, uint32_t num_i
 	if (buf == nullptr) {
 		return nullptr;
 	}
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(2);
 
@@ -2666,8 +2569,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
 	EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
 	EXIT_NOT_IMPLEMENTED((reinterpret_cast<uint64_t>(index_addr) & 1u) != 0);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(6);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2708,8 +2609,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 	EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
 	EXIT_NOT_IMPLEMENTED(object_ids == nullptr);
 	EXIT_NOT_IMPLEMENTED((reinterpret_cast<uint64_t>(index_addr) & 1u) != 0);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(9);
 
@@ -2778,8 +2677,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_c
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2807,8 +2704,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
 	     index_offset, index_count, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(5);
 
@@ -2839,8 +2734,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(4);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2864,8 +2757,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 	     data_offset_in_bytes, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(5);
 
@@ -2893,8 +2784,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_off
 	     data_offset_in_bytes, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(5);
 
@@ -2931,8 +2820,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	if (buf == nullptr) {
 		return nullptr;
 	}
-
-	buf->DbgDump();
 
 	constexpr uint32_t draw_packet_size_dw = 10u;
 	constexpr uint32_t total_size_dw =
@@ -2994,8 +2881,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((count_indirect & ~1u) != 0);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(10);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -3044,8 +2929,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -3076,8 +2959,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(event_type > 0x3fu);
-
-	buf->DbgDump();
 
 	const bool addressed_event = ((event_type & 0xfeu) == 0x38u);
 	auto*      cmd             = buf->AllocateDW(addressed_event ? 4u : 2u);
@@ -3174,8 +3055,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 		}
 	}
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(8);
 
 	if (cmd == nullptr) {
@@ -3233,8 +3112,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32
 		LOGF_COLOR(Log::Color::Red, "\t condExec range is too large: %" PRIu32 "\n", num_dwords);
 		return nullptr;
 	}
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(5);
 
@@ -3407,8 +3284,6 @@ uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
 		return nullptr;
 	}
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(4);
 
 	if (cmd == nullptr) {
@@ -3456,8 +3331,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(2);
 
@@ -3745,6 +3618,20 @@ int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication
 	return OK;
 }
 
+int KYTY_SYSV_ABI AgcSetNop(uint32_t* packet) {
+	PRINT_NAME();
+
+	const auto size = AgcGetPacketSize(packet);
+
+	packet[0] = (packet[0] & 0xffff0003u) | (Pm4::IT_NOP << 8u);
+	// Prevent the disabled payload from being treated as an executable marker.
+	if (size > 1 && (packet[1] & 0xffff0000u) == 0x68750000u) {
+		packet[1] &= 0xffffu;
+	}
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
                                          uint32_t predication) {
 	PRINT_NAME();
@@ -3864,8 +3751,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 		return nullptr;
 	}
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(4 + num_dwords);
 
 	if (cmd == nullptr) {
@@ -3917,8 +3802,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_poli
 	if (buf == nullptr) {
 		return nullptr;
 	}
-
-	buf->DbgDump();
 
 	auto* cmd = buf->AllocateDW(5);
 
@@ -4122,8 +4005,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 		           cache_policy);
 	}
 
-	buf->DbgDump();
-
 	auto address_value = reinterpret_cast<uint64_t>(address);
 	bool wait32        = (size == 0);
 	auto poll          = wait_reg_mem_poll_cycles_to_packet(poll_cycles);
@@ -4253,8 +4134,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	buf->DbgDump();
-
 	auto* cmd = buf->AllocateDW(6);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -4275,7 +4154,11 @@ namespace Gen5Driver {
 
 LIB_NAME("Graphics5Driver", "Graphics5Driver");
 
-static int InitializeDmem() {
+int Initialize() {
+	std::scoped_lock lock {g_driver_dmem.mutex};
+	if (g_driver_dmem.physical_offset >= 0) {
+		return OK;
+	}
 	int64_t physical_offset = -1;
 	auto result = LibKernel::Memory::KernelAllocateDirectMemory(
 	    0, LibKernel::Memory::KernelGetDirectMemorySize(), DriverDmemSize, DriverDmemSize,
@@ -4292,6 +4175,31 @@ static int InitializeDmem() {
 	}
 	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
 	std::memset(address, 0, DriverDmemSize);
+	struct FunctionShaderBindings {
+		uint64_t code;
+		uint32_t user_data[2];
+	};
+	static_assert(sizeof(FunctionShaderBindings) == 16);
+	// Ordered-count queue validator, including its return to the caller.
+	static constexpr std::array<uint32_t, 16> validator {
+	    0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,
+	    0xbf800000, 0x8590807e, 0xb96a0a18, 0xbf066a80,
+	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
+	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
+	};
+	const auto base = DriverDmemBase + AgcDmemOffset;
+	const auto function_table = base + 0x60;
+	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
+	std::array<FunctionShaderBindings, 8> functions {};
+	functions[2].code = code_address;
+	const std::array<uint32_t, 4> descriptor {
+	    static_cast<uint32_t>(function_table),
+	    static_cast<uint32_t>(function_table >> 32u) | 0x00100000u,
+	    static_cast<uint32_t>(functions.size()), 0x5204u,
+	};
+	std::memcpy(reinterpret_cast<void*>(function_table), functions.data(), sizeof(functions));
+	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
+	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
 	g_driver_dmem.physical_offset = physical_offset;
 	return OK;
 }

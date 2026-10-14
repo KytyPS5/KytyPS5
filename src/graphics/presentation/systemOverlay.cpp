@@ -7,6 +7,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
 #include "imgui.h"
@@ -890,6 +891,11 @@ struct SystemOverlay::Impl {
 		info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount    = 1;
 		info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &color_format;
 		info.CheckVkResultFn = CheckVulkanResult;
+		if (IsHdrSwapchainFormat(format)) {
+			info.CustomShaderFragCreateInfo.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+			info.CustomShaderFragCreateInfo.codeSize = sizeof(GPU_IMGUI_HDR_SPV);
+			info.CustomShaderFragCreateInfo.pCode    = GPU_IMGUI_HDR_SPV;
+		}
 		EXIT_IF(!ImGui_ImplVulkan_Init(&info));
 		vulkan_initialized = true;
 	}

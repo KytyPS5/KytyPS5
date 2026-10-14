@@ -10,9 +10,9 @@ namespace {
 
 struct FormatInfo {
 	BufferFormat       format;
-	uint32_t           bytes_per_element;
-	uint32_t           block_compressed_bytes_per_block;
-	uint32_t           render_target_bytes_per_element;
+	uint8_t            bytes_per_element;
+	uint8_t            block_compressed_bytes_per_block;
+	uint8_t            render_target_bytes_per_element;
 	bool               sampled_texture;
 	bool               uint_texture;
 	bool               sint_texture = false;
@@ -21,7 +21,7 @@ struct FormatInfo {
 constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k8UNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8UScaled, 1, 0, 0, true, false},
-	{BufferFormat::k8SNorm, 1, 0, 1, false, false},
+	{BufferFormat::k8SNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8UInt, 1, 0, 1, true, true},
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16SNorm, 2, 0, 2, true, false},
@@ -41,6 +41,7 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16_16UInt, 4, 0, 4, true, true},
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
+	{BufferFormat::k11_11_10UNorm, 4, 0, 0, true, false},
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},
@@ -237,6 +238,7 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 	switch (format) {
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
+		case BufferFormat::k11_11_10UNorm:
 		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
 		default: return format;
 	}

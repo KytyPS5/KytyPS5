@@ -11268,7 +11268,7 @@ public:
               auto source = ShaderRecompiler::PrepareShaderSource(caller, options);
               auto translated = ShaderRecompiler::TranslateProgram(
                   ShaderRecompiler::RefreshShaderSource(source, runtime), options);
-              auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+              auto plan = LoadedResourcePlan(name, translated.program);
               ShaderRecompiler::IR::ResourceSnapshot snapshot;
               ShaderRecompiler::IR::ResourceSpecialization specialization;
               Require(name, "vector helper resources", ShaderRecompiler::IR::MaterializeResources(
@@ -17196,7 +17196,7 @@ public:
       stencil_options.user_data = stencil_userdata;
       stencil_options.input_info.compute = &stencil_compute;
       auto stencil_translated = ShaderRecompiler::TranslateProgram(stencil_shader, stencil_options);
-      auto stencil_plan = ShaderRecompiler::IR::ExtractResourcePlan(stencil_translated.program);
+      auto stencil_plan = LoadedResourcePlan(name, stencil_translated.program);
       ShaderRecompiler::IR::ResourceSpecialization stencil_specialization;
       ShaderRecompiler::IR::ResourceSnapshot stencil_snapshot;
       stencil_compute.stage.resources = &stencil_snapshot;
@@ -39684,7 +39684,7 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   options.user_data = test.user_data;
   options.input_info.compute = &test.compute_info;
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
-  auto plan = ExtractResourcePlan(translated.program);
+  auto plan = LoadedResourcePlan(test.name, translated.program);
   struct CountMemory { u32 value = 72; u32 reads = 0; bool readable = true; } memory;
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
@@ -45000,7 +45000,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     options.dump_ir = false;
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
     auto resource_plan =
-        ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+        LoadedResourcePlan("Ps5GameExampleImageClear", translated.program);
     ShaderRecompiler::IR::ResourceSnapshot resources;
     ShaderRecompiler::IR::ResourceSpecialization specialization;
     const ShaderRecompiler::IR::SrtRuntime runtime{
@@ -45611,7 +45611,7 @@ void CheckEmbeddedFetchVertexOffset() {
 
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
     auto resource_plan =
-        ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+        LoadedResourcePlan(name, translated.program);
     ShaderRecompiler::IR::ResourceSnapshot resources;
     ShaderRecompiler::IR::ResourceSpecialization specialization;
     const ShaderRecompiler::IR::SrtRuntime runtime{
@@ -47500,7 +47500,7 @@ void CheckImageSamplerSpecialization() {
   mixed_sampler_program.info.samplers[0].source = 4;
   mixed_sampler_program.srt_plan_complete = true;
   auto mixed_sampler_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(mixed_sampler_program);
+      LoadedResourcePlan("ImageSamplerSpecialization", mixed_sampler_program);
   ShaderRecompiler::IR::ResourceSnapshot mixed_sampler_snapshot;
   ShaderRecompiler::IR::ResourceSpecialization mixed_sampler_specialization;
   Require("ImageSamplerSpecialization", "resource materialization",
@@ -47634,7 +47634,7 @@ void CheckImageSamplerSpecialization() {
     options.user_data = user_data;
     options.input_info.compute = &compute;
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
-    auto plan = ExtractResourcePlan(translated.program);
+    auto plan = LoadedResourcePlan(name, translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
@@ -47691,7 +47691,7 @@ void CheckImageSamplerSpecialization() {
       code[2] = EncodeSopp(0x00, 0); // GPU selectors do not need a host nonempty-EXEC witness.
     }
     auto retained = ShaderRecompiler::TranslateProgram(code, options);
-    auto retained_plan = ExtractResourcePlan(retained.program);
+    auto retained_plan = LoadedResourcePlan(name, retained.program);
     Require(name, "retained descriptor consumers",
             MaterializeResources(retained_plan, runtime, snapshot, specialization),
             "retained GPU descriptor reads could not use the shared image table");
@@ -47726,7 +47726,7 @@ void CheckResourcePlanHandoff() {
     options.user_data = user_data;
     options.input_info.compute = &compute;
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
-    auto plan = ExtractResourcePlan(translated.program);
+    auto plan = LoadedResourcePlan(name, translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     const SrtRuntime runtime{.user_data = user_data};
@@ -47844,7 +47844,7 @@ void CheckShaderRecompilerFatalContracts() {
           ShaderRecompiler::IR::Value(descriptor.dwords[dword]);
     }
     program.srt_plan_complete = true;
-    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(program);
+    auto plan = LoadedResourcePlan("PackedAtomicImageRejection", program);
     ShaderRecompiler::IR::ResourceSnapshot snapshot;
     ShaderRecompiler::IR::ResourceSpecialization specialization;
     Require("PackedAtomicImageRejection", "resource materialization",
@@ -48555,7 +48555,7 @@ void CheckEmbeddedFetchLaneSpill() {
 
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+      LoadedResourcePlan("EmbeddedFetchLaneSpill", translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const ShaderRecompiler::IR::SrtRuntime runtime{

@@ -1016,6 +1016,7 @@ private:
 				                           a.table_stride != b.table_stride)) || a.indexed != b.indexed ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    a.signed_count != b.signed_count ||
+				    !EquivalentValue(m_program, a.workgroup_key, b.workgroup_key) ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1158,14 +1159,20 @@ private:
 		return guarded && witnessed;
 	}
 
-	uint32_t WorkgroupAxis(Value key) const {
-		const auto* builtin = key.Resolve().TryInstruction();
-		uint32_t axis = UINT32_MAX;
-		if (m_program.stage != ShaderType::Compute || builtin == nullptr ||
-		    builtin->GetOpcode() != ValueOpcode::GetBuiltin || builtin->NumArgs() != 2u ||
-		    builtin->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) ||
-		    !ImmediateU32(builtin->Arg(1), axis) || axis >= 3u) return UINT32_MAX;
-		return axis;
+	uint32_t WorkgroupAxis(Value key, bool allow_derived = false) const {
+		if (m_program.stage != ShaderType::Compute) return UINT32_MAX;
+		if (!allow_derived) {
+			const auto* builtin = key.Resolve().TryInstruction();
+			uint32_t axis = UINT32_MAX;
+			if (builtin == nullptr || builtin->GetOpcode() != ValueOpcode::GetBuiltin || builtin->NumArgs() != 2u ||
+			    builtin->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) ||
+			    !ImmediateU32(builtin->Arg(1), axis) || axis >= 3u) return UINT32_MAX;
+			return axis;
+		}
+		if (ValidateRuntimeValue(m_program, key, RuntimeValueType::Integer)) return UINT32_MAX;
+		for (uint32_t axis = 0; axis < 3u; ++axis)
+			if (ValidateRuntimeValue(m_program, key, RuntimeValueType::Integer, axis)) return axis;
+		return UINT32_MAX;
 	}
 
 	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
@@ -3011,8 +3018,17 @@ private:
 		indirect.table_offset = table_offset;
 		indirect.table_immediate = table_immediate;
 		indirect.table_stride = table_stride;
-		indirect.workgroup_axis = WorkgroupAxis(key);
-		if (indirect.workgroup_axis != UINT32_MAX && !plan.table_indexed) {
+		const auto* key_inst = key.Resolve().TryInstruction();
+		const bool direct_workgroup = key_inst != nullptr &&
+		                              key_inst->GetOpcode() == ValueOpcode::GetBuiltin;
+		if (!plan.table_indexed && direct_workgroup)
+			indirect.workgroup_axis = WorkgroupAxis(key, true);
+		else if (!plan.table_indexed && !sampler && table_source.dword_count == 2u &&
+		         guarded_count.IsEmpty() && SelectorMaximum(key) >= MaxIndirectDescriptorProbes)
+			indirect.workgroup_axis = WorkgroupAxis(key, true);
+		if (indirect.workgroup_axis != UINT32_MAX) {
+			if (!direct_workgroup)
+				indirect.workgroup_key = key;
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.retain_reads = true;

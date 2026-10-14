@@ -20,6 +20,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+constexpr uint32_t MaxDerivedWorkgroupEvaluations = 4u * MaxIndirectDescriptorProbes;
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -745,17 +746,38 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
 			if (!indirect.selector_first.IsEmpty() && !WalkedValue(program, indirect.selector_first, first_key))
 				return false;
-			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
-			    (indirect.selector_first.IsEmpty() && key_count != 0u &&
-			         uint64_t {indirect.table_offset} + indirect.table_immediate +
-			         uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
-			             UINT32_MAX + 1ull)) {
+			const bool derived = !indirect.workgroup_key.IsEmpty();
+			if (indirect.table_stride == 0u ||
+			    key_count > (derived ? MaxDerivedWorkgroupEvaluations : MaxIndirectDescriptorProbes))
 				return false;
-			}
 			keys.resize(key_count);
 			std::iota(keys.begin(), keys.end(), first_key);
 			if (!keys.empty() && keys.back() < keys.front())
 				std::rotate(keys.begin(), keys.begin() + (UINT32_MAX - first_key + 1ull), keys.end());
+			if (derived) {
+				std::array<uint32_t, 3> workgroup_id {};
+				auto group_runtime = runtime;
+				if (source_index >= program.workgroup_plans.size() || !program.workgroup_plans[source_index])
+					return false;
+				const auto& group = *program.workgroup_plans[source_index];
+				std::vector<uint32_t> group_flat;
+				group_runtime.workgroup_id = workgroup_id;
+				for (auto& key: keys) {
+					workgroup_id[indirect.workgroup_axis] = key;
+					if (!WalkSrt(group, group_runtime, group_flat, &snapshot.specialization_reads) ||
+					    !WalkedValue(group, indirect.workgroup_key, key)) return false;
+				}
+				std::ranges::sort(keys);
+				keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+				if (keys.size() > MaxIndirectDescriptorProbes) return false;
+			}
+			if ((indirect.selector_first.IsEmpty() || !indirect.workgroup_key.IsEmpty()) &&
+			    !keys.empty() &&
+			    uint64_t {indirect.table_offset} + indirect.table_immediate +
+			        uint64_t {keys.back()} * indirect.table_stride + descriptor_bytes >
+			            UINT32_MAX + 1ull) {
+				return false;
+			}
 		} else {
 			if (!indirect.selector_mask.IsEmpty() && table_value.dword_count != 2u) return false;
 			if (!selector_keys->resolved) {
@@ -1319,7 +1341,24 @@ static bool DerivePlanState(ResourcePlan& plan) {
 		if (group == plan.selector_keys.size()) plan.selector_keys.emplace_back();
 		if (group != UINT32_MAX && group >= plan.selector_keys.size()) return false;
 	}
-	if (plan.srt_plan_complete && plan.resource_tracking_complete) CompileSrtWalker(plan);
+	if (plan.srt_plan_complete && plan.resource_tracking_complete) {
+		for (uint32_t source = 0; source < plan.descriptor_sources.size(); ++source) {
+			const auto& indirect = plan.descriptor_sources[source].indirect_descriptor;
+			if (!indirect || indirect->workgroup_key.IsEmpty()) continue;
+			if (plan.workgroup_plans.empty()) plan.workgroup_plans.resize(plan.descriptor_sources.size());
+			plan.workgroup_plans[source] = std::make_unique<ResourcePlan>();
+			auto& group = *plan.workgroup_plans[source];
+			group.stage = plan.stage;
+			group.user_data_base = plan.user_data_base;
+			group.user_data_count = plan.user_data_count;
+			group.memory_info = plan.memory_info;
+			group.srt_reads = plan.srt_reads;
+			group.control_flow = plan.control_flow;
+			group.control_phi_predecessors = plan.control_phi_predecessors;
+			CompileSrtWalker(group, {&indirect->workgroup_key, 1});
+		}
+		CompileSrtWalker(plan);
+	}
 	return true;
 }
 
@@ -1392,6 +1431,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (target.indirect_descriptor.has_value()) {
 			capture_indirect_reads = true;
 			target.indirect_descriptor->key_count = Clone(target.indirect_descriptor->key_count);
+			target.indirect_descriptor->workgroup_key = Clone(target.indirect_descriptor->workgroup_key);
 			target.indirect_descriptor->selector_first =
 			    Clone(target.indirect_descriptor->selector_first);
 			target.indirect_descriptor->selector_mask =
@@ -2060,7 +2100,7 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
 	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
-	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
+	       srt_code, workgroup_plans, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,

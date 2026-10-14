@@ -43,6 +43,7 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	std::span<const uint32_t> workgroup_id;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
 };
@@ -63,7 +64,8 @@ private:
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
+                          RuntimeValueType type = RuntimeValueType::Any,
+                          uint32_t workgroup_axis = UINT32_MAX);
 // Uniform across a compute wave, including values derived from its workgroup ID.
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);

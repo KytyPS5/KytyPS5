@@ -599,6 +599,7 @@ struct DescriptorSource {
 		bool     indexed = false;
 		bool     signed_count = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
+		Value    workgroup_key;
 		Value    key_count;
 		// First selector index, or first descriptor key for a direct or bitmap range.
 		Value                 selector_first;
@@ -686,6 +687,7 @@ struct ResourcePlan {
 	UniformFillPlan                     uniform_fill;
 	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	std::vector<std::unique_ptr<ResourcePlan>> workgroup_plans;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
 	// GPU-thread scratch for walker results and material keys.

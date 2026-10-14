@@ -174,8 +174,9 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 class RuntimeValidator {
 public:
 	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
-	                          bool wave_uniform = false)
-	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform) {}
+	                          bool wave_uniform = false, uint32_t workgroup_axis = UINT32_MAX)
+	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform),
+	      m_workgroup_axis(workgroup_axis) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -236,10 +237,13 @@ private:
 				return finish(false);
 			}
 			if (m_type != RuntimeValueType::Any) {
-				const auto active_mask = m_active_mask;
-				m_active_mask          = {};
-				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
-				m_active_mask          = active_mask;
+				const auto active_mask    = m_active_mask;
+				const auto workgroup_axis = m_workgroup_axis;
+				m_active_mask             = {};
+				m_workgroup_axis          = UINT32_MAX;
+				const bool valid          = Validate(m_program.srt_reads[slot.U32()].value);
+				m_active_mask             = active_mask;
+				m_workgroup_axis          = workgroup_axis;
 				if (!valid) return finish(false);
 			}
 		}
@@ -266,17 +270,15 @@ private:
 			}
 			return finish(true);
 		}
-		if (op == ValueOpcode::GetShaderBase) {
-			if (inst->NumArgs() != 0) {
-				return finish(false);
-			}
-			return finish(true);
+		if (op == ValueOpcode::GetShaderBase || op == ValueOpcode::GetSrtResource) {
+			return finish(inst->NumArgs() == 0);
 		}
-		if (m_wave_uniform && op == ValueOpcode::GetBuiltin) {
+		if ((m_wave_uniform || m_workgroup_axis < 3u) && op == ValueOpcode::GetBuiltin) {
 			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
 			return finish(m_program.stage == ShaderType::Compute && inst->NumArgs() == 2u &&
 			              inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
-			              axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
+			              axis.IsImmediate() && axis.GetType() == Type::U32 &&
+			              (m_wave_uniform ? axis.U32() < 3u : axis.U32() == m_workgroup_axis));
 		}
 		if (op == ValueOpcode::Phi) {
 			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
@@ -302,12 +304,6 @@ private:
 			m_active_mask          = active_mask;
 			return finish(valid);
 		}
-		if (op == ValueOpcode::GetSrtResource) {
-			if (inst->NumArgs() != 0) {
-				return finish(false);
-			}
-			return finish(true);
-		}
 		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
 		    op == ValueOpcode::LoadBufferU32) {
 			const auto  expected = op == ValueOpcode::LoadAddressU32
@@ -318,11 +314,18 @@ private:
 			    handle->GetOpcode() != expected) {
 				return finish(false);
 			}
+			const auto workgroup_axis = m_workgroup_axis;
+			m_workgroup_axis          = UINT32_MAX;
+			bool valid                = false;
 			if (op == ValueOpcode::LoadBufferU32) {
 				const auto guard = inst->Arg(4).Resolve();
-				return finish(Validate(inst->Arg(0)) &&
-				              ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
+				valid            = Validate(inst->Arg(0)) &&
+				        ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard));
+			} else {
+				valid = ValidateArguments(*inst, true);
 			}
+			m_workgroup_axis = workgroup_axis;
+			return finish(valid);
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
@@ -346,8 +349,7 @@ private:
 			if (inst->NumArgs() != expected) {
 				return finish(false);
 			}
-		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
-		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
+		} else if (op != ValueOpcode::ReadConst && !IsRuntimeUniformOp(op)) {
 			return finish(false);
 		}
 		return finish(ValidateArguments(*inst, true));
@@ -356,6 +358,7 @@ private:
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
 	bool                            m_wave_uniform;
+	uint32_t                        m_workgroup_axis;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
@@ -374,7 +377,7 @@ public:
 	void Compile(std::span<const Value> values);
 
 private:
-	enum class Kind : uint8_t { Unknown, Constant, UserData, ShaderBase, Node };
+	enum class Kind : uint8_t { Unknown, Constant, UserData, ShaderBase, WorkgroupId, Node };
 	struct Operand {
 		Kind     kind  = Kind::Unknown;
 		uint64_t value = 0;
@@ -403,7 +406,7 @@ private:
 		return node.referenced || node.result == Operand {Kind::Node, index};
 	}
 	static bool MayBeUnknown(const Operand& operand) {
-		return operand.kind == Kind::Unknown || operand.kind == Kind::Node;
+		return operand.kind == Kind::Unknown || operand.kind == Kind::Node || operand.kind == Kind::WorkgroupId;
 	}
 
 	uint32_t Context(Value mask) {
@@ -440,7 +443,7 @@ private:
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
-	uint32_t m_user_data = 0, m_captures = 0;
+	uint32_t m_user_data = 0, m_captures = 0, m_workgroup_id = 0;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -534,6 +537,13 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 			const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
 			if (reg < m_plan.user_data_base || reg - m_plan.user_data_base >= m_plan.user_data_count) return {};
 			return {{Kind::UserData, reg - m_plan.user_data_base}};
+		}
+		case ValueOpcode::GetBuiltin: {
+			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
+			if (m_plan.stage != ShaderType::Compute || inst->NumArgs() != 2u ||
+			    inst->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) ||
+			    !axis.IsImmediate() || axis.GetType() != Type::U32 || axis.U32() >= 3u) return {};
+			return {{Kind::WorkgroupId, axis.U32()}};
 		}
 		case ValueOpcode::GetShaderBase: return {{Kind::ShaderBase}};
 		case ValueOpcode::Phi:
@@ -683,6 +693,8 @@ void WalkerCompiler::Layout() {
 	uint32_t offset = OutputOffset(m_plan) + static_cast<uint32_t>(m_outputs.size()) * 8u;
 	m_shader_base = offset;
 	offset += 8u;
+	m_workgroup_id = offset;
+	offset += 8u;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (!Thunk(index)) continue;
 		m_nodes[index].slot = offset;
@@ -734,6 +746,9 @@ void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown)
 	auto& c = m_code;
 	if (operand.kind == Kind::Unknown) {
 		c.jmp(unknown, Near);
+	} else if (operand.kind == Kind::WorkgroupId) {
+		c.cmp(c.qword[c.rdx + m_workgroup_id], 0);
+		c.je(unknown, Near);
 	} else if (operand.kind == Kind::Node) {
 		auto& node = m_nodes[operand.value];
 		c.call(node.label);
@@ -751,6 +766,10 @@ void WalkerCompiler::Load(const Xbyak::Reg64& reg, const Operand& operand) {
 			c.mov(reg.cvt32(), c.dword[c.rdi + operand.value * sizeof(uint32_t)]);
 			break;
 		case Kind::ShaderBase: c.mov(reg, c.qword[c.rdx + m_shader_base]); break;
+		case Kind::WorkgroupId:
+			c.mov(reg, c.qword[c.rdx + m_workgroup_id]);
+			c.mov(reg.cvt32(), c.dword[reg + operand.value * sizeof(uint32_t)]);
+			break;
 		case Kind::Node: c.mov(reg, c.qword[c.rdx + m_nodes[operand.value].slot]); break;
 		case Kind::Unknown: break;
 	}
@@ -1196,6 +1215,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 	Xbyak::Label pass, fail, reset;
 	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
+	c.mov(c.qword[c.rdx + m_workgroup_id], c.r8);
 	Zero(m_reach, m_states_end - m_reach);
 	c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
 	if (!resources) {
@@ -1347,10 +1367,12 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
-	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t,
+	                                               const uint32_t*);
 	t_running_walker = plan.srt_code.get();
+	const auto* workgroup_id = runtime.workgroup_id.size() >= 3u ? runtime.workgroup_id.data() : nullptr;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
+	                                                plan.srt_scratch.data(), runtime.shader_base, workgroup_id);
 	t_running_walker = nullptr;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
@@ -1391,8 +1413,9 @@ bool WalkedActive(const ResourcePlan& plan, uint32_t source) {
 	return Scratch(plan)[ActiveOffset(plan) + source] != 0u;
 }
 
-bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
-	return RuntimeValidator(program, type).Run(value);
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
+                          uint32_t workgroup_axis) {
+	return RuntimeValidator(program, type, false, workgroup_axis).Run(value);
 }
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {

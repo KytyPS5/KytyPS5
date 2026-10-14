@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -312,6 +313,187 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
     fixture->Emit(ValueOpcode::ReferenceU32, {result});
   }
   return fixture;
+}
+
+void TestBoundedWorkgroupImageKey() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  for (uint32_t mode = 0; mode < 3u; ++mode) {
+    Fixture fixture;
+    const auto address = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto group = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto key = fixture.Emit(mode == 1u ? ValueOpcode::UMin32 : ValueOpcode::BitwiseAnd32,
+        {group, mode == 2u ? fixture.UserData(2) : Value(7u)});
+    if (mode == 2u) {
+      auto *entry = fixture.block;
+      auto *body = fixture.AddBlock();
+      auto *done = fixture.AddBlock();
+      entry->AddBranch(body);
+      entry->AddBranch(done);
+      body->AddBranch(done);
+      entry->condition = fixture.Emit(ValueOpcode::ULessThan32, {key, Value(8u)});
+      entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                           .true_block = body, .false_block = done};
+      body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = done};
+      done->terminator.kind = CFG::TerminatorKind::Return;
+      fixture.block = body;
+    }
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo scalar;
+      scalar.kind = ResourceKind::ScalarAddress;
+      scalar.offset = 0x80u + word * 4u;
+      scalar.component_index = word;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {address, offset, Value(0u), Value(true)}, fixture.AddMemory(scalar, 16u));
+    }
+    MemoryInfo store;
+    store.kind = ResourceKind::Image;
+    store.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto payload = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+        {Value(0u), Value(0u), Value(0u), Value(0u)});
+    fixture.Emit(ValueOpcode::ImageWrite,
+        {fixture.Image(words), fixture.ImageAddress(), payload, Value(true)},
+        fixture.AddMemory(store, 24u));
+    fixture.PlanAndTrack();
+    const auto plan = ExtractResourcePlan(fixture.program);
+    LinearTestMemory memory;
+    std::array<uint32_t, 8> descriptor {};
+    descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u;
+    descriptor[2] = 3u | (3u << 14u);
+    descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    for (uint32_t entry = 0; entry < 8u; ++entry) {
+      descriptor[0] = 0x20u + entry;
+      std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x80u / 4u + entry * 8u);
+    }
+    std::array<uint32_t, 3> data {0x1000u, 0u, UINT32_MAX};
+    std::array<uint32_t, 3> counts {4u * MaxIndirectDescriptorProbes + 1u, 1u, 1u};
+    FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+    SrtRuntime runtime {.user_data = data, .userdata = &memory,
+        .read_specialization_memory = ReadLinearTestMemory, .workgroup_counts = counts};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "bounded workgroup key failed to materialize for a large dispatch");
+    Check(memory.descriptor_reads == 8u && snapshot.images.size() == 8u,
+          "bounded workgroup key did not materialize exactly its descriptor domain");
+  }
+}
+
+void TestWorkgroupImageKey() {
+  Fixture fixture;
+  const auto address = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  const auto group = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(2u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto first = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {address, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 8u));
+  const auto total = fixture.Emit(ValueOpcode::IAdd32, {first, group});
+  const auto high = fixture.Emit(ValueOpcode::UMulHi, {total, Value(0xaaaaaaabu)});
+  const auto key = fixture.Emit(ValueOpcode::ShiftRightLogical32, {high, Value(7u)});
+  Check(!ValidateRuntimeValue(fixture.program, key, RuntimeValueType::Integer) &&
+            !ValidateRuntimeValue(fixture.program, key, RuntimeValueType::Integer, 0u) &&
+            ValidateRuntimeValue(fixture.program, key, RuntimeValueType::Integer, 2u),
+        "workgroup key escaped its enumeration context");
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    scalar.offset = 0x80u + word * 4u;
+    scalar.component_index = word;
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {address, offset, Value(0u), Value(true)}, fixture.AddMemory(scalar, 16u));
+  }
+  MemoryInfo store;
+  store.kind = ResourceKind::Image;
+  store.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto payload = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  fixture.Emit(ValueOpcode::ImageWrite,
+      {fixture.Image(words), fixture.ImageAddress(), payload, Value(true)},
+      fixture.AddMemory(store, 24u));
+  fixture.PlanAndTrack();
+  const auto unused_address = fixture.Address(Value(0x5000u), Value(0u));
+  const auto unused_read = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {unused_address, Value(0u), Value(0u), Value(true)},
+      fixture.AddMemory({.kind = ResourceKind::ScalarAddress, .planning_only = true}, 0x40u));
+  const auto unused_key = fixture.Emit(ValueOpcode::IAdd32, {unused_read, group});
+  auto unused = fixture.program.descriptor_sources[fixture.program.info.images[0].source];
+  unused.indirect_descriptor->workgroup_key = unused_key;
+  fixture.program.descriptor_sources.push_back(unused);
+  const auto bytes = SaveResourcePlan(ExtractResourcePlan(fixture.program));
+  ResourcePlan plan;
+  Check(LoadResourcePlan(bytes, plan) && SaveResourcePlan(plan) == bytes,
+        "derived workgroup plan did not round-trip through the shader cache");
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> descriptor {};
+  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (uint32_t entry = 0; entry < 3u; ++entry) {
+    descriptor[0] = 0x20u + entry;
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x80u / 4u + entry * 8u);
+  }
+  std::array<uint32_t, 2> data {0x1000u, 0u};
+  std::array<uint32_t, 3> counts {1u, 1u, 3u};
+  FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+  SrtRuntime runtime {.user_data = data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory, .workgroup_counts = counts};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (uint32_t first_value : {191u, 383u}) {
+    memory.words[0] = first_value;
+    memory.descriptor_reads = 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "derived workgroup image key did not materialize");
+    Check(std::ranges::any_of(snapshot.specialization_reads, [&](const auto &read) {
+              return read.first == memory.base && read.second == sizeof(uint32_t);
+            }) && std::ranges::none_of(snapshot.specialization_reads, [](const auto &read) {
+              return read.first == 0x5000u;
+            }), "workgroup enumeration lost its inputs or loaded an unused descriptor's inputs");
+    const auto mapping = specialization.images[0].indirect_mapping_offset;
+    const auto first_key = first_value / 192u;
+    Check(memory.descriptor_reads == 2u && snapshot.flattened_srt[mapping] == 2u &&
+              snapshot.flattened_srt[mapping + 1u] == first_key &&
+              snapshot.flattened_srt[mapping + 3u] == first_key + 1u &&
+              snapshot.images[0].dwords[0] == 0x20u + first_key,
+          "workgroup enumeration lost distinct keys or reused stale scalar memory");
+  }
+  memory.fail_address = memory.base;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images[0].dwords[0] == 0x20u,
+        "unavailable workgroup key memory did not read as zero");
+  memory.fail_address = UINT64_MAX;
+  memory.words[0] = 0u;
+  constexpr uint32_t enumeration_limit = 4u * MaxIndirectDescriptorProbes;
+  const auto max_keys = (enumeration_limit - 1u) / 192u + 1u;
+  memory.words.resize(0x80u / 4u + max_keys * 8u);
+  for (uint32_t entry = 0; entry < max_keys; ++entry) {
+    descriptor[0] = 0x20u + entry;
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x80u / 4u + entry * 8u);
+  }
+  for (const uint32_t count : {MaxIndirectDescriptorProbes + 1u, enumeration_limit,
+                               enumeration_limit + 1u}) {
+    counts[2] = count;
+    memory.descriptor_reads = 0u;
+    const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+    if (count > enumeration_limit) {
+      Check(!materialized && memory.descriptor_reads == 0u,
+            "oversized workgroup enumeration probed descriptor memory");
+      continue;
+    }
+    const auto key_count = (count - 1u) / 192u + 1u;
+    Check(materialized, "large derived workgroup domain did not materialize");
+    const auto mapping = specialization.images[0].indirect_mapping_offset;
+    Check(memory.descriptor_reads == key_count && snapshot.flattened_srt[mapping] == key_count &&
+              snapshot.flattened_srt[mapping + key_count * 2u - 1u] == key_count - 1u,
+          "large workgroup enumeration did not deduplicate descriptor keys");
+  }
 }
 
 void TestInvariantIndirectImageMaterialization(bool nested) {
@@ -8914,6 +9096,8 @@ int main() {
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
+    Run("workgroup image key", TestWorkgroupImageKey);
+    Run("bounded workgroup image key", TestBoundedWorkgroupImageKey);
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);

@@ -496,6 +496,118 @@ void TestWorkgroupImageKey() {
   }
 }
 
+enum class ImageKeyCase {
+  BoundedFloat,
+  MissingSaturation,
+  InvalidNan,
+  UnrelatedPredicate,
+};
+
+void CheckImageTableKey(ImageKeyCase test_case) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *body = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  entry->AddBranch(body);
+  entry->AddBranch(exit);
+  body->AddBranch(exit);
+  body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = exit};
+  exit->terminator.kind = CFG::TerminatorKind::Return;
+  const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  const auto active = fixture.Emit(ValueOpcode::INotEqual32, {lane, Value(0u)});
+  const auto unrelated = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(4u)});
+  const auto write_mask = test_case == ImageKeyCase::UnrelatedPredicate ? unrelated : active;
+  const auto unit = fixture.Emit(ValueOpcode::BitCastF32U32, {lane});
+  const auto clamped = test_case == ImageKeyCase::MissingSaturation
+                           ? unit : fixture.Emit(ValueOpcode::FPSaturate32, {unit});
+  auto reflected = fixture.Emit(ValueOpcode::FPMad32,
+      {Value::F32(-7.0f), clamped, Value::F32(7.0f)});
+  const auto bits = fixture.Emit(ValueOpcode::BitCastU32F32, {reflected});
+  const auto selected = fixture.Emit(ValueOpcode::SelectU32, {write_mask, bits, Value(0u)});
+  const auto floating = fixture.Emit(ValueOpcode::BitCastF32U32, {selected});
+  const auto rounded = fixture.Emit(ValueOpcode::FPFloor32, {floating});
+  auto integer = fixture.Emit(ValueOpcode::ConvertS32F32, {rounded});
+  if (test_case == ImageKeyCase::InvalidNan) {
+    const auto nan = fixture.Emit(ValueOpcode::FPIsNan32, {rounded});
+    integer = fixture.Emit(ValueOpcode::SelectU32, {nan, Value(100u), integer});
+  }
+  const auto local = fixture.Emit(ValueOpcode::SelectU32, {write_mask, integer, Value(0u)});
+  auto key = fixture.Emit(ValueOpcode::ReadLane, {local, Value(0u)});
+  const auto equal = fixture.Emit(ValueOpcode::IEqual32, {key, local});
+  const auto guard = fixture.Emit(ValueOpcode::LogicalAnd, {active, equal});
+  entry->condition = guard;
+  entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = body, .false_block = exit};
+  const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  fixture.block = body;
+  const auto adjacent = fixture.Emit(ValueOpcode::SMin32,
+      {fixture.Emit(ValueOpcode::IAdd32, {key, Value(1u)}), Value(7u)});
+  for (const auto index : {key, adjacent}) {
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {index, Value(5u)}), Value(0x80u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {base, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 16u));
+    }
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim3D;
+    memory.image_sample_flags = Decoder::ImageSampleFlagLevelZero;
+    const auto image = fixture.Image(words);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto address = fixture.ImageAddress();
+    const auto flags = fixture.AddMemory(memory, 24u);
+    const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address, guard}, flags);
+    fixture.Emit(ValueOpcode::ReferenceU32,
+        {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+  }
+  if (test_case == ImageKeyCase::MissingSaturation ||
+      test_case == ImageKeyCase::InvalidNan ||
+      test_case == ImageKeyCase::UnrelatedPredicate) {
+    CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+        "unbounded or inactive float index entered an image table plan");
+    return;
+  }
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  for (const auto &image : plan.info.images) {
+    const auto &source = plan.descriptor_sources[image.source];
+    Check(source.indirect_descriptor && source.indirect_descriptor->key_count == Value(8u),
+        "float key lost its bounded range");
+  }
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+  LinearTestMemory memory;
+  for (uint32_t key = 0; key < 8u; ++key) {
+    std::array<uint32_t, 8> descriptor {};
+    descriptor[0] = 0x20u + key;
+    descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u;
+    descriptor[2] = 3u | (3u << 14u);
+    const auto type = Libs::Graphics::Prospero::ImageType::kColor2D;
+    descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u);
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x80u / 4u + key * 8u);
+  }
+  const std::array<uint32_t, 2> data {0x1000u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime {.user_data = data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+      "image table keys did not materialize");
+}
+
+void TestBoundedFloatImageKey() {
+  for (const auto test_case : {ImageKeyCase::BoundedFloat, ImageKeyCase::MissingSaturation,
+                              ImageKeyCase::InvalidNan, ImageKeyCase::UnrelatedPredicate})
+    CheckImageTableKey(test_case);
+}
+
 void TestInvariantIndirectImageMaterialization(bool nested) {
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, nested);
   fixture->PlanAndTrack();
@@ -4540,8 +4652,12 @@ void TestPrivateLdsForwarding() {
     MemoryInfo memory;
     memory.kind = ResourceKind::Lds;
     memory.offset = 4096u;
+    const auto stored = variant == Variant::Valid
+        ? fixture.Emit(ValueOpcode::BitCastU32F32,
+              {fixture.Emit(ValueOpcode::BitCastF32U32, {Value(0x12345678u)}, 0, entry)}, 0, entry)
+        : Value(0x12345678u);
     fixture.Emit(ValueOpcode::WriteSharedU32,
-        {address, Value(0x12345678u), variant == Variant::Mask ? active : Value(true)},
+        {address, stored, variant == Variant::Mask ? active : Value(true)},
         fixture.AddMemory(memory, 0x10), variant == Variant::Bypass ? body : entry);
     if (variant == Variant::Overlap || variant == Variant::Duplicate) {
       auto other = memory;
@@ -4562,6 +4678,7 @@ void TestPrivateLdsForwarding() {
     compute.threads_num[2] = 1u;
     compute.lds_size_dwords = variant == Variant::OutOfBounds ? 1024u : 2048u;
     fixture.PlanAndTrack({.compute = &compute});
+    ValidateProgram(fixture.program, true);
     const auto result = use.Instruction()->Arg(0).ResolveInstruction();
     Check(result != nullptr &&
               (result->GetOpcode() == ValueOpcode::SelectU32) ==
@@ -9098,6 +9215,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("workgroup image key", TestWorkgroupImageKey);
     Run("bounded workgroup image key", TestBoundedWorkgroupImageKey);
+    Run("bounded float image key", TestBoundedFloatImageKey);
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);

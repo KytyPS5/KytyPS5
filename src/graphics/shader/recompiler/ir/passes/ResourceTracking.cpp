@@ -1800,14 +1800,61 @@ private:
 		});
 	}
 
-	Value ActiveValue(Value value, Value guard) const {
-		value = value.Resolve();
-		while (const auto* select = value.TryInstruction()) {
-			if (select->GetOpcode() != ValueOpcode::SelectU32 ||
-			    !Implies(guard, select->Arg(0))) break;
-			value = select->Arg(1).Resolve();
+	Value ActiveValue(Value value, Value guard, bool through_bitcasts = false) const {
+		for (uint32_t depth = 0; depth < 32u; ++depth) {
+			value = value.Resolve();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr) break;
+			if (through_bitcasts && (inst->GetOpcode() == ValueOpcode::BitCastF32U32 ||
+			                         inst->GetOpcode() == ValueOpcode::BitCastU32F32)) {
+				value = inst->Arg(0);
+			} else if (inst->GetOpcode() == ValueOpcode::SelectU32 && Implies(guard, inst->Arg(0))) {
+				value = inst->Arg(1);
+			} else break;
 		}
-		return value;
+		return value.Resolve();
+	}
+
+	Value FloatIndexSource(Value value, Value guard) const {
+		const auto* result = ActiveValue(value, guard, true).TryInstruction();
+		if (result == nullptr || result->GetOpcode() != ValueOpcode::ConvertS32F32) return {};
+		const auto* floor = result->Arg(0).Resolve().TryInstruction();
+		if (floor == nullptr || floor->GetOpcode() != ValueOpcode::FPFloor32) return {};
+		return ActiveValue(floor->Arg(0), guard, true);
+	}
+
+	uint32_t BoundedImageKey(Value value, const Inst& image, uint32_t depth = 0) const {
+		if (depth > 16u) return UINT32_MAX;
+		const auto known = SelectorMaximum(value);
+		if (known <= INT32_MAX) return known;
+		const auto guard = PositiveLaneWitness(image.Parent());
+		if (guard.IsEmpty()) return UINT32_MAX;
+		uint32_t constant;
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr) return UINT32_MAX;
+		if (inst->GetOpcode() == ValueOpcode::IAdd32 && ImmediateU32(inst->Arg(1), constant)) {
+			const auto maximum = uint64_t {BoundedImageKey(inst->Arg(0), image, depth + 1u)} + constant;
+			return maximum <= INT32_MAX ? static_cast<uint32_t>(maximum) : UINT32_MAX;
+		}
+		if (inst->GetOpcode() == ValueOpcode::SMin32 && ImmediateU32(inst->Arg(1), constant) &&
+		    constant <= INT32_MAX) {
+			const auto maximum = BoundedImageKey(inst->Arg(0), image, depth + 1u);
+			return maximum <= INT32_MAX ? std::min(maximum, constant) : UINT32_MAX;
+		}
+		const auto local = EqualLocalKey(guard, value);
+		if (local.IsEmpty()) return UINT32_MAX;
+		const auto source = FloatIndexSource(local, guard);
+		const auto* mad = source.TryInstruction();
+		if (mad == nullptr || mad->GetOpcode() != ValueOpcode::FPMad32 ||
+		    !mad->Arg(0).IsImmediate() || mad->Arg(0).GetType() != Type::F32 ||
+		    !mad->Arg(2).IsImmediate() || mad->Arg(2).GetType() != Type::F32) return UINT32_MAX;
+		const auto limit = mad->Arg(2).F32Value();
+		if (!(limit >= 0.0f && limit < 2147483648.0f) ||
+		    limit != static_cast<float>(static_cast<uint32_t>(limit)) ||
+		    mad->Arg(0).F32Value() != -limit) return UINT32_MAX;
+		const auto* unit = ActiveValue(mad->Arg(1), guard, true).TryInstruction();
+		if (unit == nullptr || unit->GetOpcode() != ValueOpcode::FPSaturate32) return UINT32_MAX;
+		return static_cast<uint32_t>(limit);
 	}
 
 	bool Reaches(const Block* from, const Block* to, const Block* stop = nullptr) const {
@@ -3097,7 +3144,7 @@ private:
 			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, false) &&
 			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, true) &&
 			    !MatchReversedImageRange(key, indirect)) {
-				const auto maximum = SelectorMaximum(key);
+				const auto maximum = BoundedImageKey(key, handle);
 				if (maximum >= MaxIndirectDescriptorProbes) return false;
 				indirect.key_count = Value(maximum + 1u);
 			}

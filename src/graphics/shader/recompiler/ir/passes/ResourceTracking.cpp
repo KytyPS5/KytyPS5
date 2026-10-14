@@ -1857,6 +1857,61 @@ private:
 		return static_cast<uint32_t>(limit);
 	}
 
+	bool MatchBufferFloatKey(Value key, const Inst& image, DescriptorSource::IndirectDescriptor& indirect) {
+		const auto guard = PositiveLaneWitness(image.Parent());
+		if (guard.IsEmpty()) return false;
+		DescriptorSource::IndirectDescriptor::SelectorRead selector;
+		const auto* inst = key.Resolve().TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::SMin32 &&
+		    ImmediateU32(inst->Arg(1), selector.maximum)) {
+			if (selector.maximum == UINT32_MAX) return false;
+			key = inst->Arg(0);
+			inst = key.Resolve().TryInstruction();
+		}
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::IAdd32 &&
+		    ImmediateU32(inst->Arg(1), selector.key_add)) key = inst->Arg(0);
+		const auto local = EqualLocalKey(guard, key);
+		if (local.IsEmpty()) return false;
+		const auto source = FloatIndexSource(local, guard);
+		const auto* floating = source.TryInstruction();
+		if (floating == nullptr || floating->GetOpcode() != ValueOpcode::ConvertF32F16) return false;
+		const auto* half = floating->Arg(0).Resolve().TryInstruction();
+		if (half == nullptr || half->GetOpcode() != ValueOpcode::BitCastF16U16) return false;
+		const auto* narrow = half->Arg(0).Resolve().TryInstruction();
+		if (narrow == nullptr || narrow->GetOpcode() != ValueOpcode::ConvertU16U32) return false;
+		const auto* field = narrow->Arg(0).Resolve().TryInstruction();
+		if (field == nullptr || field->GetOpcode() != ValueOpcode::BitFieldUExtract ||
+		    field->Arg(2) != Value(16u) || !ImmediateU32(field->Arg(1), selector.f16_shift) ||
+		    (selector.f16_shift != 0u && selector.f16_shift != 16u)) return false;
+		const auto* component = ActiveValue(field->Arg(0), guard, true).TryInstruction();
+		uint32_t word;
+		if (component == nullptr || component->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
+		    !ImmediateU32(component->Arg(1), word) || word >= 4u) return false;
+		const auto* read = component->Arg(0).Resolve().TryInstruction();
+		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32x4 ||
+		    !Implies(guard, read->Arg(4))) return false;
+		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+		    !memory.idxen || !memory.offen || memory.data_bits != 32u || memory.data_dwords != 4u ||
+		    read->Arg(3) != Value(0u)) return false;
+		AffineOffset offset;
+		if (!MatchAffineOffset(read->Arg(2), guard, offset) || offset.index.IsEmpty() ||
+		    offset.stride == 0u || (offset.stride & 3u) != 0u ||
+		    offset.offset + memory.offset + word * 4u > UINT32_MAX) return false;
+		const auto* builtin = offset.index.Resolve().TryInstruction();
+		if (m_program.stage != ShaderType::Compute || builtin == nullptr ||
+		    builtin->GetOpcode() != ValueOpcode::GetBuiltin ||
+		    builtin->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)) ||
+		    !ImmediateU32(builtin->Arg(1), selector.local_axis) || selector.local_axis >= 3u) return false;
+		DescriptorSource material;
+		if (!MakeRuntimeTableSource(*read, material)) return false;
+		selector.source = InternSource(material);
+		selector.offset = static_cast<uint32_t>(offset.offset + memory.offset + word * 4u);
+		selector.stride = static_cast<uint32_t>(offset.stride);
+		indirect.selector = selector;
+		return true;
+	}
+
 	bool Reaches(const Block* from, const Block* to, const Block* stop = nullptr) const {
 		std::vector<const Block*> pending {to};
 		for (size_t index = 0; index < pending.size(); ++index) {
@@ -3143,7 +3198,8 @@ private:
 			if (indirect.key_count.IsEmpty() &&
 			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, false) &&
 			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, true) &&
-			    !MatchReversedImageRange(key, indirect)) {
+			    !MatchReversedImageRange(key, indirect) &&
+			    !MatchBufferFloatKey(key, handle, indirect)) {
 				const auto maximum = BoundedImageKey(key, handle);
 				if (maximum >= MaxIndirectDescriptorProbes) return false;
 				indirect.key_count = Value(maximum + 1u);

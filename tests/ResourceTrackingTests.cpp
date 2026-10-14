@@ -503,10 +503,12 @@ enum class ImageKeyCase {
   UnrelatedPredicate,
   MixedDimensions,
   MixedGather,
+  PackedHalf,
 };
 
 void CheckImageTableKey(ImageKeyCase test_case) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const bool material_key = test_case == ImageKeyCase::PackedHalf;
   const bool mixed_dimensions = test_case == ImageKeyCase::MixedDimensions ||
                                 test_case == ImageKeyCase::MixedGather;
   Fixture fixture;
@@ -528,6 +530,24 @@ void CheckImageTableKey(ImageKeyCase test_case) {
                            ? unit : fixture.Emit(ValueOpcode::FPSaturate32, {unit});
   auto reflected = fixture.Emit(ValueOpcode::FPMad32,
       {Value::F32(-7.0f), clamped, Value::F32(7.0f)});
+  if (material_key) {
+    const auto material = fixture.Buffer({fixture.UserData(2), fixture.UserData(3),
+        fixture.UserData(4), fixture.UserData(5)});
+    const auto member = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+        {fixture.Emit(ValueOpcode::IAdd32, {lane, Value(1u)}), Value(4u)});
+    MemoryInfo load;
+    load.kind = ResourceKind::Buffer;
+    load.idxen = load.offen = true;
+    load.data_dwords = 4u;
+    const auto loaded = fixture.Emit(ValueOpcode::LoadBufferU32x4,
+        {material, lane, member, Value(0u), active}, fixture.AddMemory(load, 8u));
+    const auto word = fixture.Emit(ValueOpcode::SelectU32, {active,
+        fixture.Emit(ValueOpcode::CompositeExtractU32x4, {loaded, Value(0u)}), Value(0u)});
+    const auto field = fixture.Emit(ValueOpcode::BitFieldUExtract, {word, Value(0u), Value(16u)});
+    const auto narrow = fixture.Emit(ValueOpcode::ConvertU16U32, {field});
+    const auto half = fixture.Emit(ValueOpcode::BitCastF16U16, {narrow});
+    reflected = fixture.Emit(ValueOpcode::ConvertF32F16, {half});
+  }
   const auto bits = fixture.Emit(ValueOpcode::BitCastU32F32, {reflected});
   const auto selected = fixture.Emit(ValueOpcode::SelectU32, {write_mask, bits, Value(0u)});
   const auto floating = fixture.Emit(ValueOpcode::BitCastF32U32, {selected});
@@ -586,8 +606,10 @@ void CheckImageTableKey(ImageKeyCase test_case) {
   auto plan = ExtractResourcePlan(fixture.program);
   for (const auto &image : plan.info.images) {
     const auto &source = plan.descriptor_sources[image.source];
-    Check(source.indirect_descriptor && source.indirect_descriptor->key_count == Value(8u),
-        "float key lost its bounded range");
+    Check(source.indirect_descriptor &&
+              (material_key ? source.indirect_descriptor->selector.has_value()
+                             : source.indirect_descriptor->key_count == Value(8u)),
+        "float key lost its bounded range or material selector");
   }
   EliminateDeadCode(fixture.program.blocks);
   ValidateProgram(fixture.program, true);
@@ -603,11 +625,17 @@ void CheckImageTableKey(ImageKeyCase test_case) {
     descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u);
     std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x80u / 4u + key * 8u);
   }
-  const std::array<uint32_t, 2> data {0x1000u, 0u};
+  std::array<uint32_t, 6> data {0x1000u, 0u, 0x2000u, 128u << 16u, 2u, 0x14204u};
+  const std::array<uint32_t, 3> local_size {4u, 1u, 1u};
+  if (material_key) {
+    const std::array<uint32_t, 8> halves {0u, 0x3f00u, 0x4700u, 0x7e00u, 0x8000u, 0xbe00u, 0x41ffu, 0x8001u};
+    for (uint32_t entry = 0; entry < halves.size(); ++entry)
+      memory.words[(0x1000u + (entry / 4u) * 128u + (entry % 4u + 1u) * 16u) / 4u] = halves[entry];
+  }
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const SrtRuntime runtime {.user_data = data, .userdata = &memory,
-      .read_specialization_memory = ReadLinearTestMemory};
+      .read_specialization_memory = ReadLinearTestMemory, .local_size = local_size};
   if (test_case == ImageKeyCase::MixedGather) {
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "mixed dimensions admitted a 3D gather");
@@ -615,6 +643,61 @@ void CheckImageTableKey(ImageKeyCase test_case) {
   }
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
       "image table keys did not materialize");
+  if (material_key) {
+    const auto mapping = specialization.images[0].indirect_mapping_offset;
+    const auto adjacent_mapping = specialization.images[1].indirect_mapping_offset;
+    Check(snapshot.flattened_srt[mapping] == 6u &&
+              snapshot.flattened_srt[mapping + 9u] == 0xfffffffeu &&
+              snapshot.flattened_srt[mapping + 11u] == UINT32_MAX &&
+              snapshot.flattened_srt[adjacent_mapping] == 6u &&
+              snapshot.flattened_srt[adjacent_mapping + 11u] == UINT32_MAX,
+        "packed half selector lost negative subnormal, NaN, floor, or signed clamp semantics");
+    memory.words[0x1010u / 4u] = 0x7c00u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 7u,
+        "packed half selector reused stale memory or lost infinity saturation");
+    memory.fail_address = 0x2010u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable packed material keys were accepted");
+    memory.fail_address = UINT64_MAX;
+    data[4] = MaxIndirectDescriptorProbes / local_size[0] + 1u;
+    memory.words.resize((0x1000u + data[4] * 128u) / 4u);
+    const auto last_row = 0x1000u + (data[4] - 1u) * 128u + 16u;
+    const auto row_bytes = (local_size[0] - 1u) * 16u + 4u;
+    const auto last = last_row + row_bytes - 4u;
+    memory.words[last / 4u] = 0x4400u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 8u,
+        "large packed half selector rejected repeated keys or lost its final record");
+    Check(std::ranges::find(snapshot.specialization_reads,
+              std::pair<uint64_t, uint64_t>{memory.base + last_row, row_bytes}) !=
+              snapshot.specialization_reads.end(),
+        "large packed half selector lost the final row's read dependency");
+    memory.words[last / 4u] = 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 7u,
+        "large packed half selector reused stale keys");
+    memory.fail_address = memory.base + last;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable final packed material row was accepted");
+    memory.fail_address = UINT64_MAX;
+    for (const auto records : {MaxIndirectDescriptorProbes + 1u, UINT32_MAX}) {
+      data[4] = records;
+      const auto reads = memory.reads;
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == reads,
+          "oversized packed half record scan read guest memory");
+    }
+    data[4] = MaxIndirectDescriptorProbes;
+    data[3] = 256u << 16u;
+    for (auto &source : plan.descriptor_sources) {
+      if (source.indirect_descriptor && source.indirect_descriptor->selector)
+        source.indirect_descriptor->selector->stride = 64u;
+    }
+    const auto reads = memory.reads;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == reads,
+        "packed half scan exceeded its total byte budget");
+    return;
+  }
   if (test_case == ImageKeyCase::MixedDimensions)
     Check(specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
             std::ranges::any_of(specialization.images, [](const auto &image) {
@@ -9238,6 +9321,7 @@ int main() {
     Run("bounded float image key", TestBoundedFloatImageKey);
     Run("mixed image dimensions", [] { CheckImageTableKey(ImageKeyCase::MixedDimensions); });
     Run("mixed gather rejection", [] { CheckImageTableKey(ImageKeyCase::MixedGather); });
+    Run("packed half image key", [] { CheckImageTableKey(ImageKeyCase::PackedHalf); });
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);

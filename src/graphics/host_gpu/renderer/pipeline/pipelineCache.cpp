@@ -381,6 +381,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		options.input_info.compute = &input_info;
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
+		runtime.local_size = input_info.threads_num;
 	}
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;

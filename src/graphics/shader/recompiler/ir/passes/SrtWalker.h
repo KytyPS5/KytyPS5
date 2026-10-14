@@ -46,6 +46,7 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_id;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	std::span<const uint32_t> local_size;
 };
 
 class SrtReadCapture {

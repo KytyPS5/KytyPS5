@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
@@ -376,6 +377,63 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 				keys.insert(keys.end(), begin, begin + lengths[row]);
 			}
 		}
+	} else if (selector->f16_shift != UINT32_MAX) {
+		ShaderBufferResource material;
+		if (!DecodeBufferDescriptor(material_value, material) ||
+		    selector->local_axis >= 3u || selector->local_axis >= runtime.local_size.size() ||
+		    (selector->f16_shift != 0u && selector->f16_shift != 16u) ||
+		    material.Type() != 0u || material.SwizzleEnabled() || material.AddTid() ||
+		    material.OutOfBounds() != 0u || material.Stride() == 0u ||
+		    (material.Base48() & 3u) != 0u || (material.Stride() & 3u) != 0u) return false;
+		const auto count = runtime.local_size[selector->local_axis];
+		if (count == 0u) return false;
+		const auto row_bytes = uint64_t {count - 1u} * selector->stride + 4u;
+		if ((selector->stride & 3u) != 0u || uint64_t {selector->offset} + row_bytes > material.Stride())
+			return false;
+		if (material.NumRecords() > MaxIndirectDescriptorProbes ||
+		    row_bytes * material.NumRecords() > uint64_t {MaxIndirectDescriptorProbes} * 64u)
+			return false;
+		const auto key_for = [&](uint32_t word) {
+			const auto half = (word >> selector->f16_shift) & 0xffffu;
+			const auto fraction = half & 0x3ffu;
+			const auto exponent = (half >> 10u) & 31u;
+			const bool negative = (half & 0x8000u) != 0u;
+			uint32_t key;
+			if (exponent == 31u) {
+				key = fraction != 0u ? 0u : negative ? 0x80000000u : 0x7fffffffu;
+			} else if (exponent < 15u) {
+				key = negative && (exponent != 0u || fraction != 0u) ? UINT32_MAX : 0u;
+			} else {
+				const auto significand = 0x400u | fraction;
+				const auto magnitude = exponent >= 25u ? significand << (exponent - 25u)
+				                                      : significand >> (25u - exponent);
+				const bool fractional = exponent < 25u &&
+				    (significand & ((1u << (25u - exponent)) - 1u)) != 0u;
+				key = negative ? 0u - magnitude - static_cast<uint32_t>(fractional) : magnitude;
+			}
+			key += selector->key_add;
+			return selector->maximum == UINT32_MAX ? key : std::bit_cast<uint32_t>(
+			    std::min(std::bit_cast<int32_t>(key), std::bit_cast<int32_t>(selector->maximum)));
+		};
+		std::vector<uint32_t> row(row_bytes / 4u);
+		// Repeated records do not expand the 16-bit selector domain.
+		std::bitset<1u << 16u> seen;
+		seen.set(0u);
+		// Zero covers out-of-bounds loads and flushed half subnormals.
+		keys.push_back(key_for(0u));
+		for (uint32_t record = 0; record < material.NumRecords(); ++record) {
+			if (!ReadScalarTable(material.Base48(), material.GetSize(),
+			                     uint64_t {record} * material.Stride() + selector->offset, runtime, row))
+				return false;
+			for (uint32_t lane = 0; lane < count; ++lane) {
+				const auto word = row[lane * (selector->stride / 4u)];
+				const auto half = (word >> selector->f16_shift) & 0xffffu;
+				if (seen.test(half)) continue;
+				seen.set(half);
+				keys.push_back(key_for(word));
+				if (keys.size() > MaxIndirectDescriptorProbes) return false;
+			}
+		}
 	} else if (selector->bitset) {
 		ShaderBufferResource material;
 		std::array<uint32_t, 4> masks {};
@@ -501,7 +559,8 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		if (count < domain_count) keys.push_back(0u); // An out-of-bounds scalar read returns zero.
 	}
 	if (selector->byte_ranges.empty()) {
-		if (selector->bit_offset != 0u || selector->bit_mask != UINT32_MAX || selector->maximum != UINT32_MAX)
+		if (selector->f16_shift == UINT32_MAX &&
+		    (selector->bit_offset != 0u || selector->bit_mask != UINT32_MAX || selector->maximum != UINT32_MAX))
 			for (auto& key: keys)
 				key = std::min((key >> selector->bit_offset) & selector->bit_mask, selector->maximum);
 		std::ranges::sort(keys);

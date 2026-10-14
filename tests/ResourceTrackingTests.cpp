@@ -5427,9 +5427,12 @@ void TestSharedAppendSelectorBounds() {
     Valid, PayloadOob, MissingInit, InactiveInit, UnknownInit, DuplicateAtomic,
     WrongAtomicGuard, UnguardedCandidate, WrongStep, WrongLocalIndex, Multiwave,
     OuterReentry, InnerAppendCycle, EarlyCounterRead, WrongConsumerBound, ExtraWriter, CounterAlias,
-    PayloadWrap, CounterOob
+    PayloadWrap, CounterOob, WrongReadMask, WrongCounterMask, WrongCounterReadFirstLaneMask
   };
-  const auto make_plan = [](Variant variant, uint32_t first_base = 1032u, uint32_t consumed_base = 8u) {
+  const auto make_plan = [](Variant variant, uint32_t first_base = 1032u,
+                            uint32_t consumed_base = 8u, bool predicated = false) {
+    predicated |= variant == Variant::WrongReadMask || variant == Variant::WrongCounterMask ||
+                  variant == Variant::WrongCounterReadFirstLaneMask;
     Fixture fixture;
     ShaderComputeInputInfo compute;
     compute.threads_num[0] = 8u;
@@ -5478,7 +5481,15 @@ void TestSharedAppendSelectorBounds() {
         {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(1u)});
     const auto local = fixture.Emit(ValueOpcode::IAdd32,
         {x, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {y, Value(3u)})});
-    auto zero_lane = fixture.Emit(ValueOpcode::IEqual32, {local, Value(0u)});
+    auto zero_lane = predicated
+        ? fixture.Emit(ValueOpcode::LogicalNot,
+            {fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), local})})
+        : fixture.Emit(ValueOpcode::IEqual32, {local, Value(0u)});
+    const auto read_mask = predicated
+        ? fixture.Emit(variant == Variant::WrongCounterReadFirstLaneMask
+                           ? ValueOpcode::UGreaterThanEqual32 : ValueOpcode::ULessThan32,
+                       {local, Value(32u)})
+        : Value(true);
     if (variant == Variant::InactiveInit) zero_lane = Value(false);
     if (variant == Variant::UnknownInit)
       zero_lane = fixture.Emit(ValueOpcode::LogicalAnd,
@@ -5552,9 +5563,20 @@ void TestSharedAppendSelectorBounds() {
     if (variant == Variant::ExtraWriter)
       fixture.Emit(ValueOpcode::WriteSharedU32,
           {Value(0u), Value(UINT32_MAX), Value(true)}, shared(12u), previous);
-    if (final_counter.IsEmpty())
+    if (final_counter.IsEmpty()) {
+      const auto counter_mask = variant == Variant::WrongCounterMask
+          ? fixture.Emit(ValueOpcode::LogicalNot, {read_mask}, 0, previous) : read_mask;
       final_counter = fixture.Emit(ValueOpcode::LoadSharedU32,
-          {Value(0u), Value(true)}, shared(0u), previous);
+          {Value(0u), counter_mask}, shared(0u), previous);
+      if (predicated) {
+        const auto read_first_lane_mask = variant == Variant::WrongCounterReadFirstLaneMask
+            ? Value(true) : read_mask;
+        final_counter = fixture.Emit(ValueOpcode::ReadFirstLane,
+            {fixture.Emit(ValueOpcode::SelectU32,
+                 {read_first_lane_mask, final_counter, Value(UINT32_MAX)}, 0, previous),
+             read_first_lane_mask}, 0, previous);
+      }
+    }
     auto *header = fixture.AddBlock();
     auto *body = fixture.AddBlock();
     auto *latch = fixture.AddBlock();
@@ -5566,13 +5588,20 @@ void TestSharedAppendSelectorBounds() {
         {Value(&index), variant == Variant::WrongConsumerBound ? count[1] : final_counter}, 0, header);
     choose(header, body, exit, in_list, CFG::BranchCondition::VccNonZero);
     fixture.block = body;
-    const auto selected = fixture.Emit(ValueOpcode::LoadSharedU32,
-        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(&index), Value(2u)}), Value(true)},
+    const auto payload_mask = variant == Variant::WrongReadMask
+        ? fixture.Emit(ValueOpcode::LogicalNot, {read_mask}) : read_mask;
+    auto selected = fixture.Emit(ValueOpcode::LoadSharedU32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(&index), Value(2u)}), payload_mask},
         shared(consumed_base));
+    if (predicated)
+      selected = fixture.Emit(ValueOpcode::ReadFirstLane,
+          {fixture.Emit(ValueOpcode::SelectU32,
+               {read_mask, selected, Value(UINT32_MAX)}), read_mask});
     const auto offset32 = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {selected, Value(5u)});
-    const auto offset = fixture.Emit(ValueOpcode::ReadFirstLane,
-        {fixture.Emit(ValueOpcode::IAdd32,
-             {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {offset32, Value(2u)}), offset32}), Value(true)});
+    const auto scaled = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {offset32, Value(2u)}), offset32});
+    const auto offset = predicated ? scaled
+        : fixture.Emit(ValueOpcode::ReadFirstLane, {scaled, Value(true)});
     MemoryInfo scalar;
     scalar.kind = ResourceKind::ScalarBuffer;
     scalar.offset = 144u;
@@ -5591,7 +5620,7 @@ void TestSharedAppendSelectorBounds() {
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
     fixture.Emit(ValueOpcode::ImageSampleRaw,
         {fixture.Image(words), fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
-         fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x50u));
+         fixture.ImageAddress(), read_mask}, fixture.AddMemory(sample, 0x50u));
     branch(body, latch);
     const auto next = fixture.Emit(ValueOpcode::IAdd32, {Value(&index), Value(1u)}, 0, latch);
     branch(latch, header);
@@ -5611,12 +5640,14 @@ void TestSharedAppendSelectorBounds() {
     return ExtractResourcePlan(fixture.program);
   };
   auto plan = make_plan(Variant::Valid);
+  auto predicated_plan = make_plan(Variant::Valid, 1032u, 8u, true);
   make_plan(Variant::PayloadOob); // Ordinary LDS reads beyond the allocation return zero.
   for (const auto variant : {Variant::MissingInit, Variant::InactiveInit, Variant::UnknownInit,
       Variant::DuplicateAtomic, Variant::WrongAtomicGuard, Variant::UnguardedCandidate,
       Variant::WrongStep, Variant::WrongLocalIndex, Variant::Multiwave, Variant::OuterReentry,
       Variant::InnerAppendCycle, Variant::EarlyCounterRead, Variant::WrongConsumerBound, Variant::ExtraWriter,
-      Variant::CounterAlias, Variant::PayloadWrap, Variant::CounterOob})
+      Variant::CounterAlias, Variant::PayloadWrap, Variant::CounterOob, Variant::WrongReadMask,
+      Variant::WrongCounterMask, Variant::WrongCounterReadFirstLaneMask})
     make_plan(variant);
 
   LinearTestMemory memory;
@@ -5655,9 +5686,11 @@ void TestSharedAppendSelectorBounds() {
   memory.words[(144u + 320u) / 4u] = 0xbe7cc577u;
   memory.fail_address = 0x1000u + 144u + 320u;
   user_data[2] = 24u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2u &&
-            snapshot.images[0].dwords[0] == 0x101u && snapshot.images[1].dwords[0] == 0x102u,
-        "a disjoint 24-entry list exposed float fields after the two active material records");
+  for (const auto *current : {&plan, &predicated_plan})
+    Check(MaterializeResources(*current, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 2u && snapshot.images[0].dwords[0] == 0x101u &&
+              snapshot.images[1].dwords[0] == 0x102u,
+          "a disjoint 24-entry list or predicated LDS read scanned unrelated material fields");
   for (const uint64_t address : {0x1800u, 0x1804u})
     Check(std::ranges::find(snapshot.specialization_reads, std::pair{address, uint64_t{4u}}) !=
               snapshot.specialization_reads.end(),
@@ -7896,6 +7929,75 @@ void TestFiniteBufferSelection() {
   }
 }
 
+void TestPredicatedImageKeyRange() {
+  enum class Variant { Bounded, WrongMask, RawArm, SharedChoice };
+  const auto make = [](Variant variant) {
+    auto fixture = std::make_unique<Fixture>();
+    auto &f = *fixture;
+    auto *entry = f.block;
+    auto *left = f.AddBlock();
+    auto *right = f.AddBlock();
+    auto *merge = f.AddBlock();
+    entry->AddBranch(left);
+    entry->AddBranch(right);
+    left->AddBranch(merge);
+    right->AddBranch(merge);
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    const auto active = f.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+    const auto other = f.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
+    const auto raw = f.Emit(ValueOpcode::UndefU32);
+    const auto bounded = f.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(255u)});
+    const auto shared = f.Emit(ValueOpcode::SelectU32, {active, raw, Value(0u)});
+    const auto overwritten = f.Emit(ValueOpcode::SelectU32, {active, raw, shared});
+    const auto selected = f.Emit(ValueOpcode::SelectU32,
+        {variant == Variant::WrongMask ? other : active, bounded,
+         variant == Variant::RawArm ? raw : overwritten}, 0, right);
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(left, variant == Variant::SharedChoice
+        ? f.Emit(ValueOpcode::SelectU32, {other, bounded, shared}, 0, left) : Value(0u));
+    phi.AddPhiOperand(right, selected);
+    f.block = merge;
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {Value(&phi), Value(true)});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    const auto table = f.Address(f.UserData(0u), f.UserData(1u));
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word)
+      words[word] = f.Emit(ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)},
+          f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = word * 4u}, 0x1384u));
+    f.Emit(ValueOpcode::ImageRead, {f.Image(words), f.ImageAddress(), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Image, .dmask = 1u,
+                     .image_dimension = Decoder::ImageDimension::Dim2D}, 0x1390u));
+    return fixture;
+  };
+  auto fixture = make(Variant::Bounded);
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  const auto &source = plan.descriptor_sources[plan.info.images[0].source];
+  Check(source.indirect_descriptor && source.indirect_descriptor->key_count == Value(256u),
+        "predicated image key retained overwritten values outside its byte range");
+  LinearTestMemory memory;
+  for (uint32_t key = 0; key < 256u; ++key) {
+    const std::array<uint32_t, 8> words{0x20u + key, 75u << 20u, 0u,
+        Libs::Graphics::DstSel(4, 5, 6, 7) | (9u << 28u), 0u, 0u, 0u, 0u};
+    std::copy(words.begin(), words.end(), memory.words.begin() + key * 8u);
+  }
+  memory.fail_address = memory.base + 256u * 32u;
+  const std::array<uint32_t, 2> data{static_cast<uint32_t>(memory.base), 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = data, .userdata = &memory,
+            .read_specialization_memory = ReadLinearTestMemory}, snapshot, specialization) &&
+            snapshot.images.size() == 256u && snapshot.images.front().dwords[0] == 0x20u &&
+            snapshot.images.back().dwords[0] == 0x11fu,
+        "predicated image key lost a reachable descriptor or exceeded its domain");
+  for (const auto variant : {Variant::WrongMask, Variant::RawArm, Variant::SharedChoice}) {
+    auto rejected = make(variant);
+    CheckFatal([&] { rejected->PlanAndTrack(); }, "not a valid runtime value",
+               "predicated image key accepted an unbounded path or reused another path's assumption");
+  }
+}
+
 void TestPackedScalarBufferSelection() {
   const auto make = [](uint32_t shift_mask = 24u, bool cycle = false, uint32_t store_offset = 0u,
                        bool byte_store = false) {
@@ -9585,6 +9687,7 @@ int main() {
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
+    Run("predicated image key range", TestPredicatedImageKeyRange);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);

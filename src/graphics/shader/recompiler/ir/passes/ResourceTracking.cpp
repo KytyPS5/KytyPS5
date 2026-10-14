@@ -2469,59 +2469,56 @@ private:
 					count = Value(maximum + 1u);
 			}
 		}
-		// Raw pointers have no V# bounds for enumerating an unbounded selector domain.
-		if (memory->kind == ResourceKind::ScalarAddress && count.IsEmpty() &&
-		    workgroup_axis == UINT32_MAX) return false;
-		const bool rows = count.IsEmpty() && workgroup_axis == UINT32_MAX && memory->offset == 0u &&
-		    MatchCountedRows(*read, count_source, row_stride);
-		if (rows) {
-			stride = 4u;
-			offset = 0u;
-		} else if (count.IsEmpty() && workgroup_axis == UINT32_MAX &&
-		           !require_bound && allow_scalar_domain && affine && stride != 0u) {
-			// The bounded selector V# covers this complete U32 address congruence
-			// class, including the zero value of out-of-bounds scalar reads.
-			stride = 1u << std::countr_zero(stride);
-			offset %= stride;
-		} else if (count.IsEmpty() && workgroup_axis == UINT32_MAX) {
-			auto address = read->Arg(1);
-			auto active = Value(true);
-			const auto* lane = address.Resolve().TryInstruction();
-			const bool selected_lane = lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadFirstLane;
-			if (selected_lane) {
-				active = lane->Arg(1);
-				address = lane->Arg(0);
-			}
-			AffineOffset affine;
-			if (!MatchAffineOffset(address, active, affine) ||
-			    affine.index.IsEmpty() || affine.stride == 0u) return false;
-			if (!selected_lane) lane = affine.index.Resolve().TryInstruction();
-			if (lane == nullptr || lane->GetOpcode() != ValueOpcode::ReadFirstLane) return false;
-			if (!HasActiveLane(lane->Arg(1), lane->Parent()) &&
-			    (!AvailableBefore(*lane, image) || image.Uses().empty() ||
-			     !std::ranges::all_of(image.Uses(), [&](const Use& use) {
-				     return use.operand == 0u &&
-				            use.user->GetOpcode() == ValueOpcode::ImageSampleRaw &&
-				            Implies(use.user->Arg(3), lane->Arg(1));
-			     })))
-				return false;
-			if (selected_lane) count = SharedLoadBound(affine.index, active);
-			if (!count.IsEmpty() && ((affine.stride | affine.offset) & 3u) == 0u &&
-			    affine.offset + base_offset <= UINT32_MAX) {
-				stride = static_cast<uint32_t>(affine.stride);
-				offset = static_cast<uint32_t>(affine.offset);
+		bool rows = false;
+		if (count.IsEmpty() && workgroup_axis == UINT32_MAX) {
+			// Raw pointers have no V# bounds for enumerating an unbounded selector domain.
+			if (memory->kind == ResourceKind::ScalarAddress) return false;
+			rows = memory->offset == 0u && MatchCountedRows(*read, count_source, row_stride);
+			if (rows) {
+				stride = 4u;
+				offset = 0u;
+			} else if (!require_bound && allow_scalar_domain && affine) {
+				// The bounded selector V# covers this complete U32 address congruence
+				// class, including the zero value of out-of-bounds scalar reads.
+				stride = 1u << std::countr_zero(stride);
+				offset %= stride;
 			} else {
-				count = {};
-				// Without a bounded source, U32 multiplication's complete offset domain
-				// is one congruence class rather than the V#'s structured record stride.
-				const auto divisor = std::gcd(affine.stride, uint64_t {1} << 32u);
-				stride = static_cast<uint32_t>(std::max<uint64_t>(divisor, 4u));
-				offset = static_cast<uint32_t>(affine.offset % divisor) & ~3u;
+				auto address = read->Arg(1);
+				const auto* lane = address.Resolve().TryInstruction();
+				const bool selected_lane = lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadFirstLane;
+				if (selected_lane) address = lane->Arg(0);
+				AffineOffset affine;
+				if (!MatchAffineOffset(address, selected_lane ? lane->Arg(1) : Value(true), affine) ||
+				    affine.index.IsEmpty() || affine.stride == 0u) return false;
+				if (!selected_lane) lane = affine.index.Resolve().TryInstruction();
+				if (lane == nullptr || lane->GetOpcode() != ValueOpcode::ReadFirstLane) return false;
+				const auto active = lane->Arg(1);
+				if (!HasActiveLane(active, lane->Parent()) &&
+				    (!AvailableBefore(*lane, image) || image.Uses().empty() ||
+				     !std::ranges::all_of(image.Uses(), [&](const Use& use) {
+					     return use.operand == 0u &&
+					            use.user->GetOpcode() == ValueOpcode::ImageSampleRaw &&
+					            Implies(use.user->Arg(use.user->NumArgs() - 1u), active);
+				     })))
+					return false;
+				count = SharedLoadBound(selected_lane ? affine.index : lane->Arg(0), active);
+				if (!count.IsEmpty() && ((affine.stride | affine.offset) & 3u) == 0u &&
+				    affine.offset + base_offset <= UINT32_MAX) {
+					stride = static_cast<uint32_t>(affine.stride);
+					offset = static_cast<uint32_t>(affine.offset);
+				} else {
+					count = {};
+					// Without a bounded source, U32 multiplication's complete offset domain
+					// is one congruence class rather than the V#'s structured record stride.
+					const auto divisor = std::gcd(affine.stride, uint64_t {1} << 32u);
+					stride = static_cast<uint32_t>(std::max<uint64_t>(divisor, 4u));
+					offset = static_cast<uint32_t>(affine.offset % divisor) & ~3u;
+				}
 			}
+			// A bounded image heap already supports GPU selection. Only enumerate a
+			// narrower proven selector domain instead of scanning unrelated material data.
+			if (require_bound && count.IsEmpty() && !rows) return false;
 		}
-		// A bounded image heap already supports GPU selection. Only enumerate a
-		// narrower proven selector domain instead of scanning unrelated material data.
-		if (require_bound && count.IsEmpty() && workgroup_axis == UINT32_MAX && !rows) return false;
 		if (!MakeRuntimeTableSource(*read, material_source)) return false;
 		const auto* scan = index.Resolve().TryInstruction();
 		// Cleared bits cannot reappear during the scan; only initial bitmap bits select records.
@@ -3628,26 +3625,43 @@ private:
 				    Implies(guard, Value(use.user))) nonnegative = true;
 			}
 		}
-		struct Arm { Value value; const Inst* choice = nullptr; bool positive = true; };
+		struct Arm {
+			Value value;
+			const Inst* choice = nullptr;
+			bool positive = true;
+			std::vector<std::pair<Value, bool>> predicates;
+		};
 		std::vector<Arm> pending {{value}};
-		std::vector<const Inst*> visited;
+		std::vector<Arm> visited;
 		uint32_t maximum = 0u;
 		bool found = false;
 		bool counted = true;
 		Value count;
 		for (size_t at = 0; at < pending.size(); ++at) {
+			const auto state = pending[at];
+			const auto normalize = [&](Value input) {
+				for (;;) {
+					input = ActiveValue(input, guard);
+					const auto* select = input.TryInstruction();
+					if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32) return input;
+					const auto predicate = std::ranges::find(state.predicates, select->Arg(0).Resolve(),
+					    &std::pair<Value, bool>::first);
+					if (predicate == state.predicates.end()) return input;
+					input = select->Arg(predicate->second ? 1u : 2u);
+				}
+			};
 			uint32_t literal;
-			const auto current = ActiveValue(pending[at].value, guard);
+			const auto current = normalize(state.value);
 			if (ImmediateU32(current, literal)) {
 				if (nonnegative && std::bit_cast<int32_t>(literal) < 0) continue;
 				maximum = std::max(maximum, literal);
 				found = true;
 				if (counted) {
 					Value candidate;
-					if (const auto* choice = pending[at].choice; choice != nullptr) {
+					if (const auto* choice = state.choice; choice != nullptr) {
 						if (choice->GetOpcode() == ValueOpcode::SelectU32)
-							candidate = UnsignedBound(choice->Arg(0), current, pending[at].positive,
-							    false, pending[at].positive ? choice->Arg(0) : Value {});
+							candidate = UnsignedBound(choice->Arg(0), current, state.positive,
+							    false, state.positive ? choice->Arg(0) : Value {});
 						if (candidate.IsEmpty() && choice->Parent() != nullptr)
 							candidate = UnsignedBoundOnEntry(current, choice->Parent());
 					}
@@ -3660,15 +3674,30 @@ private:
 			const auto* choice = current.TryInstruction();
 			if (choice == nullptr) return {};
 			const bool phi = choice->GetOpcode() == ValueOpcode::Phi;
-			if ((!phi && choice->GetOpcode() != ValueOpcode::SelectU32) ||
-			    (phi && (choice->NumArgs() == 0u || choice->Parent() == nullptr ||
-			             InCycle(choice->Parent())))) return {};
+			if (!phi && choice->GetOpcode() != ValueOpcode::SelectU32) {
+				const auto bits = PossibleU32Bits(current);
+				if (bits == UINT32_MAX) return {};
+				maximum = std::max(maximum, bits);
+				found = true;
+				counted = false;
+				continue;
+			}
+			if (phi && (choice->NumArgs() == 0u || choice->Parent() == nullptr ||
+			            InCycle(choice->Parent()))) return {};
 			// Each literal uses only its own choice and block-entry proof. A shared
 			// choice therefore cannot borrow a bound from a different parent path.
-			if (std::ranges::find(visited, choice) != visited.end()) continue;
-			visited.push_back(choice);
-			for (size_t arm = phi ? 0u : 1u; arm < choice->NumArgs(); ++arm)
-				pending.push_back({choice->Arg(arm), choice, arm == 1u});
+			if (std::ranges::any_of(visited, [&](const Arm& prior) {
+				return prior.value == current && prior.predicates == state.predicates;
+			})) continue;
+			visited.push_back({.value = current, .predicates = state.predicates});
+			for (size_t arm = phi ? 0u : 1u; arm < choice->NumArgs(); ++arm) {
+				// Reconvergent selectors can multiply path-sensitive states.
+				if (pending.size() >= 4096u) return {};
+				auto predicates = state.predicates;
+				// Earlier writes under this same EXEC cannot survive its false arm.
+				if (!phi) predicates.emplace_back(choice->Arg(0).Resolve(), arm == 1u);
+				pending.push_back({choice->Arg(arm), choice, arm == 1u, std::move(predicates)});
+			}
 		}
 		return found ? SelectorDomain {maximum, counted ? count : Value {}} : SelectorDomain {};
 	}

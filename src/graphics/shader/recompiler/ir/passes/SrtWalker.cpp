@@ -1399,6 +1399,13 @@ void SrtTape::Run(const ResourcePlan& program, const SrtRuntime& runtime) const 
 			args[index] = m_values[step.args[index]];
 		}
 		uint64_t out = 0;
+		// As the walker: a pure operation that its first argument decides needs no other.
+		if (step.kind == StepKind::Pure && step.arg_count != 0u && m_ok[step.args[0]] != 0u &&
+		    DecidedByFirst(*step.inst, args[0], out)) {
+			m_values[step.out] = out;
+			m_ok[step.out]     = 1u;
+			continue;
+		}
 		if (ok) {
 			switch (step.kind) {
 				case StepKind::UserData:

@@ -1162,6 +1162,114 @@ void TestTapeMatchesWalker() {
         "a plan without its user data materialized");
 }
 
+// A program whose one SRT read is `make(program, block, user_data)`. Its plans point into it: the
+// caller keeps it while they are used.
+template <typename Make>
+Libs::Graphics::ShaderRecompiler::IR::Program OneReadProgram(Make make) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const auto user_data = [&](uint32_t index) {
+    return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(index))}));
+  };
+  program.srt_reads.push_back({make(program, block, user_data), 0});
+  return program;
+}
+
+// The plans of `program`, as the tape and as the walker.
+std::pair<Libs::Graphics::ShaderRecompiler::IR::ResourcePlan,
+          Libs::Graphics::ShaderRecompiler::IR::ResourcePlan>
+TapeAndWalkPlans(const Libs::Graphics::ShaderRecompiler::IR::Program &program) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto tape_plan = ExtractResourcePlan(program);
+  auto walk_plan = ExtractResourcePlan(program);
+  Check(tape_plan.srt_tape != nullptr, "a plain plan got no tape");
+  walk_plan.srt_tape = nullptr;
+  return {std::move(tape_plan), std::move(walk_plan)};
+}
+
+// A constant buffer read past the end of the buffer reads zero, and reads no memory, in the tape
+// as in the walker.
+void TestTapeReadsPastTheEndAsZero() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (const uint32_t offset : {8u, 16u}) {
+    const auto program = OneReadProgram([&](Program &program, auto &block,
+                                            const auto &user_data) {
+      program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer});
+      auto &buffer = block.AppendNewInst(ValueOpcode::GetBufferResource,
+                                         {user_data(0), user_data(1), Value(16u), Value(0u)});
+      auto &read = block.AppendNewInst(ValueOpcode::ReadConstBuffer,
+                                       {Value(&buffer), Value(offset)});
+      read.SetFlags(MemoryFlags{.index = 0});
+      // The buffer the read goes through, as a resource of the program.
+      DescriptorSource source;
+      source.dwords = {user_data(0), user_data(1), Value(16u), Value(0u)};
+      source.dword_count = 4;
+      program.descriptor_sources.push_back(source);
+      program.info.buffers.push_back({.source = 0});
+      return Value(&read);
+    });
+    auto [tape_plan, walk_plan] = TapeAndWalkPlans(program);
+    const std::array<uint32_t, 4> memory{0x11u, 0x22u, 0x33u, 0x44u};
+    const auto base = reinterpret_cast<uint64_t>(memory.data());
+    const std::array<uint32_t, 2> user_data{static_cast<uint32_t>(base),
+                                            static_cast<uint32_t>(base >> 32u)};
+    struct Reads { uint32_t count = 0; } tape_reads, walk_reads;
+    const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+      ++static_cast<Reads *>(data)->count;
+      std::memcpy(words.data(), reinterpret_cast<const void *>(address), sizeof(uint32_t));
+      return true;
+    };
+    ResourceSnapshot tape_snapshot;
+    ResourceSnapshot walk_snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(tape_plan,
+                               {.user_data = user_data, .read_memory = read, .userdata = &tape_reads},
+                               tape_snapshot, specialization) &&
+              MaterializeResources(walk_plan,
+                                   {.user_data = user_data, .read_memory = read,
+                                    .userdata = &walk_reads},
+                                   walk_snapshot, specialization),
+          "a constant buffer read failed");
+    const bool past_end = offset == 16u;
+    Check(tape_snapshot.flattened_srt == std::vector<uint32_t>{past_end ? 0u : 0x33u} &&
+              tape_snapshot.flattened_srt == walk_snapshot.flattened_srt,
+          "a read past the end of the buffer did not read zero in both");
+    Check(tape_reads.count == walk_reads.count && tape_reads.count == (past_end ? 0u : 1u),
+          "a read past the end of the buffer read memory");
+  }
+}
+
+// `0 <= x` holds for every U32 x, also an x that is not known: the tape gives what the walker
+// gives. A first argument other than zero needs the second, and both fail without it.
+void TestTapeZeroLowerBound() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto program = OneReadProgram([](Program &, auto &block, const auto &user_data) {
+    // User data 7 is past the end of what the test gives: its value is not known.
+    return Value(&block.AppendNewInst(ValueOpcode::ULessThanEqual32,
+                                      {user_data(0), user_data(7)}));
+  });
+  auto [tape_plan, walk_plan] = TapeAndWalkPlans(program);
+  for (const uint32_t first : {0u, 1u}) {
+    const std::array<uint32_t, 1> user_data{first};
+    ResourceSnapshot tape_snapshot;
+    ResourceSnapshot walk_snapshot;
+    ResourceSpecialization specialization;
+    const bool taped = MaterializeResources(tape_plan, {.user_data = user_data}, tape_snapshot,
+                                            specialization);
+    const bool walked = MaterializeResources(walk_plan, {.user_data = user_data}, walk_snapshot,
+                                             specialization);
+    Check(taped == walked && taped == (first == 0u),
+          "the tape and the walker decided a zero lower bound apart");
+    Check(!taped || tape_snapshot.flattened_srt == std::vector<uint32_t>{1u},
+          "a zero lower bound did not accept an unknown value");
+  }
+}
+
 // A plan whose walk depends on runtime values, or that needs the strict reader, keeps the walker.
 // Each case changes the plain program in one way; the plan is made as the renderer makes it.
 void TestRuntimeChoicesKeepTheWalker() {
@@ -1460,6 +1568,8 @@ int main() {
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSpecializationFitsTheShader();
   TestTapeMatchesWalker();
+  TestTapeReadsPastTheEndAsZero();
+  TestTapeZeroLowerBound();
   TestRuntimeChoicesKeepTheWalker();
   TestTapeBuildsEveryOperationTheWalkerEvaluates();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);

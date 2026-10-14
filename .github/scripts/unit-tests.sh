@@ -64,6 +64,7 @@ names=(
 	submit_plan
 	sync_on_address
 	trophy_system
+	vdecsw
 	video_out_resolution
 	virtual_memory_allocation
 	write_heat

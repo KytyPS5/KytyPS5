@@ -63,6 +63,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderBufferInt64Atomics  = VK_TRUE;
 	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+	features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
 
@@ -284,6 +285,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
 		              "shaderSampledImageArrayNonUniformIndexing",
 		              required_features12.shaderSampledImageArrayNonUniformIndexing);
+		check_feature(features12.shaderStorageBufferArrayNonUniformIndexing,
+		              "shaderStorageBufferArrayNonUniformIndexing",
+		              required_features12.shaderStorageBufferArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
@@ -549,9 +553,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
-	graphics.depth_color_copy_enabled = maintenance8_extension && maintenance8.maintenance8;
-	LOGF("Vulkan depth/color copy support: %s\n",
-	     graphics.depth_color_copy_enabled ? "true" : "false");
+	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	LOGF("Vulkan maintenance8 support: %s\n",
+	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
@@ -648,7 +652,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
-	if (graphics.depth_color_copy_enabled) {
+	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
@@ -685,6 +689,11 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	        });
 
 	r.enable_validation_layers = Config::VulkanValidationEnabled();
+	if (Config::HdrEnabled() &&
+	    HasExtension(r.available_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) &&
+	    !HasExtension(r.required_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+		r.required_extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+	}
 
 	if (HasExtension(r.available_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
 		r.required_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);

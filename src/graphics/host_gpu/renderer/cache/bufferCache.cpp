@@ -27,6 +27,26 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
+                                        StreamBuffer& staging, uint64_t size, uint64_t alignment,
+                                        vk::BufferUsageFlags usage, const auto& write) {
+	const auto [mapped, offset] = staging.Map(size, alignment);
+	if (mapped != nullptr) {
+		write(mapped, offset);
+		staging.Commit();
+		return {&staging, offset};
+	}
+
+	// Large transfers use the same one-time host allocation as ordinary buffer uploads.
+	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
+	                                         usage, size);
+	write(temporary->Mapped().data(), 0);
+	temporary->Flush(0, size);
+	auto* buffer = temporary.get();
+	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {buffer, 0};
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -447,28 +467,17 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
-	if (mapped != nullptr) {
+	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
+	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
+				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
 			copy.srcOffset += base_offset;
 		}
-		m_staging_buffer.Commit();
-		return m_staging_buffer.Handle();
-	}
-
-	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
-	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
-	for (const auto& copy: copies) {
-		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
-	}
-	temporary->Flush(0, total_size);
-	const auto handle = temporary->Handle();
-	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
-	return handle;
+	});
+	return source.first->Handle();
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -486,7 +495,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
@@ -521,12 +532,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
-	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
+	    [&](uint8_t* mapped, uint64_t) {
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		}
+	});
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {

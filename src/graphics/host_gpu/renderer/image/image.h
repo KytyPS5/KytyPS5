@@ -29,10 +29,8 @@ struct CachedImageView {
 };
 
 struct ImageUsage {
-	bool texture       = false;
 	bool storage       = false;
 	bool render_target = false;
-	bool depth_target  = false;
 	bool video_out     = false;
 };
 
@@ -70,40 +68,25 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
-	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
-		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
-			m_cpu_dirty        = true;
-			m_maybe_cpu_dirty  = false;
-			m_maybe_hash_valid = false;
-		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
-			m_maybe_cpu_dirty = true;
-		}
+	void MarkCpuDirty() {
+		m_cpu_dirty       = true;
+		m_maybe_cpu_dirty = false;
 	}
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
 	[[nodiscard]] bool IsDefinitelyCpuDirty() const { return m_cpu_dirty; }
 	[[nodiscard]] bool IsMaybeCpuDirty() const { return m_maybe_cpu_dirty; }
 	void               MarkMaybeCpuDirty() {
-		if (!m_cpu_dirty) {
+		if (!IsCpuDirty()) {
+			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
 		}
 	}
-	[[nodiscard]] bool NeedsMaybeCpuHash() const {
-		return m_maybe_cpu_dirty && !m_maybe_hash_valid;
-	}
-	void SetMaybeCpuHash(uint64_t hash) {
-		if (!NeedsMaybeCpuHash()) {
-			EXIT("image cannot initialize maybe-dirty hash\n");
-		}
-		m_maybe_cpu_hash   = hash;
-		m_maybe_hash_valid = true;
-	}
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
-		if (!m_maybe_cpu_dirty || !m_maybe_hash_valid || m_cpu_dirty) {
+		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
 			EXIT("image cannot resolve maybe-dirty hash\n");
 		}
-		m_maybe_cpu_dirty  = false;
-		m_maybe_hash_valid = false;
+		m_maybe_cpu_dirty = false;
 		m_cpu_dirty |= hash != m_maybe_cpu_hash;
 		return m_cpu_dirty;
 	}
@@ -112,9 +95,8 @@ public:
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
 		}
-		m_cpu_dirty        = false;
-		m_maybe_cpu_dirty  = false;
-		m_maybe_hash_valid = false;
+		m_cpu_dirty       = false;
+		m_maybe_cpu_dirty = false;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -149,6 +131,8 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// Stencil associations that refer to this depth image.
+	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
@@ -165,12 +149,11 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
-	uint64_t          m_maybe_cpu_hash   = 0;
-	bool              m_cpu_dirty        = false;
-	bool              m_maybe_cpu_dirty  = false;
-	bool              m_maybe_hash_valid = false;
-	bool              m_gpu_modified     = false;
-	bool              m_buffer_modified  = false;
+	uint64_t          m_maybe_cpu_hash  = 0;
+	bool              m_cpu_dirty       = false;
+	bool              m_maybe_cpu_dirty = false;
+	bool              m_gpu_modified    = false;
+	bool              m_buffer_modified = false;
 };
 
 namespace ImageOps {

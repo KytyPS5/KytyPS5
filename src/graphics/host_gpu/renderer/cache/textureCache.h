@@ -26,7 +26,14 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
+class TextureCache;
 struct TextureCacheTestAccess;
+
+namespace BcAlias {
+[[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
+[[nodiscard]] bool Publish(TextureCache& cache, Image& image);
+void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+} // namespace BcAlias
 
 class TextureCache {
 public:
@@ -181,6 +188,9 @@ private:
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
+	friend bool BcAlias::Publish(TextureCache&, Image&);
+	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 
 } // namespace Libs::Graphics

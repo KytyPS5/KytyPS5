@@ -272,6 +272,7 @@ public:
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
 	Graphics::RenderContext& Renderer() const noexcept { return m_renderer; }
+	bool                     IsHdrSupported() const noexcept { return m_presenter.IsHdrSupported(); }
 
 	void VblankBegin();
 	void VblankEnd();
@@ -557,14 +558,6 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	Graphics::VideoOutPixelFormatInfo pixel_format {};
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
 		EXIT("unsupported video-out pixel format: 0x%016" PRIx64 "\n", attribute.pixel_format);
-	}
-	if (attribute.pixel_format == Graphics::VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ) {
-		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-		if (!warned.test_and_set(std::memory_order_relaxed)) {
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Warning: HDR-to-SDR conversion is not implemented; displaying PQ video-out "
-			    "pixels unchanged (format=0x{:016x}).\n", attribute.pixel_format));
-		}
 	}
 	const auto          tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
 	Graphics::ImageInfo info {};
@@ -1071,31 +1064,31 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	uint32_t            height  = 0;
 	bool                current = false;
 	bool                premultiplied_alpha = false;
+	bool                hdr                 = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
 		current = cfg->opened && !cfg->closing && cfg->generation == generation;
-		if (current) {
-			if (special) {
-				width  = cfg->width;
-				height = cfg->height;
-			} else {
-				const auto& surface = cfg->buffers[index];
-				if (!surface.Occupied()) {
-					EXIT("cannot prepare flip from an unregistered surface, id=%" PRIu64
-					     " index=%d\n",
-					     request_id, index);
-				}
-				if (surface.group_index >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX ||
-				    !cfg->groups[surface.group_index].occupied) {
-					EXIT("video-out surface references an unavailable attribute group, id=%" PRIu64
-					     " index=%d group=%d\n",
-					     request_id, index, surface.group_index);
-				}
-				source_info = cfg->groups[surface.group_index].ImageInfo(surface);
-				premultiplied_alpha =
-				    (cfg->groups[surface.group_index].attribute.option &
-				     VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED) != 0;
+		if (current && special) {
+			width  = cfg->width;
+			height = cfg->height;
+		} else if (current) {
+			const auto& surface = cfg->buffers[index];
+			if (!surface.Occupied()) {
+				EXIT("cannot prepare flip from an unregistered surface, id=%" PRIu64
+				     " index=%d\n",
+				     request_id, index);
 			}
+			if (surface.group_index >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX ||
+			    !cfg->groups[surface.group_index].occupied) {
+				EXIT("video-out surface references an unavailable attribute group, id=%" PRIu64
+				     " index=%d group=%d\n",
+				     request_id, index, surface.group_index);
+			}
+			const auto& group   = cfg->groups[surface.group_index];
+			source_info         = group.ImageInfo(surface);
+			hdr                 = Graphics::IsHdrVideoOutPixelFormat(group.attribute.pixel_format);
+			premultiplied_alpha = (group.attribute.option &
+			                       VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED) != 0;
 		}
 	}
 	if (!current) {
@@ -1108,12 +1101,18 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
+	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+	if (hdr && !m_presenter.IsHdrSupported() && !warned.test_and_set(std::memory_order_relaxed)) {
+		Log::WriteToConsoleAndLog(
+		    "Warning: HDR output is unavailable; HDR-to-SDR conversion is not implemented, "
+		    "displaying PQ video-out pixels unchanged.\n");
+	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr);
 	}
 
 	Common::LockGuard lock(m_mutex);
@@ -1790,11 +1789,14 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 
 	int32_t attribute3 = 0;
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
+	int32_t attribute = 0;
+	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
+	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
 	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
-	status->dynamicRange = 1;
+	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
 	         ? VIDEO_OUT_REFRESH_RATE_119_88HZ

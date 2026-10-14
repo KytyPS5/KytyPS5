@@ -180,6 +180,12 @@
               <property name="text"><string>Accurate texture synchronization</string></property>
              </widget>
             </item>
+            <item row="8" column="1">
+             <widget class="QCheckBox" name="checkBox_hdr">
+              <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
+              <property name="text"><string>Enable HDR display support</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
@@ -320,6 +326,23 @@
           </item>
          </layout>
         </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="network_tab">
+      <attribute name="title"><string>Network</string></attribute>
+      <layout class="QVBoxLayout" name="networkTabLayout">
+       <item>
+        <widget class="QCheckBox" name="checkBox_network_connected">
+         <property name="toolTip"><string>Let games use your computer's local network connection.</string></property>
+         <property name="text"><string>Enable network connection</string></property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="networkSpacer">
+         <property name="orientation"><enum>Qt::Vertical</enum></property>
+         <property name="sizeHint" stdset="0"><size><width>20</width><height>40</height></size></property>
+        </spacer>
        </item>
       </layout>
      </widget>

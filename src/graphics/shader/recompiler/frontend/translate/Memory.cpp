@@ -578,11 +578,13 @@ void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
 	const auto address = ReadU32(inst.src0);
-	const IR::Value value =
-	    memory.data_dwords == 2u ? IR::Value(ReadU64(inst.src1)) : IR::Value(ReadU32(inst.src1));
+	const auto read = [&](const Decoder::Operand& operand) -> IR::Value {
+		return memory.data_dwords == 2u ? IR::Value(ReadU64(operand)) : IR::Value(ReadU32(operand));
+	};
+	const auto value = read(inst.src1);
 	const auto flags = AddMemoryInfo(memory, inst.pc);
 	const auto result = inst.src_count == 3u
-	                        ? ir.Emit(opcode, {address, value, ReadU32(inst.src2), ir.GetExec()}, flags)
+	                        ? ir.Emit(opcode, {address, value, read(inst.src2), ir.GetExec()}, flags)
 	                        : ir.Emit(opcode, {address, value, ir.GetExec()}, flags);
 	if (returns_value) {
 		WriteOperand(inst.dst, result);
@@ -687,7 +689,8 @@ void Translator::IMAGE_SAMPLE(const Decoder::Instruction& inst) {
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageSampleRaw, {resource, sampler, address},
+	const auto result   = ir.Emit(IR::ValueOpcode::ImageSampleRaw,
+	                              {resource, sampler, address, ir.GetExec()},
 	                              AddMemoryInfo(memory, inst.pc));
 	const bool dref     = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u;
 	if (dref && memory.data_bits != 16u) {
@@ -714,7 +717,7 @@ void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	     has_lod ? resource.Instruction()->Arg(1) : IR::Value(0u),
 	     has_lod ? resource.Instruction()->Arg(3) : IR::Value(0u),
 	     has_lod ? sampler.Instruction()->Arg(1) : IR::Value(0u),
-	     has_lod ? sampler.Instruction()->Arg(2) : IR::Value(0u)},
+	     has_lod ? sampler.Instruction()->Arg(2) : IR::Value(0u), ir.GetExec()},
 	    AddMemoryInfo(memory, inst.pc));
 	for (uint32_t index = 0; index < memory.data_dwords; index++) {
 		WriteOperand(OffsetOperand(inst.dst, index),
@@ -1072,6 +1075,10 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax32, false);
 		case Decoder::Opcode::DS_MAX_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax32, true);
+		case Decoder::Opcode::DS_MAX_RTN_U64:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax64, true);
+		case Decoder::Opcode::DS_CMPST_RTN_B64:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicCmpSwap64, true);
 		case Decoder::Opcode::DS_AND_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicAnd32, false);
 		case Decoder::Opcode::DS_AND_RTN_B32:

@@ -608,16 +608,19 @@ enum class CbColorMode : uint8_t {
 	DccDecompress      = 6,
 };
 
-static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
+bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
+                                                   uint32_t render_target_slice_offset) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
-	// These special modes run color-buffer metadata or decompression operations. The shader is a
-	// vehicle for that operation, and its exported color must not be applied as a normal draw.
-	// Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
-	// hardware pass is emitted. Tracked DCC clear state is materialized on attachment bind;
-	// future CMask/FMask support can consume its state through the same TextureCache path.
-	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
-	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
+	if (mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear)) {
+		// FCE can precede any ordinary draw. Discover the target to materialize its native
+		// clear metadata before the expanded image is sampled.
+		RenderColorInfo target {};
+		ResolveRenderColorTarget(buffer, target, render_target_slice_offset, 0, true);
+		return true;
+	}
+	// Metadata/decompression shaders must not export colors into the expanded image.
+	return mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
@@ -1038,7 +1041,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	const auto& hw = buffer.GetRegisters();
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
-	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().depth_color_copy_enabled ||
+	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().maintenance8_enabled ||
 	                     !Prospero::IsRectList(ucfg.GetPrimType()) ||
 	                     draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
 	                     emit.first_vertex != 0 || emit.first_instance != 0 ||
@@ -1257,7 +1260,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
@@ -1370,7 +1374,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;

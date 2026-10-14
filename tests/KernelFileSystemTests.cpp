@@ -35,6 +35,9 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -898,6 +901,11 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   using WriteCounter = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint8_t, uint64_t,
                                            uint8_t, uint32_t);
   using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
+  using WriteImmediately = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t,
+                                               uint32_t);
+  using MeasureWriteAddress = uint64_t (KYTY_SYSV_ABI *)(volatile uint64_t *, uint64_t);
+  using MeasureWriteImmediately = uint64_t (KYTY_SYSV_ABI *)(volatile uint64_t *, uint64_t,
+                                                           uint32_t);
   using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
                                        void *, uint64_t, uint64_t);
   using WriteKernelEvent = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint64_t,
@@ -916,6 +924,9 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   const auto wait_counter = reinterpret_cast<WaitCounter>(find("cQb8Zr8Q0Y0"));
   const auto write_counter = reinterpret_cast<WriteCounter>(find("jK+yuYCI7MA"));
   const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
+  const auto write_immediately = reinterpret_cast<WriteImmediately>(find("j0+3uJMxYJY"));
+  const auto measure_write_address = reinterpret_cast<MeasureWriteAddress>(find("C+IEj+BsAFM"));
+  const auto measure_write_immediately = reinterpret_cast<MeasureWriteImmediately>(find("4fgtGfXDrFc"));
   const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
   const auto write_event = reinterpret_cast<WriteKernelEvent>(find("H896Pt-yB4I"));
   const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
@@ -927,7 +938,7 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
     std::array<uint32_t, 256> data {};
   };
   std::array<Buffer, 4> buffers;
-  const auto reset = [&](size_t apr_count) {
+  const auto reset = [&](size_t apr_count, uint32_t data_size = sizeof(Buffer::data)) {
     for (size_t i = 0; i < buffers.size(); ++i) {
       auto &buffer = buffers[i];
       construct(buffer.header.data());
@@ -936,10 +947,60 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
       } else {
         construct_amm(buffer.header.data());
       }
-      Check(set_buffer(buffer.header.data(), buffer.data.data(), sizeof(buffer.data)) == OK,
+      Check(set_buffer(buffer.header.data(), buffer.data.data(), data_size) == OK,
             "initialize AMPR command buffer");
     }
   };
+  struct LiteralWrite { uint64_t value; uint32_t size; };
+  constexpr std::array literal_writes {
+      LiteralWrite{0, 8}, LiteralWrite{3, 8}, LiteralWrite{4, 12},
+      LiteralWrite{(uint64_t{1} << 34) - 1, 12},
+      LiteralWrite{uint64_t{1} << 34, 16}, LiteralWrite{UINT64_MAX, 16}};
+  for (const auto &literal : literal_writes) {
+    for (const bool immediately : std::array{false, true}) {
+      reset(1, literal.size);
+      auto *command_buffer = buffers[0].header.data();
+      uint64_t fence = ~literal.value;
+      const auto append = [&](uint64_t value) {
+        return immediately ? write_immediately(command_buffer, &fence, value, 1)
+                           : write_address(command_buffer, &fence, value);
+      };
+      Check(measure_write_address(&fence, literal.value) == literal.size &&
+                measure_write_immediately(&fence, literal.value, 1) == literal.size &&
+                append(literal.value) == OK && offset(command_buffer) == literal.size,
+            "literal write fits exactly its measured command size");
+      Check(append(~literal.value) == Libs::LibKernel::KERNEL_ERROR_EBUSY &&
+                offset(command_buffer) == literal.size,
+            "rejected write preserves the full command buffer offset");
+      Result result {1234, 5678};
+      uint32_t submission = 0;
+      Check(submit_apr(command_buffer, 3, &result, &submission) == OK &&
+                wait_apr(submission) == OK && result.result == OK &&
+                fence == literal.value,
+            "bounded write preserves all sixty-four literal bits");
+    }
+  }
+  reset(1, 768);
+  std::array<std::array<char, 3>, 16> batch_output {};
+  std::array<uint64_t, 16> batch_fences {};
+  auto *batch = buffers[0].header.data();
+  for (size_t i = 0; i < batch_fences.size(); ++i) {
+    Check(read_file(batch, reinterpret_cast<uint64_t>(&buffers[0].header[3]),
+                    reinterpret_cast<uint64_t>(&buffers[0].header[4]), file_id,
+                    batch_output[i].data(), batch_output[i].size(), 0) == OK &&
+              write_address(batch, &batch_fences[i], i + 1) == OK,
+          "sixteen APR read/fence pairs fit the guest's 768-byte command buffer");
+  }
+  Result batch_result {1234, 5678};
+  uint32_t batch_submission = 0;
+  Check(submit_apr(batch, 3, &batch_result, &batch_submission) == OK &&
+            wait_apr(batch_submission) == OK && batch_result.result == OK,
+        "complete the bounded APR read batch");
+  for (size_t i = 0; i < batch_fences.size(); ++i) {
+    Check(batch_fences[i] == i + 1 &&
+              std::memcmp(batch_output[i].data(), "APR", 3) == 0,
+          "every read publishes its data and completion, including requests fourteen and fifteen");
+  }
   // WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
   struct Comparison { uint8_t compare; uint64_t blocked, reference, released; };
   constexpr std::array comparisons {
@@ -1401,6 +1462,84 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
 }
 #endif
 
+#if defined(__linux__)
+void KYTY_SYSV_ABI RecordNetCtlEvent(int event, void* arg) {
+  auto& events = *static_cast<std::array<int, 2>*>(arg);
+  ++events[0];
+  events[1] = event;
+}
+
+void TestNetCtlHostIpv4() {
+  using namespace Libs::Network::NetCtl;
+  ifaddrs* interfaces = nullptr;
+  Check(getifaddrs(&interfaces) == 0, "enumerate host IPv4 addresses");
+  std::vector<uint32_t> host_addresses;
+  for (auto* interface = interfaces; interface != nullptr; interface = interface->ifa_next) {
+    if (interface->ifa_addr == nullptr || interface->ifa_addr->sa_family != AF_INET ||
+        (interface->ifa_flags & IFF_UP) == 0 || (interface->ifa_flags & IFF_RUNNING) == 0 ||
+        (interface->ifa_flags & IFF_LOOPBACK) != 0) {
+      continue;
+    }
+    const auto address = reinterpret_cast<const sockaddr_in*>(interface->ifa_addr)->sin_addr;
+    if (address.s_addr != 0 && (ntohl(address.s_addr) >> 24) != 127) {
+      host_addresses.push_back(address.s_addr);
+    }
+  }
+  freeifaddrs(interfaces);
+
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::Silent;
+  Check(!options.network_connected, "host networking requires explicit opt-in");
+  alignas(uint32_t) std::array<char, 256> storage {};
+  auto* info = reinterpret_cast<NetCtlInfo*>(storage.data());
+  constexpr int NotConnected = static_cast<int>(0x80412108u);
+  Check(NetCtlGetInfo(14, nullptr) == static_cast<int>(0x80412107u) &&
+            NetCtlGetInfo(0, info) == static_cast<int>(0x80412106u) &&
+            NetCtlGetInfo(22, info) == static_cast<int>(0x80412106u),
+        "NetCtl reports invalid output addresses and information codes");
+  for (bool enabled : {false, true}) {
+    options.network_connected = enabled;
+    Config::Load(options);
+    Check(NetCtlInit() == OK, "initialize NetCtl for selected network mode");
+    const bool connected = enabled && !host_addresses.empty();
+    int state = -1;
+    Check(NetCtlGetState(&state) == OK && state == (connected ? 3 : 0),
+          "NetCtl IPv4 state matches opt-in and host connectivity");
+    Check(NetCtlGetStateV6(&state) == OK && state == 0,
+          "IPv4 connectivity does not advertise IPv6 support");
+
+    Check(NetCtlGetInfo(14, info) == (connected ? OK : NotConnected),
+          "NetCtl IPv4 query respects network mode and host state");
+    in_addr address {};
+    if (connected) {
+      Check(inet_pton(AF_INET, storage.data(), &address) == 1 &&
+                std::find(host_addresses.begin(), host_addresses.end(), address.s_addr) !=
+                    host_addresses.end(),
+            "NetCtl reports an IPv4 address assigned to an active host interface");
+    }
+    Check(NetCtlGetInfo(15, info) == (connected ? OK : NotConnected) &&
+              (!connected || inet_pton(AF_INET, storage.data(), &address) == 1),
+          "NetCtl returns the active IPv4 netmask only in connected mode");
+    const int gateway_result = NetCtlGetInfo(16, info);
+    Check(gateway_result == NotConnected ||
+              (connected && gateway_result == OK &&
+               inet_pton(AF_INET, storage.data(), &address) == 1),
+          "NetCtl reports a valid IPv4 gateway or its absence");
+
+    std::array<int, 2> events {};
+    int callback_id = -1;
+    Check(NetCtlRegisterCallback(RecordNetCtlEvent, &events, &callback_id) == OK &&
+              NetCtlCheckCallback() == OK && events[0] == 1 &&
+              events[1] == (connected ? 3 : 1) && NetCtlCheckCallback() == OK && events[0] == 1,
+          "NetCtl delivers the matching connection event once while state is unchanged");
+    Check(NetCtlUnregisterCallback(callback_id) == OK, "release NetCtl callback");
+    NetCtlTerm();
+  }
+  options.network_connected = false;
+  Config::Load(options);
+}
+#endif
+
 void CheckEtherAddressFormatting() {
   Loader::SymbolDatabase symbols;
   Libs::LibNet::InitNet_1_Net(&symbols);
@@ -1732,6 +1871,9 @@ int main(int, char**) {
   FileSystem::Shutdown();
   CheckSocketWakeup();
   CheckEtherAddressFormatting();
+#if defined(__linux__)
+  TestNetCtlHostIpv4();
+#endif
   TestNpWebApi2Memory();
   TestNpCommerceDialog();
   graphics.reset();

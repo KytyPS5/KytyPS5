@@ -25,6 +25,7 @@
 #include <mutex>
 #include <span>
 #include <tuple>
+#include <utility>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -36,7 +37,9 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
-	const auto  format   = desc.view_info.format;
+	const auto  format   = desc.info.IsDepth()
+	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
+	                           : desc.view_info.format;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
@@ -249,14 +252,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	if (!image->depth_id) {
-		std::vector<ImageId> associations;
-		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
-			if (associated.depth_id == id) {
-				associations.push_back(candidate);
-			}
-		});
-		for (const auto association: associations) {
+	if (image->depth_id) {
+		std::erase(m_slot_images[image->depth_id].stencil_ids, id);
+	} else {
+		// Detach first: deleting each association also unlinks it from its depth owner.
+		for (const auto association: std::exchange(image->stencil_ids, {})) {
 			FreeImage(association);
 		}
 	}
@@ -297,9 +297,6 @@ void TextureCache::TouchImage(Image& image) {
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	image.MarkMaybeCpuDirty();
-	if (image.NeedsMaybeCpuHash()) {
-		image.SetMaybeCpuHash(image.HashGuestEdges());
-	}
 	UntrackImage(id);
 }
 
@@ -631,6 +628,9 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
 	RefreshCopySource(source_id);
+	if (m_slot_images[destination_id].IsBufferModified()) {
+		RefreshImage(destination_id);
+	}
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
@@ -751,11 +751,63 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	return replacement_id;
 }
 
+namespace BcAlias {
+
+bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
+	return requested.guest_format != cached.guest_format &&
+	       requested.IsBlock() != cached.IsBlock() &&
+	       requested.tile_mode == cached.tile_mode &&
+	       requested.bytes_per_block == cached.bytes_per_block &&
+	       requested.samples == 1 && cached.samples == 1 &&
+	       (requested.data != cached.data || requested.resources != cached.resources ||
+	        requested.BlockExtent() != cached.BlockExtent()) &&
+	       !TextureCache::SameBacking(cached, requested, false);
+}
+
+bool Publish(TextureCache& cache, Image& image) {
+	if (!cache.CanDownload(image)) {
+		return false;
+	}
+	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
+	auto [buffer, offset] =
+	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
+	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
+	image.ClearGpuModified();
+	image.MarkBufferModified();
+	return true;
+}
+
+void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
+	auto& cached = cache.m_slot_images[cached_id];
+	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
+	// PS5 raw block images can span several packed BC mips. Transfer their complete
+	// guest bytes, including tail padding, before retiring the incompatible backing.
+	if (cached.SafeToDownload()) {
+		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
+			return;
+		}
+		if (!Publish(cache, cached)) {
+			return;
+		}
+		if (merged) {
+			merged->MarkBufferModified();
+		}
+	}
+	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+	cache.FreeImage(cached_id);
+}
+
+} // namespace BcAlias
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
 	auto owner = m_slot_images.try_get(cached_id);
-	if (owner == nullptr) {
+	if (owner == nullptr || !owner->registered) {
+		return {merged_id};
+	}
+	if (BcAlias::Matches(requested, owner->info) && !owner->IsCpuDirty()) {
+		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
 	auto&      cached       = *owner;
@@ -1059,8 +1111,15 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		{
 			std::scoped_lock lock {m_lock};
-			ClearImage(m_scheduler.Current(), id, view.format,
-			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+			const auto& image = m_slot_images[id];
+			const bool depth = image.info.IsDepth();
+			if (depth) {
+				const auto value = clear.color.float32[0];
+				clear.depthStencil = {value, 0u};
+			}
+			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
+			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
+			            view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
@@ -1082,12 +1141,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	}
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
-		const auto hash = image.HashGuestEdges();
-		if (image.NeedsMaybeCpuHash()) {
-			image.SetMaybeCpuHash(hash);
-			return;
-		}
-		(void)image.ResolveMaybeCpuHash(hash);
+		(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -1141,6 +1195,12 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		    plane.IsTiled() ? TileGetDepthPitch(plane.extent.width, 1, 0) : depth.info.pitch;
 		plane.bytes_per_block = 1;
 		plane.UpdateSize();
+		if (record.depth_id != depth_id) {
+			if (record.depth_id) {
+				std::erase(m_slot_images[record.depth_id].stencil_ids, association);
+			}
+			depth.stencil_ids.push_back(association);
+		}
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1166,6 +1226,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		bool block_alias = false;
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1184,6 +1245,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
+			} else if (image.SafeToDownload() &&
+			           BcAlias::Matches(desc.info, image.info)) {
+				block_alias = true;
 			}
 		}
 
@@ -1199,6 +1263,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					result     = overlap.image;
 					view_mip   = overlap.mip;
 					view_layer = overlap.layer;
+				}
+			}
+		} else if (block_alias) {
+			for (const auto candidate: candidates) {
+				const auto* owner = m_slot_images.try_get(candidate);
+				if (candidate != result && owner != nullptr && owner->registered &&
+				    !owner->IsCpuDirty() &&
+				    BcAlias::Matches(m_slot_images[result].info, owner->info)) {
+					BcAlias::Resolve(*this, candidate, result);
 				}
 			}
 		}
@@ -1363,7 +1436,6 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
-	image.usage.depth_target = true;
 	if (desc.info.HasStencil()) {
 		const auto layers = image.info.resources.layers;
 		EXIT_IF(layers == 0 || image.info.data.size % layers != 0 ||
@@ -1779,7 +1851,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
-			owner->InvalidateCpuWrite(address, size);
+			owner->MarkCpuDirty();
 			UntrackImage(id);
 			continue;
 		}
@@ -1923,6 +1995,9 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	if (!m_readback_linear_images) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);

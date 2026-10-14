@@ -41,6 +41,7 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16_16UInt, 4, 0, 4, true, true},
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
+	{BufferFormat::k11_11_10UNorm, 4, 0, 0, true, false},
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},
@@ -237,6 +238,7 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 	switch (format) {
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
+		case BufferFormat::k11_11_10UNorm:
 		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
 		default: return format;
 	}

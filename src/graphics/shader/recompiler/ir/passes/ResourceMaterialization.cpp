@@ -476,29 +476,34 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		}
 	} else if (selector->bitset) {
 		ShaderBufferResource material;
-		std::array<uint32_t, 4> masks {};
+		std::array<uint32_t, 8> masks {};
 		uint32_t first = 0, count = 0;
 		if (!DecodeBufferDescriptor(material_value, material) ||
 		    !WalkedValue(program, indirect.selector_first, first) ||
-		    !EvaluateIndirectCount(program, indirect, runtime, count) || count != masks.size() * 32u ||
-		    selector->stride != sizeof(masks) || selector->offset != 0u ||
-		    material.Type() != 0u || material.Stride() != sizeof(masks) ||
-		    material.SwizzleEnabled() || material.AddTid() || material.OutOfBounds() != 0u ||
-		    (material.Base48() & 3u) != 0u) return false;
+		    !EvaluateIndirectCount(program, indirect, runtime, count) ||
+		    (count != 128u && count != 256u) || selector->stride != count / 8u ||
+		    selector->offset != 0u || material.Type() != 0u ||
+		    material.Stride() != count / 8u || material.SwizzleEnabled() || material.AddTid() ||
+		    material.OutOfBounds() != 0u || (material.Base48() & 3u) != 0u)
+			return false;
+		const auto selected_masks = std::span(masks).first(count / 32u);
 		if (material.Format() != Prospero::BufferFormat::kInvalid) {
 			const auto words = material.GetSize() / sizeof(uint32_t);
 			// Bitmap storage can grow with resolution while its candidate domain stays
-			// at 128 keys. Bound scratch memory, preserving each coherent read's capture.
+			// within the proven bit domain. Preserve each coherent read's capture.
 			for (uint64_t first_word = 0; first_word < words; first_word += keys.size()) {
 				keys.resize(std::min<uint64_t>(words - first_word, MaxIndirectDescriptorProbes));
 				if (!ReadScalarTable(material.Base48(), material.GetSize(), first_word * 4u,
 				                     runtime, keys)) return false;
-				for (size_t word = 0; word < keys.size(); ++word) masks[word % masks.size()] |= keys[word];
-				if (std::ranges::all_of(masks, [](uint32_t mask) { return mask == UINT32_MAX; })) break;
+				for (size_t word = 0; word < keys.size(); ++word)
+					selected_masks[(first_word + word) % selected_masks.size()] |= keys[word];
+				if (std::ranges::all_of(selected_masks,
+				                        [](uint32_t mask) { return mask == UINT32_MAX; }))
+					break;
 			}
 			keys.clear();
-			for (uint32_t word = 0; word < masks.size(); ++word) {
-				auto mask = masks[word];
+			for (uint32_t word = 0; word < selected_masks.size(); ++word) {
+				auto mask = selected_masks[word];
 				while (mask != 0u) {
 					const auto rank = word * 32u + std::countr_zero(mask);
 					keys.push_back(first + count - 1u - rank);

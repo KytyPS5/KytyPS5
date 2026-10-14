@@ -2912,9 +2912,10 @@ void TestDescendingImageRange() {
   enum class Variant {
     Valid, WrongStep, IncrementBypass, MissingNonzero, NegativeInitial,
     Bitmap, BitmapAddsBit, BitmapWrongWord, BitmapUnknownInitial,
-    BitmapByteOffset, BitmapScalarOffset, BitmapOuterClobber, BitmapWrongLoadMask
+    BitmapByteOffset, BitmapScalarOffset, BitmapOuterClobber, BitmapWrongLoadMask,
+    BitmapSecondIndex, BitmapTruncatedWord
   };
-  const auto make_plan = [](Variant variant) {
+  const auto make_plan = [](Variant variant, uint32_t word_count = 4u) {
     Fixture fixture;
     const bool bitmap = variant >= Variant::Bitmap;
     auto *entry = fixture.block;
@@ -2939,8 +2940,8 @@ void TestDescendingImageRange() {
     branch(latch, header);
     auto &induction = header->AppendNewInst(ValueOpcode::Phi);
     induction.SetFlags(Type::U32);
-    std::array<Inst *, 4> outer_words {}, remaining_words {};
-    std::array<Value, 4> loaded_words {};
+    std::vector<Inst *> outer_words(word_count), remaining_words(word_count);
+    std::vector<Value> loaded_words(word_count);
     if (bitmap)
       for (auto& word : outer_words)
         word = &header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
@@ -2960,14 +2961,21 @@ void TestDescendingImageRange() {
       read.idxen = true;
       read.offen = variant == Variant::BitmapByteOffset;
       read.data_dwords = 4u;
-      const auto packed = fixture.Emit(ValueOpcode::LoadBufferU32x4,
-          {buffer, lane,
-           Value(variant == Variant::BitmapByteOffset ? 4u : 0u),
-           Value(variant == Variant::BitmapScalarOffset ? 4u : 0u), load_active},
-          fixture.AddMemory(read, 0x10));
-      for (uint32_t word = 0; word < 4u; ++word) {
+      std::array<Value, 2> packed;
+      for (uint32_t chunk = 0; chunk < word_count / 4u; ++chunk) {
+        read.offset = chunk * 16u;
+        const auto index = variant == Variant::BitmapSecondIndex && chunk == 1u
+            ? fixture.Emit(ValueOpcode::IAdd32, {lane, Value(1u)}) : lane;
+        packed[chunk] = fixture.Emit(ValueOpcode::LoadBufferU32x4,
+            {buffer, index, Value(variant == Variant::BitmapByteOffset ? 4u : 0u),
+             Value(variant == Variant::BitmapScalarOffset ? 4u : 0u), load_active},
+            fixture.AddMemory(read, 0x10 + chunk * 8u));
+      }
+      for (uint32_t word = 0; word < word_count; ++word) {
+        const auto component_index = variant == Variant::BitmapWrongWord
+            ? (word + 1u) % 4u : word % 4u;
         auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
-            {packed, Value(variant == Variant::BitmapWrongWord ? (word + 1u) % 4u : word)}, 0, entry);
+            {packed[word / 4u], Value(component_index)}, 0, entry);
         component = fixture.Emit(ValueOpcode::SelectU32,
             {load_active, component, fixture.Emit(ValueOpcode::UndefU32)});
         loaded_words[word] = component;
@@ -2980,9 +2988,12 @@ void TestDescendingImageRange() {
         remaining_words[word]->AddPhiOperand(header, Value(outer_words[word]));
       }
       auto selected = fixture.Emit(ValueOpcode::UndefU32, {}, 0, guard);
-      for (uint32_t word = 0; word < 4u; ++word) {
+      const auto selected_index = variant == Variant::BitmapTruncatedWord
+          ? fixture.Emit(ValueOpcode::BitwiseAnd32, {Value(&induction), Value(3u)}, 0, guard)
+          : Value(&induction);
+      for (uint32_t word = 0; word < word_count; ++word) {
         selected = fixture.Emit(ValueOpcode::SelectU32,
-            {fixture.Emit(ValueOpcode::IEqual32, {Value(&induction), Value(word)}, 0, guard),
+            {fixture.Emit(ValueOpcode::IEqual32, {selected_index, Value(word)}, 0, guard),
              Value(remaining_words[word]), selected}, 0, guard);
       }
       mask = selected;
@@ -3043,7 +3054,7 @@ void TestDescendingImageRange() {
               {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(1u), bit})})});
       if (variant == Variant::BitmapAddsBit)
         next = fixture.Emit(ValueOpcode::BitwiseOr32, {next, Value(1u << 21u)});
-      for (uint32_t word = 0; word < 4u; ++word) {
+      for (uint32_t word = 0; word < word_count; ++word) {
         const auto selected_word = fixture.Emit(ValueOpcode::LogicalAnd,
             {active, fixture.Emit(ValueOpcode::IEqual32, {Value(&induction), Value(word)})});
         remaining_words[word]->AddPhiOperand(body, fixture.Emit(ValueOpcode::SelectU32,
@@ -3053,13 +3064,13 @@ void TestDescendingImageRange() {
           carried = fixture.Emit(ValueOpcode::SelectU32,
               {fixture.Emit(ValueOpcode::IEqual32,
                    {Value(&induction), Value(word + 1u)}, 0, latch),
-               loaded_words[(word + 1u) % 4u], carried}, 0, latch);
+               loaded_words[(word + 1u) % word_count], carried}, 0, latch);
         outer_words[word]->AddPhiOperand(latch, carried);
       }
     }
     const auto step = fixture.Emit(ValueOpcode::IAdd32,
         {Value(&induction), Value(variant == Variant::WrongStep ? UINT32_MAX - 1u : UINT32_MAX)}, 0, latch);
-    induction.AddPhiOperand(entry, Value(variant == Variant::NegativeInitial ? UINT32_MAX : 3u));
+    induction.AddPhiOperand(entry, Value(variant == Variant::NegativeInitial ? UINT32_MAX : word_count - 1u));
     induction.AddPhiOperand(latch, step);
     fixture.PlanAndTrack();
     Check(ordinal.Instruction()->Arg(1).Resolve() == bit.Resolve(),
@@ -3068,7 +3079,7 @@ void TestDescendingImageRange() {
         fixture.program.info.images[0].source].indirect_descriptor;
     Check(indirect && indirect->selector.has_value() == (variant == Variant::Bitmap) &&
               (!indirect->selector || indirect->selector->bitset) &&
-              indirect->key_count == Value(128u) &&
+              indirect->key_count == Value(word_count * 32u) &&
               !indirect->selector_first.IsEmpty(),
           "descending bitscan range lost its bound or accepted an unproved bitmap subset");
     return ExtractResourcePlan(fixture.program);
@@ -3235,6 +3246,41 @@ void TestDescendingImageRange() {
               return read.first >= memory.fail_address;
             }),
         "a complete bitmap domain read redundant chunks or lost candidate keys");
+
+  auto wide_plan = make_plan(Variant::Bitmap, 8u);
+  make_plan(Variant::BitmapSecondIndex, 8u);
+  make_plan(Variant::BitmapTruncatedWord, 8u);
+  make_plan(Variant::BitmapWrongWord, 8u);
+  LinearTestMemory wide_memory;
+  constexpr uint32_t wide_bitmap_address = 0x8000u;
+  const auto wide_bitmap_word = (wide_bitmap_address - wide_memory.base) / 4u;
+  wide_memory.words.resize(wide_bitmap_word + 16u, 0u);
+  for (const uint32_t key : {0u, 255u}) {
+    const auto descriptor = 0x1000u / 4u + key * 8u;
+    wide_memory.words[descriptor] = key + 1u;
+    wide_memory.words[descriptor + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    wide_memory.words[descriptor + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  wide_memory.words[wide_bitmap_word] = 1u;
+  wide_memory.words[wide_bitmap_word + 15u] = 1u << 31u;
+  const std::array<uint32_t, 8> wide_data {0x1000u, 0u, 255u, UINT32_MAX,
+                                         wide_bitmap_address, 32u << 16u, 2u, 0x5204u};
+  const SrtRuntime wide_runtime {.user_data = wide_data, .userdata = &wide_memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(wide_plan, wide_runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && wide_memory.descriptor_reads == 2u,
+        "256-bit bitmap lost a load chunk or read unreachable image descriptors");
+  const auto wide_offset = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[wide_offset] == 2u &&
+            snapshot.flattened_srt[wide_offset + 1u] == 0u &&
+            snapshot.flattened_srt[wide_offset + 3u] == 255u,
+        "256-bit bitmap associated bits with the wrong image keys");
+  wide_memory.words[wide_bitmap_word + 15u] = 0u;
+  Check(MaterializeResources(wide_plan, wide_runtime, snapshot, specialization) &&
+            snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == 256u,
+        "256-bit bitmap refresh retained a stale high-word key");
 }
 
 void TestUniformizedMaterialImageKeys() {

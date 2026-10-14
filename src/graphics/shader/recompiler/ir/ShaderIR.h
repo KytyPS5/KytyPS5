@@ -585,7 +585,7 @@ struct DescriptorSource {
 			uint32_t mask_stride = 0;
 			uint32_t mask_offset = 0;
 			bool global = false;
-			// Four DWORD bitmap words per record; set-bit ranks subtract from the last key.
+			// Bitmap words per record; set-bit ranks subtract from the last key.
 			bool bitset = false;
 			std::optional<CountedRows> rows;
 			std::vector<std::pair<uint32_t, uint32_t>> byte_ranges;

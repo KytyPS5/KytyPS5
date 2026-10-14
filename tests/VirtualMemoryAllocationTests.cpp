@@ -1224,6 +1224,38 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestRuntimeMemoryFreeFailure() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "RuntimeMemoryFreeFailure";
+	const auto available = AvailableFlexibleMemory(test);
+	const auto page = SceKernelPageSize;
+	const auto base = AllocateProgramMemory(0, 3 * page, Common::VirtualMemory::Mode::ReadWrite,
+	                                        "free_failure_code");
+	Check(test, base != 0 && FreeGuestMemory(base + page, page), "code allocation failed");
+	Check(test, AllocateRuntimeMemory(base + page, page, Common::VirtualMemory::Mode::ReadWrite,
+	                                  "free_failure_runtime", true) == base + page,
+	      "runtime allocation failed");
+	*reinterpret_cast<uint64_t*>(base + 2 * page) = 0x12345678u;
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	TestFailGuestBackingStoreUnmapAfter(1);
+	const bool freed = FreeGuestMemory(base, 3 * page);
+	TestSetGpuRangeCallback(nullptr);
+	Check(test, !freed, "injected code release failure was ignored");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + page);
+	Check(test, TestPlaceholderRangeIsFree(base, 2 * page), "released prefix is not reusable");
+	ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 3 * page,
+	            SceKernelProtCpuRead | SceKernelProtCpuRw, 0, 0, 0, 1, "free_failure_code");
+	Check(test, *reinterpret_cast<uint64_t*>(base + 2 * page) == 0x12345678u &&
+	                g_gpu_range_events == std::vector<GpuRangeEvent>{
+	                    {false, base, 3 * page}, {true, base + 2 * page, page}},
+	      "failed release lost the surviving data or GPU mapping");
+	Check(test, FreeGuestMemory(base + 2 * page, page), "release retry failed");
+	Check(test, AvailableFlexibleMemory(test) == available, "failed release leaked flexible memory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestCopySparseMemoryMappings() {
 	using namespace Libs::LibKernel::Memory;
 	const char* test = "CopySparseMemoryMappings";
@@ -3605,10 +3637,13 @@ void TestMemoryPoolCommitDecommitQueryFlags() {
 
 void TestProgramMemoryAllocationAndProtection() {
 	const char* test = "ProgramMemoryAllocationAndProtection";
+	const auto  available = AvailableFlexibleMemory(test);
 	const auto  size = SceKernelPageSize * 3;
 	const auto  base = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    0x900000000, size, Common::VirtualMemory::Mode::ReadWrite, "program_test");
 	Check(test, base != 0, "program guest allocation failed");
+	Check(test, AvailableFlexibleMemory(test) == available - size,
+	      "program allocation did not consume flexible memory");
 	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, size),
 	      "program allocation escaped the guest owner");
 	ExpectRange(test, Query(test, base), base, base + size,
@@ -3645,6 +3680,8 @@ void TestProgramMemoryAllocationAndProtection() {
 	            base + size, SceKernelProtCpuRead, 0, 0, 0, 1, "program_test");
 
 	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(base, size), "program guest free failed");
+	Check(test, AvailableFlexibleMemory(test) == available,
+	      "program release did not restore flexible memory");
 	ExpectUnmapped(test, base);
 
 	std::printf("[host]    %-48s ok\n", test);
@@ -3654,6 +3691,50 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
 	      "module relocation did not retain writable host memory and semantic guest protection");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+std::vector<GpuRangeEvent> g_callback_events;
+
+void ObserveAllocation(uintptr_t address, size_t size) {
+	g_callback_events.push_back({true, address, size});
+}
+
+void ObserveRelease(uintptr_t address, size_t size) {
+	g_callback_events.push_back({false, address, size});
+}
+
+void TestProgramMemoryCallbacks() {
+	const char* test = "ProgramMemoryCallbacks";
+	const auto size = SceKernelPageSize;
+	const auto early = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0, size, Common::VirtualMemory::Mode::ReadWrite, "early_code_callback");
+	Check(test, early != 0, "code allocation before callback registration failed");
+	const auto early_runtime = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, size, Common::VirtualMemory::Mode::ReadWrite, "early_runtime_callback");
+	Check(test, early_runtime != 0, "runtime allocation before callback registration failed");
+	Libs::LibKernel::Memory::RegisterCallbacks(ObserveAllocation, ObserveRelease);
+	Check(test, std::ranges::count(g_callback_events, GpuRangeEvent{true, early, size}) == 1,
+	      "code allocation was not replayed exactly once");
+	Check(test, std::ranges::count(g_callback_events, GpuRangeEvent{true, early_runtime, size}) == 0,
+	      "runtime allocation was unexpectedly replayed");
+	g_callback_events.clear();
+	const auto late = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0, size, Common::VirtualMemory::Mode::ReadWrite, "late_code_callback");
+	Check(test, late != 0 && late != early, "code allocation after callback registration failed");
+	const auto late_runtime = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, size, Common::VirtualMemory::Mode::ReadWrite, "late_runtime_callback");
+	Check(test, late_runtime != 0 && late_runtime != late,
+	      "runtime allocation after callback registration failed");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(early, size), "code release failed");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(early_runtime, size),
+	      "runtime release failed");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(late, size), "KernelMunmap(code)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(late_runtime, size),
+	        "KernelMunmap(runtime)");
+	Check(test, g_callback_events == std::vector<GpuRangeEvent>{
+	                {true, late, size}, {false, early, size}, {false, late, size}},
+	      "code allocation and release notifications were not paired");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5012,6 +5093,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingUnmapRollback);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
+	RunTest(TestRuntimeMemoryFreeFailure);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestFlexibleRangeEditsCoalesce);
@@ -5064,6 +5146,7 @@ int main(int argc, char** argv) {
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);
 #endif
+	RunTest(TestProgramMemoryCallbacks);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

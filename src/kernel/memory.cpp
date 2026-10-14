@@ -291,17 +291,6 @@ public:
 		return true;
 	}
 
-	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
-		auto position = m_ranges.find(start);
-		if (position != m_ranges.end() && position->second.size == size &&
-		    IsReservedRangeType(position->second.type)) {
-			EraseUnlocked(position);
-		}
-		return true;
-	}
-
 	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type, uint64_t offset,
 	                 int protection, int memory_type, VirtualRangeType type, const char* name,
 	                 bool disallow_merge = false) {

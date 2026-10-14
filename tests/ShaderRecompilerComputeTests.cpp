@@ -5450,14 +5450,14 @@ public:
     }
     auto &cache = context.GetBufferCache();
     // Exercise the ordinary ring before requesting the captured 576-MiB footprint.
-    const auto small = cache.ObtainBufferForImage(base, page);
+    const auto small_buffer = cache.ObtainBufferForImage(base, page);
     auto readback = CreateHostBuffer(name, 8u * sizeof(u32),
         vk::BufferUsageFlagBits::eTransferDst, {});
-    const vk::BufferCopy small_copy{small.second, 0, sizeof(u32)};
-    scheduler.Current().Handle().copyBuffer(small.first->Handle(), readback.buffer, 1, &small_copy);
+    const vk::BufferCopy small_copy{small_buffer.second, 0, sizeof(u32)};
+    scheduler.Current().Handle().copyBuffer(small_buffer.first->Handle(), readback.buffer, 1, &small_copy);
     const auto large = cache.ObtainBufferForImage(base, size);
-    Require(name, "temporary image source", large.first != nullptr && large.first != small.first &&
-        large.first->Size() == size && small.first->Size() == ring_size,
+    Require(name, "temporary image source", large.first != nullptr && large.first != small_buffer.first &&
+        large.first->Size() == size && small_buffer.first->Size() == ring_size,
         "oversized image upload resized the ring or truncated its source");
     constexpr std::array<uint64_t, 5> probes{0, page, ring_size - 4u, ring_size, size - 4u};
     std::array<vk::BufferCopy, probes.size()> copies{};

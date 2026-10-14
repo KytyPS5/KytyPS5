@@ -505,8 +505,7 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		const auto last = count != 0u ? uint64_t {first} + count - 1u : 0u;
 		if (last > UINT32_MAX) return false;
 		const auto end = count != 0u ? last * step + selector->offset + 4u : 0u;
-		if (end > uint64_t {UINT32_MAX} + 1u ||
-		    (indirect.workgroup_axis == UINT32_MAX && end > size))
+		if (end > uint64_t {UINT32_MAX} + 1u)
 			return false;
 		if (!read_keys(base, size, uint64_t {first} * step + selector->offset, step, count))
 			return false;

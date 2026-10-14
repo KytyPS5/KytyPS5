@@ -15115,7 +15115,7 @@ void TestBoundedScalarMaterialImageKeys() {
           "unavailable selected material key was accepted");
   }
   memory = {.stride = 1, .records = 311};
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.key_reads == 0,
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "scalar material byte range escaped V# bounds");
   memory = {.mixed = true};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&

@@ -4604,6 +4604,105 @@ void TestCompactScalarImageTable() {
                "compact table accepted an unproved selector or inconsistent descriptor width");
 }
 
+void TestBitScanScalarImageSelector() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto make = [](bool guarded, bool wrapping) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *body = fixture.AddBlock();
+    auto *done = fixture.AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(done);
+    body->AddBranch(done);
+    const auto mask = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    entry->condition =
+        guarded ? fixture.Emit(ValueOpcode::INotEqual32, {mask, Value(0u)})
+                : Value(true);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body,
+                         .false_block = done};
+    const auto material =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    const auto table =
+        fixture.Address(fixture.UserData(4), fixture.UserData(5));
+    fixture.block = body;
+    const auto index = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const auto offset = fixture.Emit(
+        ValueOpcode::IMul32, {index, Value(wrapping ? 0x80000000u : 208u)});
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    scalar.offset = 4u;
+    const auto key =
+        fixture.Emit(ValueOpcode::ReadConstBuffer, {material, offset},
+                     fixture.AddMemory(scalar, 0x10));
+    const auto record =
+        fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      scalar.kind = ResourceKind::ScalarAddress;
+      scalar.offset = word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, record, Value(0u), Value(true)},
+                                 fixture.AddMemory(scalar, 0x20));
+    }
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+                 {fixture.Image(words),
+                  fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
+                  fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(sample, 0x30));
+    fixture.PlanAndTrack();
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make(true, false);
+  const auto &indirect =
+      *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+  Check(indirect.key_count == Value(32u) &&
+            indirect.selector_first == Value(0u) && indirect.selector &&
+            indirect.selector->stride == 208u,
+        "nonzero bit scan did not bound the scalar material records");
+  CheckFatal([&] { make(false, false); }, "not a valid runtime value",
+             "zero bit scan sentinel was treated as a bounded material index");
+  CheckFatal(
+      [&] { make(true, true); }, "not a valid runtime value",
+      "wrapped multiplication was treated as a finite unwrapped record domain");
+  LinearTestMemory memory;
+  memory.words[1] = 1u;
+  memory.words[208u / 4u + 1u] = 2u;
+  for (uint32_t key = 0; key < 3u; ++key) {
+    const auto word = (0x1000u + key * 32u) / 4u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] =
+        static_cast<uint32_t>(
+            Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+        << 20u;
+    memory.words[word + 3u] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+         << 28u);
+  }
+  std::array<uint32_t, 6> user_data{0x1000u, 0u, 216u, 0u, 0x2000u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  memory.fail_address = memory.base + 216u;
+  FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+  const SrtRuntime runtime{.user_data = user_data,
+      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 3u &&
+            snapshot.images[0].dwords[0] == 0x100u &&
+            snapshot.images[1].dwords[0] == 0x101u &&
+            snapshot.images[2].dwords[0] == 0x102u,
+        "bounded material selector lost the OOB zero key or read beyond V# "
+        "bounds");
+}
+
 void TestScalarBufferSelectorDomain() {
   const auto make_plan = [](bool active = true, bool sparse = false, bool uniformize_first = false) {
     Fixture fixture;
@@ -5468,8 +5567,12 @@ void TestSharedAppendSelectorBounds() {
             snapshot.images.size() == 2u && snapshot.images.back().dwords[0] == 0x104u,
         "shared append materialization reused stale selector contents");
   user_data[2] = 1u;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "shared append materialization accepted a range outside its V# bounds");
+  Check(
+      MaterializeResources(plan, runtime, snapshot, specialization) &&
+          snapshot.images.size() == 2u &&
+          snapshot.images[0].dwords[0] == 0x100u &&
+          snapshot.images[1].dwords[0] == 0x101u,
+      "shared append materialization lost the zero key for an OOB scalar read");
   user_data[2] = 8u;
   for (const auto too_large : {65537u, UINT32_MAX}) {
     for (uint32_t list = 0; list < 2u; ++list) {
@@ -9360,6 +9463,7 @@ int main() {
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("compact scalar image table", TestCompactScalarImageTable);
     Run("scalar buffer selector domain", TestScalarBufferSelectorDomain);
+    Run("bit scan scalar image selector", TestBitScanScalarImageSelector);
     Run("private LDS forwarding", TestPrivateLdsForwarding);
     Run("counted row image selector", TestCountedRowImageSelector);
     Run("shared append selector bounds", TestSharedAppendSelectorBounds);

@@ -624,6 +624,36 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// Guest bytes an address access may touch, from a base pair the host evaluates. The offset bound
+// is a postfix expression over host-evaluable leaves (root last); a result above 32 bits has no
+// proof, since the shader's 32-bit offset would wrap.
+struct AddressRangePlan {
+	enum class Op : uint8_t {
+		Constant,
+		Runtime,
+		Add,
+		Mul,
+		ShiftLeft,
+		ShiftRight,
+		Min,
+		Max,
+		Decrement
+	};
+	struct Node {
+		Op       op       = Op::Constant;
+		uint32_t left     = 0;
+		uint32_t right    = 0;
+		uint64_t constant = 0;
+		Value    value;
+	};
+	Value             base_low;
+	Value             base_high;
+	bool              scalar       = false; // ScalarAddress drops the low two address bits.
+	int64_t           first_offset = 0;
+	int64_t           last_offset  = 0;
+	std::vector<Node> offset_bound;
+};
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -665,6 +695,7 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<AddressRangePlan>                          address_ranges;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

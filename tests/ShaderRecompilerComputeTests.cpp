@@ -5360,6 +5360,118 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // GoW Ragnarok's Bink DC-prediction shader reads a bitmask table through GLOBAL_LOAD with a
+  // user-data base, under an EXEC guard `row < height` on a wrapped `step - lane` row. No buffer
+  // covers that page before the first dispatch: BDA used to read zeros there.
+  void CheckAddressRangeResidency() {
+    constexpr const char *name = "AddressRangeResidency";
+    constexpr uintptr_t base = 0x0000000204800000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t params = base;
+    // The rows straddle a 16 KiB cache page: both pages must be resident.
+    constexpr uint64_t table = base + 0x7fc0;
+    constexpr uint64_t output = base + 0xc000;
+    constexpr u32 rows = 32;
+    constexpr u32 step = 40;
+    constexpr u32 sentinel = 0xdeadbeefu;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "guest allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "guest mapping failed");
+    auto *words = static_cast<u32 *>(mapped);
+    std::fill_n(words, allocation_size / sizeof(u32), 0u);
+    words[0] = rows;
+    words[1] = step;
+    for (u32 row = 0; row < rows; ++row) {
+      words[(table - base + 0x10u) / sizeof(u32) + row] = 0x1000u + row;
+    }
+    std::fill_n(words + (output - base) / sizeof(u32), 64, sentinel);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, allocation_size);
+    context.GetGpu().SendCommandSync([&] {
+      std::vector<u32> code;
+      code.push_back(EncodeSmem0(0x00, 8));                    // s_load_dword s8, s[0:1], 0
+      code.push_back(EncodeSmem1(0, 0x7d));
+      code.push_back(EncodeSmem0(0x00, 9));                    // s_load_dword s9, s[0:1], 4
+      code.push_back(EncodeSmem1(4, 0x7d));
+      code.push_back(EncodeSopp(0x0c, 0xc07f));                // s_waitcnt lgkmcnt(0)
+      code.push_back(EncodeVop2(0x26, 1, 9, 0));               // v_sub_nc_u32 v1, s9, v0
+      code.push_back(EncodeVopc(0xc4, 8, 1));                  // v_cmp_gt_u32 vcc, s8, v1
+      code.push_back(EncodeSop1(0x24, 10, 106));               // s_and_saveexec_b64 s[10:11], vcc
+      code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 1));    // v_lshlrev_b32 v2, 2, v1
+      code.push_back(EncodeFlat0(0x0c, 2, 0x10));              // global_load_dword v3, v2, s[2:3]
+      code.push_back(EncodeFlat1(3, 2, 0, 2));                 //   offset:16
+      code.push_back(EncodeSopp(0x0c, 0x3f70));                // s_waitcnt vmcnt(0)
+      code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));    // v_lshlrev_b32 v4, 2, v0
+      code.push_back(EncodeMubuf0(0x1cu));                     // buffer_store_dword v3, v4,
+      code.push_back(EncodeMubuf1(3, 1, 4));                   //   s[4:7], 0 offen
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 8});
+      ShaderBufferResource descriptor{};
+      descriptor.UpdateAddress48(output);
+      descriptor.fields[2] = 64 * sizeof(u32);
+      descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      const std::array<u32, 8> user_data{
+          static_cast<u32>(params), static_cast<u32>(params >> 32u),
+          static_cast<u32>(table), static_cast<u32>(table >> 32u),
+          descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+          descriptor.fields[3]};
+      for (u32 i = 0; i < user_data.size(); i++) {
+        shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
+      }
+      context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u, false);
+      std::array<u32, 64> actual{};
+      context.GetBufferCache().ReadMemory(output, sizeof(actual));
+      Require(name, "output readback",
+              Libs::LibKernel::Memory::TryReadBacking(output, actual.data(), sizeof(actual)),
+              "output readback failed");
+      for (u32 lane = 0; lane < actual.size(); ++lane) {
+        const u32 row = step - lane;
+        const u32 expected = row < rows ? 0x1000u + row : sentinel;
+        if (actual[lane] != expected) {
+          Fail(name, "first dispatch",
+               "lane " + std::to_string(lane) + " read " + std::to_string(actual[lane]) +
+                   " instead of " + std::to_string(expected) +
+                   ": the guarded GLOBAL_LOAD page was not resident before the shader ran");
+        }
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "guest unmap failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "guest release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -48554,6 +48666,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaSyncUploads();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--address-range-residency-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckAddressRangeResidency();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -48783,6 +48900,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckAddressRangeResidency();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

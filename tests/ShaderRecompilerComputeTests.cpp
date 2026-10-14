@@ -11600,6 +11600,8 @@ public:
         PackedCase{vk::Format::eR16G16Unorm, 0x0000ffffu, {1.0f, 0.0f}},
         PackedCase{vk::Format::eR16G16Unorm, 0x80000001u,
                    {1.0f / 65535.0f, 32768.0f / 65535.0f}},
+        PackedCase{vk::Format::eR16G16B16A16Unorm, 0xffff800000000001ull,
+                   {1.0f / 65535.0f, 0.0f, 32768.0f / 65535.0f, 1.0f}},
     };
     for (const auto &test : packed_cases) {
       vk::ClearColorValue clear{};
@@ -11626,6 +11628,11 @@ public:
                   DecodeColorDwordFill(format, 0x3c003c00u, clear),
               "alternating R16 pixels were treated as a uniform clear");
     }
+    Require(name, "RG32 uint clear",
+            DecodePackedColorClear(vk::Format::eR32G32Uint, 0x89abcdef01234567ull, clear) &&
+                clear.uint32[0] == 0x01234567u && clear.uint32[1] == 0x89abcdefu &&
+                clear.uint32[2] == 0u && clear.uint32[3] == 0u,
+            "64-bit register clear ignored CB_COLOR_CLEAR_WORD1");
     Require(name, "RG32 DWORD fill",
             DecodeColorDwordFill(vk::Format::eR32G32Sfloat, 0x3f800000u, clear) &&
                 clear.float32[0] == 1.0f && clear.float32[1] == 1.0f,

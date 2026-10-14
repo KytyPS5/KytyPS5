@@ -170,6 +170,13 @@ void InitSubsystems() {
 
 	subsystems.Initialize<Log::Lifecycle>();
 
+	size_t default_flexible_memory_size = 0;
+	CheckOk("InitSubsystems",
+	        Libs::LibKernel::Memory::KernelConfiguredFlexibleMemorySize(&default_flexible_memory_size),
+	        "KernelConfiguredFlexibleMemorySize");
+	Check("InitSubsystems", default_flexible_memory_size == 448ull * 1024ull * 1024ull,
+	      "unexpected default flexible memory capacity");
+
 	const auto param_json = std::filesystem::temp_directory_path() /
 	                        ("kyty_virtual_memory_" +
 	                         std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");

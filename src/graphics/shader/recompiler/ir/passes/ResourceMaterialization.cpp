@@ -9,11 +9,15 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex>
 #include <numeric>
+#include <set>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -60,6 +64,9 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+/// Whether the eight dwords are an image descriptor the emulator can bind: reserved bits clear, a
+/// known type, a format the encoding defines, and for an r128 load a 1D or 2D type. Rejected values
+/// are bound as a null image instead of aborting.
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
@@ -72,6 +79,13 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
 	    format > Prospero::BufferFormat::kBc7Srgb) {
+		return false;
+	}
+	// The range check above leaves the encoding's gaps open. A value such as 139, which lies
+	// between k4_4_4_4UNorm (136) and the FMASK range (156) and names nothing, used to pass here
+	// and abort the emulator further down instead of being treated as what it is: eight dwords
+	// that are not a descriptor, typically a texture-table slot the guest never filled.
+	if (!Prospero::IsDefinedBufferFormat(format)) {
 		return false;
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
@@ -94,6 +108,30 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 		       (r128 || max_mip == fragments);
 	}
 	return true;
+}
+
+/// Reports an image descriptor that was rejected and bound as a null image. The same slot is
+/// reported once per shader so a hot draw call does not flood the log, and the cap keeps a
+/// corrupt table from growing the set without limit.
+void ReportRejectedImageDescriptor(const ResourcePlan& program, uint32_t index,
+                                   const DescriptorValue& descriptor) {
+	if (std::all_of(descriptor.dwords.begin(), descriptor.dwords.end(),
+	                [](uint32_t w) { return w == 0u; })) {
+		return;
+	}
+	static std::mutex reported_mutex;
+	static std::set<std::pair<uint64_t, uint32_t>> reported;
+	const std::lock_guard lock(reported_mutex);
+	if (reported.size() >= 64u || !reported.emplace(program.shader_hash, index).second) {
+		return;
+	}
+	const auto& words = descriptor.dwords;
+	std::fprintf(stderr,
+	             "image descriptor %u of shader 0x%016" PRIx64
+	             " is not a descriptor, binding null: "
+	             "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	             index, program.shader_hash, words[0], words[1], words[2], words[3], words[4],
+	             words[5], words[6], words[7]);
 }
 
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
@@ -1381,6 +1419,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				return false;
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+				// A null image keeps the draw alive, but the walk read something that is not a
+				// descriptor, so say so once per slot instead of hiding it. All-zero dwords are
+				// an unbound slot rather than a wrong read and stay quiet.
+				ReportRejectedImageDescriptor(program, i, snapshot.images[i]);
 				snapshot.images[i].dwords.fill(0);
 			}
 		}

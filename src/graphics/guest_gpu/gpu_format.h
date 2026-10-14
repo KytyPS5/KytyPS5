@@ -44,6 +44,11 @@ uint32_t                   NumBytesPerElement(BufferFormat format);
 uint32_t                   BlockCompressedBytesPerBlock(BufferFormat format);
 uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
+/// Whether the value names a format at all. The encoding leaves wide gaps (137-155 sit between
+/// k4_4_4_4UNorm and the FMASK range and name nothing), so a value well inside the enum's range can
+/// still be no format, and that is what separates a real descriptor from eight dwords that merely
+/// sit where one was expected.
+bool                       IsDefinedBufferFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
 

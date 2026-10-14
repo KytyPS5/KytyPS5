@@ -43739,6 +43739,10 @@ void CheckAgcSystemTable(RenderContext &renderer) {
               0, LibKernel::Memory::KernelGetDirectMemorySize(), 0x200000,
               0x200000, 12, &unavailable) == LibKernel::KERNEL_ERROR_EAGAIN,
           "test did not exhaust the driver-sized allocation pool");
+  Require(name, "main allocation respects guest budget",
+          LibKernel::Memory::KernelAllocateMainDirectMemory(
+              0x4000, 0x4000, 12, &unavailable) == LibKernel::KERNEL_ERROR_EAGAIN,
+          "main direct-memory allocation reached the hidden alignment tail");
   uint32_t state = 0xabcdef01u;
   Require(name, "driver startup", Gen5::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
           "Agc startup failed or changed its ignored public state pointer");

@@ -227,10 +227,12 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 }
 
 void CommandProcessor::BufferInit() {
+	m_needs_flush = false;
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
 void CommandProcessor::BufferFlush() {
+	m_needs_flush = false;
 	GetScheduler().Flush();
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();
@@ -274,6 +276,92 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
+}
+
+void CommandProcessor::MemSemaphore(uint64_t* addr, uint32_t operation, bool write_signal,
+                                    bool use_mailbox) {
+	EXIT_IF(addr == nullptr || (reinterpret_cast<uint64_t>(addr) & 0x7u) != 0);
+	EXIT_NOT_IMPLEMENTED(operation != 6u && operation != 7u);
+	EXIT_IF(g_current_execution == nullptr);
+
+	const auto address      = reinterpret_cast<uint64_t>(addr);
+	auto&      tick         = g_current_execution->m_wait_tick;
+	auto&      cache        = m_renderer.GetBufferCache();
+	const bool mapped       = m_renderer.IsMapped(address, sizeof(*addr));
+	auto       signal       = [addr, write_signal] {
+		std::atomic_ref<uint64_t> counter(*addr);
+		if (write_signal) {
+			counter.store(1u, std::memory_order_release);
+		} else {
+			counter.fetch_add(1u, std::memory_order_release);
+		}
+	};
+	// Mailbox signals wait for completion; tracked counters also need GPU-thread cache maintenance.
+	if (operation == 6u && !use_mailbox && !mapped) {
+		GetScheduler().DeferPriorityOperation([signal, gpu = g_gpu_state] {
+			signal();
+			if (gpu != nullptr) gpu->Wake();
+		});
+		g_current_execution->m_eop_pending = true;
+		return;
+	}
+
+	auto       is_gpu_dirty = [&] {
+		if (!mapped) {
+			return false;
+		}
+		Common::LockGuard lock(m_renderer.GetMutex());
+		return cache.IsRegionGpuModified(address, sizeof(*addr));
+	};
+	bool gpu_dirty    = is_gpu_dirty();
+	bool need_completion = operation == 6u && tick == 0;
+	while (need_completion || gpu_dirty || tick != 0) {
+		if (tick == 0) {
+			if (gpu_dirty) {
+				Common::LockGuard lock(m_renderer.GetMutex());
+				tick = cache.StageDownload(address, sizeof(*addr));
+			}
+			if (need_completion || tick == 0) {
+				tick = GetScheduler().CurrentTick();
+			}
+			if (!GetScheduler().IsFree(tick)) {
+				if (g_gpu_state != nullptr) {
+					GetScheduler().DeferPriorityOperation([gpu = g_gpu_state] { gpu->Wake(); });
+				}
+				BufferFlush();
+			}
+			need_completion = false;
+		}
+		// Yield before publishing a signal or reading a GPU-owned counter.
+		if (!GetScheduler().IsFree(tick)) {
+			SuspendPm4();
+			return;
+		}
+		GetScheduler().WaitPriorityOperations(tick);
+		tick = 0;
+		if (gpu_dirty) {
+			Common::LockGuard lock(m_renderer.GetMutex());
+			(void)cache.CompleteStagedDownload(address, sizeof(*addr));
+		}
+		gpu_dirty = is_gpu_dirty();
+	}
+
+	if (operation == 6u) {
+		(void)m_renderer.InvalidateMemory(address, sizeof(*addr));
+		signal();
+		return;
+	}
+
+	std::atomic_ref<uint64_t> counter(*addr);
+	auto value = counter.load(std::memory_order_acquire);
+	while (value != 0) {
+		if (counter.compare_exchange_weak(value, value - 1u, std::memory_order_acq_rel,
+		                                  std::memory_order_acquire)) {
+			(void)m_renderer.InvalidateMemory(address, sizeof(*addr));
+			return;
+		}
+	}
+	SuspendPm4();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -407,6 +495,14 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	const auto unblock_queues = [&] {
+		for (auto& queue: gpu->m_queues) {
+			if (!queue.empty()) {
+				queue.front().blocked = false;
+			}
+		}
+	};
+
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -439,15 +535,11 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					// A wake that came before this wait must not be lost.
-					if (!std::exchange(gpu->m_wake_pending, false)) {
+					if (!gpu->m_wake_pending) {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					}
-					for (auto& queue: gpu->m_queues) {
-						if (!queue.empty()) {
-							queue.front().blocked = false;
-						}
-					}
+					gpu->m_wake_pending = false;
+					unblock_queues();
 					continue;
 				}
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
@@ -482,16 +574,16 @@ void GuestGpu::ThreadRun(void* data) {
 		const bool complete = gpu->Process(submission);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		const bool unblock =
+		    std::exchange(gpu->m_wake_pending, false) || complete ||
+		    submission.execution.MadeProgress();
+		if (unblock) {
+			unblock_queues();
+		}
 		if (!complete) {
-			submission.blocked = true;
+			submission.blocked = !unblock;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
-		} else {
-			for (auto& queue: gpu->m_queues) {
-				if (!queue.empty()) {
-					queue.front().blocked = false;
-				}
-			}
 		}
 		gpu->m_processing = false;
 		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -531,7 +623,7 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::Graphics:
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
-			if (submission.execution.MadeProgress()) {
+			if (cp.NeedsFlush()) {
 				cp.BufferFlush();
 			}
 			break;
@@ -616,6 +708,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
+			m_needs_flush             = true;
 			continue;
 		}
 
@@ -639,6 +732,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
+			m_needs_flush             = true;
 			continue;
 		}
 
@@ -668,6 +762,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		m_needs_flush             = true;
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {

@@ -707,6 +707,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME msaa_storage
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
+	add_test(NAME pm4_mem_semaphore
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mem-semaphore-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler

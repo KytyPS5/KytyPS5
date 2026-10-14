@@ -3070,6 +3070,30 @@ uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, 
 	return cmd;
 }
 
+uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile uint64_t* address,
+                                           uint32_t mailbox, uint32_t signal_type,
+                                           uint32_t operation) {
+	PRINT_NAME();
+
+	const auto vaddr = reinterpret_cast<uint64_t>(address);
+	if (buf == nullptr || address == nullptr || (vaddr & 0x7u) != 0 ||
+	    (operation != 6u && operation != 7u) || signal_type > 1u || mailbox > 1u) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(4);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	cmd[0] = KYTY_PM4(4, Pm4::IT_MEM_SEMAPHORE, 0u);
+	cmd[1] = static_cast<uint32_t>(vaddr);
+	cmd[2] = static_cast<uint32_t>(vaddr >> 32u);
+	cmd[3] = (operation << 29u) | (signal_type << 20u) | (mailbox << 16u);
+
+	return cmd;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {

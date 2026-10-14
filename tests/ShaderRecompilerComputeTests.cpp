@@ -2062,6 +2062,11 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
 
 } // namespace TestSpv
 
+std::array<uint32_t, 4> MakeMemSemaphorePacket(uint64_t address, uint32_t control) {
+  return {0xc0023900u, static_cast<uint32_t>(address),
+          static_cast<uint32_t>(address >> 32u), control};
+}
+
 void WriteDataPacket(uint32_t *packet, uint32_t *destination, uint32_t value) {
   const auto address = reinterpret_cast<uint64_t>(destination);
   packet[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
@@ -2069,6 +2074,20 @@ void WriteDataPacket(uint32_t *packet, uint32_t *destination, uint32_t value) {
   packet[2] = static_cast<uint32_t>(address);
   packet[3] = static_cast<uint32_t>(address >> 32u);
   packet[4] = value;
+}
+
+Pm4ProcessResult ExecuteMemSemaphorePacket(CommandProcessor &processor,
+                                         const std::array<uint32_t, 4> &packet) {
+  processor.BufferInit();
+  Pm4Execution execution;
+  auto result = processor.Process(execution, packet);
+  if ((packet[3] >> 29u) == 6u) {
+    processor.BufferWait();
+    if (result == Pm4ProcessResult::Blocked) {
+      result = processor.Process(execution, packet);
+    }
+  }
+  return result;
 }
 
 class VulkanHarness {
@@ -2950,6 +2969,289 @@ public:
     m_runtime_context.device.destroySemaphore(gate, nullptr);
     Require(name, "shutdown native completion", !shutdown_overtook_native,
             "shutdown returned while the suspend point was still executing");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckMemSemaphoreGpu() {
+    constexpr const char *name = "MemSemaphoreGpu";
+    constexpr uint64_t base = 0x0000000204c00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint64_t address = base + 0x1000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation", LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+                &direct_offset) == 0, "semaphore allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping", LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base), "semaphore mapping failed");
+    std::memset(mapped, 0xa5, size);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, size);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &gpu = context.GetGpu();
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    CommandProcessor processor(context, 0x20);
+    const auto wait = MakeMemSemaphorePacket(address, 0xe0000000u);
+    const auto signal = MakeMemSemaphorePacket(address, 0xc0010000u);
+    std::atomic_ref<uint64_t> counter(*reinterpret_cast<uint64_t *>(address));
+    const auto gpu_fill_counter = [&](uint32_t value) {
+      (void)cache.ObtainBuffer(address, sizeof(uint64_t), true, true);
+      cache.FillBuffer(address, sizeof(uint64_t), value, false);
+      Require(name, "GPU-dirty counter setup",
+              cache.IsRegionGpuModified(address, sizeof(uint64_t)),
+              "counter range was not marked GPU-modified");
+    };
+    const auto check_gpu_counter = [&](const char *stage, uint64_t expected) {
+      (void)cache.ObtainBuffer(base + 0x8000, sizeof(uint64_t), true, true);
+      cache.CopyBuffer(base + 0x8000, address, sizeof(uint64_t), false, false);
+      cache.ReadMemory(base + 0x8000, sizeof(uint64_t));
+      uint64_t copied = 0;
+      Require(name, stage, LibKernel::Memory::TryReadBacking(
+                  base + 0x8000, &copied, sizeof(copied)) && copied == expected,
+              "subsequent GPU work did not see the updated counter");
+    };
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      gpu_fill_counter(0);
+      Pm4Execution empty_wait;
+      processor.Process(empty_wait, wait);
+      scheduler.Finish();
+      Require(name, "GPU counter readback",
+              processor.Process(empty_wait, wait) == Pm4ProcessResult::Blocked &&
+                  counter.load() == 0,
+              "wait consumed stale CPU data instead of the GPU counter");
+      Require(name, "clean wait poll",
+              !cache.IsRegionGpuModified(address, sizeof(uint64_t)) &&
+                  !cache.IsRegionCpuModified(address, sizeof(uint64_t)),
+              "failed wait poll dirtied a clean cached semaphore page");
+      gpu_fill_counter(UINT32_MAX);
+      Require(name, "GPU counter increment",
+              ExecuteMemSemaphorePacket(processor, signal) == Pm4ProcessResult::Complete &&
+                  counter.load() == 0,
+              "signal failed to read the GPU counter or wrap its increment");
+      gpu_fill_counter(1);
+      const auto write_signal = MakeMemSemaphorePacket(address, 0xc0100000u);
+      Require(name, "GPU counter replacement",
+              ExecuteMemSemaphorePacket(processor, write_signal) == Pm4ProcessResult::Complete &&
+                  counter.load() == 1,
+              "write signal failed to replace the GPU counter");
+      check_gpu_counter("counter upload", 1);
+      Pm4Execution consume;
+      Require(name, "cached counter consumption",
+              processor.Process(consume, wait) == Pm4ProcessResult::Complete &&
+                  counter.load() == 0,
+              "cached counter wait did not consume one token");
+      check_gpu_counter("consumption upload", 0);
+      scheduler.Finish();
+    });
+
+    vk::SemaphoreTypeCreateInfo timeline_type{};
+    timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo create{};
+    create.pNext = &timeline_type;
+    vk::Semaphore gate = nullptr;
+    RequireVk(name, "gate", m_device.createSemaphore(&create, nullptr, &gate),
+              "vkCreateSemaphore");
+    const auto release_gate = [&](uint64_t value) {
+      vk::SemaphoreSignalInfo release{};
+      release.semaphore = gate;
+      release.value = value;
+      RequireVk(name, "release gate", m_device.signalSemaphore(&release), "vkSignalSemaphore");
+    };
+    const auto process_async = [&](Pm4Execution &execution,
+                                   const std::array<uint32_t, 4> &packet,
+                                   uint64_t gate_value) {
+      std::binary_semaphore done{0};
+      Pm4ProcessResult result = Pm4ProcessResult::Complete;
+      gpu.SendCommand([&] {
+        processor.BufferInit();
+        result = processor.Process(execution, packet);
+        done.release();
+      });
+      const bool returned = done.try_acquire_for(std::chrono::seconds(2));
+      if (!returned) {
+        release_gate(gate_value);
+        done.acquire();
+      }
+      return std::pair{returned, result};
+    };
+
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      (void)context.InvalidateMemory(address, sizeof(uint64_t));
+      counter.store(0);
+      gpu_fill_counter(0);
+      SubmitInfo blocked;
+      blocked.AddWait(gate, 1ull);
+      scheduler.Flush(blocked);
+    });
+    Pm4Execution waiting;
+    const auto [wait_returned, wait_result] = process_async(waiting, wait, 1ull);
+    uint64_t observed = UINT64_MAX;
+    Require(name, "nonblocking wait", wait_returned &&
+                wait_result == Pm4ProcessResult::Blocked &&
+                LibKernel::Memory::TryReadBacking(address, &observed, sizeof(observed)) && observed == 0,
+            "empty wait blocked the GPU thread on unrelated native work");
+    Pm4Execution signaling;
+    const auto [signal_returned, signal_result] = process_async(signaling, signal, 1ull);
+    Require(name, "counter before completion", LibKernel::Memory::TryReadBacking(
+                address, &observed, sizeof(observed)), "counter backing could not be read");
+    const auto value_before_completion = observed;
+    if (signal_returned) {
+      gpu.SendCommandSync([&] {
+        const auto before = scheduler.CurrentTick();
+        Require(name, "pending signal retry",
+                processor.Process(signaling, signal) == Pm4ProcessResult::Blocked &&
+                    !signaling.MadeProgress() && scheduler.CurrentTick() == before,
+                "pending signal replayed its submission or blocked other GPU commands");
+      });
+      release_gate(1ull);
+    }
+    Require(name, "nonblocking signal", signal_returned &&
+                signal_result == Pm4ProcessResult::Blocked && value_before_completion == 0,
+            "signal blocked the GPU thread or published before native completion");
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      scheduler.Finish();
+      Require(name, "signal completion",
+              processor.Process(signaling, signal) == Pm4ProcessResult::Complete &&
+                  counter.load() == 1,
+              "signal did not publish exactly one token after native completion");
+      Require(name, "resume after completion",
+              processor.Process(waiting, wait) == Pm4ProcessResult::Complete &&
+                  counter.load() == 0,
+              "wait failed to consume the completed native signal");
+      scheduler.Finish();
+    });
+
+    Pm4Execution staged_wait;
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      gpu_fill_counter(1);
+      Require(name, "staged download suspend",
+              processor.Process(staged_wait, wait) == Pm4ProcessResult::Blocked,
+              "GPU-dirty wait did not suspend while staging its download");
+      scheduler.Finish();
+      SubmitInfo blocked;
+      blocked.AddWait(gate, 2ull);
+      scheduler.Flush(blocked);
+    });
+    const auto [staged_resumed, staged_resume_result] =
+        process_async(staged_wait, wait, 2ull);
+    if (staged_resumed) {
+      release_gate(2ull);
+    }
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      Require(name, "staged download resume without synchronous wait",
+              staged_resumed && staged_resume_result == Pm4ProcessResult::Complete &&
+                  counter.load() == 0x0000000100000000ull,
+              "resuming a completed staged download stalled on a subsequent gated submission");
+      counter.store(0);
+    });
+    Pm4Execution older_wait;
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      gpu_fill_counter(1);
+      const auto staged_tick = cache.StageDownload(address, sizeof(uint64_t));
+      SubmitInfo blocked;
+      blocked.AddWait(gate, 3ull);
+      scheduler.Flush(blocked);
+      const auto before = scheduler.CurrentTick();
+      Require(name, "older staged download wake",
+              staged_tick < before && processor.Process(older_wait, wait) == Pm4ProcessResult::Blocked &&
+                  scheduler.CurrentTick() == before + 1u && scheduler.HasPendingPriorityOperations(),
+              "an older staged download suspended without submitting a completion wake");
+    });
+    release_gate(3ull);
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      Require(name, "older staged download resume",
+              processor.Process(older_wait, wait) == Pm4ProcessResult::Complete &&
+                  counter.load() == 0x0000000100000000ull,
+              "an older staged download did not resume with its GPU counter");
+      counter.store(0);
+    });
+
+    alignas(8) uint64_t mailbox_value = 0;
+    std::atomic_ref<uint64_t> mailbox_counter(mailbox_value);
+    uint64_t gate_value = 4;
+    for (const uint32_t signal_type : {0u, 1u}) {
+      for (const uint32_t use_mailbox : {0u, 1u}) {
+        mailbox_counter.store(7);
+        const auto mailbox_signal = MakeMemSemaphorePacket(
+            reinterpret_cast<uint64_t>(&mailbox_value),
+            0xc0000000u | (signal_type << 20u) | (use_mailbox << 16u));
+        gpu.SendCommandSync([&] {
+          processor.BufferInit();
+          SubmitInfo blocked;
+          blocked.AddWait(gate, gate_value);
+          scheduler.Flush(blocked);
+        });
+        Pm4Execution mailbox_execution;
+        const auto [returned, result] =
+            process_async(mailbox_execution, mailbox_signal, gate_value);
+        const auto before_completion = mailbox_counter.load();
+        if (returned) {
+          gpu.SendCommandSync([&] {
+            if (use_mailbox != 0) {
+              const auto before = scheduler.CurrentTick();
+              Require(name, "mailbox retry",
+                      processor.Process(mailbox_execution, mailbox_signal) ==
+                              Pm4ProcessResult::Blocked &&
+                          !mailbox_execution.MadeProgress() && scheduler.CurrentTick() == before,
+                      "mailbox signal replayed its submission while completion was pending");
+            } else {
+              processor.BufferFlush();
+            }
+          });
+          release_gate(gate_value);
+        }
+        gpu.SendCommandSync([&] {
+          scheduler.Finish();
+          Require(name, "mailbox selection", returned && before_completion == 7 &&
+                      result == (use_mailbox != 0 ? Pm4ProcessResult::Blocked
+                                                 : Pm4ProcessResult::Complete),
+                  "mailbox selection did not control the signal-side wait or published early");
+          if (use_mailbox != 0) {
+            Require(name, "mailbox completion",
+                    processor.Process(mailbox_execution, mailbox_signal) ==
+                        Pm4ProcessResult::Complete,
+                    "mailbox signal did not resume after native completion");
+          }
+          Require(name, "mailbox signal value",
+                  mailbox_counter.load() == (signal_type != 0 ? 1u : 8u),
+                  "mailbox signal lost its operation or published more than once");
+        });
+        ++gate_value;
+      }
+    }
+    m_device.destroySemaphore(gate, nullptr);
+
+    std::array<uint32_t, 2> results{};
+    std::array<std::array<uint32_t, 9>, 2> waiters{};
+    for (size_t i = 0; i < waiters.size(); ++i) {
+      std::copy(wait.begin(), wait.end(), waiters[i].begin());
+      WriteDataPacket(waiters[i].data() + 4, &results[i], static_cast<uint32_t>(i + 1));
+    }
+    gpu.SubmitCompute(0x20, waiters[0]);
+    gpu.SubmitCompute(0x21, waiters[1]);
+    gpu.SubmitCompute(0x22, signal);
+    gpu.SubmitCompute(0x22, signal);
+    gpu.WaitForIdle();
+    Require(name, "queue scheduling", results == std::array<uint32_t, 2>{1, 2} &&
+                counter.load() == 0,
+            "blocked compute queues failed to resume or consumed the wrong number of tokens");
+    gpu.SendCommandSync([&] { context.UnmapMemory(base, size); scheduler.Finish(); });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+            "semaphore mapping or allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -50017,6 +50319,183 @@ void CheckPm4AcquireMemPackets(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckPm4MemSemaphore(RenderContext &renderer) {
+  constexpr const char *name = "Pm4MemSemaphore";
+  Loader::SymbolDatabase symbols;
+  Libs::InitAgcDriver_1(&symbols);
+  const auto *symbol = symbols.FindByNid("q4VuU-QsLOE", Loader::SymbolType::Func);
+  Require(name, "export", symbol != nullptr &&
+              symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbMemSemaphore),
+          "async memory semaphore import did not resolve to the emitter");
+  const auto emit = reinterpret_cast<decltype(&Gen5::AgcAcbMemSemaphore)>(symbol->vaddr);
+
+  constexpr uint32_t sentinel = 0x12345678u;
+  std::array<uint32_t, 6> acb_storage{};
+  acb_storage.fill(sentinel);
+  CommandBufferLayout acb{acb_storage.data(), acb_storage.data() + acb_storage.size(),
+                          acb_storage.data() + 1, acb_storage.data() + 5, nullptr, nullptr, 0};
+  auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&acb);
+  constexpr uint64_t test_address = 0x123456789ab8ull;
+  const auto *semaphore = reinterpret_cast<const volatile uint64_t *>(test_address);
+  for (const uint32_t operation : {6u, 7u}) {
+    for (const uint32_t signal_type : {0u, 1u}) {
+      for (const uint32_t mailbox : {0u, 1u}) {
+        acb.cursor_up = acb_storage.data() + 1;
+        Require(name, "packet", emit(buffer, semaphore, mailbox, signal_type, operation) ==
+                    acb_storage.data() + 1 && acb.cursor_up == acb_storage.data() + 5 &&
+                    acb_storage == std::array<uint32_t, 6>{sentinel, 0xc0023900u,
+                        0x56789ab8u, 0x1234u,
+                        (operation << 29u) | (signal_type << 20u) | (mailbox << 16u),
+                        sentinel},
+                "semaphore packet fields or four-DWORD allocation are incorrect");
+      }
+    }
+  }
+  const auto before = acb_storage;
+  acb.cursor_up = acb_storage.data() + 1;
+  Require(name, "null arguments", emit(nullptr, semaphore, 0, 0, 6) == nullptr &&
+              emit(buffer, nullptr, 0, 0, 6) == nullptr,
+          "semaphore emitter accepted a null argument");
+  for (uint64_t offset = 1; offset < 8; ++offset) {
+    Require(name, "address alignment", emit(buffer,
+                reinterpret_cast<const volatile uint64_t *>(test_address + offset), 0, 0, 6) == nullptr,
+            "semaphore emitter accepted an unaligned address");
+  }
+  for (const uint32_t operation : {0u, 5u, 8u, 0x106u, UINT32_MAX}) {
+    Require(name, "invalid operation", emit(buffer, semaphore, 0, 0, operation) == nullptr,
+            "semaphore emitter accepted an invalid operation");
+  }
+  for (const uint32_t selector : {2u, 0x100u, UINT32_MAX}) {
+    Require(name, "invalid selectors", emit(buffer, semaphore, 0, selector, 6) == nullptr &&
+                emit(buffer, semaphore, selector, 0, 6) == nullptr,
+            "semaphore emitter accepted an invalid signal type or mailbox selector");
+  }
+  acb.reserved_dw = 1;
+  Require(name, "bounded allocation", emit(buffer, semaphore, 0, 0, 6) == nullptr &&
+              acb.cursor_up == acb_storage.data() + 1 && acb_storage == before,
+          "failed semaphore emission changed the cursor or command storage");
+
+  GraphicsInitJmpTables();
+  CommandProcessor graphics(renderer, 0);
+  CommandProcessor compute(renderer, 0x20);
+  const auto packet = [](uint64_t *address, uint32_t control) {
+    return MakeMemSemaphorePacket(reinterpret_cast<uint64_t>(address), control);
+  };
+  struct alignas(8) {
+    uint64_t before = 0x123456789abcdef0ull;
+    uint64_t counter = 0;
+    uint64_t after = 0xfedcba9876543210ull;
+  } memory;
+  acb.reserved_dw = 0;
+  acb.cursor_up = acb_storage.data() + 1;
+  const auto *guest_signal = emit(buffer, &memory.counter, 0, 1, 6);
+  Require(name, "guest signal ABI", guest_signal == acb_storage.data() + 1 &&
+              guest_signal[3] == 0xc0100000u,
+          "guest argument order did not emit a write-one signal");
+  std::array<uint32_t, 4> emitted_signal{};
+  std::copy_n(guest_signal, emitted_signal.size(), emitted_signal.begin());
+  Require(name, "guest signal execution",
+          ExecuteMemSemaphorePacket(compute, emitted_signal) == Pm4ProcessResult::Complete &&
+              memory.counter == 1,
+          "guest signal did not publish the graphics wait label");
+  const std::array<uint32_t, 9> graphics_wait{
+      0xc0079300u, 0x13u, static_cast<uint32_t>(reinterpret_cast<uint64_t>(&memory.counter)),
+      static_cast<uint32_t>(reinterpret_cast<uint64_t>(&memory.counter) >> 32u),
+      1u, 0u, UINT32_MAX, UINT32_MAX, 25u};
+  graphics.BufferInit();
+  Pm4Execution graphics_execution;
+  Require(name, "guest signal releases graphics",
+          graphics.Process(graphics_execution, graphics_wait) == Pm4ProcessResult::Complete,
+          "graphics queue remained blocked after the guest signal");
+  for (const uint64_t value : std::array<uint64_t, 3>{0, 0xffffffffull, UINT64_MAX}) {
+    memory.counter = value;
+    auto signal = packet(&memory.counter, 0xc0000000u);
+    signal[0] |= 2u;
+    Require(name, "increment", ExecuteMemSemaphorePacket(compute, signal) == Pm4ProcessResult::Complete &&
+                memory.counter == value + 1u,
+            "signal did not increment the complete 64-bit counter");
+    const auto write = packet(&memory.counter, 0xc0110000u);
+    Require(name, "write one", ExecuteMemSemaphorePacket(graphics, write) == Pm4ProcessResult::Complete &&
+                memory.counter == 1u,
+            "write signal did not replace the counter with one");
+  }
+  for (const uint64_t value : std::array<uint64_t, 3>{1, 0x100000000ull, UINT64_MAX}) {
+    memory.counter = value;
+    const auto wait = packet(&memory.counter, 0xe0110000u);
+    Require(name, "consume", ExecuteMemSemaphorePacket(compute, wait) == Pm4ProcessResult::Complete &&
+                memory.counter == value - 1u,
+            "wait did not consume exactly one token");
+  }
+  uint64_t prefix = 0;
+  uint32_t suffix = 0;
+  memory.counter = 0;
+  std::array<uint32_t, 13> commands{};
+  const auto first = packet(&prefix, 0xc0000000u);
+  const auto wait = packet(&memory.counter, 0xe0000000u);
+  std::copy(first.begin(), first.end(), commands.begin());
+  std::copy(wait.begin(), wait.end(), commands.begin() + 4);
+  WriteDataPacket(commands.data() + 8, &suffix, 33);
+  graphics.BufferInit();
+  Pm4Execution execution;
+  graphics.Process(execution, commands);
+  renderer.GetCommandScheduler().Finish();
+  const auto result = graphics.Process(execution, commands);
+  Require(name, "suspend", result == Pm4ProcessResult::Blocked &&
+              prefix == 1 && suffix == 0 && memory.counter == 0,
+          "empty semaphore did not suspend at its ordered position");
+  Require(name, "retry", graphics.Process(execution, commands) == Pm4ProcessResult::Blocked &&
+              !execution.MadeProgress() && prefix == 1 && suffix == 0 && memory.counter == 0,
+          "empty semaphore replayed earlier commands or underflowed");
+  compute.BufferInit();
+  Pm4Execution second_wait;
+  Require(name, "second waiter", compute.Process(second_wait, wait) == Pm4ProcessResult::Blocked,
+          "another queue consumed an absent token");
+  const auto signal = packet(&memory.counter, 0xc0000000u);
+  Require(name, "other queue signal", ExecuteMemSemaphorePacket(compute, signal) == Pm4ProcessResult::Complete,
+          "suspended wait prevented another queue from signaling");
+  graphics.BufferInit();
+  auto resumed = graphics.Process(execution, commands);
+  if (resumed == Pm4ProcessResult::Blocked) {
+    Require(name, "ordered write suspend", prefix == 1 && suffix == 0 && memory.counter == 0,
+            "resumed wait replayed the prefix or failed to consume the token before the write");
+    renderer.GetCommandScheduler().Finish();
+    resumed = graphics.Process(execution, commands);
+  }
+  Require(name, "resume", resumed == Pm4ProcessResult::Complete &&
+              prefix == 1 && suffix == 33 && memory.counter == 0 &&
+              memory.before == 0x123456789abcdef0ull && memory.after == 0xfedcba9876543210ull,
+          "resumed wait replayed commands, lost a token, or changed adjacent memory");
+  compute.BufferInit();
+  Require(name, "one token per waiter",
+          compute.Process(second_wait, wait) == Pm4ProcessResult::Blocked &&
+              memory.counter == 0,
+          "one signal released multiple waiters");
+  Require(name, "second signal", ExecuteMemSemaphorePacket(graphics, signal) == Pm4ProcessResult::Complete,
+          "second signal failed to complete");
+  compute.BufferInit();
+  Require(name, "second resume", compute.Process(second_wait, wait) == Pm4ProcessResult::Complete &&
+              memory.counter == 0,
+          "second waiter did not consume its own signal");
+  renderer.GetCommandScheduler().Finish();
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  for (const uint32_t control : {0u, 0xa0000000u, 0xc0001000u, 0xc1000000u}) {
+    ExpectFatal(name, [&] {
+      const auto invalid = packet(&memory.counter, control);
+      Pm4Execution invalid_execution;
+      graphics.Process(invalid_execution, invalid);
+    });
+  }
+  ExpectFatal(name, [&] {
+    auto invalid = packet(&memory.counter, 0xc0000000u);
+    invalid[1] |= 4u;
+    Pm4Execution invalid_execution;
+    graphics.Process(invalid_execution, invalid);
+  });
+  ExpectFatal(name, [&] { CpOpMemSemaphore(graphics, 0xc0023900u, nullptr, 3u, 3u); });
+#endif
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitPackets(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -51974,6 +52453,12 @@ int main(int argc, char **argv) {
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mem-semaphore-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
+    vulkan.CheckMemSemaphoreGpu();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-draw-multi-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4DrawIndirectMultiPacket(vulkan.RuntimeRenderer());
@@ -52285,6 +52770,7 @@ int main(int argc, char **argv) {
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
   CheckShaderFusion();
   CheckAgcSystemTable(vulkan.RuntimeRenderer());
+  CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());
   CheckPm4DrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
@@ -52372,6 +52858,7 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, test);
   }
   vulkan.CheckGpuSuspendPoint();
+  vulkan.CheckMemSemaphoreGpu();
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
   // Last: its window installs global GPU resources.

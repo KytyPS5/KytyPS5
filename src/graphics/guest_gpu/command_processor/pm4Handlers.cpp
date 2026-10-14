@@ -2212,6 +2212,23 @@ KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
 	return 6;
 }
 
+KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_MEM_SEMAPHORE ||
+	                     KYTY_PM4_R(cmd_id) != 0u || KYTY_PM4_LEN(cmd_id) != 4u || dw < 4u);
+	const auto control   = buffer[2];
+	const auto operation = control >> 29u;
+	EXIT_NOT_IMPLEMENTED((control & ~0xe0110000u) != 0 ||
+	                     (operation != 6u && operation != 7u));
+	auto* addr = reinterpret_cast<uint64_t*>(buffer[0] |
+	                                         (static_cast<uint64_t>(buffer[1]) << 32u));
+	cp.MemSemaphore(addr, operation, (control & (1u << 20u)) != 0,
+	                (control & (1u << 16u)) != 0);
+
+	return 3;
+}
+
 template <typename T>
 static T CpOpWaitRegMemReadValue(const uint32_t* buffer) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));

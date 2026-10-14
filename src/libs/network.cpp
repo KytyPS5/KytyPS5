@@ -1075,6 +1075,10 @@ static int ConvertSocketOptionName(int level, int option) {
 			case 0x0020: return SO_BROADCAST;
 			case 0x1001: return SO_SNDBUF;
 			case 0x1002: return SO_RCVBUF;
+#if defined(_WIN32)
+			// Existing millisecond receive-timeout ABI uses a DWORD on Winsock.
+			case 0x1006: return SO_RCVTIMEO;
+#endif
 			case 0x1007: return SO_ERROR;
 			case 0x1105: return SO_SNDTIMEO;
 			default: break;
@@ -1082,11 +1086,9 @@ static int ConvertSocketOptionName(int level, int option) {
 	} else if (level == 6 && option == 1) {
 		return TCP_NODELAY;
 	}
-#if defined(_WIN32)
-	return option;
-#else
+	// Guest option numbers are not a native ABI. Only explicitly translated
+	// options may reach the host; unknown values have one guest error everywhere.
 	return -1;
-#endif
 }
 
 static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {

@@ -603,12 +603,14 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 # These tests use exceptions.
-if(NOT KYTY_CLANG_CL)
-	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests)
+foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+		virtual_memory_allocation_tests)
+	if(KYTY_CLANG_CL)
+		target_compile_options(${kyty_exception_test} PRIVATE /EHsc)
+	else()
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
-	endforeach()
-endif()
+	endif()
+endforeach()
 
 if(BUILD_TESTING)
 	add_test(NAME emulator_user_name_cli
@@ -672,6 +674,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 	add_test(NAME image_transfer_layout
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-layout-only)
+	add_test(NAME image_transition_state
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transition-only)
+	foreach(copy_case layers depth)
+		add_test(NAME image_mip_copy_bounds_${copy_case}
+			COMMAND ${CMAKE_COMMAND}
+				-DTEST_EXECUTABLE=$<TARGET_FILE:shader_recompiler_compute_tests>
+				-DCOPY_CASE=${copy_case}
+				-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/MipCopyDeath.cmake)
+	endforeach()
 
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
@@ -692,6 +703,13 @@ if(BUILD_TESTING)
 
 	add_test(NAME texture_cache_image_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
+	foreach(alias_case cross-format unequal-samples)
+		add_test(NAME texture_cache_depth_alias_${alias_case}
+			COMMAND ${CMAKE_COMMAND}
+				-DTEST_EXECUTABLE=$<TARGET_FILE:shader_recompiler_compute_tests>
+				-DALIAS_CASE=${alias_case}
+				-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/DepthAliasDeath.cmake)
+	endforeach()
 	add_test(NAME texture_cache_htile_clear
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 	add_test(NAME buffer_cache_ranges

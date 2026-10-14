@@ -113,6 +113,32 @@ void CommandBuffer::EndRendering() const {
 		return;
 	}
 	Handle().endRendering();
+	// Dynamic rendering supplies no external dependency between pass instances.
+	// Publish stores at the boundary, keeping repeated draws in one pass batched.
+	vk::MemoryBarrier2 attachment_barrier {};
+	if (m_render_state.num_color_attachments != 0) {
+		attachment_barrier.srcStageMask |= vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+		attachment_barrier.srcAccessMask |= vk::AccessFlagBits2::eColorAttachmentWrite;
+	}
+	if (m_render_state.depth_stencil_attachment.has_depth ||
+	    m_render_state.depth_stencil_attachment.has_stencil) {
+		attachment_barrier.srcStageMask |= vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+		                                   vk::PipelineStageFlagBits2::eLateFragmentTests;
+		attachment_barrier.srcAccessMask |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	}
+	if (attachment_barrier.srcAccessMask) {
+		attachment_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+		                                   vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+		                                   vk::PipelineStageFlagBits2::eLateFragmentTests;
+		attachment_barrier.dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+		                                   vk::AccessFlagBits2::eColorAttachmentWrite |
+		                                   vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		                                   vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &attachment_barrier;
+		Handle().pipelineBarrier2(dependency);
+	}
 	m_rendering    = false;
 	m_render_state = {};
 }

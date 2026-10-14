@@ -85,6 +85,10 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend class TextureCache;
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferImpl(uint64_t vaddr, uint64_t size,
+	                                                            bool is_written,
+	                                                            bool is_texel_buffer, BufferId id);
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);

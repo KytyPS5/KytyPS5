@@ -563,14 +563,18 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
-	m_scheduler.EndRendering();
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
 	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
 	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
+	if (source_layers > source.backing.layers || destination_layers > backing.layers - layer ||
+	    (source.backing.image_type == vk::ImageType::e3D && depth > source.backing.extent.depth)) {
+		EXIT("Image: mip copy exceeds subresource bounds\n");
+	}
 	const auto aspects                             = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
+	m_scheduler.EndRendering();
 	std::array<vk::ImageCopy, 2> copies {};
 	uint32_t                     copy_count = 0;
 	for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,

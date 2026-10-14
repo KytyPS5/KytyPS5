@@ -1743,13 +1743,16 @@ void CheckSocketWakeup() {
             Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL,
         "Net send timeout rejects undersized values");
   uint32_t option_size = sizeof(timeout);
-  Check(net_setsockopt(datagram, 0xffff, 0x7fffffff, &timeout, option_size) ==
-            Libs::Network::NET_ERROR_ENOPROTOOPT &&
-            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
-            net_getsockopt(datagram, 0xffff, 0x7fffffff, &timeout, &option_size) ==
-            Libs::Network::NET_ERROR_ENOPROTOOPT &&
-            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
-        "Net unknown socket options return protocol-option errors");
+  for (const auto [level, option] : std::array<std::pair<int, int>, 3>{
+           {{0xffff, 0x7fffffff}, {6, 0x7fffffff}, {0x7fffffff, 1}}}) {
+    Check(net_setsockopt(datagram, level, option, &timeout, option_size) ==
+                  Libs::Network::NET_ERROR_ENOPROTOOPT &&
+              *net_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
+              net_getsockopt(datagram, level, option, &timeout, &option_size) ==
+                  Libs::Network::NET_ERROR_ENOPROTOOPT &&
+              *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
+          "Net unknown socket options return protocol-option errors");
+  }
 #if defined(__linux__)
   Check(net_setsockopt(datagram, 0xffff, 0x1007, &timeout, option_size) ==
             Libs::Network::NET_ERROR_ENOPROTOOPT &&

@@ -31,7 +31,6 @@ struct TextureCacheTestAccess;
 
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
-[[nodiscard]] bool Publish(TextureCache& cache, Image& image);
 void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
@@ -140,11 +139,13 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
+	void                        RefreshImage(ImageId id, ImageId pending_destination = {});
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
+	[[nodiscard]] bool          PublishImageToBuffer(Image& image);
+	void                        PrepareBufferWrite(uint64_t address, uint64_t size);
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
@@ -154,7 +155,7 @@ private:
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
-	void RefreshCopySource(ImageId id);
+	void                  RefreshCopySource(ImageId id, ImageId pending_destination = {});
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
@@ -189,7 +190,6 @@ private:
 	friend class BufferCache;
 	friend class RenderExecutor;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
-	friend bool BcAlias::Publish(TextureCache&, Image&);
 	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 

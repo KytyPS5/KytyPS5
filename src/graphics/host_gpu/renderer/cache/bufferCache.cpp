@@ -483,6 +483,62 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	if (is_written) {
+		m_texture_cache.PrepareBufferWrite(vaddr, size);
+	} else if (is_texel_buffer) {
+		if (!GuestRange {vaddr, size}.Valid() || m_scheduler.Current().IsInvalid()) {
+			EXIT("BufferCache: image read requires a valid range and command buffer\n");
+		}
+		std::scoped_lock     lock {m_texture_cache.m_lock};
+		std::vector<ImageId> sources;
+		auto                 begin = vaddr;
+		auto                 end   = vaddr + size;
+		for (const auto candidate: m_texture_cache.FindImagesInRegion(vaddr, size, false)) {
+			auto& image = m_texture_cache.m_slot_images[candidate];
+			if (image.depth_id) {
+				continue;
+			}
+			if (image.IsMaybeCpuDirty()) {
+				m_texture_cache.TrackImage(candidate);
+				(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
+			}
+			if (!image.SafeToDownload()) {
+				continue;
+			}
+			if (!m_texture_cache.CanDownload(image)) {
+				EXIT("BufferCache: cannot read native image through overlapping buffer\n");
+			}
+			for (const auto source: sources) {
+				if (m_texture_cache.m_slot_images[source].Overlaps(image.info.data.address,
+				                                                   image.info.data.size)) {
+					EXIT("BufferCache: conflicting native image writers during buffer read\n");
+				}
+			}
+			sources.push_back(candidate);
+			begin = std::min(begin, image.info.data.address);
+			end   = std::max(end, image.info.data.End());
+		}
+		if (!sources.empty()) {
+			// Download complete guest layouts, including strided array slices, before
+			// exposing the requested subrange. A read keeps native image ownership.
+			id           = FindBuffer(begin, end - begin);
+			auto& buffer = m_slot_buffers[id];
+			TouchBuffer(buffer);
+			(void)SynchronizeBuffer(buffer, begin, end - begin, false, false);
+			for (const auto source: sources) {
+				auto& image = m_texture_cache.m_slot_images[source];
+				m_texture_cache.DownloadImage(image, buffer, buffer.Offset(image.info.data.address),
+				                              image.info.data.size, image.info.resources.levels);
+			}
+			return {&buffer, buffer.Offset(vaddr)};
+		}
+	}
+	return ObtainBufferImpl(vaddr, size, is_written, is_texel_buffer, id);
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferImpl(uint64_t vaddr, uint64_t size,
+                                                           bool is_written, bool is_texel_buffer,
+                                                           BufferId id) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -556,15 +612,15 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
-	if (!IsRegionGpuModified(vaddr, size)) {
+	if (!IsRegionGpuModified(vaddr, size) && !m_texture_cache.IsRegionRegistered(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		return;
 	}
 
-	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	dst->Fill(dst_offset, size, value);
 }
 
@@ -582,22 +638,24 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	    !IsRegionGpuModified(src_vaddr, size) &&
+	    !m_texture_cache.IsRegionRegistered(src_vaddr, size) &&
+	    !m_texture_cache.IsRegionRegistered(dst_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
 	}
 
 	auto& command = m_scheduler.Current();
-	if (dst_memory) {
-		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
-	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
 	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	if (dst_memory) {
+		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 

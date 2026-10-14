@@ -502,9 +502,9 @@ void TextureCache::PrepareImageCopy(Image& image) {
 	}
 }
 
-void TextureCache::RefreshCopySource(ImageId id) {
+void TextureCache::RefreshCopySource(ImageId id, ImageId pending_destination) {
 	auto& image = m_slot_images[id];
-	RefreshImage(id);
+	RefreshImage(id, pending_destination);
 	if (image.IsDefinitelyCpuDirty()) {
 		EXIT("TextureCache: image copy source remained CPU-dirty after refresh\n");
 	}
@@ -586,7 +586,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 }
 
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
-	RefreshCopySource(source_id);
+	RefreshCopySource(source_id, destination_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
@@ -627,7 +627,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
-	RefreshCopySource(source_id);
+	RefreshCopySource(source_id, destination_id);
 	if (m_slot_images[destination_id].IsBufferModified()) {
 		RefreshImage(destination_id);
 	}
@@ -686,7 +686,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
-	bool recreate = cached.info.resources < requested.resources ||
+	bool recreate = cached.info.resources.levels < requested.resources.levels ||
+	                cached.info.resources.layers < requested.resources.layers ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -704,11 +705,28 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
+	// Reject unsupported conversions before refreshing or replacing the owner.
+	// Image construction preserves the requested native format and sample count.
+	if (cached.backing.samples == requested.samples) {
+		const bool copy_supported =
+		    cached.backing.samples == 1 || cached.backing.format == requested.pixel_format ||
+		    (!cached.info.IsDepth() && !requested.IsDepth() &&
+			 ImageViewOps::FormatsCompatible(cached.backing.format, requested.pixel_format));
+		if (!copy_supported) {
+			EXIT("TextureCache: unsupported cross-format multisample depth copy "
+			     "(format=%u -> %u, samples=%u)\n",
+			     static_cast<uint32_t>(cached.backing.format),
+			     static_cast<uint32_t>(requested.pixel_format), requested.samples);
+		}
+	} else if (!(cached.backing.samples == 1 && requested.samples > 1 && requested.IsDepth())) {
+		EXIT("TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
+		     cached.backing.samples, requested.samples);
+	}
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
-		info.data       = cached.info.data;
-		info.resources  = cached.info.resources;
+		info.data                = cached.info.data;
+		info.resources           = cached.info.resources;
 		info.mip_layout          = cached.info.mip_layout;
 		info.tiling              = cached.info.tiling;
 		info.tiled_slice_stride  = cached.info.tiled_slice_stride;
@@ -723,18 +741,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		cached.binding.needs_rebind = true;
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
-		const bool copy_supported =
-		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
-		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
-		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
-		if (copy_supported) {
-			CopyImage(replacement_id, cached_id);
-		} else {
-			LOGF_COLOR(Log::Color::BrightYellow,
-			           "TextureCache: unsupported cross-format multisample depth copy\n");
-		}
-	} else if (cached.backing.samples == 1 && replacement.backing.samples > 1 &&
-	           replacement.info.IsDepth()) {
+		CopyImage(replacement_id, cached_id);
+	} else {
 		RefreshCopySource(cached_id);
 		if (cached.IsBufferModified() || cached.IsDefinitelyCpuDirty()) {
 			EXIT("TextureCache: multisample depth conversion source is not native-current\n");
@@ -742,39 +750,59 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		PrepareImageCopy(replacement);
 		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
 		CommitGpuWrite(replacement);
-	} else {
-		LOGF_COLOR(Log::Color::BrightYellow,
-		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
-		           cached.backing.samples, replacement.backing.samples);
 	}
 	FreeImage(cached_id);
 	return replacement_id;
+}
+
+bool TextureCache::PublishImageToBuffer(Image& image) {
+	if (!CanDownload(image)) {
+		return false;
+	}
+	ImageIds aliases;
+	if (!image.depth_id && !image.info.HasStencil() && !image.info.HasMetadata()) {
+		for (const auto candidate:
+		     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+			auto& alias = m_slot_images[candidate];
+			if (&alias == &image || alias.depth_id || alias.info.HasStencil() ||
+			    alias.info.HasMetadata() || !CanDownload(alias)) {
+				continue;
+			}
+			if (alias.IsMaybeCpuDirty()) {
+				TrackImage(candidate);
+				(void)alias.ResolveMaybeCpuHash(alias.HashGuestEdges());
+			}
+			if (alias.SafeToDownload()) {
+				EXIT("TextureCache: conflicting native writers during alias publication\n");
+			}
+			aliases.push_back(candidate);
+		}
+	}
+	// Preserve guest padding before overlaying the native GPU image contents.
+	// Ownership is already held here; do not recursively prepare this image write.
+	auto [buffer, offset] = m_buffer_cache.ObtainBufferImpl(image.info.data.address,
+	                                                        image.info.data.size, true, false, {});
+	DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
+	image.ClearGpuModified();
+	image.MarkBufferModified();
+	// Publication supersedes overlapping copies even when their layouts differ.
+	// Bytes outside the published range remain in the preserved buffer backing.
+	for (const auto alias: aliases) {
+		m_slot_images[alias].MarkBufferModified();
+	}
+	return true;
 }
 
 namespace BcAlias {
 
 bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
 	return requested.guest_format != cached.guest_format &&
-	       requested.IsBlock() != cached.IsBlock() &&
-	       requested.tile_mode == cached.tile_mode &&
-	       requested.bytes_per_block == cached.bytes_per_block &&
-	       requested.samples == 1 && cached.samples == 1 &&
+	       requested.IsBlock() != cached.IsBlock() && requested.tile_mode == cached.tile_mode &&
+	       requested.bytes_per_block == cached.bytes_per_block && requested.samples == 1 &&
+	       cached.samples == 1 &&
 	       (requested.data != cached.data || requested.resources != cached.resources ||
 	        requested.BlockExtent() != cached.BlockExtent()) &&
 	       !TextureCache::SameBacking(cached, requested, false);
-}
-
-bool Publish(TextureCache& cache, Image& image) {
-	if (!cache.CanDownload(image)) {
-		return false;
-	}
-	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
-	auto [buffer, offset] =
-	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
-	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
-	image.ClearGpuModified();
-	image.MarkBufferModified();
-	return true;
 }
 
 void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
@@ -783,10 +811,10 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 	// PS5 raw block images can span several packed BC mips. Transfer their complete
 	// guest bytes, including tail padding, before retiring the incompatible backing.
 	if (cached.SafeToDownload()) {
-		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
+		if (merged && merged->SafeToDownload() && !cache.PublishImageToBuffer(*merged)) {
 			return;
 		}
-		if (!Publish(cache, cached)) {
+		if (!cache.PublishImageToBuffer(cached)) {
 			return;
 		}
 		if (merged) {
@@ -812,13 +840,82 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	}
 	auto&      cached       = *owner;
 	const auto current_tick = m_scheduler.CurrentTick();
-	const bool safe_to_delete =
+	const bool old_enough_to_retire =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	const auto preserve_overlap = [&](bool retire) {
+		// Native-only multisample/stencil records may coexist during discovery.
+		// Their dedicated paths cannot be replaced by a guest-buffer transfer.
+		// Age-based retirement still has to prove that their contents are safe.
+		if (!retire && (cached.backing.samples > 1 || cached.depth_id)) {
+			return;
+		}
+		if (cached.IsMaybeCpuDirty()) {
+			(void)cached.ResolveMaybeCpuHash(cached.HashGuestEdges());
+		}
+		// Fresh overlaps also need current guest bytes, even when their native
+		// records remain cached. Preserve a previously merged image first.
+		if (cached.SafeToDownload()) {
+			auto* merged =
+			    merged_id && merged_id != cached_id ? &m_slot_images[merged_id] : nullptr;
+			if (merged != nullptr) {
+				if (merged->IsMaybeCpuDirty()) {
+					(void)merged->ResolveMaybeCpuHash(merged->HashGuestEdges());
+				}
+				if (merged->SafeToDownload() && !PublishImageToBuffer(*merged)) {
+					EXIT("TextureCache: cannot publish merged overlap contents\n");
+				}
+			}
+			if (!PublishImageToBuffer(cached)) {
+				EXIT("TextureCache: cannot publish overlapping image contents: "
+				     "cached=0x%016" PRIx64 "+0x%" PRIx64 " format=%u samples=%u stencil_proxy=%u "
+				     "requested=0x%016" PRIx64 "+0x%" PRIx64 " format=%u samples=%u\n",
+				     cached.info.data.address, cached.info.data.size,
+				     static_cast<uint32_t>(cached.info.pixel_format), cached.info.samples,
+				     cached.depth_id ? 1u : 0u, requested.data.address, requested.data.size,
+				     static_cast<uint32_t>(requested.pixel_format), requested.samples);
+			}
+			if (merged != nullptr) {
+				merged->MarkBufferModified();
+			}
+		}
+		if (retire) {
+			FreeImage(cached_id);
+		}
+	};
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
+		const bool reshaped_subresources =
+		    (requested.resources.levels < cached.info.resources.levels &&
+			 requested.resources.layers > cached.info.resources.layers) ||
+		    (requested.resources.levels > cached.info.resources.levels &&
+			 requested.resources.layers < cached.info.resources.layers);
+		const bool depth_has_auxiliary_planes =
+		    requested.IsDepth() && (requested.HasStencil() || cached.info.HasStencil() ||
+			                        requested.HasMetadata() || cached.info.HasMetadata());
+		if (!depth_has_auxiliary_planes && reshaped_subresources &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    requested.type == cached.info.type && requested.tile_mode == cached.info.tile_mode) {
+			// Mixed mip/layer growth can change the guest stride. Preserve byte
+			// ownership instead of copying identically numbered native subresources.
+			RefreshCopySource(cached_id);
+			if (merged_id && merged_id != cached_id) {
+				RefreshCopySource(merged_id);
+				auto& merged = m_slot_images[merged_id];
+				if (merged.SafeToDownload() && !PublishImageToBuffer(merged)) {
+					EXIT("TextureCache: cannot preserve merged image for a mip/layer reshape\n");
+				}
+				merged.MarkBufferModified();
+			}
+			if (cached.SafeToDownload() && !PublishImageToBuffer(cached)) {
+				EXIT("TextureCache: cannot preserve image for a mip/layer reshape\n");
+			}
+			cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+			FreeImage(cached_id);
+			return {merged_id};
+		}
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
@@ -834,9 +931,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
 			                        left.surface_z == right.surface_z;
 		                 }))) {
-			if (safe_to_delete) {
-				FreeImage(cached_id);
-			}
+			preserve_overlap(old_enough_to_retire);
 			return {merged_id};
 		}
 		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
@@ -919,20 +1014,51 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
-	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
-	}
+	preserve_overlap(requested.data.address >= cached.info.data.address && old_enough_to_retire);
 	return {merged_id};
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
+	const auto& source_info         = m_slot_images[source_id].info;
+	const bool  source_gpu_modified = m_slot_images[source_id].IsGpuModified();
+	bool        remapped            = false;
+	if (source_info.data.address == info.data.address && source_info.extent == info.extent &&
+	    source_info.type == info.type && source_info.resources != info.resources) {
+		const bool multiple_slices =
+		    source_info.resources.layers > 1 || source_info.extent.depth > 1;
+		remapped =
+		    source_info.tile_mode != info.tile_mode ||
+		    (multiple_slices && (source_info.linear_slice_stride != info.linear_slice_stride ||
+			                     source_info.tiled_slice_stride != info.tiled_slice_stride));
+		const auto levels = std::min(source_info.resources.levels, info.resources.levels);
+		for (uint32_t level = 0; level < levels; ++level) {
+			const auto& old_mip = source_info.mip_layout[level];
+			const auto& new_mip = info.mip_layout[level];
+			remapped |= old_mip.offset != new_mip.offset || old_mip.pitch != new_mip.pitch ||
+			            old_mip.height != new_mip.height || old_mip.tail_x != new_mip.tail_x ||
+			            old_mip.tail_y != new_mip.tail_y || old_mip.surface_z != new_mip.surface_z;
+		}
+	}
+	// A native mip copy is valid only while the guest placement is unchanged.
+	// Publish before inserting the replacement so its upload sees current bytes.
+	if (remapped && m_slot_images[source_id].SafeToDownload() &&
+	    !PublishImageToBuffer(m_slot_images[source_id])) {
+		EXIT("TextureCache: cannot preserve guest layout during image expansion\n");
+	}
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id);
+	if (remapped) {
+		if (source_gpu_modified) {
+			m_slot_images[expanded_id].MarkGpuModified();
+		}
+		FreeImage(source_id);
+		return expanded_id;
+	}
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
 	if (layer >= 0) {
@@ -1132,7 +1258,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
-void TextureCache::RefreshImage(ImageId id) {
+void TextureCache::RefreshImage(ImageId id, ImageId pending_destination) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1142,6 +1268,42 @@ void TextureCache::RefreshImage(ImageId id) {
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
 		(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
+	}
+	if (!image.depth_id && !image.info.HasStencil() && !image.info.HasMetadata() &&
+	    CanDownload(image)) {
+		ImageIds writers;
+		for (const auto candidate:
+		     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+			auto& alias = m_slot_images[candidate];
+			// A merge destination may already contain earlier child mips, but it
+			// cannot supersede the source that is about to be copied into it.
+			if (candidate == id || candidate == pending_destination || alias.depth_id ||
+			    alias.info.HasStencil() || alias.info.HasMetadata() || !CanDownload(alias)) {
+				continue;
+			}
+			if (alias.IsMaybeCpuDirty()) {
+				TrackImage(candidate);
+				(void)alias.ResolveMaybeCpuHash(alias.HashGuestEdges());
+			}
+			if (alias.SafeToDownload()) {
+				if (image.SafeToDownload()) {
+					EXIT("TextureCache: conflicting native writers for overlapping aliases "
+					     "[%llx + %llu, format %u] [%llx + %llu, format %u]\n",
+					     static_cast<unsigned long long>(image.info.data.address),
+					     static_cast<unsigned long long>(image.info.data.size),
+					     static_cast<unsigned>(image.info.pixel_format),
+					     static_cast<unsigned long long>(alias.info.data.address),
+					     static_cast<unsigned long long>(alias.info.data.size),
+					     static_cast<unsigned>(alias.info.pixel_format));
+				}
+				writers.push_back(candidate);
+			}
+		}
+		for (const auto writer: writers) {
+			if (!PublishImageToBuffer(m_slot_images[writer])) {
+				EXIT("TextureCache: cannot publish existing overlapping alias contents\n");
+			}
+		}
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -1279,8 +1441,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (result && !m_slot_images[result].depth_id) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+				// The new native format is initialized from guest-layout buffer bytes.
+				// An earlier buffer snapshot may predate the current image writes.
+				if (resolved.SafeToDownload() && !PublishImageToBuffer(resolved)) {
+					EXIT("TextureCache: cannot publish exact-format alias contents\n");
+				}
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (resolved.info.resources.levels < desc.info.resources.levels ||
+			           resolved.info.resources.layers < desc.info.resources.layers) {
+				if (resolved.IsMaybeCpuDirty()) {
+					TrackImage(result);
+					(void)resolved.ResolveMaybeCpuHash(resolved.HashGuestEdges());
+				}
+				if (resolved.SafeToDownload() && !PublishImageToBuffer(resolved)) {
+					EXIT("TextureCache: cannot publish undersized image contents\n");
+				}
 				FreeImage(result);
 				result = {};
 			}
@@ -1375,9 +1550,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 		}
 	}
-	if (desc.type == BindingType::Storage) {
-		image.MarkGpuModified();
-	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id);
 		if (image.info.HasStencil() &&
@@ -1397,6 +1569,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
+			image.MarkGpuModified();
 			if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
 			}
@@ -1417,7 +1590,6 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1435,7 +1607,6 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
 	if (desc.info.HasStencil()) {
 		const auto layers = image.info.resources.layers;
 		EXIT_IF(layers == 0 || image.info.data.size % layers != 0 ||
@@ -1825,16 +1996,33 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
+void TextureCache::PrepareBufferWrite(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid() || m_scheduler.Current().IsInvalid()) {
+		EXIT("TextureCache: buffer write preparation requires a valid range and command buffer\n");
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		auto& image = m_slot_images[id];
+		if (image.depth_id) {
+			continue;
+		}
+		if (image.IsMaybeCpuDirty()) {
+			TrackImage(id);
+			(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
+		}
+		if (image.SafeToDownload() && !PublishImageToBuffer(image)) {
+			EXIT("TextureCache: cannot preserve native image before overlapping buffer write\n");
+		}
+	}
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, true)) {
+	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto& image = m_slot_images[id];
-		if (image.info.data.address != address) {
-			continue;
-		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}

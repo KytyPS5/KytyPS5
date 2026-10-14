@@ -5368,14 +5368,14 @@ public:
     }
     auto &cache = context.GetBufferCache();
     // Exercise the ordinary ring before requesting the captured 576-MiB footprint.
-    const auto small = cache.ObtainBufferForImage(base, page);
+    const auto ring_source = cache.ObtainBufferForImage(base, page);
     auto readback = CreateHostBuffer(name, 8u * sizeof(u32),
         vk::BufferUsageFlagBits::eTransferDst, {});
-    const vk::BufferCopy small_copy{small.second, 0, sizeof(u32)};
-    scheduler.Current().Handle().copyBuffer(small.first->Handle(), readback.buffer, 1, &small_copy);
+    const vk::BufferCopy small_copy{ring_source.second, 0, sizeof(u32)};
+    scheduler.Current().Handle().copyBuffer(ring_source.first->Handle(), readback.buffer, 1, &small_copy);
     const auto large = cache.ObtainBufferForImage(base, size);
-    Require(name, "temporary image source", large.first != nullptr && large.first != small.first &&
-        large.first->Size() == size && small.first->Size() == ring_size,
+    Require(name, "temporary image source", large.first != nullptr && large.first != ring_source.first &&
+        large.first->Size() == size && ring_source.first->Size() == ring_size,
         "oversized image upload resized the ring or truncated its source");
     constexpr std::array<uint64_t, 5> probes{0, page, ring_size - 4u, ring_size, size - 4u};
     std::array<vk::BufferCopy, probes.size()> copies{};
@@ -5454,7 +5454,7 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckUnifiedTextureCacheFlow() {
+  void CheckUnifiedTextureCacheFlow(const char *unsupported_alias = nullptr) {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
     constexpr uint64_t allocation_size = 0x3000000;
@@ -6761,6 +6761,28 @@ public:
               texture_cache.GetImage(ms_stencil_alias).backing.image == nullptr,
           "unequal-sample overlap did not run the color-to-MS-depth pass "
           "without manufacturing stencil ownership");
+      if (unsupported_alias != nullptr) {
+        auto alias = color_desc;
+        if (std::strcmp(unsupported_alias, "cross-format") == 0) {
+          alias.info.pixel_format = vk::Format::eR16Unorm;
+          alias.info.guest_format = Prospero::BufferFormat::k16UNorm;
+          alias.info.bytes_per_block = 2;
+          alias.info.samples = 2;
+          alias.view_info.format = vk::Format::eR16Unorm;
+        }
+        alias.type = BindingType::RenderTarget;
+        alias.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+        std::printf("[gpu] unsupported depth alias reached: %s\n",
+                    unsupported_alias);
+        std::fflush(stdout);
+        const auto replacement = texture_cache.FindImage(alias);
+        Require(name, "unsupported alias returned",
+                replacement && replacement != ms_depth_image,
+                "unsupported alias did not reach the replacement path");
+        std::printf("[gpu] unsupported depth alias silently replaced source\n");
+        std::fflush(stdout);
+        std::exit(0);
+      }
       auto &oversized_ms = texture_cache.GetImage(ms_depth_image);
       const auto ms_data_size = oversized_ms.info.data.size;
       oversized_ms.info.data.size = (32ull << 20) + 4;
@@ -7073,41 +7095,267 @@ public:
         verify_array();
       }
 
-      // A write through a separate buffer must not replace untouched image
-      // texels with stale backing bytes. Exact-base writes still refresh it.
+      // Buffer writes must update the addressed texel while retaining every
+      // other native-written image texel, including exact-base partial writes.
       constexpr uint64_t buffer_alias_offset = 0x1a00000;
       constexpr uint32_t buffer_alias_image_value = 0x13579bdfu;
       constexpr uint32_t buffer_alias_write_value = 0x2468ace0u;
       std::memset(memory + buffer_alias_offset, 0, 4 * sizeof(uint32_t));
+      constexpr uint64_t buffer_copy_offset = buffer_alias_offset + 0x1000;
+      std::memcpy(memory + buffer_copy_offset, &buffer_alias_write_value,
+                  sizeof(buffer_alias_write_value));
       auto buffer_alias_desc = MakeLinearDesc(
           base + buffer_alias_offset, 4 * sizeof(uint32_t), vk::Format::eR32Uint,
           Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
           {4, 1, 1}, 1, 4, 1);
       const auto buffer_alias_image = texture_cache.FindImage(buffer_alias_desc);
-      for (const uint32_t write_offset : {0u, 12u}) {
+      for (const uint32_t write_method : {0u, 1u, 2u}) {
+        for (const uint32_t write_offset : {0u, 12u}) {
+          vk::ClearValue painted{};
+          painted.color.uint32 =
+              std::array{buffer_alias_image_value, 0u, 0u, 0u};
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), buffer_alias_image,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+          const auto write_address =
+              buffer_alias_desc.info.data.address + write_offset;
+          if (write_method == 0) {
+            auto writable = resources.GetBufferCache().ObtainBuffer(
+                write_address, sizeof(uint32_t), true, false);
+            Require(name, "image alias buffer allocation",
+                    writable.first != nullptr,
+                    "failed to allocate the image alias write buffer");
+            writable.first->Fill(writable.second, sizeof(uint32_t),
+                                 buffer_alias_write_value);
+            texture_cache.InvalidateMemoryFromGPU(write_address,
+                                                  sizeof(uint32_t));
+          } else if (write_method == 1) {
+            Require(name, "buffer fill uses GPU path",
+                    resources.GetBufferCache().IsRegionGpuModified(
+                        write_address, sizeof(u32)),
+                    "buffer fill fixture did not exercise GPU writes");
+            resources.GetBufferCache().FillBuffer(
+                write_address, sizeof(u32), buffer_alias_write_value, false);
+          } else {
+            Require(name, "buffer copy uses GPU path",
+                    resources.GetBufferCache().IsRegionGpuModified(
+                        write_address, sizeof(u32)),
+                    "buffer copy fixture did not exercise GPU writes");
+            resources.GetBufferCache().CopyBuffer(write_address,
+                                                  base + buffer_copy_offset,
+                                                  sizeof(u32), false, false);
+          }
+          (void)texture_cache.FindTexture(buffer_alias_image,
+                                          buffer_alias_desc);
+          std::vector<u32> buffer_alias_expected(4, buffer_alias_image_value);
+          buffer_alias_expected[write_offset / sizeof(u32)] =
+              buffer_alias_write_value;
+          Require(name,
+                  write_method == 1   ? "partial buffer fill"
+                  : write_method == 2 ? "partial buffer copy"
+                  : write_offset == 0 ? "exact-base partial buffer write"
+                                      : "interior partial buffer write",
+                  ReadCachedTexel(name, context, buffer_alias_image, {},
+                                  {4, 1, 1}) == buffer_alias_expected,
+                  "partial buffer write lost modified or untouched GPU image "
+                  "texels");
+        }
+      }
+
+      // Image-synchronized buffer reads must also see interior native writes.
+      for (const uint32_t read_offset : {12u, 0u}) {
+        const uint32_t expected = 0x76543210u + read_offset;
         vk::ClearValue painted{};
-        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        painted.color.uint32 = std::array{expected, 0u, 0u, 0u};
         TextureCacheTestAccess::ClearImage(
             texture_cache, scheduler.Current(), buffer_alias_image,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
-        const auto write_address = buffer_alias_desc.info.data.address + write_offset;
-        auto writable = resources.GetBufferCache().ObtainBuffer(
-            write_address, sizeof(uint32_t), true, false);
-        Require(name, "image alias buffer allocation", writable.first != nullptr,
-                "failed to allocate the image alias write buffer");
-        writable.first->Fill(writable.second, sizeof(uint32_t), buffer_alias_write_value);
-        texture_cache.InvalidateMemoryFromGPU(write_address, sizeof(uint32_t));
-        (void)texture_cache.FindTexture(buffer_alias_image, buffer_alias_desc);
-        const bool exact_base = write_offset == 0;
-        const uint32_t read_texels = exact_base ? 1 : 3;
-        Require(name, exact_base ? "exact-base buffer write refresh"
-                                 : "overlapping buffer preserves untouched texels",
-                ReadCachedTexel(name, context, buffer_alias_image, {},
-                                {read_texels, 1, 1}) ==
-                    std::vector<u32>(read_texels, exact_base ? buffer_alias_write_value
-                                                           : buffer_alias_image_value),
-                exact_base ? "exact-base buffer write did not refresh the native image"
-                           : "overlapping buffer write replaced untouched GPU image texels");
+        auto readable = resources.GetBufferCache().ObtainBuffer(
+            buffer_alias_desc.info.data.address + read_offset, sizeof(uint32_t),
+            false, true);
+        Require(name, "partial image buffer read allocation",
+                readable.first != nullptr,
+                "image buffer read allocation failed");
+        auto readback = CreateHostBuffer(
+            name, sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::MemoryBarrier ready{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0,
+            nullptr);
+        const vk::BufferCopy copy{readable.second, 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(readable.first->Handle(),
+                                                readback.buffer, 1, &copy);
+        HostReadBarrier(readback.buffer, readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(
+            name,
+            read_offset == 0 ? "exact-base image buffer read"
+                             : "interior image buffer read",
+            ReadBuffer(name, readback, 1) == std::vector<u32>{expected},
+            "buffer read returned stale bytes instead of native image data");
+        Require(
+            name, "partial image buffer read ownership",
+            texture_cache.GetImage(buffer_alias_image).IsGpuModified() &&
+                !texture_cache.GetImage(buffer_alias_image).IsBufferModified(),
+            "read-only buffer acquisition transferred image ownership");
+        DestroyBuffer(&readback);
+      }
+
+      // A single buffer range can contain multiple disjoint native writers and
+      // untouched guest bytes. No earlier buffer write may prime this fixture.
+      constexpr uint64_t multi_read_offset = 0x1b00000;
+      constexpr uint32_t multi_read_untouched = 0xdeadbeefu;
+      std::vector<u32> multi_read_expected(16, multi_read_untouched);
+      std::memcpy(memory + multi_read_offset, multi_read_expected.data(), 64);
+      std::array<Libs::Graphics::ImageId, 2> multi_read_images{};
+      for (uint32_t index = 0; index < multi_read_images.size(); ++index) {
+        const uint32_t offset = 4 + index * 32;
+        const uint32_t value = 0x12345678u + index;
+        auto desc = MakeLinearDesc(
+            base + multi_read_offset + offset, 16, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {2, 2, 1}, 1, 4, 1);
+        const auto id = texture_cache.FindImage(desc);
+        multi_read_images[index] = id;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        std::fill_n(multi_read_expected.begin() + offset / sizeof(u32), 4,
+                    value);
+      }
+      Require(name, "fresh image read fixture",
+              !resources.GetBufferCache().IsRegionGpuModified(
+                  base + multi_read_offset, 64),
+              "prior buffer writes primed the native image read fixture");
+      for (const uint32_t size : {4u, 64u}) {
+        const uint32_t offset = size == 4 ? 16 : 0;
+        auto readable = resources.GetBufferCache().ObtainBuffer(
+            base + multi_read_offset + offset, size, false, true);
+        Require(name, "multi-image buffer allocation",
+                readable.first != nullptr,
+                "multi-image buffer read allocation failed");
+        auto readback = CreateHostBuffer(
+            name, size, vk::BufferUsageFlagBits::eTransferDst, {});
+        const vk::MemoryBarrier ready{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0,
+            nullptr);
+        const vk::BufferCopy copy{readable.second, 0, size};
+        scheduler.Current().Handle().copyBuffer(readable.first->Handle(),
+                                                readback.buffer, 1, &copy);
+        HostReadBarrier(readback.buffer, size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        const std::vector<u32> expected(
+            multi_read_expected.begin() + offset / sizeof(u32),
+            multi_read_expected.begin() + (offset + size) / sizeof(u32));
+        Require(name,
+                size == 4 ? "fresh interior image read"
+                          : "multiple image sources in buffer read",
+                ReadBuffer(name, readback, size / sizeof(u32)) == expected,
+                "buffer read lost a native writer or untouched guest bytes");
+        for (const auto id : multi_read_images) {
+          Require(name, "multiple image read ownership",
+                  texture_cache.GetImage(id).IsGpuModified() &&
+                      !texture_cache.GetImage(id).IsBufferModified(),
+                  "read-only range changed native source ownership");
+        }
+        DestroyBuffer(&readback);
+      }
+
+      constexpr uint64_t native_copy_destination = 0x1b10000;
+      const auto native_copy_source = base + multi_read_offset + 16;
+      Require(name, "native copy source has no buffer writer",
+              !resources.GetBufferCache().IsRegionGpuModified(
+                  native_copy_source, 4) &&
+                  !resources.GetBufferCache().IsRegionGpuModified(
+                      base + native_copy_destination, 4),
+              "native image copy fixture bypassed the CPU-copy decision");
+      resources.GetBufferCache().CopyBuffer(
+          base + native_copy_destination, native_copy_source, 4, false, false);
+      auto copied = resources.GetBufferCache().ObtainBuffer(
+          base + native_copy_destination, 4, false, false);
+      auto copy_readback =
+          CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {0});
+      const vk::MemoryBarrier copy_ready{
+          .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+          .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eAllCommands,
+          vk::PipelineStageFlagBits::eTransfer, {}, 1, &copy_ready, 0, nullptr,
+          0, nullptr);
+      const vk::BufferCopy native_copy{copied.second, 0, 4};
+      scheduler.Current().Handle().copyBuffer(
+          copied.first->Handle(), copy_readback.buffer, 1, &native_copy);
+      HostReadBarrier(copy_readback.buffer, 4,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "copy from interior native image",
+              ReadBuffer(name, copy_readback, 1) ==
+                  std::vector<u32>{0x12345678u},
+              "copy used stale guest backing for a native image source");
+      DestroyBuffer(&copy_readback);
+
+      constexpr uint64_t fresh_copy_source = 0x1b40000;
+      constexpr uint32_t fresh_write_value = 0xabcdef01u;
+      std::memcpy(memory + fresh_copy_source, &fresh_write_value, 4);
+      constexpr std::array<uint64_t, 3> fresh_destination_offsets{
+          0x1b20000, 0x1b30000, 0x1b50000};
+      for (uint32_t method = 0; method < fresh_destination_offsets.size();
+           ++method) {
+        const auto address = base + fresh_destination_offsets[method];
+        auto desc = MakeLinearDesc(
+            address, 16, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {2, 2, 1}, 1, 4, 1);
+        const auto id = texture_cache.FindImage(desc);
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{0x76543210u, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        Require(name, "fresh native destination has no buffer writer",
+                !resources.GetBufferCache().IsRegionGpuModified(address, 16) &&
+                    !resources.GetBufferCache().IsRegionGpuModified(
+                        base + fresh_copy_source, 4),
+                "prior buffer writes primed the native destination fixture");
+        if (method == 0) {
+          resources.GetBufferCache().FillBuffer(address + 4, 4,
+                                                fresh_write_value, false);
+        } else if (method == 1) {
+          resources.GetBufferCache().CopyBuffer(
+              address + 4, base + fresh_copy_source, 4, false, false);
+        } else {
+          resources.GetBufferCache().CopyBuffer(
+              address + 3, base + fresh_copy_source + 1, 3, false, false);
+        }
+        (void)texture_cache.FindTexture(id, desc);
+        std::vector<u32> expected(4, 0x76543210u);
+        if (method == 2) {
+          std::memcpy(reinterpret_cast<uint8_t *>(expected.data()) + 3,
+                      reinterpret_cast<const uint8_t *>(&fresh_write_value) + 1,
+                      3);
+        } else {
+          expected[1] = fresh_write_value;
+        }
+        Require(
+            name,
+            method == 0   ? "fill into fresh native image"
+            : method == 1 ? "copy into fresh native image"
+                          : "byte copy across native texel boundary",
+            ReadCachedTexel(name, context, id, {}, {2, 2, 1}) == expected,
+            "partial write through CPU fast path lost untouched GPU texels");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;
@@ -7131,6 +7379,19 @@ public:
               !texture_cache.GetImage(exact_buffer_image).IsBufferModified() &&
               texture_cache.GetImage(exact_buffer_image).IsGpuModified(),
           "exact replacement copy transferred cache ownership");
+      constexpr uint32_t exact_gpu_value = 0x3f654321u;
+      auto &exact_source_native = texture_cache.GetImage(exact_buffer_image);
+      exact_source_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                  vk::AccessFlagBits2::eTransferWrite, {},
+                                  command.Handle());
+      vk::ClearColorValue exact_clear{};
+      exact_clear.uint32[0] = exact_gpu_value;
+      const vk::ImageSubresourceRange exact_range{
+          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      command.Handle().clearColorImage(exact_source_native.backing.image,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       &exact_clear, 1, &exact_range);
+      texture_cache.MarkGpuWritten(exact_buffer_image);
       auto exact_float_desc = exact_buffer_desc;
       exact_float_desc.info.pixel_format = vk::Format::eR32Sfloat;
       exact_float_desc.info.guest_format = Prospero::BufferFormat::k32Float;
@@ -7139,15 +7400,16 @@ public:
           texture_cache.FindImage(exact_float_desc, true);
       (void)texture_cache.FindTexture(exact_float_image, exact_float_desc);
       Require(
-          name, "Buffer-superseded exact coexistence",
+          name, "exact-format publication ownership",
           exact_float_image != exact_buffer_image &&
               TextureCacheTestAccess::Contains(texture_cache,
                                                exact_buffer_image) &&
-              texture_cache.GetImage(exact_buffer_image).IsGpuModified() &&
+              !texture_cache.GetImage(exact_buffer_image).IsGpuModified() &&
+              texture_cache.GetImage(exact_buffer_image).IsBufferModified() &&
               !texture_cache.GetImage(exact_float_image).IsBufferModified() &&
               !texture_cache.GetImage(exact_float_image).IsGpuModified(),
-          "exact-format lookup retired its old record or transferred Buffer "
-          "ownership");
+          "exact-format lookup did not publish the native owner before "
+          "initializing its alias");
       auto exact_buffer_readback = CreateHostBuffer(
           name, sizeof(exact_buffer_value),
           vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>{0});
@@ -7908,6 +8170,133 @@ public:
               texture_cache.GetImage(layered_depth_image).IsGpuModified(),
               "a CPU read invalidated layered depth GPU ownership");
 
+      // Growing the layer count must not be hidden by a smaller mip count.
+      constexpr uint64_t capacity_offset = 0x2e00000;
+      std::memcpy(memory + capacity_offset, memory + layered_offset,
+                  layered_guest_size);
+      std::vector<u32> depth_capacity_guest(layered_guest_size / sizeof(u32));
+      std::memcpy(depth_capacity_guest.data(), memory + capacity_offset,
+                  layered_guest_size);
+      auto capacity_source = layered_color;
+      capacity_source.info.data.address = base + capacity_offset;
+      capacity_source.type = BindingType::DepthTarget;
+      capacity_source.info.pixel_format = vk::Format::eD32Sfloat;
+      capacity_source.view_info.format = vk::Format::eD32Sfloat;
+      capacity_source.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      capacity_source.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto capacity_source_id = texture_cache.FindImage(capacity_source);
+      (void)texture_cache.FindDepthTarget(capacity_source_id, capacity_source);
+      auto &depth_capacity_source = texture_cache.GetImage(capacity_source_id);
+      depth_capacity_source.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                    vk::AccessFlagBits2::eTransferWrite, {},
+                                    command.Handle());
+      command.Handle().clearDepthStencilImage(
+          depth_capacity_source.backing.image,
+          vk::ImageLayout::eTransferDstOptimal,
+          vk::ClearDepthStencilValue{0.75f, 0},
+          vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eDepth, 0, 2, 0,
+                                    2});
+      texture_cache.MarkGpuWritten(capacity_source_id);
+      auto capacity_request = layered_depth;
+      capacity_request.info.data.address = base + capacity_offset;
+      const auto capacity_result = texture_cache.FindImage(capacity_request);
+      const auto &capacity_native = texture_cache.GetImage(capacity_result);
+      Require(name, "fewer mips with more depth layers",
+              capacity_result != capacity_source_id &&
+                  capacity_native.backing.layers == 4 &&
+                  capacity_native.backing.mip_levels == 1,
+              "lexicographic mip comparison hid a missing array layer");
+      (void)texture_cache.FindDepthTarget(capacity_result, capacity_request);
+
+      constexpr uint64_t color_capacity_offset = 0x2d00000;
+      std::vector<u32> color_capacity_guest(
+          4 * layered_guest_size / sizeof(u32), std::bit_cast<u32>(0.125f));
+      std::memcpy(memory + color_capacity_offset, color_capacity_guest.data(),
+                  color_capacity_guest.size() * sizeof(u32));
+      auto color_capacity_source = layered_color;
+      color_capacity_source.info.data.address = base + color_capacity_offset;
+      const auto color_capacity_source_id =
+          texture_cache.FindImage(color_capacity_source);
+      (void)texture_cache.FindTexture(color_capacity_source_id,
+                                      color_capacity_source);
+      auto &color_capacity_owner =
+          texture_cache.GetImage(color_capacity_source_id);
+      color_capacity_owner.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                   vk::AccessFlagBits2::eTransferWrite, {},
+                                   command.Handle());
+      vk::ClearColorValue capacity_clear{};
+      capacity_clear.float32[0] = 0.75f;
+      const vk::ImageSubresourceRange capacity_range{
+          vk::ImageAspectFlagBits::eColor, 0, 2, 0, 2};
+      command.Handle().clearColorImage(color_capacity_owner.backing.image,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       capacity_clear, capacity_range);
+      texture_cache.MarkGpuWritten(color_capacity_source_id);
+      const auto ForEachCapacityWord = [&](const ImageInfo &layout,
+                                           auto visit) {
+        for (const auto &copy : layout.BufferCopies()) {
+          const auto pitch = copy.bufferRowLength != 0 ? copy.bufferRowLength
+                                                       : copy.imageExtent.width;
+          const auto rows = copy.bufferImageHeight != 0
+                                ? copy.bufferImageHeight
+                                : copy.imageExtent.height;
+          for (uint32_t layer = 0; layer < copy.imageSubresource.layerCount;
+               ++layer) {
+            for (uint32_t y = 0; y < copy.imageExtent.height; ++y) {
+              for (uint32_t x = 0; x < copy.imageExtent.width; ++x) {
+                const auto word = copy.bufferOffset / sizeof(u32) +
+                                  (uint64_t{layer} * rows + y) * pitch + x;
+                Require(name, "color capacity guest bounds",
+                        word < color_capacity_guest.size() &&
+                            word < layout.data.size / sizeof(u32),
+                        "capacity test exceeded its guest allocation");
+                visit(word, copy.imageSubresource.mipLevel,
+                      copy.imageSubresource.baseArrayLayer + layer, y, x);
+              }
+            }
+          }
+        }
+      };
+      ForEachCapacityWord(
+          capacity_source.info,
+          [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+            depth_capacity_guest[word] = std::bit_cast<u32>(0.75f);
+          });
+      std::vector<u32> depth_capacity_expected(16);
+      ForEachCapacityWord(
+          capacity_request.info,
+          [&](uint64_t word, uint32_t, uint32_t layer, uint32_t y, uint32_t x) {
+            depth_capacity_expected[layer * 4 + y * 2 + x] =
+                depth_capacity_guest[word];
+          });
+      ForEachCapacityWord(
+          color_capacity_source.info,
+          [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+            color_capacity_guest[word] = std::bit_cast<u32>(0.75f);
+          });
+      auto color_capacity_request = color_capacity_source;
+      color_capacity_request.info.resources = {1, 4};
+      color_capacity_request.info.UpdateSize();
+      color_capacity_request.view_info.level_count = 1;
+      color_capacity_request.view_info.layer_count = 4;
+      std::vector<u32> color_capacity_expected(16);
+      ForEachCapacityWord(
+          color_capacity_request.info,
+          [&](uint64_t word, uint32_t, uint32_t layer, uint32_t y, uint32_t x) {
+            color_capacity_expected[layer * 4 + y * 2 + x] =
+                color_capacity_guest[word];
+          });
+      const auto color_capacity_result =
+          texture_cache.FindImage(color_capacity_request);
+      Require(
+          name, "fewer mips with more color layers",
+          color_capacity_result != color_capacity_source_id &&
+              texture_cache.GetImage(color_capacity_result).backing.layers == 4,
+          "color alias returned a backing with too few layers");
+      (void)texture_cache.FindTexture(color_capacity_result,
+                                      color_capacity_request);
+
       constexpr uint64_t replacement_offset = 0x18000;
       constexpr uint64_t replacement_size = 0x2000;
       constexpr uint32_t replacement_pixel = 0xcafebabeu;
@@ -8208,6 +8597,43 @@ public:
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
 
+      auto capacity_readback = CreateHostBuffer(
+          name, 16 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(16, 0));
+      auto &capacity_depth_native = texture_cache.GetImage(capacity_result);
+      capacity_depth_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                                    vk::AccessFlagBits2::eTransferRead, {},
+                                    command.Handle());
+      auto depth_capacity_copy = layered_copy;
+      depth_capacity_copy.imageSubresource.layerCount = 4;
+      command.Handle().copyImageToBuffer(capacity_depth_native.backing.image,
+                                         vk::ImageLayout::eTransferSrcOptimal,
+                                         capacity_readback.buffer, 1,
+                                         &depth_capacity_copy);
+      HostReadBarrier(capacity_readback.buffer, capacity_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+
+      auto color_capacity_readback = CreateHostBuffer(
+          name, 16 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(16, 0));
+      auto &color_capacity_native =
+          texture_cache.GetImage(color_capacity_result);
+      color_capacity_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                                    vk::AccessFlagBits2::eTransferRead, {},
+                                    command.Handle());
+      auto color_capacity_copy = layered_copy;
+      color_capacity_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor,
+                                              0, 0, 4};
+      command.Handle().copyImageToBuffer(color_capacity_native.backing.image,
+                                         vk::ImageLayout::eTransferSrcOptimal,
+                                         color_capacity_readback.buffer, 1,
+                                         &color_capacity_copy);
+      HostReadBarrier(color_capacity_readback.buffer,
+                      color_capacity_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+
       vk::ShaderModuleCreateInfo module_info{};
       module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
       module_info.codeSize = sizeof(GPU_TEST_MS_DEPTH_SPV);
@@ -8388,9 +8814,70 @@ public:
               "native image bytes");
       Require(name, "Buffer-superseded exact content",
               ReadBuffer(name, exact_buffer_readback, 1) ==
-                  std::vector<u32>{exact_buffer_value},
+                  std::vector<u32>{exact_gpu_value},
               "exact-format recreation initialized from "
               "stale guest bytes");
+      {
+        auto signed_desc = exact_buffer_desc;
+        signed_desc.info.pixel_format = vk::Format::eR32Sint;
+        signed_desc.info.guest_format = Prospero::BufferFormat::k32SInt;
+        signed_desc.view_info.format = vk::Format::eR32Sint;
+        const auto signed_alias = texture_cache.FindImage(signed_desc, true);
+        (void)texture_cache.FindTexture(signed_alias, signed_desc);
+        for (const bool introduce_format : {false, true}) {
+          const uint32_t alias_rewrite =
+              std::bit_cast<uint32_t>(introduce_format ? 0.5f : 0.875f);
+          const auto writer_id =
+              introduce_format ? exact_buffer_image : exact_float_image;
+          auto &writer = texture_cache.GetImage(writer_id);
+          writer.Transit(vk::ImageLayout::eTransferDstOptimal,
+                         vk::AccessFlagBits2::eTransferWrite, {},
+                         command.Handle());
+          vk::ClearColorValue rewrite_clear{};
+          rewrite_clear.uint32[0] = alias_rewrite;
+          command.Handle().clearColorImage(writer.backing.image,
+                                           vk::ImageLayout::eTransferDstOptimal,
+                                           &rewrite_clear, 1, &exact_range);
+          texture_cache.MarkGpuWritten(writer_id);
+          if (introduce_format) {
+            auto rgba_desc = exact_buffer_desc;
+            rgba_desc.info.pixel_format = vk::Format::eR8G8B8A8Uint;
+            rgba_desc.info.guest_format = Prospero::BufferFormat::k8_8_8_8UInt;
+            rgba_desc.view_info.format = vk::Format::eR8G8B8A8Uint;
+            const auto rgba_alias = texture_cache.FindImage(rgba_desc, true);
+            (void)texture_cache.FindTexture(rgba_alias, rgba_desc);
+          }
+          auto reuse_desc = exact_buffer_desc;
+          const auto reused = texture_cache.FindImage(reuse_desc, true);
+          Require(name, "existing exact alias reuse",
+                  reused == exact_buffer_image,
+                  "existing exact-format alias was unnecessarily replaced");
+          for (const auto read_alias : {reused, signed_alias}) {
+            (void)texture_cache.FindTexture(
+                read_alias, read_alias == reused ? reuse_desc : signed_desc);
+            auto &reader = texture_cache.GetImage(read_alias);
+            auto reuse_readback = CreateHostBuffer(
+                name, sizeof(alias_rewrite),
+                vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>{0});
+            reader.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                           vk::AccessFlagBits2::eTransferRead, {},
+                           command.Handle());
+            command.Handle().copyImageToBuffer(
+                reader.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+                reuse_readback.buffer, 1, &exact_float_copy);
+            HostReadBarrier(reuse_readback.buffer, reuse_readback.size,
+                            vk::PipelineStageFlagBits::eTransfer,
+                            vk::AccessFlagBits::eTransferWrite);
+            scheduler.Finish();
+            Require(name, "existing exact alias fresh contents",
+                    ReadBuffer(name, reuse_readback, 1) ==
+                        std::vector<u32>{alias_rewrite},
+                    "existing format alias read a stale buffer after native "
+                    "writes");
+            DestroyBuffer(&reuse_readback);
+          }
+        }
+      }
       Require(name, "partial-page CPU refresh content",
               ReadBuffer(name, partial_cpu_refresh_readback,
                          partial_cpu_refresh_expected.size()) ==
@@ -8429,6 +8916,292 @@ public:
       }
       Require(name, "layered depth common-mip content", layered_content,
               "depth/color conversion changed a shared array-layer value");
+      Require(name, "depth reshape preserves guest-byte mapping",
+              ReadBuffer(name, capacity_readback, 16) ==
+                  depth_capacity_expected,
+              "depth reshape changed guest-byte mapping");
+      DestroyBuffer(&capacity_readback);
+      Require(name, "color capacity preserves guest-byte mapping",
+              ReadBuffer(name, color_capacity_readback, 16) ==
+                  color_capacity_expected,
+              "changed array strides lost GPU writes or untouched guest bytes");
+      DestroyBuffer(&color_capacity_readback);
+      Require(
+          name, "color capacity oracle exercises padding",
+          std::ranges::find(color_capacity_expected,
+                            std::bit_cast<u32>(0.125f)) !=
+                  color_capacity_expected.end() &&
+              std::ranges::find(color_capacity_expected,
+                                std::bit_cast<u32>(0.75f)) !=
+                  color_capacity_expected.end(),
+          "capacity test did not distinguish padding from GPU-written pixels");
+      auto &reverse_source = texture_cache.GetImage(color_capacity_result);
+      reverse_source.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {},
+                             command.Handle());
+      capacity_clear.float32[0] = 0.5f;
+      const vk::ImageSubresourceRange reverse_range{
+          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 4};
+      command.Handle().clearColorImage(reverse_source.backing.image,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       capacity_clear, reverse_range);
+      texture_cache.MarkGpuWritten(color_capacity_result);
+      ForEachCapacityWord(
+          color_capacity_request.info,
+          [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+            color_capacity_guest[word] = std::bit_cast<u32>(0.5f);
+          });
+      auto reverse_request = color_capacity_source;
+      const auto reverse_id = texture_cache.FindImage(reverse_request);
+      auto &reverse_native = texture_cache.GetImage(reverse_id);
+      Require(name, "more color mips with fewer layers",
+              reverse_id != color_capacity_result &&
+                  reverse_native.backing.layers == 2 &&
+                  reverse_native.backing.mip_levels == 2,
+              "reverse alias reused a backing with too few mip levels");
+      (void)texture_cache.FindTexture(reverse_id, reverse_request);
+      std::vector<u32> reverse_expected(10);
+      ForEachCapacityWord(reverse_request.info, [&](uint64_t word, uint32_t mip,
+                                                    uint32_t layer, uint32_t y,
+                                                    uint32_t x) {
+        reverse_expected[mip == 0 ? layer * 4 + y * 2 + x : 8 + layer] =
+            color_capacity_guest[word];
+      });
+      auto reverse_readback = CreateHostBuffer(
+          name, 10 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(10, 0));
+      std::array<vk::BufferImageCopy, 2> reverse_copies{};
+      reverse_copies[0].imageSubresource = {vk::ImageAspectFlagBits::eColor, 0,
+                                            0, 2};
+      reverse_copies[0].imageExtent = {2, 2, 1};
+      reverse_copies[1].bufferOffset = 8 * sizeof(u32);
+      reverse_copies[1].imageSubresource = {vk::ImageAspectFlagBits::eColor, 1,
+                                            0, 2};
+      reverse_copies[1].imageExtent = {1, 1, 1};
+      reverse_native.Download(reverse_copies, reverse_readback.buffer, 0,
+                              reverse_readback.size);
+      HostReadBarrier(reverse_readback.buffer, reverse_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "reverse color alias preserves guest-byte mapping",
+              ReadBuffer(name, reverse_readback, 10) == reverse_expected,
+              "reverse reshape lost updated GPU pixels or retained mip bytes");
+      DestroyBuffer(&reverse_readback);
+      reverse_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {},
+                             command.Handle());
+      capacity_clear.float32[0] = 0.625f;
+      command.Handle().clearColorImage(reverse_native.backing.image,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       capacity_clear, capacity_range);
+      texture_cache.MarkGpuWritten(reverse_id);
+      ForEachCapacityWord(
+          reverse_request.info,
+          [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+            color_capacity_guest[word] = std::bit_cast<u32>(0.625f);
+          });
+      auto mixed_format_request = color_capacity_request;
+      mixed_format_request.info.pixel_format = vk::Format::eR32Uint;
+      mixed_format_request.info.guest_format = Prospero::BufferFormat::k32UInt;
+      mixed_format_request.view_info.format = vk::Format::eR32Uint;
+      mixed_format_request.info.UpdateSize();
+      const auto mixed_format_id =
+          texture_cache.FindImage(mixed_format_request);
+      auto &mixed_format_native = texture_cache.GetImage(mixed_format_id);
+      Require(name, "mixed-format reshape capacity",
+              mixed_format_id != reverse_id &&
+                  mixed_format_native.backing.layers == 4 &&
+                  mixed_format_native.backing.mip_levels == 1,
+              "compatible-format alias reused a backing with too few layers");
+      (void)texture_cache.FindTexture(mixed_format_id, mixed_format_request);
+      std::vector<u32> mixed_format_expected(16);
+      ForEachCapacityWord(
+          mixed_format_request.info,
+          [&](uint64_t word, uint32_t, uint32_t layer, uint32_t y, uint32_t x) {
+            mixed_format_expected[layer * 4 + y * 2 + x] =
+                color_capacity_guest[word];
+          });
+      auto mixed_format_readback = CreateHostBuffer(
+          name, 16 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(16, 0));
+      mixed_format_native.Download(std::span{&color_capacity_copy, 1},
+                                   mixed_format_readback.buffer, 0,
+                                   mixed_format_readback.size);
+      HostReadBarrier(mixed_format_readback.buffer, mixed_format_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(
+          name, "mixed-format reshape preserves GPU bits",
+          ReadBuffer(name, mixed_format_readback, 16) == mixed_format_expected,
+          "compatible-format reshape converted or lost GPU-written guest bits");
+      DestroyBuffer(&mixed_format_readback);
+      auto growth_source_id = mixed_format_id;
+      auto growth_source_desc = mixed_format_request;
+      for (const bool grow_layers : {false, true}) {
+        auto &growth_source = texture_cache.GetImage(growth_source_id);
+        growth_source.Transit(vk::ImageLayout::eTransferDstOptimal,
+                              vk::AccessFlagBits2::eTransferWrite, {},
+                              command.Handle());
+        const u32 growth_value =
+            std::bit_cast<u32>(grow_layers ? 0.96875f : 0.9375f);
+        capacity_clear.uint32[0] = growth_value;
+        const vk::ImageSubresourceRange growth_range{
+            vk::ImageAspectFlagBits::eColor, 0,
+            growth_source_desc.info.resources.levels, 0,
+            growth_source_desc.info.resources.layers};
+        command.Handle().clearColorImage(growth_source.backing.image,
+                                         vk::ImageLayout::eTransferDstOptimal,
+                                         capacity_clear, growth_range);
+        texture_cache.MarkGpuWritten(growth_source_id);
+        ForEachCapacityWord(
+            growth_source_desc.info,
+            [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+              color_capacity_guest[word] = growth_value;
+            });
+        auto growth_request = growth_source_desc;
+        growth_request.info.data.size *= 2;
+        growth_request.info.resources.levels = 2;
+        if (grow_layers) {
+          growth_request.info.resources.layers *= 2;
+        }
+        growth_request.info.pixel_format =
+            grow_layers ? vk::Format::eR32Uint : vk::Format::eR32Sfloat;
+        growth_request.info.guest_format =
+            grow_layers ? Prospero::BufferFormat::k32UInt
+                        : Prospero::BufferFormat::k32Float;
+        growth_request.view_info.format = growth_request.info.pixel_format;
+        growth_request.view_info.level_count = 2;
+        growth_request.view_info.layer_count =
+            growth_request.info.resources.layers;
+        growth_request.info.UpdateSize();
+        const uint32_t growth_layers = growth_request.info.resources.layers;
+        const uint32_t growth_words = growth_layers * 5;
+        std::vector<u32> growth_expected(growth_words);
+        ForEachCapacityWord(
+            growth_request.info, [&](uint64_t word, uint32_t mip,
+                                     uint32_t layer, uint32_t y, uint32_t x) {
+              growth_expected[mip == 0 ? layer * 4 + y * 2 + x
+                                       : growth_layers * 4 + layer] =
+                  color_capacity_guest[word];
+            });
+        Require(name, "growth oracle includes GPU writes",
+                std::ranges::find(growth_expected, growth_value) !=
+                    growth_expected.end(),
+                "growth oracle did not cover any native-written guest bytes");
+        const auto growth_id = texture_cache.FindImage(growth_request);
+        Require(name, "format-change mip growth capacity",
+                growth_id != growth_source_id &&
+                    texture_cache.GetImage(growth_id).backing.mip_levels == 2 &&
+                    texture_cache.GetImage(growth_id).backing.layers ==
+                        growth_layers,
+                "format-change growth did not allocate the required mip/layer "
+                "capacity");
+        (void)texture_cache.FindTexture(growth_id, growth_request);
+        auto growth_copies = reverse_copies;
+        growth_copies[0].imageSubresource.layerCount = growth_layers;
+        growth_copies[1].bufferOffset = growth_layers * 4 * sizeof(u32);
+        growth_copies[1].imageSubresource.layerCount = growth_layers;
+        auto growth_readback =
+            CreateHostBuffer(name, growth_words * sizeof(u32),
+                             vk::BufferUsageFlagBits::eTransferDst,
+                             std::vector<u32>(growth_words));
+        texture_cache.GetImage(growth_id).Download(
+            growth_copies, growth_readback.buffer, 0, growth_readback.size);
+        HostReadBarrier(growth_readback.buffer, growth_readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name,
+                grow_layers ? "format-change layer growth preserves guest bytes"
+                            : "format-change mip growth preserves guest bytes",
+                ReadBuffer(name, growth_readback, growth_words) ==
+                    growth_expected,
+                "capacity replacement discarded GPU contents or changed "
+                "guest-byte mapping");
+        DestroyBuffer(&growth_readback);
+        growth_source_id = growth_id;
+        growth_source_desc = growth_request;
+      }
+      {
+        constexpr uint64_t expansion_offset = color_capacity_offset + 0x10000;
+        constexpr u32 expansion_value = 0xabcdef31u;
+        std::vector<u32> expansion_shadow(2 * layered_guest_size / sizeof(u32),
+                                          0x12345678u);
+        std::memcpy(memory + expansion_offset, expansion_shadow.data(),
+                    expansion_shadow.size() * sizeof(u32));
+        auto expansion_source = mixed_format_request;
+        expansion_source.info.data.address = base + expansion_offset;
+        const auto expansion_source_id =
+            texture_cache.FindImage(expansion_source);
+        (void)texture_cache.FindTexture(expansion_source_id, expansion_source);
+        auto &native = texture_cache.GetImage(expansion_source_id);
+        native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                       vk::AccessFlagBits2::eTransferWrite, {},
+                       command.Handle());
+        vk::ClearColorValue expansion_clear{};
+        expansion_clear.uint32[0] = expansion_value;
+        const vk::ImageSubresourceRange expansion_range{
+            vk::ImageAspectFlagBits::eColor, 0, 1, 0, 4};
+        command.Handle().clearColorImage(native.backing.image,
+                                         vk::ImageLayout::eTransferDstOptimal,
+                                         expansion_clear, expansion_range);
+        texture_cache.MarkGpuWritten(expansion_source_id);
+        ForEachCapacityWord(
+            expansion_source.info,
+            [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+              expansion_shadow[word] = expansion_value;
+            });
+        auto expansion_request = expansion_source;
+        expansion_request.info.data.size *= 2;
+        expansion_request.info.resources.levels = 2;
+        expansion_request.view_info.level_count = 2;
+        expansion_request.info.UpdateSize();
+        std::vector<u32> expansion_expected(20);
+        ForEachCapacityWord(expansion_request.info, [&](uint64_t word,
+                                                        uint32_t mip,
+                                                        uint32_t layer,
+                                                        uint32_t y,
+                                                        uint32_t x) {
+          expansion_expected[mip == 0 ? layer * 4 + y * 2 + x : 16 + layer] =
+              expansion_shadow[word];
+        });
+        const auto expansion_id = texture_cache.FindImage(expansion_request);
+        (void)texture_cache.FindTexture(expansion_id, expansion_request);
+        const auto &expanded = texture_cache.GetImage(expansion_id);
+        Require(name, "same-format expansion ownership",
+                expansion_id != expansion_source_id &&
+                    expanded.backing.mip_levels == 2 &&
+                    expanded.IsGpuModified() && expanded.IsTracked(),
+                "byte-preserving expansion lost capacity, GPU ownership or CPU "
+                "tracking");
+        Require(name, "expansion oracle covers old and new bytes",
+                std::ranges::find(expansion_expected, expansion_value) !=
+                        expansion_expected.end() &&
+                    std::ranges::find(expansion_expected, 0x12345678u) !=
+                        expansion_expected.end(),
+                "expansion fixture did not cover both GPU and untouched guest "
+                "bytes");
+        auto expansion_copies = reverse_copies;
+        expansion_copies[0].imageSubresource.layerCount = 4;
+        expansion_copies[1].bufferOffset = 16 * sizeof(u32);
+        expansion_copies[1].imageSubresource.layerCount = 4;
+        auto expansion_readback = CreateHostBuffer(
+            name, 20 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+            std::vector<u32>(20));
+        texture_cache.GetImage(expansion_id)
+            .Download(expansion_copies, expansion_readback.buffer, 0,
+                      expansion_readback.size);
+        HostReadBarrier(expansion_readback.buffer, expansion_readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "same-format mip expansion preserves guest bytes",
+                ReadBuffer(name, expansion_readback, 20) == expansion_expected,
+                "native mip expansion relocated GPU bytes within guest memory");
+        DestroyBuffer(&expansion_readback);
+      }
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},
@@ -9481,6 +10254,160 @@ public:
                   !boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)),
               "a final-byte CPU read did not publish the GPU-owned final word");
 
+      for (const uint32_t overlap_case : {0u, 1u, 2u}) {
+        const bool maybe_cpu_dirty = overlap_case == 1;
+        const bool retain = overlap_case == 2;
+        const uint64_t aged_offset = 0x2b00000 + overlap_case * 0x1000;
+        constexpr uint32_t aged_value = 0x7a3512cdu;
+        std::memset(memory + aged_offset, 0, 64);
+        auto aged_desc =
+            MakeLinearDesc(base + aged_offset, 64, vk::Format::eR32Uint,
+                           Prospero::BufferFormat::k32UInt,
+                           Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 4, 1);
+        const auto aged_id = texture_cache.FindImage(aged_desc);
+        (void)texture_cache.FindTexture(aged_id, aged_desc);
+        auto &aged_native = texture_cache.GetImage(aged_id);
+        aged_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                            vk::AccessFlagBits2::eTransferWrite, {},
+                            command.Handle());
+        vk::ClearColorValue aged_clear{};
+        aged_clear.uint32[0] = aged_value;
+        const vk::ImageSubresourceRange aged_range{
+            vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        command.Handle().clearColorImage(aged_native.backing.image,
+                                         vk::ImageLayout::eTransferDstOptimal,
+                                         &aged_clear, 1, &aged_range);
+        texture_cache.MarkGpuWritten(aged_id);
+        while (scheduler.CurrentTick() <= 33) {
+          scheduler.Finish();
+        }
+        aged_native.tick_accessed_last = retain ? scheduler.CurrentTick() : 0;
+        if (maybe_cpu_dirty) {
+          aged_native.MarkMaybeCpuDirty();
+        }
+        auto interior_desc =
+            MakeLinearDesc(base + aged_offset + 4, 16, vk::Format::eR32Uint,
+                           Prospero::BufferFormat::k32UInt,
+                           Prospero::ImageType::kColor2D, {2, 2, 1}, 1, 4, 1);
+        const auto interior_id = texture_cache.FindImage(interior_desc);
+        Require(name, "aged overlap retirement",
+                TextureCacheTestAccess::Contains(texture_cache, aged_id) ==
+                    retain,
+                "overlap retirement did not respect the cache age threshold");
+        (void)texture_cache.FindTexture(interior_id, interior_desc);
+        auto &interior = texture_cache.GetImage(interior_id);
+        auto aged_readback =
+            CreateHostBuffer(name, 16, vk::BufferUsageFlagBits::eTransferDst,
+                             std::vector<u32>(4));
+        vk::BufferImageCopy aged_copy{};
+        aged_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        aged_copy.imageExtent = {2, 2, 1};
+        interior.Download(std::span{&aged_copy, 1}, aged_readback.buffer, 0,
+                          16);
+        HostReadBarrier(aged_readback.buffer, aged_readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name,
+                retain ? "retained overlap GPU contents"
+                       : "aged overlap GPU contents",
+                ReadBuffer(name, aged_readback, 4) ==
+                    std::vector<u32>(4, aged_value),
+                "overlap resolution discarded authoritative GPU bytes");
+        DestroyBuffer(&aged_readback);
+        if (retain) {
+          // Make both cached copies clean before the smaller alias is written.
+          (void)texture_cache.FindTexture(aged_id, aged_desc);
+          interior.Transit(vk::ImageLayout::eTransferDstOptimal,
+                           vk::AccessFlagBits2::eTransferWrite, {},
+                           command.Handle());
+          constexpr u32 interior_value = 0x13579bdfu;
+          aged_clear.uint32[0] = interior_value;
+          command.Handle().clearColorImage(interior.backing.image,
+                                           vk::ImageLayout::eTransferDstOptimal,
+                                           &aged_clear, 1, &aged_range);
+          texture_cache.MarkGpuWritten(interior_id);
+          const auto reused_id = texture_cache.FindImage(aged_desc);
+          Require(name, "partial alias cache hit", reused_id == aged_id,
+                  "partial alias test did not reuse the larger backing");
+          (void)texture_cache.FindTexture(reused_id, aged_desc);
+          auto outer_readback =
+              CreateHostBuffer(name, 64, vk::BufferUsageFlagBits::eTransferDst,
+                               std::vector<u32>(16));
+          auto outer_copy = aged_copy;
+          outer_copy.imageExtent = {4, 4, 1};
+          texture_cache.GetImage(reused_id).Download(
+              std::span{&outer_copy, 1}, outer_readback.buffer, 0, 64);
+          HostReadBarrier(outer_readback.buffer, outer_readback.size,
+                          vk::PipelineStageFlagBits::eTransfer,
+                          vk::AccessFlagBits::eTransferWrite);
+          scheduler.Finish();
+          std::vector<u32> outer_expected(16, aged_value);
+          std::fill(outer_expected.begin() + 1, outer_expected.begin() + 5,
+                    interior_value);
+          Require(name, "partial alias cache-hit freshness",
+                  ReadBuffer(name, outer_readback, 16) == outer_expected,
+                  "larger cached image missed GPU writes through its interior "
+                  "alias");
+          auto second_desc = interior_desc;
+          second_desc.info.data.address = base + aged_offset + 36;
+          const auto second_id = texture_cache.FindImage(second_desc);
+          (void)texture_cache.FindTexture(second_id, second_desc);
+          const std::array writer_ids{interior_id, second_id};
+          for (const bool neighboring_cpu_write : {false, true}) {
+            const std::array<u32, 2> writer_values =
+                neighboring_cpu_write
+                    ? std::array<u32, 2>{0x76543210u, 0xfedcba98u}
+                    : std::array<u32, 2>{0x2468ace0u, 0x10203040u};
+            for (size_t writer = 0; writer < writer_ids.size(); ++writer) {
+              auto &native = texture_cache.GetImage(writer_ids[writer]);
+              native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {},
+                             command.Handle());
+              aged_clear.uint32[0] = writer_values[writer];
+              command.Handle().clearColorImage(
+                  native.backing.image, vk::ImageLayout::eTransferDstOptimal,
+                  &aged_clear, 1, &aged_range);
+              texture_cache.MarkGpuWritten(writer_ids[writer]);
+              std::fill(outer_expected.begin() + 1 + writer * 8,
+                        outer_expected.begin() + 5 + writer * 8,
+                        writer_values[writer]);
+            }
+            if (neighboring_cpu_write) {
+              texture_cache.InvalidateMemory(base + aged_offset + 128, 1);
+              for (const auto writer_id : writer_ids) {
+                const auto &writer = texture_cache.GetImage(writer_id);
+                Require(name, "neighboring CPU write marks aliases uncertain",
+                        writer.IsMaybeCpuDirty() && !writer.IsTracked(),
+                        "neighboring invalidation did not exercise uncertain "
+                        "ownership");
+              }
+            }
+            (void)texture_cache.FindTexture(reused_id, aged_desc);
+            texture_cache.GetImage(reused_id).Download(
+                std::span{&outer_copy, 1}, outer_readback.buffer, 0, 64);
+            HostReadBarrier(outer_readback.buffer, outer_readback.size,
+                            vk::PipelineStageFlagBits::eTransfer,
+                            vk::AccessFlagBits::eTransferWrite);
+            scheduler.Finish();
+            Require(
+                name,
+                neighboring_cpu_write ? "uncertain partial alias writers"
+                                      : "disjoint partial alias writers",
+                ReadBuffer(name, outer_readback, 16) == outer_expected,
+                "publishing disjoint writers lost modified or untouched bytes");
+            if (neighboring_cpu_write) {
+              for (const auto writer_id : writer_ids) {
+                const auto &writer = texture_cache.GetImage(writer_id);
+                Require(name, "resolved alias tracking restored",
+                        !writer.IsMaybeCpuDirty() && writer.IsTracked(),
+                        "resolved alias lost its CPU write protection");
+              }
+            }
+          }
+          DestroyBuffer(&outer_readback);
+        }
+      }
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);
@@ -40561,7 +41488,191 @@ void CheckSampledDepthResource() {
   std::printf("[host]    %-32s ok\n", "SampledDepthResource");
 }
 
+struct AttachmentBarrierCapture {
+  inline static AttachmentBarrierCapture *active = nullptr;
+  PFN_vkCmdPipelineBarrier2 original;
+  VkCommandBuffer command;
+  std::vector<VkMemoryBarrier2> barriers;
+
+  explicit AttachmentBarrierCapture(vk::CommandBuffer buffer)
+      : original(VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier2),
+        command(buffer) {
+    Require("AttachmentBarrierCapture", "scope", active == nullptr,
+            "nested dispatch capture");
+    active = this;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier2 = Capture;
+  }
+  ~AttachmentBarrierCapture() {
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier2 = original;
+    active = nullptr;
+  }
+  static VKAPI_ATTR void VKAPI_CALL Capture(VkCommandBuffer buffer,
+                                            const VkDependencyInfo *info) {
+    if (buffer == active->command) {
+      for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+        active->barriers.push_back(info->pMemoryBarriers[i]);
+      }
+    }
+    active->original(buffer, info);
+  }
+};
+
+void CheckAttachmentPassDependencies(RenderContext &renderer) {
+  constexpr const char *name = "AttachmentPassDependencies";
+  auto &graphics = renderer.GetGraphics();
+  CommandScheduler scheduler(renderer, graphics);
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  scheduler.Begin(registers, user_config, shaders);
+  for (const auto format : {vk::Format::eR32Sfloat, vk::Format::eD32Sfloat}) {
+    const bool depth = format == vk::Format::eD32Sfloat;
+    ImageInfo info{};
+    info.pixel_format = format;
+    info.guest_format = Prospero::BufferFormat::k32Float;
+    info.extent = {2, 2, 1};
+    info.pitch = 2;
+    info.bytes_per_block = 4;
+    Image image(graphics, scheduler, info);
+    const auto aspect = depth ? vk::ImageAspectFlagBits::eDepth
+                              : vk::ImageAspectFlagBits::eColor;
+    const auto layout = depth ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                              : vk::ImageLayout::eColorAttachmentOptimal;
+    const auto read = depth ? vk::AccessFlagBits2::eDepthStencilAttachmentRead
+                            : vk::AccessFlagBits2::eColorAttachmentRead;
+    const auto write = depth ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                             : vk::AccessFlagBits2::eColorAttachmentWrite;
+    vk::ImageViewCreateInfo view_info{};
+    view_info.image = image.backing.image;
+    view_info.viewType = vk::ImageViewType::e2D;
+    view_info.format = format;
+    view_info.subresourceRange = {aspect, 0, 1, 0, 1};
+    vk::ImageView view;
+    RequireVk(name, "view",
+              graphics.device.createImageView(&view_info, nullptr, &view),
+              "create attachment view");
+    auto &command = scheduler.Current();
+    image.Transit(layout, read | write, {}, command.Handle());
+    RenderState state{};
+    state.width = state.height = 2;
+    state.num_layers = 1;
+    if (depth) {
+      auto &attachment = state.depth_stencil_attachment;
+      attachment.image_view = view;
+      attachment.image_layout = layout;
+      attachment.has_depth = true;
+      attachment.depth_clear = true;
+      attachment.clear_value[0] = std::bit_cast<uint32_t>(0.25f);
+    } else {
+      state.num_color_attachments = 1;
+      auto &attachment = state.color_attachments[0];
+      attachment.image_view = view;
+      attachment.image_layout = layout;
+      attachment.is_clear = true;
+      attachment.clear_value[0] = std::bit_cast<uint32_t>(0.25f);
+    }
+    {
+      AttachmentBarrierCapture capture(command.Handle());
+      command.BeginRendering(state);
+      command.BeginRendering(state);
+      Require(name, "same-pass batching", capture.barriers.empty(),
+              "unchanged render state introduced an unnecessary pass boundary");
+      command.EndRendering();
+      Require(name, "attachment store dependency", capture.barriers.size() == 1,
+              "ending rendering did not publish attachment stores for the next "
+              "pass");
+      const auto &barrier = capture.barriers.front();
+      const VkPipelineStageFlags2 stages =
+          depth ? VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT
+                : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      Require(name, "attachment stage scopes",
+              (barrier.srcStageMask & stages) == stages &&
+                  (barrier.dstStageMask & stages) == stages,
+              "attachment dependency omitted its framebuffer pipeline stages");
+      Require(name, "attachment access scopes",
+              (barrier.srcAccessMask & static_cast<VkAccessFlags2>(write)) !=
+                      0 &&
+                  (barrier.dstAccessMask &
+                   static_cast<VkAccessFlags2>(read | write)) ==
+                      static_cast<VkAccessFlags2>(read | write),
+              "attachment dependency omitted store/load access");
+      state.depth_stencil_attachment.depth_clear = false;
+      state.color_attachments[0].is_clear = false;
+      command.BeginRendering(state);
+      command.EndRendering();
+      command.EndRendering();
+      Require(name, "separate pass and idle end", capture.barriers.size() == 2,
+              "a real pass end lost its dependency or an idle end added one");
+    }
+    StreamBuffer download(graphics, scheduler, MemoryUsage::Download, 4096);
+    const auto [data, offset] = download.Map(16, 4);
+    download.Commit();
+    vk::BufferImageCopy copy{};
+    copy.bufferOffset = offset;
+    copy.imageSubresource = {aspect, 0, 0, 1};
+    copy.imageExtent = {2, 2, 1};
+    image.Download(std::span{&copy, 1}, download.Handle(), offset, 16);
+    scheduler.Finish();
+    download.Invalidate(offset, 16);
+    const std::array<float, 4> expected{0.25f, 0.25f, 0.25f, 0.25f};
+    Require(name, "clear/store/load content",
+            data != nullptr &&
+                std::memcmp(data, expected.data(), sizeof(expected)) == 0,
+            "a separate load pass lost the preceding clear");
+    graphics.device.destroyImageView(view);
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+VKAPI_ATTR void VKAPI_CALL RejectInvalidMipCopyDispatch(VkCommandBuffer,
+                                                        VkImage, VkImageLayout,
+                                                        VkImage, VkImageLayout,
+                                                        uint32_t,
+                                                        const VkImageCopy *) {
+  std::puts("invalid mip copy reached Vulkan dispatch");
+  std::fflush(stdout);
+  std::_Exit(0);
+}
+
+void CheckInvalidMipCopy(RenderContext &renderer, const char *test_case) {
+  auto &graphics = renderer.GetGraphics();
+  CommandScheduler scheduler(renderer, graphics);
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  scheduler.Begin(registers, user_config, shaders);
+  ImageInfo source_info{};
+  source_info.pixel_format = vk::Format::eR8Unorm;
+  source_info.guest_format = Prospero::BufferFormat::k8UNorm;
+  source_info.extent = {2, 2, 1};
+  source_info.pitch = 2;
+  source_info.bytes_per_block = 1;
+  auto destination_info = source_info;
+  uint32_t layer = 0;
+  if (std::strcmp(test_case, "layers") == 0) {
+    source_info.resources.layers = 2;
+    destination_info.resources.layers = 2;
+    layer = 1;
+  } else {
+    Require("InvalidMipCopy", "case", std::strcmp(test_case, "depth") == 0,
+            "unknown mip-copy death test case");
+    source_info.type = destination_info.type = Prospero::ImageType::kColor3D;
+    destination_info.extent.depth = 2;
+  }
+  Image source(graphics, scheduler, source_info);
+  Image destination(graphics, scheduler, destination_info);
+  // Never submit the intentionally invalid region to the driver, even before
+  // the production guard exists. Reaching dispatch must fail the death test.
+  VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyImage = RejectInvalidMipCopyDispatch;
+  std::printf("invalid mip copy reached: %s\n", test_case);
+  std::fflush(stdout);
+  destination.CopyMip(source, 0, layer);
+  std::_Exit(0);
+}
+
 void CheckImageTransitionState(RenderContext &renderer) {
+  CheckAttachmentPassDependencies(renderer);
   constexpr const char *name = "ImageTransitionState";
   auto &context = renderer.GetGraphics();
   CommandScheduler scheduler(renderer, context);
@@ -40768,7 +41879,8 @@ void CheckImageTransitionState(RenderContext &renderer) {
   source_info.stencil = {0x1000, 4};
   auto destination_info = depth_info;
   destination_info.resources.levels = 2;
-  destination_info.stencil = {0x2000, 16};
+  destination_info.resources.layers = 2;
+  destination_info.stencil = {0x2000, 32};
   Image source(context, scheduler, source_info);
   Image destination(context, scheduler, destination_info);
   StreamBuffer upload(context, scheduler, MemoryUsage::Upload, 4096);
@@ -40793,7 +41905,7 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                        1};
   source_copies[1].imageExtent = {2, 2, 1};
   source.Upload(source_copies, upload.Handle(), upload_offset, 128);
-  destination.CopyMip(source, 1, 0);
+  destination.CopyMip(source, 1, 1);
 
   const auto [download_data, download_offset] = download.Map(128, 4);
   Require(name, "depth/stencil download map", download_data != nullptr,
@@ -40802,8 +41914,10 @@ void CheckImageTransitionState(RenderContext &renderer) {
   auto destination_copies = source_copies;
   destination_copies[0].bufferOffset = download_offset;
   destination_copies[0].imageSubresource.mipLevel = 1;
+  destination_copies[0].imageSubresource.baseArrayLayer = 1;
   destination_copies[1].bufferOffset = download_offset + 64;
   destination_copies[1].imageSubresource.mipLevel = 1;
+  destination_copies[1].imageSubresource.baseArrayLayer = 1;
   destination.Download(destination_copies, download.Handle(), download_offset,
                        128);
 
@@ -45472,6 +46586,20 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-upload-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLargeSparseImageUpload();
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--mip-copy-death") == 0) {
+    VulkanHarness vulkan;
+    CheckInvalidMipCopy(vulkan.RuntimeRenderer(), argv[2]);
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--depth-alias-death") == 0) {
+    Require("DepthAlias", "case",
+            std::strcmp(argv[2], "cross-format") == 0 ||
+                std::strcmp(argv[2], "unequal-samples") == 0,
+            "unknown death test case");
+    VulkanHarness vulkan;
+    vulkan.CheckUnifiedTextureCacheFlow(argv[2]);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {

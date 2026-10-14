@@ -720,6 +720,8 @@ struct Ngs2VoiceInternal {
 			return NGS2_ERROR_FULL_WAVEFORM_BLOCKS;
 		}
 		if (clear) {
+			// Also discards staged frames (frame_cursor, frame_samples, next_frame_samples),
+			// so a clear after a partial render cannot replay samples from the old stream.
 			ClearWaveformBlocks();
 		} else if (retained != 0) {
 			blocks.back().info.data_size = tail.info.data_size;

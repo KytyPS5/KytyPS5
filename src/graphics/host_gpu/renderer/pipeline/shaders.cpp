@@ -21,6 +21,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <vector>
@@ -31,7 +34,6 @@ namespace Libs::Graphics {
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
     static_cast<uint8_t>(Prospero::VertexAttribFormat::k16_16SInt);
 constexpr uint32_t kTemporaryPs5BufferFormat121 = 121u;
-
 static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_components) {
 	if (used_components == 0 || used_components >= size) {
 		return false;
@@ -121,6 +123,7 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		size   = 2;
 		return;
 	}
+
 
 	format = VulkanFormat(fmt);
 	size   = ShaderRecompiler::Format::GetFormatInfo(fmt).component_count;
@@ -322,6 +325,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
 		GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
 		               static_cast<uint32_t>(used_components));
+		// A vertex attribute format the device cannot fetch (VUID-VkVertexInputAttributeDescription-
+		// format-00623) makes pipeline creation fail, so name it instead.
+		if (!(graphics.GetFormatProperties(input_attr[index].format).bufferFeatures &
+		      vk::FormatFeatureFlagBits::eVertexBuffer)) {
+			EXIT("Pipeline: vertex attribute format %d is not supported by the device\n",
+			     static_cast<int>(input_attr[index].format));
+		}
 
 		if (graphics_debug_dump_enabled()) {
 			static std::atomic_uint log_count = 0;
@@ -634,10 +644,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	const auto compile_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+	                                                          compile_start)
+	        .count();
+	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p ms=%" PRId64 "\n",
+	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline), compile_ms);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

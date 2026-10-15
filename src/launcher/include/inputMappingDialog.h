@@ -10,6 +10,7 @@ class ControllerPreview;
 class DualSenseWidget;
 class QLabel;
 class QPushButton;
+class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QTabWidget;
@@ -45,6 +46,7 @@ private:
 	QLabel*                      m_status          = nullptr;
 	QDoubleSpinBox*              m_sensitivity     = nullptr;
 	QComboBox*                   m_particle_skin   = nullptr;
+	QCheckBox*                   m_touch_cursor    = nullptr;
 	bool                         m_custom_bindings = false;
 	bool                         m_custom_pad      = false;
 };

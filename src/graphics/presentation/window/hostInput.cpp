@@ -224,7 +224,7 @@ public:
 				    std::clamp(std::isfinite(sensitivity) ? sensitivity : 1.0f, 0.1f, 5.0f);
 				continue;
 			}
-			if (entry.starts_with(TOUCH_PARTICLE_SKIN)) {
+			if (entry.starts_with(TOUCH_PARTICLE_SKIN) || entry.starts_with("TouchCursorImage=")) {
 				continue;
 			}
 			if (entry.starts_with(PAD_PREFIX)) {

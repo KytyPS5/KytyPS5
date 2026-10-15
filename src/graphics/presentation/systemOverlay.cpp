@@ -180,6 +180,18 @@ TouchParticleSkin GetTouchParticleSkin() {
 	return skin;
 }
 
+bool TouchCursorImageEnabled() {
+	static const bool enabled = [] {
+		for (const auto& value: Config::GetKeymap()) {
+			if (std::string_view(value) == "TouchCursorImage=Off") {
+				return false;
+			}
+		}
+		return true;
+	}();
+	return enabled;
+}
+
 enum class InputKind : uint8_t {
 	Button,
 	Axis,
@@ -1479,8 +1491,8 @@ struct SystemOverlay::Impl {
 		}
 		auto* draw = ImGui::GetForegroundDrawList();
 		DrawTouchParticles(draw, now);
-		if (!state.enabled || !state.cursor_visible || !state.position_valid ||
-		    !cursor_initialized) {
+		if (!TouchCursorImageEnabled() || !state.enabled || !state.cursor_visible ||
+		    !state.position_valid || !cursor_initialized) {
 			return;
 		}
 

@@ -3,6 +3,7 @@
 #include "controllerPreview.h"
 #include "dualsenseWidget.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -27,6 +28,7 @@ namespace {
 constexpr auto DEFAULT_MOUSE_SENSITIVITY = 1.0;
 constexpr char MOUSE_SENSITIVITY[]       = "MouseSensitivity=";
 constexpr char TOUCH_PARTICLE_SKIN[]     = "TouchParticleSkin=";
+constexpr char TOUCH_CURSOR_OFF[]        = "TouchCursorImage=Off";
 
 constexpr char PAD_PREFIX[] = "Pad:";
 
@@ -310,6 +312,7 @@ QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 	for (const auto& entry: mapping) {
 		if (entry.startsWith(QLatin1String(MOUSE_SENSITIVITY)) ||
 		    entry.startsWith(QLatin1String(TOUCH_PARTICLE_SKIN)) ||
+		    entry.startsWith(QLatin1String("TouchCursorImage=")) ||
 		    entry.startsWith(QLatin1String(PAD_PREFIX))) {
 			continue;
 		}
@@ -380,6 +383,29 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, ControllerPre
 	m_tabs->addTab(BuildTab(false), tr("Keyboard && Mouse → PS5"));
 	layout->addWidget(m_tabs, 1);
 	m_sensitivity->setValue(ParseMouseSensitivity(mapping));
+
+	auto* touch_group  = new QGroupBox(tr("Emulated touch pad (shared by both tabs)"), this);
+	auto* touch_layout = new QHBoxLayout(touch_group);
+	touch_layout->addWidget(new QLabel(tr("Particle skin"), touch_group));
+	m_particle_skin = new QComboBox(touch_group);
+	m_particle_skin->setObjectName(QStringLiteral("touchParticleSkin"));
+	m_particle_skin->addItem(tr("Classic"), QStringLiteral("Classic"));
+	m_particle_skin->addItem(tr("Blue neon"), QStringLiteral("BlueNeon"));
+	m_particle_skin->addItem(tr("Monochrome"), QStringLiteral("Monochrome"));
+	m_particle_skin->addItem(tr("Crimson"), QStringLiteral("Crimson"));
+	m_particle_skin->addItem(tr("Red/Blue"), QStringLiteral("RedBlue"));
+	touch_layout->addWidget(m_particle_skin);
+	m_touch_cursor = new QCheckBox(tr("Show hand cursor"), touch_group);
+	m_touch_cursor->setObjectName(QStringLiteral("touchCursorImage"));
+	m_touch_cursor->setToolTip(tr("When off, the emulated touch pad still works but the hand "
+	                              "image is not drawn (particles still follow your drawing)."));
+	m_touch_cursor->setChecked(!mapping.contains(QLatin1String(TOUCH_CURSOR_OFF)));
+	touch_layout->addWidget(m_touch_cursor);
+	touch_layout->addStretch();
+	touch_layout->addWidget(new QLabel(
+	    tr("Toggle with the touch pad mode key (F6 by default); draw with left mouse / Cross."),
+	    touch_group));
+	layout->addWidget(touch_group);
 	const auto skin_index = m_particle_skin->findData(ParseTouchParticleSkin(mapping));
 	m_particle_skin->setCurrentIndex(skin_index >= 0 ? skin_index : 0);
 
@@ -533,25 +559,6 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 		sensitivity_layout->addStretch();
 		layout->addLayout(sensitivity_layout);
 
-		auto* touch_layout = new QHBoxLayout;
-		touch_layout->addWidget(new QLabel(tr("Touch pad particle skin"), page));
-		m_particle_skin = new QComboBox(page);
-		m_particle_skin->setObjectName(QStringLiteral("touchParticleSkin"));
-		m_particle_skin->addItem(tr("Classic"), QStringLiteral("Classic"));
-		m_particle_skin->addItem(tr("Blue neon"), QStringLiteral("BlueNeon"));
-		m_particle_skin->addItem(tr("Monochrome"), QStringLiteral("Monochrome"));
-		m_particle_skin->addItem(tr("Crimson"), QStringLiteral("Crimson"));
-		m_particle_skin->addItem(tr("Red/Blue"), QStringLiteral("RedBlue"));
-		touch_layout->addWidget(m_particle_skin);
-		touch_layout->addStretch();
-		layout->addLayout(touch_layout);
-		auto* touch_note = new QLabel(
-		    tr("Emulated touch pad: press the touch pad mode key (F6) to show a cursor, then hold "
-		       "the left mouse button to draw. On gamepads, map a button to touch pad mode, move "
-		       "with the left stick and hold Cross."),
-		    page);
-		touch_note->setWordWrap(true);
-		layout->addWidget(touch_note);
 	}
 	return page;
 }
@@ -583,6 +590,9 @@ QStringList InputMappingDialog::Mapping() const {
 	const auto skin = m_particle_skin->currentData().toString();
 	if (skin != QLatin1String("Classic")) {
 		result.append(QLatin1String(TOUCH_PARTICLE_SKIN) + skin);
+	}
+	if (!m_touch_cursor->isChecked()) {
+		result.append(QLatin1String(TOUCH_CURSOR_OFF));
 	}
 	return result;
 }
@@ -649,7 +659,6 @@ void InputMappingDialog::RestoreDefaults() {
 			}
 		}
 		m_sensitivity->setValue(DEFAULT_MOUSE_SENSITIVITY);
-		m_particle_skin->setCurrentIndex(0);
 		m_custom_bindings = false;
 	}
 	UpdateButtons();

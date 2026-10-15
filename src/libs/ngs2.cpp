@@ -29,7 +29,7 @@ namespace Ngs2 {
 LIB_NAME("Ngs2", "Ngs2");
 
 constexpr int32_t NGS2_ERROR_INVALID_SYSTEM_HANDLE =
-    static_cast<int32_t>(0x804a0230u);
+    static_cast<int32_t>(0x804a8201u);
 constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
     static_cast<int32_t>(0x804a8010u);
 constexpr int32_t NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS =
@@ -891,6 +891,15 @@ static Ngs2Internal* Ngs2CreateSystemInternal(const Ngs2SystemOption*      optio
 	return ngs;
 }
 
+static Ngs2Internal* Ngs2FindSystem(uintptr_t system_handle) {
+	for (auto* ngs = g_ngs_list; ngs != nullptr; ngs = ngs->next) {
+		if (reinterpret_cast<uintptr_t>(ngs) == system_handle) {
+			return ngs;
+		}
+	}
+	return nullptr;
+}
+
 static bool Ngs2RackIsCustom(Ngs2RackType type) {
 	switch (type) {
 		case Ngs2RackType::CustomSubmixer:
@@ -1112,7 +1121,6 @@ int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* inf
                                     size_t info_size) {
 	constexpr int32_t ERROR_INVALID_OUT_ADDRESS   = static_cast<int32_t>(0x804a8010u);
 	constexpr int32_t ERROR_INVALID_OUT_SIZE      = static_cast<int32_t>(0x804a8011u);
-	constexpr int32_t ERROR_INVALID_SYSTEM_HANDLE = static_cast<int32_t>(0x804a8201u);
 
 	if (info == nullptr) {
 		return ERROR_INVALID_OUT_ADDRESS;
@@ -1121,13 +1129,9 @@ int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* inf
 		return ERROR_INVALID_OUT_SIZE;
 	}
 
-	auto* ngs     = reinterpret_cast<Ngs2Internal*>(system_handle);
-	auto* current = g_ngs_list;
-	while (current != nullptr && current != ngs) {
-		current = current->next;
-	}
-	if (current == nullptr) {
-		return ERROR_INVALID_SYSTEM_HANDLE;
+	auto* ngs = Ngs2FindSystem(system_handle);
+	if (ngs == nullptr) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
 	}
 
 	Common::LockGuard lock(ngs->mutex);
@@ -2639,10 +2643,10 @@ int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state
 int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle) {
 	PRINT_NAME();
 
-	if (system_handle == 0) return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
-
-	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
-	if (ngs == nullptr) return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	auto* ngs = Ngs2FindSystem(system_handle);
+	if (ngs == nullptr) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	}
 
 	ngs->mutex.Lock();
 
@@ -2652,10 +2656,10 @@ int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle) {
 int KYTY_SYSV_ABI Ngs2SystemUnlock(uintptr_t system_handle) {
 	PRINT_NAME();
 
-	if (system_handle == 0) return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
-
-	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
-	if (ngs == nullptr) return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	auto* ngs = Ngs2FindSystem(system_handle);
+	if (ngs == nullptr) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	}
 
 	ngs->mutex.Unlock();
 

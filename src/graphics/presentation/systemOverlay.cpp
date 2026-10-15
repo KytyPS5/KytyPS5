@@ -1,4 +1,4 @@
-#include "graphics/presentation/systemOverlay.h"
+﻿#include "graphics/presentation/systemOverlay.h"
 
 #include <SDL3/SDL.h>
 
@@ -10,6 +10,7 @@
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
@@ -149,6 +150,35 @@ bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
 }
 
 constexpr size_t INPUT_QUEUE_CAPACITY = 128;
+constexpr int    MAX_TOUCH_CURSOR_IMAGE_DIMENSION = 2048;
+constexpr float  TOUCH_CURSOR_IMAGE_SIZE          = 48.0f;
+
+enum class TouchParticleSkin : uint8_t { Classic, BlueNeon, Monochrome, Crimson, RedBlue };
+
+TouchParticleSkin GetTouchParticleSkin() {
+	static const auto skin = [] {
+		for (const auto& value: Config::GetKeymap()) {
+			constexpr std::string_view key = "TouchParticleSkin=";
+			if (std::string_view(value).starts_with(key)) {
+				const auto name = std::string_view(value).substr(key.size());
+				if (name == "BlueNeon") {
+					return TouchParticleSkin::BlueNeon;
+				}
+				if (name == "Monochrome") {
+					return TouchParticleSkin::Monochrome;
+				}
+				if (name == "Crimson") {
+					return TouchParticleSkin::Crimson;
+				}
+				if (name == "RedBlue") {
+					return TouchParticleSkin::RedBlue;
+				}
+			}
+		}
+		return TouchParticleSkin::Classic;
+	}();
+	return skin;
+}
 
 enum class InputKind : uint8_t {
 	Button,
@@ -552,9 +582,11 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
-	return {core.active || dialog.active || system.active || trophy_active || splash,
+	const auto cursor        = GetHostInputTouchPadVisualState();
+	return {core.active || dialog.active || system.active || trophy_active || splash ||
+	            (cursor.enabled && cursor.cursor_visible),
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u)};
+	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -694,6 +726,20 @@ void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
 }
 
 struct SystemOverlay::Impl {
+	enum class TouchParticleIcon : uint8_t { Square, Triangle, Cross, Circle };
+
+	struct TouchParticle {
+		ImVec2            position;
+		Clock::time_point born;
+		TouchParticleIcon icon;
+	};
+
+	struct TouchTrailSegment {
+		ImVec2            from;
+		ImVec2            to;
+		Clock::time_point born;
+	};
+
 	explicit Impl(GraphicContext& context): graphics(context) {}
 
 	~Impl() {
@@ -705,6 +751,12 @@ struct SystemOverlay::Impl {
 		ReleaseVulkan();
 		if (imgui_context != nullptr) {
 			ImGui::SetCurrentContext(imgui_context);
+			if (hand_cursor_image) {
+				ImGui::UnregisterUserTexture(hand_cursor_image.get());
+			}
+			if (drawing_cursor_image) {
+				ImGui::UnregisterUserTexture(drawing_cursor_image.get());
+			}
 			if (trophy_notification_image) {
 				ImGui::UnregisterUserTexture(trophy_notification_image.get());
 			}
@@ -735,6 +787,8 @@ struct SystemOverlay::Impl {
 		style.WindowRounding = 10.0f;
 		style.FrameRounding  = 6.0f;
 		style.ItemSpacing    = {8.0f, 8.0f};
+		hand_cursor_image    = LoadTouchCursorImage("hand.png");
+		drawing_cursor_image = LoadTouchCursorImage("drawing.png");
 	}
 
 	void PlayTrophySound() {
@@ -773,6 +827,55 @@ struct SystemOverlay::Impl {
 		     !SDL_ResumeAudioStreamDevice(trophy_sound_stream))) {
 			LOGF("[Trophy] could not play sound: %s\n", SDL_GetError());
 		}
+	}
+
+	std::unique_ptr<ImTextureData> LoadTouchCursorImage(std::string_view filename) {
+		const char* base_path = SDL_GetBasePath();
+		if (base_path == nullptr) {
+			LOGF("Could not locate the emulator folder for touchpad cursor images: %s\n",
+			     SDL_GetError());
+			return nullptr;
+		}
+		const std::filesystem::path path =
+		    std::filesystem::path(base_path) / "assets" / "cursors" / std::string(filename);
+
+		Common::File file;
+		if (!file.Open(path, Common::File::Mode::Read)) {
+			LOGF("Touchpad cursor image not found: %s\n", Common::PathToString(path).c_str());
+			return nullptr;
+		}
+		const auto encoded = file.ReadWholeBuffer();
+		if (encoded.empty() ||
+		    encoded.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+			LOGF("Touchpad cursor image is empty or too large: %s\n",
+			     Common::PathToString(path).c_str());
+			return nullptr;
+		}
+
+		int width = 0;
+		int height = 0;
+		auto* pixels = stbi_load_from_memory(
+		    reinterpret_cast<const stbi_uc*>(encoded.data()), static_cast<int>(encoded.size()),
+		    &width, &height, nullptr, 4);
+		if (pixels == nullptr || width <= 0 || height <= 0 ||
+		    width > MAX_TOUCH_CURSOR_IMAGE_DIMENSION ||
+		    height > MAX_TOUCH_CURSOR_IMAGE_DIMENSION) {
+			LOGF("Could not load touchpad cursor image %s: %s\n",
+			     Common::PathToString(path).c_str(),
+			     pixels == nullptr ? stbi_failure_reason() : "image dimensions exceed 2048x2048");
+			stbi_image_free(pixels);
+			return nullptr;
+		}
+
+		auto texture = std::make_unique<ImTextureData>();
+		texture->Create(ImTextureFormat_RGBA32, width, height);
+		std::memcpy(texture->Pixels, pixels,
+		            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+		texture->UseColors = true;
+		stbi_image_free(pixels);
+		ImGui::RegisterUserTexture(texture.get());
+		LOGF("Loaded touchpad cursor image: %s\n", Common::PathToString(path).c_str());
+		return texture;
 	}
 
 	std::unique_ptr<ImTextureData> LoadTrophyIcon(std::span<const std::byte> encoded) {
@@ -1191,6 +1294,243 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	void EmitTouchParticles(ImVec2 from, ImVec2 to, Clock::time_point now) {
+		const float dx       = to.x - from.x;
+		const float dy       = to.y - from.y;
+		const float distance = std::hypot(dx, dy);
+		if (distance < 0.01f) {
+			return;
+		}
+		if (distance >= 1.0f) {
+			trail_segments.push_back({from, to, now});
+			if (trail_segments.size() > MAX_TOUCH_TRAIL_SEGMENTS) {
+				trail_segments.erase(trail_segments.begin());
+			}
+		}
+
+		constexpr float PARTICLE_SPACING = 24.0f;
+		float           traveled         = 0.0f;
+		while (particle_distance + distance - traveled >= PARTICLE_SPACING) {
+			traveled += PARTICLE_SPACING - particle_distance;
+			const float fraction = std::clamp(traveled / distance, 0.0f, 1.0f);
+			particles.push_back(
+			    {{from.x + dx * fraction, from.y + dy * fraction}, now, next_particle_icon});
+			next_particle_icon = static_cast<TouchParticleIcon>(
+			    (static_cast<uint8_t>(next_particle_icon) + 1) % 4);
+			if (particles.size() > MAX_TOUCH_PARTICLES) {
+				particles.erase(particles.begin());
+			}
+			particle_distance = 0.0f;
+		}
+		particle_distance += distance - traveled;
+	}
+
+	void DrawTouchParticles(ImDrawList* draw, Clock::time_point now) {
+		const auto skin = GetTouchParticleSkin();
+		constexpr float PARTICLE_LIFETIME = 1.0f;
+		constexpr float TRAIL_LIFETIME    = 0.35f;
+		std::erase_if(trail_segments, [now](const auto& segment) {
+			return std::chrono::duration<float>(now - segment.born).count() >= TRAIL_LIFETIME;
+		});
+		std::erase_if(particles, [now](const auto& particle) {
+			return std::chrono::duration<float>(now - particle.born).count() >=
+			       PARTICLE_LIFETIME;
+		});
+		for (const auto& segment: trail_segments) {
+			const float age =
+			    std::chrono::duration<float>(now - segment.born).count() / TRAIL_LIFETIME;
+			const float fade = 1.0f - age;
+			if (skin == TouchParticleSkin::RedBlue) {
+				draw->AddLine(segment.from, segment.to,
+				              IM_COL32(20, 75, 220, static_cast<int>(105.0f * fade)),
+				              9.0f * (1.0f - age * 0.5f));
+				draw->AddLine(segment.from, segment.to,
+				              IM_COL32(255, 45, 65, static_cast<int>(230.0f * fade)),
+				              4.0f * (1.0f - age * 0.5f));
+			} else if (skin == TouchParticleSkin::Crimson) {
+				draw->AddLine(segment.from, segment.to,
+				              IM_COL32(110, 0, 8, static_cast<int>(130.0f * fade)),
+				              9.0f * (1.0f - age * 0.5f));
+				draw->AddLine(segment.from, segment.to,
+				              IM_COL32(255, 35, 20, static_cast<int>(235.0f * fade)),
+				              4.0f * (1.0f - age * 0.5f));
+			} else {
+				draw->AddLine(segment.from, segment.to,
+				              IM_COL32(35, 145, 255, static_cast<int>(180.0f * fade)),
+				              5.0f * (1.0f - age * 0.5f));
+			}
+		}
+
+		for (const auto& particle: particles) {
+			const float age =
+			    std::chrono::duration<float>(now - particle.born).count() / PARTICLE_LIFETIME;
+			const float alpha = 1.0f - age;
+			const float size  = 9.0f * (1.0f - age * 0.35f);
+			const float drift = (static_cast<uint8_t>(particle.icon) % 2 == 0 ? -1.0f : 1.0f) *
+			                    8.0f * age;
+			const ImVec2 center {particle.position.x + drift, particle.position.y - 18.0f * age};
+			const auto faded = [alpha, skin, icon = particle.icon](int r, int g, int b) {
+				if (skin == TouchParticleSkin::BlueNeon) {
+					r = 75;
+					g = 220;
+					b = 255;
+				} else if (skin == TouchParticleSkin::RedBlue) {
+					const bool red = icon == TouchParticleIcon::Square ||
+					                 icon == TouchParticleIcon::Cross;
+					r = red ? 255 : 75;
+					g = red ? 65 : 175;
+					b = red ? 85 : 255;
+				} else if (skin == TouchParticleSkin::Monochrome) {
+					r = 235;
+					g = 245;
+					b = 255;
+				} else if (skin == TouchParticleSkin::Crimson) {
+					const bool ember = icon == TouchParticleIcon::Triangle ||
+					                   icon == TouchParticleIcon::Circle;
+					r = 255;
+					g = ember ? 205 : 115;
+					b = ember ? 70 : 15;
+				}
+				return IM_COL32(r, g, b, static_cast<int>(255.0f * alpha));
+			};
+
+			if (skin != TouchParticleSkin::Classic) {
+				const ImU32 glow =
+				    skin == TouchParticleSkin::BlueNeon
+				        ? IM_COL32(0, 115, 255, static_cast<int>(38.0f * alpha))
+				        : (skin == TouchParticleSkin::RedBlue
+				               ? IM_COL32(75, 100, 255, static_cast<int>(55.0f * alpha))
+				               : (skin == TouchParticleSkin::Crimson
+				               ? IM_COL32(255, 70, 0, static_cast<int>(70.0f * alpha))
+				               : IM_COL32(115, 165, 255, static_cast<int>(30.0f * alpha))));
+				draw->AddCircleFilled(center, size + 6.0f, glow);
+			}
+			const ImU32 particle_glow =
+			    skin == TouchParticleSkin::Crimson
+			        ? (particle.icon == TouchParticleIcon::Triangle ||
+			                   particle.icon == TouchParticleIcon::Circle
+			               ? IM_COL32(255, 195, 30, static_cast<int>(135.0f * alpha))
+			               : IM_COL32(255, 95, 0, static_cast<int>(135.0f * alpha)))
+			        : (skin == TouchParticleSkin::RedBlue
+			               ? (particle.icon == TouchParticleIcon::Square ||
+			                          particle.icon == TouchParticleIcon::Cross
+			                      ? IM_COL32(255, 40, 65, static_cast<int>(105.0f * alpha))
+			                      : IM_COL32(35, 125, 255, static_cast<int>(105.0f * alpha)))
+			               : IM_COL32(35, 145, 255,
+			                          static_cast<int>((skin == TouchParticleSkin::BlueNeon
+			                                                ? 100.0f
+			                                                : 65.0f) *
+			                                           alpha)));
+			draw->AddCircleFilled(center, size + 2.0f, particle_glow);
+			switch (particle.icon) {
+				case TouchParticleIcon::Square:
+					draw->AddRect({center.x - size * 0.65f, center.y - size * 0.65f},
+					              {center.x + size * 0.65f, center.y + size * 0.65f},
+					              faded(255, 105, 180), 2.0f, 0, 2.2f);
+					break;
+				case TouchParticleIcon::Triangle:
+					draw->AddLine({center.x, center.y - size}, {center.x - size, center.y + size},
+					              faded(80, 230, 130), 2.2f);
+					draw->AddLine({center.x - size, center.y + size},
+					              {center.x + size, center.y + size}, faded(80, 230, 130), 2.2f);
+					draw->AddLine({center.x + size, center.y + size},
+					              {center.x, center.y - size}, faded(80, 230, 130), 2.2f);
+					break;
+				case TouchParticleIcon::Cross:
+					draw->AddLine({center.x - size * 0.75f, center.y - size * 0.75f},
+					              {center.x + size * 0.75f, center.y + size * 0.75f},
+					              faded(90, 170, 255), 2.5f);
+					draw->AddLine({center.x + size * 0.75f, center.y - size * 0.75f},
+					              {center.x - size * 0.75f, center.y + size * 0.75f},
+					              faded(90, 170, 255), 2.5f);
+					break;
+				case TouchParticleIcon::Circle:
+					draw->AddCircle(center, size * 0.8f, faded(255, 105, 105), 0, 2.2f);
+					break;
+			}
+		}
+	}
+
+	void DrawTouchPadCursor(const HostInputTouchPadVisualState& state) {
+		const auto now = Clock::now();
+		if (state.enabled && state.position_valid) {
+			const ImVec2 target {state.x * extent.width, state.y * extent.height};
+			if (!cursor_initialized || state.gesture != cursor_gesture) {
+				cursor_position    = target;
+				cursor_initialized = true;
+				cursor_gesture     = state.gesture;
+				particle_distance  = 0.0f;
+			} else {
+				const float dt = last_cursor_update == Clock::time_point {}
+				                     ? 1.0f / 60.0f
+				                     : std::clamp(std::chrono::duration<float>(now -
+				                                                             last_cursor_update)
+				                                      .count(),
+				                                  1.0f / 1000.0f, 0.05f);
+				const ImVec2 previous = cursor_position;
+				const float  follow   = 1.0f - std::exp(-18.0f * dt);
+				cursor_position.x += (target.x - cursor_position.x) * follow;
+				cursor_position.y += (target.y - cursor_position.y) * follow;
+				if (state.drawing) {
+					EmitTouchParticles(previous, cursor_position, now);
+				}
+			}
+			last_cursor_update = now;
+		}
+		auto* draw = ImGui::GetForegroundDrawList();
+		DrawTouchParticles(draw, now);
+		if (!state.enabled || !state.cursor_visible || !state.position_valid ||
+		    !cursor_initialized) {
+			return;
+		}
+
+		const ImVec2 position = cursor_position;
+		const auto& cursor_image =
+		    state.drawing ? drawing_cursor_image : hand_cursor_image;
+		if (cursor_image != nullptr) {
+			const float scale = TOUCH_CURSOR_IMAGE_SIZE /
+			                    static_cast<float>(std::max(cursor_image->Height, 1));
+			const ImVec2 size {static_cast<float>(cursor_image->Width) * scale,
+			                   static_cast<float>(cursor_image->Height) * scale};
+			draw->AddImage(cursor_image->GetTexRef(), position,
+			               {position.x + size.x, position.y + size.y});
+			return;
+		}
+
+		const ImU32  blue     = IM_COL32(35, 145, 255, 220);
+		const ImVec2 hand[] = {
+		    {position.x, position.y},         {position.x, position.y + 20.0f},
+		    {position.x + 4.0f, position.y + 16.0f},
+		    {position.x + 9.0f, position.y + 27.0f},
+		    {position.x + 13.0f, position.y + 25.0f},
+		    {position.x + 10.0f, position.y + 17.0f},
+		    {position.x + 18.0f, position.y + 18.0f},
+		    {position.x + 20.0f, position.y + 15.0f},
+		    {position.x + 19.0f, position.y + 12.0f},
+		    {position.x + 12.0f, position.y + 10.0f},
+		    {position.x + 12.0f, position.y + 4.0f},
+		    {position.x + 10.0f, position.y + 2.0f},
+		    {position.x + 8.0f, position.y + 3.0f},
+		    {position.x + 8.0f, position.y + 10.0f},
+		    {position.x + 6.0f, position.y + 2.0f},
+		    {position.x + 4.0f, position.y + 2.0f},
+		    {position.x + 3.0f, position.y + 10.0f},
+		    {position.x + 2.0f, position.y + 1.0f},
+		};
+		draw->AddConvexPolyFilled(hand, IM_ARRAYSIZE(hand), IM_COL32(250, 250, 250, 255));
+		for (std::size_t i = 0; i < IM_ARRAYSIZE(hand); i++) {
+			draw->AddLine(hand[i], hand[(i + 1) % IM_ARRAYSIZE(hand)],
+			              IM_COL32(20, 25, 35, 255), 1.5f);
+		}
+		if (state.drawing) {
+			const ImVec2 pen_start {position.x + 12.0f, position.y + 8.0f};
+			const ImVec2 pen_end {position.x + 23.0f, position.y - 3.0f};
+			draw->AddLine(pen_start, pen_end, IM_COL32(10, 45, 95, 255), 5.0f);
+			draw->AddLine(pen_start, pen_end, blue, 2.5f);
+		}
+	}
+
+
 	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now) {
 		std::erase_if(retired_trophy_images, [](const auto& texture) {
 			if (texture->Status != ImTextureStatus_Destroyed) {
@@ -1316,7 +1656,8 @@ struct SystemOverlay::Impl {
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
-		    !g_splash_active.load(std::memory_order_acquire)) {
+		    !g_splash_active.load(std::memory_order_acquire) &&
+		    !GetHostInputTouchPadVisualState().enabled) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1356,6 +1697,7 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now);
+		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
 		ImGui::Render();
 		extent = frame_extent;
 		return true;
@@ -1410,6 +1752,18 @@ struct SystemOverlay::Impl {
 	ImVec2                                right_stick {};
 	OverlaySession                              session;
 	std::unique_ptr<ImTextureData>              trophy_notification_image;
+	std::unique_ptr<ImTextureData>              hand_cursor_image;
+	std::unique_ptr<ImTextureData>              drawing_cursor_image;
+	bool                                        cursor_initialized = false;
+	ImVec2                                      cursor_position {};
+	float                                       particle_distance  = 0.0f;
+	TouchParticleIcon                           next_particle_icon = TouchParticleIcon::Square;
+	Clock::time_point                           last_cursor_update;
+	uint64_t                                    cursor_gesture = 0;
+	std::vector<TouchParticle>                  particles;
+	std::vector<TouchTrailSegment>              trail_segments;
+	static constexpr std::size_t                MAX_TOUCH_PARTICLES      = 64;
+	static constexpr std::size_t                MAX_TOUCH_TRAIL_SEGMENTS = 128;
 	std::optional<TrophyNotification>           trophy_notification;
 	Clock::time_point                           trophy_notification_born;
 	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;

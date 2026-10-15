@@ -3,6 +3,7 @@
 #include "controllerPreview.h"
 #include "dualsenseWidget.h"
 
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QGridLayout>
@@ -25,6 +26,7 @@ namespace {
 
 constexpr auto DEFAULT_MOUSE_SENSITIVITY = 1.0;
 constexpr char MOUSE_SENSITIVITY[]       = "MouseSensitivity=";
+constexpr char TOUCH_PARTICLE_SKIN[]     = "TouchParticleSkin=";
 
 constexpr char PAD_PREFIX[] = "Pad:";
 
@@ -65,6 +67,7 @@ constexpr PadControl PAD_CONTROLS[] = {
     {"TouchPad", "Touch pad click", "Backspace", "Touchpad", System},
     {"TouchPadRight", "Touch pad right", "Tab", nullptr, System},
     {"GyroToggle", "Gyro emulation toggle", "", "Back", System},
+    {"TouchPadMode", "Emulated touch pad mode", "F6", "", System},
     {"LeftStickUp", "Up", "W", nullptr, LeftStick},
     {"LeftStickDown", "Down", "S", nullptr, LeftStick},
     {"LeftStickLeft", "Left", "A", nullptr, LeftStick},
@@ -306,6 +309,7 @@ QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 	QHash<QString, QString> result;
 	for (const auto& entry: mapping) {
 		if (entry.startsWith(QLatin1String(MOUSE_SENSITIVITY)) ||
+		    entry.startsWith(QLatin1String(TOUCH_PARTICLE_SKIN)) ||
 		    entry.startsWith(QLatin1String(PAD_PREFIX))) {
 			continue;
 		}
@@ -315,6 +319,15 @@ QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 		}
 	}
 	return result;
+}
+
+QString ParseTouchParticleSkin(const QStringList& mapping) {
+	for (const auto& entry: mapping) {
+		if (entry.startsWith(QLatin1String(TOUCH_PARTICLE_SKIN))) {
+			return entry.mid(sizeof(TOUCH_PARTICLE_SKIN) - 1);
+		}
+	}
+	return QStringLiteral("Classic");
 }
 
 double ParseMouseSensitivity(const QStringList& mapping) {
@@ -332,7 +345,7 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, ControllerPre
                                        QWidget* parent)
     : QDialog(parent), m_preview(preview) {
 	setWindowTitle(tr("Controls"));
-	resize(QSize(1100, 760).boundedTo(screen()->availableGeometry().size()));
+	resize(QSize(1360, 780).boundedTo(screen()->availableGeometry().size()));
 
 	m_bindings        = ParseMapping(mapping);
 	m_custom_bindings = !m_bindings.isEmpty();
@@ -367,6 +380,8 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, ControllerPre
 	m_tabs->addTab(BuildTab(false), tr("Keyboard && Mouse → PS5"));
 	layout->addWidget(m_tabs, 1);
 	m_sensitivity->setValue(ParseMouseSensitivity(mapping));
+	const auto skin_index = m_particle_skin->findData(ParseTouchParticleSkin(mapping));
+	m_particle_skin->setCurrentIndex(skin_index >= 0 ? skin_index : 0);
 
 	auto* buttons  = new QDialogButtonBox(QDialogButtonBox::RestoreDefaults |
 	                                          QDialogButtonBox::Save | QDialogButtonBox::Cancel,
@@ -451,7 +466,7 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 				rows->setHorizontalSpacing(12);
 				rows->setVerticalSpacing(6);
 				rows->setColumnStretch(0, 1);
-				rows->setColumnMinimumWidth(1, 150);
+				rows->setColumnMinimumWidth(1, 190);
 			}
 			const auto id    = QString::fromLatin1(control.id);
 			const auto label = !pad && id == QLatin1String("TouchPad") ? tr("Touch pad left")
@@ -461,7 +476,7 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 			button->setObjectName((pad ? QStringLiteral("padBinding_") : QStringLiteral("binding_")) +
 			                      id);
 			button->setAutoDefault(false);
-			button->setMinimumWidth(150);
+			button->setMinimumWidth(190);
 			button->setContextMenuPolicy(Qt::CustomContextMenu);
 			button->setAccessibleName(tr(SECTION_TITLES[section]) + QStringLiteral(" / ") + label);
 			rows->addWidget(name, row, 0);
@@ -482,13 +497,15 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 	columns->setColumnStretch(0, 1);
 	columns->setColumnStretch(1, 1);
 	scroll->setWidget(content);
-	body->addWidget(scroll, 1);
+	scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	scroll->setMinimumWidth(pad ? 640 : 700);
+	body->addWidget(scroll, 3);
 
 	if (pad) {
 		m_controller = new DualSenseWidget(page);
 		m_controller->setObjectName(QStringLiteral("controllerDiagram"));
 		m_controller->setMinimumWidth(320);
-		body->addWidget(m_controller, 1);
+		body->addWidget(m_controller, 2);
 		connect(m_controller, &DualSenseWidget::ControlClicked, this,
 		        [this](const QString& id) {
 			        ChangePadBinding(id == QLatin1String("TouchPadRight") ? QStringLiteral("TouchPad")
@@ -515,6 +532,26 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 		    new QLabel(tr("F7 in-game toggles mouse movement on the right stick."), page));
 		sensitivity_layout->addStretch();
 		layout->addLayout(sensitivity_layout);
+
+		auto* touch_layout = new QHBoxLayout;
+		touch_layout->addWidget(new QLabel(tr("Touch pad particle skin"), page));
+		m_particle_skin = new QComboBox(page);
+		m_particle_skin->setObjectName(QStringLiteral("touchParticleSkin"));
+		m_particle_skin->addItem(tr("Classic"), QStringLiteral("Classic"));
+		m_particle_skin->addItem(tr("Blue neon"), QStringLiteral("BlueNeon"));
+		m_particle_skin->addItem(tr("Monochrome"), QStringLiteral("Monochrome"));
+		m_particle_skin->addItem(tr("Crimson"), QStringLiteral("Crimson"));
+		m_particle_skin->addItem(tr("Red/Blue"), QStringLiteral("RedBlue"));
+		touch_layout->addWidget(m_particle_skin);
+		touch_layout->addStretch();
+		layout->addLayout(touch_layout);
+		auto* touch_note = new QLabel(
+		    tr("Emulated touch pad: press the touch pad mode key (F6) to show a cursor, then hold "
+		       "the left mouse button to draw. On gamepads, map a button to touch pad mode, move "
+		       "with the left stick and hold Cross."),
+		    page);
+		touch_note->setWordWrap(true);
+		layout->addWidget(touch_note);
 	}
 	return page;
 }
@@ -542,6 +579,10 @@ QStringList InputMappingDialog::Mapping() const {
 	if (m_sensitivity->value() != DEFAULT_MOUSE_SENSITIVITY) {
 		result.append(QLatin1String(MOUSE_SENSITIVITY) +
 		              QString::number(m_sensitivity->value(), 'f', 1));
+	}
+	const auto skin = m_particle_skin->currentData().toString();
+	if (skin != QLatin1String("Classic")) {
+		result.append(QLatin1String(TOUCH_PARTICLE_SKIN) + skin);
 	}
 	return result;
 }
@@ -608,6 +649,7 @@ void InputMappingDialog::RestoreDefaults() {
 			}
 		}
 		m_sensitivity->setValue(DEFAULT_MOUSE_SENSITIVITY);
+		m_particle_skin->setCurrentIndex(0);
 		m_custom_bindings = false;
 	}
 	UpdateButtons();

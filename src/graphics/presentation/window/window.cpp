@@ -249,6 +249,15 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 		}
 
 		HostInputMouseButton(mouse_button, mb.down);
+		if (!mb.touch && mb.left) {
+			HostInputMouseTouchPad(mb.down, static_cast<float>(mb.x), static_cast<float>(mb.y));
+		}
+	} else if (mb.motion && !mb.touch) {
+		if (mb.left) {
+			HostInputMouseTouchPad(true, static_cast<float>(mb.x), static_cast<float>(mb.y));
+		} else {
+			HostInputMouseMotion(static_cast<float>(mb.x), static_cast<float>(mb.y));
+		}
 	}
 }
 
@@ -298,6 +307,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.removed) {
 		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
+			HostInputDisconnectGamepadTouchPad(f.id);
 			Controller::Disconnect(f.id);
 			SDL_CloseGamepad(pad);
 		}
@@ -314,8 +324,12 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		} else if (const auto axis = ControllerAxisFromSdl(f.axis_id);
 		           axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
-			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			const int value = ControllerAxisValueFromSdl(f.axis_id, f.axis_value);
+			if ((f.axis_id == SDL_GAMEPAD_AXIS_LEFTX || f.axis_id == SDL_GAMEPAD_AXIS_LEFTY) &&
+			    HostInputGamepadAxis(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFTX, value)) {
+				return;
+			}
+			Controller::SetAxis(f.id, axis, value);
 		}
 	}
 }

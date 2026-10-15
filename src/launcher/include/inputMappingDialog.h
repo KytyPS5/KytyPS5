@@ -1,4 +1,4 @@
-#ifndef LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
+﻿#ifndef LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
 #define LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
 
 #include <QDialog>
@@ -10,6 +10,7 @@ class ControllerPreview;
 class DualSenseWidget;
 class QLabel;
 class QPushButton;
+class QComboBox;
 class QDoubleSpinBox;
 class QTabWidget;
 class QWidget;
@@ -43,6 +44,7 @@ private:
 	QString                      m_selected;
 	QLabel*                      m_status          = nullptr;
 	QDoubleSpinBox*              m_sensitivity     = nullptr;
+	QComboBox*                   m_particle_skin   = nullptr;
 	bool                         m_custom_bindings = false;
 	bool                         m_custom_pad      = false;
 };

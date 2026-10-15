@@ -81,6 +81,7 @@ struct ConfigOptions {
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   playgo_hack_enabled         = false;
+	bool                   raytracing_enabled          = false;
 	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
@@ -138,6 +139,11 @@ bool TessellationEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
+// --raytracing (EXPERIMENTAL, off by default): runs the real software BVH box/triangle
+// intersection for IMAGE_BVH_INTERSECT_RAY. Off, every node query reports a miss instead, so a
+// title's ray-traced effects go dark instead of costing GPU time or (if the traversal has a bug)
+// risking a hung dispatch.
+bool RaytracingEnabled();
 bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();

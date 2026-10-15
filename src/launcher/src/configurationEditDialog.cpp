@@ -294,6 +294,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
+	m_ui->checkBox_raytracing->setChecked(info.raytracing_enabled);
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
@@ -480,6 +481,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
+	info.raytracing_enabled        = ui.checkBox_raytracing->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif

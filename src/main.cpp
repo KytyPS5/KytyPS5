@@ -95,6 +95,7 @@ static void PrintUsage() {
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --raytracing                          Enable BVH ray intersection (EXPERIMENTAL).\n");
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
 	    "                                      Default: false.\n");
@@ -252,6 +253,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--tessellation") {
 			options.config.tessellation_enabled = true;
+			continue;
+		}
+
+		if (arg == "--raytracing") {
+			options.config.raytracing_enabled = true;
 			continue;
 		}
 

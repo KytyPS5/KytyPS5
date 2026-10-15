@@ -2639,6 +2639,8 @@ int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state
 int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle) {
 	PRINT_NAME();
 
+	EXIT_NOT_IMPLEMENTED(system_handle == 0);
+
 	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
 	if (ngs == nullptr) return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
 
@@ -2649,6 +2651,8 @@ int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle) {
 
 int KYTY_SYSV_ABI Ngs2SystemUnlock(uintptr_t system_handle) {
 	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(system_handle == 0);
 
 	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
 	if (ngs == nullptr) return NGS2_ERROR_INVALID_SYSTEM_HANDLE;

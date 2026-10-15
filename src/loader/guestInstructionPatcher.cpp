@@ -130,8 +130,12 @@ struct DecodedCodeInstruction {
 struct DecodedFunction {
 	std::map<uintptr_t, DecodedCodeInstruction> instructions;
 	std::set<uintptr_t>                         branch_targets;
+	std::map<uintptr_t, std::vector<uintptr_t>> jump_table_targets;
+	std::set<uintptr_t>                         possible_jump_targets;
+	bool                                        indirect_targets_bounded {};
 	bool                                        uses_red_zone {};
 	bool                                        uses_frame_pointer_red_zone {};
+	bool                                        uses_conservative_frame_pointer_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
 };
@@ -520,8 +524,110 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	return resolved_targets;
 }
 
+// A superset of an unbounded table's targets: every leading entry that lands in the function.
+std::optional<std::vector<uintptr_t>> ScanJumpTableTargets(const DecodedFunction& function,
+                                                           uintptr_t              branch_address,
+                                                           uintptr_t              function_start,
+                                                           uintptr_t              function_end) {
+	const auto branch = function.instructions.find(branch_address);
+	if (branch == function.instructions.end() ||
+	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
+	    branch->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER) {
+		return std::nullopt;
+	}
+	const ZydisRegister target_reg          = branch->second.operands[0].reg.value;
+	const auto          previous_contiguous = [&function](auto instruction) {
+		if (instruction == function.instructions.begin()) {
+			return function.instructions.end();
+		}
+		const auto previous = std::prev(instruction);
+		return previous->first + previous->second.instruction.length == instruction->first
+		           ? previous
+		           : function.instructions.end();
+	};
+	const auto add = previous_contiguous(branch);
+	if (add == function.instructions.end() ||
+	    add->second.instruction.mnemonic != ZYDIS_MNEMONIC_ADD ||
+	    add->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    !IsSameRegister(add->second.operands[0].reg.value, target_reg) ||
+	    add->second.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER) {
+		return std::nullopt;
+	}
+	const ZydisRegister table_reg = add->second.operands[1].reg.value;
+	const auto          load      = previous_contiguous(add);
+	if (load == function.instructions.end() ||
+	    load->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD ||
+	    load->second.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
+	    !IsSameRegister(load->second.operands[1].mem.base, table_reg) ||
+	    load->second.operands[1].mem.scale != sizeof(s32)) {
+		return std::nullopt;
+	}
+
+	constexpr size_t    MaxPatternInstructions = 64;
+	std::set<uintptr_t> tables;
+	auto                cursor = previous_contiguous(load);
+	for (size_t count = 0; count < MaxPatternInstructions && cursor != function.instructions.end();
+	     ++count, cursor = previous_contiguous(cursor)) {
+		const auto& decoded = cursor->second;
+		if (!WritesRegister(decoded, table_reg)) {
+			continue;
+		}
+		ZyanU64 table {};
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+		    ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &decoded.operands[1],
+		                                          decoded.address, &table))) {
+			tables.insert(table);
+		}
+		break;
+	}
+	if (tables.empty()) {
+		for (const auto& [address, decoded]: function.instructions) {
+			ZyanU64 table {};
+			if (address < branch_address && decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+			    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    IsSameRegister(decoded.operands[0].reg.value, table_reg) &&
+			    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+			    ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &decoded.operands[1],
+			                                          decoded.address, &table))) {
+				tables.insert(table);
+			}
+		}
+	}
+
+	constexpr size_t       MaxJumpTableEntries = 4096;
+	std::vector<uintptr_t> targets;
+	for (const uintptr_t table: tables) {
+		const auto* module = GetContainingModule(reinterpret_cast<const void*>(table));
+		if (module == nullptr) {
+			return std::nullopt;
+		}
+		for (size_t index = 0; index < MaxJumpTableEntries; ++index) {
+			const uintptr_t entry = table + index * sizeof(s32);
+			if (entry + sizeof(s32) > reinterpret_cast<uintptr_t>(module->end)) {
+				break;
+			}
+			s32 offset;
+			std::memcpy(&offset, reinterpret_cast<const void*>(entry), sizeof(offset));
+			const s64 target = static_cast<s64>(table) + offset;
+			if (target < static_cast<s64>(function_start) ||
+			    target >= static_cast<s64>(function_end)) {
+				break;
+			}
+			targets.push_back(static_cast<uintptr_t>(target));
+		}
+	}
+	if (targets.empty()) {
+		return std::nullopt;
+	}
+	return targets;
+}
+
+struct SegmentSweep;
+bool IsSweptInstructionStart(const SegmentSweep& sweep, uintptr_t address);
+
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
-                               uintptr_t segment_start, uintptr_t segment_end) {
+                               uintptr_t segment_start, uintptr_t segment_end,
+                               const SegmentSweep* sweep) {
 	DecodedFunction               function;
 	std::vector<uintptr_t>        blocks {function_start};
 	std::unordered_set<uintptr_t> visited;
@@ -572,6 +678,18 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 		}
 
 		bool discovered_block = false;
+		// An execute-only segment holds no data, so its sweep names an unresolved table's cases.
+		if (sweep != nullptr && indirect_branches.size() != resolved_indirect_branches.size()) {
+			for (uintptr_t address = function_start; address < function_end; ++address) {
+				if (!visited.contains(address) && IsSweptInstructionStart(*sweep, address)) {
+					blocks.push_back(address);
+					discovered_block = true;
+				}
+			}
+			if (discovered_block) {
+				continue;
+			}
+		}
 		for (const uintptr_t branch_address: indirect_branches) {
 			if (resolved_indirect_branches.contains(branch_address)) {
 				continue;
@@ -582,6 +700,7 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 				continue;
 			}
 			resolved_indirect_branches.insert(branch_address);
+			function.jump_table_targets.emplace(branch_address, *targets);
 			for (const uintptr_t target: *targets) {
 				function.branch_targets.insert(target);
 				if (!visited.contains(target)) {
@@ -595,7 +714,35 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 		}
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+	function.indirect_targets_bounded = true;
+	for (const uintptr_t branch_address: indirect_branches) {
+		if (resolved_indirect_branches.contains(branch_address)) {
+			continue;
+		}
+		const auto targets =
+		    ScanJumpTableTargets(function, branch_address, function_start, function_end);
+		if (!targets) {
+			function.indirect_targets_bounded = false;
+			break;
+		}
+		function.possible_jump_targets.insert(targets->begin(), targets->end());
+	}
 	return function;
+}
+
+bool OnlyFramePointerMemory(const DecodedCodeInstruction& decoded) {
+	bool any = false;
+	for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
+		const auto& operand = decoded.operands[index];
+		if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+			continue;
+		}
+		if (operand.mem.base != ZYDIS_REGISTER_RBP) {
+			return false;
+		}
+		any = true;
+	}
+	return any;
 }
 
 // clang frames small functions with rbp and no `sub rsp`; fold [rbp - disp] onto red-zone bits.
@@ -648,6 +795,75 @@ FramePointerState NextFramePointerState(const DecodedCodeInstruction& decoded,
 	return {.known = true, .delta = state.delta - *decoded.stack_pointer_delta};
 }
 
+bool IsComputedBranch(const DecodedCodeInstruction& decoded) {
+	return decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR &&
+	       GetRelativeTarget(decoded) == 0;
+}
+
+// Without a trusted per-instruction frame distance, measure [rbp - disp] against the prologue's.
+void AnalyzeFramePointerRedZoneConservatively(DecodedFunction& function, uintptr_t function_start) {
+	constexpr size_t   MaxPrologueInstructions = 16;
+	auto               cursor                  = function.instructions.find(function_start);
+	std::optional<s64> delta;
+	for (size_t count = 0; count < MaxPrologueInstructions && cursor != function.instructions.end();
+	     ++count) {
+		const auto& decoded = cursor->second;
+		if (const auto base = DecodeFramePointerBase(decoded)) {
+			delta = *base;
+		} else if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSH ||
+		           (decoded.changes_stack_pointer && decoded.stack_pointer_delta.has_value() &&
+		            *decoded.stack_pointer_delta < 0)) {
+			if (delta) {
+				*delta -= *decoded.stack_pointer_delta;
+			}
+		} else if (delta || decoded.changes_stack_pointer ||
+		           WritesRegister(decoded, ZYDIS_REGISTER_RBP) ||
+		           IsControlFlowTerminator(decoded.instruction) ||
+		           decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+			break;
+		}
+		const auto next = function.instructions.find(decoded.address + decoded.instruction.length);
+		cursor          = next;
+	}
+	if (!delta) {
+		return;
+	}
+	for (const auto& [address, decoded]: function.instructions) {
+		for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
+			const auto& operand = decoded.operands[index];
+			if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+			    operand.mem.base != ZYDIS_REGISTER_RBP || operand.mem.disp.size == 0 ||
+			    *delta + operand.mem.disp.value >= 0) {
+				continue;
+			}
+			function.uses_red_zone                            = true;
+			function.uses_frame_pointer_red_zone              = true;
+			function.uses_conservative_frame_pointer_red_zone = true;
+			function.requires_conservative_red_zone_tracking  = true;
+			break;
+		}
+		if (function.uses_conservative_frame_pointer_red_zone) {
+			break;
+		}
+	}
+	const bool frame_pointer_throughout =
+	    std::ranges::none_of(function.instructions, [](const auto& entry) {
+		    const auto& decoded = entry.second;
+		    return WritesRegister(decoded, ZYDIS_REGISTER_RBP) &&
+		           !DecodeFramePointerBase(decoded) &&
+		           decoded.instruction.mnemonic != ZYDIS_MNEMONIC_POP &&
+		           decoded.instruction.mnemonic != ZYDIS_MNEMONIC_LEAVE;
+	    });
+	if (function.uses_conservative_frame_pointer_red_zone && frame_pointer_throughout) {
+		// The guest stack never takes a GPU write-watch fault.
+		for (auto& [address, decoded]: function.instructions) {
+			if (OnlyFramePointerMemory(decoded)) {
+				decoded.accesses_memory = false;
+			}
+		}
+	}
+}
+
 void AnalyzeFramePointerRedZone(DecodedFunction& function, uintptr_t function_start) {
 	if (function.instructions.empty()) {
 		return;
@@ -657,6 +873,7 @@ void AnalyzeFramePointerRedZone(DecodedFunction& function, uintptr_t function_st
 	    std::ranges::any_of(function.branch_targets, [&function](uintptr_t target) {
 		    return !function.instructions.contains(target);
 	    })) {
+		AnalyzeFramePointerRedZoneConservatively(function, function_start);
 		return;
 	}
 
@@ -666,6 +883,7 @@ void AnalyzeFramePointerRedZone(DecodedFunction& function, uintptr_t function_st
 	}
 	const auto entry_state = states.find(function_start);
 	if (entry_state == states.end()) {
+		AnalyzeFramePointerRedZoneConservatively(function, function_start);
 		return;
 	}
 	// rbp still holds the caller's frame pointer on entry, so nothing is known about it yet.
@@ -700,6 +918,13 @@ void AnalyzeFramePointerRedZone(DecodedFunction& function, uintptr_t function_st
 			if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
 				reaches(next_address);
 				reaches(branch_target);
+			} else if (IsComputedBranch(decoded)) {
+				if (const auto table = function.jump_table_targets.find(address);
+				    table != function.jump_table_targets.end()) {
+					for (const uintptr_t target: table->second) {
+						reaches(target);
+					}
+				}
 			} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
 				reaches(branch_target);
 			} else if (!IsControlFlowTerminator(decoded.instruction)) {
@@ -709,6 +934,7 @@ void AnalyzeFramePointerRedZone(DecodedFunction& function, uintptr_t function_st
 	}
 
 	if (std::ranges::any_of(states, [](const auto& entry) { return !entry.second.has_value(); })) {
+		AnalyzeFramePointerRedZoneConservatively(function, function_start);
 		return;
 	}
 
@@ -716,6 +942,9 @@ void AnalyzeFramePointerRedZone(DecodedFunction& function, uintptr_t function_st
 		const FramePointerState& state = *states.at(address);
 		if (!state.known) {
 			continue;
+		}
+		if (OnlyFramePointerMemory(decoded)) {
+			decoded.accesses_memory = false;
 		}
 		for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
 			const auto& operand = decoded.operands[index];
@@ -811,6 +1040,13 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 			if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
 				add_successor(next_address);
 				add_successor(branch_target);
+			} else if (IsComputedBranch(decoded)) {
+				if (const auto table = function.jump_table_targets.find(decoded.address);
+				    table != function.jump_table_targets.end()) {
+					for (const uintptr_t target: table->second) {
+						add_successor(target);
+					}
+				}
 			} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
 				add_successor(branch_target);
 			} else if (!IsControlFlowTerminator(decoded.instruction)) {
@@ -978,6 +1214,10 @@ struct SegmentSweep {
 	    : boundaries(base, size), jump_targets(base, size), red_zone_candidates(base, size),
 	      indirect_jumps(base, size) {}
 };
+
+bool IsSweptInstructionStart(const SegmentSweep& sweep, uintptr_t address) {
+	return sweep.boundaries.Test(address);
+}
 
 bool MayAddressRedZone(const ZydisDecoderContext&     context,
                        const ZydisDecodedInstruction& instruction) {
@@ -1307,8 +1547,10 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
                                GuestInstructionPatchResult& result) {
 	const auto is_jump_target = [&function, sweep](uintptr_t address) {
 		return function.branch_targets.contains(address) ||
+		       function.possible_jump_targets.contains(address) ||
 		       (sweep != nullptr && sweep->jump_targets.Test(address));
 	};
+	const bool targets_known = !function.has_indirect_branch || function.indirect_targets_bounded;
 
 	struct RelocationSpan {
 		std::vector<const DecodedCodeInstruction*> instructions;
@@ -1482,7 +1724,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 		std::optional<RelocationSpan> selected_span;
 		std::optional<size_t>         trampoline_offset;
-		const auto&                   site_instruction       = function.instructions.at(site);
+		const auto&                   site_instruction = function.instructions.at(site);
+		const bool can_relocate_neighbors              = targets_known && !restrict_relocation;
 		if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
 			auto forward_span = collect_forward_span();
 			if (forward_span) {
@@ -1546,6 +1789,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 		const auto site_instruction = function.instructions.find(site);
 		ASSERT(site_instruction != function.instructions.end());
+		if (!targets_known || restrict_relocation ||
 		    site_instruction->second.instruction.length < ShortJumpSize) {
 			record_unsupported(site);
 			continue;
@@ -1902,6 +2146,8 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 					summary.has_indirect_branch = sweep->indirect_jumps.AnyInRange(start, end);
 					continue;
 				}
+				auto function = DecodeFunction(start, end, segment_addr, segment_end,
+				                               sweep ? &*sweep : nullptr);
 				if (analyze_red_zone) {
 					AnalyzeFramePointerRedZone(function, start);
 				}
@@ -1936,11 +2182,12 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		previous_unresolved_branch = restrict_relocation || summary.has_indirect_branch;
 
 		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
 		result.instruction_count += summary.instruction_count;
 		if (!summary.analyzed || (!summary.uses_red_zone && !emulate_amd)) {
 			continue;
 		}
+		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end,
+		                               sweep ? &*sweep : nullptr);
 		if (analyze_red_zone) {
 			AnalyzeFramePointerRedZone(function, function_start);
 			AnalyzeRedZoneLiveness(function);
@@ -1951,6 +2198,8 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		if (function.uses_red_zone) {
 			++result.red_zone_function_count;
 			result.frame_pointer_red_zone_function_count += function.uses_frame_pointer_red_zone;
+			result.conservative_frame_pointer_function_count +=
+			    function.uses_conservative_frame_pointer_red_zone;
 			result.indirect_red_zone_function_count += function.has_indirect_branch;
 		}
 		if (protect_memory) {

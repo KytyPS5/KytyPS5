@@ -35,17 +35,18 @@ struct InstructionPatchCounts {
 };
 
 struct GuestInstructionPatchResult {
-	uint64_t               function_count                           = 0;
-	uint64_t               instruction_count                        = 0;
-	uint64_t               red_zone_function_count                  = 0;
-	uint64_t               memory_instruction_count                 = 0;
-	uint64_t               short_memory_instruction_count           = 0;
-	uint64_t               patched_memory_instruction_count         = 0;
-	uint64_t               stack_dependent_memory_instruction_count = 0;
-	uint64_t               control_flow_memory_instruction_count    = 0;
-	uint64_t               unrelocatable_memory_instruction_count   = 0;
-	uint64_t               indirect_red_zone_function_count         = 0;
+	uint64_t               function_count                            = 0;
+	uint64_t               instruction_count                         = 0;
+	uint64_t               red_zone_function_count                   = 0;
+	uint64_t               memory_instruction_count                  = 0;
+	uint64_t               short_memory_instruction_count            = 0;
+	uint64_t               patched_memory_instruction_count          = 0;
+	uint64_t               stack_dependent_memory_instruction_count  = 0;
+	uint64_t               control_flow_memory_instruction_count     = 0;
+	uint64_t               unrelocatable_memory_instruction_count    = 0;
+	uint64_t               indirect_red_zone_function_count          = 0;
 	uint64_t               frame_pointer_red_zone_function_count     = 0;
+	uint64_t               conservative_frame_pointer_function_count = 0;
 	uint64_t               code_pointer_function_count               = 0;
 	uint64_t               padding_function_count                    = 0;
 	bool                   sweep_trusted                             = false;

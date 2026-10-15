@@ -414,6 +414,7 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			break;
 		case SDL_EVENT_WINDOW_MOUSE_LEAVE:
 			LOGF("Mouse left window %" PRIu32 "\n", window_event.windowID);
+			HostInputSetTouchPadMode(false);
 			break;
 		case SDL_EVENT_WINDOW_FOCUS_GAINED:
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);

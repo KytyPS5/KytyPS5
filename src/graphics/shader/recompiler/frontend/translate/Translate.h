@@ -29,6 +29,10 @@ struct TranslateOptions {
 	uint32_t                      user_data_count     = 64;
 	ShaderStageInputInfo          input_info;
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
+	// The program is a ray tracing kernel whose indirect calls were inlined (see ExpandIndirectCalls).
+	bool                          rt_call_kernel = false;
+	// Standalone analysis inherits caller state; supply inputs before SSA.
+	bool initialize_stage_inputs = true;
 };
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,

@@ -12163,8 +12163,8 @@ public:
     constexpr uint64_t allocation_size = 0x10000;
     struct FormatCase {
       Prospero::BufferFormat format;
-      std::array<uint16_t, 4> words;
-      std::array<std::array<uint32_t, 4>, 4> channels;
+      std::array<uint32_t, 4> words;
+      std::array<std::array<float, 4>, 4> channels;
       std::array<uint32_t, 4> maxima;
     };
     // Packed format channels start at the least significant bit.
@@ -12178,6 +12178,12 @@ public:
                    {0x000f, 0x00f0, 0x0f00, 0x4321},
                    {{{15, 0, 0, 0}, {0, 15, 0, 0}, {0, 0, 15, 0}, {1, 2, 3, 4}}},
                    {15, 15, 15, 15}},
+        FormatCase{Prospero::BufferFormat::k10_10_10_2Float,
+                   {0u, 1u | (448u << 10u) | (1023u << 20u) | (1u << 30u),
+                    64u | (63u << 10u) | (512u << 20u) | (2u << 30u), 0xffffffffu},
+                   {{{0.f, 0.f, 0.f, 0.f}, {1.f / 4096.f, 1.f, 508.f, 1.f / 3.f},
+                     {1.f / 64.f, 63.f / 4096.f, 2.f, 2.f / 3.f}, {508.f, 508.f, 508.f, 1.f}}},
+                   {1u, 1u, 1u, 1u}},
     };
     const auto argb = TextureGetComponentMapping(DstSel(5, 1, 7, 0),
                                                  Prospero::ColorMappingArgb);
@@ -12221,7 +12227,9 @@ public:
             "packed texture mapping failed");
     for (const auto &format : cases) {
       std::memset(mapped, 0, allocation_size);
-      std::memcpy(mapped, format.words.data(), sizeof(format.words));
+      const auto bytes = Prospero::NumBytesPerElement(format.format);
+      for (uint32_t pixel = 0; pixel < format.words.size(); ++pixel)
+        std::memcpy(static_cast<uint8_t*>(mapped) + pixel * bytes, &format.words[pixel], bytes);
       RenderContext context(m_runtime_context);
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
@@ -40500,6 +40508,35 @@ TestCase ImageStorePackedUintSaturatesChannels() {
   return test;
 }
 
+
+TestCase ImageStorePackedFloatUsesFiniteRange() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ImageStorePackedFloatUsesFiniteRange";
+  const std::array<std::array<float, 4>, 2> values{{
+      {1.f / 4096.f, 508.f, -1.f, 2.f / 3.f},
+      {1000.f, 0.f, 63.f / 4096.f, 1.5f}}};
+  for (uint32_t pixel = 0; pixel < values.size(); ++pixel) {
+    AppendVMovU32(&test.code, 20, pixel);
+    AppendVMovU32(&test.code, 21, 0);
+    for (uint32_t channel = 0; channel < 4u; ++channel)
+      AppendVMovLiteral(&test.code, channel, std::bit_cast<uint32_t>(values[pixel][channel]));
+    test.code.push_back(EncodeMimg0(0x08, 0xf));
+    test.code.push_back(EncodeMimg1(0, 20));
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k10_10_10_2Float);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(4, 5, 6, 7);
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui[0] = 1u | (1023u << 10u) | (2u << 30u);
+  test.expected_storage_image_r32ui[1] = 1023u | (63u << 20u) | (3u << 30u);
+  test.required_spirv = {"OpConvertFToU", "OpFOrdGreaterThanEqual"};
+  return test;
+}
+
 TestCase ImageStorePackedUintHonorsSparseDmask() {
   using O = ShaderOpcode;
 
@@ -42326,6 +42363,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreR32SintUsesRawUintView);
   AddCase(ImageStoreR32UintUsesFormatlessStorageImage);
   AddCase(ImageStorePackedUintSaturatesChannels);
+  AddCase(ImageStorePackedFloatUsesFiniteRange);
   AddCase(ImageStorePackedUintHonorsSparseDmask);
   AddCase(ImageStorePackedUnorm<false>);
   AddCase(ImageStorePackedUnorm<true>);
@@ -47981,6 +48019,7 @@ int main(int argc, char **argv) {
     vulkan.CheckPackedTextureComponents();
     CheckSigned16ImageStore(vulkan);
     vulkan.CheckBgra16Readback();
+    RunCase(&vulkan, ImageStorePackedFloatUsesFiniteRange());
     RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
     RunCase(&vulkan, ImageLoadPackedUnorm<false, false>());
     RunCase(&vulkan, ImageLoadPackedUnorm<false, true>());

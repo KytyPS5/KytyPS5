@@ -13,6 +13,9 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include <chrono>
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
@@ -15881,6 +15884,66 @@ void TestSpirvRepeatedEmission() {
   compute.host_subgroup_size = 32;
   Check(Spirv::EmitProgram(compiled.program, options.input_info) == split,
         "split-wave re-emission retained native-wave definitions");
+
+  // Shared RT bounds helpers take SPIR-V value IDs for access widths, not literal byte counts.
+  compiled.program.rt_plain_formatted_indirect = true;
+  const auto bounds = Spirv::EmitProgram(compiled.program, options.input_info);
+  CheckSpirvBinaryValidates(bounds);
+  Check(DisassembleSpirvBinary(bounds).find("indirect_buffer_dword_in_bounds") != std::string::npos,
+        "RT bounds regression fixture did not emit the shared helper");
+}
+
+void TestRtLoopWatchdogReturn() {
+  using namespace ShaderRecompiler;
+  Config::ConfigOptions rt_options;
+  rt_options.printf_direction = Config::LogDirection::Silent;
+  rt_options.raytracing_enabled = true;
+  Config::Load(rt_options);
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32;
+  for (uint32_t i = 0; i < 5; ++i) {
+    program.block_storage.push_back(std::make_unique<IR::Block>());
+    program.blocks.push_back(program.block_storage.back().get());
+    program.blocks.back()->id = i;
+  }
+  auto* entry = program.blocks[0];
+  auto* header = program.blocks[1];
+  auto* body = program.blocks[2];
+  auto* latch = program.blocks[3];
+  auto* merge = program.blocks[4];
+  entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+  entry->AddBranch(header);
+  header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = body,
+                       .merge_block = merge, .continue_block = latch, .loop_header = true};
+  header->AddBranch(body);
+  auto& value = body->AppendNewInst(IR::ValueOpcode::IAdd32, {IR::Value(1u), IR::Value(2u)});
+  body->condition = IR::Value(true);
+  body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                      .true_block = latch, .false_block = merge};
+  body->AddBranch(latch);
+  body->AddBranch(merge);
+  latch->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+  latch->AddBranch(header);
+  merge->AppendNewInst(IR::ValueOpcode::ReferenceU32, {IR::Value(&value)});
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.info.uses_dma = true;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 32;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.wave_size = 32;
+  compute.host_subgroup_size = 32;
+  ShaderStageInputInfo input;
+  input.compute = &compute;
+  IR::CollectShaderInfo(program, input);
+  const auto spirv = Spirv::EmitProgram(program, input);
+  CheckSpirvBinaryValidates(spirv);
+  Check(MeasureSpirv(spirv).phis >= 1u,
+        "watchdog fixture did not emit its iteration counter");
+  Config::ConfigOptions defaults;
+  defaults.printf_direction = Config::LogDirection::Silent;
+  Config::Load(defaults);
 }
 
 void TestSpirvConditionVotes() {
@@ -16282,6 +16345,7 @@ int main() {
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();
+  TestRtLoopWatchdogReturn();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();

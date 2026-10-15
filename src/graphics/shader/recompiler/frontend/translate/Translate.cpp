@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
 
@@ -738,10 +739,24 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
                                     IR::Block& info) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		IR::U1 condition;
+		// Scalar branches are wavefront-uniform on hardware: SCC is a single bit computed as
+		// "result mask != 0", i.e. a subgroup-any over the lanes. Emitting the branch on the
+		// per-lane SCC value instead diverges the wavefront, after which every subgroup op that
+		// needs convergence (V_READFIRSTLANE ballots/shuffles in waterfall loops) reads garbage.
+		// VCC/EXEC branches stay divergent on purpose: memory ops are not exec-predicated, so the
+		// diverge+phi pattern is load-bearing there. SCC feeds no memory addressing, and every
+		// in-shader SCC producer is either uniform already (SALU: any() is the identity) or a
+		// per-lane remain-mask (S_ANDN2 waterfall guards: any() is exactly the hardware meaning).
+		const auto subgroup_any = [&](IR::U1 bit) {
+			// Only ray tracing call-table kernels need the waterfall convergence workaround.
+			if (!program.gpu_selected_call_payloads) return bit;
+			const auto mask = BallotMask(bit);
+			return ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u)));
+		};
 		switch (kind) {
 			case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
-			case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
-			case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
+			case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(subgroup_any(ir.GetScc())); break;
+			case CFG::BranchCondition::SccNonZero: condition = subgroup_any(ir.GetScc()); break;
 			case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
 			case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
 			case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
@@ -1025,6 +1040,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
+	result.gpu_selected_call_payloads = options.rt_call_kernel;
 	switch (options.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Local:
@@ -1126,8 +1142,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			block.AddBranch(target->second);
 		}
 	}
-	{
-		entry.AddBranch(entry.terminator.true_block);
+	entry.AddBranch(entry.terminator.true_block);
+	// A standalone function inherits the caller's state: its entry block is left empty for the caller-state bridge.
+	if (options.initialize_stage_inputs) {
 		IR::IREmitter entry_ir(&entry);
 		const auto    builtin = [&](IR::StageInputKind kind, uint32_t component = 0u) {
 			return IR::U32(

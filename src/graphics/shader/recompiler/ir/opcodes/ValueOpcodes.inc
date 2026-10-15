@@ -351,6 +351,8 @@ VALUE_OPCODE(ControlNop, Void)
 VALUE_OPCODE(StoreCompletion, Void)
 VALUE_OPCODE(Barrier, Void)
 VALUE_OPCODE(Sendmsg, Void)
+// RtFeedback.h: store 1 to usage[slot][byte offset >> 2] in the host-visible feedback buffer when the lane is active.
+VALUE_OPCODE(RtFeedbackLog, Void, U32, U32, U1)
 VALUE_OPCODE(TtraceData, Void)
 VALUE_OPCODE(InstPrefetch, Void)
 VALUE_OPCODE(SelectU32, U32, U1, U32, U32)

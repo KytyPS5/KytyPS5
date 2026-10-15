@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/RtFeedback.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
@@ -647,6 +648,16 @@ void Translator::FLAT_STORE(const Decoder::Instruction& inst) {
 	}
 }
 
+void Translator::RtRecordLog(const Decoder::Instruction& inst) {
+	const uint32_t slot = inst.src0.value & ~RtFeedback::LogMask;
+	// The register holds the record's byte offset in the 16-byte table (index << 4); the flag is a dword.
+	const auto record_offset = ReadU32(inst.src1);
+	const auto flag_offset   = ir.Emit(IR::ValueOpcode::BitwiseAnd32,
+	                                   {ir.Emit(IR::ValueOpcode::ShiftRightLogical32, {record_offset, IR::Value(2u)}),
+	                                    IR::Value(RtFeedback::RegionDwords * 4u - 4u)});
+	ir.Emit(IR::ValueOpcode::RtFeedbackLog, {IR::Value(slot), flag_offset, ir.GetExec()});
+}
+
 void Translator::IMAGE_GET_RESINFO(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
@@ -1034,6 +1045,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMax32);
 		case Decoder::Opcode::BUFFER_ATOMIC_AND:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicAnd32);
+		case Decoder::Opcode::BUFFER_ATOMIC_ADD_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd64);
 		case Decoder::Opcode::BUFFER_ATOMIC_AND_X2:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicAnd64);
 		case Decoder::Opcode::BUFFER_ATOMIC_OR:
@@ -1045,8 +1058,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_ATOMIC_FMIN:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicFMin32);
 		case Decoder::Opcode::BUFFER_ATOMIC_FMAX:
-		case Decoder::Opcode::BUFFER_ATOMIC_ADD_X2:
-			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd64);
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicFMax32);
 
 		case Decoder::Opcode::DS_ADD_U32:

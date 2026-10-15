@@ -233,6 +233,8 @@ private:
 	void S_WAITCNT_VSCNT(const Decoder::Instruction& inst);
 	void S_BARRIER();
 	void S_SENDMSG(const Decoder::Instruction& inst);
+	// A call-table record the ray tracing kernel did not inline: store 1 to its usage flag (RtFeedback.h).
+	void RtRecordLog(const Decoder::Instruction& inst);
 	void S_TTRACEDATA();
 	void S_INST_PREFETCH();
 	void S_GETPC_B64(const Decoder::Instruction& inst);

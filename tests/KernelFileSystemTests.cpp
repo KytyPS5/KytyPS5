@@ -399,6 +399,27 @@ void TestTruncate(const std::filesystem::path &root) {
                                std::filesystem::perm_options::replace);
 }
 
+void TestFdatasync() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto *fsync_symbol = symbols.FindByNid("fTx66l5iWIA", Loader::SymbolType::Func);
+  const auto *fdatasync_symbol = symbols.FindByNid("30Rh4ixbKy4", Loader::SymbolType::Func);
+  Check(fsync_symbol != nullptr && fdatasync_symbol != nullptr,
+        "sceKernelFsync and sceKernelFdatasync resolve");
+  Check(fdatasync_symbol->vaddr == fsync_symbol->vaddr,
+        "sceKernelFdatasync shares the sceKernelFsync handler");
+  using Fdatasync = int (KYTY_SYSV_ABI *)(int);
+  const auto fdatasync = reinterpret_cast<Fdatasync>(fdatasync_symbol->vaddr);
+
+  constexpr char Path[] = "/savedata0/fdatasync.dat";
+  constexpr char Payload[] = "index";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload)) == sizeof(Payload),
+        "write the fdatasync fixture");
+  Check(fdatasync(fd) == OK, "sceKernelFdatasync of a written file");
+  Check(FileSystem::KernelClose(fd) == OK, "close the fdatasync fixture");
+}
+
 void TestAioBatches() {
   namespace Kernel = Libs::LibKernel;
   Loader::SymbolDatabase symbols;
@@ -1977,6 +1998,7 @@ int main(int, char**) {
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestTruncate(temporary.Path());
+  TestFdatasync();
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

@@ -18,10 +18,10 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 namespace {
 
-// Nothing is ever mapped in the first 64 KiB, on the guest or on the host, so an ordinary read
-// there comes from a null table pointer. The walker reaches such reads when it follows both sides
-// of a branch it cannot decide, so read zero there instead of faulting the host.
-constexpr uint64_t NULL_PAGE_END = 0x10000;
+// Guest memory starts at HOST_SYSTEM_MANAGED_MIN (memoryAddressSpace.inc), so a table pointer or an
+// ordinary read below it comes from a null table pointer. The walker reaches such reads when it
+// follows both sides of a branch it cannot decide, so read zero there instead of faulting the host.
+constexpr uint64_t GUEST_MEMORY_MIN = 0x40000;
 
 } // namespace
 
@@ -47,7 +47,7 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
-	} else if (address < NULL_PAGE_END) {
+	} else if (address < GUEST_MEMORY_MIN) {
 		std::ranges::fill(values, 0u);
 		return true;
 	} else {
@@ -460,12 +460,10 @@ void CompileSrtWalker(ResourcePlan& program) {
 		code.and_(code.rdi, code.r9);
 		const auto first = reads.begin()->first;
 		const auto last = reads.rbegin()->first;
-		// Underflowing and null-page tables fall back to the interpreted walk.
-		if (const auto lowest = static_cast<int64_t>(NULL_PAGE_END) - first; lowest > 0) {
-			code.mov(code.r10, lowest);
-			code.cmp(code.rdi, code.r10);
-			code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
-		}
+		// Tables below guest memory and underflowing reads fall back to the interpreted walk.
+		code.mov(code.r10, GUEST_MEMORY_MIN + static_cast<uint64_t>(-std::min<int64_t>(first, 0)));
+		code.cmp(code.rdi, code.r10);
+		code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
 		if (last > 0) {
 			code.mov(code.r10, AddressMask - last);
 			code.cmp(code.rdi, code.r10);
@@ -704,7 +702,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		if (address >= NULL_PAGE_END) {
+		if (base >= GUEST_MEMORY_MIN && address >= GUEST_MEMORY_MIN) {
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 	}

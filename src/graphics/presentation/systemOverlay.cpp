@@ -1199,7 +1199,7 @@ struct SystemOverlay::Impl {
 			ImGui::UnregisterUserTexture(texture.get());
 			return true;
 		});
-		constexpr float TOAST_LIFETIME = 5.0f;
+		const float TOAST_LIFETIME = static_cast<float>(Config::GetTrophyDurationSeconds());
 		if (trophy_notification &&
 		    std::chrono::duration<float>(now - trophy_notification_born).count() >=
 		        TOAST_LIFETIME) {

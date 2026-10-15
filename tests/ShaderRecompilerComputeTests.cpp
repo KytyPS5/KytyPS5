@@ -42712,6 +42712,10 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
     std::string assembly;
     Require(name, "disassembly", tools.Disassemble(result.spirv, &assembly),
             "failed to disassemble tessellation shader");
+    // Every ring access in these programs sits at a fixed offset inside its record, so the
+    // attribute and component must be static (RADV drops patch outputs after dynamic ones).
+    Require(name, "static record offsets", assembly.find("OpUMod") == std::string::npos,
+            "ring accesses at stride * control point + constant must use static attributes");
     Require(name, "native local inputs",
             stage != 0 || (assembly.find("VertexIndex") != std::string::npos &&
                            assembly.find("InstanceIndex") != std::string::npos),

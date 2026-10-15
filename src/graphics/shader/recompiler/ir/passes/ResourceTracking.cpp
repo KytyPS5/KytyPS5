@@ -145,9 +145,10 @@ public:
 		for (uint32_t incoming = 0; incoming < m_induction.NumArgs(); ++incoming) {
 			m_incoming = m_induction.PhiBlock(incoming);
 			m_values[1].clear();
-			if (Evaluate(condition, true) != (positive ? 0u : 1u)) return false;
+			const auto result = Evaluate(condition, true);
+			if (m_exhausted || result != (positive ? 0u : 1u)) return false;
 		}
-		return true;
+		return !m_exhausted;
 	}
 
 	bool SelectsRange(const Inst& selected, Value active, const Inst& candidate,
@@ -163,6 +164,8 @@ public:
 			return value;
 		};
 		const auto contains = [&](const auto& self, uint32_t node) -> uint32_t {
+			ProofStep step(*this);
+			if (!step) return 0u;
 			if (std::ranges::find(range_values, node) != range_values.end()) return 1u;
 			const auto entry = m_nodes[node];
 			if (entry.variable == UINT32_MAX) return 0u;
@@ -199,10 +202,30 @@ public:
 			allowed = Select(allowed, Evaluate(active, true), 0u);
 			if (Select(allowed, contains(contains, value), 1u) != 1u) return false;
 		}
-		return true;
+		return !m_exhausted;
 	}
 
 private:
+	// Shader expressions and decision diagrams can both be arbitrarily deep.
+	// Bound their shared recursion and total work, and reject the entire proof on
+	// exhaustion: a placeholder result must never establish a loop bound.
+	class ProofStep {
+	public:
+		explicit ProofStep(LoopBoundProof& proof): m_proof(proof) {
+			++m_proof.m_depth;
+			if (m_proof.m_depth > 128u || ++m_proof.m_steps > 65536u ||
+			    m_proof.m_nodes.size() > 16384u)
+				m_proof.m_exhausted = true;
+		}
+		~ProofStep() { --m_proof.m_depth; }
+		explicit operator bool() const { return !m_proof.m_exhausted; }
+		ProofStep(const ProofStep&)            = delete;
+		ProofStep& operator=(const ProofStep&) = delete;
+
+	private:
+		LoopBoundProof& m_proof;
+	};
+
 	struct Node {
 		uint32_t variable = UINT32_MAX;
 		uint32_t low = 0;
@@ -224,6 +247,8 @@ private:
 	}
 
 	uint32_t Select(uint32_t condition, uint32_t yes, uint32_t no) {
+		ProofStep step(*this);
+		if (!step) return 0u;
 		if (condition == 0u) return no;
 		if (condition == 1u || yes == no) return yes;
 		if (yes == 1u && no == 0u) return condition;
@@ -243,6 +268,8 @@ private:
 	}
 
 	uint32_t Compare(const Inst& inst, uint32_t left, uint32_t right) {
+		ProofStep step(*this);
+		if (!step) return 0u;
 		if (left == right) {
 			if (inst.GetOpcode() == ValueOpcode::IEqual32) return 1u;
 			if (inst.GetOpcode() == ValueOpcode::INotEqual32) return 0u;
@@ -267,6 +294,8 @@ private:
 	}
 
 	uint32_t Evaluate(Value value, bool current) {
+		ProofStep step(*this);
+		if (!step) return 0u;
 		value = value.Resolve();
 		if (value.IsImmediate()) {
 			if (value.GetType() == Type::U1) return value.U1() ? 1u : 0u;
@@ -344,6 +373,11 @@ private:
 	const Inst& m_bound;
 	const Block* m_incoming = nullptr;
 	uint32_t m_variables = 0;
+
+	uint32_t m_depth     = 0;
+	uint32_t m_steps     = 0;
+	bool     m_exhausted = false;
+
 	bool m_exclude_bound = true;
 	std::vector<Node> m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>> m_literals;

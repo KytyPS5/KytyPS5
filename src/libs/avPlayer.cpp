@@ -998,8 +998,11 @@ public:
 		if (previous_video) {
 			video_buffers.Push(std::move(previous_video));
 		}
-		if (current_video) {
+		// With only two buffers, holding one would leave the decoder none: return it at once.
+		if (current_video && max_video_buffers > 2) {
 			previous_video = std::move(current_video->buffer);
+		} else if (current_video) {
+			video_buffers.Push(std::move(current_video->buffer));
 		}
 		current_video = std::move(*frame);
 		*out          = current_video->info;

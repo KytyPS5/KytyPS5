@@ -82,6 +82,18 @@ struct MemoryInfo {
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
 
+	// Whether a load can be served without a bound descriptor, by re-deriving base, stride, swizzle
+	// and bounds from the V# dwords on the GPU (spirvEmitterMemory.cpp LoadIndirectBuffer). A
+	// "formatted" access with neither a data format nor a number format is a plain DWORD fetch, so the
+	// raw path is exact for it too; anything with a real format is not. The inlined hit functions of
+	// PPSA24156 read descriptors this way (LoadBufferU32, formatted, dfmt = nfmt = 0).
+	// Raw dword stores through a GPU-selected descriptor (the same address and bounds rules as the loads).
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !typed && !formatted && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
@@ -499,6 +511,7 @@ struct ShaderInfo {
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
+	std::vector<uint8_t>             live_buffer_flags;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;
@@ -572,6 +585,17 @@ struct DescriptorSource {
 		uint32_t table_record_bytes = 0;
 		bool     table_scalar = false;
 		bool     indexed = false;
+		// The table records hold a 64-bit pointer (at table_offset) to the descriptor instead of the
+		// descriptor itself: the descriptor is hop_descriptor_offset bytes into what it points at.
+		bool     pointer_hop = false;
+		uint32_t hop_descriptor_offset = 0;
+        // Additional constant-offset pointer dereferences, in root-to-leaf order.
+        std::vector<uint32_t> pointer_path_offsets;
+		// The table is an unbounded scalar address (no V# size): the host reads records until one is unreadable or null.
+		bool     pointer_probe = false;
+		// A sampler behind the pointer is only meaningful for records whose image (this many bytes into the
+		// same pointer) is a valid descriptor.
+		uint32_t companion_offset = UINT32_MAX;
 		bool     signed_count = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		Value    key_count;
@@ -615,6 +639,8 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	// A ray tracing kernel whose call table was inlined: its pipeline can take the driver minutes to hours.
+	bool                          rt_expanded_calls   = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 };
@@ -665,6 +691,16 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
+	// The four descriptor dwords of every IMAGE_BVH_INTERSECT_RAY, kept so the host
+	// can evaluate them: the pool base and size are assembled from a loop-carried value
+	// and are otherwise only known to the GPU (PPSA24156).
+	// --raytracing (PPSA24156): a GPU-selected formatted MUBUF load of two to four dwords with no data or
+	// number format in the instruction is served as raw dwords from the V# (the hit functions read
+	// 32-bit-per-component records this way). Off elsewhere: the format lives in the descriptor.
+	bool                                rt_plain_formatted_indirect = false;
+	// Inlined GPU-selected calls may leave inactive payload pointers invalid.
+	// Only descriptor dependencies are evaluated on the host in these programs.
+	bool                                gpu_selected_call_payloads = false;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

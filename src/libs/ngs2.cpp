@@ -28,6 +28,8 @@ namespace Ngs2 {
 
 LIB_NAME("Ngs2", "Ngs2");
 
+constexpr int32_t NGS2_ERROR_INVALID_SYSTEM_HANDLE =
+    static_cast<int32_t>(0x804a0230u);
 constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
     static_cast<int32_t>(0x804a8010u);
 constexpr int32_t NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS =
@@ -2630,6 +2632,17 @@ int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state
 	Common::LockGuard lock(voice->rack->ngs->mutex);
 
 	*state_flags = Ngs2GetStateFlags(voice);
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle) {
+	PRINT_NAME();
+
+	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	if (ngs == nullptr) return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+
+	ngs->mutex.Lock();
 
 	return OK;
 }

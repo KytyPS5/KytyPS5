@@ -296,6 +296,7 @@ inline constexpr auto EmitBufferAtomicSMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicUMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicAnd32     = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicAnd64     = EmitBufferAtomic64;
+inline constexpr auto EmitBufferAtomicIAdd64    = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicOr32      = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicOr64      = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicXor32     = EmitAtomic32;

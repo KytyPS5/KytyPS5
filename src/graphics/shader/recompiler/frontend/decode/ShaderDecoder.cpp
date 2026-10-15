@@ -670,6 +670,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_CMPSWAP:
 		case Opcode::BUFFER_ATOMIC_SWAP_X2:
 		case Opcode::BUFFER_ATOMIC_ADD:
+		case Opcode::BUFFER_ATOMIC_ADD_X2:
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
 		case Opcode::BUFFER_ATOMIC_UMIN:

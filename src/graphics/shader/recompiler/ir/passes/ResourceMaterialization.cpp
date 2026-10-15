@@ -1,6 +1,8 @@
+#include <chrono>
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -10,15 +12,20 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <string_view>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+// --raytracing pads every GPU-selected candidate list to this many entries.
+constexpr uint32_t RtPaddedCandidates     = 64u;
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -237,6 +244,24 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
 	return ReadTable(base & AddressMask & ~uint64_t {3}, size, offset & ~uint64_t {3}, runtime, words);
 }
 
+// Follow only the pointer chain proven by the resource tracker. Addresses are
+// refreshed through the strict specialization reader; no GPU argument is guessed.
+bool ReadPointerPath(const DescriptorSource::IndirectDescriptor& indirect,
+                     uint64_t table_base, uint64_t table_size, uint64_t table_offset,
+                     const SrtRuntime& runtime, uint64_t& target) {
+    if (indirect.pointer_path_offsets.size() > 8u) return false;
+    uint32_t pointer[2]{};
+    if (!ReadScalarTable(table_base, table_size, table_offset, runtime, pointer)) return false;
+    target = pointer[0] | (static_cast<uint64_t>(pointer[1]) << 32u);
+    for (const auto offset : indirect.pointer_path_offsets) {
+        if (target == 0u) return true;
+        if ((offset & 3u) != 0u ||
+            !ReadScalarTable(target & AddressMask, UINT64_MAX, offset, runtime, pointer)) return false;
+        target = pointer[0] | (static_cast<uint64_t>(pointer[1]) << 32u);
+    }
+    return true;
+}
+
 bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
@@ -292,7 +317,7 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 bool IsBoundedDescriptorTable(const ResourcePlan& program,
                               const DescriptorSource::IndirectDescriptor& indirect) {
 	const auto* table = Source(program, indirect.table_source);
-	return indirect.sources.empty() && !indirect.selector &&
+	return indirect.sources.empty() && !indirect.selector && !indirect.pointer_hop &&
 	       (indirect.key_count.IsEmpty() || indirect.table_maximum) && indirect.workgroup_axis == UINT32_MAX &&
 	       table != nullptr && table->dword_count == 4u;
 }
@@ -516,6 +541,58 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 	return true;
 }
 
+// The sampler behind a record pointer. One sampler object serves the whole kernel, so the candidates the table's
+// records point at must agree: the first non-null S# is used, and a table whose records disagree is reported once.
+bool MaterializeHopSampler(const DescriptorSource::IndirectDescriptor& indirect, const SrtRuntime& runtime,
+                           SrtWalker& clean, DescriptorValue& result) {
+	DescriptorValue table_value;
+	uint32_t        count = 0;
+	if (indirect.key_count.IsEmpty() || !clean.EvaluateDescriptor(indirect.table_source, table_value) ||
+	    table_value.dword_count != 2u || !clean.Evaluate(indirect.key_count, count) ||
+	    count > MaxIndirectDescriptorProbes) {
+		return false;
+	}
+	const auto table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
+	result = {.dword_count = 4u};
+	bool     found    = false;
+	uint32_t distinct = 0;
+	for (uint32_t key = 0; key < count; ++key) {
+        const uint64_t at = uint64_t {key} * indirect.table_stride + indirect.table_offset;
+        uint64_t target = 0;
+        if (!ReadPointerPath(indirect, table_base, UINT64_MAX, at, runtime, target)) continue;
+		if (target == 0u) continue;
+		DescriptorValue candidate {.dword_count = 4u};
+		if (!ReadScalarTable(target & AddressMask, UINT64_MAX, indirect.hop_descriptor_offset, runtime,
+		                     std::span(candidate.dwords).first(4u)))
+			continue;
+		if (candidate.dwords[0] == 0u && candidate.dwords[1] == 0u && candidate.dwords[2] == 0u &&
+		    candidate.dwords[3] == 0u)
+			continue;
+		if (indirect.companion_offset != UINT32_MAX) {
+			DescriptorValue image {.dword_count = 8u};
+			if (!ReadScalarTable(target & AddressMask, UINT64_MAX, indirect.companion_offset, runtime,
+			                     std::span(image.dwords).first(8u)) ||
+			    NullImageDescriptor(image) || !ValidImageDescriptor(image, false))
+				continue;
+		}
+		if (!found) {
+			result   = candidate;
+			found    = true;
+			distinct = 1u;
+		} else if (!(candidate == result)) {
+			++distinct;
+		}
+	}
+	if (distinct > 1u) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			std::fprintf(stderr, "RT calls: the records of the call table point at %u different samplers; the first is used\n", distinct);
+		}
+	}
+	return true;
+}
+
 template <typename Specialization, typename Normalize>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    uint32_t source_index,
@@ -701,7 +778,35 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (selector == nullptr) {
 			uint32_t key_count = 0;
 			uint32_t first_key = 0;
-			if (!EvaluateIndirectCount(indirect, runtime, clean, key_count)) return false;
+			if (indirect.pointer_hop) {
+				// One record per key; the buffer descriptor bounds the table.
+				if (indirect.table_stride == 0u) return false;
+				if (table_size == UINT64_MAX && !indirect.key_count.IsEmpty()) {
+					uint32_t records = 0;
+					if (!clean.Evaluate(indirect.key_count, records) || records == 0u ||
+					    records > MaxIndirectDescriptorProbes) return false;
+					key_count = records;
+				} else if (table_size == UINT64_MAX) {
+					// A scalar address has no bound: take records while their pointer reads back non-null.
+					if (!indirect.pointer_probe) return false;
+					uint32_t records = 0;
+					for (; records < 4096u; ++records) {
+						// A record starts with its function address; the pointer may legitimately be null.
+						uint32_t target[2] {};
+						const uint64_t at = uint64_t {records} * indirect.table_stride;
+						if (!ReadScalarTable(table_base, table_size, at, runtime, target) ||
+						    (target[0] | target[1]) == 0u) break;
+					}
+					if (records == 0u) return false;
+					key_count = records;
+				} else {
+					const uint64_t records = table_size / indirect.table_stride;
+					if (records == 0u || records > MaxIndirectDescriptorProbes) return false;
+					key_count = static_cast<uint32_t>(records);
+				}
+			} else if (!EvaluateIndirectCount(indirect, runtime, clean, key_count)) {
+				return false;
+			}
 			if (!indirect.selector_first.IsEmpty() && !clean.Evaluate(indirect.selector_first, first_key))
 				return false;
 			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
@@ -736,7 +841,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (sources.empty()) {
 			table_offset = uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
 			               (indirect.table_immediate & ~3u);
-			if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
+			if (indirect.pointer_hop) {
+				// The record points at the descriptor. A null or unreadable pointer is an unused record: its
+				// descriptor stays zero and normalization rejects it.
+                uint64_t target = 0;
+                if (!ReadPointerPath(indirect, table_base, table_size, table_offset, runtime, target)) return false;
+				if (target != 0u) {
+					ReadScalarTable(target & AddressMask, UINT64_MAX, indirect.hop_descriptor_offset, runtime,
+					                std::span(candidate.dwords).first(read_dwords));
+				}
+			} else if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 			                     std::span(candidate.dwords).first(read_dwords))) {
 				return read_failed("table descriptor read", key, 0u, table_base, table_offset, descriptor_bytes);
 			}
@@ -754,13 +868,34 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = key;
 		snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = ordinal;
 	}
+	// A ray tracing call-table kernel: pad the candidate list of a GPU-selected table with null descriptors to a
+	// fixed count, so the specialization (and the program built from it) does not change with the table's contents.
+	const uint32_t pad_candidates = program.gpu_selected_call_payloads ? RtPaddedCandidates : 0u;
+	// The key table is padded too (to PaddedKeys entries, sentinel keys sort last and select the root), so the search
+	// depth and every later mapping offset stay the same whatever the table holds.
+	constexpr uint32_t PaddedKeys = 1024u;
+	const bool pad = pad_candidates != 0u && key_count <= PaddedKeys && sources.empty();
+	if (pad) {
+		while (descriptors.size() - children_begin + 1u < pad_candidates && descriptors.size() < maximum_resources) {
+			descriptors.push_back(DescriptorValue {.dword_count = dword_count});
+			auto child = root_resource;
+			child.indirect_root = resource_index;
+			specializations.push_back(child);
+		}
+		snapshot.flattened_srt.resize(mapping_offset + 1u + PaddedKeys * 2u, 0u);
+		for (uint32_t entry = static_cast<uint32_t>(key_count); entry < PaddedKeys; ++entry) {
+			snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = 0xffffffffu;
+			snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = 0u;
+		}
+		snapshot.flattened_srt[mapping_offset] = PaddedKeys;
+	}
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(key_count);
+		root.indirect_search_iterations = std::bit_width(pad ? PaddedKeys : static_cast<uint32_t>(key_count));
 	}
 	return true;
 }
@@ -772,8 +907,8 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::array<std::array<uint32_t, 2>, ShaderInfo::MaxSamplers> mapping;
-	std::array<Binding, ShaderInfo::MaxSamplers>                bindings;
+	std::vector<std::array<uint32_t, 2>> mapping;
+	std::vector<Binding>                bindings;
 	uint32_t                                                  sampler_count = 0;
 };
 
@@ -830,6 +965,23 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (base.resource_class == ImageResourceClass::None ||
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
+		}
+		// An FMASK descriptor in a GPU-selected table is another material's multisample metadata, never what a sampled
+		// or loaded site of this table reads: bind it as null like the other unusable candidates.
+		if (image.indirect_root != ImageResource::NoIndirectImage && !NullImageDescriptor(snapshot.images[i]) &&
+		    base.resource_class != ImageResourceClass::Storage &&
+		    Prospero::IsFmaskTextureFormat(static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu))) {
+			snapshot.images[i] = DescriptorValue {.dword_count = snapshot.images[i].dword_count};
+		}
+		// A format the host cannot sample in one candidate of a GPU-selected table must not fail the whole table.
+		if (program.gpu_selected_call_payloads && i >= program.info.images.size() && !NullImageDescriptor(snapshot.images[i]) &&
+		    base.resource_class != ImageResourceClass::Storage &&
+		    (Prospero::SampledTextureNumericClass(static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu)) ==
+		         Prospero::TextureNumericClass::Unsupported ||
+		     (base.depth_compare &&
+		      Prospero::SampledTextureNumericClass(static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu)) !=
+		          Prospero::TextureNumericClass::Float))) {
+			snapshot.images[i] = DescriptorValue {.dword_count = snapshot.images[i].dword_count};
 		}
 		image.mip_count = ImageMipCount(base, descriptor);
 		if (NullImageDescriptor(descriptor)) {
@@ -961,10 +1113,50 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				exemplar = resource;
 			}
 		}
-		if (resource_count < 2u || exemplar == ImageResource::NoIndirectImage) {
+		{
+			// The sample instruction fixes the dimension (and so the coordinates) the site uses: take the class
+			// the most candidates of that dimension share, rather than whichever candidate happens first.
+			const auto site_dimension = program.info.images[root_index].dimension;
+			uint32_t best_votes = 0;
+			for (uint32_t a = 0; a < specialization.images.size(); a++) {
+				const auto& ia = specialization.images[a];
+				if (ia.indirect_root != root_index || NullImageDescriptor(snapshot.images[a]) ||
+				    ia.dimension != site_dimension) {
+					continue;
+				}
+				uint32_t votes = 0;
+				for (uint32_t b = 0; b < specialization.images.size(); b++) {
+					const auto& ib = specialization.images[b];
+					if (ib.indirect_root == root_index && !NullImageDescriptor(snapshot.images[b]) &&
+					    ib.dimension == ia.dimension && ib.cube == ia.cube &&
+					    ib.numeric_class == ia.numeric_class && ib.mip_count == ia.mip_count)
+						++votes;
+				}
+				if (votes > best_votes) {
+					best_votes = votes;
+					exemplar   = a;
+				}
+			}
+		}
+		// With padded candidate lists (call-table kernels) the class of a table comes from the sampling instruction
+		// itself, not from whichever textures this dispatch's records name, so it is the same in every dispatch; a
+		// candidate of another class is bound as null below.
+		const bool padded = program.gpu_selected_call_payloads;
+		ResourceSpecialization::Image site_class;
+		if (padded) {
+			const auto& site = program.info.images[root_index];
+			site_class                   = specialization.images[root_index];
+			site_class.numeric_class     = site.atomic ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float;
+			site_class.dimension         = site.dimension == Decoder::ImageDimension::Unknown ? Decoder::ImageDimension::Dim2D : site.dimension;
+			site_class.cube              = site.cube;
+			site_class.mip_count         = 1u;
+			site_class.conversion_format = Prospero::BufferFormat::kInvalid;
+			site_class.shader_swizzle    = ShaderImageIdentitySwizzle;
+		}
+		if (resource_count < 2u || (exemplar == ImageResource::NoIndirectImage && !padded)) {
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
-		const auto& image_class = specialization.images[exemplar];
+		const auto& image_class = padded ? site_class : specialization.images[exemplar];
 		const auto& base = program.info.images[root_index];
 		const bool storage_swizzle = base.unfiltered_access_only &&
 		    base.resource_class == ImageResourceClass::Storage;
@@ -981,6 +1173,27 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (image.indirect_root != root_index) {
 				continue;
 			}
+			// Normal tables select a typed run for each numeric class. Padded tables retain
+			// their fixed site class; unsupported coordinate and conversion layouts stay null.
+			if (program.gpu_selected_call_payloads && !NullImageDescriptor(snapshot.images[candidate]) &&
+			    ((padded && image.numeric_class != image_class.numeric_class) || image.mip_count != image_class.mip_count ||
+			     image.conversion_format != image_class.conversion_format ||
+			     image.shader_swizzle != image_class.shader_swizzle || image.cube != image_class.cube ||
+			     !(image.dimension == image_class.dimension ||
+			       (is_2d(image.dimension) && is_2d(image_class.dimension))))) {
+				static uint32_t reported = 0;
+				if (reported++ < 40u) {
+					std::fprintf(stderr,
+					             "RT calls: image table candidate %u bound as null (class %u/%u dim %u/%u cube %u/%u mips %u/%u conv %u/%u swz %x/%x)\n",
+					             candidate, static_cast<uint32_t>(image.numeric_class), static_cast<uint32_t>(image_class.numeric_class),
+					             static_cast<uint32_t>(image.dimension), static_cast<uint32_t>(image_class.dimension),
+					             static_cast<uint32_t>(image.cube), static_cast<uint32_t>(image_class.cube),
+					             static_cast<uint32_t>(image.mip_count), static_cast<uint32_t>(image_class.mip_count),
+					             static_cast<uint32_t>(image.conversion_format), static_cast<uint32_t>(image_class.conversion_format),
+					             static_cast<uint32_t>(image.shader_swizzle), static_cast<uint32_t>(image_class.shader_swizzle));
+				}
+				snapshot.images[candidate] = DescriptorValue {.dword_count = snapshot.images[candidate].dword_count};
+			}
 			if (NullImageDescriptor(snapshot.images[candidate])) {
 				image.numeric_class     = image_class.numeric_class;
 				image.dimension         = image_class.dimension;
@@ -989,6 +1202,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
+			if (padded) image.dimension = image_class.dimension; // 2D candidates of a 2D-array site use a one-layer array view
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
 			const bool unfiltered_coordinates = base.unfiltered_access_only &&
@@ -1001,8 +1215,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
 				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates (cand {} vs {}: class {}/{} dim {}/{} cube {}/{} mips {}/{} conv {}/{} swz {}/{})",
+				                program.info.images[root_index].first_use_pc, candidate, exemplar,
+				                static_cast<uint32_t>(image.numeric_class), static_cast<uint32_t>(image_class.numeric_class),
+				                static_cast<uint32_t>(image.dimension), static_cast<uint32_t>(image_class.dimension),
+				                static_cast<uint32_t>(image.cube), static_cast<uint32_t>(image_class.cube),
+				                static_cast<uint32_t>(image.mip_count), static_cast<uint32_t>(image_class.mip_count),
+				                static_cast<uint32_t>(image.conversion_format), static_cast<uint32_t>(image_class.conversion_format),
+				                static_cast<uint32_t>(image.shader_swizzle), static_cast<uint32_t>(image_class.shader_swizzle)));
 			}
 		}
 	}
@@ -1011,10 +1231,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 }
 
 bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
-	if (base.samplers.size() > plan.mapping.size()) {
-		return false;
-	}
-	std::array<uint8_t, ShaderInfo::MaxSamplers> usage {};
+	// Inlining independent call shaders combines their sampler namespaces.
+	// Each source may need a native variant for both numeric classes.
+	plan.mapping.resize(base.samplers.size());
+	plan.bindings.resize(base.samplers.size() * 2u);
+	std::vector<uint8_t> usage(base.samplers.size(), 0u);
 	plan.sampler_count = static_cast<uint32_t>(base.samplers.size());
 	for (const auto& pair: base.sampled_pairs) {
 		if (pair.image >= base.images.size() || pair.sampler >= base.samplers.size()) {
@@ -1038,7 +1259,7 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 		for (uint32_t type = 0; type < mapping.size(); type++) {
 			if ((classes & (1u << type)) == 0u) continue;
 			const auto target = first ? index : plan.sampler_count++;
-			if (target >= ShaderInfo::MaxSamplers) return false;
+			if (target >= plan.bindings.size()) return false;
 			mapping[type]         = target;
 			plan.bindings[target] = {index, static_cast<SamplerClass>(type)};
 			first                = false;
@@ -1261,6 +1482,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
+	plan.gpu_selected_call_payloads = program.gpu_selected_call_payloads;
 
 	std::unordered_map<const Inst*, Inst*> cloned;
 	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
@@ -1479,7 +1701,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
 	     runtime.read_specialization_memory == nullptr)) {
-		return false;
+		return SpecializationFail("resource tracking incomplete or specialization memory missing");
 	}
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
 		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
@@ -1525,7 +1747,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
-			return false;
+			return SpecializationFail("descriptor source index out of range (" + std::to_string(source) + ")");
 		}
 		if (active.empty() || active[source]) {
 			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value) ||
@@ -1608,7 +1830,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
-			return false;
+			return SpecializationFail("an image resource has no descriptor source (image " + std::to_string(i) + ")");
 		}
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
@@ -1630,7 +1852,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
-				return false;
+				return SpecializationFail("an image descriptor source did not evaluate (image " + std::to_string(i) + ")");
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				snapshot.images[i].dwords.fill(0);
@@ -1648,7 +1870,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto* descriptor = Source(program, source);
 			if (descriptor == nullptr) return false;
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
-			if (indirect != nullptr && indirect->sources.empty()) {
+			if (indirect != nullptr && indirect->pointer_hop) {
+				if (!MaterializeHopSampler(*indirect, observed, clean, snapshot.samplers[i]))
+					return SpecializationFail("a sampler behind a record pointer did not evaluate (sampler " +
+					                          std::to_string(i) + ")");
+			} else if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
 				if ((active.empty() || active[source]) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, clean, snapshot, snapshot.samplers,
@@ -1672,7 +1898,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	const bool built = BuildResourceSpecialization(program, snapshot, specialization);
+	return built;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
@@ -1769,6 +1996,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::Integer;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		// The S# bit is recorded per snapshot sampler; a native variant shares its source's snapshot.
 	}
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];
@@ -1894,8 +2122,16 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
+			if (image.indirect_root == memory.resource && inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			    inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
+			    inst.GetOpcode() != ValueOpcode::ImageRead && inst.GetOpcode() != ValueOpcode::ImageWrite) {
+				const auto name = ValueOpcodeName(inst.GetOpcode());
+				std::fprintf(stderr, "indirect image %u is used by %.*s (only sampling and size queries select among records)\n",
+				             memory.resource, static_cast<int>(name.size()), name.data());
+			}
 			EXIT_IF(image.indirect_root == memory.resource &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
 			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageRead &&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite);

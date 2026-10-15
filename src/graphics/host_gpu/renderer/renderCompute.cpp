@@ -831,7 +831,24 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (use_thread_dimensions) {
 		PushThreadLimit(vk_buffer, pipeline, thread_record);
 	}
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	const bool ordered_append = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_ORDERED_APPEND_ENBL) != 0 &&
+	                            program.info.uses_gds && !use_thread_dimensions &&
+	                            thread_group_x * thread_group_y * thread_group_z > 1u;
+	if (ordered_append) {
+		// Ordered append hands out GDS counts in workgroup launch order, X fastest.
+		for (uint32_t z = 0; z < thread_group_z; z++) {
+			for (uint32_t y = 0; y < thread_group_y; y++) {
+				for (uint32_t x = 0; x < thread_group_x; x++) {
+					if (x + y + z != 0u) {
+						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+					}
+					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
+				}
+			}
+		}
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 	m_context.GetIndirectKeyFeedback().Flush(vk_buffer);
 
 	// The removed host fence also ordered read-only dispatches before later writers.

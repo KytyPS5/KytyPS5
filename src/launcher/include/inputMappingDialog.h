@@ -3,6 +3,7 @@
 
 #include <QDialog>
 #include <QHash>
+#include <QSet>
 #include <QStringList>
 
 class ControllerPreview;
@@ -10,6 +11,8 @@ class DualSenseWidget;
 class QLabel;
 class QPushButton;
 class QDoubleSpinBox;
+class QTabWidget;
+class QWidget;
 
 class InputMappingDialog final: public QDialog {
 public:
@@ -20,20 +23,28 @@ public:
 	[[nodiscard]] QStringList Mapping() const;
 
 private:
-	void ChangeBinding(const QString& id);
-	void RestoreDefaults();
-	void UpdateButtons();
-	void UpdatePreview();
-	void UpdateHighlights();
+	QWidget* BuildTab(bool pad);
+	void     ChangeKeyboardBinding(const QString& id);
+	void     ChangePadBinding(const QString& id);
+	void     ClearBinding(bool pad, const QString& id);
+	void     RestoreDefaults();
+	void     UpdateButtons();
+	void     UpdatePreview();
+	void     UpdateHighlights();
 
 	ControllerPreview*           m_preview;
 	DualSenseWidget*             m_controller = nullptr;
+	QTabWidget*                  m_tabs       = nullptr;
 	QHash<QString, QString>      m_bindings;
+	QHash<QString, QString>      m_pad_bindings;
 	QHash<QString, QPushButton*> m_buttons;
+	QHash<QString, QPushButton*> m_pad_buttons;
+	QSet<QString>                m_pad_pressed;
 	QString                      m_selected;
 	QLabel*                      m_status          = nullptr;
 	QDoubleSpinBox*              m_sensitivity     = nullptr;
 	bool                         m_custom_bindings = false;
+	bool                         m_custom_pad      = false;
 };
 
 #endif /* LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_ */

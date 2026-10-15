@@ -27,6 +27,7 @@ struct ControlInfo {
 	float            touch_x  = 0.0f;
 
 	Controller::Setting setting {};
+	bool                gyro = false;
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -61,9 +62,64 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {.name = "VibrationIntensity", .setting = Controller::Setting::VibrationIntensity},
     ControlInfo {.name    = "TriggerEffectIntensity",
                  .setting = Controller::Setting::TriggerEffectIntensity},
+    ControlInfo {.name = "GyroToggle", .gyro = true},
 };
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
+
+struct PadSource {
+	std::string_view name;
+	int              button; // SDL_GamepadButton, or -1 for an analog trigger
+};
+
+constexpr std::array PAD_SOURCES = {
+    PadSource {"South", SDL_GAMEPAD_BUTTON_SOUTH},
+    PadSource {"East", SDL_GAMEPAD_BUTTON_EAST},
+    PadSource {"West", SDL_GAMEPAD_BUTTON_WEST},
+    PadSource {"North", SDL_GAMEPAD_BUTTON_NORTH},
+    PadSource {"Back", SDL_GAMEPAD_BUTTON_BACK},
+    PadSource {"Guide", SDL_GAMEPAD_BUTTON_GUIDE},
+    PadSource {"Start", SDL_GAMEPAD_BUTTON_START},
+    PadSource {"LeftStick", SDL_GAMEPAD_BUTTON_LEFT_STICK},
+    PadSource {"RightStick", SDL_GAMEPAD_BUTTON_RIGHT_STICK},
+    PadSource {"LeftShoulder", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+    PadSource {"RightShoulder", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+    PadSource {"DpadUp", SDL_GAMEPAD_BUTTON_DPAD_UP},
+    PadSource {"DpadDown", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+    PadSource {"DpadLeft", SDL_GAMEPAD_BUTTON_DPAD_LEFT},
+    PadSource {"DpadRight", SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+    PadSource {"Misc1", SDL_GAMEPAD_BUTTON_MISC1},
+    PadSource {"RightPaddle1", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
+    PadSource {"LeftPaddle1", SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
+    PadSource {"RightPaddle2", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2},
+    PadSource {"LeftPaddle2", SDL_GAMEPAD_BUTTON_LEFT_PADDLE2},
+    PadSource {"Touchpad", SDL_GAMEPAD_BUTTON_TOUCHPAD},
+    PadSource {"LeftTrigger", -1},
+    PadSource {"RightTrigger", -1},
+};
+
+constexpr std::size_t LEFT_TRIGGER_SOURCE  = PAD_SOURCES.size() - 2;
+constexpr std::size_t RIGHT_TRIGGER_SOURCE = PAD_SOURCES.size() - 1;
+constexpr std::size_t INVALID_SOURCE       = PAD_SOURCES.size();
+
+struct PadDefault {
+	std::string_view control;
+	std::string_view source;
+};
+
+constexpr std::array PAD_DEFAULTS = {
+    PadDefault {"Cross", "South"},         PadDefault {"Circle", "East"},
+    PadDefault {"Square", "West"},         PadDefault {"Triangle", "North"},
+    PadDefault {"Options", "Start"},       PadDefault {"L3", "LeftStick"},
+    PadDefault {"R3", "RightStick"},       PadDefault {"L1", "LeftShoulder"},
+    PadDefault {"R1", "RightShoulder"},    PadDefault {"L2", "LeftTrigger"},
+    PadDefault {"R2", "RightTrigger"},     PadDefault {"Up", "DpadUp"},
+    PadDefault {"Down", "DpadDown"},       PadDefault {"Left", "DpadLeft"},
+    PadDefault {"Right", "DpadRight"},     PadDefault {"TouchPad", "Touchpad"},
+    PadDefault {"GyroToggle", "Back"},
+};
+
+constexpr std::string_view PAD_PREFIX = "Pad:";
 
 struct Binding {
 	SDL_Keycode key          = SDLK_UNKNOWN;
@@ -133,6 +189,10 @@ public:
 				    std::clamp(std::isfinite(sensitivity) ? sensitivity : 1.0f, 0.1f, 5.0f);
 				continue;
 			}
+			if (entry.starts_with(PAD_PREFIX)) {
+				AddPadEntry(entry.substr(PAD_PREFIX.size()), value);
+				continue;
+			}
 			const auto split = entry.find('=');
 
 			Binding binding;
@@ -153,9 +213,24 @@ public:
 			}
 			Add(binding);
 		}
+		if (!m_custom_pad) {
+			for (const auto& item: PAD_DEFAULTS) {
+				AssignPad(ControlFromName(item.control), SourceFromName(item.source));
+			}
+		}
 	}
 	[[nodiscard]] bool  Custom() const { return m_size != 0; }
 	[[nodiscard]] float MouseSensitivity() const { return m_mouse_sensitivity; }
+
+	[[nodiscard]] std::size_t PadControl(std::size_t source) const {
+		return source < m_pad_controls.size() ? m_pad_controls[source] : INVALID_CONTROL;
+	}
+
+	static std::size_t SourceFromButton(int button) {
+		const auto item = std::find_if(PAD_SOURCES.begin(), PAD_SOURCES.end(),
+		                               [button](const auto& s) { return s.button == button; });
+		return static_cast<std::size_t>(std::distance(PAD_SOURCES.begin(), item));
+	}
 
 	[[nodiscard]] std::size_t FindKey(int key_code) const {
 		key_code = NormalizeKey(static_cast<SDL_Keycode>(key_code));
@@ -173,6 +248,37 @@ public:
 	}
 
 private:
+	static std::size_t SourceFromName(std::string_view name) {
+		const auto item = std::find_if(PAD_SOURCES.begin(), PAD_SOURCES.end(),
+		                               [name](const auto& s) { return s.name == name; });
+		return static_cast<std::size_t>(std::distance(PAD_SOURCES.begin(), item));
+	}
+
+	void AssignPad(std::size_t control, std::size_t source) {
+		for (auto& existing: m_pad_controls) {
+			if (existing == control) {
+				existing = INVALID_CONTROL;
+			}
+		}
+		m_pad_controls[source] = control;
+	}
+
+	void AddPadEntry(std::string_view entry, const std::string& original) {
+		const auto split   = entry.find('=');
+		const auto control = split != std::string_view::npos ? ControlFromName(entry.substr(0, split))
+		                                                     : INVALID_CONTROL;
+		const auto source  = split != std::string_view::npos ? SourceFromName(entry.substr(split + 1))
+		                                                     : INVALID_SOURCE;
+		if (control == INVALID_CONTROL || source == INVALID_SOURCE) {
+			EXIT("Invalid input mapping: %s\n", original.c_str());
+		}
+		const auto& info = CONTROL_INFO[control];
+		if (info.button == 0 && !info.gyro && info.axis != Controller::Axis::AxisMax) {
+			EXIT("Invalid input mapping: %s\n", original.c_str());
+		}
+		m_custom_pad = true;
+		AssignPad(control, source);
+	}
 	void Add(const Binding& binding) {
 		for (std::size_t index = 0; index < m_size;) {
 			if (Conflicts(m_bindings[index], binding)) {
@@ -186,6 +292,12 @@ private:
 	}
 
 	std::array<Binding, CONTROL_INFO.size()> m_bindings {};
+	std::array<std::size_t, PAD_SOURCES.size()> m_pad_controls = [] {
+		std::array<std::size_t, PAD_SOURCES.size()> a {};
+		a.fill(INVALID_CONTROL);
+		return a;
+	}();
+	bool                                     m_custom_pad = false;
 	std::size_t                              m_size              = 0;
 	float                                    m_mouse_sensitivity = 1.0f;
 };
@@ -268,6 +380,12 @@ void SetControl(std::size_t control, bool down) {
 	}
 	if (info.button != 0) {
 		SetButton(info.button, down);
+		return;
+	}
+	if (info.gyro) {
+		if (down) {
+			Controller::ToggleGyroEmulation(Controller::HOST_INPUT_CONTROLLER_ID);
+		}
 		return;
 	}
 	if (info.axis == Controller::Axis::AxisMax) {
@@ -399,8 +517,61 @@ bool IsCursorActivity(const SDL_Event& event) {
 	return which != SDL_TOUCH_MOUSEID && which != SDL_PEN_MOUSEID;
 }
 
+void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down) {
+	if (control == INVALID_CONTROL) {
+		return;
+	}
+	const auto& info = CONTROL_INFO[control];
+	if (info.gyro) {
+		if (down) {
+			Controller::ToggleGyroEmulation(id);
+		}
+	} else if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
+		// Real touchpads report their own finger position; other inputs emulate a click.
+		if (source != PAD_SOURCES.size() && PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+			Controller::SetTouchPad(id, 0, down, info.touch_x != 0.0f ? info.touch_x : 0.5f, 0.5f);
+		}
+		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, down);
+	} else if (info.button == Controller::PAD_BUTTON_L2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerLeft, down ? 255 : 0);
+	} else if (info.button == Controller::PAD_BUTTON_R2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerRight, down ? 255 : 0);
+	} else if (info.button != 0) {
+		Controller::SetButton(id, info.button, down);
+	} else if (info.axis == Controller::Axis::AxisMax) {
+		CycleSettingOnPress(info.setting, down);
+	}
+}
+
 } // namespace
 
+void HostInputPadButton(int id, int button, bool down) {
+	const auto  source = InputMap::SourceFromButton(button);
+	const auto& map    = GetInputMap();
+	ApplyPadControl(id, map.PadControl(source), source, down);
+}
+
+void HostInputPadTrigger(int id, bool left, int value) {
+	static bool pressed[2] = {};
+	const auto  source     = left ? LEFT_TRIGGER_SOURCE : RIGHT_TRIGGER_SOURCE;
+	const auto  control    = GetInputMap().PadControl(source);
+	if (control == INVALID_CONTROL) {
+		return;
+	}
+	const auto& info = CONTROL_INFO[control];
+	if (info.button == Controller::PAD_BUTTON_L2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerLeft, value);
+	} else if (info.button == Controller::PAD_BUTTON_R2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerRight, value);
+	} else {
+		auto& state = pressed[left ? 0 : 1];
+		const bool down = state ? value > 32 : value > 96;
+		if (down != state) {
+			state = down;
+			ApplyPadControl(id, control, source, down);
+		}
+	}
+}
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
 	g_mouse_window = window;

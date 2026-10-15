@@ -12,6 +12,8 @@ void               HostInputInit(SDL_Window* window);
 void               HostInputShutdown();
 void               HostInputKey(int key_code, bool down);
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
+void               HostInputPadButton(int id, int sdl_button, bool down);
+void               HostInputPadTrigger(int id, bool left, int value);
 void               HostInputToggleMouseToJoystick();
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
 

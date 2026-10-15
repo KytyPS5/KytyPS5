@@ -126,6 +126,7 @@ public:
 	void Motion(int id, Sensor sensor, const float* data, uint64_t time_us);
 	void SetMotionSensorState(bool enable);
 	void ResetOrientation();
+	void ToggleGyroEmulation(int id);
 	void ResetInputState();
 	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
@@ -147,6 +148,8 @@ private:
 
 	void CheckActive();
 	void AddState();
+	// Emulated tilt: the right stick drives pitch and roll instead of the stick axes.
+	void UpdateEmulatedTilt();
 	// Apply cached output without changing its game-requested lifetime; caller holds m_mutex.
 	void ApplyVibration();
 	bool SendTriggerEffect(const PadTriggerEffectParam& param);
@@ -160,6 +163,9 @@ private:
 	int              m_connected_count = 0;
 	bool             m_motion_enabled  = true;
 	uint64_t         m_gyro_time       = 0;
+	bool             m_gyro_emulation  = false;
+	uint64_t         m_emulated_time   = 0;
+	std::array<int, 2> m_emulated_stick {128, 128};
 	// Accelerometer gravity direction in the reset frame.
 	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
 	bool                 m_up_reference_valid = false;
@@ -479,6 +485,9 @@ void GameController::CheckActive() {
 	m_connected     = new_connected;
 	m_state         = {};
 	m_gyro_time     = 0;
+	m_gyro_emulation = false;
+	m_emulated_time  = 0;
+	m_emulated_stick = {128, 128};
 	m_up_reference_valid = false;
 	m_states_num    = 0;
 	m_first_state   = 0;
@@ -524,6 +533,12 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 
 		EXIT_IF(axis_id < 0 || axis_id >= static_cast<int>(Controller::Axis::AxisMax));
 
+		if (m_gyro_emulation && (axis == Controller::Axis::RightX || axis == Controller::Axis::RightY)) {
+			m_emulated_stick[axis == Controller::Axis::RightY ? 1 : 0] = value;
+			UpdateEmulatedTilt();
+			return;
+		}
+
 		m_state.axes[axis_id] = value;
 
 		uint32_t trigger = 0;
@@ -545,7 +560,12 @@ void GameController::RightStick(int id, int x, int y) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
-		m_state.time                                 = LibKernel::KernelGetProcessTime();
+		m_state.time = LibKernel::KernelGetProcessTime();
+		if (m_gyro_emulation) {
+			m_emulated_stick = {x, y};
+			UpdateEmulatedTilt();
+			return;
+		}
 		m_state.axes[static_cast<int>(Axis::RightX)] = x;
 		m_state.axes[static_cast<int>(Axis::RightY)] = y;
 		AddState();
@@ -675,6 +695,82 @@ void GameController::SetMotionSensorState(bool enable) {
 		m_state.time         = LibKernel::KernelGetProcessTime();
 		AddState();
 	}
+}
+
+static Quat QuatMultiply(const Quat& a, const Quat& b) {
+	return {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+	        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+	        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+	        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+}
+
+void GameController::UpdateEmulatedTilt() {
+	constexpr float max_angle = 0.7853982f; // 45 degrees at full stick deflection
+	const auto      angle     = [](int value) {
+        return std::clamp((value - 128) / 127.0f, -1.0f, 1.0f) * max_angle;
+	};
+	const float roll  = angle(m_emulated_stick[0]);
+	const float pitch = angle(m_emulated_stick[1]);
+
+	const Quat q_pitch {std::sin(pitch * 0.5f), 0.0f, 0.0f, std::cos(pitch * 0.5f)};
+	const Quat q_roll {0.0f, 0.0f, std::sin(-roll * 0.5f), std::cos(-roll * 0.5f)};
+	Quat       q = QuatMultiply(q_roll, q_pitch);
+
+	const uint64_t now = LibKernel::KernelGetProcessTime();
+	Vec3           rate {};
+	if (m_emulated_time != 0 && now > m_emulated_time) {
+		const float dt = std::clamp(static_cast<float>(now - m_emulated_time) * 0.000001f,
+		                            0.001f, 0.1f);
+		auto delta = QuatMultiply(QuatConjugate(m_state.orientation), q);
+		if (delta[3] < 0.0f) {
+			for (auto& v: delta) {
+				v = -v;
+			}
+		}
+		rate = {2.0f * delta[0] / dt, 2.0f * delta[1] / dt, 2.0f * delta[2] / dt};
+	}
+	m_emulated_time = now;
+
+	m_state.time        = now;
+	m_state.orientation = q;
+	m_state.accel       = QuatRotate(QuatConjugate(q), {0.0f, 1.0f, 0.0f});
+	m_state.gyro        = rate;
+	AddState();
+	// Angular velocity is only nonzero while the tilt changes.
+	m_state.gyro = {};
+}
+
+void GameController::ToggleGyroEmulation(int id) {
+	Common::LockGuard lock(m_mutex);
+	if (id != HOST_INPUT_CONTROLLER_ID && id != m_active_id) {
+		return;
+	}
+	// Pads with a real gyroscope report it directly.
+	if (m_active_id != HOST_INPUT_CONTROLLER_ID) {
+		auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+		if (pad != nullptr && SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) {
+			return;
+		}
+	}
+
+	m_gyro_emulation = !m_gyro_emulation;
+	m_emulated_time  = 0;
+	m_state.time     = LibKernel::KernelGetProcessTime();
+	if (m_gyro_emulation) {
+		m_emulated_stick = {m_state.axes[static_cast<int>(Axis::RightX)],
+		                    m_state.axes[static_cast<int>(Axis::RightY)]};
+		m_state.axes[static_cast<int>(Axis::RightX)] = 128;
+		m_state.axes[static_cast<int>(Axis::RightY)] = 128;
+		UpdateEmulatedTilt();
+	} else {
+		m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+		m_state.accel       = {0.0f, 1.0f, 0.0f};
+		m_state.gyro        = {};
+		m_state.axes[static_cast<int>(Axis::RightX)] = m_emulated_stick[0];
+		m_state.axes[static_cast<int>(Axis::RightY)] = m_emulated_stick[1];
+		AddState();
+	}
+	LOGF("Emulated gyro tilt: %s\n", m_gyro_emulation ? "enabled" : "disabled");
 }
 
 void GameController::ResetOrientation() {
@@ -929,6 +1025,10 @@ void SetTouchPad(int id, int finger, bool down, float x, float y) {
 
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us) {
 	g_controller->Motion(id, sensor, data, time_us);
+}
+
+void ToggleGyroEmulation(int id) {
+	g_controller->ToggleGyroEmulation(id);
 }
 
 void ResetInputState() {

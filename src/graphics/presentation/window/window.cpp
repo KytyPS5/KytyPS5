@@ -1,4 +1,4 @@
-#include "graphics/presentation/window.h"
+﻿#include "graphics/presentation/window.h"
 
 #include <SDL3/SDL.h>
 
@@ -54,25 +54,6 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
-static uint32_t ControllerButtonToPadButton(int button) {
-	switch (button) {
-		case SDL_GAMEPAD_BUTTON_SOUTH: return Controller::PAD_BUTTON_CROSS;
-		case SDL_GAMEPAD_BUTTON_EAST: return Controller::PAD_BUTTON_CIRCLE;
-		case SDL_GAMEPAD_BUTTON_WEST: return Controller::PAD_BUTTON_SQUARE;
-		case SDL_GAMEPAD_BUTTON_NORTH: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDL_GAMEPAD_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
-		case SDL_GAMEPAD_BUTTON_LEFT_STICK: return Controller::PAD_BUTTON_L3;
-		case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return Controller::PAD_BUTTON_R3;
-		case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return Controller::PAD_BUTTON_L1;
-		case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return Controller::PAD_BUTTON_R1;
-		case SDL_GAMEPAD_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
-		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
-		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
-		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDL_GAMEPAD_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
-		default: return 0;
-	}
-}
 
 static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 	switch (axis_id) {
@@ -323,28 +304,16 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 
 	if (f.down || f.up) {
-		const auto button = ControllerButtonToPadButton(f.button);
-		if (button != 0) {
-			Controller::SetButton(f.id, button, f.down);
-		} else if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
-			// Pads without a touchpad (Switch, Xbox, ...) have no way to click it, which
-			// blocks games that require it. Use their Back/Select button as a centered click.
-			auto* pad = SDL_GetGamepadFromID(f.id);
-			if (pad != nullptr && SDL_GetNumGamepadTouchpads(pad) == 0) {
-				if (f.down) {
-					Controller::SetTouchPad(f.id, 0, true, 0.5f, 0.5f);
-				}
-				Controller::SetButton(f.id, Controller::PAD_BUTTON_TOUCH_PAD, f.down);
-				if (f.up) {
-					Controller::SetTouchPad(f.id, 0, false, 0.5f, 0.5f);
-				}
-			}
-		}
+		HostInputPadButton(f.id, f.button, f.down);
 	}
 
 	if (f.axis) {
-		const auto axis = ControllerAxisFromSdl(f.axis_id);
-		if (axis != Controller::Axis::AxisMax) {
+		if (f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
+		    f.axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+			HostInputPadTrigger(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
+			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+		} else if (const auto axis = ControllerAxisFromSdl(f.axis_id);
+		           axis != Controller::Axis::AxisMax) {
 			Controller::SetAxis(f.id, axis,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}

@@ -957,6 +957,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				hi = snapshot.flattened_srt[pointer.hi];
 			}
 			const auto address = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u);
+			if (pointer.store) {
+				m_context.PrefetchBdaStoreRun(address);
+			}
 			if (pointer.relative_offset != UINT32_MAX) {
 				PrefetchRelativeStores(m_context, address, pointer);
 				continue;

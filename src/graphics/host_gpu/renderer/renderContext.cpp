@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -192,6 +193,33 @@ void RenderContext::PrefetchBda(uint64_t address, bool store) {
 		if (start <= address && end > address) {
 			m_buffer_cache.PrefetchBda(start, end - start, store);
 		}
+	});
+}
+
+void RenderContext::PrefetchBdaStoreRun(uint64_t address) {
+	constexpr uint64_t MaxRun = 256 * 1024 * 1024;
+	if (address == 0) {
+		return;
+	}
+	const auto begin = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+	uint64_t   end   = begin;
+	for (uint64_t cursor = begin; end - begin < MaxRun;) {
+		uint64_t start  = 0;
+		uint64_t length = 0;
+		if (!Libs::LibKernel::Memory::QueryCommittedRange(cursor, &start, &length) ||
+		    start + length <= cursor) {
+			break;
+		}
+		end    = start + length;
+		cursor = end;
+	}
+	if (end <= begin) {
+		return;
+	}
+	end = std::min(end, begin + MaxRun);
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t first, uint64_t last) {
+		m_buffer_cache.PrefetchBda(first, last - first, false);
 	});
 }
 

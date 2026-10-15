@@ -1,12 +1,11 @@
 #ifndef EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 
-#include <SDL3/SDL.h>
-
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <SDL3/SDL.h>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -16,6 +15,10 @@ namespace Libs::Graphics {
 
 class Presenter;
 class RenderContext;
+struct DisplayLuminance;
+
+// Queries the host display that contains native_window (HWND on Windows).
+[[nodiscard]] bool HostGetDisplayLuminance(void* native_window, DisplayLuminance* luminance);
 
 struct SurfaceCapabilities {
 	vk::SurfaceCapabilitiesKHR        capabilities {};
@@ -24,9 +27,9 @@ struct SurfaceCapabilities {
 };
 
 struct WindowLoopState {
-	SDL_Event        event {};
-	bool             need_exit = false;
-	std::atomic_bool paused    = false;
+	SDL_Event             event {};
+	bool                  need_exit = false;
+	std::atomic_bool      paused    = false;
 	std::atomic<uint64_t> presented_frames {0};
 };
 
@@ -39,20 +42,20 @@ struct WindowContext {
 	[[nodiscard]] static vk::PhysicalDeviceVulkan12Features RequiredVulkan12Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features RequiredVulkan13Features() noexcept;
 	[[nodiscard]] static uint32_t InitialWindowFlags(bool fullscreen) noexcept;
-	void                                                    CreateVulkan();
-	void                                                    RecreateSurface();
-	void                                                    RefreshSurfaceCapabilities();
-	void                                                    UpdateIcon();
-	void UpdateTitle(uint64_t frame_num, double current_fps);
-	void                                                    Resize(int width, int height);
-	void ProcessWindowEvent(const SDL_WindowEvent& event);
-	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
-	void ProcessEvent(double time_seconds);
-	void Run();
+	void                          CreateVulkan();
+	void                          RecreateSurface();
+	void                          RefreshSurfaceCapabilities();
+	void                          UpdateIcon();
+	void                          UpdateTitle(uint64_t frame_num, double current_fps);
+	void                          Resize(int width, int height);
+	void                          ProcessWindowEvent(const SDL_WindowEvent& event);
+	void                          ProcessDisplayEvent(const SDL_DisplayEvent& event);
+	void                          ProcessEvent(double time_seconds);
+	void                          Run();
 
 	GraphicContext                 graphic_ctx;
-	SDL_Window*                    window        = nullptr;
-	vk::SurfaceKHR                 surface       = nullptr;
+	SDL_Window*                    window  = nullptr;
+	vk::SurfaceKHR                 surface = nullptr;
 	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;

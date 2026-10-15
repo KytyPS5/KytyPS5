@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "emulator.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -221,9 +222,17 @@ SystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance)
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	luminance->max_full_frame_tone_map_luminance = 80.0f;
-	luminance->max_tone_map_luminance            = 1000.0f;
-	luminance->min_tone_map_luminance            = 0.0f;
+	// Cached by the window thread, cheap enough for games that poll every frame.
+	Graphics::DisplayLuminance display {};
+	if (Graphics::WindowGetDisplayLuminance(&display)) {
+		luminance->max_full_frame_tone_map_luminance = display.max_full_frame_luminance;
+		luminance->max_tone_map_luminance            = display.max_luminance;
+		luminance->min_tone_map_luminance            = display.min_luminance;
+	} else {
+		luminance->max_full_frame_tone_map_luminance = 80.0f;
+		luminance->max_tone_map_luminance            = 1000.0f;
+		luminance->min_tone_map_luminance            = 0.0f;
+	}
 
 	return OK;
 }

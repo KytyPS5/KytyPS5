@@ -1,17 +1,15 @@
 #include "graphics/presentation/window.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -24,13 +22,14 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
 #include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -87,8 +86,7 @@ static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 }
 
 static bool ControllerAxisIsTrigger(int axis_id) {
-	return axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
-	       axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+	return axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
 }
 
 static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
@@ -152,6 +150,12 @@ struct EventController {
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
+void*                          g_native_window = nullptr;
+// Host display luminance is queried on window/display events and cached, because guests may
+// ask for it every frame.
+Common::Mutex    g_luminance_mutex;
+DisplayLuminance g_luminance {};
+bool             g_luminance_valid = false;
 
 } // namespace
 
@@ -180,7 +184,7 @@ static void ToggleDesktopFullscreen() {
 		return;
 	}
 
-	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const auto flags      = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
 	const bool fullscreen = (flags & SDL_WINDOW_FULLSCREEN) != 0u;
 	if (!SDL_SetWindowFullscreen(g_window->window, !fullscreen)) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
@@ -345,8 +349,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
-			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis, ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -384,9 +387,45 @@ void WindowContext::Resize(int new_width, int new_height) {
 	graphic_ctx.screen_height = static_cast<uint32_t>(new_height);
 }
 
+static void RefreshDisplayLuminance() {
+	DisplayLuminance luminance {};
+	const bool       valid = HostGetDisplayLuminance(g_native_window, &luminance);
+
+	Common::LockGuard lock(g_luminance_mutex);
+	const bool changed = valid != g_luminance_valid ||
+	                     luminance.min_luminance != g_luminance.min_luminance ||
+	                     luminance.max_luminance != g_luminance.max_luminance ||
+	                     luminance.max_full_frame_luminance != g_luminance.max_full_frame_luminance;
+	if (!changed) {
+		return;
+	}
+	if (valid) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Host display luminance: max_full_frame = {}, max = {}, min = {} nits\n",
+		    luminance.max_full_frame_luminance, luminance.max_luminance, luminance.min_luminance));
+	} else if (g_luminance_valid) {
+		luminance.max_full_frame_luminance = 80.0f;
+		luminance.max_luminance            = 1000.0f;
+		luminance.min_luminance            = 0.0f;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Host display luminance was not reported (not yet implemented on linux and mac). Using "
+		    "default values: "
+		    "max_full_frame = {}, max = {}, min = {} nits\n",
+		    luminance.max_full_frame_luminance, luminance.max_luminance, luminance.min_luminance));
+	}
+	g_luminance       = luminance;
+	g_luminance_valid = valid;
+}
+
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 	const auto& window_event = event;
 	switch (window_event.type) {
+		case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+		case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
+			LOGF("Window %" PRIu32 " display or HDR state changed\n", window_event.windowID);
+			RefreshDisplayLuminance();
+			break;
+
 		case SDL_EVENT_WINDOW_SHOWN:
 			LOGF("Window %" PRIu32 " shown\n", window_event.windowID);
 			break;
@@ -434,6 +473,8 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			break;
 		case SDL_EVENT_WINDOW_FOCUS_GAINED:
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
+			// The user may have recalibrated the display while the emulator was in background.
+			RefreshDisplayLuminance();
 			break;
 		case SDL_EVENT_WINDOW_FOCUS_LOST:
 			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
@@ -449,6 +490,7 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 }
 
 void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
+	RefreshDisplayLuminance();
 	switch (display.type) {
 		case SDL_EVENT_DISPLAY_ORIENTATION: {
 			LOGF("Display %" PRIu32 " changed orientation to %d - ", display.displayID,
@@ -694,9 +736,8 @@ void WindowContext::ProcessEvent(double time_s) {
 				                      sensor.sensor == SDL_SENSOR_ACCEL ? Controller::Sensor::Accel
 				                                                        : Controller::Sensor::Gyro,
 				                      sensor.data,
-				                      sensor.sensor_timestamp != 0
-				                          ? sensor.sensor_timestamp / 1000
-				                          : sensor.timestamp / 1000);
+				                      sensor.sensor_timestamp != 0 ? sensor.sensor_timestamp / 1000
+				                                                   : sensor.timestamp / 1000);
 			}
 			break;
 		}
@@ -796,7 +837,7 @@ static void WindowCreate(WindowContext& context) {
 	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
 		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
 			const std::string base_path_str = base_path;
-			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
+			std::string       moltenvk_path = base_path_str + "libMoltenVK.dylib";
 			if (!Common::File::IsFileExisting(moltenvk_path)) {
 				moltenvk_path = base_path_str + "../Frameworks/libMoltenVK.dylib";
 			}
@@ -820,6 +861,11 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	g_native_window = SDL_GetPointerProperty(SDL_GetWindowProperties(context.window),
+	                                         SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+#endif
+	RefreshDisplayLuminance();
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
@@ -857,6 +903,13 @@ void WindowRun() {
 	g_window->Run();
 	Common::LockGuard lock(g_window->render_context->GetMutex());
 	g_window->render_context->GetPipelineCache().Save();
+}
+
+bool WindowGetDisplayLuminance(DisplayLuminance* luminance) {
+	EXIT_IF(luminance == nullptr);
+	Common::LockGuard lock(g_luminance_mutex);
+	*luminance = g_luminance;
+	return g_luminance_valid;
 }
 
 void WindowShutdown() {
@@ -921,8 +974,8 @@ static void WindowLoadPngIcon(const std::filesystem::path& path, WindowIcon* ico
 
 	EXIT_IF(icon->pixels == nullptr);
 
-	icon->surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon->pixels,
-	                                      width * 4);
+	icon->surface =
+	    SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon->pixels, width * 4);
 	EXIT_NOT_IMPLEMENTED(icon->surface == nullptr);
 }
 
@@ -963,7 +1016,7 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 #endif
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
+	auto        text        = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),

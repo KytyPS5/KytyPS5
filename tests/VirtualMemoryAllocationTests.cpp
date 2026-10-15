@@ -393,9 +393,182 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+// SILENT HILL Townfall's VectorVM handlers: an rbp frame, no `sub rsp`, and a switch jump table.
+void TestWindowsGuestRedZoneJumpTables() {
+	const char* test = "WindowsGuestRedZoneJumpTables";
+	constexpr uint64_t SENTINEL        = 0x1122334455667788ull;
+	constexpr uint64_t CODE_SIZE       = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
+	const auto         mapping         = Libs::LibKernel::Memory::AllocateProgramMemory(
+        0x0000000902000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+        Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_jump_table_test");
+	Check(test, mapping != 0, "failed to allocate patch test code");
+
+	g_red_zone_fault_page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+	Check(test, g_red_zone_fault_page != nullptr, "failed to allocate fault page");
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneFaultHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(const uint64_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
+	const auto run_fault = [&] {
+		DWORD old_protection = 0;
+		Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+		return function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
+	};
+
+	enum class Fixture { ResolvedTable, UnresolvedTable, DeadRedZone };
+	struct Outcome {
+		bool                        reproduced = false;
+		bool                        preserved  = false;
+		bool                        wrapped    = false;
+		Loader::GuestInstructionPatchResult result;
+	};
+	const auto run_fixture = [&](Fixture fixture) {
+		std::vector<uint8_t> code;
+		const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
+			code.insert(code.end(), bytes.begin(), bytes.end());
+		};
+		const auto emit32 = [&code](uint32_t value) {
+			const auto offset = code.size();
+			code.resize(offset + sizeof(value));
+			std::memcpy(code.data() + offset, &value, sizeof(value));
+		};
+		const auto emit64 = [&code](uint64_t value) {
+			const auto offset = code.size();
+			code.resize(offset + sizeof(value));
+			std::memcpy(code.data() + offset, &value, sizeof(value));
+		};
+		const auto patch8 = [&code](size_t at, size_t target) {
+			code[at] = static_cast<uint8_t>(target - (at + 1));
+		};
+		const auto patch32 = [&code](size_t at, int64_t value) {
+			const auto narrow = static_cast<int32_t>(value);
+			std::memcpy(code.data() + at, &narrow, sizeof(narrow));
+		};
+		const bool live = fixture != Fixture::DeadRedZone;
+
+		emit({0x55});                               // push rbp
+		emit({0x48, 0x89, 0xe5});                   // mov rbp, rsp
+		emit({0x41, 0x57, 0x41, 0x56, 0x41, 0x55}); // push r15; push r14; push r13
+		emit({0x41, 0x54, 0x53});                   // push r12; push rbx  (rbp - rsp is now 0x28)
+		emit({0x48, 0xb8});
+		emit64(SENTINEL);                           // movabs rax, sentinel
+		if (live) {
+			emit({0x48, 0x89, 0x45, 0xc0});         // mov [rbp-0x40], rax  (== [rsp-0x18])
+			emit({0x48, 0x89, 0x45, 0xb8});         // mov [rbp-0x48], rax
+		}
+		emit({0x31, 0xc9});                         // xor ecx, ecx
+		emit({0x83, 0xf9, 0x01});                   // cmp ecx, 1
+		emit({0x77, 0x00});                         // ja default
+		const auto default_jump = code.size() - 1;
+		emit({0x48, 0x8d, 0x15});                   // lea rdx, [rip + table]
+		const auto table_rel = code.size();
+		emit32(0);
+		emit({0x48, 0x63, 0x0c, 0x8a});             // movsxd rcx, dword [rdx + rcx*4]
+		emit({0x48, 0x01, 0xd1});                   // add rcx, rdx
+		emit({0xff, 0xe1});                         // jmp rcx
+		const auto case0 = code.size();
+		const auto fault_offset = code.size();
+		emit({0x48, 0x8b, 0x87, 0x00, 0x00, 0x00, 0x00}); // mov rax, [rdi+0] (faultable, 7 bytes)
+		emit({0xeb, 0x00});                         // jmp join
+		const auto join_jump = code.size() - 1;
+		const auto case1 = code.size();
+		patch8(default_jump, case1);
+		emit({0x48, 0x31, 0xc0});                   // xor rax, rax
+		const auto join = code.size();
+		patch8(join_jump, join);
+		if (!live) {
+			emit({0x48, 0xb8});
+			emit64(SENTINEL);                       // movabs rax, sentinel
+			emit({0x48, 0x89, 0x45, 0xc0});         // mov [rbp-0x40], rax
+		}
+		emit({0x48, 0x8b, 0x45, 0xc0});             // mov rax, [rbp-0x40]
+		emit({0x48, 0xb9});
+		emit64(SENTINEL);                           // movabs rcx, sentinel
+		emit({0x48, 0x39, 0xc8});                   // cmp rax, rcx
+		emit({0x0f, 0x94, 0xc0});                   // sete al
+		emit({0x0f, 0xb6, 0xc0});                   // movzx eax, al
+		emit({0x5b, 0x41, 0x5c, 0x41, 0x5d});       // pop rbx; pop r12; pop r13
+		emit({0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3}); // pop r14; pop r15; pop rbp; ret
+		while (code.size() % 4 != 0) {
+			code.push_back(0xcc);
+		}
+		const auto table = code.size();
+		patch32(table_rel, static_cast<int64_t>(table) - static_cast<int64_t>(table_rel + 4));
+		emit32(static_cast<uint32_t>(static_cast<int32_t>(case0 - table)));
+		emit32(static_cast<uint32_t>(static_cast<int32_t>(case1 - table)));
+		Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
+
+		std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
+		      "failed to flush generated test code");
+		Outcome outcome;
+		outcome.reproduced = !run_fault();
+		Loader::RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(mapping), CODE_SIZE, reinterpret_cast<void*>(mapping + CODE_SIZE),
+		    TRAMPOLINE_SIZE);
+		if (fixture == Fixture::UnresolvedTable) {
+			// The table lies outside the patched execute-only segment, as rodata does in a game.
+			const std::array<Loader::RedZoneFunctionRange, 1> unwind_functions = {
+			    Loader::RedZoneFunctionRange {.start = static_cast<uintptr_t>(mapping), .size = table}};
+			outcome.result = Loader::PatchGuestInstructions(
+			    mapping, table, {.unwind_functions = unwind_functions, .execute_only = true}, true,
+			    false);
+		} else {
+			outcome.result =
+			    Loader::PatchGuestInstructions(mapping, code.size(), function_starts, true, false);
+		}
+		outcome.wrapped   = *reinterpret_cast<const uint8_t*>(mapping + fault_offset) == 0xe9;
+		outcome.preserved = run_fault();
+		Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+		std::printf("[host]    red-zone jump table fixture=%d red_zone=%llu frame=%llu "
+		            "conservative=%llu patched=%llu wrapped=%d preserved=%d mem=%llu unrel=%llu stack=%llu ctl=%llu\n",
+		            static_cast<int>(fixture),
+		            static_cast<unsigned long long>(outcome.result.red_zone_function_count),
+		            static_cast<unsigned long long>(outcome.result.frame_pointer_red_zone_function_count),
+		            static_cast<unsigned long long>(outcome.result.conservative_frame_pointer_function_count),
+		            static_cast<unsigned long long>(outcome.result.patched_memory_instruction_count),
+		            outcome.wrapped, outcome.preserved, static_cast<unsigned long long>(outcome.result.memory_instruction_count), static_cast<unsigned long long>(outcome.result.unrelocatable_memory_instruction_count), static_cast<unsigned long long>(outcome.result.stack_dependent_memory_instruction_count), static_cast<unsigned long long>(outcome.result.control_flow_memory_instruction_count));
+		return outcome;
+	};
+
+	const auto resolved   = run_fixture(Fixture::ResolvedTable);
+	const auto unresolved = run_fixture(Fixture::UnresolvedTable);
+	const auto dead       = run_fixture(Fixture::DeadRedZone);
+
+	RemoveVectoredExceptionHandler(handler);
+	VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);
+	g_red_zone_fault_page = nullptr;
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+	Check(test, resolved.reproduced && unresolved.reproduced,
+	      "test harness did not reproduce red-zone corruption behind a jump table");
+	Check(test, resolved.wrapped && resolved.preserved &&
+	                resolved.result.frame_pointer_red_zone_function_count == 1 &&
+	                resolved.result.conservative_frame_pointer_function_count == 0 &&
+	                resolved.result.unrelocatable_memory_instruction_count == 0,
+	      "a live red zone across a resolved jump table was not protected precisely");
+	Check(test, unresolved.wrapped && unresolved.preserved &&
+	                unresolved.result.frame_pointer_red_zone_function_count == 1 &&
+	                unresolved.result.conservative_frame_pointer_function_count == 1 &&
+	                unresolved.result.unrelocatable_memory_instruction_count == 0,
+	      "an unresolved jump table did not fall back to protecting the whole function");
+	Check(test, !dead.reproduced && !dead.wrapped && dead.preserved &&
+	                dead.result.conservative_frame_pointer_function_count == 0,
+	      "an access with a dead red zone was wrapped");
+	Check(test, freed, "failed to free patch test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
 #else
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
+}
+void TestWindowsGuestRedZoneJumpTables() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneJumpTables");
 }
 #endif
 
@@ -4823,6 +4996,7 @@ int main(int argc, char** argv) {
 #endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
+		RunTest(TestWindowsGuestRedZoneJumpTables);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
@@ -4837,6 +5011,7 @@ int main(int argc, char** argv) {
 	RunTest(TestCpuExtensionPatches);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
+	RunTest(TestWindowsGuestRedZoneJumpTables);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestBufferRangeReportsSummariseRepeats);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);

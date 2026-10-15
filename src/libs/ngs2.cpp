@@ -2647,6 +2647,17 @@ int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI Ngs2SystemUnlock(uintptr_t system_handle) {
+	PRINT_NAME();
+
+	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	if (ngs == nullptr) return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+
+	ngs->mutex.Unlock();
+
+	return OK;
+}
+
 } // namespace Ngs2
 
 } // namespace Libs::Audio

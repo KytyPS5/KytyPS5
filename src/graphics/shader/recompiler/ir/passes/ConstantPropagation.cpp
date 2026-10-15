@@ -53,16 +53,20 @@ public:
 	void QueueUsers(const std::vector<Use>& users) {
 		++generation;
 		affected.clear();
-		for (const auto& use: users) affected.push_back(use.user);
+		for (const auto& use: users) affected.push_back({use.user, 1u});
 		// Pattern folds inspect nested operands even when intermediate operations
 		// stay dynamic. Visit consumers once per change, including cyclic Phi edges.
+		// The walk stops at a fixed depth: a fold looks only a few operations down, and a
+		// consumer further away is queued anyway when the operation feeding it changes.
+		// Without the bound every change of a kernel with a large Phi web walks all of it.
 		for (size_t i = 0; i < affected.size(); ++i) {
-			auto* inst = affected[i];
+			auto* inst = affected[i].inst;
 			const auto found = locations.find(inst);
 			if (found == locations.end() || found->second.visited == generation) continue;
 			found->second.visited = generation;
 			Queue(inst);
-			for (const auto& use: inst->Uses()) affected.push_back(use.user);
+			if (affected[i].depth >= MaxUserDepth) continue;
+			for (const auto& use: inst->Uses()) affected.push_back({use.user, affected[i].depth + 1u});
 		}
 	}
 
@@ -78,7 +82,14 @@ public:
 	std::unordered_set<Inst*> lowered_ancillary;
 
 private:
-	std::vector<Inst*> affected;
+	static constexpr uint32_t MaxUserDepth = 4;
+
+	struct Affected {
+		Inst*    inst;
+		uint32_t depth;
+	};
+
+	std::vector<Affected> affected;
 	uint64_t generation = 0;
 };
 
@@ -969,6 +980,28 @@ private:
 
 } // namespace
 
+uint32_t EliminateDuplicateBitcasts(const BlockList& blocks) {
+	uint32_t removed = 0;
+	for (auto* block: blocks) {
+		std::unordered_map<Inst*, Inst*> to_float, to_uint;
+		for (auto& inst: *block) {
+			const auto opcode = inst.GetOpcode();
+			if ((opcode != ValueOpcode::BitCastF32U32 && opcode != ValueOpcode::BitCastU32F32) ||
+			    !inst.HasUses()) continue;
+			auto* source = inst.Arg(0).Resolve().TryInstruction();
+			if (source == nullptr) continue;
+			auto& available = opcode == ValueOpcode::BitCastF32U32 ? to_float : to_uint;
+			const auto [found, inserted] = available.emplace(source, &inst);
+			if (!inserted) {
+				// Same source and destination type, earlier in the same block: no memory
+				// or floating-point operation is changed, and the replacement dominates.
+				inst.ReplaceUsesWith(Value(found->second));
+				removed++;
+			}
+		}
+	}
+	return removed;
+}
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	FoldWorklist worklist;
 	LaneMaskProjection mask_projection(worklist);

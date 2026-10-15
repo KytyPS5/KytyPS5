@@ -379,8 +379,8 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, ControllerPre
 	m_tabs = new QTabWidget(this);
 	m_tabs->setObjectName(QStringLiteral("inputTabs"));
 	m_tabs->setDocumentMode(true);
-	m_tabs->addTab(BuildTab(true), tr("Controller → PS5"));
-	m_tabs->addTab(BuildTab(false), tr("Keyboard && Mouse → PS5"));
+	m_tabs->addTab(BuildTab(true), tr("Gamepad"));
+	m_tabs->addTab(BuildTab(false), tr("Keyboard && Mouse"));
 	layout->addWidget(m_tabs, 1);
 	m_sensitivity->setValue(ParseMouseSensitivity(mapping));
 

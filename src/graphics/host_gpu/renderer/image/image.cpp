@@ -710,15 +710,76 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
-		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
-		     "flags=0x%x samples=%u\n",
-		     static_cast<int>(create.format), static_cast<int>(create.imageType),
-		     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
-		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
+	const auto query = [&] {
+		return graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                        create.usage, create.flags,
+		                                        &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & create.samples);
+	};
+	if (!query()) {
+		// A guest can name a format whose host mapping satisfies only the base usage, and the format
+		// query then rejects the whole create rather than the individual flag. Both optional flags
+		// are hints -- EXTENDED_USAGE only enables aliasing views, BLOCK_TEXEL_VIEW_COMPATIBLE only
+		// relaxes block-texel view rules -- so rebuild the flag word from scratch without them
+		// rather than clearing bits in place, and keep whichever combination the device accepts.
+		const auto build_flags = [&](bool extended_usage, bool block_texel_view) {
+			vk::ImageCreateFlags flags {};
+			if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
+				flags |= vk::ImageCreateFlagBits::eMutableFormat;
+				if (extended_usage) {
+					flags |= vk::ImageCreateFlagBits::eExtendedUsage;
+				}
+				if (block_texel_view && info.IsBlock() && graphics.supports_block_texel_view) {
+					flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+				}
+			}
+			if (info.IsVolume()) {
+				flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
+			}
+			return flags;
+		};
+		const auto requested_flags = create.flags;
+		const auto requested_usage = create.usage;
+		bool       accepted        = false;
+		// Storage access is not universal across formats (packed 4-bit-per-channel targets and R8Uscaled reject it on
+		// some drivers): when no flag combination is accepted with it, the last resort is the image without it.
+		for (const bool drop_storage : {false, true}) {
+			if (drop_storage) {
+				if (!(requested_usage & vk::ImageUsageFlagBits::eStorage)) break;
+				create.usage = requested_usage & ~vk::ImageUsageFlagBits::eStorage;
+			}
+			for (const auto& attempt : {std::pair {false, false}, std::pair {true, false}, std::pair {false, true}}) {
+				create.flags = build_flags(attempt.first, attempt.second);
+				if (query()) {
+					accepted = true;
+					break;
+				}
+			}
+			if (accepted) break;
+		}
+		if (!accepted) {
+			create.flags = requested_flags;
+			create.usage = requested_usage;
+			EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
+			     "flags=0x%x samples=%u guest_format=%u tile=%u extent=%ux%u\n",
+			     static_cast<int>(create.format), static_cast<int>(create.imageType),
+			     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
+			     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples,
+			     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+			     info.extent.width, info.extent.height);
+		}
+		if (create.flags != requested_flags || create.usage != requested_usage) {
+			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+			if (!warned.test_and_set(std::memory_order_relaxed)) {
+				LOGF("WARNING: created %s with flags 0x%x usage 0x%x instead of 0x%x 0x%x: the driver rejects the "
+				     "requested combination for this format\n",
+				     vk::to_string(create.format).c_str(),
+				     static_cast<vk::ImageCreateFlags::MaskType>(create.flags),
+				     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
+				     static_cast<vk::ImageCreateFlags::MaskType>(requested_flags),
+				     static_cast<vk::ImageUsageFlags::MaskType>(requested_usage));
+			}
+		}
 	}
 
 	if (!graphics.CreateImage(create, backing)) {

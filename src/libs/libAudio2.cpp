@@ -177,7 +177,7 @@ struct AudioOut2ContextState {
 	uint32_t               queued              = 0;
 	uint32_t               num_grains          = 512;
 	uint64_t               last_update         = 0;
-	int                    object_audio_handle = 0;
+	int                    object_audio_handle = -1;
 	std::vector<float>     object_mix;
 };
 
@@ -191,7 +191,7 @@ struct AudioOut2PortStateEntry {
 	uint32_t               sampling_freq = 48000;
 	uint32_t               samples_num   = 512;
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
-	int                    audio_handle  = 0;
+	int                    audio_handle  = -1;
 	std::array<float, 16>  gains {};
 	uint32_t               ambisonics        = UINT32_MAX;
 	bool                   attributes_locked = false;
@@ -403,6 +403,7 @@ static void audioout2_mix_object(AudioOut2ContextState&         context,
 	}
 }
 
+// Queues the completed PCM buffers for all active ports in a context.
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue.
 	// Keep both PCM storage and port handles alive until it returns.
@@ -414,13 +415,13 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	context->object_mix.clear();
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
-	for (const auto& state: g_audioout2_ports) {
+	for (auto& state: g_audioout2_ports) {
 		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
 			continue;
 		}
 		if (audioout2_port_type_is_object(state.port_type)) {
 			audioout2_mix_object(*context, state);
-		} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
+		} else if (state.audio_handle >= 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
 			params.push_back({state.audio_handle, state.pcm_data.data(), state.gains.data()});
 		}
 	}
@@ -432,8 +433,10 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 		                                     blocking);
 	}
 }
+
+// Closes a valid zero-based audio handle; negative values represent no handle.
 static void audioout2_close_audio_handle(int audio_handle) {
-	if (audio_handle > 0) {
+	if (audio_handle >= 0) {
 		AudioInternal::AudioOutClose(audio_handle);
 	}
 }
@@ -475,6 +478,7 @@ int KYTY_SYSV_ABI AudioOut2ContextQueryMemory(const AudioOut2ContextParam* param
 	return OK;
 }
 
+// Creates an AudioOut2 context and opens its object-mix output when requested.
 int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, void* buffer,
                                          size_t buffer_size, AudioOut2ContextHandle* ctx) {
 	PRINT_NAME();
@@ -485,10 +489,10 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	const auto num_grains = params->num_grains == 0 ? 512u : params->num_grains;
 	const int  object_audio_handle =
 	    params->max_object_ports == 0
-	        ? 0
+	        ? -1
 	        : AudioInternal::AudioOutOpen(AUDIO_OUT_PORT_TYPE_MAIN, num_grains, 48000,
 	                                      AudioInternal::Format::FloatStereo);
-	if (params->max_object_ports != 0 && object_audio_handle == 0) {
+	if (params->max_object_ports != 0 && object_audio_handle < 0) {
 		return AUDIO_OUT2_ERROR_OUT_OF_RESOURCE;
 	}
 
@@ -520,6 +524,8 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 
 	return OK;
 }
+
+// Destroys a context, releases its ports, and closes its associated audio handles.
 int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 "\n", ctx);
@@ -529,14 +535,14 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		if (state->object_audio_handle > 0) {
+		if (state->object_audio_handle >= 0) {
 			audio_handles[audio_handles_num++] = state->object_audio_handle;
 		}
 		*state = AudioOut2ContextState {};
 	}
 	for (auto& port_state: g_audioout2_ports) {
 		if (port_state.used && port_state.context == ctx) {
-			if (port_state.audio_handle > 0 && audio_handles_num < audio_handles.size()) {
+			if (port_state.audio_handle >= 0 && audio_handles_num < audio_handles.size()) {
 				audio_handles[audio_handles_num++] = port_state.audio_handle;
 			}
 			port_state = AudioOut2PortStateEntry {};
@@ -635,6 +641,7 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 	return OK;
 }
 
+// Creates a context port and opens a host output handle for supported bed formats.
 int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params,
                                       AudioOut2PortHandle* port) {
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
@@ -651,7 +658,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
 	if (audioout2_port_type_is_object(params->port_type) &&
-	    (params->port_type != 0x100 || context_state->object_audio_handle == 0 ||
+	    (params->port_type != 0x100 || context_state->object_audio_handle < 0 ||
 	     params->sampling_freq != 48000 ||
 	     (audio_format != AudioInternal::Format::FloatMono &&
 	      audio_format != AudioInternal::Format::Signed16bitMono))) {
@@ -691,7 +698,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		return AUDIO_OUT2_ERROR_PORT_FULL;
 	}
 
-	int audio_handle = 0;
+	int audio_handle = -1;
 
 	if (audio_format != AudioInternal::Format::Unknown &&
 	    !audioout2_port_type_is_object(params->port_type)) {
@@ -725,11 +732,12 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	return OK;
 }
 
+// Destroys a port and closes its associated host audio handle.
 int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 	PRINT_NAME();
 	LOGF("\t port = 0x%016" PRIx64 "\n", port);
 
-	int audio_handle = 0;
+	int audio_handle = -1;
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
 		audio_handle = state->audio_handle;

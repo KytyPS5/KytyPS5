@@ -60,6 +60,8 @@ public:
 	// Stores own every tracked page up front: the guest may read before the dispatch completes.
 	void               PrepareBda(bool stores);
 	void               PrefetchBda(uint64_t address, bool store);
+	// Makes the committed mappings that run on from a store pointer without a gap resident.
+	void               PrefetchBdaStoreRun(uint64_t address);
 	// Makes [address, address + size) resident, and store-tracked when `store`, wherever mapped.
 	void               PrefetchBdaRange(uint64_t address, uint64_t size, bool store);
 	void               RunGarbageCollector();

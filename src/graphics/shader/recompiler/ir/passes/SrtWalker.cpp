@@ -57,6 +57,11 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	return true;
 }
 
+bool SrtReadCapture::ReadsHostMemory(const SrtRuntime& runtime) {
+	return runtime.read_memory == ReadOrdinary &&
+	       static_cast<const SrtReadCapture*>(runtime.userdata)->m_source.read_memory == nullptr;
+}
+
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
@@ -696,13 +701,19 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	uint32_t word = 0;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
+	// A host-memory read through a table below guest memory reads zero, whatever its offset.
+	if (!vector && base < GUEST_MEMORY_MIN &&
+	    (reader == nullptr || SrtReadCapture::ReadsHostMemory(m_runtime))) {
+		result = 0;
+		return true;
+	}
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
 			return false;
 		}
 	} else {
 		if (vector) return false;
-		if (base >= GUEST_MEMORY_MIN && address >= GUEST_MEMORY_MIN) {
+		if (address >= GUEST_MEMORY_MIN) {
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 	}

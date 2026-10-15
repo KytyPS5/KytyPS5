@@ -776,6 +776,8 @@ int main() {
     TestUndefinedRuntimeValueFails();
     TestNullTablePointerReadsZero(0x18u);
     TestNullTablePointerReadsZero(0x20000u);
+    TestNullTablePointerReadsZero(0x40000u);
+    TestNullTablePointerReadsZero(0x100000u);
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {

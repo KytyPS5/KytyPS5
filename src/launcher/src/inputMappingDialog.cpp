@@ -395,10 +395,10 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, ControllerPre
 	m_particle_skin->addItem(tr("Crimson"), QStringLiteral("Crimson"));
 	m_particle_skin->addItem(tr("Red/Blue"), QStringLiteral("RedBlue"));
 	touch_layout->addWidget(m_particle_skin);
-	m_touch_cursor = new QCheckBox(tr("Show hand cursor"), touch_group);
+	m_touch_cursor = new QCheckBox(tr("Show hand cursor and trail"), touch_group);
 	m_touch_cursor->setObjectName(QStringLiteral("touchCursorImage"));
 	m_touch_cursor->setToolTip(tr("When off, the emulated touch pad still works but the hand "
-	                              "image is not drawn (particles still follow your drawing)."));
+	                              "image and drawing trail are not shown."));
 	m_touch_cursor->setChecked(!mapping.contains(QLatin1String(TOUCH_CURSOR_OFF)));
 	touch_layout->addWidget(m_touch_cursor);
 	touch_layout->addStretch();

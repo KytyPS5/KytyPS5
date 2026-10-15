@@ -1464,6 +1464,11 @@ struct SystemOverlay::Impl {
 	}
 
 	void DrawTouchPadCursor(const HostInputTouchPadVisualState& state) {
+		if (!TouchCursorImageEnabled()) {
+			particles.clear();
+			trail_segments.clear();
+			return;
+		}
 		const auto now = Clock::now();
 		if (state.enabled && state.position_valid) {
 			const ImVec2 target {state.x * extent.width, state.y * extent.height};

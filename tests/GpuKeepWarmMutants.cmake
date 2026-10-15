@@ -1,0 +1,53 @@
+# Mutation tests of gpuKeepWarm.h. The production header carries no mutant switches: every mutant is a copy of it with one expression
+# changed, generated at configure time into the build directory. A mutant whose `from` text no longer exists (or occurs twice) fails the
+# configuration, so the list cannot silently go stale. Each mutant's test must fail (WILL_FAIL).
+
+set(KYTY_KW_MUTANT_DIR "${CMAKE_CURRENT_BINARY_DIR}/gpu_keepwarm_mutants")
+set(KYTY_KW_HEADER_REL "graphics/host_gpu/renderer/gpuKeepWarm.h")
+
+# name | from | to
+set(KYTY_KW_MUTANTS
+	no_guard luid_le_only luid_be_only wrong_device one_in_flight no_stop no_pause no_resume flag_not_set idle_short paused_time_dropped)
+set(KYTY_KW_FROM_no_guard "if (!apple_silicon) {")
+set(KYTY_KW_TO_no_guard "if (false) {")
+set(KYTY_KW_FROM_luid_le_only "return little == registry_id || big == registry_id;")
+set(KYTY_KW_TO_luid_le_only "return little == registry_id;")
+set(KYTY_KW_FROM_luid_be_only "return little == registry_id || big == registry_id;")
+set(KYTY_KW_TO_luid_be_only "return big == registry_id;")
+set(KYTY_KW_FROM_wrong_device "if (LuidIsRegistryId(wanted.luid, devices[i].registry_id)) {")
+set(KYTY_KW_TO_wrong_device "if (true) {")
+set(KYTY_KW_FROM_one_in_flight "m_in_flight < kMinInFlight ? kMinInFlight - m_in_flight : 0")
+set(KYTY_KW_TO_one_in_flight "m_in_flight < 1 ? 1 - m_in_flight : 0")
+set(KYTY_KW_FROM_no_stop "\t\tm_stopped = true;")
+set(KYTY_KW_TO_no_stop "")
+set(KYTY_KW_FROM_no_pause "now - m_last_activity.load() >= kIdleNs")
+set(KYTY_KW_TO_no_pause "false")
+set(KYTY_KW_FROM_no_resume "m_resumes++;\n\t\treturn TakeLocked();")
+set(KYTY_KW_TO_no_resume "m_resumes++;\n\t\treturn 0;")
+set(KYTY_KW_FROM_flag_not_set "\t\t\tm_paused_flag = true;\n")
+set(KYTY_KW_TO_flag_not_set "")
+set(KYTY_KW_FROM_idle_short "kIdleNs      = 250ull")
+set(KYTY_KW_TO_idle_short "kIdleNs      = 25ull")
+set(KYTY_KW_FROM_paused_time_dropped "m_paused_ns += now - m_pause_start;")
+set(KYTY_KW_TO_paused_time_dropped "")
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${KYTY_SOURCE_DIR}/${KYTY_KW_HEADER_REL}")
+file(READ "${KYTY_SOURCE_DIR}/${KYTY_KW_HEADER_REL}" KYTY_KW_TEXT)
+foreach(mutant IN LISTS KYTY_KW_MUTANTS)
+	set(from "${KYTY_KW_FROM_${mutant}}")
+	string(FIND "${KYTY_KW_TEXT}" "${from}" first)
+	if(first EQUAL -1)
+		message(FATAL_ERROR "gpu_keepwarm mutant ${mutant}: text not found in ${KYTY_KW_HEADER_REL}: ${from}")
+	endif()
+	string(REPLACE "${from}" "@@KW_MUTANT_SITE@@" probe "${KYTY_KW_TEXT}")
+	string(REGEX MATCHALL "@@KW_MUTANT_SITE@@" hits "${probe}")
+	list(LENGTH hits count)
+	if(NOT count EQUAL 1)
+		message(FATAL_ERROR "gpu_keepwarm mutant ${mutant}: text occurs ${count} times in ${KYTY_KW_HEADER_REL}: ${from}")
+	endif()
+	string(REPLACE "${from}" "${KYTY_KW_TO_${mutant}}" mutated "${KYTY_KW_TEXT}")
+	file(WRITE "${KYTY_KW_MUTANT_DIR}/${mutant}/${KYTY_KW_HEADER_REL}" "${mutated}")
+	add_executable(gpu_keepwarm_mutant_${mutant}_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuKeepWarmTests.cpp")
+	# The mutated copy is found first.
+	target_include_directories(gpu_keepwarm_mutant_${mutant}_tests BEFORE PRIVATE "${KYTY_KW_MUTANT_DIR}/${mutant}" ${inc_headers})
+endforeach()

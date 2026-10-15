@@ -332,11 +332,23 @@ list(APPEND kyty_emulator_src
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
+# KYTY_GPU_KEEPWARM: native Metal (Objective-C++), macOS only.
+if(APPLE)
+	set(KYTY_KEEPWARM_MM "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/gpuKeepWarm.mm")
+	# Compiled as C++ with the Objective-C++ dialect forced (enable_language(OBJCXX) after the second project() breaks the toolchain files).
+	set_source_files_properties("${KYTY_KEEPWARM_MM}" PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
+	list(APPEND kyty_emulator_src "${KYTY_KEEPWARM_MM}")
+endif()
+
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+
+if(APPLE)
+	list(APPEND kyty_emulator_link_libraries "-framework Metal" "-framework Foundation")
+endif()
 
 # Linux system libraries.
 if(LINUX)
@@ -575,6 +587,16 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(gpu_keepwarm_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuKeepWarmTests.cpp")
+target_include_directories(gpu_keepwarm_tests PRIVATE ${inc_headers})
+include("${KYTY_TESTS_DIR}/GpuKeepWarmMutants.cmake")
+if(APPLE)
+	# Smoke on the real MTLDevice (opt-in, needs the GPU): spins 3 s, expects cb_n > 0, and that the spin pauses when idle and resumes.
+	add_executable(gpu_keepwarm_gpu_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuKeepWarmGpuTests.cpp" "${KYTY_KEEPWARM_MM}")
+	target_include_directories(gpu_keepwarm_gpu_tests PRIVATE ${inc_headers})
+	target_link_libraries(gpu_keepwarm_gpu_tests "-framework Metal" "-framework Foundation")
+endif()
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -624,6 +646,11 @@ if(BUILD_TESTING)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
+	add_test(NAME gpu_keepwarm COMMAND $<TARGET_FILE:gpu_keepwarm_tests>)
+	foreach(mutant IN LISTS KYTY_KW_MUTANTS)
+		add_test(NAME gpu_keepwarm_mutant_${mutant} COMMAND $<TARGET_FILE:gpu_keepwarm_mutant_${mutant}_tests>)
+		set_tests_properties(gpu_keepwarm_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
+	endforeach()
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
@@ -729,6 +756,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	foreach(mutant IN LISTS KYTY_KW_MUTANTS)
+		add_dependencies(kyty_tests gpu_keepwarm_mutant_${mutant}_tests)
+	endforeach()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.

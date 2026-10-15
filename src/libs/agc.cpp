@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/gpuKeepWarm.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -68,6 +69,44 @@ static void AgcTrace(const char* format, const Args&... args) {
 	}
 }
 
+// KYTY_GPU_KEEPWARM=<K> (default OFF: nothing happens). The spin runs until Shutdown() or the end of the process.
+static void KeepWarmStart() {
+	const uint32_t groups = GpuKeepWarm::GroupsFromEnv();
+	if (groups == 0) {
+		return;
+	}
+	GpuKeepWarm::WantedDevice wanted;
+	const auto&               graphics = g_renderer->GetGraphics();
+	wanted.name                        = graphics.physical_device_properties.deviceName.data();
+	vk::PhysicalDeviceIDProperties id_properties {};
+	vk::PhysicalDeviceProperties2  properties2 {};
+	properties2.pNext = &id_properties;
+	graphics.physical_device.getProperties2(&properties2);
+	if (id_properties.deviceLUIDValid != VK_FALSE) {
+		// MoltenVK reports the registry id of the MTLDevice as the LUID.
+		std::memcpy(wanted.luid.data(), id_properties.deviceLUID.data(), wanted.luid.size());
+		wanted.has_luid = true;
+	}
+	std::string reason;
+	if (GpuKeepWarm::Start(groups, GpuKeepWarm::DispatchUsFromEnv(), wanted, reason)) {
+		LOGF("[keepwarm] on: K=%u ms=%.2f device=%s\n", groups, static_cast<double>(GpuKeepWarm::DispatchUsFromEnv()) / 1000.0,
+		     GpuKeepWarm::DeviceName());
+		std::atexit([] { GpuKeepWarm::Stop(); });
+	} else {
+		LOGF("[keepwarm] off: %s\n", reason.c_str());
+	}
+}
+
+static void KeepWarmStop() {
+	if (*GpuKeepWarm::DeviceName() == '\0') {
+		return;
+	}
+	GpuKeepWarm::Stop();
+	const auto st = GpuKeepWarm::GetStats();
+	LOGF("[keepwarm] stopped: cb_n=%" PRIu64 " gpu_ms=%.1f iters=%" PRIu64 " pauses=%" PRIu64 " resumes=%" PRIu64 " paused_ms=%.1f\n", st.cb_n,
+	     static_cast<double>(st.gpu_ns) / 1e6, st.iters, st.pauses, st.resumes, static_cast<double>(st.paused_ns) / 1e6);
+}
+
 void Initialize() {
 	// Some games lock up if this is not called first
 	if (Config::RenderDocEnabled()) {
@@ -84,10 +123,12 @@ void Initialize() {
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
 	EXIT_IF(Gen5Driver::Initialize() != OK);
 	ShaderInit();
+	KeepWarmStart();
 }
 
 void Shutdown() {
 	EXIT_IF(g_renderer == nullptr);
+	KeepWarmStop(); // before the device goes away; idempotent
 	g_renderer->ShutdownGpu();
 	Gen5Driver::ReleaseDmem();
 	VideoOut::VideoOutShutdown();

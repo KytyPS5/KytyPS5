@@ -682,6 +682,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			     stage, ir.shader_hash, traced);
 		}
 	}
+	if (const auto selects = IR::EliminateMaskedSelects(ir.blocks); selects != 0) {
+		LOGF("ShaderRecompiler %s masked select elimination: selects=%" PRIu32 "\n", stage, selects);
+	}
+	IR::RemoveIdentities(ir);
+	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;

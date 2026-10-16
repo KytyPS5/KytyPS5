@@ -9451,6 +9451,39 @@ void TestValuePhiValidation() {
 #endif
 }
 
+void TestMaskedSelectElimination() {
+  using namespace ShaderRecompiler::IR;
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.blocks.push_back(program.block_storage.back().get());
+  auto *block = program.blocks.front();
+  block->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+  IREmitter e(block);
+  const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+  const auto other = e.GetUserData(static_cast<ScalarReg>(1));
+  const auto exec = e.INotEqual(raw, U32(Value(0u)));
+  const auto selected = e.IEqual(other, U32(Value(7u)));
+  const auto active = e.LogicalAnd(exec, selected);
+  const auto sum = e.IAdd(raw, U32(Value(1u)));
+  // Masked again by its own consumer: only the active lanes' value is ever stored.
+  const auto masked = e.Select(exec, sum, raw);
+  const auto doubled = e.IAdd(masked, masked);
+  e.Emit(ValueOpcode::WriteSharedU32, {other, doubled, active});
+  // The same select reaching every lane keeps the inactive lanes' old value.
+  const auto kept = e.Select(exec, sum, other);
+  e.Emit(ValueOpcode::WriteSharedU32, {raw, kept, U1(Value(true))});
+  const auto partial = e.Select(selected, sum, other);
+  e.Emit(ValueOpcode::WriteSharedU32, {other, partial, exec});
+  Check(EliminateMaskedSelects(program.blocks) == 1,
+        "masked select elimination replaced the wrong number of selects");
+  Check(doubled.Resolve().TryInstruction()->Arg(0).Resolve() == sum.Resolve(),
+        "a select read only in its own lanes kept the old value");
+  Check(kept.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::SelectU32 &&
+            partial.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::SelectU32,
+        "masked select elimination dropped an old value another lane reads");
+}
+
 void TestLaneMaskProjection() {
   using namespace ShaderRecompiler::IR;
   for (const uint32_t wave_size : {32u, 64u}) {
@@ -13684,6 +13717,7 @@ int main() {
   TestSsaRewriteSealsFilledBlocks();
   TestValuePhiValidation();
   TestLaneMaskProjection();
+  TestMaskedSelectElimination();
   TestLateConstantPropagation();
   TestRepeatedBitcastPropagation();
   TestMaskedShiftConstantPropagation();

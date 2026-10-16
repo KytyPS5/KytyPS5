@@ -25828,13 +25828,17 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
   AppendVMovLiteral(&code, 3, 0x80007e00u);
   AppendVMovLiteral(&code, 4, 0x40007d01u);
   AppendVMovLiteral(&code, 5, 0x7d014000u);
+  AppendVMovLiteral(&code, 6, 0x40007e01u);
+  AppendVMovLiteral(&code, 7, 0x7e013c00u);
 
   AppendVop3p(&code, 0x11, 10, Vgpr(0), Vgpr(1), 0, 0x3);
   AppendVop3p(&code, 0x12, 11, Vgpr(2), Vgpr(3), 0, 0x3);
   AppendVop3p(&code, 0x11, 12, Vgpr(4), Vgpr(5), 0, 0x3);
   AppendVop3p(&code, 0x12, 13, Vgpr(4), Vgpr(5), 0, 0x3);
+  AppendVop3p(&code, 0x11, 14, Vgpr(6), Vgpr(7), 0, 0x3);
+  AppendVop3p(&code, 0x12, 15, Vgpr(6), Vgpr(7), 0, 0x3);
 
-  for (u32 i = 0; i < 4; i++) {
+  for (u32 i = 0; i < 6; i++) {
     AppendStoreVgpr(&code, 10 + i, i);
   }
   AppendEnd(&code);
@@ -25842,7 +25846,7 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
   return {"PackedMinMaxF16NanAndSignedZeroEdges",
           code,
           {},
-          {0x80004000u, 0x00004000u, 0x7f017f01u, 0x7f017f01u},
+          {0x80004000u, 0x00004000u, 0x7f017f01u, 0x7f017f01u, 0x40003c00u, 0x40003c00u},
           {O::V_MOV_B32, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }

@@ -6,6 +6,7 @@
 #include "configurationListWidget.h"
 #include "controllerPreview.h"
 #include "gameContent.h"
+#include "titleSound.h"
 #include "updateChecker.h"
 
 #include <QApplication>
@@ -90,6 +91,7 @@ private:
 	MainDialog*     m_main_dialog    = nullptr;
 	UpdateChecker*  m_update_checker = nullptr;
 	ControllerPreview m_controller_preview;
+	TitleSound      m_title_sound;
 	QString         m_interpreter;
 
 	QProcess m_process;
@@ -124,7 +126,13 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
-	connect(m_ui->widget, &ConfigurationListWidget::Select, this, &MainDialogPrivate::Update);
+	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
+		Update();
+		const auto* item = m_ui->widget->GetSelectedItem();
+		m_title_sound.SetTitle(m_process.state() == QProcess::NotRunning && item != nullptr
+		                           ? item->GetInfo().basedir
+		                           : QString());
+	});
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_process.state() == QProcess::NotRunning) {
@@ -530,6 +538,7 @@ void MainDialogPrivate::Run() {
 
 	m_running_item->SetRunning(true);
 	m_controller_preview.SetSuspended(true);
+	m_title_sound.SetTitle({});
 
 	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
 	m_main_dialog->RunInterpreter(&m_process, *info);

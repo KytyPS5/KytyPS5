@@ -223,10 +223,18 @@ bool DepthColorCopyEnabled(const GraphicContext& graphics) {
 	return true;
 }
 
+// A one-row 2D image places its texels exactly where a 1D image of that width does.
+[[nodiscard]] Prospero::ImageType RowType(const ImageInfo& info) {
+	return info.type == Prospero::ImageType::kColor2D && info.extent.height == 1
+	           ? Prospero::ImageType::kColor1D
+	           : info.type;
+}
+
 [[nodiscard]] bool SameAliasLayout(const ImageInfo& a, const ImageInfo& b) {
 	// Equal pitch and tile mode put a texel at the same address in both, so extents may differ.
 	return a.data == b.data && a.resources == b.resources && a.pitch == b.pitch &&
 	       a.bytes_per_block == b.bytes_per_block && a.tile_mode == b.tile_mode &&
+	       RowType(a) == RowType(b) && a.IsBlock() == b.IsBlock() && SameGuestMipLayout(a, b) &&
 	       a.extent.depth == b.extent.depth;
 }
 
@@ -1127,6 +1135,8 @@ void TextureCache::WakeImage(ImageId id, const ImageIds& candidates) {
 	if (!UnparkImage(id)) {
 		return;
 	}
+	// The alias parked below may hold pixels written while this image slept.
+	SyncLayoutAlias(id, candidates);
 	auto       owner   = m_slot_images.try_get(id);
 	const auto address = owner->info.data.address;
 	const auto size    = owner->info.data.size;

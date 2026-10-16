@@ -29,6 +29,7 @@ endfunction()
 
 # Header mutants: name, from, to (all in perVertexVsStore.h).
 set(KYTY_PV_HEADER_MUTANTS
+	binding_fits_no_tail
 	first_third
 	no_instance
 	no_first
@@ -114,6 +115,8 @@ set(KYTY_PV_FROM_scan_drop_ok "\t\t\tdropped = true;\n\t\t\tcontinue;")
 set(KYTY_PV_TO_scan_drop_ok "\t\t\tcontinue;")
 set(KYTY_PV_FROM_scan_end_inclusive "range.end   = static_cast<uint64_t>(hi) + 1;")
 set(KYTY_PV_TO_scan_end_inclusive "range.end   = static_cast<uint64_t>(hi);")
+set(KYTY_PV_FROM_binding_fits_no_tail "return desc.ok && desc.tail_fits;")
+set(KYTY_PV_TO_binding_fits_no_tail "return desc.ok;")
 set(KYTY_PV_FROM_scan_overflow_ok "if (adjusted > INT32_MAX) return {};")
 set(KYTY_PV_TO_scan_overflow_ok "")
 

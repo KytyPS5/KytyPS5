@@ -1109,7 +1109,8 @@ bool RenderExecutor::TryPvVsStoreDraw(const DrawCallInfo& draw, const DrawRender
                                       vk::PrimitiveTopology topology, bool primitive_restart_enable,
                                       const DrawEmitInfo&          emit,
                                       const DrawIndexBufferSource& index_source,
-                                      PvVsStoreDrawSetup&          setup) {
+                                      bool index_bound, uint64_t index_offset,
+                                      uint64_t index_buffer_size, PvVsStoreDrawSetup& setup) {
 	if (!state.ps_active || state.vertex_info[0].logical_stage != ShaderType::Vertex ||
 	    state.vertex_info[0].stage.program->stage == ShaderType::Mesh)
 		return false;
@@ -1156,19 +1157,15 @@ bool RenderExecutor::TryPvVsStoreDraw(const DrawCallInfo& draw, const DrawRender
 	// PerVertexKHR.
 	const bool index_aligned = element_size == 0 || index_source.host_data != nullptr ||
 	                           index_source.address % element_size == 0;
-	// The descriptor of the index buffer must stay inside the buffer the cache hands out (its end
-	// is not ours to choose): obtain the binding now (the draw obtains the same range again) and
-	// ask whether the last word the PS reads fits. A host copy is padded to a whole word in
-	// PrepareIndexBuffer.
-	bool index_tail_fits = true;
-	if (index_aligned && scannable && index_source.host_data == nullptr) {
-		const auto [index_buffer, index_offset] =
-		    m_context.GetBufferCache().ObtainBuffer(index_source.address, index_source.size, false);
-		index_tail_fits =
-		    PvVsStoreIndexDescriptorFor(index_offset, element_size, graphics.StorageMinAlignment(),
-		                                index_source.size, index_buffer->Size())
-		        .tail_fits;
-	}
+	// The descriptor of the index buffer must be bindable and stay inside the buffer the cache
+	// handed out (its end is not ours to choose). Asked of the binding the draw really uses (this
+	// runs after PrepareIndexBuffer): an earlier ObtainBuffer could be stale, the cache may merge
+	// or move the range while the other resources of the draw are prepared. A host copy is padded
+	// to a whole word in PrepareIndexBuffer.
+	const bool index_tail_fits =
+	    !index_aligned || !index_bound ||
+	    PvVsStoreIndexBindingFits(index_offset, element_size, graphics.StorageMinAlignment(),
+	                              index_source.size, index_buffer_size);
 	if (!m_pv_vsstore)
 		m_pv_vsstore =
 		    std::make_shared<PvVsStoreRuntime>(graphics, m_context.GetCommandScheduler());
@@ -1281,10 +1278,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
-	PvVsStoreDrawSetup pv_store;
-	const bool use_pv_store = !mesh_active && PvVsStoreEnabled() &&
-	                          TryPvVsStoreDraw(draw, state, topology, primitive_restart_enable,
-	                                           emit, index_source, pv_store);
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1307,6 +1300,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	// The VS-store decision needs the index binding the draw really got (the cache may move or
+	// merge the range while the bindings above are prepared); it only chooses the pipeline, which
+	// is made below.
+	PvVsStoreDrawSetup pv_store;
+	const bool         use_pv_store =
+	    !mesh_active && PvVsStoreEnabled() &&
+	    TryPvVsStoreDraw(draw, state, topology, primitive_restart_enable, emit, index_source,
+	                     index_binding.buffer != nullptr, index_binding.offset, index_binding.size,
+	                     pv_store);
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}

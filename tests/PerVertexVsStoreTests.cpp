@@ -309,6 +309,17 @@ void TestIndexDescriptor() {
 	Check(!PvVsStoreIndexDescriptorFor(0, 1, 16, 12, 12, kClamp).ok, "bad element size");
 }
 
+// The decision is taken on the binding the draw really got: a range that fits where an early ObtainBuffer put it can sit elsewhere
+// (another offset, a smaller buffer) once the cache has merged or moved it.
+void TestIndexBindingFits() {
+	Check(PvVsStoreIndexBindingFits(0, 4, 16, 24, 64), "early binding: offset 0 in a 64-byte buffer fits");
+	Check(!PvVsStoreIndexBindingFits(36, 4, 16, 24, 59), "actual binding: offset 36 in a 59-byte buffer does not fit (tail)");
+	Check(!PvVsStoreIndexBindingFits(34, 4, 16, 24, 64), "actual binding: offset 34 is not a multiple of the element size (not bindable)");
+	Check(PvVsStoreIndexBindingFits(36, 4, 16, 24, 64), "actual binding: offset 36 in a 64-byte buffer fits");
+	Check(!PvVsStoreIndexBindingFits(0, 2, 16, 10, 10), "16-bit odd end at the buffer end does not fit");
+	Check(PvVsStoreIndexBindingFits(0, 2, 16, 10, 12), "a word-padded buffer fits");
+}
+
 void TestIndexTailDecision() {
 	const auto place_ok = [](const PvVsStorePlan&) { return true; };
 	PvVsStoreRequest r;
@@ -460,6 +471,7 @@ int main() {
 	TestIndexBinding();
 	TestIndexRange();
 	TestIndexDescriptor();
+	TestIndexBindingFits();
 	TestIndexTailDecision();
 	TestSlabs();
 	TestFallbackClass();

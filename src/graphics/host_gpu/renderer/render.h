@@ -194,12 +194,14 @@ private:
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
 	// True when the draw takes the VS-store path (fills `setup`); counts the fallback reason
-	// otherwise.
+	// otherwise. Called after the index buffer is prepared: `index_bound` / `index_offset` /
+	// `index_buffer_size` describe the binding the draw will really use.
 	[[nodiscard]] bool TryPvVsStoreDraw(const DrawCallInfo& draw, const DrawRenderState& state,
 	                                    vk::PrimitiveTopology topology,
 	                                    bool primitive_restart_enable, const DrawEmitInfo& emit,
 	                                    const DrawIndexBufferSource& index_source,
-	                                    PvVsStoreDrawSetup&          setup);
+	                                    bool index_bound, uint64_t index_offset,
+	                                    uint64_t index_buffer_size, PvVsStoreDrawSetup& setup);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,

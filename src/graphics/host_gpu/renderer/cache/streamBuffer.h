@@ -35,10 +35,18 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+// A sparse buffer only gets device memory for the ranges passed to EnsureResident; the rest reads
+// as zero. Meant for large tables that are mostly empty, such as the BDA page table.
+struct SparseResidency {
+	uint64_t chunk_size;
+};
+
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, vk::BufferUsageFlags flags,
+	       uint64_t size, SparseResidency residency);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -67,6 +75,9 @@ public:
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	// Sparse buffers only: backs the range with zeroed device memory. No-op otherwise.
+	void               EnsureResident(uint64_t offset, uint64_t size);
+	[[nodiscard]] bool IsSparse() const noexcept { return m_sparse_chunk_size != 0; }
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
@@ -89,6 +100,9 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	uint64_t                      m_sparse_chunk_size   = 0;
+	uint32_t                      m_sparse_memory_types = 0;
+	std::vector<VmaAllocation>    m_sparse_chunks;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;

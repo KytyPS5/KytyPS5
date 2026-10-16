@@ -14710,17 +14710,13 @@ public:
                                     {probe_width, 1, 1}, selected_layer) == expected,
                 "native metadata did not materialize the expected color");
         if (fill_case.reuse_mips) {
+          // A tiled chain stores small mips first: the two-level chain's mip 0 is not at offset 0.
           const auto &image = texture_cache.GetImage(color.image_id);
-          Require(name, "single-mip clear reuses mip chain",
-                  color.image_id == preexisting_id && image.info.resources.levels == 2 &&
+          Require(name, "single-mip clear gets its own image",
+                  color.image_id != preexisting_id && image.info.resources.levels == 1 &&
                       color.desc.info.resources.levels == 1 &&
                       color.desc.view_info.base_level == 0 && color.desc.view_info.level_count == 1,
-                  "the single-mip target did not retain its cached image and view scope");
-          Require(name, "single-mip clear preserves higher mip",
-                  ReadCachedTexel(name, context, color.image_id, {255, 127, 0},
-                                  {1, 1, 1}, 0, 1) ==
-                      std::vector<u32>{0x00003c00u, 0x00003c00u},
-                  "clearing mip zero changed its higher mip");
+                  "the single-mip target reused a chain whose mip 0 lies at another offset");
         }
         const auto check_expanded_metadata = [&] {
           context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);

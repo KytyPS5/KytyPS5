@@ -535,7 +535,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                                         native->info);
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		const auto per_fragment_writes = depth.AttachmentWriteAspects(false);
+		if ((feedback_aspects & per_fragment_writes) &&
+		    !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
 		auto layout = depth_attachment_layout(depth);

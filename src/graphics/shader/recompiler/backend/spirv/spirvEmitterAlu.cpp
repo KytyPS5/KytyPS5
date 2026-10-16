@@ -123,16 +123,37 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	const auto min_ab   = EmitMinMaxF32Value(state, a, b, false);
-	const auto min3     = EmitMinMaxF32Value(state, min_ab, c, false);
-	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);
-	const auto high_min = EmitMinMaxF32Value(state, max_ab, c, false);
-	const auto median   = EmitMinMaxF32Value(state, min_ab, high_min, true);
-	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state),
-	                             EmitClassifyF32(state, a).nan, EmitClassifyF32(state, b).nan);
+	const auto u     = TypeU32(state);
+	const auto order = [&](uint32_t x) {
+		const auto sign = Binary(state, spv::OpShiftRightArithmetic, u, x, ConstantU32(state, 31));
+		return Binary(state, spv::OpBitwiseXor, u, x, EmitAndConstant(state, sign, 0x7fffffffu));
+	};
+	const auto smin = [&](uint32_t x, uint32_t y) {
+		return EmitExt(state, u, GLSLstd450SMin, {x, y});
+	};
+	const auto smax = [&](uint32_t x, uint32_t y) {
+		return EmitExt(state, u, GLSLstd450SMax, {x, y});
+	};
+	const std::array        inputs {a, b, c};
+	std::array<uint32_t, 3> bits {}, keys {}, nans {}, masked {};
+	for (uint32_t i = 0; i < 3; i++) {
+		bits[i] = EmitBitcastF32ToU32(state, inputs[i]);
+		keys[i] = order(bits[i]);
+		nans[i] = EmitCompareU32Constant(state, spv::OpUGreaterThan,
+		                                 EmitAndConstant(state, bits[i], 0x7fffffffu), 0x7f800000u);
+		masked[i] = Select(state, u, nans[i], ConstantU32(state, 0x7fffffffu), keys[i]);
+	}
+	const auto median = smax(smin(keys[0], keys[1]), smin(smax(keys[0], keys[1]), keys[2]));
+	const auto min3   = smin(smin(masked[0], masked[1]), masked[2]);
 	const auto any_nan =
-	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitClassifyF32(state, c).nan);
-	return Select(state, TypeF32(state), any_nan, min3, median);
+	    Binary(state, spv::OpLogicalOr, TypeBool(state),
+	           Binary(state, spv::OpLogicalOr, TypeBool(state), nans[0], nans[1]), nans[2]);
+	const auto all_nan =
+	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	           Binary(state, spv::OpLogicalAnd, TypeBool(state), nans[0], nans[1]), nans[2]);
+	const auto result =
+	    Select(state, u, all_nan, bits[2], order(Select(state, u, any_nan, min3, median)));
+	return EmitBitcastU32ToF32(state, result);
 }
 
 uint32_t EmitFindUMsb64(EmitterState& state, uint32_t value) {

@@ -164,6 +164,16 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
 	return EquivalentValue(program, left, right, visited);
 }
 
+bool EquivalentSelectorDomain(const ResourcePlan& program,
+                              const DescriptorSource::IndirectDescriptor& left,
+                              const DescriptorSource::IndirectDescriptor& right) {
+	return left.selector == right.selector && left.signed_count == right.signed_count &&
+	       left.workgroup_axis == right.workgroup_axis &&
+	       EquivalentValue(program, left.key_count, right.key_count) &&
+	       EquivalentValue(program, left.selector_first, right.selector_first) &&
+	       EquivalentValue(program, left.selector_mask, right.selector_mask);
+}
+
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	value            = value.Resolve();
 	const auto* root = value.TryInstruction();
@@ -471,10 +481,15 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
-					return Fail("indirect buffer requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
+					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
+					            "or formatted X load");
 				}
+				const auto access = BufferAccessOf(inst.GetOpcode());
+				const bool packed_formatted =
+				    (access == BufferAccess::Read || access == BufferAccess::Write) && memory.formatted &&
+				    memory.data_bits == 16u && memory.component_count == 4u && buffer_components == 2u;
 				if (buffer_components > 1u &&
-				    (!vector_buffer || memory.data_bits != 32u ||
+				    (!vector_buffer || (memory.data_bits != 32u && !packed_formatted) ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
 					return Fail(fmt::format("{} has inconsistent native-wide metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));
@@ -661,13 +676,6 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		if (!info.indirect_target.IsEmpty() && !control_dominates(info.indirect_target, block)) {
 			return Fail("value IR indirect selector definition does not dominate its use");
 		}
-	}
-}
-
-void ResolveControlFlowIdentities(Program& program) {
-	for (auto* block: program.blocks) {
-		block->condition       = block->condition.Resolve();
-		block->indirect_target = block->indirect_target.Resolve();
 	}
 }
 

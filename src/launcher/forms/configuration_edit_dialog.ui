@@ -201,6 +201,29 @@
               <property name="checked"><bool>true</bool></property>
              </widget>
             </item>
+            <item>
+             <layout class="QHBoxLayout" name="trophyDurationLayout">
+              <item>
+               <widget class="QLabel" name="label_trophy_duration">
+                <property name="text"><string>Trophy notification duration:</string></property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QSpinBox" name="spinBox_trophy_duration">
+                <property name="toolTip"><string>How long each trophy unlock notification stays on screen.</string></property>
+                <property name="suffix"><string> s</string></property>
+                <property name="minimum"><number>5</number></property>
+                <property name="maximum"><number>10</number></property>
+                <property name="value"><number>6</number></property>
+               </widget>
+              </item>
+              <item>
+               <spacer name="trophyDurationSpacer">
+                <property name="orientation"><enum>Qt::Horizontal</enum></property>
+               </spacer>
+              </item>
+             </layout>
+            </item>
            </layout>
           </widget>
          </item>

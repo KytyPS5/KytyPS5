@@ -1,11 +1,21 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void RemoveIdentities(const BlockList& blocks) {
-	for (auto* block: blocks) {
+void RemoveIdentities(Program& program) {
+	// Resolve metadata before deleting its identity nodes; retain only folded native constants.
+	for (auto& write: program.scalar_writes) {
+		const auto value = write.value.Resolve();
+		write.value = value.IsImmediate() && value.GetType() == Type::U32 ? value : Value {};
+	}
+	for (auto* block: program.blocks) {
+		block->condition       = block->condition.Resolve();
+		block->indirect_target = block->indirect_target.Resolve();
+	}
+	for (auto* block: program.blocks) {
 		auto& instructions = block->Instructions();
 		for (auto inst = instructions.begin(); inst != instructions.end();) {
 			if (inst->GetOpcode() != ValueOpcode::Identity) {

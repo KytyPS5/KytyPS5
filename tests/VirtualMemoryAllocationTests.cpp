@@ -926,6 +926,19 @@ void TestFlexibleNoCoalescePreservesBoundaries() {
 	            0, 1, "no_coalesce");
 	ExpectRange(test, Query(test, base + SceKernelPageSize), base + SceKernelPageSize,
 	            base + SceKernelPageSize * 2, SceKernelProtCpuRw, 1, 0, 0, 1, "no_coalesce");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reserve, SceKernelPageSize * 2,
+	                                                SceKernelProtCpuRead),
+	        "KernelMprotect(NO_COALESCE span)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelSetVirtualRangeName(reserve, SceKernelPageSize * 2,
+	                                                           "renamed_no_coalesce"),
+	        "KernelSetVirtualRangeName(NO_COALESCE span)");
+	for (uint64_t i = 0; i < 2; ++i) {
+		ExpectRange(test, Query(test, base + i * SceKernelPageSize), base + i * SceKernelPageSize,
+		            base + (i + 1) * SceKernelPageSize, SceKernelProtCpuRead, 1, 0, 0, 1,
+		            "renamed_no_coalesce");
+	}
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
 	        "KernelMunmap");
@@ -1262,6 +1275,179 @@ void TestPartialFlexibleMunmapAndFindNext() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestFlexibleRangeEditsCoalesce() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "FlexibleRangeEditsCoalesce";
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t pages    = 129;
+	constexpr uint64_t size     = pages * page;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	const auto         base     = MapNamedFlexible(test, size, SceKernelProtCpuRw, "dense_ranges");
+
+	// Alternate protections fragment one allocation into many independently queryable ranges.
+	for (uint64_t i = 1; i < pages; i += 2) {
+		CheckOk(
+		    test,
+		    KernelMprotect(reinterpret_cast<void*>(base + i * page), page, SceKernelProtCpuRead),
+		    "KernelMprotect(fragment)");
+	}
+	for (uint64_t i = 0; i < pages; ++i) {
+		ExpectRange(test, Query(test, base + i * page + page - 1), base + i * page,
+		            base + (i + 1) * page, i % 2 == 0 ? SceKernelProtCpuRw : SceKernelProtCpuRead,
+		            1, 0, 0, 1, "dense_ranges");
+	}
+	CheckOk(test, KernelMprotect(reinterpret_cast<void*>(base), size, SceKernelProtCpuRw),
+	        "KernelMprotect(coalesce all fragments)");
+	ExpectRange(test, Query(test, base + size - 1), base, base + size, SceKernelProtCpuRw, 1, 0, 0,
+	            1, "dense_ranges");
+
+	// Renaming the interior must split both boundaries, then restoring it must join both sides.
+	CheckOk(test,
+	        KernelSetVirtualRangeName(reinterpret_cast<void*>(base + page), size - 2 * page,
+	                                  "renamed_interior"),
+	        "KernelSetVirtualRangeName(interior)");
+	ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRw, 1, 0, 0, 1,
+	            "dense_ranges");
+	ExpectRange(test, Query(test, base + page), base + page, base + size - page, SceKernelProtCpuRw,
+	            1, 0, 0, 1, "renamed_interior");
+	ExpectRange(test, Query(test, base + size - page), base + size - page, base + size,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "dense_ranges");
+	CheckOk(test,
+	        KernelSetVirtualRangeName(reinterpret_cast<void*>(base + page), size - 2 * page,
+	                                  "dense_ranges"),
+	        "KernelSetVirtualRangeName(restore interior)");
+	ExpectRange(test, Query(test, base), base, base + size, SceKernelProtCpuRw, 1, 0, 0, 1,
+	            "dense_ranges");
+
+	for (uint64_t i = 1; i < pages; i += 2) {
+		CheckOk(test,
+		        KernelSetVirtualRangeName(reinterpret_cast<void*>(base + i * page), page,
+		                                  "fragment_name"),
+		        "KernelSetVirtualRangeName(fragment)");
+	}
+	CheckOk(test, KernelClearVirtualRangeName(reinterpret_cast<void*>(base), size),
+	        "KernelClearVirtualRangeName(coalesce all fragments)");
+	ExpectRange(test, Query(test, base + size - 1), base, base + size, SceKernelProtCpuRw, 1, 0, 0,
+	            1, "");
+
+	constexpr uint64_t middle = pages / 2 * page;
+	CheckOk(test, KernelMunmap(base + middle, page), "KernelMunmap(create hole)");
+	CheckOk(test, KernelSetVirtualRangeName(reinterpret_cast<void*>(base), size, "across_hole"),
+	        "KernelSetVirtualRangeName(across hole)");
+	ExpectRange(test, Query(test, base + middle - 1), base, base + middle, SceKernelProtCpuRw, 1, 0,
+	            0, 1, "across_hole");
+	ExpectUnmapped(test, base + middle);
+	ExpectRange(test, Query(test, base + middle, SceKernelVqFindNext), base + middle + page,
+	            base + size, SceKernelProtCpuRw, 1, 0, 0, 1, "across_hole");
+	Check(test, ClampRangeSize(base + middle - page / 2, page) == page / 2,
+	      "range clamp crossed the hole after renaming");
+	CheckOk(test, KernelMunmap(base, middle), "KernelMunmap(left cleanup)");
+	CheckOk(test, KernelMunmap(base + middle + page, size - middle - page),
+	        "KernelMunmap(right cleanup)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "range edit cleanup did not restore flexible capacity");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestPageTableStatsTrackRangeEdits() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test       = "PageTableStatsTrackRangeEdits";
+	constexpr uint64_t page       = SceKernelPageSize;
+	constexpr uint64_t table_span = 0x200000;
+	constexpr uint64_t size       = table_span + 3 * page;
+	constexpr int      gpu_read   = 0x10;
+	constexpr int      gpu_write  = 0x20;
+	constexpr int      both       = SceKernelProtCpuRw | gpu_read;
+	const auto         read_stats = [&] {
+		std::array<int, 4> stats {};
+		CheckOk(test, KernelGetPageTableStats(&stats[0], &stats[1], &stats[2], &stats[3]),
+		        "KernelGetPageTableStats");
+		return stats;
+	};
+	const auto baseline    = read_stats();
+	const auto expect_used = [&](int cpu, int gpu, const char* action) {
+		const auto stats = read_stats();
+		Check(test,
+		      stats[0] == baseline[0] && stats[2] == baseline[2] && baseline[1] - stats[1] == cpu &&
+		          baseline[3] - stats[3] == gpu,
+		      std::string(action) + " changed page-table statistics unexpectedly");
+	};
+	void* address = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&address, size, 0, table_span),
+	        "KernelReserveVirtualRange(flexible stats)");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	Check(test, base % table_span == 0, "stats reservation is not aligned");
+	expect_used(0, 0, "reservation");
+	CheckOk(test,
+	        KernelMapNamedFlexibleMemory(&address, size, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                     "table_stats"),
+	        "KernelMapNamedFlexibleMemory(stats)");
+	expect_used(2, 0, "flexible mapping across two table entries");
+
+	// The existing ABI estimate counts each fragment's touched 2 MiB entries independently.
+	void* middle = reinterpret_cast<void*>(base + page);
+	CheckOk(test, KernelSetVirtualRangeName(middle, page, "table_stats_middle"),
+	        "KernelSetVirtualRangeName(stats split)");
+	expect_used(4, 0, "name split");
+	CheckOk(test, KernelSetVirtualRangeName(middle, page, "table_stats"),
+	        "KernelSetVirtualRangeName(stats merge)");
+	expect_used(2, 0, "name coalescing");
+	CheckOk(test, KernelMprotect(middle, page, both), "KernelMprotect(stats split)");
+	expect_used(4, 1, "protection split");
+	CheckOk(test, KernelMprotect(address, size, both), "KernelMprotect(stats merge)");
+	expect_used(2, 2, "protection coalescing");
+	CheckOk(test, KernelMprotect(address, size, gpu_write), "KernelMprotect(GPU only)");
+	expect_used(0, 2, "GPU-only protection");
+	CheckOk(test, KernelMprotect(address, size, SceKernelProtCpuRw), "KernelMprotect(CPU only)");
+	expect_used(2, 0, "CPU-only protection");
+	CheckOk(test, KernelMprotect(address, size, 0), "KernelMprotect(no access)");
+	expect_used(0, 0, "no-access protection");
+	CheckOk(test, KernelMprotect(address, size, both), "KernelMprotect(restore stats access)");
+	CheckOk(test, KernelMunmap(base + page, page), "KernelMunmap(stats middle)");
+	expect_used(3, 3, "partial removal");
+	CheckOk(test, KernelMunmap(base, page), "KernelMunmap(stats left)");
+	expect_used(2, 2, "exact removal");
+	CheckOk(test, KernelMunmap(base + 2 * page, size - 2 * page), "KernelMunmap(stats right)");
+	expect_used(0, 0, "flexible cleanup");
+
+	int64_t physical = 0;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 3 * page, page,
+	                                   SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory(stats)");
+	address = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&address, 3 * page, 0, table_span),
+	        "KernelReserveVirtualRange(direct stats)");
+	const auto direct_base = reinterpret_cast<uint64_t>(address);
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&address, 3 * page, both, SceKernelMapFixed, physical, page,
+	                                   "direct_table_stats"),
+	        "KernelMapNamedDirectMemory(stats)");
+	expect_used(1, 1, "direct mapping");
+	CheckOk(test, KernelMprotect(reinterpret_cast<void*>(direct_base + page), page, both),
+	        "KernelMprotect(unchanged direct stats subspan)");
+	expect_used(3, 3, "unchanged direct protection split");
+#if defined(__linux__)
+	TestFailNextVirtualRangeReplacement();
+	CheckFailed(test,
+	            KernelMapNamedDirectMemory(&address, 3 * page, SceKernelProtCpuRw,
+	                                       SceKernelMapFixed, physical, page,
+	                                       "rejected_table_stats"),
+	            "KernelMapNamedDirectMemory(stats publication failure)");
+	expect_used(3, 3, "failed direct replacement");
+#endif
+	address = reinterpret_cast<void*>(direct_base);
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&address, 3 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                   physical, page, "replacement_table_stats"),
+	        "KernelMapNamedDirectMemory(stats replacement)");
+	expect_used(1, 0, "direct replacement");
+	CheckOk(test, KernelReleaseDirectMemory(physical, 3 * page),
+	        "KernelReleaseDirectMemory(stats cleanup)");
+	expect_used(0, 0, "direct cleanup");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestReserveMapFixedAndNoOverwrite() {
 	const char* test = "ReserveMapFixedAndNoOverwrite";
 	void*       addr = nullptr;
@@ -1502,6 +1688,88 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	ExpectUnmapped(test, base);
 	ExpectUnmapped(test, base + SceKernelPageSize * 2);
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFixedArenaChurnKeepsRangesExact() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test        = "FixedArenaChurnKeepsRangesExact";
+	constexpr uint64_t page        = SceKernelPageSize;
+	constexpr uint64_t arena_size  = page * 4;
+	constexpr uint64_t arena_count = 8;
+	constexpr uint64_t size        = arena_size * arena_count;
+	int64_t            physical    = 0;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), size, page, SceKernelMtypeC,
+	                                   &physical),
+	        "KernelAllocateDirectMemory");
+	void* reservation = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reservation, size, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base      = reinterpret_cast<uint64_t>(reservation);
+	const auto offset    = static_cast<uint64_t>(physical);
+	const auto map_arena = [&](uint64_t i) {
+		void* target = reinterpret_cast<void*>(base + i * arena_size);
+		CheckOk(test,
+		        KernelMapNamedDirectMemory(&target, arena_size, SceKernelProtCpuRw,
+		                                   SceKernelMapFixed, physical + i * arena_size, page,
+		                                   "fixed_arena"),
+		        "KernelMapNamedDirectMemory(arena)");
+		Check(test, reinterpret_cast<uint64_t>(target) == base + i * arena_size,
+		      "fixed arena mapping moved");
+	};
+	for (uint64_t i = 0; i < arena_count; ++i) {
+		map_arena(i);
+	}
+	CheckOk(test, KernelMunmap(base + 2 * arena_size, 4 * arena_size), "KernelMunmap(arenas 2-5)");
+	map_arena(3);
+	for (uint64_t i: {0, 1, 3, 6, 7}) {
+		ExpectRange(test, Query(test, base + i * arena_size), base + i * arena_size,
+		            base + (i + 1) * arena_size, SceKernelProtCpuRw, 0, 1, 0, 1, "fixed_arena",
+		            offset + i * arena_size);
+	}
+	for (uint64_t i: {2, 4, 5}) {
+		ExpectUnmapped(test, base + i * arena_size);
+	}
+	ExpectRange(test, Query(test, base + 4 * arena_size, SceKernelVqFindNext),
+	            base + 6 * arena_size, base + 7 * arena_size, SceKernelProtCpuRw, 0, 1, 0, 1,
+	            "fixed_arena", offset + 6 * arena_size);
+
+	// A span crossing two direct mappings splits each one and preserves its physical offset.
+	CheckOk(
+	    test,
+	    KernelMprotect(reinterpret_cast<void*>(base + 2 * page), 4 * page, SceKernelProtCpuRead),
+	    "KernelMprotect(across direct arenas)");
+	for (uint64_t i = 0; i < 4; ++i) {
+		ExpectRange(test, Query(test, base + i * 2 * page), base + i * 2 * page,
+		            base + (i + 1) * 2 * page,
+		            i == 1 || i == 2 ? SceKernelProtCpuRead : SceKernelProtCpuRw, 0, 1, 0, 1,
+		            "fixed_arena", offset + i * 2 * page);
+	}
+	CheckOk(test, KernelMprotect(reservation, 2 * arena_size, SceKernelProtCpuRw),
+	        "KernelMprotect(restore direct arenas)");
+	CheckOk(test, KernelSetVirtualRangeName(reservation, 2 * arena_size, "renamed_arena"),
+	        "KernelSetVirtualRangeName(direct arenas)");
+	for (uint64_t i = 0; i < 4; ++i) {
+		ExpectRange(test, Query(test, base + i * 2 * page), base + i * 2 * page,
+		            base + (i + 1) * 2 * page, SceKernelProtCpuRw, 0, 1, 0, 1, "renamed_arena",
+		            offset + i * 2 * page);
+	}
+	// Even unchanged protection preserves the new boundary when direct ranges cannot merge.
+	CheckOk(test, KernelMprotect(reinterpret_cast<void*>(base + page), page, SceKernelProtCpuRw),
+	        "KernelMprotect(unchanged direct subspan)");
+	ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRw, 0, 1, 0, 1,
+	            "renamed_arena", offset);
+	ExpectRange(test, Query(test, base + page), base + page, base + 2 * page, SceKernelProtCpuRw, 0,
+	            1, 0, 1, "renamed_arena", offset + page);
+	Check(test, ClampRangeSize(base + page, 2 * arena_size) == 2 * arena_size - page,
+	      "range clamp did not traverse direct fragments up to the hole");
+	CheckOk(test, KernelMunmap(base, 2 * arena_size), "KernelMunmap(arenas 0-1)");
+	CheckOk(test, KernelMunmap(base + 3 * arena_size, arena_size), "KernelMunmap(arena 3)");
+	CheckOk(test, KernelMunmap(base + 6 * arena_size, 2 * arena_size), "KernelMunmap(arenas 6-7)");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + size - 1);
+	CheckOk(test, KernelReleaseDirectMemory(physical, size), "KernelReleaseDirectMemory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4509,6 +4777,25 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
+		RunTest(TestFlexibleNoCoalescePreservesBoundaries);
+		RunTest(TestFlexibleRangeEditsCoalesce);
+		RunTest(TestPageTableStatsTrackRangeEdits);
+		RunTest(TestPartialFlexibleMunmapAndFindNext);
+		RunTest(TestReserveMapFixedAndNoOverwrite);
+		RunTest(TestFixedNoOverwriteRejectsReservedRange);
+		RunTest(TestFixedArenaChurnKeepsRangesExact);
+		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+		RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+#if defined(__linux__)
+		RunTest(TestFixedDirectReplacementPreservesAccess);
+#endif
+		RunTest(TestFixedReserveReplacesPartialDirectMapping);
+		RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
+		RunTest(TestMemoryPoolMultiRangeDecommit);
+		RunTest(TestProgramMemoryAllocationAndProtection);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
@@ -4585,12 +4872,15 @@ int main(int argc, char** argv) {
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
+	RunTest(TestFlexibleRangeEditsCoalesce);
+	RunTest(TestPageTableStatsTrackRangeEdits);
 	RunTest(TestReserveMapFixedAndNoOverwrite);
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+	RunTest(TestFixedArenaChurnKeepsRangesExact);
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
 #endif

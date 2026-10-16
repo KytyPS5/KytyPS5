@@ -21,6 +21,7 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	bool                        emit_debug_info            = false;
 	bool                        maintenance8_enabled       = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;

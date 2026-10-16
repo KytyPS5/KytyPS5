@@ -556,6 +556,8 @@ struct ShaderRegisters {
 	uint32_t m_vgtGsMaxVertOut        = 0;
 	uint32_t m_vgtGsOutPrimType       = 0;
 	uint32_t m_vgtPrimitiveIdEn       = 0;
+	uint32_t m_vgtDrawPayloadCntl     = 0;
+	uint32_t m_paClObjprimIdCntl      = 0;
 	uint32_t m_vgtReuseOff            = 0;
 	uint32_t m_vgtTessDistribution    = 0;
 	uint32_t m_vgtLsHsConfig          = 0;
@@ -679,6 +681,10 @@ public:
 
 	void                   SetRenderTargetMask(uint32_t mask) { m_render_target_mask = mask; }
 	[[nodiscard]] uint32_t GetRenderTargetMask() const { return m_render_target_mask; }
+	[[nodiscard]] bool HasObjectPrimitiveIdOutput() const {
+		return (m_sh_regs.m_vgtDrawPayloadCntl & 1u) != 0 &&
+		       (m_render_target_mask & 0xf0000000u) != 0;
+	}
 
 	void                   SetShaderStages(uint32_t flags) { m_shader_stages = flags; }
 	[[nodiscard]] uint32_t GetShaderStages() const { return m_shader_stages; }
@@ -877,6 +883,8 @@ public:
 	void SetGsMaxVertOut(uint32_t value) { m_sh_regs.m_vgtGsMaxVertOut = value; }
 	void SetGsOutPrimType(uint32_t value) { m_sh_regs.m_vgtGsOutPrimType = value; }
 	void SetPrimitiveIdEn(uint32_t value) { m_sh_regs.m_vgtPrimitiveIdEn = value; }
+	void SetDrawPayloadControl(uint32_t value) { m_sh_regs.m_vgtDrawPayloadCntl = value; }
+	void SetObjprimIdControl(uint32_t value) { m_sh_regs.m_paClObjprimIdCntl = value; }
 	void SetReuseOff(uint32_t value) { m_sh_regs.m_vgtReuseOff = value; }
 	void SetTessDistribution(uint32_t value) { m_sh_regs.m_vgtTessDistribution = value; }
 	void SetLsHsConfig(uint32_t value) { m_sh_regs.m_vgtLsHsConfig = value; }

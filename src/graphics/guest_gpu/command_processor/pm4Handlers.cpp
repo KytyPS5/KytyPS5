@@ -295,10 +295,6 @@ static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t valu
 	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
 }
 
-static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreObjprimIdControl([[maybe_unused]] uint32_t value) {}
-
 static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreVtxControl([[maybe_unused]] uint32_t value) {}
@@ -454,23 +450,13 @@ KYTY_HW_CTX_PARSER(HwCtxSetAlphaToMask) {
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetDrawPayloadControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreDrawPayloadControl(buffer[i]);
-	}
-
-	return num_values;
+	cp.GetCtx().SetDrawPayloadControl(buffer[0]);
+	return KYTY_PM4_LEN(cmd_id) - 2u;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetObjprimIdControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreObjprimIdControl(buffer[i]);
-	}
-
-	return num_values;
+	cp.GetCtx().SetObjprimIdControl(buffer[0]);
+	return KYTY_PM4_LEN(cmd_id) - 2u;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetPrimitiveIdReset) {
@@ -1304,8 +1290,8 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
-	return (cmd_id == 0xc0061050 ? 7 : 6);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
+	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
@@ -3106,7 +3092,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetTfParam(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_DRAW_PAYLOAD_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreDrawPayloadControl(value);
+		cp.GetCtx().SetDrawPayloadControl(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_PRIMITIVEID_RESET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnorePrimitiveIdReset(value);
@@ -3115,7 +3101,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetShaderZFormat(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_CL_OBJPRIM_ID_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreObjprimIdControl(value);
+		cp.GetCtx().SetObjprimIdControl(value);
 	};
 
 	for (auto cmd_offset = Pm4::PA_SC_CLIPRECT_RULE; cmd_offset < Pm4::PA_SC_CLIPRECT_0_TL + 8u;

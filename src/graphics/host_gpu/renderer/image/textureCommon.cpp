@@ -64,7 +64,10 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
                                                     Prospero::ChannelOrder  order) {
 	const auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
 	if (encoding.IsValid() && encoding.SupportsOrder(order)) {
-		const auto host_format = ResolveHostFormat(encoding.buffer_format, order);
+		const auto backing_format = encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm
+		                                ? Prospero::RemapTextureFormat(encoding.buffer_format)
+		                                : encoding.buffer_format;
+		const auto host_format = ResolveHostFormat(backing_format, order);
 		const auto bytes       = Prospero::RenderTargetBytesPerElement(encoding.buffer_format);
 		if (host_format.format != vk::Format::eUndefined && bytes != 0) {
 			const auto order_mapping =

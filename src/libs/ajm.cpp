@@ -156,20 +156,8 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
 
-	auto* handle = Atrac9GetHandle();
-	if (handle == nullptr) {
-		return AJM_ERROR_INVALID_PARAMETER;
-	}
-
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = AjmAt9InitDecoder(handle, static_cast<const uint8_t*>(config_data));
-	const int       info_result =
-	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
-	Atrac9ReleaseHandle(handle);
-
-	if (info_result != 0 || codec_info.channels <= 0 || codec_info.samplingRate <= 0 ||
-	    codec_info.frameSamples <= 0 || codec_info.framesInSuperframe <= 0 ||
-	    codec_info.superframeSize <= 0) {
+	if (!AjmAt9GetCodecInfo(static_cast<const uint8_t*>(config_data), codec_info)) {
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
 

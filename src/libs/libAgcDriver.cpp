@@ -19,8 +19,8 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("wRbq6ZjNop4", Gen5::AgcGetRegisterDefaults2Internal);
 	LIB_FUNC("f3dg2CSgRKY", Gen5::AgcCreateShader);
 	LIB_FUNC("dolOmWH+huQ", Gen5::AgcUnknownGetFusedShaderSize);
-	LIB_FUNC("fd5Bp5tGTgo", Gen5::AgcUnknownFuseShaderHalves);
-	LIB_FUNC("nApJjpKNBl4", Gen5::AgcUnknownNApJjpKNBl4);
+	LIB_FUNC("fd5Bp5tGTgo", Gen5::AgcFuseShaderHalves_0200);
+	LIB_FUNC("nApJjpKNBl4", Gen5::AgcFuseShaderHalves);
 	LIB_FUNC("vcmNN+AAXnY", Gen5::AgcSetCxRegIndirectPatchSetAddress);
 	LIB_FUNC("Qrj4c+61z4A", Gen5::AgcSetShRegIndirectPatchSetAddress);
 	LIB_FUNC("6lNcCp+fxi4", Gen5::AgcSetUcRegIndirectPatchSetAddress);
@@ -108,7 +108,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("6DFuRKT4C9w", Gen5::AgcDcbSetNumInstancesGetSize);
 	LIB_FUNC("q88lQ+GP5Yk", Gen5::AgcDcbDrawIndex);
 	LIB_FUNC("6ee9Hd3EWXQ", Gen5::AgcDcbDrawIndexGetSize);
-	LIB_FUNC("Ikfdt-rIqCE", Gen5::AgcUnknownIkfdtRIqCE);
+	LIB_FUNC("Ikfdt-rIqCE", Gen5::AgcJumpPatchSetTarget_0300);
 	LIB_FUNC("Rlx+bykm0r0", Gen5::AgcDcbDrawIndexMultiInstanced);
 	LIB_FUNC("mR9j7+SfM34", Gen5::AgcDcbDrawIndexMultiInstancedGetSize);
 	LIB_FUNC("Yw0jKSqop+E", Gen5::AgcDcbDrawIndexAuto);
@@ -137,7 +137,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("BIPexNBSGog", Gen5::AgcDcbCondExec);
 	LIB_FUNC("ou16V5hh5sg", Gen5::AgcDcbCondExecGetSize);
 	LIB_FUNC("bbFueFP+J4k", Gen5::AgcDcbSetPredication);
-	LIB_FUNC("-KRzWekV120", Gen5::AgcUnknownKRzWekV120);
+	LIB_FUNC("-KRzWekV120", Gen5::AgcDcbSetIndexSize_0600);
 	LIB_FUNC("IxYiarKlXxM", Gen5::AgcDmaDataPatchSetDstAddressOrOffset);
 	LIB_FUNC("cdDRpqcFGbU", Gen5::AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate);
 	LIB_FUNC("Lkf86B98qPc", Gen5::AgcGetPacketSize);
@@ -158,10 +158,10 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("MlEw1feXcjg", Gen5::AgcQueueEndOfPipeActionPatchData);
 	LIB_FUNC("ORWsxIbk4TE", Gen5::AgcCondExecPatchSetEnd);
 	LIB_FUNC("YWTKOju587o", Gen5::AgcCondExecPatchSetCommandAddress);
-	LIB_FUNC("k-JpyR2dYAM", Gen5::AgcCondExecPatchSetEnd);
-	LIB_FUNC("3ZWa3AoyWZQ", Gen5::AgcCondExecPatchSetCommandAddress);
+	LIB_FUNC("k-JpyR2dYAM", Gen5::AgcCondExecPatchSetEnd);            // sceAgcAsyncCondExecPatchSetEnd
+	LIB_FUNC("3ZWa3AoyWZQ", Gen5::AgcCondExecPatchSetCommandAddress); // sceAgcAsyncCondExecPatchSetCommandAddress
 	LIB_FUNC("ziVA3whp3p4", Gen5::AgcRewindPatchSetRewindState);
-	LIB_FUNC("eWaWyFegzgQ", Gen5::AgcRewindPatchSetRewindState);
+	LIB_FUNC("eWaWyFegzgQ", Gen5::AgcRewindPatchSetRewindState);      // sceAgcAsyncRewindPatchSetRewindState
 	LIB_FUNC("YUeqkyT7mEQ", Gen5::AgcDcbSetFlip);
 }
 
@@ -177,9 +177,9 @@ LIB_DEFINE(InitAgcDriver_1) {
 	PRINT_NAME_ENABLE(true);
 
 	LIB_FUNC("UglJIZjGssM", Gen5Driver::AgcDriverSubmitDcb);
-	LIB_FUNC("AhGvpITrf4M", Gen5Driver::AgcDriverSubmitDcb);
+	LIB_FUNC("AhGvpITrf4M", Gen5Driver::AgcDriverSubmitDcb);       // sceAgcDriverAgrSubmitDcb
 	LIB_FUNC("6UzEidRZwkg", Gen5Driver::AgcDriverSubmitMultiDcbs);
-	LIB_FUNC("+T8Xo6LtFJI", Gen5Driver::AgcDriverSubmitMultiDcbs);
+	LIB_FUNC("+T8Xo6LtFJI", Gen5Driver::AgcDriverSubmitMultiDcbs); // sceAgcDriverAgrSubmitMultiDcbs
 	LIB_FUNC("b4fpgH5ZXxQ", Gen5Driver::AgcDriverSubmitCommandBuffer);
 	LIB_FUNC("Fj7r9EHzF38", Gen5Driver::AgcDriverSubmitMultiCommandBuffers);
 	LIB_FUNC("gSRnr79F8tQ", Gen5Driver::AgcDriverSubmitAcb);
@@ -191,7 +191,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("XlNp7jzGiPo", Gen5Driver::AgcDriverSetTFRing);
 	LIB_FUNC("MM4IZSEYytQ", Gen5Driver::AgcDriverSetHsOffchipParam);
 	LIB_FUNC("Ddwk4gLT5j0", Gen5Driver::AgcDriverIsCaptureInProgress);
-	LIB_FUNC("U9ueyEhSkF4", Gen5Driver::AgcDriverUnknownU9ueyEhSkF4);
+	LIB_FUNC("U9ueyEhSkF4", Gen5Driver::AgcDriverRegisterDefaultOwner);
 }
 
 } // namespace LibGen5Driver

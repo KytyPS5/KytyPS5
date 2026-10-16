@@ -18,6 +18,9 @@
 
 namespace Libs {
 
+namespace LibNpEntitlementAccess {
+void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase* s);
+}
 namespace LibNpTrophy2 {
 void InitNet_1_NpTrophy2(Loader::SymbolDatabase* s);
 }
@@ -1662,152 +1665,6 @@ LIB_DEFINE(InitNet_1_NpSessionSignaling) {
 }
 
 } // namespace LibNpSessionSignaling
-
-namespace LibNpEntitlementAccess {
-
-LIB_VERSION("NpEntitlementAccess", 1, "NpEntitlementAccess", 1, 1);
-
-constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER      = -2122514430; /* 0x817D0002 */
-constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT = -2122514425; /* 0x817D0007 */
-constexpr uint32_t NP_ENTITLEMENT_ACCESS_SKU_FLAG_FULL        = 3;
-
-struct NpEntitlementAccessInitParam {
-	char reserved[32];
-};
-
-struct NpEntitlementAccessBootParam {
-	char reserved[32];
-};
-
-struct NpUnifiedEntitlementLabel {
-	char data[17];
-	char padding[3];
-};
-
-struct NpEntitlementAccessAddcontEntitlementInfo {
-	NpUnifiedEntitlementLabel entitlement_label;
-	uint32_t                  package_type;
-	uint32_t                  download_status;
-};
-
-struct NpEntitlementAccessEntitlementKey {
-	uint8_t data[16];
-};
-
-static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
-    {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
-    {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
-    {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
-};
-
-static int KYTY_SYSV_ABI NpEntitlementAccessInitialize(
-    const NpEntitlementAccessInitParam* init_param, NpEntitlementAccessBootParam* boot_param) {
-	PRINT_NAME();
-
-	if (init_param == nullptr || boot_param == nullptr) {
-		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-	}
-
-	memset(boot_param, 0, sizeof(*boot_param));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpEntitlementAccessGetSkuFlag(uint32_t* sku_flag) {
-	PRINT_NAME();
-
-	if (sku_flag == nullptr) {
-		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-	}
-
-	*sku_flag = NP_ENTITLEMENT_ACCESS_SKU_FLAG_FULL;
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
-    uint32_t service_label, NpEntitlementAccessAddcontEntitlementInfo* list, uint32_t list_num,
-    uint32_t* hit_num) {
-	PRINT_NAME();
-
-	LOGF("\t service_label = %" PRIu32 "\n", service_label);
-	LOGF("\t list          = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(list));
-	LOGF("\t list_num      = %" PRIu32 "\n", list_num);
-	LOGF("\t hit_num       = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(hit_num));
-
-	if (hit_num == nullptr || (list == nullptr && list_num != 0)) {
-		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-	}
-
-	*hit_num = static_cast<uint32_t>(sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST) /
-	                                 sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST[0]));
-
-	if (list != nullptr && list_num != 0) {
-		memset(list, 0, sizeof(*list) * list_num);
-
-		const auto copy_num = (list_num < *hit_num ? list_num : *hit_num);
-		for (uint32_t i = 0; i < copy_num; i++) {
-			list[i] = NP_ENTITLEMENT_ACCESS_ADDON_LIST[i];
-		}
-	}
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
-    uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
-    NpEntitlementAccessAddcontEntitlementInfo* info) {
-	PRINT_NAME();
-
-	LOGF("\t service_label     = %" PRIu32 "\n", service_label);
-	LOGF("\t entitlement_label = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(entitlement_label));
-	LOGF("\t info              = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(info));
-
-	if (entitlement_label == nullptr || info == nullptr) {
-		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-	}
-
-	memset(info, 0, sizeof(*info));
-
-	for (const auto& entitlement: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
-		if (strncmp(entitlement_label->data, entitlement.entitlement_label.data,
-		            sizeof(entitlement_label->data)) == 0) {
-			*info = entitlement;
-			return 0;
-		}
-	}
-
-	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
-}
-
-static int KYTY_SYSV_ABI NpEntitlementAccessGetEntitlementKey(
-    uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
-    NpEntitlementAccessEntitlementKey* key) {
-	PRINT_NAME();
-
-	LOGF("\t service_label     = %" PRIu32 "\n"
-	     "\t entitlement_label = 0x%016" PRIx64 "\n"
-	     "\t key               = 0x%016" PRIx64 "\n",
-	     service_label, reinterpret_cast<uint64_t>(entitlement_label),
-	     reinterpret_cast<uint64_t>(key));
-
-	if (entitlement_label == nullptr || key == nullptr) {
-		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-	}
-
-	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
-}
-
-LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
-	LIB_FUNC("jO8DM8oyego", LibNpEntitlementAccess::NpEntitlementAccessInitialize);
-	LIB_FUNC("lPDO62PpJIA", LibNpEntitlementAccess::NpEntitlementAccessGetSkuFlag);
-	LIB_FUNC("TFyU+KFBv54",
-	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
-	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
-	LIB_FUNC("5LiMEPuW0DQ", LibNpEntitlementAccess::NpEntitlementAccessGetEntitlementKey);
-}
-
-} // namespace LibNpEntitlementAccess
 
 namespace LibNpAuth {
 

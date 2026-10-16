@@ -236,7 +236,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		// DCC owns the clear when both planes are enabled; single-sample CMASK stays expanded.
 		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
-		desc.info.metadata.clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.clear_word =
+		    rt.clear_word0.word0 | (uint64_t {rt.clear_word1.word1} << 32u);
 		desc.info.metadata.clear_register_valid = true;
 	}
 	desc.view_info.format = target_format.format;

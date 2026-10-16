@@ -27872,15 +27872,15 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
       {0x40400000u, 0x7fc01234u, 0x40000000u, 0x40000000u},
       {0x80000000u, 0x00000000u, 0x3f800000u, 0x00000000u},
       {0x00000000u, 0x80000000u, 0xbf800000u, 0x80000000u},
-      {0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0x00000000u, 0x80000000u, 0x00000000u},
-      {0x80000000u, 0x00000000u, 0x80000000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u},
       {0x00000000u, 0x80000000u, 0x80000000u, 0x80000000u},
-      {0xbf800000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0xbf800000u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0xbf800000u, 0x00000000u, 0x80000000u, 0x80000000u},
-      {0x80000000u, 0xbf800000u, 0x00000000u, 0x00000000u},
+      {0x80000000u, 0xbf800000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0xbf800000u, 0x80000000u, 0x80000000u},
-      {0x80000000u, 0x00000000u, 0xbf800000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0xbf800000u, 0x80000000u},
       {0x7fc01234u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0x3f800000u, 0x40400000u, 0x40000000u, 0x40000000u},
       {0xc0400000u, 0xbf800000u, 0xc0000000u, 0xc0000000u},
@@ -27913,8 +27913,8 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 17,593/36,607 words; keep classification growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 17600u : 36620u;
+  // Measured 13,164/27,739 words; keep classification growth below a single MED3.
+  test.max_spirv_words = wave == 32u ? 13171u : 27752u;
   return test;
 }
 

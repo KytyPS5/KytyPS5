@@ -102,6 +102,35 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 	}
 }
 
+// Nothing writes an image in these layouts, whatever attachment access the uses name.
+bool IsReadOnlyLayout(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+		case vk::ImageLayout::eShaderReadOnlyOptimal:
+		case vk::ImageLayout::eDepthReadOnlyOptimal:
+		case vk::ImageLayout::eStencilReadOnlyOptimal:
+		case vk::ImageLayout::eReadOnlyOptimal: return true;
+		default: return false;
+	}
+}
+
+// Within one read-only layout no write can follow the barrier that entered it, so a use whose
+// accesses and stages an earlier barrier already made visible needs none. Otherwise the barrier
+// adds the new use and the state keeps every reader, for the barrier that leaves the layout.
+bool CoveredReadOnlyUse(const VulkanImageState& state, vk::ImageLayout layout,
+                        vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
+	return state.layout == layout && IsReadOnlyLayout(layout) && !(access & ~state.access_mask) &&
+	       !(stage & ~state.pl_stage);
+}
+
+VulkanImageState NextImageState(const VulkanImageState& state, vk::ImageLayout layout,
+                                vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
+	if (state.layout == layout && IsReadOnlyLayout(layout)) {
+		return {state.pl_stage | stage, state.access_mask | access, layout};
+	}
+	return {stage, access, layout};
+}
+
 } // namespace
 
 vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
@@ -182,6 +211,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			subresource_states.clear();
 		}
 	} else {
+		if (CoveredReadOnlyUse(state, destination_layout, destination_access, destination_stage)) {
+			return {};
+		}
 		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
 		                                vk::AccessFlagBits2::eShaderWrite |
 		                                vk::AccessFlagBits2::eMemoryWrite;
@@ -207,6 +239,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barrier.subresourceRange.baseArrayLayer = 0;
 		barrier.subresourceRange.layerCount     = VK_REMAINING_ARRAY_LAYERS;
 		barriers.push_back(barrier);
+		state = NextImageState(state, destination_layout, destination_access, destination_stage);
+		return barriers;
 	}
 
 	state = {destination_stage, destination_access, destination_layout};

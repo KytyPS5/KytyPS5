@@ -68,29 +68,68 @@ inline vk::ImageAspectFlags DepthReadableAspects(vk::ImageLayout layout) {
 	}
 }
 
-inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
-	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
-	const auto writes        = depth.AttachmentWriteAspects();
-	const bool has_depth     = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
-	const bool has_stencil   = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);
-	// The attachment layout must permit load clears as well as draw writes.
-	const bool depth_write   = static_cast<bool>(writes & vk::ImageAspectFlagBits::eDepth);
-	const bool stencil_write = static_cast<bool>(writes & vk::ImageAspectFlagBits::eStencil);
+// Aspects a draw may write through an attachment in this layout.
+inline vk::ImageAspectFlags DepthWritableAspects(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilAttachmentOptimal:
+			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+		case vk::ImageLayout::eDepthAttachmentOptimal:
+		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+			return vk::ImageAspectFlagBits::eDepth;
+		case vk::ImageLayout::eStencilAttachmentOptimal:
+		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+			return vk::ImageAspectFlagBits::eStencil;
+		default: return {};
+	}
+}
+
+// Whether a depth attachment in `layout` permits a draw that writes `writes` (draw writes and load
+// clears alike) and samples `sampled` aspects. Feedback-loop layouts are left to the caller.
+inline bool DepthAttachmentLayoutPermits(vk::ImageLayout layout, vk::ImageAspectFlags writes,
+                                         vk::ImageAspectFlags sampled) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilAttachmentOptimal:
+		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthAttachmentOptimal:
+		case vk::ImageLayout::eDepthReadOnlyOptimal:
+		case vk::ImageLayout::eStencilAttachmentOptimal:
+		case vk::ImageLayout::eStencilReadOnlyOptimal:
+			return !(writes & ~DepthWritableAspects(layout)) &&
+			       !(sampled & ~DepthReadableAspects(layout));
+		default: return false;
+	}
+}
+
+// The layout a depth attachment enters for a draw that writes `writes` and samples `sampled`
+// aspects, the sampled ones read-only. Draws keep it while it permits their accesses: changing it
+// ends the render pass and can make the GPU decompress the surface. With nothing sampled every
+// aspect is writable, as games alternate which aspects consecutive draws write; otherwise
+// unwritten aspects are read-only as well, so draws that only test and sample need no barriers.
+inline vk::ImageLayout depth_attachment_layout(vk::ImageAspectFlags available,
+                                               vk::ImageAspectFlags writes,
+                                               vk::ImageAspectFlags sampled) {
+	const auto writable         = sampled ? writes & ~sampled : available;
+	const bool has_depth        = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
+	const bool has_stencil      = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);
+	const bool depth_writable   = static_cast<bool>(writable & vk::ImageAspectFlagBits::eDepth);
+	const bool stencil_writable = static_cast<bool>(writable & vk::ImageAspectFlagBits::eStencil);
 	if (!has_stencil) {
-		return depth_write ? vk::ImageLayout::eDepthAttachmentOptimal
-		                   : vk::ImageLayout::eDepthReadOnlyOptimal;
+		return depth_writable ? vk::ImageLayout::eDepthAttachmentOptimal
+		                      : vk::ImageLayout::eDepthReadOnlyOptimal;
 	}
 	if (!has_depth) {
-		return stencil_write ? vk::ImageLayout::eStencilAttachmentOptimal
-		                     : vk::ImageLayout::eStencilReadOnlyOptimal;
+		return stencil_writable ? vk::ImageLayout::eStencilAttachmentOptimal
+		                        : vk::ImageLayout::eStencilReadOnlyOptimal;
 	}
-	if (depth_write && stencil_write) {
+	if (depth_writable && stencil_writable) {
 		return vk::ImageLayout::eDepthStencilAttachmentOptimal;
 	}
-	if (depth_write) {
+	if (depth_writable) {
 		return vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
 	}
-	if (stencil_write) {
+	if (stencil_writable) {
 		return vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
 	}
 	return vk::ImageLayout::eDepthStencilReadOnlyOptimal;

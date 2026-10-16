@@ -31,6 +31,9 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
+	bool                               shader_buffer_int64_atomics_enabled   = false;
+	bool                               supports_image_view_min_lod           = true;
+	bool                               shader_cull_distance_enabled          = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;

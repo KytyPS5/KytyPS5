@@ -426,6 +426,7 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	EXIT_IF((Prospero::RemapTextureFormat(format) == format && !raw_signed) || info.component_count == 0u ||
 	        info.component_count > 4u);
 	EXIT_IF(!raw_signed && info.type != Format::ComponentType::Uscaled &&
+	        info.type != Format::ComponentType::Sscaled &&
 	        ((info.type != Format::ComponentType::Uint &&
 	          info.type != Format::ComponentType::Unorm) || !info.packed_bitfield ||
 	         info.byte_size != sizeof(uint32_t)));
@@ -477,7 +478,22 @@ uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem)
 	return selector >= 4u ? (selector - 4u) % info.component_count : 0u;
 }
 
-uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
+// A *SCALED image is backed by the UNorm/SNorm format of the same width; this is the factor
+// that turns its normalized texel back into the integer the guest sees (as a float).
+float ScaledTexelFactor(const Format::BufferFormatInfo& info) {
+	if (info.type != Format::ComponentType::Uscaled && info.type != Format::ComponentType::Sscaled) {
+		return 255.0f;
+	}
+	const auto bits = info.component_bits[0];
+	return static_cast<float>(info.type == Format::ComponentType::Sscaled ? (1u << (bits - 1u)) - 1u
+	                                                                      : (1u << bits) - 1u);
+}
+
+// `exact` is for texel fetches, which return the stored integer exactly after rounding the
+// product; filtered samples keep the interpolated value. 8-bit UScaled predates this and keeps
+// its unrounded product.
+uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel,
+                          bool exact = false) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return DecodeSrgb(ctx.state, mem, texel);
 
@@ -500,16 +516,27 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 			components[component] = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(spv::OpCompositeExtract, scalar_type,
 			                              components[component], texel, component);
-			// UNorm backing preserves the guest's filtering; scaling precedes swizzle constants.
-			const auto unorm_max = static_cast<float>((1u << info.component_bits[component]) - 1u);
+			// UNorm/SNorm backing preserves the guest's filtering; scaling precedes swizzle
+			// constants.
+			const auto scale = info.type == Format::ComponentType::Sscaled
+			                       ? ScaledTexelFactor(info)
+			                       : static_cast<float>((1u << info.component_bits[component]) - 1u);
 			components[component] = Binary(ctx.state, spv::OpFMul, scalar_type, components[component],
-			                               ConstantF32Value(ctx.state, unorm_max));
+			                               ConstantF32Value(ctx.state, scale));
 			if (integer) {
 				// Depth bits: round back to the stored UNorm code.
 				components[component] =
 				    Unary(ctx.state, spv::OpConvertFToU, TypeU32(ctx.state),
 				          Binary(ctx.state, spv::OpFAdd, scalar_type, components[component],
 				                 ConstantF32Value(ctx.state, 0.5f)));
+			} else if (exact && (info.type == Format::ComponentType::Sscaled ||
+			                     (info.type == Format::ComponentType::Uscaled &&
+			                      info.component_bits[0] > 8u))) {
+				const auto rounded = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction(spv::OpExtInst, scalar_type, rounded,
+				                              GlslStd450(ctx.state), GLSLstd450RoundEven,
+				                              components[component]);
+				components[component] = rounded;
 			}
 		}
 	}
@@ -554,6 +581,7 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 		uint32_t value;
 		switch (info.type) {
 			case Format::ComponentType::Uscaled:
+			case Format::ComponentType::Sscaled:
 				value = ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
 				break;
 			default: value = ConstantU32(ctx.state, selector == 1u ? 1u : 0u); break;
@@ -562,7 +590,7 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 		                                  value, value);
 	}
 	if (!info.packed_bitfield) {
-		const auto scale  = ConstantF32Value(ctx.state, 255.0f);
+		const auto scale  = ConstantF32Value(ctx.state, ScaledTexelFactor(info));
 		const auto scales = ctx.state.builder.Constant(spv::OpConstantComposite, vector_type,
 		                                                scale, scale, scale, scale);
 		return Binary(ctx.state, spv::OpFMul, vector_type, gathered, scales);
@@ -811,7 +839,8 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 		candidate_mem.resource = resource;
 		if (!scalar) {
 			value = gather ? UnpackImageGather(ctx, candidate_mem, value)
-			               : UnpackImageTexel(ctx, candidate_mem, value);
+			               : UnpackImageTexel(ctx, candidate_mem, value,
+			                                  inst.GetOpcode() == IR::ValueOpcode::ImageRead);
 		}
 		return ResultVector(ctx, value,
 		                    dref ? Prospero::TextureNumericClass::Float

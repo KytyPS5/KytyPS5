@@ -24082,6 +24082,31 @@ public:
                   signed_surface.conversion_format ==
                       Prospero::BufferFormat::kInvalid,
               "signed sampled texture class or native backing changed");
+
+      // 16_16_16_16 USCALED/SSCALED sample through the UNorm/SNorm backing; the formats that
+      // were already supported keep their class and their (absent) remap.
+      using F = Prospero::BufferFormat;
+      using C = Prospero::TextureNumericClass;
+      const auto unchanged = [](F f, C c, F remap) {
+        return Prospero::SampledTextureNumericClass(f) == c &&
+               Prospero::RemapTextureFormat(f) == remap;
+      };
+      Require(name, "16_16_16_16 scaled texture mapping",
+              unchanged(F::k16_16_16_16UScaled, C::Float, F::k16_16_16_16UNorm) &&
+                  unchanged(F::k16_16_16_16SScaled, C::Float, F::k16_16_16_16SNorm) &&
+                  unchanged(F::k16_16_16_16UNorm, C::Float, F::k16_16_16_16UNorm) &&
+                  unchanged(F::k16_16_16_16SNorm, C::Float, F::k16_16_16_16SNorm) &&
+                  unchanged(F::k16_16_16_16Float, C::Float, F::k16_16_16_16Float) &&
+                  unchanged(F::k16_16_16_16UInt, C::Uint, F::k16_16_16_16UInt) &&
+                  unchanged(F::k16_16_16_16SInt, C::Sint, F::k16_16_16_16SInt) &&
+                  unchanged(F::k8UScaled, C::Float, F::k8UNorm) &&
+                  unchanged(F::k8_8UScaled, C::Float, F::k8_8UNorm) &&
+                  unchanged(F::k8SScaled, C::Unsupported, F::k8SScaled) &&
+                  unchanged(F::k16UScaled, C::Unsupported, F::k16UScaled) &&
+                  unchanged(F::k16_16_16_16UNorm, C::Float, F::k16_16_16_16UNorm) &&
+                  Prospero::NumBytesPerElement(F::k16_16_16_16UScaled) == 8 &&
+                  Prospero::NumBytesPerElement(F::k16_16_16_16SScaled) == 8,
+              "scaled 16_16_16_16 mapping or an existing format's class/remap changed");
     }
 
     {
@@ -43429,6 +43454,81 @@ TestCase ImageLoadDepthBits() {
   return test;
 }
 
+// R16G16B16A16 USCALED/SSCALED texels are integers read as floats. They are backed by an
+// UNorm/SNorm image (hosts rarely sample *SCALED), so loads must round-trip the integer
+// exactly and filtered samples must interpolate the integers.
+template <bool is_signed, bool load> TestCase ImageScaled16() {
+  using O = ShaderOpcode;
+  constexpr int texels[4][4] = {{0, 1, is_signed ? -1234 : 1234, is_signed ? 32767 : 65535},
+                                {is_signed ? -1 : 65534, is_signed ? -32767 : 65535,
+                                 is_signed ? 1234 : 32768, is_signed ? -2 : 2},
+                                {is_signed ? 100 : 40000, is_signed ? -100 : 7,
+                                 is_signed ? 20000 : 256, is_signed ? -20000 : 12345},
+                                {is_signed ? -32767 : 1, is_signed ? 32767 : 2,
+                                 is_signed ? 0 : 3, is_signed ? -1 : 4}};
+  TestCase test;
+  test.name = load ? (is_signed ? "ImageLoadRGBA16SScaled" : "ImageLoadRGBA16UScaled")
+                   : (is_signed ? "ImageSampleRGBA16SScaled" : "ImageSampleRGBA16UScaled");
+  test.image_width = test.image_height = 2;
+  for (const auto &texel : texels) {
+    test.sampled_image_rgba.push_back((texel[0] & 0xffff) | (texel[1] << 16));
+    test.sampled_image_rgba.push_back((texel[2] & 0xffff) | (texel[3] << 16));
+  }
+  test.sampled_image_format =
+      is_signed ? vk::Format::eR16G16B16A16Snorm : vk::Format::eR16G16B16A16Unorm;
+  test.sampled_image_dwords_per_pixel = 2;
+  test.user_data = MakeSampledTextureData(is_signed ? Prospero::BufferFormat::k16_16_16_16SScaled
+                                                    : Prospero::BufferFormat::k16_16_16_16UScaled);
+  test.user_data[1] |= 1u << 30u;
+  test.user_data[2] = 1u << 14u;
+  test.has_user_data = true;
+  auto &code = test.code;
+  auto expect = [&](float value) { test.expected.push_back(std::bit_cast<u32>(value)); };
+  if (load) {
+    for (u32 pixel = 0; pixel < 4u; ++pixel) {
+      AppendVMovU32(&code, 28, pixel & 1u);
+      AppendVMovU32(&code, 29, pixel >> 1u);
+      code.push_back(EncodeMimg0(0x00, 0xf));
+      code.push_back(EncodeMimg1(pixel * 4u, 28));
+      for (const auto value : texels[pixel]) expect(static_cast<float>(value));
+    }
+    test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  } else {
+    // Pixel centers, then the midpoint between the first two texels (bilinear), then a
+    // gather of the red channel, which bypasses filtering.
+    constexpr float coordinates[5][2] = {{0.25f, 0.25f}, {0.75f, 0.25f}, {0.25f, 0.75f},
+                                         {0.75f, 0.75f}, {0.5f, 0.25f}};
+    for (u32 sample = 0; sample < 5u; ++sample) {
+      AppendVMovLiteral(&code, 28, std::bit_cast<u32>(coordinates[sample][0]));
+      AppendVMovLiteral(&code, 29, std::bit_cast<u32>(coordinates[sample][1]));
+      code.push_back(EncodeMimg0(0x20, 0xf));
+      code.push_back(EncodeMimg1(sample * 4u, 28));
+      for (u32 channel = 0; channel < 4u; ++channel) {
+        expect(sample < 4u ? static_cast<float>(texels[sample][channel])
+                           : (texels[0][channel] + texels[1][channel]) * 0.5f);
+      }
+    }
+    AppendVMovLiteral(&code, 28, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&code, 29, std::bit_cast<u32>(0.5f));
+    code.push_back(EncodeMimg0(0x47, 0x1));
+    code.push_back(EncodeMimg1(20, 28));
+    // Gather order is (x0, y1), (x1, y1), (x1, y0), (x0, y0).
+    for (const auto pixel : {2, 3, 1, 0}) expect(static_cast<float>(texels[pixel][0]));
+    test.sampler_filter = vk::Filter::eLinear;
+    // Hardware filtering of 16-bit normalized texels is not bit exact.
+    test.expected_float_tolerance = 1.0f;
+    test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  }
+  for (u32 index = 0; index < test.expected.size(); ++index) {
+    AppendStoreVgpr(&code, index, index);
+  }
+  AppendEnd(&code);
+  test.user_data[50] = test.expected.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  return test;
+}
+
 TestCase ImageLoadR128IgnoresAdjacentMaskSgprs() {
   using O = ShaderOpcode;
 
@@ -46042,7 +46142,7 @@ void CheckCountedRowImageSelector(VulkanHarness &vulkan) {
     for (u32 key = 0; key < 4u; ++key)
       put_image(key * 396u + 184u, 0x100u + key, F::k32_32_32_32Float);
     put_image(32u, 0x104u, F::k32_32_32_32Float);
-    put_image(256u, 0x200u, F::k8SScaled);
+    put_image(256u, 0x200u, F::k10_10_10_2SScaled);
     if (masked) {
       // The scalar tile list reverses workgroups; row selection must remain on the GPU.
       test.initial[tile_list / 4u] = 2u;
@@ -50583,6 +50683,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleSrgb8_8<1>);
   AddCase(ImageSampleSrgb8_8<2>);
   AddCase(ImageLoadDepthBits);
+  AddCase(ImageScaled16<false, true>);
+  AddCase(ImageScaled16<true, true>);
+  AddCase(ImageScaled16<false, false>);
+  AddCase(ImageScaled16<true, false>);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
@@ -57883,6 +57987,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageSamplePacked8<false>());
     RunCase(&vulkan, ImageSamplePacked8<true>());
     RunCase(&vulkan, ImageSamplePacked8<false, true>());
+    RunCase(&vulkan, ImageScaled16<false, true>());
+    RunCase(&vulkan, ImageScaled16<true, true>());
+    RunCase(&vulkan, ImageScaled16<false, false>());
+    RunCase(&vulkan, ImageScaled16<true, false>());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--srgb-texture-only") == 0) {

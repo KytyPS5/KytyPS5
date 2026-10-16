@@ -1235,6 +1235,40 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// A T# with format 16_16_16_16 USCALED/SSCALED used to be a fatal "unsupported format"; it now
+// materializes as a float image converted from the UNorm/SNorm backing. Formats that were
+// already supported keep their class and get no conversion.
+void TestScaled16SampledFormats() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  using N = Libs::Graphics::Prospero::TextureNumericClass;
+  struct Case {
+    F format;
+    N numeric_class;
+    bool converted;
+  };
+  for (const auto &[format, numeric_class, converted] :
+       {Case{F::k16_16_16_16UScaled, N::Float, true}, Case{F::k16_16_16_16SScaled, N::Float, true},
+        Case{F::k16_16_16_16UNorm, N::Float, false}, Case{F::k16_16_16_16Float, N::Float, false},
+        Case{F::k16_16_16_16UInt, N::Uint, false}, Case{F::k8UScaled, N::Float, true}}) {
+    auto program = MixedSamplerProgram();
+    auto &first = program.descriptor_sources[0];
+    first.dwords[0] = Value(0x100u);
+    first.dwords[1] = Value(static_cast<uint32_t>(format) << 20u);
+    first.dwords[3] = program.descriptor_sources[1].dwords[3];
+    auto plan = ExtractResourcePlan(program);
+    std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+    const SrtRuntime runtime{.user_data = user_data};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              specialization.images[0].numeric_class == numeric_class &&
+              (specialization.images[0].conversion_format != F::kInvalid) == converted &&
+              (!converted || specialization.images[0].conversion_format == format),
+          "16_16_16_16 scaled sampled image changed its materialization");
+  }
+}
+
 void TestSignedStorageSpecialization() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using F = Libs::Graphics::Prospero::BufferFormat;

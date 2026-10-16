@@ -58,6 +58,8 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k32_32Float, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16UNorm, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16SNorm, 8, 0, 8, true, false},
+	{BufferFormat::k16_16_16_16UScaled, 8, 0, 0, true, false},
+	{BufferFormat::k16_16_16_16SScaled, 8, 0, 0, true, false},
 	{BufferFormat::k16_16_16_16UInt, 8, 0, 8, true, true},
 	{BufferFormat::k16_16_16_16SInt, 8, 0, 8, true, false, true},
 	{BufferFormat::k16_16_16_16Float, 8, 0, 8, true, false},
@@ -244,8 +246,14 @@ TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 
 BufferFormat RemapTextureFormat(BufferFormat format) {
 	switch (format) {
+		// 16_16_16_16 scaled texels are integers read as floats (float(uint) / float(int)),
+		// which hosts rarely allow sampling. The image is backed by the UNorm/SNorm format of
+		// the same width (so filtering still happens in float) and the shader multiplies the
+		// result by 65535 (UNorm) or 32767 (SNorm).
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
+		case BufferFormat::k16_16_16_16UScaled: return BufferFormat::k16_16_16_16UNorm;
+		case BufferFormat::k16_16_16_16SScaled: return BufferFormat::k16_16_16_16SNorm;
 		case BufferFormat::k11_11_10UNorm:
 		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
 		default: return format;

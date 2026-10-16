@@ -68,35 +68,25 @@ uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
 }
 
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
-	const auto trunc         = EmitTruncF32Value(state, src);
-	const auto converted_raw = state.builder.AllocateId();
-	if (signed_value) {
-		const auto converted_i = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), converted_i, trunc);
-		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), converted_raw, converted_i);
-	} else {
-		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), converted_raw, trunc);
+	if (!signed_value) {
+		const auto clamped = EmitExt(state, TypeF32(state), GLSLstd450NClamp,
+		                             {src, ConstantF32(state, 0), ConstantF32(state, 0x4f7fffffu)});
+		const auto converted = Unary(state, spv::OpConvertFToU, TypeU32(state), clamped);
+		const auto above     = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
+		                              ConstantF32(state, 0x4f800000u));
+		return Select(state, TypeU32(state), above, ConstantU32(state, 0xffffffffu), converted);
 	}
-	const auto nan = EmitClassifyF32(state, src).nan;
-	if (signed_value) {
-		const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src,
-		                          ConstantF32(state, 0xcf000000u));
-		const auto above = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
-		                          ConstantF32(state, 0x4f000000u));
-		const auto high =
-		    Select(state, TypeU32(state), above, ConstantU32(state, 0x7fffffffu), converted_raw);
-		const auto low =
-		    Select(state, TypeU32(state), below, ConstantU32(state, 0x80000000u), high);
-		return Select(state, TypeU32(state), nan, ConstantU32(state, 0), low);
-	}
-	const auto below =
-	    Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src, ConstantF32(state, 0));
-	const auto above = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
-	                          ConstantF32(state, 0x4f800000u));
-	const auto zero  = Binary(state, spv::OpLogicalOr, TypeBool(state), nan, below);
-	const auto high =
-	    Select(state, TypeU32(state), above, ConstantU32(state, 0xffffffffu), converted_raw);
-	return Select(state, TypeU32(state), zero, ConstantU32(state, 0), high);
+	const auto number =
+	    Select(state, TypeF32(state), Unary(state, spv::OpIsNan, TypeBool(state), src),
+	           ConstantF32(state, 0), src);
+	const auto clamped =
+	    EmitExt(state, TypeF32(state), GLSLstd450NClamp,
+	            {number, ConstantF32(state, 0xcf000000u), ConstantF32(state, 0x4effffffu)});
+	const auto converted = Unary(state, spv::OpBitcast, TypeU32(state),
+	                             Unary(state, spv::OpConvertFToS, TypeI32(state), clamped));
+	const auto above     = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), number,
+	                              ConstantF32(state, 0x4f000000u));
+	return Select(state, TypeU32(state), above, ConstantU32(state, 0x7fffffffu), converted);
 }
 
 } // namespace

@@ -162,7 +162,7 @@ void TestGsVgprComponentCounts() {
 	std::string           error;
 	CheckAccepted(ShaderBuildGsAssembly(ValidGsRegisters(), reference, &notes, &error),
 	      "the reference GS assembly was rejected", error);
-	Check(reference.max_primitives == 16 && reference.primitives_per_group == 16 &&
+	Check(reference.max_primitives == 48 && reference.primitives_per_group == 16 &&
 	          reference.vertices_per_group == 48 && reference.threads_num[0] == 96 &&
 	          reference.threads_num[1] == 1 && reference.threads_num[2] == 1,
 	      "the reference GS assembly was derived incorrectly");

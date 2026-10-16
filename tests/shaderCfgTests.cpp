@@ -12280,7 +12280,7 @@ void TestMergedShaderUserDataSnapshot() {
   ShaderVertexInputInfo fan_input{};
   PrepareProgram(regs, context, user_config, fan_input);
   Check(fan_input.mesh.primitives_per_group == 30 && fan_input.mesh.vertices_per_group == 32 &&
-            fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 192,
+            fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 256,
         "captured triangle-fan GS configuration lost its subgroup assembly limits");
   context.SetShaderStages(0x00482030u);
   context.SetMaxOutputPerSubgroup(32);

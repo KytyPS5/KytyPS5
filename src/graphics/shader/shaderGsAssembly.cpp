@@ -78,10 +78,14 @@ bool ShaderBuildGsAssembly(const ShaderGsAssemblyRegisters& regs, ShaderMeshInpu
 		return Reject(error, regs, mesh, "GS subgroup holds no complete input primitive");
 	}
 
-	mesh.max_primitives       = mesh.fast_launch ? mesh.max_vertices
-	                            : regs.native_ngg
-	                                ? mesh.InputPrimitiveCount(mesh.max_vertices)
-	                                : regs.primitive_group_size * (regs.gs_max_vert_out - 2u);
+	// A GS-mode subgroup exports at most one primitive per output vertex slot, not only a strip's
+	// worth: Nanite's raster exports 32 triangles from 32 vertices.
+	mesh.max_primitives = mesh.fast_launch ? mesh.max_vertices
+	                      : regs.native_ngg
+	                          ? mesh.InputPrimitiveCount(mesh.max_vertices)
+	                          : std::max(regs.primitive_group_size * (regs.gs_max_vert_out - 2u),
+	                                     std::min(regs.primitive_group_size * regs.gs_max_vert_out,
+	                                              mesh.max_vertices));
 	mesh.primitives_per_group = std::min(
 	    {regs.primitive_group_size, mesh.InputPrimitiveCount(regs.vertex_group_size),
 	     regs.native_ngg ? mesh.max_primitives : mesh.max_vertices / regs.gs_max_vert_out});

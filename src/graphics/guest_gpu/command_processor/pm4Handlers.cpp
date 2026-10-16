@@ -1822,6 +1822,19 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	return 5;
 }
 
+// PS5 Pro upscaling request written by libScePsml's dispatch (graphics/guest_gpu/pssr.h). The
+// packet fills the whole space the game reserved; the request is at its start.
+KYTY_CP_OP_PARSER(CpOpPssr) {
+	KYTY_PROFILER_FUNCTION();
+
+	const auto packet_dw = KYTY_PM4_LEN(cmd_id) - 1;
+	EXIT_NOT_IMPLEMENTED(packet_dw < Pssr::RequestDwords || packet_dw > dw);
+	Pssr::Request request {};
+	std::memcpy(&request, buffer, sizeof(request));
+	cp.ProcessPssr(request);
+	return packet_dw;
+}
+
 KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
 	KYTY_PROFILER_FUNCTION();
 

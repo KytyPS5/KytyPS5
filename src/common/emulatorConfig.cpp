@@ -80,6 +80,10 @@ bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }
 
+bool Ps5ProEnabled() {
+	return g_config->ps5_pro_enabled;
+}
+
 bool VrEnabled() {
 	return g_config->vr_enabled;
 }

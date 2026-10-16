@@ -15,6 +15,7 @@
 #include <QFileInfo>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListView>
@@ -347,6 +348,28 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	button_layout->addStretch(1);
 	group_layout->addLayout(button_layout);
 
+	group_layout->addWidget(new QLabel(tr("Add-ons folder"), m_game_dirs_group));
+	auto* addons_layout = new QHBoxLayout;
+	addons_layout->setContentsMargins(0, 0, 0, 0);
+	addons_layout->setSpacing(4);
+	m_addons_dir_edit = new QLineEdit(m_game_dirs_group);
+	m_addons_dir_edit->setPlaceholderText(tr("Folder containing extracted add-on (DLC) packages"));
+	addons_layout->addWidget(m_addons_dir_edit, 1);
+	auto* addons_button = new QToolButton(m_game_dirs_group);
+	addons_button->setIcon(style()->standardIcon(QStyle::SP_DirOpenIcon));
+	addons_button->setToolTip(tr("Select add-ons folder"));
+	addons_button->setAutoRaise(true);
+	addons_layout->addWidget(addons_button);
+	group_layout->addLayout(addons_layout);
+	connect(addons_button, &QToolButton::clicked, this, [this]() {
+		const auto dir = QFileDialog::getExistingDirectory(
+		    this, tr("Select add-ons folder"),
+		    m_addons_dir_edit->text().isEmpty() ? QDir::homePath() : m_addons_dir_edit->text());
+		if (!dir.isEmpty()) {
+			m_addons_dir_edit->setText(QDir::toNativeSeparators(dir));
+		}
+	});
+
 	m_ui->gridLayout->addWidget(m_game_dirs_group, 1, 0, 1, 1);
 	m_game_dirs_group->setVisible(false);
 
@@ -359,9 +382,10 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
+void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const QString& addons_dir) {
 	m_global_settings = true;
-	auto* menu        = new QMenu(m_ui->settings_button);
+	m_addons_dir_edit->setText(QDir::toNativeSeparators(addons_dir));
+	auto* menu = new QMenu(m_ui->settings_button);
 	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
 	menu->addAction(tr("Export..."), this, &ConfigurationEditDialog::ExportGameSettings);
 	m_ui->settings_button->setMenu(menu);
@@ -378,6 +402,10 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	update_game_directory_buttons();
 	layout()->activate();
 	resize(size().expandedTo(minimumSizeHint()));
+}
+
+QString ConfigurationEditDialog::GetAddonsDirectory() const {
+	return m_global_settings ? m_addons_dir_edit->text().trimmed() : QString();
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {

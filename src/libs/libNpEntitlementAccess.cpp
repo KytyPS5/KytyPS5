@@ -1,13 +1,16 @@
 #include "common/abi.h"
 #include "common/logging/log.h"
 #include "libs/libs.h"
+#include "loader/additionalContent.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -163,6 +166,16 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
     {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
 };
+
+static NpEntitlementAccessAddcontEntitlementInfo
+MakeAddcontInfo(const Loader::AddContentEntry& entry) {
+	NpEntitlementAccessAddcontEntitlementInfo info {};
+	std::memcpy(info.entitlement_label.data, entry.entitlement_label.data(),
+	            entry.entitlement_label.size());
+	info.package_type    = 2; // Additional content with extra data.
+	info.download_status = 4; // Installed.
+	return info;
+}
 
 static int KYTY_SYSV_ABI NpEntitlementAccessInitialize(
     const NpEntitlementAccessInitParam* init_param, NpEntitlementAccessBootParam* boot_param) {
@@ -404,19 +417,21 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
 	LOGF("\t list_num      = %" PRIu32 "\n", list_num);
 	LOGF("\t hit_num       = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(hit_num));
 
-	if (hit_num == nullptr || (list == nullptr && list_num != 0)) {
+	if (hit_num == nullptr) {
 		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
 	}
 
-	*hit_num = static_cast<uint32_t>(sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST) /
-	                                 sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST[0]));
+	constexpr auto legacy_count = std::size(NP_ENTITLEMENT_ACCESS_ADDON_LIST);
+	const auto&    entries      = Loader::AddContentGetAll();
+	*hit_num                    = static_cast<uint32_t>(legacy_count + entries.size());
 
 	if (list != nullptr && list_num != 0) {
 		memset(list, 0, sizeof(*list) * list_num);
 
-		const auto copy_num = (list_num < *hit_num ? list_num : *hit_num);
+		const auto copy_num = std::min(list_num, *hit_num);
 		for (uint32_t i = 0; i < copy_num; i++) {
-			list[i] = NP_ENTITLEMENT_ACCESS_ADDON_LIST[i];
+			list[i] = i < legacy_count ? NP_ENTITLEMENT_ACCESS_ADDON_LIST[i]
+			                          : MakeAddcontInfo(entries[i - legacy_count]);
 		}
 	}
 
@@ -445,6 +460,12 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 			*info = entitlement;
 			return 0;
 		}
+	}
+
+	if (const auto* entry =
+	        Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data))) {
+		*info = MakeAddcontInfo(*entry);
+		return 0;
 	}
 
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;

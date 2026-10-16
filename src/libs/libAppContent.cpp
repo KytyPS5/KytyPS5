@@ -4,15 +4,21 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/systemService.h"
+#include "loader/additionalContent.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <string>
 #include <system_error>
+#include <vector>
 
 namespace Libs {
 
@@ -20,10 +26,21 @@ LIB_VERSION("AppContent", 1, "AppContentUtil", 1, 1);
 
 namespace AppContent {
 
-constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL   = 3;
-constexpr int      APP_CONTENT_ERROR_PARAMETER          = -2133262334; /* 0x80D90002 */
-constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED        = -2133262332; /* 0x80D90004 */
-constexpr int      APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT = -2133262329; /* 0x80D90007 */
+constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL = 3;
+constexpr int      APP_CONTENT_ERROR_PARAMETER        = -2133262334; /* 0x80D90002 */
+constexpr int      APP_CONTENT_ERROR_BUSY             = -2133262333; /* 0x80D90003 */
+constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED      = -2133262332; /* 0x80D90004 */
+constexpr int      APP_CONTENT_ERROR_NOT_FOUND        = -2133262331; /* 0x80D90005 */
+constexpr int      APP_CONTENT_ERROR_MOUNT_FULL       = -2133262330; /* 0x80D90006 */
+constexpr size_t   APP_CONTENT_ADDCONT_MOUNT_MAXNUM   = 64;
+
+struct AddcontMount {
+	std::string label;
+	std::string point;
+};
+
+static std::mutex                g_addcont_mutex;
+static std::vector<AddcontMount> g_addcont_mounts;
 
 static std::string g_title_id;
 
@@ -174,13 +191,51 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	     service_label, reinterpret_cast<uint64_t>(entitlement_label),
 	     reinterpret_cast<uint64_t>(mount_point));
 
-	if (entitlement_label == nullptr || mount_point == nullptr) {
+	if (service_label != 0 || entitlement_label == nullptr || mount_point == nullptr) {
 		return APP_CONTENT_ERROR_PARAMETER;
 	}
 
 	std::memset(mount_point->data, 0, sizeof(mount_point->data));
 
-	return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
+	const auto* entry =
+	    Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data));
+	if (entry == nullptr) {
+		return APP_CONTENT_ERROR_NOT_FOUND;
+	}
+
+	std::lock_guard lock(g_addcont_mutex);
+
+	for (const auto& m: g_addcont_mounts) {
+		if (m.label == entry->entitlement_label) {
+			return APP_CONTENT_ERROR_BUSY;
+		}
+	}
+
+	if (g_addcont_mounts.size() == APP_CONTENT_ADDCONT_MOUNT_MAXNUM) {
+		return APP_CONTENT_ERROR_MOUNT_FULL;
+	}
+	std::error_code ec;
+	if (!std::filesystem::is_directory(entry->mount_dir, ec)) {
+		return APP_CONTENT_ERROR_NOT_FOUND;
+	}
+
+	uint32_t index = 0;
+	while (
+	    std::any_of(g_addcont_mounts.begin(), g_addcont_mounts.end(), [&](const AddcontMount& m) {
+		    return m.point == "/addcont" + std::to_string(index) + "/";
+	    })) {
+		index++;
+	}
+
+	AddcontMount mount {entry->entitlement_label, "/addcont" + std::to_string(index) + "/"};
+	LibKernel::FileSystem::Mount(entry->mount_dir, mount.point);
+	LOGF("\t mounted %s -> %s\n", mount.point.c_str(),
+	     Common::PathToString(entry->mount_dir).c_str());
+
+	std::strncpy(mount_point->data, mount.point.c_str(), sizeof(mount_point->data) - 1);
+	g_addcont_mounts.push_back(std::move(mount));
+
+	return OK;
 }
 
 int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_point) {
@@ -195,6 +250,19 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 	if (mount_point->data[0] == '\0') {
 		return APP_CONTENT_ERROR_NOT_MOUNTED;
 	}
+
+	const std::string point(mount_point->data,
+	                        strnlen(mount_point->data, sizeof(mount_point->data)));
+
+	std::lock_guard lock(g_addcont_mutex);
+
+	const auto it = std::find_if(g_addcont_mounts.begin(), g_addcont_mounts.end(),
+	                             [&](const AddcontMount& m) { return m.point == point; });
+	if (it == g_addcont_mounts.end()) {
+		return APP_CONTENT_ERROR_NOT_MOUNTED;
+	}
+	LibKernel::FileSystem::Umount(point);
+	g_addcont_mounts.erase(it);
 
 	return OK;
 }

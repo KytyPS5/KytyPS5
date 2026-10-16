@@ -14,6 +14,7 @@
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
+#include "loader/additionalContent.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -67,6 +68,10 @@ void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
 
 namespace Libs::LibNpCommerce {
 void InitNet_1_NpCommerce(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNpEntitlementAccess {
+void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -303,6 +308,143 @@ void TestSystemServiceEntitlementEvents() {
         "receive delivers the entitlement event with cleared payload exactly once");
   Check(receive(&event) == Libs::SystemService::SYSTEM_SERVICE_ERROR_NO_EVENT,
         "empty event queue reports NO_EVENT");
+}
+
+void TestAddContent(const std::filesystem::path& root) {
+  const auto folder = root / "add-ons";
+  const auto write = [](const std::filesystem::path& path, const std::string& text) {
+    std::filesystem::create_directories(path.parent_path());
+    Common::File file;
+    Check(file.Create(path), "create add-on fixture");
+    uint32_t written = 0;
+    file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
+    Check(written == text.size(), "write add-on fixture");
+  };
+  const auto label = [](unsigned index) {
+    std::array<char, 17> value {};
+    std::snprintf(value.data(), value.size(), "DLC%013u", index);
+    return std::string(value.data());
+  };
+  const auto param = [](const std::string& title, const std::string& entitlement) {
+    return "{\"contentId\":\"UP0001-" + title + "_00-" + entitlement + "\"}";
+  };
+  write(folder / "foreign" / "sce_sys" / "param.json", param("PPSA22222", label(0)));
+  write(folder / "foreign-label" / "sce_sys" / "param.json",
+        param("PPSA22222", "PPSA11111XXXXXXX"));
+  write(folder / "outside" / "param.json", param("PPSA11111", label(66)));
+  write(folder / "invalid" / "sce_sys" / "param.json", "{\"contentId\":17}");
+  write(folder / "malformed" / "sce_sys" / "param.json", "{broken");
+  write(folder / "short-id" / "sce_sys" / "param.json", param("PPSA11111", "SHORT"));
+  write(folder / "base-game" / "sce_sys" / "param.json",
+        "{\"contentId\":\"UP0001-PPSA11111_00-BASE000000000000\",\"applicationCategoryType\":0}");
+  for (unsigned i = 0; i < 65; ++i) {
+    write(folder / label(i) / "sce_sys" / "param.json", param("PPSA11111", label(i)));
+  }
+  write(folder / "duplicate" / "sce_sys" / "param.json", param("PPSA11111", label(1)));
+  write(folder / label(0) / "payload.txt", "DLC payload");
+
+  Loader::AddContentLoad(folder, "");
+  Check(Loader::AddContentGetAll().empty(), "unknown title never exposes unrelated add-ons");
+  Loader::AddContentLoad(folder, "PPSA11111");
+  Check(Loader::AddContentGetAll().size() == 65,
+        "scan filters title before deduplication and ignores invalid/non-package metadata");
+
+  struct Label { char data[17]; char padding[3]; };
+  struct Info { Label label; uint32_t package_type; uint32_t download_status; };
+  struct MountPoint { char data[16]; };
+  static_assert(sizeof(Label) == 20 && sizeof(Info) == 28 && sizeof(MountPoint) == 16);
+  Loader::SymbolDatabase symbols;
+  Libs::InitAppContent_1(&symbols);
+  Libs::LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(&symbols);
+  const auto resolve = [&](const char* nid) {
+    const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "add-on export resolves");
+    return symbol->vaddr;
+  };
+  const auto initialize = reinterpret_cast<int (KYTY_SYSV_ABI *)(const void*, void*)>(
+      resolve("jO8DM8oyego"));
+  const auto list = reinterpret_cast<int (KYTY_SYSV_ABI *)(uint32_t, Info*, uint32_t, uint32_t*)>(
+      resolve("TFyU+KFBv54"));
+  const auto get = reinterpret_cast<int (KYTY_SYSV_ABI *)(uint32_t, const Label*, Info*)>(
+      resolve("xddD23+8TfQ"));
+  const auto mount = reinterpret_cast<int (KYTY_SYSV_ABI *)(uint32_t, const Label*, MountPoint*)>(
+      resolve("VANhIWcqYak"));
+  const auto unmount = reinterpret_cast<int (KYTY_SYSV_ABI *)(const MountPoint*)>(
+      resolve("3rHWaV-1KC4"));
+  std::array<char, 32> init {}, boot {};
+  Check(initialize(init.data(), boot.data()) == OK, "initialize add-on entitlements");
+  uint32_t count = 0;
+  Check(list(0, nullptr, 0, &count) == OK && count == 68,
+        "query existing and detected add-ons together");
+  Check(list(0, nullptr, 1, &count) == OK && count == 68,
+        "count-only query ignores output capacity");
+  Check(list(1, nullptr, 0, &count) == OK && count == 68,
+        "existing service-label handling remains unchanged");
+  std::array<Info, 5> info {};
+  info[4].package_type = 99;
+  Check(list(0, info.data(), 4, &count) == OK && count == 68 && info[4].package_type == 99,
+        "truncated entitlement list reports total and respects output capacity");
+  constexpr std::array<const char*, 3> existing {"85y-je", "5d5c48", "_mtqu6"};
+  Info single {};
+  for (size_t i = 0; i < existing.size(); ++i) {
+    Check(std::strcmp(info[i].label.data, existing[i]) == 0 &&
+              info[i].package_type == 3 && info[i].download_status == 4 &&
+              get(1, &info[i].label, &single) == OK &&
+              std::memcmp(&single, &info[i], sizeof(single)) == 0,
+          "GTA V entitlements retain their order, metadata, and individual lookups");
+  }
+  Check(std::strcmp(info[3].label.data, label(0).c_str()) == 0 &&
+            info[3].package_type == 2 && info[3].download_status == 4 &&
+            get(0, &info[3].label, &single) == OK &&
+            std::memcmp(&single, &info[3], sizeof(single)) == 0,
+        "detected add-ons follow existing entitlements with matching individual lookups");
+  Label missing {};
+  std::memcpy(missing.data, "MISSING000000000", 16);
+  MountPoint point {};
+  Check(get(0, &missing, &single) == static_cast<int>(0x817d0007u) &&
+            mount(0, &missing, &point) == static_cast<int>(0x80d90005u),
+        "unknown add-on returns entitlement and mount errors");
+  Check(mount(0, nullptr, &point) == static_cast<int>(0x80d90002u) &&
+            list(0, nullptr, 0, nullptr) == static_cast<int>(0x817d0002u),
+        "null add-on parameters return parameter errors");
+  Check(mount(0, &info[3].label, &point) == OK, "mount owned add-on");
+  const std::string mounted_file = std::string(point.data) + "/payload.txt";
+  const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
+  std::array<char, 11> payload {};
+  Check(fd >= 3 && FileSystem::KernelRead(fd, payload.data(), payload.size()) == payload.size() &&
+            std::string_view(payload.data(), payload.size()) == "DLC payload" &&
+            FileSystem::KernelClose(fd) == OK,
+        "guest reads files from the selected title's add-on");
+  MountPoint repeated {};
+  Check(mount(0, &info[3].label, &repeated) == static_cast<int>(0x80d90003u),
+        "duplicate mount returns BUSY");
+  Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
+            unmount(&point) == static_cast<int>(0x80d90004u),
+        "unmount removes mapping and repeated unmount reports NOT_MOUNTED");
+  std::array<MountPoint, 64> mounts {};
+  for (unsigned i = 0; i < mounts.size(); ++i) {
+    Label entitlement {};
+    std::memcpy(entitlement.data, label(i).c_str(), 17);
+    Check(mount(0, &entitlement, &mounts[i]) == OK, "mount up to the simultaneous mount limit");
+  }
+  Label extra {};
+  std::memcpy(extra.data, label(64).c_str(), 17);
+  Check(mount(0, &extra, &point) == static_cast<int>(0x80d90006u),
+        "65th simultaneous mount returns MOUNT_FULL");
+  Check(unmount(&mounts[0]) == OK && mount(0, &extra, &point) == OK,
+        "freed mount slot can be reused");
+  Check(unmount(&point) == OK, "unmount reused slot");
+  for (size_t i = 1; i < mounts.size(); ++i) {
+    Check(unmount(&mounts[i]) == OK, "unmount fixture");
+  }
+  Loader::AddContentLoad(folder / "missing", "PPSA11111");
+  Check(list(0, info.data(), 4, &count) == OK && count == 3,
+        "missing add-ons folder retains GTA V entitlements");
+  for (size_t i = 0; i < existing.size(); ++i) {
+    Check(std::strcmp(info[i].label.data, existing[i]) == 0 &&
+              get(0, &info[i].label, &single) == OK,
+          "GTA V entitlement lookup works without detected add-ons");
+  }
 }
 
 void TestSaveOpenVisibility() {
@@ -2033,6 +2175,7 @@ int main(int, char**) {
   FileSystem::Initialize();
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
+  TestAddContent(temporary.Path());
   TestRandomDevices();
   TestFileDescriptorFlags();
   CheckMountRoot(temporary.Path());

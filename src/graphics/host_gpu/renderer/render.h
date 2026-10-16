@@ -158,9 +158,9 @@ public:
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
-	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
-	                    const PipelineCache::Pipeline&     pipeline,
-	                    std::span<PreparedBindings* const> bindings);
+	[[nodiscard]] bool CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
+	                                  const PipelineCache::Pipeline&     pipeline,
+	                                  std::span<PreparedBindings* const> bindings);
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);

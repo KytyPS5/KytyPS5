@@ -374,6 +374,7 @@ struct PipelineCache::ProgramCache {
 			stage_input.compute = &input_info;
 		}
 		const char* label = nullptr;
+		KYTY_PROFILER_BLOCK("ShaderRecompiler::CacheMiss", profiler::colors::DeepOrangeA200);
 		const char* stage_name = nullptr;
 		switch (stage) {
 			case ShaderType::Vertex: label = "ShaderRecompiler VS"; stage_name = "vs"; break;
@@ -444,19 +445,21 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		if (graphics_debug_dump_enabled()) {
+			std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
+			for (const auto& [key, source]: programs) {
+				counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+			}
+			// Guest geometry shaders are compiled through the host mesh stage.
+			std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+			            counts[static_cast<size_t>(ShaderType::Vertex)],
+			            counts[static_cast<size_t>(ShaderType::Pixel)],
+			            counts[static_cast<size_t>(ShaderType::Compute)],
+			            counts[static_cast<size_t>(ShaderType::Mesh)],
+			            counts[static_cast<size_t>(ShaderType::Local)],
+			            counts[static_cast<size_t>(ShaderType::TessellationControl)],
+			            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
 	}
 
@@ -517,8 +520,10 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
+		// Pipeline cache entries are keyed by the actual Vulkan create data. Keeping the cache for
+		// a development build is therefore safe: the driver ignores entries from changed shaders,
+		// while unchanged pipelines avoid another expensive driver compilation on the next run.
+		PipelineCacheLog("Vulkan pipeline cache: enabled for dirty build");
 	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
@@ -770,8 +775,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
-
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
 	EXIT_IF(!vertex_program);
 	const bool ps_active = ps_input_info != nullptr;
@@ -934,6 +937,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		return *iter->second;
 	}
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -963,14 +967,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 PipelineCache::Pipeline&
 PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                   const ShaderProgram&          compute_program) {
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
-
 	EXIT_IF(!compute_program);
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
 		return *iter->second;
 	}
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);

@@ -631,6 +631,48 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   }
 }
 
+void TestWrittenDescriptorReadDoesNotAliasOutput() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  // This dependency still has to be synchronized with the host before dispatch.
+  program.source_reads = {{0x2000u, 4u}};
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(0u), Value(0u), Value(false)});
+  read.SetFlags(MemoryFlags{.index = 0});
+  DescriptorSource source;
+  source.dwords = {Value(&read), Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+
+  const auto plan = ExtractResourcePlan(program);
+  Check(plan.capture_specialization_reads,
+        "written descriptor test did not retain its independent scalar read");
+  uint32_t reads = 0;
+  const SrtRuntime runtime{
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        ++*static_cast<uint32_t *>(data);
+        if (address != 0x1000u || words.size() != 1u) return false;
+        words[0] = 0x8000u;
+        return true;
+      },
+      .userdata = &reads};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && reads == 1u &&
+            snapshot.buffers[0].dwords[0] == 0x8000u &&
+            snapshot.specialization_reads ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{0x2000u, 4u}},
+        "written descriptor bytes were incorrectly tracked as a post-dispatch dependency");
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -1138,6 +1180,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   for (const bool memory_condition : {false, true})
     TestWrittenDescriptorPredicateReads(memory_condition);
+  TestWrittenDescriptorReadDoesNotAliasOutput();
   TestFailedMaterializationRejectsStage();
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();

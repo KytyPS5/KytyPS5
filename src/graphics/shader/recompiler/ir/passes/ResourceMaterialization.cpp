@@ -1260,6 +1260,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtReadCapture capture {runtime, reads};
 	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	SrtWalker clean(program, CleanRuntime(observed));
+	// A writable descriptor is consumed before the dispatch can modify its backing bytes.
+	// Resolve it through the strict reader, but do not record its descriptor bytes as a
+	// CPU-side specialization dependency: they are allowed to overlap the dispatch output.
+	SrtWalker prewrite_clean(program, CleanRuntime(runtime));
 	SrtWalker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
@@ -1283,7 +1287,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
+			return (capture_reads && written ? prewrite_clean : walker)
+			    .EvaluateDescriptor(source, value);
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -1302,8 +1307,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
+					const bool prewrite = capture_reads && base.written;
 					if (!MaterializeIndirectDescriptor(
-					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
+					        program, *source->indirect_descriptor, i, 4u,
+					        prewrite ? runtime : observed, prewrite ? prewrite_clean : clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectStoreBuffer(
@@ -1365,8 +1372,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			const bool prewrite = capture_reads && image.written;
 			if (!MaterializeIndirectDescriptor(
-			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
+			        program, indirect, i, 8u, prewrite ? runtime : observed,
+			        prewrite ? prewrite_clean : clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||

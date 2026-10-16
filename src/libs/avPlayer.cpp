@@ -835,6 +835,10 @@ public:
 			pause_time    = clock_start;
 			seek_video_frame_pending =
 			    paused_after_start && show_seek_frame && video_id.has_value();
+			// The first decoded picture establishes presentation even when the container
+			// carries a non-zero stream timestamp. Without this, a title can wait on its
+			// own A/V clock before it has received the first image to present.
+			video_start_frame_pending = video_id.has_value();
 		}
 
 		if (!StartWorkers()) {
@@ -968,7 +972,7 @@ public:
 			return false;
 		}
 		auto frame = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
-			if (deliver_seek_frame || sync_mode != 0) {
+			if (deliver_seek_frame || video_start_frame_pending || sync_mode != 0) {
 				return true;
 			}
 			auto now = CurrentTimeNoLock();
@@ -986,6 +990,7 @@ public:
 		if (deliver_seek_frame) {
 			seek_video_frame_pending = false;
 		}
+		video_start_frame_pending = false;
 		return true;
 	}
 	bool Audio(AvPlayerFrameInfo* out) {
@@ -1079,6 +1084,7 @@ private:
 		video_done               = true;
 		audio_done               = true;
 		seek_video_frame_pending = false;
+		video_start_frame_pending = false;
 		last_output_loop_offset  = 0;
 		pending_loop_warnings    = 0;
 	}
@@ -1435,6 +1441,22 @@ private:
 	}
 	uint32_t VideoPitch(AVStream* s) const { return align_up(Width(s), 256u); }
 	uint32_t VideoBufferSize(AVStream* s) const { return VideoPitch(s) * Height(s) * 3 / 2; }
+	uint64_t FrameTimestamp(const AVFrame* frame, const AVStream* stream) const {
+		int64_t timestamp = frame->best_effort_timestamp != AV_NOPTS_VALUE
+		                        ? frame->best_effort_timestamp
+		                        : frame->pts;
+		if (timestamp == AV_NOPTS_VALUE) {
+			return 0;
+		}
+		// Individual streams can have different start times. Normalizing each one
+		// independently loses their A/V offset, so use the demuxer's shared clock
+		// origin instead.
+		int64_t timestamp_ms = av_rescale_q(timestamp, stream->time_base, AVRational {1, 1000});
+		if (fmt != nullptr && fmt->start_time != AV_NOPTS_VALUE) {
+			timestamp_ms -= av_rescale_q(fmt->start_time, AV_TIME_BASE_Q, AVRational {1, 1000});
+		}
+		return static_cast<uint64_t>(std::max<int64_t>(timestamp_ms, 0));
+	}
 	void     FillVideo(AVStream* s, AvPlayerVideo* v) const {
 		std::memset(v, 0, sizeof(*v));
 		v->width        = Width(s);
@@ -1567,9 +1589,7 @@ private:
 		}
 		std::memset(info, 0, sizeof(*info));
 		info->data       = dst;
-		info->time_stamp = to_ms(
-		    src->best_effort_timestamp != AV_NOPTS_VALUE ? src->best_effort_timestamp : src->pts,
-		    s->time_base);
+		info->time_stamp = FrameTimestamp(src, s);
 		FillVideoEx(s, &info->details.video, src->sample_aspect_ratio);
 		info->details.video.crop_left_offset = static_cast<uint32_t>(src->crop_left);
 		info->details.video.crop_right_offset =
@@ -1585,9 +1605,8 @@ private:
 	}
 	bool PrepareAudio(AVFrame* src, std::unique_ptr<GuestBuffer>& buffer,
 	                  AvPlayerFrameInfoEx* info) {
-		auto timestamp = to_ms(
-		    src->best_effort_timestamp != AV_NOPTS_VALUE ? src->best_effort_timestamp : src->pts,
-		    fmt->streams[audio_id.value()]->time_base);
+		auto* s         = fmt->streams[audio_id.value()];
+		auto  timestamp = FrameTimestamp(src, s);
 		AVFrame* pcm = src;
 		AVFrame* tmp = nullptr;
 		if (src->format != AV_SAMPLE_FMT_S16) {
@@ -1633,7 +1652,6 @@ private:
 			buffer = std::move(replacement);
 		}
 		std::memcpy(buffer->Get(), pcm->data[0], size);
-		auto* s = fmt->streams[audio_id.value()];
 		std::memset(info, 0, sizeof(*info));
 		info->data       = buffer->Get();
 		info->time_stamp = timestamp;
@@ -1685,6 +1703,7 @@ private:
 	State                                    state                    = State::Ready;
 	bool                                     paused                   = false;
 	bool                                     seek_video_frame_pending = false;
+	bool                                     video_start_frame_pending = false;
 	std::atomic_bool                         loop {false};
 	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
 	uint32_t                                 sync_mode     = 0;

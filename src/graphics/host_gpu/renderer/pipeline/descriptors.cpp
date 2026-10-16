@@ -365,16 +365,56 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 			break;
 		default: EXIT("null image has unsupported numeric class\n");
 	}
+	const bool is_multisampled =
+	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa ||
+	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
-	desc.info.type            = Prospero::ImageType::kColor2D;
+	// A comparison image is declared with OpTypeImage Depth=1. Even an unbound guest
+	// descriptor must therefore provide a depth-format view: R32_SFLOAT has the same
+	// storage size as D32_SFLOAT but is not legal for depth comparison sampling.
+	if (resource.depth_compare) {
+		if (binding == TextureCache::BindingType::Storage ||
+		    (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+		     resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&
+		     resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+		     resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray)) {
+			EXIT("null depth-comparison image has unsupported binding or dimension\n");
+		}
+		desc.info.pixel_format = vk::Format::eD32Sfloat;
+	}
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
 	desc.info.bytes_per_block = Prospero::NumBytesPerElement(desc.info.guest_format);
-	desc.info.samples         = 1;
+	desc.info.samples         = is_multisampled ? 2 : 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
-	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
+	switch (resource.dimension) {
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
+			desc.info.type      = Prospero::ImageType::kColor2D;
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
+			desc.info.type      = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
+			desc.info.type      = Prospero::ImageType::kColor2D;
+			desc.view_info.type = vk::ImageViewType::e2D;
+			break;
+		default: EXIT("null image has unsupported dimension\n");
+	}
+	desc.view_info.aspect     = resource.depth_compare ? vk::ImageAspectFlagBits::eDepth
+	                                                    : vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
@@ -641,7 +681,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	// k32Float can describe both a color R32_SFLOAT image and a depth D32_SFLOAT image.
+	// They are storage-compatible, but Vulkan only permits the latter with a comparison
+	// sampler. Do not reuse an existing color backing for a comparison descriptor.
+	auto       id = texture_cache.FindImage(desc, shader_conversion || resource.depth_compare);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -914,7 +957,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
-void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+bool RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
@@ -978,7 +1021,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						// The descriptor's specialization reads have already been observed on the CPU,
+						// but this shader also writes the same guest bytes. Vulkan cannot reproduce
+						// the PS5 ordering for that feedback loop without an isolated snapshot buffer.
+						// Do not submit undefined storage accesses: a number of drivers reset the
+						// device instead of reporting a validation error for this workload.
+						static std::atomic<uint32_t> log_count = 0;
+						if (log_count.fetch_add(1, std::memory_order_relaxed) < 32u) {
+							LOGF("ResourceSpecialization: skipping self-aliasing shader "
+							     "read=0x%016" PRIx64 "+0x%016" PRIx64
+							     " write=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+							     address, size, written.address, written.size);
+						}
+						return false;
 					}
 				}
 			}
@@ -1160,6 +1215,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                             0, nullptr);
 		}
 	}
+	return true;
 }
 
 } // namespace Libs::Graphics

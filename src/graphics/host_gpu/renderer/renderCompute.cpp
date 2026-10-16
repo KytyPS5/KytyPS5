@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -223,6 +224,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -292,6 +294,47 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
+	const auto& limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	const auto local_sizes = std::array {std::max(cs_regs.cs_regs.num_thread_x, 1u),
+	                                    std::max(cs_regs.cs_regs.num_thread_y, 1u),
+	                                    std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+	uint64_t local_invocations = 1;
+	for (uint32_t axis = 0; axis < 3; ++axis) {
+		if (local_sizes[axis] > limits.maxComputeWorkGroupSize[axis] ||
+		    local_invocations > limits.maxComputeWorkGroupInvocations / local_sizes[axis]) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32u) {
+				LOGF("GraphicsRenderDispatchDirect: skipping invalid local size=%ux%ux%u "
+				     "limits=%ux%ux%u max_invocations=%u shader=0x%016" PRIx64 "\n",
+				     local_sizes[0], local_sizes[1], local_sizes[2],
+				     limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1],
+				     limits.maxComputeWorkGroupSize[2], limits.maxComputeWorkGroupInvocations,
+				     sh_ctx.GetCs().cs_regs.data_addr);
+			}
+			return;
+		}
+		local_invocations *= local_sizes[axis];
+	}
+	if (input_info.workgroup_counts[0] > limits.maxComputeWorkGroupCount[0] ||
+	    input_info.workgroup_counts[1] > limits.maxComputeWorkGroupCount[1] ||
+	    input_info.workgroup_counts[2] > limits.maxComputeWorkGroupCount[2]) {
+		// The PM4 stream occasionally contains a sentinel or stale thread count. Vulkan
+		// treats it as a real dispatch and some drivers lose the device rather than
+		// returning a validation error. Validate after translating thread dimensions,
+		// because those are the counts passed to vkCmdDispatch.
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32u) {
+			LOGF("GraphicsRenderDispatchDirect: skipping out-of-range groups=%ux%ux%u "
+			     "limits=%ux%ux%u requested=%ux%ux%u mode=0x%08" PRIx32
+			     " shader=0x%016" PRIx64 "\n",
+			     input_info.workgroup_counts[0], input_info.workgroup_counts[1],
+			     input_info.workgroup_counts[2], limits.maxComputeWorkGroupCount[0],
+			     limits.maxComputeWorkGroupCount[1], limits.maxComputeWorkGroupCount[2],
+			     thread_group_x, thread_group_y, thread_group_z, mode,
+			     sh_ctx.GetCs().cs_regs.data_addr);
+		}
+		return;
+	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (use_thread_dimensions) {
@@ -350,8 +393,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
+	if (!CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	                    std::span {&descriptor_stage, 1u})) {
+		ResetBindings();
+		return;
+	}
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
@@ -437,62 +483,44 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
-	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
-	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
-	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
-	Common::LockGuard lock(m_context.GetMutex());
-	const auto& cs_regs = buffer.GetShaders().GetCs();
-	if (cs_regs.cs_regs.data_addr == 0) {
+
+	// A preceding GPU command may have produced these arguments. Download the
+	// dirty range before accessing guest backing memory; this is the same
+	// visibility path used for shared-memory indirect bindings.
+	m_context.GetBufferCache().ReadMemory(args_addr, sizeof(vk::DispatchIndirectCommand));
+
+	// Reading the validated arguments on the CPU avoids passing corrupt group
+	// counts to the Vulkan driver. Keep the preceding debug tag until this read
+	// completes: it may submit pending work that is responsible for a device loss.
+	std::array<uint32_t, 3> groups {};
+	if (!LibKernel::Memory::TryReadBufferBacking(args_addr, groups.data(), sizeof(groups))) {
+		LOGF("GraphicsRenderDispatchIndirect: failed to read arguments at 0x%016" PRIx64 "\n",
+		     args_addr);
 		return;
 	}
-	ShaderComputeInputInfo input_info {};
-	input_info.async_compute = async_compute;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
-	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
-	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
-	PreparedBindings* descriptor_stage = &bindings;
-	FindBuffers(std::span {&descriptor_stage, 1u});
-	const auto& program = *input_info.stage.program;
-	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+	const auto& limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	if (groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
+		return;
 	}
-	BindSharedMemory(m_context, input_info, bindings, args_addr);
-	RebindImages(bindings);
-	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
-	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
-	RebindBuffers(bindings);
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
-	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage) ||
-	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.written && image.resource_class ==
-		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
-	    });
-	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (groups[0] > limits.maxComputeWorkGroupCount[0] ||
+	    groups[1] > limits.maxComputeWorkGroupCount[1] ||
+	    groups[2] > limits.maxComputeWorkGroupCount[2]) {
+		LOGF("GraphicsRenderDispatchIndirect: skipping out-of-range groups=%ux%ux%u "
+		     "limits=%ux%ux%u args=0x%016" PRIx64 " shader=0x%016" PRIx64 "\n",
+		     groups[0], groups[1], groups[2], limits.maxComputeWorkGroupCount[0],
+		     limits.maxComputeWorkGroupCount[1], limits.maxComputeWorkGroupCount[2], args_addr,
+		     buffer.GetShaders().GetCs().cs_regs.data_addr);
+		return;
 	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	ResetBindings();
+	// Vulkan drivers execute vkCmdDispatchIndirect asynchronously and may lose the device when
+	// guest code supplies corrupted dimensions. The validated direct form is equivalent after the
+	// readback above and provides a safe fallback for this path. DispatchDirect sets the debug tag;
+	// skipped indirect commands must leave the preceding command's tag intact.
+	DispatchDirect(submit_id, buffer, groups[0], groups[1], groups[2], mode, async_compute);
 }
 
 } // namespace Libs::Graphics

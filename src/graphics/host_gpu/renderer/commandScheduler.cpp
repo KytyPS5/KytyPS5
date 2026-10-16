@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -176,12 +177,14 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	KYTY_PROFILER_BLOCK("CommandScheduler::FlushAndWait", profiler::colors::RedA100);
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Finish", profiler::colors::RedA100);
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -192,6 +195,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Wait", profiler::colors::RedA100);
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -381,6 +385,14 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_master.RecordSubmission({.tick = tick,
+	                           .operation = m_command.m_debug_op,
+	                           .submit_id = m_command.m_debug_submit_id,
+	                           .arg0 = m_command.m_debug_arg0,
+	                           .arg1 = m_command.m_debug_arg1,
+	                           .arg2 = m_command.m_debug_arg2,
+	                           .arg3 = m_command.m_debug_arg3,
+	                           .arg4 = m_command.m_debug_arg4});
 
 	m_command.m_buffer = nullptr;
 	return tick;

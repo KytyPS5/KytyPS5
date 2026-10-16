@@ -1181,7 +1181,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	if (!CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages)) {
+		return;
+	}
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,

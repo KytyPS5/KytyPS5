@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -17,8 +18,10 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr size_t MaxPageFaults    = 1024;
+constexpr size_t MaxPageFaults     = 1024;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+constexpr uint32_t MaxReportedPageFaults = static_cast<uint32_t>(MaxPageFaults - 1);
+constexpr uint32_t MaxLoggedPageFaults   = 16;
 
 } // namespace
 
@@ -131,12 +134,21 @@ void FaultManager::ProcessFaultBuffer() {
 	m_scheduler.DeferOperation([this, mapped, offset, area] {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
-		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		const auto* faults         = std::bit_cast<const uint64_t*>(mapped);
+		const auto  reported_count = static_cast<uint32_t>(faults[0]);
+		const auto  count          = std::min(reported_count, MaxReportedPageFaults);
+		if (reported_count != count) {
+			LOGF("FaultManager: clamping invalid fault count %u to %u\n", reported_count, count);
+		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			if (index <= MaxLoggedPageFaults) {
+				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			}
+		}
+		if (count > MaxLoggedPageFaults) {
+			LOGF("FaultManager: suppressed %u additional faults\n", count - MaxLoggedPageFaults);
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());

@@ -13,7 +13,9 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <string_view>
 #include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
 
@@ -391,6 +393,22 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 		return std::bit_cast<float>(sign | ((exponent == 31 ? 255u : exponent + 112u) << 23u) |
 		                            (mantissa << 13u));
 	};
+	// Raw lane `index` of `bits` bits, counted from the least significant end of the pixel.
+	const auto lane = [clear_words](uint32_t bits, uint32_t index) {
+		return static_cast<uint32_t>((clear_words >> (bits * index)) &
+		                             ((uint64_t {1} << bits) - 1u));
+	};
+	const auto unorm = [](uint32_t value, uint32_t bits) {
+		return static_cast<float>(value) / static_cast<float>((uint64_t {1} << bits) - 1u);
+	};
+	const auto sint = [](uint32_t value, uint32_t bits) {
+		return static_cast<int32_t>(value << (32u - bits)) >> (32u - bits);
+	};
+	const auto snorm = [&](uint32_t value, uint32_t bits) {
+		return std::max(static_cast<float>(sint(value, bits)) /
+		                    static_cast<float>((uint64_t {1} << (bits - 1u)) - 1u),
+		                -1.0f);
+	};
 	switch (format) {
 		case vk::Format::eB10G11R11UfloatPack32:
 			next.float32[0] = float16((packed & 0x7ffu) << 4u);
@@ -454,6 +472,94 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 			next.float32[2] = static_cast<float>(packed & 0x3ffu) / 1023.0f;
 			next.float32[3] = static_cast<float>((packed >> 30u) & 0x3u) / 3.0f;
 			break;
+		// One case per channel layout; the lanes fill R, G, B, A in storage order.
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR8Snorm:
+		case vk::Format::eR8G8Snorm:
+		case vk::Format::eR8G8B8A8Snorm:
+		case vk::Format::eR16Snorm:
+		case vk::Format::eR16G16Snorm:
+		case vk::Format::eR16G16B16A16Snorm:
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR8Sint:
+		case vk::Format::eR8G8Sint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR32G32Sint: {
+			const auto bits     = vk::componentBits(format, 0);
+			const auto channels = vk::componentCount(format);
+			const auto numeric  = std::string_view {vk::componentNumericFormat(format, 0)};
+			for (uint32_t index = 0; index < channels; index++) {
+				const auto value = lane(bits, index);
+				if (numeric == "UNORM") {
+					next.float32[index] = unorm(value, bits);
+				} else if (numeric == "SNORM") {
+					next.float32[index] = snorm(value, bits);
+				} else if (numeric == "UINT") {
+					next.uint32[index] = value;
+				} else {
+					next.int32[index] = sint(value, bits);
+				}
+			}
+			break;
+		}
+		case vk::Format::eB8G8R8A8Snorm:
+			next.float32[0] = snorm(lane(8, 2), 8);
+			next.float32[1] = snorm(lane(8, 1), 8);
+			next.float32[2] = snorm(lane(8, 0), 8);
+			next.float32[3] = snorm(lane(8, 3), 8);
+			break;
+		case vk::Format::eA2B10G10R10SnormPack32:
+			next.float32[0] = snorm(packed & 0x3ffu, 10);
+			next.float32[1] = snorm((packed >> 10u) & 0x3ffu, 10);
+			next.float32[2] = snorm((packed >> 20u) & 0x3ffu, 10);
+			next.float32[3] = snorm((packed >> 30u) & 0x3u, 2);
+			break;
+		case vk::Format::eA2B10G10R10UintPack32:
+			next.uint32[0] = packed & 0x3ffu;
+			next.uint32[1] = (packed >> 10u) & 0x3ffu;
+			next.uint32[2] = (packed >> 20u) & 0x3ffu;
+			next.uint32[3] = (packed >> 30u) & 0x3u;
+			break;
+		// Packed 16-bit formats name their channels from the most significant bit down.
+		case vk::Format::eR5G6B5UnormPack16:
+			next.float32[0] = unorm((packed >> 11u) & 0x1fu, 5);
+			next.float32[1] = unorm((packed >> 5u) & 0x3fu, 6);
+			next.float32[2] = unorm(packed & 0x1fu, 5);
+			break;
+		case vk::Format::eB5G6R5UnormPack16:
+			next.float32[0] = unorm(packed & 0x1fu, 5);
+			next.float32[1] = unorm((packed >> 5u) & 0x3fu, 6);
+			next.float32[2] = unorm((packed >> 11u) & 0x1fu, 5);
+			break;
+		case vk::Format::eA1R5G5B5UnormPack16:
+			next.float32[0] = unorm((packed >> 10u) & 0x1fu, 5);
+			next.float32[1] = unorm((packed >> 5u) & 0x1fu, 5);
+			next.float32[2] = unorm(packed & 0x1fu, 5);
+			next.float32[3] = unorm((packed >> 15u) & 0x1u, 1);
+			break;
+		case vk::Format::eR5G5B5A1UnormPack16:
+			next.float32[0] = unorm((packed >> 11u) & 0x1fu, 5);
+			next.float32[1] = unorm((packed >> 6u) & 0x1fu, 5);
+			next.float32[2] = unorm((packed >> 1u) & 0x1fu, 5);
+			next.float32[3] = unorm(packed & 0x1u, 1);
+			break;
+		case vk::Format::eR4G4B4A4UnormPack16:
+			next.float32[0] = unorm((packed >> 12u) & 0xfu, 4);
+			next.float32[1] = unorm((packed >> 8u) & 0xfu, 4);
+			next.float32[2] = unorm((packed >> 4u) & 0xfu, 4);
+			next.float32[3] = unorm(packed & 0xfu, 4);
+			break;
 		default: return false;
 	}
 	clear = next;
@@ -464,17 +570,17 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 // Keep this separate: the first register word alone cannot describe a 64-bit color.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
-	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
-	    (packed & 0xffffu) != (packed >> 16u)) {
+	// A pixel narrower than the word must repeat within it.
+	const auto pixel_bytes = vk::blockSize(format);
+	if ((pixel_bytes == 2 && (packed & 0xffffu) != (packed >> 16u)) ||
+	    (pixel_bytes == 1 && packed != (packed & 0xffu) * 0x01010101u)) {
 		return false;
 	}
-	if (format == vk::Format::eR16G16B16A16Sfloat) {
-		if (packed != 0) {
-			return false;
-		}
+	if (format == vk::Format::eR16G16B16A16Sfloat && packed == 0) {
 		clear = vk::ClearColorValue {};
 		return true;
 	}
+	// A 64-bit pixel holds the repeated word twice, so a non-zero RGBA16F fill decodes too.
 	return DecodePackedColorClear(format, uint64_t {packed} | (uint64_t {packed} << 32u), clear);
 }
 

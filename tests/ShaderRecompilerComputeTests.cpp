@@ -17470,6 +17470,47 @@ public:
                   DecodeColorDwordFill(format, 0x3c003c00u, clear),
               "alternating R16 pixels were treated as a uniform clear");
     }
+    // CB_COLOR_CLEAR_WORD1:WORD0 is one pixel in the target's own layout.
+    struct RawCase {
+      vk::Format format;
+      uint64_t word;
+      std::array<uint32_t, 4> lanes;
+    };
+    const auto f = [](float value) { return std::bit_cast<uint32_t>(value); };
+    const std::array raw_cases{
+        RawCase{vk::Format::eR16G16B16A16Sfloat, 0x000038003c00bc00ull,
+                {f(-1.0f), f(1.0f), f(0.5f), 0}},
+        RawCase{vk::Format::eR8G8Unorm, 0xffffffffull, {f(1.0f), f(1.0f), 0, 0}},
+        RawCase{vk::Format::eR8G8Uint, 0x0000ab12ull, {0x12u, 0xabu, 0, 0}},
+        RawCase{vk::Format::eR8Uint, 0x7full, {0x7fu, 0, 0, 0}},
+        RawCase{vk::Format::eR8G8B8A8Snorm, 0x80817f00ull, {0, f(1.0f), f(-1.0f), f(-1.0f)}},
+        RawCase{vk::Format::eR16G16B16A16Unorm, 0x0000ffff0000ffffull,
+                {f(1.0f), 0, f(1.0f), 0}},
+        RawCase{vk::Format::eR32G32Sfloat, 0x400000003f800000ull, {f(1.0f), f(2.0f), 0, 0}},
+        RawCase{vk::Format::eR32G32Sint, 0xffffffff00000005ull, {5u, 0xffffffffu, 0, 0}},
+        RawCase{vk::Format::eB8G8R8A8Unorm, 0x000000ffull, {0, 0, f(1.0f), 0}},
+        RawCase{vk::Format::eA2B10G10R10UnormPack32, 0xc00003ffull, {f(1.0f), 0, 0, f(1.0f)}},
+        RawCase{vk::Format::eB10G11R11UfloatPack32,
+                0x3c0ull | (0x380ull << 11u) | (0x200ull << 22u),
+                {f(1.0f), f(0.5f), f(2.0f), 0}},
+    };
+    for (const auto &test : raw_cases) {
+      clear = {};
+      Require(name, "register clear pixel",
+              DecodePackedColorClear(test.format, test.word, clear) &&
+                  std::bit_cast<std::array<uint32_t, 4>>(clear.uint32) == test.lanes,
+              "register clear lost a channel, its order, its numeric type or the second word");
+    }
+    Require(name, "R8 DWORD fill",
+            DecodeColorDwordFill(vk::Format::eR8Uint, 0x07070707u, clear) &&
+                clear.uint32[0] == 7u &&
+                !DecodeColorDwordFill(vk::Format::eR8Uint, 0x07070708u, clear),
+            "a DWORD fill of R8 must repeat one pixel in every byte");
+    Require(name, "RGBA16F DWORD fill",
+            DecodeColorDwordFill(vk::Format::eR16G16B16A16Sfloat, 0x3c003c00u, clear) &&
+                std::bit_cast<std::array<uint32_t, 4>>(clear.uint32) ==
+                    std::array<uint32_t, 4>{f(1.0f), f(1.0f), f(1.0f), f(1.0f)},
+            "a DWORD fill repeats its word across both halves of a 64-bit pixel");
     Require(name, "RG32 DWORD fill",
             DecodeColorDwordFill(vk::Format::eR32G32Sfloat, 0x3f800000u, clear) &&
                 clear.float32[0] == 1.0f && clear.float32[1] == 1.0f,

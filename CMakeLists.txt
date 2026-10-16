@@ -756,6 +756,7 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	add_dependencies(kyty_tests gpu_keepwarm_tests)
 	foreach(mutant IN LISTS KYTY_KW_MUTANTS)
 		add_dependencies(kyty_tests gpu_keepwarm_mutant_${mutant}_tests)
 	endforeach()

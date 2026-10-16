@@ -7,7 +7,7 @@ set(KYTY_KW_HEADER_REL "graphics/host_gpu/renderer/gpuKeepWarm.h")
 
 # name | from | to
 set(KYTY_KW_MUTANTS
-	no_guard luid_le_only luid_be_only wrong_device one_in_flight no_stop no_pause no_resume flag_not_set idle_short paused_time_dropped)
+	no_guard luid_le_only luid_be_only wrong_device one_in_flight no_stop no_pause no_resume flag_not_set idle_short paused_time_dropped no_restart_reset)
 set(KYTY_KW_FROM_no_guard "if (!apple_silicon) {")
 set(KYTY_KW_TO_no_guard "if (false) {")
 set(KYTY_KW_FROM_luid_le_only "return little == registry_id || big == registry_id;")
@@ -30,6 +30,8 @@ set(KYTY_KW_FROM_idle_short "kIdleNs      = 250ull")
 set(KYTY_KW_TO_idle_short "kIdleNs      = 25ull")
 set(KYTY_KW_FROM_paused_time_dropped "m_paused_ns += now - m_pause_start;")
 set(KYTY_KW_TO_paused_time_dropped "")
+set(KYTY_KW_FROM_no_restart_reset "\t\tm_stopped     = false;\n\t\tm_paused      = false;\n\t\tm_paused_flag = false;\n")
+set(KYTY_KW_TO_no_restart_reset "")
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${KYTY_SOURCE_DIR}/${KYTY_KW_HEADER_REL}")
 file(READ "${KYTY_SOURCE_DIR}/${KYTY_KW_HEADER_REL}" KYTY_KW_TEXT)

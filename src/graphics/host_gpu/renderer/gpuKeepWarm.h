@@ -161,10 +161,14 @@ inline Eligibility CheckEligibility(bool apple_silicon, const std::vector<Device
 // guest activity is older than kIdleNs -> running again at the first NoteActivity() (it returns the buffers to encode).
 class InFlightPolicy {
 public:
-	// The first fill at start (the idle clock starts at `now`).
+	// The fill at (re)start (the idle clock starts at `now`). A Start() after a Stop() in the same process begins a new run: the stopped and
+	// paused states are cleared (buffers of the previous run that are still in flight keep being counted; the counters stay cumulative).
 	uint32_t Fill(uint64_t now) {
 		m_last_activity.store(now);
 		std::lock_guard<std::mutex> lock(m_mutex);
+		m_stopped     = false;
+		m_paused      = false;
+		m_paused_flag = false;
 		return TakeLocked();
 	}
 

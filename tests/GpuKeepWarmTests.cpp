@@ -115,9 +115,27 @@ void TestStop() {
 	p.Stop();
 	Check(p.Stopped(), "stopped");
 	Check(p.OnCompleted(1 * kMs) == 0, "no replacement after Stop");
-	Check(p.Fill(1 * kMs) == 0, "no fill after Stop");
 	Check(p.OnCompleted(2 * kMs) == 0 && p.Idle(), "drained: idle");
 	Check(p.NoteActivity(3 * kMs) == 0, "no resume after Stop");
+}
+
+// Stop() then Start() in the same process (Fill again): the policy is reset and fills again, also after a Stop in a pause.
+void TestRestartAfterStop() {
+	InFlightPolicy p;
+	Check(p.Fill(0) == kMinInFlight, "first fill");
+	p.Stop();
+	Check(p.OnCompleted(1 * kMs) == 0 && p.OnCompleted(2 * kMs) == 0 && p.Idle(), "stopped and drained");
+	Check(p.Fill(3 * kMs) == kMinInFlight && !p.Stopped() && p.InFlight() == kMinInFlight, "stop then start fills again");
+	Check(p.OnCompleted(4 * kMs) == 1, "completions are replaced again after the restart");
+	// Stop in a pause, then start: not paused, fills.
+	InFlightPolicy q;
+	(void)q.Fill(0);
+	Check(q.OnCompleted(kIdleNs) == 0 && q.Paused(), "paused");
+	q.Stop();
+	Check(q.OnCompleted(kIdleNs + 1 * kMs) == 0 && q.Idle(), "drained");
+	Check(q.Fill(kIdleNs + 2 * kMs) == kMinInFlight && !q.Paused(), "start after stop in a pause fills again");
+	Check(q.NoteActivity(kIdleNs + 3 * kMs) == 0, "running: activity adds nothing");
+	Check(q.OnCompleted(kIdleNs + 4 * kMs) == 1, "still spinning after the restart");
 }
 
 // No guest submit for kIdleNs: the spin pauses (the buffers drain); the first submit after it resumes with 2 buffers.
@@ -161,6 +179,7 @@ int main() {
 	TestEligibility();
 	TestTwoInFlight();
 	TestStop();
+	TestRestartAfterStop();
 	TestAutoPauseAndResume();
 	std::puts("GpuKeepWarmTests: OK");
 	return 0;

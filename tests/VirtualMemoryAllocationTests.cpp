@@ -8,6 +8,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "loader/guestInstructionPatcher.h"
+#include "loader/jit.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
@@ -4775,6 +4776,59 @@ void TestSmallFiberStacksAndMigration() {
 
 } // namespace
 
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+KYTY_MS_ABI uint8_t* TlsStubTestAddress() {
+	return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(0x123456789abcull));
+}
+
+void TestTlsStubsPreserveFlags() {
+	const char*    test      = "TlsStubsPreserveFlags";
+	const uint64_t stub_size = Loader::Jit::SafeCall::GetSize();
+	constexpr uint64_t CODE_SIZE = 0x1000;
+	constexpr uint8_t  REG       = 1;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x0000000906000000ull, stub_size + CODE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "tls_stub_test");
+	Check(test, mapping != 0, "failed to allocate TLS stub test code");
+	auto* safe_call = new (reinterpret_cast<void*>(mapping)) Loader::Jit::SafeCall;
+	safe_call->SetFunc(TlsStubTestAddress);
+	const auto stub_address = mapping + Loader::Jit::TlsRegStub::GetOffset(REG);
+	auto*      stub         = new (reinterpret_cast<void*>(stub_address)) Loader::Jit::TlsRegStub;
+	stub->SetFunc(mapping);
+	stub->SetOutputReg(REG);
+
+	using Fixture  = uint64_t(KYTY_SYSV_ABI*)(uint64_t*);
+	bool preserved = true;
+	for (const auto [input, status]: {std::pair {uint8_t {0x7f}, uint64_t {0x890}},
+	                                  std::pair {uint8_t {0xff}, uint64_t {0x055}}}) {
+		Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping + stub_size));
+		code.push(code.rbx);
+		code.mov(code.rbx, code.rdi);
+		code.mov(code.rax, 0x5555555555555555ull);
+		code.mov(code.al, input);
+		code.add(code.al, 1);
+		code.mov(code.r11, stub_address);
+		code.call(code.r11);
+		code.mov(code.qword[code.rbx], code.rcx);
+		code.mov(code.qword[code.rbx + 8], code.rax);
+		code.pushf();
+		code.pop(code.rax);
+		code.pop(code.rbx);
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate TLS stub fixture");
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, stub_size + CODE_SIZE),
+		      "failed to flush TLS stub test code");
+		std::array<uint64_t, 2> registers {};
+		const auto flags = reinterpret_cast<Fixture>(mapping + stub_size)(registers.data());
+		const auto rax   = (0x5555555555555555ull & ~0xffull) | static_cast<uint8_t>(input + 1u);
+		preserved &= (flags & 0x8d5u) == status && registers[0] == 0x123456789abcull &&
+		             registers[1] == rax;
+	}
+	Libs::LibKernel::Memory::FreeGuestMemory(mapping, stub_size + CODE_SIZE);
+	Check(test, preserved, "TLS stubs changed the caller's flags or registers");
+}
+#endif
+
 int main(int argc, char** argv) {
 	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
@@ -4919,6 +4973,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestTlsStubsPreserveFlags);
+#endif
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

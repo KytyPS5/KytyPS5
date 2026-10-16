@@ -1395,6 +1395,43 @@ static void AppendWriteContent(std::vector<uint64_t>& out, const vk::WriteDescri
 	}
 }
 
+// A tiled layer holds its whole mip chain at the slice stride.
+static void AppendStorageWriteRanges(const TextureCache::ImageDesc&              desc,
+                                     std::vector<std::pair<uint64_t, uint64_t>>& out) {
+	const auto& info   = desc.info;
+	const auto& view   = desc.view_info;
+	const auto  layers = info.resources.layers;
+	if (info.data.size == 0) {
+		return;
+	}
+	bool planes = info.IsTiled() && !info.IsVolume() && info.tiled_slice_stride != 0 &&
+	              layers != 0 && view.level_count != 0 && view.layer_count != 0 &&
+	              view.base_level + view.level_count <= info.resources.levels &&
+	              view.base_layer + view.layer_count <= layers;
+	for (uint32_t level = view.base_level; planes && level < view.base_level + view.level_count;
+	     level++) {
+		planes = info.mip_layout[level].size / layers != 0;
+	}
+	if (!planes) {
+		out.emplace_back(info.data.address, info.data.size);
+	} else {
+		for (uint32_t layer = view.base_layer; layer < view.base_layer + view.layer_count;
+		     layer++) {
+			for (uint32_t level = view.base_level; level < view.base_level + view.level_count;
+			     level++) {
+				const auto& mip = info.mip_layout[level];
+				out.emplace_back(info.data.address + layer * info.tiled_slice_stride + mip.offset,
+				                 mip.size / layers);
+			}
+		}
+	}
+	for (const auto written: {info.stencil, info.metadata.range}) {
+		if (written.size != 0) {
+			out.emplace_back(written.address, written.size);
+		}
+	}
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1447,13 +1484,21 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		written_buffers.clear();
 		for (const auto id: m_bound_images) {
 			const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
-			if (image == nullptr || (!image->binding.shader_write && !image->binding.is_target)) {
+			if (image == nullptr || !image->binding.is_target) {
 				continue;
 			}
 			for (const auto written:
 			     {image->info.data, image->info.stencil, image->info.metadata.range}) {
 				if (written.size != 0) {
 					written_images.emplace_back(written.address, written.size);
+				}
+			}
+		}
+		for (const auto* writer: prepared_bindings) {
+			const auto& program = *writer->runtime->program;
+			for (size_t index = 0; index < program.info.images.size(); index++) {
+				if (program.info.images[index].written && index < writer->images.size()) {
+					AppendStorageWriteRanges(writer->images[index].desc, written_images);
 				}
 			}
 		}

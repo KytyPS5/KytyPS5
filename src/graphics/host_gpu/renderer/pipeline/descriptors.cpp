@@ -1266,6 +1266,42 @@ static void AppendWriteContent(std::vector<uint64_t>& out, const vk::WriteDescri
 	}
 }
 
+static void AppendStorageWriteRanges(const TextureCache::ImageDesc&              desc,
+                                     std::vector<std::pair<uint64_t, uint64_t>>& out) {
+	const auto& info   = desc.info;
+	const auto& view   = desc.view_info;
+	const auto  layers = info.resources.layers;
+	if (info.data.size == 0) {
+		return;
+	}
+	bool planes = info.IsTiled() && !info.IsVolume() && info.tiled_slice_stride != 0 &&
+	              layers != 0 && view.level_count != 0 && view.layer_count != 0 &&
+	              view.base_level + view.level_count <= info.resources.levels &&
+	              view.base_layer + view.layer_count <= layers;
+	for (uint32_t level = view.base_level; planes && level < view.base_level + view.level_count;
+	     level++) {
+		planes = info.mip_layout[level].size / layers != 0;
+	}
+	if (!planes) {
+		out.emplace_back(info.data.address, info.data.size);
+	} else {
+		for (uint32_t layer = view.base_layer; layer < view.base_layer + view.layer_count;
+		     layer++) {
+			for (uint32_t level = view.base_level; level < view.base_level + view.level_count;
+			     level++) {
+				const auto& mip = info.mip_layout[level];
+				out.emplace_back(info.data.address + layer * info.tiled_slice_stride + mip.offset,
+				                 mip.size / layers);
+			}
+		}
+	}
+	for (const auto written: {info.stencil, info.metadata.range}) {
+		if (written.size != 0) {
+			out.emplace_back(written.address, written.size);
+		}
+	}
+}
+
 const char*
 RenderExecutor::ScalarReadConflict(std::span<PreparedBindings* const> prepared_bindings) {
 	const bool any_reads = std::ranges::any_of(prepared_bindings, [](const PreparedBindings* p) {
@@ -1299,6 +1335,7 @@ RenderExecutor::ScalarReadConflict(std::span<PreparedBindings* const> prepared_b
 		const auto& program = *writer->runtime->program;
 		for (size_t index = 0; index < program.info.images.size(); index++) {
 			if (program.info.images[index].written && index < writer->images.size()) {
+				AppendStorageWriteRanges(writer->images[index].desc, written_images);
 			}
 		}
 	}
@@ -1334,6 +1371,7 @@ RenderExecutor::ScalarReadConflict(std::span<PreparedBindings* const> prepared_b
 	}
 	return nullptr;
 }
+
 static void ReportScalarReadConflict(std::span<PreparedBindings* const> stages,
                                      const char*                        conflict) {
 	static RefusalReporter reports;
@@ -1344,6 +1382,8 @@ static void ReportScalarReadConflict(std::span<PreparedBindings* const> stages,
 		                hash, conflict));
 	}
 }
+
+bool RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {

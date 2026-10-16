@@ -115,6 +115,7 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         load_bda_dword_function = 0;
+	std::array<uint32_t, 3>                          load_bda_unaligned_function {};
 	uint32_t                                         indirect_bounds_function = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         indirect_format_function = 0;
@@ -599,6 +600,8 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
+	// Ray tracing call-table kernels only: a guard that is always taken needs no branch and no phi.
+	if (state.program.gpu_selected_call_payloads && condition == ConstantBool(state, true)) return fn();
 	const auto then_label  = state.builder.AllocateId();
 	const auto header     = state.current_label;
 	const auto merge_label = state.builder.AllocateId();

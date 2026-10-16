@@ -223,39 +223,48 @@ uint32_t LoadBdaDwordState(EmitterState& state, uint32_t address, bool coherent)
 	});
 }
 
+// The unaligned read at a guest address: the aligned dword, the next one when the value crosses into it, funnel-shifted.
+uint32_t LoadBdaUnalignedBody(EmitterState& state, uint32_t address, uint32_t bits, bool coherent) {
+	const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+	                            ConstantU64(state, ~uint64_t {3}));
+	const auto first   = LoadBdaDwordState(state, aligned, coherent);
+	const auto byte =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
+	const auto crosses =
+	    bits == 8u ? ConstantBool(state, false)
+	               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
+	                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
+	const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
+		return LoadBdaDwordState(state, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
+		                                       ConstantU64(state, sizeof(uint32_t))), coherent);
+	});
+	const auto shift =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
+	const auto upper_shift =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                  Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 4), byte),
+	                  ConstantU32(state, 3)),
+	           ConstantU32(state, 3));
+	const auto merged =
+	    Binary(state, spv::OpBitwiseOr, TypeU32(state),
+	           Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, shift),
+	           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), second, upper_shift));
+	return bits == 32u ? merged
+	                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
+	                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+}
+
 uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
                  bool coherent = false) {
 	auto& state = ctx.state;
+	const auto function = coherent ? 0u : state.load_bda_unaligned_function[bits == 8u ? 0 : bits == 16u ? 1 : 2];
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
-		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
-		                            ConstantU64(state, ~uint64_t {3}));
-		const auto first   = LoadBdaDword(ctx, aligned, coherent);
-		const auto byte =
-		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
-		const auto crosses =
-		    bits == 8u ? ConstantBool(state, false)
-		               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
-		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
-		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
-			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
-			                                ConstantU64(state, sizeof(uint32_t))), coherent);
-		});
-		const auto shift =
-		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
-		const auto upper_shift =
-		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-		           Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-		                  Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 4), byte),
-		                  ConstantU32(state, 3)),
-		           ConstantU32(state, 3));
-		const auto merged =
-		    Binary(state, spv::OpBitwiseOr, TypeU32(state),
-		           Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, shift),
-		           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), second, upper_shift));
-		return bits == 32u ? merged
-		                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
-		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+		if (function == 0u) return LoadBdaUnalignedBody(state, address, bits, coherent);
+		const auto call = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), call, function, address);
+		return call;
 	});
 }
 
@@ -1391,6 +1400,20 @@ void DefineLoadBdaDword(EmitterState& state) {
 	state.builder.AddFunction(spv::OpReturnValue, value);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	state.load_bda_dword_function = function;
+	// The unaligned forms wrap it: one function per width, thousands of call sites in a call-table kernel.
+	for (size_t index = 0; state.program.gpu_selected_call_payloads && index < 3u; ++index) {
+		const uint32_t bits  = index == 0u ? 8u : index == 1u ? 16u : 32u;
+		const auto     fn_id = state.builder.AllocateId();
+		const auto     param = state.builder.AllocateId();
+		state.builder.AddName(fn_id, bits == 8u ? "load_bda_u8" : bits == 16u ? "load_bda_u16" : "load_bda_u32");
+		state.builder.AddFunction(spv::OpFunction, TypeU32(state), fn_id, spv::FunctionControlDontInlineMask,
+		                          function_type);
+		state.builder.AddFunction(spv::OpFunctionParameter, type, param);
+		EmitLabel(state, state.builder.AllocateId());
+		state.builder.AddFunction(spv::OpReturnValue, LoadBdaUnalignedBody(state, param, bits, false));
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		state.load_bda_unaligned_function[index] = fn_id;
+	}
 }
 
 void DefineGetBdaPointer(EmitterState& state) {

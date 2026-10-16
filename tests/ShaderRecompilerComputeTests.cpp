@@ -17782,6 +17782,9 @@ public:
         const auto paint = [&] {
           vk::ClearValue clear{};
           clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+          if (integer) {
+            clear.color.uint32 = std::array{0x00c0ffeeu, 0u, 0u, 0u};
+          }
           TextureCacheTestAccess::ClearImage(
               texture_cache, scheduler.Current(), color.image_id,
               {vk::ImageAspectFlagBits::eColor, 0, 1, selected_layer, 1}, clear);
@@ -17860,17 +17863,13 @@ public:
                                     {probe_width, 1, 1}, selected_layer) == expected,
                 "native metadata did not materialize the expected color");
         if (fill_case.reuse_mips) {
+          // A tiled chain stores small mips first: the two-level chain's mip 0 is not at offset 0.
           const auto &image = texture_cache.GetImage(color.image_id);
-          Require(name, "single-mip clear reuses mip chain",
-                  color.image_id == preexisting_id && image.info.resources.levels == 2 &&
+          Require(name, "single-mip clear gets its own image",
+                  color.image_id != preexisting_id && image.info.resources.levels == 1 &&
                       color.desc.info.resources.levels == 1 &&
                       color.desc.view_info.base_level == 0 && color.desc.view_info.level_count == 1,
-                  "the single-mip target did not retain its cached image and view scope");
-          Require(name, "single-mip clear preserves higher mip",
-                  ReadCachedTexel(name, context, color.image_id, {255, 127, 0},
-                                  {1, 1, 1}, 0, 1) ==
-                      std::vector<u32>{0x00003c00u, 0x00003c00u},
-                  "clearing mip zero changed its higher mip");
+                  "the single-mip target reused a chain whose mip 0 lies at another offset");
         }
         check_expanded_metadata();
 
@@ -17884,6 +17883,8 @@ public:
           painted = {0x0000ffffu, 0xffffffffu};
         } else if (fill_case.cmask) {
           painted = {0xffff00ffu};
+        } else if (integer) {
+          painted = {0x00c0ffeeu};
         } else if (bytes_per_pixel <= 4) {
           const uint32_t one = type == Prospero::ChannelType::kFloat ? 0x3c00u : 0xffffu;
           painted = {bytes_per_pixel == 2 ? one | (one << 16u) : one};

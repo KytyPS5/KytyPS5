@@ -211,6 +211,18 @@ bool DepthColorCopyEnabled(const GraphicContext& graphics) {
 	                  });
 }
 
+// A tiled chain stores small mips first, so the level count moves mip 0.
+[[nodiscard]] bool SharedMipsAtSameOffsets(const ImageInfo& a, const ImageInfo& b) {
+	const auto levels = std::min(
+	    {a.resources.levels, b.resources.levels, static_cast<uint32_t>(a.mip_layout.size())});
+	for (uint32_t level = 0; level < levels; level++) {
+		if (a.mip_layout[level].offset != b.mip_layout[level].offset) {
+			return false;
+		}
+	}
+	return true;
+}
+
 [[nodiscard]] bool SameAliasLayout(const ImageInfo& a, const ImageInfo& b) {
 	// Equal pitch and tile mode put a texel at the same address in both, so extents may differ.
 	return a.data == b.data && a.resources == b.resources && a.pitch == b.pitch &&
@@ -1225,6 +1237,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
+		     !SameGuestMipLayout(requested, cached.info)) ||
+		    !SharedMipsAtSameOffsets(requested, cached.info)) {
 			RetireOverlap(cached_id, safe_to_delete);
 			return {merged_id};
 		}

@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -92,10 +93,6 @@ public:
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
-	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
-	void SynchronizeBda(const RangeSet& mapped);
-	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
@@ -118,6 +115,25 @@ public:
 		m_released_ranges.Clear();
 		m_record_released = true;
 	}
+	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Uploads the pending CPU writes of the buffers within `ranges`. Visits only the tracking
+	// regions that hold a registered buffer and whose pages became CPU dirty since the previous
+	// call, or that were forced since (a buffer registered there, ForceSynchronization()): that
+	// call left no pending write under a buffer anywhere else in `ranges`. `all` visits every
+	// region that holds a buffer.
+	void SynchronizeBuffersInRanges(const RangeSet& ranges, bool all);
+	// The next SynchronizeBuffersInRanges() visits the regions of the range whatever their epoch
+	// (the range was mapped: parts of buffers there were outside the ranges synchronized so far).
+	void ForceSynchronization(uint64_t vaddr, uint64_t size);
+	// Uploads the pending CPU writes of the buffers within each [first, second) span, recorded
+	// together as SynchronizeBuffersInRanges() records them.
+	void SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans);
+	void FlushUploadBatch();
+	// FlushUploadBatch() as one dispatch; false when the batch does not fit it.
+	bool ScatterUploadBatch(const CommandRecorder& native);
+	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
+	// earlier synchronization uploaded.
+	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
 	void               RunGarbageCollector();
 
 private:
@@ -134,12 +150,6 @@ private:
 		bool                has_stream_leap;
 	};
 
-	// Copies [previous upload's end, end) go to `buffer`.
-	struct BufferUpload {
-		Buffer* buffer;
-		size_t  end;
-	};
-
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
@@ -154,8 +164,8 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
-	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
-	                  uint64_t total_size);
+	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -177,17 +187,29 @@ private:
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
 	MemoryTracker                                     m_memory_tracker;
-	std::mutex                                        m_bda_sync_mutex;
-	RangeSet                                          m_bda_sync;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_register_epoch     = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Per tracking region (address / TRACKER_REGION_SIZE), grown to the highest region that held a
+	// buffer: the number of registered buffers it holds, bitmaps of the regions holding any and of
+	// the regions to visit at the next synchronization whatever their epoch, and the CPU-dirty
+	// epoch as SynchronizeBuffersInRanges last visited it. A synchronization walks the bitmap of
+	// regions with buffers instead of every region of the mapped ranges (thousands in Demon's
+	// Souls, at each dispatch).
+	void                                       NoteBufferRegions(const Buffer& buffer, bool insert);
+	void                                       GrowRegionTables(uint64_t region);
+	std::vector<uint32_t>                      m_region_buffer_count;
+	std::vector<uint64_t>                      m_buffer_region_bits;
+	std::vector<uint64_t>                      m_forced_region_bits;
+	std::vector<uint64_t>                      m_synced_region_epochs;
+	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
 };
 
 } // namespace Libs::Graphics

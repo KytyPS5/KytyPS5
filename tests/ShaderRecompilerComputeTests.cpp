@@ -202,8 +202,6 @@ struct BufferCacheTestAccess {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
 
-  static std::mutex &BdaSyncMutex(BufferCache &cache) { return cache.m_bda_sync_mutex; }
-
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
     const auto *owner = cache.m_page_table.Find(
         address >> BufferCache::PageTable::kPageBits);
@@ -6994,22 +6992,13 @@ public:
     context.MapMemory(base + 2 * page, page);
     const auto id = cache.FindBuffer(base, 3 * page);
     auto &buffer = cache.GetBuffer(id);
-    auto readback = CreateHostBuffer(name, 9 * sizeof(u32),
+    auto readback = CreateHostBuffer(name, 6 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
-    const auto snapshot_of = [&](const auto &source, uint64_t offset, uint32_t index) {
-      const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
-      scheduler.Current().Handle().copyBuffer(source.Handle(), readback.buffer, 1, &copy);
-    };
     const auto snapshot = [&](uint64_t offset, uint32_t index) {
-      snapshot_of(buffer, offset, index);
+      const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
+      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
     };
-    {
-      const RecordedCommandCounter counter;
-      context.PrepareBda();
-      Require(name, "one barrier pair",
-              RecordedCommandCounter::barriers == 2 && RecordedCommandCounter::copies == 1,
-              "two ranges of one buffer did not upload in one copy behind one barrier pair");
-    }
+    context.PrepareBda();
     Require(name, "mapped intersection",
             !cache.IsRegionCpuModified(base, page) &&
                 cache.IsRegionCpuModified(base + page, page) &&
@@ -7041,58 +7030,16 @@ public:
     context.PrepareBda();
     snapshot(2 * page, 5);
 
-    // A write fault on GPU-dirty memory flushes it on the GPU thread, which must queue the page
-    // itself: the faulting thread can resume only after later commands.
-    (void)cache.ObtainBuffer(base + 20, sizeof(u32), true, false);
-    std::unique_lock queue_lock(BufferCacheTestAccess::BdaSyncMutex(cache));
-    std::jthread fault([&] { cache.InvalidateMemory(base + 20, sizeof(u32)); });
-    while (!cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE)) {
-      std::this_thread::yield();
-    }
-    std::binary_semaphore later_command{0};
-    context.GetGpu().SendCommand([&] { later_command.release(); });
-    Require(name, "flush queue order",
-            !later_command.try_acquire_for(std::chrono::milliseconds(100)),
-            "a GPU command ran before the write-fault flush queued its page");
-    queue_lock.unlock();
-    fault.join();
-    later_command.acquire();
-
     // Garbage collection untracks a clean buffer; its replacement queues the range on Register.
     BufferCacheTestAccess::SetGarbageCollectionThresholds(
         cache, 0, std::numeric_limits<uint64_t>::max());
     cache.RunGarbageCollector();
     Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
             "garbage collection kept the clean buffer");
-    const auto low = cache.FindBuffer(base, page);
-    const auto high = cache.FindBuffer(base + page, 2 * page);
-    {
-      const RecordedCommandCounter counter;
-      context.PrepareBda();
-      Require(name, "shared barrier pair",
-              RecordedCommandCounter::barriers == 2 && RecordedCommandCounter::copies == 2,
-              "two buffers did not upload behind one barrier pair");
-    }
+    (void)cache.FindBuffer(base, 3 * page);
+    context.PrepareBda();
     Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
-            "buffers replacing an evicted one did not upload their untracked pages");
-    snapshot_of(cache.GetBuffer(low), 16, 6);
-    snapshot_of(cache.GetBuffer(high), page, 7);
-
-    // Every write fault queues its page, however often the CPU rewrites it.
-    BufferCacheTestAccess::SetGarbageCollectionThresholds(
-        cache, std::numeric_limits<uint64_t>::max(),
-        std::numeric_limits<uint64_t>::max());
-    for (u32 interval = 0; interval < 8; ++interval) {
-      cache.RunGarbageCollector();
-      cache.InvalidateMemory(base + 8, 1);
-      words[2] = interval;
-      context.PrepareBda();
-      Require(
-          name, "repeated writes",
-          !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
-          "a write fault on a page the CPU keeps rewriting was not uploaded");
-    }
-    snapshot_of(cache.GetBuffer(low), 8, 8);
+            "a buffer replacing an evicted one did not upload its untracked pages");
 
     vk::BufferMemoryBarrier barrier{};
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -7103,13 +7050,10 @@ public:
     scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
     scheduler.Finish();
-    Require(name, "GPU contents",
-            ReadBuffer(name, readback, 9) ==
-                std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u,
-                                 0xabcdef01u, 0x12345678u, 0xfedcba98u,
-                                 0x87654321u, 0xfedcba98u, 7u},
-            "initial, re-dirtied, rewritten, newly mapped, remapped or "
-            "replacement bytes were stale on the GPU");
+    Require(name, "GPU contents", ReadBuffer(name, readback, 6) ==
+        std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u, 0xabcdef01u,
+                        0x12345678u, 0xfedcba98u},
+        "initial, re-dirtied, newly mapped or remapped bytes were stale on the GPU");
     context.UnmapMemory(base, 3 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);

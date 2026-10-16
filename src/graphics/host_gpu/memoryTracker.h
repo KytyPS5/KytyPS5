@@ -69,6 +69,59 @@ public:
 		});
 	}
 
+	// The CPU-dirty epoch of the tracking region `index` (address / TRACKER_REGION_SIZE), which
+	// advances whenever its pages become CPU dirty; 0 while the region is untracked.
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch(uint64_t index) const {
+		if (index >= REGION_COUNT) {
+			EXIT("invalid memory tracker region\n");
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->RegionCpuDirtyEpoch() : 0;
+	}
+
+	// Calls func(address, size) for maximal runs of pages that may hold CPU writes not yet
+	// uploaded, after releasing the region locks. Untracked regions count as dirty, as a new
+	// region starts dirty. Runs at most max_gap bytes apart come as one, with the clean pages
+	// between them.
+	template <typename Func>
+	void ForEachCpuDirtySpan(uint64_t vaddr, uint64_t size, uint64_t max_gap, Func&& func) {
+		ValidateRange(vaddr, size);
+		const auto                                  end = vaddr + size;
+		std::vector<std::pair<uint64_t, uint64_t>> spans; // [begin, end)
+		const auto add = [&](uint64_t begin, uint64_t finish) {
+			begin  = std::max(begin, vaddr);
+			finish = std::min(finish, end);
+			if (begin >= finish) {
+				return;
+			}
+			if (!spans.empty() && begin <= spans.back().second + max_gap) {
+				spans.back().second = finish;
+			} else {
+				spans.emplace_back(begin, finish);
+			}
+		};
+		for (uint64_t index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < end;
+		     index++) {
+			auto*      manager = m_regions[index].load(std::memory_order_acquire);
+			const auto start   = std::max(index * TRACKER_REGION_SIZE, vaddr);
+			const auto finish  = std::min((index + 1) * TRACKER_REGION_SIZE, end);
+			if (manager == nullptr) {
+				add(start, finish);
+				continue;
+			}
+			if (!manager->HasCpuDirty()) {
+				continue;
+			}
+			std::scoped_lock lock(manager->lock);
+			manager->ForEachModifiedRange<DirtySource::Cpu, false>(
+			    start - index * TRACKER_REGION_SIZE, finish - start,
+			    [&](uint64_t address, uint64_t bytes) { add(address, address + bytes); });
+		}
+		for (const auto& [begin, finish]: spans) {
+			func(begin, finish - begin);
+		}
+	}
+
 	// Calls func(address, size) for the runs of pages of [vaddr, vaddr + size) that the CPU may
 	// have written since the previous call over them: pages that became CPU dirty since then, or
 	// are still CPU dirty. Untracked pages start tracking as written. A single consumer owns the

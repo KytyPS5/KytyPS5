@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -96,6 +97,14 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
+	// Ranges mapped since the last BDA synchronization (under m_mapped_ranges_mutex): that
+	// synchronization forces their regions (BufferCache::ForceSynchronization()).
+	std::vector<std::pair<uint64_t, uint64_t>> m_bda_mapped_since_sync;
+	// SynchronizeDmaFootprint(): the spans of an operation.
+	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
+	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
+	// synchronization.
+	std::array<uint64_t, 3> m_bda_sync_epochs {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

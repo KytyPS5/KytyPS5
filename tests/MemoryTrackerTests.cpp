@@ -497,6 +497,41 @@ void BenchmarkCleanUploads() {
                 static_cast<double>(elapsed.count()) / completions);
   }
   tracker.MarkRegionAsCpuModified(address, size);
+  Release(memory);
+}
+
+void TestRegionCpuDirtyEpoch() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto index = address / Libs::Graphics::TRACKER_REGION_SIZE;
+  Check(tracker.RegionCpuDirtyEpoch(index) == 0,
+        "untracked region reported a CPU-dirty epoch");
+
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto uploaded = tracker.RegionCpuDirtyEpoch(index);
+  Check(uploaded != 0, "tracked region reported no CPU-dirty epoch");
+  (void)tracker.IsRegionCpuModified(address, page_size);
+  Check(tracker.RegionCpuDirtyEpoch(index) == uploaded,
+        "CPU-dirty epoch advanced without new CPU writes");
+
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  const auto marked = tracker.RegionCpuDirtyEpoch(index);
+  Check(marked != uploaded, "CPU-dirty epoch did not advance on a CPU write");
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.RegionCpuDirtyEpoch(index) == marked,
+        "CPU-dirty epoch advanced when an upload cleaned the region");
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  Release(memory);
+}
+
 std::vector<std::pair<uint64_t, uint64_t>>
 ConsumeCpuWrites(MemoryTracker &tracker, uint64_t address, uint64_t size) {
   std::vector<std::pair<uint64_t, uint64_t>> runs;
@@ -1332,6 +1367,7 @@ int main(int argc, char **argv) {
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
+  TestRegionCpuDirtyEpoch();
   TestConsumeCpuWrites();
   TestGpuMarkingSkipsCpuDirtyPages();
   TestRangeInvalidation();

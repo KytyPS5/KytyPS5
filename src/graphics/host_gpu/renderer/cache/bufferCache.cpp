@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -118,6 +119,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
 	if constexpr (insert) {
 		m_buffers.emplace(buffer.CpuAddress(), id);
+		m_register_epoch++;
+		m_buffer_set_epoch++;
+		NoteBufferRegions(buffer, true);
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
@@ -127,9 +131,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
-		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
+		m_buffer_set_epoch++;
+		NoteBufferRegions(buffer, false);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
@@ -279,7 +284,6 @@ BufferCache::~BufferCache() {
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	QueueBdaSync(vaddr, size);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -304,7 +308,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			QueueBdaSync(vaddr, size);
 		}
 	});
 }
@@ -415,67 +418,64 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
+	vk::Buffer                  source;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept {
-		    const BufferUpload upload {&buffer, copies.size()};
-		    UploadCopies({&upload, 1}, copies, total_size);
-	    });
+	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (source) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		vk::BufferMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+		                       vk::AccessFlagBits::eTransferRead |
+		                       vk::AccessFlagBits::eTransferWrite;
+		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer.Handle();
+		before.offset              = 0;
+		before.size                = buffer.Size();
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                  copies.data());
+		auto after          = before;
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
 }
 
-void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
-                               std::span<vk::BufferCopy> copies, uint64_t total_size) {
+vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+                                     uint64_t total_size) {
 	if (copies.empty()) {
-		return;
+		return nullptr;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
-	const auto source = UploadMemory(
-	    m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
+	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
-		    size_t first = 0;
-		    for (const auto& upload: uploads) {
-			    for (auto& copy: copies.subspan(first, upload.end - first)) {
-				    const auto address = upload.buffer->CpuAddress() + copy.dstOffset;
-				    if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset,
-					                                         copy.size)) {
-					    EXIT("BufferCache: failed to read sparse guest buffer memory\n");
-				    }
-				    copy.srcOffset += base_offset;
-			    }
-			    first = upload.end;
-		    }
-	    });
-	auto& command = m_scheduler.Current();
-	command.EndRendering();
-	const auto              native = command.Handle();
-	const vk::MemoryBarrier before {
-	    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-		                 vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
-	    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-	                       1, &before, 0, nullptr, 0, nullptr);
-	size_t first = 0;
-	for (const auto& upload: uploads) {
-		native.copyBuffer(source.first->Handle(), upload.buffer->Handle(),
-		                  static_cast<uint32_t>(upload.end - first), copies.data() + first);
-		first = upload.end;
-	}
-	const vk::MemoryBarrier after {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-	                               .dstAccessMask = vk::AccessFlagBits::eMemoryRead |
-	                                                vk::AccessFlagBits::eMemoryWrite};
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
+		for (auto& copy: copies) {
+			const auto address = buffer.CpuAddress() + copy.dstOffset;
+			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
+				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
+			copy.srcOffset += base_offset;
+		}
+	});
+	return source.first->Handle();
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -550,7 +550,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
-		// Access the guest mapping so write faults invalidate cached buffers and images.
+		// Invalidate cached buffers and images for the whole range up front, as the write
+		// faults would page by page, so the fill below does not fault on every tracked page.
+		InvalidateMemory(vaddr, size);
+		m_texture_cache.InvalidateMemory(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		return;
@@ -713,13 +716,6 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
-	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
-	std::lock_guard lock(m_bda_sync_mutex);
-	m_bda_sync.Add(begin, end - begin);
-}
-
 void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
@@ -746,42 +742,249 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-void BufferCache::SynchronizeBda(const RangeSet& mapped) {
-	const auto queued = [this] {
-		std::lock_guard lock(m_bda_sync_mutex);
-		return std::exchange(m_bda_sync, {});
-	}();
-	std::vector<vk::BufferCopy> copies;
-	std::vector<BufferUpload>   uploads;
-	uint64_t                    total_size = 0;
-	queued.ForEach([&](uint64_t begin, uint64_t end) {
-		mapped.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
-			auto it = m_buffers.upper_bound(start);
-			if (it != m_buffers.begin()) {
-				--it;
+void BufferCache::FlushUploadBatch() {
+	m_upload_batching = false;
+	if (m_upload_batch_buffers.empty()) {
+		return;
+	}
+	// The staging ranges belong to the command buffer they were mapped for.
+	EXIT_IF(m_scheduler.CurrentTick() != m_upload_batch_tick);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// A batch that copies to several buffers runs as one dispatch: a copy command each costs about
+	// as much GPU time as a small dispatch (GTA V: ~200 buffers per batch, several batches a frame).
+	if (m_upload_batch_buffers.size() > 1 && ScatterUploadBatch(native)) {
+		m_upload_batch_buffers.clear();
+		m_upload_batch_copies.clear();
+		return;
+	}
+	// As SynchronizeBuffer() records around each upload, for all the buffers at once.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 1,
+	                       &before, 0, nullptr, 0, nullptr);
+	const auto staging = m_staging_buffer.Handle();
+	size_t     first   = 0;
+	for (const auto& batch: m_upload_batch_buffers) {
+		native.copyBuffer(staging, batch.buffer, batch.count, m_upload_batch_copies.data() + first);
+		first += batch.count;
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
+	                       1, &after, 0, nullptr, 0, nullptr);
+	m_upload_batch_buffers.clear();
+	m_upload_batch_copies.clear();
+}
+
+bool BufferCache::ScatterUploadBatch(const CommandRecorder& native) {
+	// One job per piece of up to ScatterJobBytes of a copy, by device address: small pieces keep
+	// enough workgroups in flight to hide the latency of reads from host memory.
+	struct Job {
+		uint64_t source;
+		uint64_t destination;
+		uint32_t size;
+		uint32_t pad0;
+		uint64_t pad1;
+	};
+	static_assert(sizeof(Job) == 32);
+	constexpr uint64_t ScatterJobBytes = 4 * 1024;
+	constexpr uint32_t MaxJobs         = 65535;
+	const auto         staging         = m_staging_buffer.BufferDeviceAddress();
+	std::vector<Job>   jobs;
+	size_t             first = 0;
+	for (const auto& batch: m_upload_batch_buffers) {
+		if (batch.address == 0 || staging == 0) {
+			return false;
+		}
+		for (uint32_t i = 0; i < batch.count; i++) {
+			const auto& copy = m_upload_batch_copies[first + i];
+			// The shader copies whole dwords.
+			if (((copy.srcOffset | copy.dstOffset | copy.size) & 3u) != 0) {
+				return false;
 			}
-			for (; it != m_buffers.end() && it->first < finish; ++it) {
-				auto&      buffer = m_slot_buffers[it->second];
-				const auto first  = std::max(buffer.CpuAddress(), start);
-				const auto last   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
-				if (first < last) {
-					// Reads follow every range's protection; a write in between re-queues its page.
-					m_memory_tracker.ForEachUploadRange(
-					    first, last - first, false,
-					    [&](uint64_t address, uint64_t bytes) noexcept {
-						    if (uploads.empty() || uploads.back().buffer != &buffer) {
-							    uploads.push_back({&buffer, 0});
-						    }
-						    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-						    uploads.back().end = copies.size();
-						    total_size += bytes;
-					    },
-					    []() noexcept {});
-				}
+			for (uint64_t done = 0; done < copy.size; done += ScatterJobBytes) {
+				jobs.push_back({staging + copy.srcOffset + done, batch.address + copy.dstOffset + done,
+				                static_cast<uint32_t>(std::min(ScatterJobBytes, copy.size - done)), 0, 0});
 			}
-		});
+		}
+		first += batch.count;
+	}
+	if (jobs.empty() || jobs.size() > MaxJobs) {
+		return false;
+	}
+	// The job list goes after the staged data, in the same lap of the staging buffer (no wait: that
+	// would submit the command buffer without the batch).
+	const auto bytes            = jobs.size() * sizeof(Job);
+	const auto [mapped, offset] = m_staging_buffer.Map(bytes, 16, false);
+	if (mapped == nullptr) {
+		return false;
+	}
+	std::memcpy(mapped, jobs.data(), bytes);
+	m_staging_buffer.Commit();
+	if (!m_scatter_pipeline) {
+		const auto                   device = m_graphics.device;
+		const vk::PushConstantRange  push {vk::ShaderStageFlagBits::eCompute, 0, 16};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push;
+		RequireVulkanSuccess(device.createPipelineLayout(&layout_info, nullptr, &m_scatter_layout),
+		                     "create buffer scatter pipeline layout");
+		const auto                        module = CompileSPV(BUFFER_SCATTER_SPV, device);
+		vk::PipelineShaderStageCreateInfo stage {};
+		stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		stage.module = module;
+		stage.pName  = "main";
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage  = stage;
+		pipeline_info.layout = m_scatter_layout;
+		const auto result    = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &m_scatter_pipeline);
+		device.destroyShaderModule(module, nullptr);
+		RequireVulkanSuccess(result, "create buffer scatter pipeline");
+		SetVulkanObjectNameF(device, m_scatter_pipeline, "Kyty.BufferScatter");
+	}
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlagBits::eByRegion, 1,
+	                       &before, 0, nullptr, 0, nullptr);
+	struct Push {
+		uint64_t jobs;
+		uint32_t job_count;
+		uint32_t pad;
+	} push {staging + offset, static_cast<uint32_t>(jobs.size()), 0};
+	native.bindPipeline(vk::PipelineBindPoint::eCompute, m_scatter_pipeline);
+	native.pushConstants(m_scatter_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	native.dispatch(push.job_count, 1, 1);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
+	                       1, &after, 0, nullptr, 0, nullptr);
+	return true;
+}
+
+// Each buffer's upload would record its own pair of barriers: record them once, around the
+// copies of every buffer (hundreds per frame in GTA V).
+struct BufferCache::UploadBatch {
+	BufferCache& cache;
+	explicit UploadBatch(BufferCache& owner): cache(owner) {
+		cache.m_upload_batching   = true;
+		cache.m_upload_batch_tick = cache.m_scheduler.CurrentTick();
+	}
+	~UploadBatch() { cache.FlushUploadBatch(); }
+	UploadBatch(const UploadBatch&)            = delete;
+	UploadBatch& operator=(const UploadBatch&) = delete;
+};
+
+void BufferCache::SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans) {
+	const UploadBatch batch {*this};
+	for (const auto& [first, last]: spans) {
+		SynchronizeBuffersInRange(first, last - first);
+	}
+}
+
+void BufferCache::GrowRegionTables(uint64_t region) {
+	if (region < m_region_buffer_count.size()) {
+		return;
+	}
+	const auto words = region / 64 + 1;
+	m_region_buffer_count.resize(words * 64, 0);
+	m_synced_region_epochs.resize(words * 64, 0);
+	m_buffer_region_bits.resize(words, 0);
+	m_forced_region_bits.resize(words, 0);
+}
+
+void BufferCache::NoteBufferRegions(const Buffer& buffer, bool insert) {
+	const auto first = buffer.CpuAddress() / TRACKER_REGION_SIZE;
+	const auto last  = (buffer.CpuAddress() + buffer.Size() - 1) / TRACKER_REGION_SIZE;
+	GrowRegionTables(last);
+	for (auto index = first; index <= last; index++) {
+		const auto bit = uint64_t {1} << (index % 64);
+		if (insert) {
+			// A new buffer may cover CPU-dirty pages that no earlier synchronization uploaded.
+			m_region_buffer_count[index]++;
+			m_buffer_region_bits[index / 64] |= bit;
+			m_forced_region_bits[index / 64] |= bit;
+		} else {
+			EXIT_IF(m_region_buffer_count[index] == 0);
+			if (--m_region_buffer_count[index] == 0) {
+				m_buffer_region_bits[index / 64] &= ~bit;
+			}
+		}
+	}
+}
+
+void BufferCache::ForceSynchronization(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || m_buffer_region_bits.empty()) {
+		return;
+	}
+	const auto first = vaddr / TRACKER_REGION_SIZE;
+	const auto last  = std::min<uint64_t>((vaddr + size - 1) / TRACKER_REGION_SIZE, m_region_buffer_count.size() - 1);
+	for (auto index = first; index <= last; index++) {
+		m_forced_region_bits[index / 64] |= uint64_t {1} << (index % 64);
+	}
+}
+
+void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
+	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
+	// it again, and the next call visits the region again. Regions without buffers have nothing
+	// to upload; a buffer registered later forces its regions.
+	m_sync_regions.clear();
+	for (size_t word = 0; word < m_buffer_region_bits.size(); word++) {
+		const auto forced = m_forced_region_bits[word];
+		m_forced_region_bits[word] = 0;
+		for (auto bits = m_buffer_region_bits[word]; bits != 0; bits &= bits - 1) {
+			const auto index = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
+			const auto epoch = m_memory_tracker.RegionCpuDirtyEpoch(index);
+			// Synchronizing a buffer tracks its pages, so an untracked region (epoch 0) has no
+			// pending write under a buffer unless the region was forced.
+			if (!all && (forced & (uint64_t {1} << (index % 64))) == 0 &&
+			    (epoch == 0 || m_synced_region_epochs[index] == epoch)) {
+				continue;
+			}
+			m_sync_regions.emplace_back(index, epoch);
+		}
+	}
+	for (const auto& [index, epoch]: m_sync_regions) {
+		ranges.ForEachInRange(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE,
+		                      [this](uint64_t start, uint64_t end) {
+			                      SynchronizeBuffersInRange(start, end - start);
+		                      });
+		m_synced_region_epochs[index] = epoch;
+	}
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Only tracking regions with pending CPU writes can have anything to upload. Synchronizing a
+	// buffer protects the pages it uploads again, and each protection call costs ~2.3 us (with
+	// other threads of the process running, flushing the other processors' TLBs) besides ~0.1 us
+	// per page. Runs a few clean pages apart are synchronized together: the page tracker then
+	// protects them with one call through the clean pages between, which keep their protection.
+	constexpr uint64_t MaxGap = 32 * TRACKER_PAGE_SIZE;
+	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, MaxGap, [&](uint64_t span, uint64_t bytes) {
+		const auto end = span + bytes;
+		auto       it  = m_buffers.upper_bound(span);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto start  = std::max(buffer.CpuAddress(), span);
+			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start < finish) {
+				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			}
+		}
 	});
-	UploadCopies(uploads, copies, total_size);
 }
 
 } // namespace Libs::Graphics

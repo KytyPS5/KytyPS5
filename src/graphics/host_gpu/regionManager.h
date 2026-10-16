@@ -81,6 +81,19 @@ public:
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
 		m_cpu_dirty.Fill();
 		m_cpu_written.Fill();
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	// Advances whenever pages of any region become CPU dirty: while it is unchanged, no page
+	// was dirtied since a synchronization that started after reading it.
+	[[nodiscard]] static uint64_t CpuDirtyEpoch() {
+		return s_cpu_dirty_epoch.load(std::memory_order_acquire);
+	}
+
+	// Advances, after the pages change under the lock, whenever pages of this region become CPU
+	// dirty; a new region starts dirty at 1.
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch() const {
+		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -109,7 +122,10 @@ public:
 		if constexpr (source == DirtySource::Cpu) {
 			if constexpr (enable) {
 				m_cpu_written.SetRange(start, end);
+				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 			}
+			m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 			UpdateProtection<!enable, false>(changed);
 		} else {
 			UpdateProtection<enable, true>(changed);
@@ -127,6 +143,7 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 				UpdateProtection<true, false>(mask);
 			} else {
 				UpdateProtection<false, true>(mask);
@@ -173,6 +190,12 @@ public:
 		}
 	}
 
+	// Whether any page holds CPU writes not yet uploaded. Read without the lock: a concurrent
+	// CPU write that is not observed yet is equivalent to one that lands after the read.
+	[[nodiscard]] bool HasCpuDirty() const {
+		return m_has_cpu_dirty.load(std::memory_order_acquire);
+	}
+
 	TrackingSpinLock lock;
 
 private:
@@ -213,6 +236,11 @@ private:
 	// Pages that became CPU dirty since ConsumeCpuWritten last visited them.
 	RegionBits   m_cpu_written;
 	RegionBits   m_gpu_dirty;
+	// A new region starts with every page CPU dirty.
+	std::atomic_bool      m_has_cpu_dirty {true};
+	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
+
+	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 };
 
 } // namespace Libs::Graphics

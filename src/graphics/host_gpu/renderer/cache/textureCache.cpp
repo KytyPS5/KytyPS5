@@ -2147,6 +2147,22 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 	return true;
 }
 
+bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	bool             modified = false;
+	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
+		// PPSA17168: S_LOAD_DWORD reads shader data at an address overlapping an old
+		// render target whose memory the CPU has reused. The cached image still retains
+		// its earlier GPU-modified flag.
+		modified = !image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty();
+		return modified;
+	});
+	return modified;
+}
+
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);

@@ -127,8 +127,8 @@ uint64_t RenderContext::MappedRangesVersion() const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.QueueBdaSync(vaddr, size);
 	m_mapped_ranges_version++;
+	m_bda_mapped_since_sync.emplace_back(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -171,7 +171,30 @@ void RenderContext::PrepareBda() {
 	}();
 	m_buffer_cache.PrepareFaultBuffer();
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
+	// Nothing to upload when no page became CPU dirty, no buffer was registered and no range was
+	// mapped since the last synchronization started.
+	const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(),
+	                                      m_buffer_cache.RegisterEpoch(), m_mapped_ranges_version};
+	// The guest's CPU writes that the work of a submission may read through device addresses
+	// precede the submission, or a WAIT_REG_MEM that the work waited for; the GPU sees later ones
+	// only after such a wait. So once a synchronization ran for a submission, pages the CPU
+	// dirties afterwards wait for the next submission or wait (they stay dirty meanwhile),
+	// unless the execution thread itself wrote them for the command stream (labels, CP writes)
+	// or the buffers or mappings changed.
+	const bool same_layout = epochs[1] == m_bda_sync_epochs[1] && epochs[2] == m_bda_sync_epochs[2];
+	if (full_sync && epochs != m_bda_sync_epochs &&
+	    (!same_layout || m_bda_synced_generation != m_bda_generation)) {
+		m_bda_synced_generation = m_bda_generation;
+		// A new buffer or mapped range may cover CPU-dirty pages that earlier passes skipped: the
+		// buffer cache forces the regions of new buffers, and of the ranges mapped since. Only this
+		// thread takes the ranges out; MapMemory() adds them under the exclusive lock.
+		for (const auto& [vaddr, size]: m_bda_mapped_since_sync) {
+			m_buffer_cache.ForceSynchronization(vaddr, size);
+		}
+		m_bda_mapped_since_sync.clear();
+		m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, false);
+		m_bda_sync_epochs = epochs;
+	}
 	m_fault_process_pending = true;
 }
 

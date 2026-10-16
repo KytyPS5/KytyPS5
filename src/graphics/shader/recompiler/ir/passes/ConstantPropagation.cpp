@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <optional>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -980,25 +982,227 @@ private:
 
 } // namespace
 
-uint32_t EliminateDuplicateBitcasts(const BlockList& blocks) {
-	uint32_t removed = 0;
+// A predicated register write is a SelectU32 over the new and the old value. A float result goes through
+// BitCastU32F32 into it and out through BitCastF32U32 into the next float operation, so the chain of float
+// instructions pays two bitcasts per step. When every user of the select takes it back as F32 and one side is
+// itself a float bitcast, the select is done on F32 values: SelectF32 keeps the bits, and the bitcast pair goes.
+uint32_t PromoteSelectBitcasts(const BlockList& blocks) {
+	uint32_t promoted = 0;
 	for (auto* block: blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
+			if (inst.GetOpcode() != ValueOpcode::SelectU32 || !inst.HasUses()) continue;
+			bool all_float_users = true;
+			for (const auto& use: inst.Uses()) {
+				if (use.user->GetOpcode() != ValueOpcode::BitCastF32U32) {
+					all_float_users = false;
+					break;
+				}
+			}
+			if (!all_float_users) continue;
+			const auto float_source = [](Value side) -> Value {
+				auto* producer = side.Resolve().TryInstruction();
+				return producer != nullptr && producer->GetOpcode() == ValueOpcode::BitCastU32F32
+				           ? producer->Arg(0) : Value();
+			};
+			const auto first_float  = float_source(inst.Arg(1));
+			const auto second_float = float_source(inst.Arg(2));
+			if (first_float.IsEmpty() && second_float.IsEmpty()) continue;
+			const auto as_float = [&](Value side, Value known) -> Value {
+				if (!known.IsEmpty()) return known;
+				return Value(&*block->PrependNewInst(it, ValueOpcode::BitCastF32U32, {side}));
+			};
+			const auto true_value  = as_float(inst.Arg(1), first_float);
+			const auto false_value = as_float(inst.Arg(2), second_float);
+			const auto replacement = Value(&*block->PrependNewInst(
+			    it, ValueOpcode::SelectF32, {inst.Arg(0), true_value, false_value}));
+			const std::vector<Use> users(inst.Uses().begin(), inst.Uses().end());
+			for (const auto& use: users) use.user->ReplaceUsesWith(replacement);
+			promoted++;
+		}
+	}
+	return promoted;
+}
+
+// Register values are U32 in the IR, so a float result that goes through a predicated write (SelectU32) or a join
+// (Phi) is bitcast to U32 on the way in and back to F32 on the way out, twice per step of a float chain. A web of
+// selects and phis whose users all take the value back as F32 (or are in the web themselves) can hold F32 instead:
+// SelectF32 and an F32-typed Phi keep every bit, and the bitcast pairs between the steps go.
+//
+// The web is the largest set of candidates that stays closed under "every user is a F32 bitcast or in the set".
+// Candidates that would cost more bitcasts than they save (many operands that are not float values) are dropped
+// and the set is closed again.
+uint32_t PromoteFloatWebs(const BlockList& blocks) {
+	std::unordered_map<Inst*, Block::iterator> position;
+	std::vector<Inst*>                         candidates;
+	for (auto* block: blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
+			const bool select = inst.GetOpcode() == ValueOpcode::SelectU32;
+			const bool phi    = inst.GetOpcode() == ValueOpcode::Phi && inst.GetType() == Type::U32;
+			if ((select || phi) && inst.HasUses()) {
+				position.emplace(&inst, it);
+				candidates.push_back(&inst);
+			}
+		}
+	}
+	if (candidates.empty()) return 0;
+	std::unordered_set<Inst*> web(candidates.begin(), candidates.end());
+
+	// Value operands of a candidate: a select's two values (not its condition), all of a phi's.
+	const auto first_operand = [](const Inst& inst) -> size_t {
+		return inst.GetOpcode() == ValueOpcode::SelectU32 ? 1u : 0u;
+	};
+	const auto float_source = [](Value operand) -> Value {
+		const auto resolved = operand.Resolve();
+		if (resolved.IsImmediate() && resolved.GetType() == Type::U32) return Value::F32(std::bit_cast<float>(resolved.U32()));
+		auto* producer = resolved.TryInstruction();
+		return producer != nullptr && producer->GetOpcode() == ValueOpcode::BitCastU32F32
+		           ? producer->Arg(0) : Value();
+	};
+
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (auto* node: candidates) {
+			if (!web.contains(node)) continue;
+			bool keep = true;
+			std::unordered_set<Inst*> bitcast_users;
+			bool needs_back = false;
+			for (const auto& use: node->Uses()) {
+				if (use.user->GetOpcode() == ValueOpcode::BitCastF32U32) {
+					bitcast_users.insert(use.user);
+				} else if (web.contains(use.user)) {
+					if (use.user->GetOpcode() == ValueOpcode::SelectU32 && use.operand == 0u) { keep = false; break; }
+				} else if (use.user->GetOpcode() == ValueOpcode::Phi) {
+					keep = false; // the bitcast back would have to sit in a predecessor block
+					break;
+				} else {
+					needs_back = true; // one shared U32 bitcast serves every integer user
+				}
+			}
+			if (keep) {
+				int benefit = static_cast<int>(bitcast_users.size()) - (needs_back ? 1 : 0);
+				for (size_t index = first_operand(*node); index < node->NumArgs(); index++) {
+					const auto operand = node->Arg(index).Resolve();
+					auto* producer     = operand.TryInstruction();
+					if (producer != nullptr && web.contains(producer)) continue;
+					if (float_source(operand).IsEmpty()) {
+						if (node->GetOpcode() == ValueOpcode::Phi) { benefit = -1; break; }
+						benefit -= 1;
+					} else {
+						benefit += 1;
+					}
+				}
+				keep = benefit >= 0;
+			}
+			if (!keep) {
+				web.erase(node);
+				changed = true;
+			}
+		}
+	}
+	if (web.empty()) return 0;
+
+	// Phase A: a replacement SelectF32 per select; a phi becomes F32 in place.
+	std::unordered_map<Inst*, Value> promoted;
+	for (auto* node: candidates) {
+		if (!web.contains(node)) continue;
+		if (node->GetOpcode() == ValueOpcode::SelectU32) {
+			auto* block = node->Parent();
+			const auto made = block->PrependNewInst(position.at(node), ValueOpcode::SelectF32,
+			    {node->Arg(0), Value::F32(0.0f), Value::F32(0.0f)});
+			position[&*made] = made; // new bitcasts for its operands go in front of it
+			promoted.emplace(node, Value(&*made));
+		} else {
+			node->SetFlags(Type::F32);
+			promoted.emplace(node, Value(node));
+		}
+	}
+	// Phase B: float operands.
+	const auto as_float = [&](Value operand, Block* block, std::optional<Block::iterator> before) -> Value {
+		// A phi operand reaching here is a float value or a web member (checked above), never a new bitcast.
+		const auto resolved = operand.Resolve();
+		if (auto* producer = resolved.TryInstruction(); producer != nullptr) {
+			if (const auto found = promoted.find(producer); found != promoted.end()) return found->second;
+		}
+		if (const auto known = float_source(resolved); !known.IsEmpty()) return known;
+		return Value(&*block->PrependNewInst(*before, ValueOpcode::BitCastF32U32, {resolved}));
+	};
+	for (auto* node: candidates) {
+		if (!web.contains(node)) continue;
+		if (node->GetOpcode() == ValueOpcode::SelectU32) {
+			auto* replacement = promoted.at(node).TryInstruction();
+			auto* block       = node->Parent();
+			const auto at     = position.at(replacement);
+			const auto first  = as_float(node->Arg(1), block, at);
+			const auto second = as_float(node->Arg(2), block, at);
+			replacement->SetArg(1, first);
+			replacement->SetArg(2, second);
+		} else {
+			for (size_t index = 0; index < node->NumArgs(); index++) {
+				node->SetArg(index, as_float(node->Arg(index), nullptr, std::nullopt));
+			}
+		}
+	}
+	// Phase C: the F32 bitcasts of the web values are the values themselves; the remaining users get one U32 bitcast.
+	uint32_t count = 0;
+	std::unordered_set<Inst*> fresh; // the F32 selects made above already take F32 operands
+	for (const auto& [original, value]: promoted) fresh.insert(value.TryInstruction());
+	for (auto* node: candidates) {
+		if (!web.contains(node)) continue;
+		const std::vector<Use> users(node->Uses().begin(), node->Uses().end());
+		Value back;
+		for (const auto& use: users) {
+			if (use.user->GetOpcode() == ValueOpcode::BitCastF32U32) {
+				use.user->ReplaceUsesWith(promoted.at(node));
+			} else if (!web.contains(use.user) && !fresh.contains(use.user)) {
+				if (back.IsEmpty()) {
+					auto* block = node->Parent();
+					auto  where = position.at(node);
+					if (node->GetOpcode() == ValueOpcode::Phi) {
+						where = block->begin();
+						while (where != block->end() && where->GetOpcode() == ValueOpcode::Phi) ++where;
+					}
+					back = Value(&*block->PrependNewInst(where, ValueOpcode::BitCastU32F32, {promoted.at(node)}));
+				}
+				use.user->SetArg(use.operand, back);
+			}
+		}
+		count++;
+	}
+	return count;
+}
+
+uint32_t EliminateDuplicateBitcasts(const BlockList& blocks) {
+	// A block with a single predecessor sees everything that predecessor computed, so the available bitcasts
+	// carry down such chains instead of restarting in every block.
+	struct Available {
 		std::unordered_map<Inst*, Inst*> to_float, to_uint;
+	};
+	uint32_t removed = 0;
+	std::unordered_map<Block*, Available> finished;
+	for (auto* block: blocks) {
+		Available available;
+		const auto preds = block->ImmPredecessors();
+		if (preds.size() == 1u && preds[0] != block) {
+			if (const auto parent = finished.find(preds[0]); parent != finished.end()) available = parent->second;
+		}
 		for (auto& inst: *block) {
 			const auto opcode = inst.GetOpcode();
 			if ((opcode != ValueOpcode::BitCastF32U32 && opcode != ValueOpcode::BitCastU32F32) ||
 			    !inst.HasUses()) continue;
 			auto* source = inst.Arg(0).Resolve().TryInstruction();
 			if (source == nullptr) continue;
-			auto& available = opcode == ValueOpcode::BitCastF32U32 ? to_float : to_uint;
-			const auto [found, inserted] = available.emplace(source, &inst);
+			auto& table = opcode == ValueOpcode::BitCastF32U32 ? available.to_float : available.to_uint;
+			const auto [found, inserted] = table.emplace(source, &inst);
 			if (!inserted) {
-				// Same source and destination type, earlier in the same block: no memory
+				// Same source and destination type, earlier in a dominating position: no memory
 				// or floating-point operation is changed, and the replacement dominates.
 				inst.ReplaceUsesWith(Value(found->second));
 				removed++;
 			}
 		}
+		finished.emplace(block, std::move(available));
 	}
 	return removed;
 }

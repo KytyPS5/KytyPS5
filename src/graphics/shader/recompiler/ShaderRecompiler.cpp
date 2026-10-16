@@ -1764,8 +1764,11 @@ static TranslateResult TranslateProgramImpl(const Decoder::Program& decoded_inpu
 		}
 	}
 	if (has_inlined_calls) {
-		const auto removed = IR::EliminateDuplicateBitcasts(ir.blocks);
-		if (removed != 0u) {
+		// Each round exposes bitcast pairs the previous one left (a promoted web feeds the next select).
+		for (int round = 0; round < 4; round++) {
+			const auto promoted = IR::PromoteFloatWebs(ir.blocks) + IR::PromoteSelectBitcasts(ir.blocks);
+			const auto removed  = IR::EliminateDuplicateBitcasts(ir.blocks) + promoted;
+			if (removed == 0u) break;
 			IR::EliminateDeadCode(ir.blocks);
 		}
 	}

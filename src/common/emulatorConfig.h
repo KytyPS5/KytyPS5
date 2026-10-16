@@ -71,6 +71,8 @@ struct ConfigOptions {
 	uint32_t               controller_vibration_intensity = 100;
 	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
 	uint32_t               keyboard_player                = 0;
+	// Rumble pads that are not DualSenses with the peak of the haptic audio port.
+	bool                   pad_haptic_rumble           = false;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -147,6 +149,7 @@ int32_t  GetPlayerUserId(int player);
 int      GetPlayerFromUserId(int32_t user_id);
 // Players after the first are guests: they have no profile, trophies or NP account.
 bool     IsGuestUserId(int32_t user_id);
+bool     PadHapticRumbleEnabled();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();

@@ -14,6 +14,8 @@
 #include <thread>
 #include <vector>
 
+#include "common/emulatorConfig.h"
+
 namespace {
 void Check(bool condition, const char* text) {
 	if (!condition) {
@@ -350,6 +352,12 @@ using Port        = std::unique_ptr<Haptics::Stream, decltype(&Haptics::Close)>;
 constexpr std::array<int, 2>   unity {32768, 32768};
 constexpr std::array<float, 4> pcm {0.5f, 0.5f, 0.5f, 0.5f};
 
+void SetPadHapticRumble(bool enabled) {
+	Config::ConfigOptions options;
+	options.pad_haptic_rumble = enabled;
+	Config::Load(options);
+}
+
 struct Fixture {
 	Fixture() {
 		devices        = {{10, "Speakers (DualSense Wireless Controller)", 4}};
@@ -373,6 +381,7 @@ struct Fixture {
 		opens = rumble_calls = 0;
 		fail_open = fail_resume = false;
 		actual_channels         = 4;
+		SetPadHapticRumble(false);
 	}
 	~Fixture() {
 		Haptics::Shutdown();
@@ -458,8 +467,27 @@ void TestDiscoveryAndHotplug() {
 	Check(streams.empty(), "disconnected endpoint retained its stream");
 }
 
+void TestRumbleFallbackDisabled() {
+	// By default a pad that is not a DualSense must not rumble from haptic audio: only
+	// scePadSetVibration moves its motors.
+	Fixture f;
+	auto    port = Open();
+	Check(Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data()) == 0,
+	      "haptic audio was played for a pad that is not a DualSense");
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 0 && rumble_calls == 0,
+	      "haptic audio rumbled a pad that is not a DualSense");
+	Check(streams.empty() && hid_opens == 0, "haptic audio opened an audio device");
+	SetPadHapticRumble(true);
+	Check(Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data()) ==
+	          2 * 1000000 / 48000,
+	      "enabled rumble fallback playback time is wrong");
+	Check(pad_rumble[2].large == 65535 && pad_rumble[2].small == 65535,
+	      "enabled rumble fallback did not rumble");
+}
+
 void TestRumbleFallbackGains() {
 	Fixture f;
+	SetPadHapticRumble(true);
 	auto    port = Open();
 	const auto queue = [&](std::array<float, 2> gains) {
 		Check(Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data(), 1.0f,
@@ -481,6 +509,7 @@ void TestRumbleFallbackGains() {
 void TestRumbleFallbackSwitch() {
 	for (bool bluetooth: {false, true}) {
 		Fixture f;
+		SetPadHapticRumble(true);
 		wireless = hid_available = bluetooth;
 		auto port = Open();
 		Queue(port, pcm.data());
@@ -1312,6 +1341,7 @@ void TestAudioDefaultResumeFailure() {
 
 int main() {
 	SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+	Config::Initialize();
 	TestAudioSpeakerFallback();
 	TestAudioSpeakerRouting();
 	TestAudioFallbackGain();
@@ -1350,5 +1380,6 @@ int main() {
 	TestScaledRumbleDuration();
 	TestSwitchStopsOldRumble();
 	TestCloseRestoresRumble();
+	Config::Shutdown();
 	std::printf("PadHapticsTests: all cases passed\n");
 }

@@ -89,6 +89,10 @@ bool IsGuestUserId(int32_t user_id) {
 	return GetPlayerFromUserId(user_id) > 0;
 }
 
+bool PadHapticRumbleEnabled() {
+	return g_config->pad_haptic_rumble;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }

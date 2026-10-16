@@ -564,6 +564,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		// Raw guest writes bypass page-fault tracking when the pages are already
+		// CPU-owned, so mark the range explicitly. Otherwise a later ObtainBuffer
+		// can miss IsRegionCpuModified and serve a stale slot-buffer copy (e.g. a
+		// 0xFFFFFFFF slot-queue reset never reaching its consumer, #1072).
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		return;
 	}
 
@@ -589,6 +594,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
+		m_memory_tracker.MarkRegionAsCpuModified(dst_vaddr, size);
 		return;
 	}
 

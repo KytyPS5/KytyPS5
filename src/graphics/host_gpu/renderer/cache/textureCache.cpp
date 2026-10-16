@@ -2138,10 +2138,78 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		const bool stencil_plane_found = static_cast<bool>(result);
+		// An image another surface has since GPU-written over the requested bytes holds stale
+		// pixels there, and for a tiled surface guest memory never received the newer ones.
+		const auto request_begin = desc.info.data.address;
+		const auto request_end   = desc.info.data.End();
+		const auto content_epoch = [](const Image& image) {
+			uint64_t epoch = image.IsGpuModified() ? image.ContentEpoch() : 0;
+			return image.IsBufferModified() ? std::max(epoch, image.BufferWriteEpoch()) : epoch;
+		};
+		const auto written_epoch = [&](const Image& writer) {
+			const auto& info   = writer.info;
+			const auto  layers = info.resources.layers;
+			if (layers == 0 || info.resources.levels != 1 || info.data.size % layers != 0 ||
+			    writer.layer_content.size() != layers) {
+				return writer.ContentEpoch();
+			}
+			const auto slice_size = info.data.size / layers;
+			const auto first      = (request_begin - info.data.address) / slice_size;
+			const auto last       = (request_end - 1 - info.data.address) / slice_size;
+			uint64_t   epoch      = 0;
+			for (auto layer = first; layer <= last; layer++) {
+				epoch = std::max(epoch, writer.layer_content[layer]);
+			}
+			return epoch;
+		};
+		// Only a writer the overlap walk hands back as a view of itself may take the request.
+		const auto serves_request = [&](const ImageInfo& info) {
+			if (info.IsVolume() || desc.info.IsVolume() || info.IsBlock() != desc.info.IsBlock()) {
+				return false;
+			}
+			if (info.data.address != request_begin) {
+				return desc.info.MipOf(info) >= 0;
+			}
+			return info.type == desc.info.type && info.tile_mode == desc.info.tile_mode &&
+			       info.BlockExtent() == desc.info.BlockExtent() &&
+			       info.bytes_per_block * info.samples ==
+			           desc.info.bytes_per_block * desc.info.samples &&
+			       info.GetColorTransform() == desc.info.GetColorTransform() &&
+			       ImageViewOps::FormatsCompatible(info.pixel_format, desc.info.pixel_format);
+		};
+		const auto overwritten = [&](ImageId id) {
+			const auto& image = m_slot_images[id];
+			if ((desc.type != BindingType::Texture && desc.type != BindingType::Storage) ||
+			    image.depth_id || image.info.IsDepth() || image.info.data != desc.info.data) {
+				return false;
+			}
+			const auto epoch = content_epoch(image);
+			for (const auto other_id: candidates) {
+				const auto* writer = m_slot_images.try_get(other_id);
+				if (other_id == id || writer == nullptr || !writer->registered || writer->dormant ||
+				    writer->depth_id || writer->info.IsDepth() ||
+				    writer->backing.image == nullptr || !writer->IsGpuModified() ||
+				    writer->info.data.address > request_begin ||
+				    writer->info.data.End() < request_end || !serves_request(writer->info) ||
+				    SameAliasLayout(writer->info, image.info)) {
+					// SyncLayoutAlias brings a same-layout alias up to date instead.
+					continue;
+				}
+				if (written_epoch(*writer) > epoch) {
+					return true;
+				}
+			}
+			return false;
+		};
+		std::vector<ImageId> stale;
 		for (const auto id: candidates) {
 			const auto image = m_slot_images.try_get(id);
 			// A parked twin is only revived through ResolveDepthOverlap, which syncs it first.
 			if (image == nullptr || stencil_plane_found || (image->dormant && image->depth_twin)) {
+				continue;
+			}
+			if (overwritten(id)) {
+				stale.push_back(id);
 				continue;
 			}
 			if (image->depth_id && desc.type != BindingType::Texture &&
@@ -2181,7 +2249,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				// walk: the loop feeds each result into the next, and a second owner would
 				// re-describe the request and retire the live image in its place.
 				const auto owner = m_slot_images.try_get(candidate);
-				if (owner == nullptr || owner->dormant) {
+				if (owner == nullptr || owner->dormant ||
+				    std::ranges::find(stale, candidate) != stale.end()) {
 					continue;
 				}
 				view_mip                = -1;

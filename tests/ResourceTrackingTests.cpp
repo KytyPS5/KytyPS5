@@ -5542,8 +5542,8 @@ void TestExpandedCallResourceNamespaces() {
   ApplyResourceSpecialization(fixture.program, specialization);
   ShaderComputeInputInfo compute {};
   CollectShaderInfo(fixture.program, {.compute = &compute});
-  Check(fixture.program.info.live_buffer_flags.size() == 80u &&
-            std::ranges::count(fixture.program.info.live_buffer_flags, uint8_t{1}) == 80,
+  Check(fixture.program.info.buffers.size() == 80u &&
+            std::ranges::count_if(fixture.program.info.buffers, [](const auto& buffer) { return buffer.live; }) == 80,
         "expanded buffer namespace was truncated during shader info collection");
   Check(fixture.program.info.images.size() == 80u && fixture.program.info.samplers.size() == 40u,
         "native specialization truncated expanded call resources");

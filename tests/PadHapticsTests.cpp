@@ -143,13 +143,13 @@ void DestroyAudioStream(SDL_AudioStream* stream) {
 SDL_AudioDeviceID GetAudioStreamDevice(SDL_AudioStream*) {
 	return 999;
 }
-// Pads 1 and 3 are DualSenses.
+// Pads 1 and 3 are DualSenses; pad 2 only supports rumble.
 SDL_GamepadType GetGamepadTypeForID(SDL_JoystickID id) {
 	return id == 1 || id == 3 ? SDL_GAMEPAD_TYPE_PS5 : SDL_GAMEPAD_TYPE_UNKNOWN;
 }
 SDL_Gamepad* GetGamepadFromID(SDL_JoystickID id) {
-	return id == 1 || id == 3 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
-	                          : nullptr;
+	return id >= 1 && id <= 3 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
+	                         : nullptr;
 }
 SDL_GamepadType GetGamepadType(SDL_Gamepad* pad) {
 	return GetGamepadTypeForID(static_cast<SDL_JoystickID>(reinterpret_cast<uintptr_t>(pad)));
@@ -456,6 +456,47 @@ void TestDiscoveryAndHotplug() {
 	now += 2001;
 	Queue(port, pcm.data());
 	Check(streams.empty(), "disconnected endpoint retained its stream");
+}
+
+void TestRumbleFallbackGains() {
+	Fixture f;
+	auto    port = Open();
+	const auto queue = [&](std::array<float, 2> gains) {
+		Check(Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data(), 1.0f,
+		                     gains.data()) == 2 * 1000000 / 48000,
+		      "rumble fallback playback time is wrong");
+	};
+	queue({0.0f, 0.25f});
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 16383,
+	      "rumble fallback ignored per-channel gains");
+	queue({0.5f, 0.0f});
+	Check(pad_rumble[2].large == 32767 && pad_rumble[2].small == 0,
+	      "rumble fallback swapped per-channel gains");
+	queue({0.0f, 0.0f});
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 0,
+	      "muted fallback channels still rumbled");
+	Check(streams.empty() && hid_opens == 0, "rumble fallback opened an audio device");
+}
+
+void TestRumbleFallbackSwitch() {
+	for (bool bluetooth: {false, true}) {
+		Fixture f;
+		wireless = hid_available = bluetooth;
+		auto port = Open();
+		Queue(port, pcm.data());
+		Check(bluetooth ? Haptics::UsesBluetooth(port.get()) : streams.size() == 1,
+		      "DualSense transport did not open before fallback");
+		Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data());
+		Check(streams.empty() && !Haptics::UsesBluetooth(port.get()) &&
+		          (!bluetooth || hid_closes == 1),
+		      "switching to rumble retained the DualSense transport");
+		Check(pad_rumble[2].large == 65535 && pad_rumble[2].small == 65535,
+		      "switching from DualSense did not start rumble fallback");
+		Queue(port, pcm.data());
+		Check(bluetooth ? Haptics::UsesBluetooth(port.get()) && hid_opens == 2
+		                : streams.size() == 1 && opens == 2,
+		      "switching back delayed reopening the DualSense transport");
+	}
 }
 
 void TestSpeaker() {
@@ -1279,6 +1320,8 @@ int main() {
 	TestAudioDefaultResumeFailure();
 	TestFormatsAndVolume();
 	TestDiscoveryAndHotplug();
+	TestRumbleFallbackGains();
+	TestRumbleFallbackSwitch();
 	TestSpeaker();
 	TestSpeakerUnplug();
 	TestSpeakerSwitchAndFailures();

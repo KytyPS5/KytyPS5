@@ -328,6 +328,8 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	}
 	if (!stream->speaker &&
 	    SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) != SDL_GAMEPAD_TYPE_PS5) {
+		CloseDevice(stream);
+		stream->next_check = 0;
 		// Non-DualSense pads have no haptic audio path: approximate it with the rumble motors.
 		float peak[2] = {0.0f, 0.0f};
 		for (uint32_t frame = 0; frame < frames; frame++) {
@@ -336,7 +338,7 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 				const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
 				float      value  = is_float ? static_cast<const float*>(data)[index]
 				                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
-				value *= volume[src_ch] / 32768.0f * gain;
+				value *= volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
 				peak[ch] = std::max(peak[ch], std::fabs(value));
 			}
 		}

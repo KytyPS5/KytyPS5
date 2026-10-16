@@ -1,4 +1,4 @@
-﻿#include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/systemOverlay.h"
 
 #include <SDL3/SDL.h>
 
@@ -1496,7 +1496,7 @@ struct SystemOverlay::Impl {
 		}
 		auto* draw = ImGui::GetForegroundDrawList();
 		DrawTouchParticles(draw, now);
-		if (!TouchCursorImageEnabled() || !state.enabled || !state.cursor_visible ||
+		if (!state.enabled || !state.cursor_visible ||
 		    !state.position_valid || !cursor_initialized) {
 			return;
 		}

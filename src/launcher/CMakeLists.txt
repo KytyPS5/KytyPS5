@@ -105,6 +105,7 @@ if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(TARGETS kyty_updater DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
+	install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/cursors" DESTINATION "KytyPS5.app/Contents/Resources/assets")
 	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
 	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
 	if(NOT KYTY_MACDEPLOYQT)

@@ -306,8 +306,8 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 
 	if (f.removed) {
+		HostInputDisconnectGamepad(f.id);
 		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
-			HostInputDisconnectGamepadTouchPad(f.id);
 			Controller::Disconnect(f.id);
 			SDL_CloseGamepad(pad);
 		}

@@ -29,6 +29,8 @@ constexpr auto DEFAULT_MOUSE_SENSITIVITY = 1.0;
 constexpr char MOUSE_SENSITIVITY[]       = "MouseSensitivity=";
 constexpr char TOUCH_PARTICLE_SKIN[]     = "TouchParticleSkin=";
 constexpr char TOUCH_CURSOR_OFF[]        = "TouchCursorImage=Off";
+constexpr char KEYBOARD_DISABLED[]       = "Keyboard=Disabled";
+constexpr char PAD_DISABLED[]            = "Pad=Disabled";
 
 constexpr char PAD_PREFIX[] = "Pad:";
 
@@ -310,7 +312,8 @@ void AssignBinding(QHash<QString, QString>& bindings, const QString& id, const Q
 QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 	QHash<QString, QString> result;
 	for (const auto& entry: mapping) {
-		if (entry.startsWith(QLatin1String(MOUSE_SENSITIVITY)) ||
+		if (entry == QLatin1String(KEYBOARD_DISABLED) || entry == QLatin1String(PAD_DISABLED) ||
+		    entry.startsWith(QLatin1String(MOUSE_SENSITIVITY)) ||
 		    entry.startsWith(QLatin1String(TOUCH_PARTICLE_SKIN)) ||
 		    entry.startsWith(QLatin1String("TouchCursorImage=")) ||
 		    entry.startsWith(QLatin1String(PAD_PREFIX))) {
@@ -351,7 +354,8 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, ControllerPre
 	resize(QSize(1360, 780).boundedTo(screen()->availableGeometry().size()));
 
 	m_bindings        = ParseMapping(mapping);
-	m_custom_bindings = !m_bindings.isEmpty();
+	m_custom_bindings = !m_bindings.isEmpty() || mapping.contains(QLatin1String(KEYBOARD_DISABLED));
+	m_custom_pad      = mapping.contains(QLatin1String(PAD_DISABLED));
 	for (const auto& entry: mapping) {
 		if (!entry.startsWith(QLatin1String(PAD_PREFIX))) {
 			continue;
@@ -573,14 +577,21 @@ QStringList InputMappingDialog::Mapping() const {
 				result.append(id + QLatin1Char('=') + binding);
 			}
 		}
+		if (result.isEmpty()) {
+			result.append(QLatin1String(KEYBOARD_DISABLED));
+		}
 	}
 	if (m_custom_pad) {
+		const auto start = result.size();
 		for (const auto& control: PAD_CONTROLS) {
 			const auto id     = QString::fromLatin1(control.id);
 			const auto source = m_pad_bindings.value(id);
 			if (!source.isEmpty()) {
 				result.append(QLatin1String(PAD_PREFIX) + id + QLatin1Char('=') + source);
 			}
+		}
+		if (result.size() == start) {
+			result.append(QLatin1String(PAD_DISABLED));
 		}
 	}
 	if (m_sensitivity->value() != DEFAULT_MOUSE_SENSITIVITY) {

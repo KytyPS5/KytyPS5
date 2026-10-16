@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -175,6 +176,7 @@ constexpr float GAMEPAD_TOUCHPAD_SPEED    = 0.8f;
 MouseTouchPadState   g_mouse_touchpad;
 GamepadTouchPadState g_gamepad_touchpad;
 std::mutex           g_touchpad_mutex;
+std::unordered_map<int, std::array<bool, 2>> g_pad_trigger_pressed;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -217,6 +219,14 @@ public:
 	InputMap() {
 		for (const auto& value: Config::GetKeymap()) {
 			const std::string_view entry = value;
+			if (entry == "Keyboard=Disabled") {
+				m_custom = true;
+				continue;
+			}
+			if (entry == "Pad=Disabled") {
+				m_custom_pad = true;
+				continue;
+			}
 			if (entry.starts_with(MOUSE_SENSITIVITY)) {
 				const float sensitivity =
 				    std::strtof(value.c_str() + MOUSE_SENSITIVITY.size(), nullptr);
@@ -257,7 +267,7 @@ public:
 			}
 		}
 	}
-	[[nodiscard]] bool  Custom() const { return m_size != 0; }
+	[[nodiscard]] bool  Custom() const { return m_custom; }
 	[[nodiscard]] float MouseSensitivity() const { return m_mouse_sensitivity; }
 
 	[[nodiscard]] std::size_t PadControl(std::size_t source) const {
@@ -318,6 +328,7 @@ private:
 		AssignPad(control, source);
 	}
 	void Add(const Binding& binding) {
+		m_custom = true;
 		for (std::size_t index = 0; index < m_size;) {
 			if (Conflicts(m_bindings[index], binding)) {
 				m_bindings[index] = m_bindings[--m_size];
@@ -335,6 +346,7 @@ private:
 		a.fill(INVALID_CONTROL);
 		return a;
 	}();
+	bool                                     m_custom = false;
 	bool                                     m_custom_pad = false;
 	std::size_t                              m_size              = 0;
 	float                                    m_mouse_sensitivity = 1.0f;
@@ -599,6 +611,18 @@ bool IsCursorActivity(const SDL_Event& event) {
 	return which != SDL_TOUCH_MOUSEID && which != SDL_PEN_MOUSEID;
 }
 
+std::array<int, 2> GamepadLeftStick(int id) {
+	auto* pad = SDL_GetGamepadFromID(id);
+	if (pad == nullptr) {
+		return {128, 128};
+	}
+	const auto value = [pad](SDL_GamepadAxis axis) {
+		return Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
+		                                       SDL_GetGamepadAxis(pad, axis));
+	};
+	return {value(SDL_GAMEPAD_AXIS_LEFTX), value(SDL_GAMEPAD_AXIS_LEFTY)};
+}
+
 void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down) {
 	if (control == INVALID_CONTROL) {
 		return;
@@ -690,7 +714,6 @@ void HostInputPadButton(int id, int button, bool down) {
 }
 
 void HostInputPadTrigger(int id, bool left, int value) {
-	static bool pressed[2] = {};
 	const auto  source     = left ? LEFT_TRIGGER_SOURCE : RIGHT_TRIGGER_SOURCE;
 	const auto  control    = GetInputMap().PadControl(source);
 	if (control == INVALID_CONTROL) {
@@ -702,7 +725,7 @@ void HostInputPadTrigger(int id, bool left, int value) {
 	} else if (info.button == Controller::PAD_BUTTON_R2) {
 		Controller::SetAxis(id, Controller::Axis::TriggerRight, value);
 	} else {
-		auto& state = pressed[left ? 0 : 1];
+		auto& state = g_pad_trigger_pressed[id][left ? 0 : 1];
 		const bool down = state ? value > 32 : value > 96;
 		if (down != state) {
 			state = down;
@@ -710,6 +733,12 @@ void HostInputPadTrigger(int id, bool left, int value) {
 		}
 	}
 }
+
+void HostInputDisconnectGamepad(int id) {
+	g_pad_trigger_pressed.erase(id);
+	HostInputDisconnectGamepadTouchPad(id);
+}
+
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
 	g_mouse_window = window;
@@ -719,6 +748,7 @@ void HostInputInit(SDL_Window* window) {
 }
 
 void HostInputShutdown() {
+	g_pad_trigger_pressed.clear();
 	HostInputSetTouchPadMode(false);
 	int gamepad_touch_id = -1;
 	{
@@ -829,7 +859,12 @@ void HostInputSetTouchPadMode(bool enabled) {
 }
 
 void HostInputToggleTouchPadMode() {
-	HostInputSetTouchPadMode(!GetHostInputTouchPadVisualState().enabled);
+	bool enabled = false;
+	{
+		std::scoped_lock lock(g_touchpad_mutex);
+		enabled = !g_mouse_touchpad.enabled;
+	}
+	HostInputSetTouchPadMode(enabled);
 }
 
 void HostInputToggleGamepadTouchPad(int id) {
@@ -842,6 +877,7 @@ void HostInputToggleGamepadTouchPad(int id) {
 		HostInputSetTouchPadMode(false);
 	}
 
+	const auto stick = GamepadLeftStick(id);
 	bool  enabled = false;
 	float x       = 0.5f;
 	float y       = 0.5f;
@@ -855,6 +891,8 @@ void HostInputToggleGamepadTouchPad(int id) {
 			g_gamepad_touchpad           = {};
 			g_gamepad_touchpad.enabled   = true;
 			g_gamepad_touchpad.id        = id;
+			g_gamepad_touchpad.x_axis    = stick[0];
+			g_gamepad_touchpad.y_axis    = stick[1];
 			g_gamepad_touchpad.last_poll = SDL_GetTicks();
 			g_gamepad_touchpad.next_poll = g_gamepad_touchpad.last_poll + GAMEPAD_TOUCHPAD_POLL_MS;
 			g_mouse_touchpad.gesture++;
@@ -865,6 +903,8 @@ void HostInputToggleGamepadTouchPad(int id) {
 		}
 		g_mouse_touchpad.revision++;
 	}
+	Controller::SetAxis(id, Controller::Axis::LeftX, enabled ? 128 : stick[0]);
+	Controller::SetAxis(id, Controller::Axis::LeftY, enabled ? 128 : stick[1]);
 	if (enabled) {
 		if (!SDL_HideCursor()) {
 			LOGF("Failed to hide mouse cursor for gamepad touchpad mode: %s\n", SDL_GetError());
@@ -926,6 +966,9 @@ void HostInputDisconnectGamepadTouchPad(int id) {
 		g_mouse_touchpad.revision++;
 	}
 	Controller::SetTouchPad(id, 1, false, x, y);
+	const auto stick = GamepadLeftStick(id);
+	Controller::SetAxis(id, Controller::Axis::LeftX, stick[0]);
+	Controller::SetAxis(id, Controller::Axis::LeftY, stick[1]);
 	if (!TouchPadModeActive() && !Config::HideCursorEnabled() && !SDL_ShowCursor()) {
 		LOGF("Failed to restore mouse cursor after gamepad disconnect: %s\n", SDL_GetError());
 	}

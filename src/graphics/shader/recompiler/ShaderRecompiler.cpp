@@ -1780,7 +1780,9 @@ static TranslateResult TranslateProgramImpl(const Decoder::Program& decoded_inpu
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
+	// Only a call-table kernel is compiled per z slice: for every other compute shader the resource tracking resolves
+	// the descriptors selected by the workgroup z index itself.
+	if (has_inlined_calls && options.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
 	    options.input_info.compute->fixed_group_z == UINT32_MAX && WorkgroupZSelectsDescriptor(ir)) {
 		TranslateResult slice_result;
 		slice_result.needs_group_z = true;

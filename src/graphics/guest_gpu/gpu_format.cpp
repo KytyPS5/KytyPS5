@@ -32,7 +32,6 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16SInt, 2, 0, 2, true, false, true},
 	{BufferFormat::k16Float, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UNorm, 2, 0, 2, true, false},
-	{BufferFormat::k8_8UScaled, 2, 0, 0, true, false},
 	{BufferFormat::k8_8SNorm, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UScaled, 2, 0, 2, true, false},
 	{BufferFormat::k8_8SScaled, 2, 0, 2, true, false},

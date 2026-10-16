@@ -379,11 +379,84 @@ uint32_t InverseSwizzle(uint32_t swizzle, uint32_t component) {
 	return UINT32_MAX;
 }
 
+// Packed 10:10:10:2 float: RGB are unsigned E4M6 with a finite exponent-15 range, alpha is UNorm2.
+// The image is backed by an integer format, so the shader converts the channels itself.
+uint32_t DecodePackedFloatChannel(EmitterState& state, uint32_t packed, uint32_t component) {
+	const auto raw = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), raw, packed,
+	                          ConstantU32(state, component * 10u),
+	                          ConstantU32(state, component == 3u ? 2u : 10u));
+	uint32_t decoded;
+	if (component == 3u) {
+		decoded = Binary(state, spv::OpFMul, TypeF32(state),
+		                 Unary(state, spv::OpConvertUToF, TypeF32(state), raw),
+		                 ConstantF32Value(state, 1.0f / 3.0f));
+	} else {
+		const auto exponent = Binary(state, spv::OpShiftRightLogical, TypeU32(state), raw,
+		                             ConstantU32(state, 6u));
+		const auto mantissa = Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
+		                             ConstantU32(state, 63u));
+		const auto ieee_exponent = Binary(state, spv::OpIAdd, TypeU32(state), exponent,
+		                                  ConstantU32(state, 120u));
+		const auto bits = Binary(
+		    state, spv::OpBitwiseOr, TypeU32(state),
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ieee_exponent,
+		           ConstantU32(state, 23u)),
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), mantissa,
+		           ConstantU32(state, 17u)));
+		const auto normal    = Unary(state, spv::OpBitcast, TypeF32(state), bits);
+		const auto subnormal = Binary(state, spv::OpFMul, TypeF32(state),
+		                              Unary(state, spv::OpConvertUToF, TypeF32(state), mantissa),
+		                              ConstantF32Value(state, 1.0f / 4096.0f));
+		const auto zero_exponent = Binary(state, spv::OpIEqual, TypeBool(state), exponent,
+		                                  ConstantU32(state, 0u));
+		decoded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeF32(state), decoded, zero_exponent,
+		                          subnormal, normal);
+	}
+	return Unary(state, spv::OpBitcast, TypeU32(state), decoded);
+}
+
+uint32_t EncodePackedFloatChannel(EmitterState& state, uint32_t bits, uint32_t component) {
+	auto value = Unary(state, spv::OpBitcast, TypeF32(state), bits);
+	value      = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
+        state, value, ZeroF32(state), ConstantF32Value(state, component == 3u ? 1.0f : 508.0f));
+	if (component == 3u) {
+		const auto scaled = Binary(state, spv::OpFMul, TypeF32(state), value,
+		                           ConstantF32Value(state, 3.0f));
+		return Unary(state, spv::OpConvertFToU, TypeU32(state),
+		             EmitGlsl<GLSLstd450RoundEven, IR::Type::F32>(state, scaled));
+	}
+	const auto raw      = Unary(state, spv::OpBitcast, TypeU32(state), value);
+	const auto exponent = Binary(
+	    state, spv::OpISub, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), raw, ConstantU32(state, 23u)),
+	    ConstantU32(state, 120u));
+	const auto mantissa = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), raw, ConstantU32(state, 17u)),
+	    ConstantU32(state, 63u));
+	const auto normal = Binary(
+	    state, spv::OpBitwiseOr, TypeU32(state),
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), exponent, ConstantU32(state, 6u)),
+	    mantissa);
+	const auto subnormal = Unary(state, spv::OpConvertFToU, TypeU32(state),
+	                             Binary(state, spv::OpFMul, TypeF32(state), value,
+	                                    ConstantF32Value(state, 4096.0f)));
+	const auto is_normal = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), value,
+	                              ConstantF32Value(state, 1.0f / 64.0f));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, is_normal, normal, subnormal);
+	return result;
+}
+
 Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
                                                const IR::MemoryInfo& mem) {
 	const auto& image = state.program.info.images[mem.resource];
 	const auto format = image.conversion_format;
 	if (format == Prospero::BufferFormat::kInvalid) return {};
+	if (format == Prospero::BufferFormat::k10_10_10_2Float)
+		return {format, Format::ComponentType::Float, 4u, 4u, {10u, 10u, 10u, 2u}, {0u, 10u, 20u, 30u}, true};
 	const auto info = Format::GetFormatInfo(format);
 	const bool raw_signed = IR::RawSignedStorageFormat(image, format) != Prospero::BufferFormat::kInvalid;
 	EXIT_IF((Prospero::RemapTextureFormat(format) == format && !raw_signed) || info.component_count == 0u ||
@@ -417,6 +490,22 @@ uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem)
 uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+	if (info.format == Prospero::BufferFormat::k10_10_10_2Float) {
+		const auto packed = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), packed, texel,
+		                              0u);
+		const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
+		uint32_t   values[4] {};
+		for (uint32_t i = 0; i < 4u; ++i) {
+			const auto selector = (swizzle >> (i * 3u)) & 7u;
+			values[i] = selector >= 4u ? DecodePackedFloatChannel(ctx.state, packed, selector - 4u)
+			                           : ConstantU32(ctx.state, selector == 1u ? 0x3f800000u : 0u);
+		}
+		const auto result = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
+		                              values[0], values[1], values[2], values[3]);
+		return result;
+	}
 
 	const auto numeric_class = ctx.state.program.info.images[mem.resource].numeric_class;
 	const auto scalar_type   = ImageScalarType(ctx.state, numeric_class);
@@ -471,6 +560,7 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t gathered) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return gathered;
+	EXIT_NOT_IMPLEMENTED(info.format == Prospero::BufferFormat::k10_10_10_2Float);
 
 	const auto component = ImageGatherComponent(mem.dmask);
 	const auto selector =
@@ -613,7 +703,9 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	const bool converted = info.format != Prospero::BufferFormat::kInvalid;
 	const bool packed = info.packed_bitfield;
-	EXIT_IF(converted && info.type != Format::ComponentType::Sint &&
+	const bool packed_float = info.format == Prospero::BufferFormat::k10_10_10_2Float;
+	EXIT_NOT_IMPLEMENTED(packed_float && mem.data_bits == 16u);
+	EXIT_IF(converted && !packed_float && info.type != Format::ComponentType::Sint &&
 	        (!packed || (info.type != Format::ComponentType::Uint &&
 	                     info.type != Format::ComponentType::Unorm)));
 	const auto zero = ConstantU32(ctx.state, 0);
@@ -647,8 +739,11 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 				    EncodeFormattedStoreComponent(ctx.state, info, component, raw, mem.data_bits);
 				continue;
 			}
-			const auto value =
-			    EncodePackedColorComponent(ctx.state, info, component, raw, mem.data_bits);
+			const auto value = packed_float
+			    ? Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
+			             EncodePackedFloatChannel(ctx.state, raw, component),
+			             ConstantU32(ctx.state, component * 10u))
+			    : EncodePackedColorComponent(ctx.state, info, component, raw, mem.data_bits);
 			packed_value = packed_value == zero ? value
 			    : Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state), packed_value, value);
 			continue;

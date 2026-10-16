@@ -83,7 +83,10 @@ struct MemoryInfo {
 	bool                    planning_only                                         = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		return !typed && data_bits == 32u &&
+		if (typed) return false;
+		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
+		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
+		return data_bits == 32u &&
 		       (formatted ? opcode == ValueOpcode::LoadBufferU32
 		                  : opcode == ValueOpcode::ReadConstBuffer ||
 		                        opcode == ValueOpcode::LoadBufferU32 ||
@@ -126,6 +129,7 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	bool                   live               = false;
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
@@ -155,6 +159,7 @@ struct ImageResource {
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
+	bool                          unfiltered_access_only = true;
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
@@ -166,11 +171,27 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
+[[nodiscard]] constexpr Prospero::BufferFormat
+RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
+	if (image.resource_class != ImageResourceClass::Storage || !image.written)
+		return Prospero::BufferFormat::kInvalid;
+	if (format == Prospero::BufferFormat::k32SInt && (image.atomic ? !image.atomic64 : !image.read))
+		return Prospero::BufferFormat::k32UInt;
+	if (format == Prospero::BufferFormat::k16SInt && !image.read && !image.atomic)
+		return Prospero::BufferFormat::k16UInt;
+	return Prospero::BufferFormat::kInvalid;
+}
+
 struct SamplerResource {
+	static constexpr uint32_t NoIndirectSampler = UINT32_MAX;
+
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
 	// Native filtering/border variants share the original sampler's runtime descriptor.
 	uint32_t snapshot_index        = 0;
+	uint32_t indirect_root = NoIndirectSampler;
+	uint32_t indirect_mapping_offset = 0;
+	uint32_t indirect_search_iterations = 0;
 	std::vector<uint32_t> indirect_resources;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
@@ -224,6 +245,7 @@ enum class StageOutputKind {
 	Position,
 	Parameter,
 	Mrt,
+	ObjectPrimitiveId,
 	Depth,
 	SampleMask,
 	PointSize,
@@ -328,6 +350,10 @@ struct PushData {
 	static constexpr uint32_t MeshDrawDwordCount = 6;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
+
+	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id) {
+		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
+	}
 
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
 		return size != 0 && start <= DwordCount && size <= DwordCount - start;
@@ -461,7 +487,7 @@ struct Bindings {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 64;
+	static constexpr uint32_t MaxBufferRoots  = 64;
 	static constexpr uint32_t MaxImages       = 64;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
@@ -473,7 +499,6 @@ struct ShaderInfo {
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
-	uint64_t                        live_buffers = 0;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;
@@ -486,8 +511,10 @@ struct ShaderInfo {
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;
 	bool                            subgroup_ballot               = false;
+	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;
 	bool                            subgroup_shuffle              = false;
+	bool                            subgroup_arithmetic           = false;
 	bool                            subgroup_local_invocation_id  = false;
 	bool                            compute_derivatives           = false;
 	bool                            image_gather_extended         = false;
@@ -527,14 +554,24 @@ struct DescriptorSource {
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
+		struct PointerTable {
+			uint32_t offset = 0;
+			uint32_t stride = 0;
+			uint32_t count = 1;
+			bool indexed = false; // Parent pointers use raw MUBUF record addressing.
+
+			bool operator==(const PointerTable& other) const = default;
+		};
 		std::optional<SelectorRead> selector;
+		std::optional<uint32_t> table_maximum;
+		std::optional<PointerTable> pointer_table;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;
 		uint32_t table_stride    = 0;
 		uint32_t table_record_bytes = 0;
 		bool     table_scalar = false;
-		bool     indexed_store = false;
+		bool     indexed = false;
 		bool     signed_count = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		Value    key_count;
@@ -590,6 +627,12 @@ struct UniformFillPlan {
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
+	struct SelectorKeys {
+		uint32_t              source = UINT32_MAX;
+		std::vector<uint32_t> values;
+		bool                  resolved = false;
+	};
+
 	struct EvaluationContext {
 		struct Entry {
 			uint64_t value      = 0;
@@ -618,6 +661,7 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
+	std::vector<uint32_t>               selector_groups;
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
@@ -637,6 +681,7 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            reachable_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	mutable std::vector<SelectorKeys>       selector_keys;
 };
 
 struct Program: ResourcePlan {
@@ -656,7 +701,7 @@ struct Program: ResourcePlan {
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
-	struct ScalarWrite { uint32_t pc; ScalarReg reg; };
+	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
@@ -673,8 +718,10 @@ std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
-void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
+bool  EquivalentSelectorDomain(const ResourcePlan& program,
+                               const DescriptorSource::IndirectDescriptor& left,
+                               const DescriptorSource::IndirectDescriptor& right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
 Value ResolveActiveU32(Value value, Value active);
 

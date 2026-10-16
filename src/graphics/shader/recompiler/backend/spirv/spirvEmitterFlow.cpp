@@ -567,6 +567,28 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                          mapping.Map(3));
 				value = mapped;
 			}
+			if ((state.input_info.pixel->target_packed_unorm_mask & (1u << exp.index)) != 0u) {
+				if (exp.compr || MrtOutputMode(state, exp) != 9u ||
+				    (mapping.ApplyMask(exp.en) & 7u) != 7u) {
+					EXIT("unsupported packed UNorm EXP: export=%u mode=%u en=0x%x compr=%u\n",
+					     exp.index, MrtOutputMode(state, exp), exp.en, static_cast<uint32_t>(exp.compr));
+				}
+				const auto info = Format::GetFormatInfo(Prospero::BufferFormat::k11_11_10UNorm);
+				const auto rounding = (state.input_info.pixel->target_round_mode & (1u << exp.index)) != 0
+				                          ? UnormRounding::Truncate : UnormRounding::HalfUp;
+				const auto raw = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);
+				auto packed = ConstantU32(state, 0);
+				for (uint32_t component = 0; component < info.component_count; component++) {
+					const auto encoded = EncodePackedColorComponent(
+					    state, info, component, ExportRawComponent(ctx, raw, component), 32u, rounding);
+					packed = component == 0u ? encoded
+					    : Binary(state, spv::OpBitwiseOr, TypeU32(state), packed, encoded);
+				}
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), value,
+				                          packed, ConstantU32(state, 0), ConstantU32(state, 0),
+				                          ConstantU32(state, 0));
+			}
 		}
 		if (exp.kind == IR::ExportTargetKind::Position &&
 		    state.input_info.vertex->clip_space.enabled) {
@@ -654,17 +676,11 @@ uint32_t EmitLaneId(EmitterState& state) {
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
 	const auto index  = inst.Arg(0).U32();
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
-	return result;
+	return EmitPushDataLoad(state, ConstantU32(state, index));
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
@@ -721,17 +737,22 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// Scalar branches include lanes disabled by EXEC, which the branch body may restore.
-	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Result(inst);
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
-	const auto ballot = ctx.Ballot(inst.Arg(0));
-	const auto reference = zero ? ctx.Ballot(IR::Value(true))
-	                            : ConstantU32CompositeZero(ctx.state, 4);
-	const auto compare = Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual,
-	                            TypeBoolVector(ctx.state, 4), ballot, reference);
-	return Unary(ctx.state, zero ? spv::OpAll : spv::OpAny, TypeBool(ctx.state), compare);
+	// Zero-kind predicates are already inverted by translation.
+	auto predicate = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
+		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
+	}
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
+	                              TypeBool(ctx.state), result,
+	                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
+	return result;
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
@@ -746,6 +767,18 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+}
+
+uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	auto value = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		value = EmitUMin32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);
+	return result;
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {

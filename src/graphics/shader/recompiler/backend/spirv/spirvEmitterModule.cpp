@@ -212,9 +212,8 @@ void DefineDescriptors(EmitterState& state) {
 	auto& bindings = state.program.bindings;
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
-	for (uint32_t index = 0; index < info.buffers.size(); ++index) {
-		info.buffers[index].descriptor_index = (info.live_buffers & (uint64_t{1} << index)) != 0
-		                                          ? buffer_count++ : UINT32_MAX;
+	for (auto& buffer: info.buffers) {
+		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -244,7 +243,8 @@ void DefineDescriptors(EmitterState& state) {
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	    state.object_primitive_id_variable != 0) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -547,6 +547,11 @@ void DefineInputs(EmitterState& state) {
 		}
 		input.variable_id =
 		    DefineInterfaceVariable(state, type, spv::StorageClassInput, input.debug_name.c_str());
+		if (state.program.stage == ShaderType::Pixel && input.kind == IR::StageInputKind::PrimitiveId) {
+			// Fragment PrimitiveId accepts Tessellation, which the device already enables.
+			state.builder.RequireCapability(spv::CapabilityTessellation);
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
+		}
 		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
@@ -658,13 +663,21 @@ void DefineOutputs(EmitterState& state) {
 				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
 				            spv::BuiltInSampleMask);
 				break;
+			case IR::StageOutputKind::ObjectPrimitiveId:
+				binding.variable_id = DefineInterfaceVariable(
+				    state, TypeU32(state), spv::StorageClassOutput, binding.debug_name.c_str());
+				state.object_primitive_id_variable = binding.variable_id;
+				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+				                            spv::DecorationLocation, binding.location);
+				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
 				const bool uint_output =
 				    binding.kind == IR::StageOutputKind::Mrt &&
 				    state.program.stage == ShaderType::Pixel &&
 				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
+				    (state.input_info.pixel->target_output_mode[binding.index] == 7u ||
+				     (state.input_info.pixel->target_packed_unorm_mask & (1u << binding.index)) != 0u);
 				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
@@ -765,15 +778,22 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
 	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
-	    state.program.info.subgroup_ballot || state.program.info.subgroup_shuffle ||
-	    state.program.info.subgroup_local_invocation_id) {
+	    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
+	    state.program.info.subgroup_shuffle ||
+	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
 	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
+	if (state.program.info.subgroup_vote) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+	}
 	if (state.program.info.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
+	if (state.program.info.subgroup_arithmetic) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);

@@ -2,16 +2,17 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+	                          pointer, state.push_constant_variable, ConstantU32(state, 0), index);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
 static uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t dword_index) {
-	if (state.program.bindings.UsesPushData()) {
-		const auto pointer = state.builder.AllocateId();
-		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
-		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
-		                          dword_index);
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-		return value;
-	}
+	if (state.program.bindings.UsesPushData()) return EmitPushDataLoad(state, dword_index);
 	if (state.shader_data_storage_variable != 0) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
@@ -108,30 +109,40 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
-bool UsesSharedIndirectBufferStore(const EmitterState& state, uint32_t resource) {
+uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {
 	const auto& buffers = state.program.info.buffers;
 	const auto& root = buffers[resource];
 	if (root.indirect_root != resource || root.descriptor_index == UINT32_MAX ||
-	    root.packed_stride == 0u || root.indirect_resources.empty()) {
-		return false;
+	    root.indirect_resources.size() < 2u) {
+		return UINT32_MAX;
 	}
-	uint32_t slot = root.descriptor_index;
-	for (const auto candidate: root.indirect_resources) {
-		if (buffers[candidate].packed_stride != root.packed_stride ||
-		    buffers[candidate].descriptor_index != slot++) return false;
+	const auto first = root.packed_stride == 0u ? 1u : 0u;
+	const auto representative = root.indirect_resources[first];
+	const auto& shared = buffers[representative];
+	if (shared.packed_stride == 0u) return UINT32_MAX;
+	uint32_t next_child_slot = UINT32_MAX;
+	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal) {
+		const auto& candidate = buffers[root.indirect_resources[ordinal]];
+		if (candidate.packed_stride != shared.packed_stride ||
+		    candidate.descriptor_format != shared.descriptor_format ||
+		    candidate.descriptor_swizzle != shared.descriptor_swizzle ||
+		    candidate.descriptor_index == UINT32_MAX ||
+		    (ordinal > 1u && candidate.descriptor_index != next_child_slot)) return UINT32_MAX;
+		if (ordinal != 0u) next_child_slot = candidate.descriptor_index + 1u;
 	}
-	return true;
+	return representative;
 }
 
 void EmitMemoryOffsets(EmitterState& state) {
-	std::array<bool, IR::ShaderInfo::MaxBuffers> dynamic_offsets {};
+	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
+	state.memory_byte_offsets.resize(count);
+	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
-		if (!UsesSharedIndirectBufferStore(state, resource)) continue;
+		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
 		for (const auto candidate: state.program.info.buffers[resource].indirect_resources) {
 			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
 		}
 	}
-	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	for (uint32_t i = 0; i < count; i += 4u) {
 		const auto lanes = std::min(4u, count - i);
 		if (std::all_of(dynamic_offsets.begin() + i, dynamic_offsets.begin() + i + lanes,
@@ -227,7 +238,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	return access;
 }
 
-MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem) {
+MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
+                                                 uint32_t array_index) {
 	MemoryResourceAccess access {.kind = mem.kind};
 	switch (mem.kind) {
 		case IR::ResourceKind::Lds:
@@ -267,7 +279,7 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			} else if (bits == 16u) {
 				buffer = &state.storage_buffers[1];
 			}
-			access = PrepareStorageBufferResourceAccess(state, mem, *buffer);
+			access = PrepareStorageBufferResourceAccess(state, mem, *buffer, array_index);
 			access.element_bits = bits;
 			return access;
 		}
@@ -418,7 +430,9 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 }
 
 uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
-                                       uint32_t component, uint32_t data, uint32_t data_bits) {
+                                       uint32_t component, uint32_t data, uint32_t data_bits,
+                                       UnormRounding rounding) {
+	EXIT_IF(rounding != UnormRounding::RoundEven && info.type != Format::ComponentType::Unorm);
 	const auto bits = info.component_bits[component];
 	if (data_bits == 16u) {
 		if (info.type == Format::ComponentType::Uint) {
@@ -428,6 +442,13 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		} else {
 			data = EmitBitCastU32F32(state, EmitF16BitsToF32(state, data));
 		}
+	}
+	if (info.type == Format::ComponentType::Sint && bits < 32u) {
+		const auto maximum = (1u << (bits - 1u)) - 1u;
+		data = EmitSMax32(state, data, ConstantU32(state, ~maximum));
+		data = EmitSMin32(state, data, ConstantU32(state, maximum));
+		return Binary(state, spv::OpBitwiseAnd, TypeU32(state), data,
+		              ConstantU32(state, (1u << bits) - 1u));
 	}
 	const bool normalized = info.type == Format::ComponentType::Unorm ||
 	                        info.type == Format::ComponentType::Snorm;
@@ -446,8 +467,12 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		value = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
 		    state, value, ConstantF32Value(state, lower), ConstantF32Value(state, upper));
 		if (normalized) {
-			value = EmitFPRoundEven32(
-			    state, EmitFPMul32(state, value, ConstantF32Value(state, max_value)));
+			value = EmitFPMul32(state, value, ConstantF32Value(state, max_value));
+			if (rounding == UnormRounding::RoundEven) {
+				value = EmitFPRoundEven32(state, value);
+			} else if (rounding == UnormRounding::HalfUp) {
+				value = EmitFPAdd32(state, value, ConstantF32Value(state, 0.5f));
+			}
 		}
 		// Float-to-integer conversion truncates scaled values toward zero.
 		value = Unary(state, is_signed ? spv::OpConvertFToS : spv::OpConvertFToU,
@@ -460,6 +485,21 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		return EmitPackHalf2x16(state, pair);
 	}
 	return data;
+}
+
+uint32_t EncodePackedColorComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                    uint32_t component, uint32_t data, uint32_t data_bits,
+                                    UnormRounding rounding) {
+	auto value = EncodeFormattedStoreComponent(state, info, component, data, data_bits, rounding);
+	if (info.type == Format::ComponentType::Uint) {
+		value = EmitUMin32(state, value,
+		                  ConstantU32(state, (1u << info.component_bits[component]) - 1u));
+	}
+	if (info.component_bit_offset[component] != 0u) {
+		value = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), value,
+		               ConstantU32(state, info.component_bit_offset[component]));
+	}
+	return value;
 }
 
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {

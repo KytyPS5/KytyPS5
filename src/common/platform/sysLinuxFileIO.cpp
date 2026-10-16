@@ -152,42 +152,29 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 	}
 }
 
-sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
+static sys_file_t* OpenHostFile(const std::filesystem::path& file_name, const char* mode,
+                               sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
-
-	auto real_name     = get_internal_name(file_name);
-	auto real_name_str = real_name.string();
-
-	ret->f = fopen(real_name_str.c_str(), "w+");
-
-	if (ret->f == nullptr) {
-		printf("can't create file: %s\n", real_name_str.c_str());
+	ret->f = fopen(get_internal_name(file_name).c_str(), mode);
+	ret->type = ret->f == nullptr ? SYS_FILE_ERROR : SYS_FILE_FILE;
+	if (ret->f != nullptr) {
+		// Independent handles must observe writes and truncation immediately.
+		setvbuf(ret->f, nullptr, _IONBF, 0);
+		apply_cache_hint(ret->f, cache_type);
 	}
+	return ret;
+}
 
-	ret->type = SYS_FILE_FILE;
-
+sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
+	auto* ret = OpenHostFile(file_name, "w+", SYS_FILE_CACHE_AUTO);
+	if (ret->f == nullptr) {
+		printf("can't create file: %s\n", file_name.c_str());
+	}
 	return ret;
 }
 
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
-	auto* ret = new sys_file_t;
-
-	ret->type = SYS_FILE_FILE;
-
-	auto internal_name     = get_internal_name(file_name);
-	auto internal_name_str = internal_name.string();
-
-	FILE* f = fopen(internal_name_str.c_str(), "r");
-
-	if (f == nullptr) {
-		ret->type = SYS_FILE_ERROR;
-	}
-
-	apply_cache_hint(f, cache_type);
-
-	ret->f = f;
-
-	return ret;
+	return OpenHostFile(file_name, "r", cache_type);
 }
 
 sys_file_t* SysFileOpen(uint8_t* buf, uint32_t buf_size) {
@@ -215,46 +202,12 @@ sys_file_t* SysFileCreate() {
 }
 
 sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
-	auto* ret = new sys_file_t;
-
-	auto real_name     = get_internal_name(file_name);
-	auto real_name_str = real_name.string();
-
-	FILE* f = fopen(real_name_str.c_str(), "r+");
-
-	if (f == nullptr) {
-		ret->type = SYS_FILE_ERROR;
-	} else {
-		ret->type = SYS_FILE_FILE;
-	}
-
-	apply_cache_hint(f, cache_type);
-
-	ret->f = f;
-
-	return ret;
+	return OpenHostFile(file_name, "r+", cache_type);
 }
 
 sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
                           sys_file_cache_type_t        cache_type) {
-	auto* ret = new sys_file_t;
-
-	auto real_name     = get_internal_name(file_name);
-	auto real_name_str = real_name.string();
-
-	FILE* f = fopen(real_name_str.c_str(), "r+");
-
-	if (f == nullptr) {
-		ret->type = SYS_FILE_ERROR;
-	} else {
-		ret->type = SYS_FILE_FILE;
-	}
-
-	apply_cache_hint(f, cache_type);
-
-	ret->f = f;
-
-	return ret;
+	return OpenHostFile(file_name, "r+", cache_type);
 }
 
 void SysFileClose(sys_file_t* f) {

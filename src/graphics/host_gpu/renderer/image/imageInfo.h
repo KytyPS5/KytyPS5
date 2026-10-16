@@ -69,7 +69,7 @@ struct ImageInfo {
 	GuestRange                   data;
 	GuestRange                   stencil;
 	ImageMetadataInfo            metadata;
-	uint32_t                     htile_clear_mask = UINT32_MAX;
+	bool                         htile_initial_clear = true;
 	vk::Format                   pixel_format     = vk::Format::eUndefined;
 	Prospero::BufferFormat       guest_format     = Prospero::BufferFormat::kInvalid;
 	Prospero::ImageType          type             = Prospero::ImageType::kColor2D;
@@ -88,6 +88,7 @@ struct ImageInfo {
 	uint32_t first_tail_level    = 16;
 
 	void                                           UpdateSize();
+	[[nodiscard]] uint32_t                         DataAlignment() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
@@ -136,53 +137,7 @@ struct ImageInfo {
 		}
 		return -1;
 	}
-	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
-		if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
-		    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
-		    container.resources.layers == 0 || mip < 0 ||
-		    static_cast<uint32_t>(mip) >= container.resources.levels ||
-		    container.resources.levels > container.mip_layout.size() ||
-		    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
-		    data.End() > container.data.End()) {
-			return -1;
-		}
-		if (HasStencil() != container.HasStencil() ||
-		    (HasStencil() && (stencil.address < container.stencil.address ||
-		                      stencil.End() > container.stencil.End()))) {
-			return -1;
-		}
-
-		const auto  level  = static_cast<uint32_t>(mip);
-		const auto& layout = container.mip_layout[level];
-		if (extent.width != std::max(container.extent.width >> level, 1u) ||
-		    extent.height != std::max(container.extent.height >> level, 1u) ||
-		    extent.depth != container.extent.depth || mip_layout[0].pitch != layout.pitch ||
-		    mip_layout[0].height != layout.height || layout.size == 0 ||
-		    layout.size % container.resources.layers != 0 ||
-		    container.data.size % container.resources.layers != 0 ||
-		    data.size % resources.layers != 0) {
-			return -1;
-		}
-
-		// PS5 block slices contain the entire reversed mip chain.
-		const auto slice_stride = container.data.size / container.resources.layers;
-		const auto child_stride = data.size / resources.layers;
-		if (child_stride != layout.size / container.resources.layers ||
-		    layout.offset >= slice_stride || child_stride > slice_stride - layout.offset ||
-		    (resources.layers > 1 && child_stride != slice_stride)) {
-			return -1;
-		}
-		const auto address_delta = data.address - container.data.address;
-		if (address_delta < layout.offset || (address_delta - layout.offset) % slice_stride != 0) {
-			return -1;
-		}
-		const auto layer = (address_delta - layout.offset) / slice_stride;
-		if (layer > INT32_MAX || layer >= container.resources.layers ||
-		    resources.layers > container.resources.layers - layer) {
-			return -1;
-		}
-		return static_cast<int32_t>(layer);
-	}
+	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept;
 };
 
 struct ImageViewInfo {

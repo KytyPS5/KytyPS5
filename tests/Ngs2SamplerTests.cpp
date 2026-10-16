@@ -383,6 +383,186 @@ void TestAtrac9Vibration() {
 	}
 }
 
+void TestAtrac9Discrete() {
+	using namespace Libs::Audio::Ajm;
+	constexpr std::array<uint8_t, 4> captured {0x30, 0x72, 0xc0, 0xfe};
+	struct Geometry { uint32_t channels, rate_index, rate, samples, frames, bytes; };
+	for (const auto [channels, rate_index, rate, samples, frames, bytes]:
+	     {Geometry {12, 7, 48000, 256, 4, 64}, Geometry {16, 4, 24000, 128, 1, 96},
+	      Geometry {64, 1, 12000, 64, 4, 96}}) {
+		const uint32_t word = 0x30000000u | (rate_index << 20u) | ((channels - 1u) << 14u) |
+		                      ((bytes - 1u) << 2u) | (frames == 4 ? 2u : 0u);
+		std::array<uint8_t, 4> config {uint8_t(word >> 24u), uint8_t(word >> 16u),
+		                               uint8_t(word >> 8u), uint8_t(word)};
+		const auto original = config;
+		AjmAt9Decoder decoder(channels, rate, AjmSampleEncoding::S16, 0);
+		const auto initialized = decoder.Initialize(config.data(), config.size());
+		AjmSidebandDecAt9CodecInfo info {};
+		decoder.WriteCodecInfo(&info, sizeof(info), initialized);
+		Atrac9CodecInfo parsed {};
+		Check(initialized.result == OK && initialized.format.channel_num == channels &&
+		          initialized.format.sampling_frequency == rate && info.frame_samples == samples &&
+		          info.frames_in_super_frame == frames && info.super_frame_size == bytes * frames * channels &&
+		          Ngs2GetAtrac9CodecInfo(config, parsed) && parsed.channels == channels &&
+		          parsed.samplingRate == rate && parsed.frameSamples == samples &&
+		          parsed.framesInSuperframe == frames && parsed.superframeSize == bytes * frames * channels &&
+		          config == original && (channels != 12 || config == captured),
+		      "ATRAC9 discrete metadata or channel limit is incorrect");
+	}
+
+	// The existing mono fixture's constant gradient/scalefactors give 24 nine-bit
+	// coefficients. Ignored extension bits vary frame lengths independently of PCM.
+	std::array<std::array<std::vector<uint8_t>, 4>, 12> blocks;
+	std::array<size_t, 12> channel_bytes {};
+	std::array<size_t, 4> frame_ends {};
+	std::vector<uint8_t> encoded;
+	for (unsigned frame = 0; frame < 4; ++frame) {
+		for (unsigned channel = 0; channel < 12; ++channel) {
+			auto& block = blocks[channel][frame];
+			unsigned position = 0;
+			auto put = [&](unsigned value, unsigned bits) {
+				for (unsigned bit = bits; bit != 0; --bit) {
+					if (position % 8 == 0) block.push_back(0);
+					block.back() |= ((value >> (bit - 1)) & 1u) << (7u - position++ % 8u);
+				}
+			};
+			put(frame != 0, 1); // First frame, fresh band parameters, three bands, no BEX.
+			put(0, 6);
+			put(0, 14); // Gradient mode/start/end, then constant value 16.
+			put(16, 5);
+			put(16, 5);
+			put(0, 4);
+			put(1, 1); // Optional ignored extension payload of 0/8/16/24 bits.
+			put(0, 2);
+			put((channel % 4) * 8, 5);
+			put(0, (channel % 4) * 8);
+			put(1, 2); // CLC scale factors: two bits each, base 24.
+			put(0, 2);
+			put(24, 5);
+			for (unsigned unit = 0; unit < 10; ++unit) put(0, 2);
+			const int coefficient = int((channel + 1) * (frame + 1) * 4);
+			put(unsigned(channel % 2 ? -coefficient : coefficient) & 0x1ffu, 9);
+			for (unsigned coefficient = 1; coefficient < 24; ++coefficient) put(0, 9);
+			encoded.insert(encoded.end(), block.begin(), block.end());
+			channel_bytes[channel] += block.size();
+			if (frame == 3) {
+				Check(channel_bytes[channel] < 256, "ATRAC9 test channel has no padding");
+				encoded.insert(encoded.end(), 256 - channel_bytes[channel], 0x01);
+			}
+		}
+		frame_ends[frame] = encoded.size();
+	}
+	Check(encoded.size() == 3072 && blocks[0][0].size() != blocks[3][0].size(),
+	      "ATRAC9 discrete fixture did not exercise distinct channel padding");
+
+	for (auto encoding: {AjmSampleEncoding::S16, AjmSampleEncoding::S32,
+	                     AjmSampleEncoding::Float}) {
+		const size_t sample_bytes = AjmBytesPerSample(encoding);
+		const size_t row_bytes = 12 * sample_bytes;
+		const size_t frame_bytes = 256 * row_bytes;
+		std::vector<uint8_t> expected(4 * frame_bytes), mono(256 * sample_bytes);
+		for (unsigned channel = 0; channel < 12; ++channel) {
+			auto reference = std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>(
+			    Atrac9GetHandle(), Atrac9ReleaseHandle);
+			std::array<uint8_t, 4> mono_config {0xfe, 0x70, 0x07, 0xf0};
+			Check(reference && Atrac9InitDecoder(reference.get(), mono_config.data()) == 0,
+			      "ATRAC9 discrete mono reference initialization failed");
+			for (unsigned frame = 0; frame < 4; ++frame) {
+				int used = 0, result = -1;
+				std::array<uint8_t, 64> input {}; // LibAtrac9's bit reader peeks past the final byte.
+				std::copy(blocks[channel][frame].begin(), blocks[channel][frame].end(), input.begin());
+				switch (encoding) {
+					case AjmSampleEncoding::S16:
+						result = Atrac9Decode(reference.get(), input.data(),
+						                      reinterpret_cast<int16_t*>(mono.data()), &used, 0);
+						break;
+					case AjmSampleEncoding::S32:
+						result = Atrac9DecodeS32(reference.get(), input.data(),
+						                         reinterpret_cast<int32_t*>(mono.data()), &used, 0);
+						break;
+					case AjmSampleEncoding::Float:
+						result = Atrac9DecodeF32(reference.get(), input.data(),
+						                         reinterpret_cast<float*>(mono.data()), &used, 0);
+						break;
+				}
+				Check(result == 0 && used == blocks[channel][frame].size(),
+				      "ATRAC9 discrete mono reference did not consume its exact frame");
+				for (unsigned sample = 0; sample < 256; ++sample) {
+					std::memcpy(expected.data() + (frame * 256 + sample) * row_bytes +
+					                channel * sample_bytes,
+					            mono.data() + sample * sample_bytes, sample_bytes);
+				}
+			}
+		}
+		Check(std::ranges::any_of(expected, [](uint8_t byte) { return byte != 0; }),
+		      "ATRAC9 discrete reference unexpectedly contains only silence");
+		AjmAt9Decoder decoder(12, 48000, encoding, 0);
+		Check(decoder.Initialize(captured.data(), captured.size()).result == OK,
+		      "ATRAC9 discrete decoder initialization failed");
+		std::vector<uint8_t> actual(expected.size() + 32, 0xa5);
+		auto decode = [&](size_t input_size, size_t output_size) {
+			return decoder.Decode(encoded.data(), input_size, actual.data() + 16,
+			                      output_size, true, nullptr);
+		};
+		const auto partial = decode(encoded.size() - 1, expected.size());
+		const auto short_output = decode(encoded.size(), frame_bytes - 1);
+		Check(partial.result == AJM_RESULT_PARTIAL_INPUT && partial.frames == 0 &&
+		          partial.input_consumed == 0 && partial.output_written == 0 &&
+		          short_output.result == AJM_RESULT_NOT_ENOUGH_ROOM && short_output.frames == 0 &&
+		          short_output.input_consumed == 0 && short_output.output_written == 0 &&
+		          std::ranges::all_of(actual, [](uint8_t byte) { return byte == 0xa5; }),
+		      "ATRAC9 discrete partial input/output consumed data or wrote PCM");
+		for (unsigned pass = 0; pass < 2; ++pass) {
+			if (pass != 0) decoder.Reset();
+			const auto result = decode(encoded.size(), expected.size());
+			Check(result.result == OK && result.frames == 4 &&
+			          result.input_consumed == encoded.size() &&
+			          result.output_written == expected.size() && result.total_decoded_samples == 1024 &&
+			          std::equal(expected.begin(), expected.end(), actual.begin() + 16) &&
+			          std::all_of(actual.begin(), actual.begin() + 16, [](auto b) { return b == 0xa5; }) &&
+			          std::all_of(actual.end() - 16, actual.end(), [](auto b) { return b == 0xa5; }),
+			      "ATRAC9 discrete interleave, per-channel padding, reset or PCM bounds differ");
+		}
+		decoder.Reset();
+		size_t offset = 0;
+		for (unsigned frame = 0; frame < 4; ++frame) {
+			const auto result = decoder.Decode(encoded.data() + offset, encoded.size() - offset,
+			                                   actual.data() + 16, frame_bytes, false, nullptr);
+			Check(result.result == OK && result.frames == 1 &&
+			          result.input_consumed == frame_ends[frame] - offset &&
+			          result.output_written == frame_bytes &&
+			          std::equal(expected.begin() + frame * frame_bytes,
+			                     expected.begin() + (frame + 1) * frame_bytes, actual.begin() + 16),
+			      "ATRAC9 discrete split calls lost channel histories or padding position");
+			offset = frame_ends[frame];
+		}
+		decoder.Reset();
+		AjmGaplessState gapless;
+		gapless.Set({700, 17, 0}, true);
+		const auto trimmed = decoder.Decode(encoded.data(), encoded.size(), actual.data() + 16,
+		                                    700 * row_bytes, true, &gapless);
+		Check(trimmed.result == OK && trimmed.frames == 4 &&
+		          trimmed.input_consumed == encoded.size() && trimmed.output_written == 700 * row_bytes &&
+		          trimmed.total_decoded_samples == 700 && gapless.IsEnd() &&
+		          std::equal(expected.begin() + 17 * row_bytes,
+		                     expected.begin() + 717 * row_bytes, actual.begin() + 16),
+		      "ATRAC9 discrete gapless trim or superframe drain changed channel order");
+	}
+	for (auto invalid: {std::array<uint8_t, 4> {0x31, 0x72, 0xc0, 0xfe},
+	                   std::array<uint8_t, 4> {0x30, 0xf2, 0xc0, 0xfe},
+	                   std::array<uint8_t, 4> {0x30, 0x62, 0xc0, 0xfe},
+	                   std::array<uint8_t, 4> {0x30, 0x72, 0xe0, 0xfe},
+	                   std::array<uint8_t, 4> {0x30, 0x72, 0xc1, 0x82},
+	                   std::array<uint8_t, 4> {0x30, 0x72, 0xc0, 0xfd},
+	                   std::array<uint8_t, 4> {0x30, 0x72, 0xc0, 0xff}}) {
+		Atrac9CodecInfo info {};
+		AjmAt9Decoder decoder(12, 48000, AjmSampleEncoding::S16, 0);
+		Check(!Ngs2GetAtrac9CodecInfo(invalid, info) &&
+		          decoder.Initialize(invalid.data(), invalid.size()).result != OK,
+		      "ATRAC9 discrete accepted unsupported configuration fields");
+	}
+}
+
 void TestAtrac9ResampleAcrossFrames() {
 	const auto make_voice = [] {
 		auto f = std::make_unique<Fixture>(24000);
@@ -1425,6 +1605,7 @@ int main() {
 	TestWaveformQueueCapacity();
 	TestWaveformRingReuse();
 	TestAtrac9Vibration();
+	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
 	TestSubmixerSetupAndRouting();
 	TestWaveformBlockGeometry();

@@ -172,6 +172,10 @@ bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }
 
+uint32_t GetTrophyDurationSeconds() {
+	return std::clamp(g_config->trophy_duration_seconds, 5u, 10u);
+}
+
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }

@@ -23,7 +23,6 @@ constexpr auto MakeRegisterNames() {
 	names[R_DISPATCH_RESET] = "R_DISPATCH_RESET";
 	names[R_PUSH_MARKER]    = "R_PUSH_MARKER";
 	names[R_POP_MARKER]     = "R_POP_MARKER";
-	names[R_ACQUIRE_MEM]    = "R_ACQUIRE_MEM";
 	names[R_WRITE_DATA]     = "R_WRITE_DATA";
 	names[R_FLIP]           = "R_FLIP";
 	names[R_RELEASE_MEM]    = "R_RELEASE_MEM";

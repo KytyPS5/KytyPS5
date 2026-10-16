@@ -585,7 +585,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 	const auto& sh_regs     = ctx.GetShaderRegisters();
 	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
-	uint32_t    output_mask = 0;
+	uint32_t    output_mask = ctx.HasObjectPrimitiveIdOutput() ? 1u << 7u : 0;
 	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
 		const auto slot = ShaderPixelExportTarget(sh_regs.m_cbShaderMask, index);
 		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
@@ -905,7 +905,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
-			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
+			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
+			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
 				mrt_mask |= 1u << output.location;
 			}
 		}
@@ -1182,20 +1183,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (mesh_active) {
-		const uint32_t draw_data[] {
-		    draw.index_count,
-		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
-		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
-	} else {
+	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
+	}
+	const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
+	    mesh_active, state.ps_input_info.object_primitive_id);
+	if (draw_dwords != 0) {
+		std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshDrawDwordCount> draw_data {};
+		const auto draw_stages = vk::ShaderStageFlagBits::eFragment |
+		                         (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT
+		                                      : vk::ShaderStageFlagBits::eVertex);
+		if (mesh_active) {
+			draw_data = {
+			    draw.index_count,
+			    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+			    emit.first_instance, index_source.guest_element_size,
+			    static_cast<uint32_t>(index_source.address),
+			    static_cast<uint32_t>(index_source.address >> 32u)};
+		} else {
+			draw_data[0] = buffer.GetUserConfig().GetObjectId();
+		}
+		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
+		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();

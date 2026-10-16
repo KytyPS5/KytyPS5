@@ -619,6 +619,124 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
+void TestCompleteUMinReduction() {
+  enum class Case {
+    Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32,
+    UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
+    Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
+    Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
+    CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
+    Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation
+  };
+  for (const auto test : {Case::Masked, Case::Subset, Case::Literal,
+       Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::UnrelatedSeed,
+       Case::UnmaskedSymbolic, Case::WrongNeutral, Case::RowMask, Case::BankMask,
+       Case::Shift, Case::FetchInactive, Case::BoundControl, Case::Dpp8,
+       Case::MoveExec, Case::UpdateExec, Case::Previous, Case::DppSource,
+       Case::CrossExec, Case::CrossRow, Case::CrossSelectorLow,
+       Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
+       Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
+       Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation}) {
+    Fixture fixture(test == Case::CrossBlock ? 2 : 1);
+    const auto source = fixture.Emit(ValueOpcode::LaneId);
+    const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
+    const auto other_mask = fixture.Emit(ValueOpcode::IEqual32, {source, Value(7u)});
+    const auto negated = fixture.Emit(ValueOpcode::LogicalNot, {mask});
+    const bool literal = test == Case::Literal || test == Case::LiteralMasked;
+    const auto enabled = literal ? Value(true) :
+        fixture.Emit(ValueOpcode::LogicalOr, {negated, mask});
+    auto seed_mask = test == Case::UnrelatedSeed ? other_mask : mask;
+    if (test == Case::Subset)
+      seed_mask = fixture.Emit(ValueOpcode::LogicalAnd, {other_mask, mask});
+    const auto seed = test == Case::Literal || test == Case::UnmaskedSymbolic ? source :
+        fixture.Emit(ValueOpcode::SelectU32,
+            {seed_mask, source, Value(test == Case::WrongNeutral ? 0u : UINT32_MAX)});
+    auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
+    Value preserved;
+    const auto operation = test == Case::WrongOperation ? ValueOpcode::BitwiseOr32 :
+                                                        ValueOpcode::UMin32;
+    for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
+      DppMoveFlags flags{.control = 0x110u + shift};
+      if (shift == 2) {
+        if (test == Case::RowMask) flags.row_mask = 7;
+        if (test == Case::BankMask) flags.bank_mask = 7;
+        if (test == Case::Shift) flags.control = 0x113;
+        if (test == Case::FetchInactive) flags.fetch_inactive = true;
+        if (test == Case::BoundControl) flags.bound_control = true;
+        if (test == Case::Dpp8) flags.dpp8 = true;
+      }
+      const auto move = fixture.Emit(ValueOpcode::DppMoveU32,
+          {test == Case::DppSource ? source : prefix,
+           test == Case::MoveExec ? mask : test == Case::LiteralMove ? Value(true) : enabled});
+      move.Instruction()->SetFlags(flags);
+      const auto combined = fixture.Emit(operation, {move, prefix});
+      const auto update = fixture.Emit(ValueOpcode::DppUpdateU32,
+          {combined, test == Case::Previous ? source : prefix,
+           test == Case::UpdateExec ? mask : enabled});
+      update.Instruction()->SetFlags(flags);
+      prefix = update;
+      if (shift == 2) preserved = fixture.Emit(ValueOpcode::ReferenceU32, {prefix});
+    }
+    auto cross_exec = test == Case::CrossExec ? mask : enabled;
+    if (test == Case::DifferentWitness) {
+      const auto other_not = fixture.Emit(ValueOpcode::LogicalNot, {other_mask});
+      cross_exec = fixture.Emit(ValueOpcode::LogicalOr, {other_mask, other_not});
+    }
+    const auto cross = fixture.Emit(ValueOpcode::Permlane16U32,
+        {test == Case::CrossSource ? source : prefix,
+         Value(test == Case::CrossSelectorLow ? 0xfffffff0u : UINT32_MAX),
+         Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX), cross_exec});
+    cross.Instruction()->SetFlags(PermlaneFlags{
+        .x16 = test != Case::CrossRow, .fetch_inactive = test == Case::CrossFetch,
+        .bound_control = test != Case::CrossBound});
+    const auto cross_write = fixture.Emit(ValueOpcode::SelectU32, {enabled, cross, source});
+    const auto combined = fixture.Emit(operation, {prefix, cross_write});
+    const auto final = fixture.Emit(ValueOpcode::SelectU32,
+        {test == Case::FinalExec ? mask : enabled, combined, prefix});
+    const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
+    const auto low = fixture.Emit(ValueOpcode::ReadLane,
+        {final, Value(test == Case::Endpoint ? 30u : 31u)}, 0, result_block);
+    const auto high = fixture.Emit(ValueOpcode::ReadLane,
+        {test == Case::EndpointSource ? prefix : final, Value(63u)}, 0, result_block);
+    const auto result = fixture.Emit(operation, {high, low}, 0, result_block);
+    const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {result}, 0, result_block);
+    using Terminator = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+    fixture.BlockAt(result_block).terminator.kind = Terminator::Return;
+    if (result_block != 0) {
+      fixture.BlockAt().AddBranch(&fixture.BlockAt(1));
+      fixture.BlockAt().terminator.kind = Terminator::Branch;
+      fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
+    }
+    ValidateProgram(fixture.program, true);
+    const auto stats = EliminateReadLane(fixture.program, test == Case::Wave32 ? 32u : 64u);
+    const bool matches = test == Case::Masked || test == Case::Subset ||
+        test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove;
+    Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
+          ("UMin reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
+    if (matches) {
+      const auto *reduction = use.Instruction()->Arg(0).ResolveInstruction();
+      Check(reduction->GetOpcode() == ValueOpcode::SubgroupUMinU32 &&
+                reduction->Arg(0).Resolve() == seed.Resolve(),
+            "UMin reduction changed the neutral-masked input");
+      RemoveIdentities(fixture.program);
+      EliminateDeadCode(fixture.program.blocks);
+      uint32_t updates = 0;
+      for (const auto &inst : fixture.BlockAt()) {
+        updates += inst.GetOpcode() == ValueOpcode::DppUpdateU32;
+        Check(inst.GetOpcode() != ValueOpcode::ReadLane &&
+                  inst.GetOpcode() != ValueOpcode::Permlane16U32,
+              "UMin reduction retained unused endpoint or cross-row operations");
+      }
+      Check(updates == 2 && preserved.Instruction()->Arg(0).Instruction()->HasUses(),
+            "UMin reduction destroyed an independently consumed prefix or kept its dead suffix");
+      ValidateProgram(fixture.program, true);
+    } else {
+      Check(use.Instruction()->Arg(0).Resolve() == result,
+            "rejected UMin proof changed its original result");
+    }
+  }
+}
+
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -627,7 +745,7 @@ void TestOptimizationPipeline() {
   fixture.Emit(ValueOpcode::IMul32, {Value(6u), Value(7u)});
 
   ConstantPropagationPass(fixture.program.blocks);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
 
   const auto &instructions = fixture.BlockAt().Instructions();
@@ -667,8 +785,7 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 1,
         "control-flow fixture did not eliminate its fixed-lane read");
   ConstantPropagationPass(fixture.program.blocks);
-  ResolveControlFlowIdentities(fixture.program);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
 
   Check(entry_info.condition == Value(true),
@@ -756,6 +873,7 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
+    TestCompleteUMinReduction();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();

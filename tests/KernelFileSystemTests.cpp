@@ -14,6 +14,7 @@
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
+#include "loader/additionalContent.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -69,6 +70,10 @@ namespace Libs::LibNpCommerce {
 void InitNet_1_NpCommerce(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibNpEntitlementAccess {
+void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase *symbols);
+}
+
 namespace {
 
 namespace FileSystem = Libs::LibKernel::FileSystem;
@@ -103,6 +108,48 @@ public:
 private:
   std::filesystem::path m_path;
 };
+
+void CheckOpenFileCoherence(const std::filesystem::path& root) {
+  const auto path = root / "open-file-coherence.dat";
+  Common::File writer;
+  Check(writer.Create(path), "create shared file fixture");
+  uint32_t count = 0;
+  writer.Write("abcdef", 6, &count);
+  Check(count == 6 && Common::File::Size(path) == 6,
+        "created file writes are visible before flush or close");
+
+  Common::File reader(path, Common::File::Mode::Read);
+  Common::File update(path, Common::File::Mode::Write);
+  Check(!reader.IsInvalid() && !update.IsInvalid(), "open independent file handles");
+  std::array<char, 2> bytes {};
+  reader.Read(bytes.data(), 1, &count);
+  Check(count == 1 && bytes[0] == 'a' && update.Seek(1),
+        "prime sequential read and position independent writer");
+  update.Write("XY", 2, &count);
+  Check(count == 2, "overwrite bytes through write handle");
+  reader.Read(bytes.data(), bytes.size(), &count);
+  Check(count == bytes.size() && std::memcmp(bytes.data(), "XY", bytes.size()) == 0,
+        "sequential reader observes another handle's writes without seeking");
+
+  Common::File read_write(path, Common::File::Mode::ReadWrite);
+  Check(!read_write.IsInvalid() && read_write.Seek(3), "open read-write handle");
+  read_write.Write("Z", 1, &count);
+  Check(count == 1, "overwrite through read-write handle");
+  reader.Read(bytes.data(), 1, &count);
+  Check(count == 1 && bytes[0] == 'Z', "read-write handle changes are immediately visible");
+
+  writer.Write("g", 1, &count);
+  Check(count == 1 && writer.Tell() == 7, "extend through the original writer");
+  std::error_code error;
+  std::filesystem::resize_file(path, 2, error);
+  Check(!error && writer.Tell() == 7 && Common::File::Size(path) == 2,
+        "path resize preserves an open writer's position");
+  writer.Close();
+  update.Close();
+  read_write.Close();
+  Check(Common::File::Size(path) == 2,
+        "closing existing writers cannot undo a path truncation");
+}
 
 void CheckSaveRename(const std::filesystem::path &root,
                      std::string_view payload) {
@@ -263,6 +310,143 @@ void TestSystemServiceEntitlementEvents() {
         "empty event queue reports NO_EVENT");
 }
 
+void TestAddContent(const std::filesystem::path& root) {
+  const auto folder = root / "add-ons";
+  const auto write = [](const std::filesystem::path& path, const std::string& text) {
+    std::filesystem::create_directories(path.parent_path());
+    Common::File file;
+    Check(file.Create(path), "create add-on fixture");
+    uint32_t written = 0;
+    file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
+    Check(written == text.size(), "write add-on fixture");
+  };
+  const auto label = [](unsigned index) {
+    std::array<char, 17> value {};
+    std::snprintf(value.data(), value.size(), "DLC%013u", index);
+    return std::string(value.data());
+  };
+  const auto param = [](const std::string& title, const std::string& entitlement) {
+    return "{\"contentId\":\"UP0001-" + title + "_00-" + entitlement + "\"}";
+  };
+  write(folder / "foreign" / "sce_sys" / "param.json", param("PPSA22222", label(0)));
+  write(folder / "foreign-label" / "sce_sys" / "param.json",
+        param("PPSA22222", "PPSA11111XXXXXXX"));
+  write(folder / "outside" / "param.json", param("PPSA11111", label(66)));
+  write(folder / "invalid" / "sce_sys" / "param.json", "{\"contentId\":17}");
+  write(folder / "malformed" / "sce_sys" / "param.json", "{broken");
+  write(folder / "short-id" / "sce_sys" / "param.json", param("PPSA11111", "SHORT"));
+  write(folder / "base-game" / "sce_sys" / "param.json",
+        "{\"contentId\":\"UP0001-PPSA11111_00-BASE000000000000\",\"applicationCategoryType\":0}");
+  for (unsigned i = 0; i < 65; ++i) {
+    write(folder / label(i) / "sce_sys" / "param.json", param("PPSA11111", label(i)));
+  }
+  write(folder / "duplicate" / "sce_sys" / "param.json", param("PPSA11111", label(1)));
+  write(folder / label(0) / "payload.txt", "DLC payload");
+
+  Loader::AddContentLoad(folder, "");
+  Check(Loader::AddContentGetAll().empty(), "unknown title never exposes unrelated add-ons");
+  Loader::AddContentLoad(folder, "PPSA11111");
+  Check(Loader::AddContentGetAll().size() == 65,
+        "scan filters title before deduplication and ignores invalid/non-package metadata");
+
+  struct Label { char data[17]; char padding[3]; };
+  struct Info { Label label; uint32_t package_type; uint32_t download_status; };
+  struct MountPoint { char data[16]; };
+  static_assert(sizeof(Label) == 20 && sizeof(Info) == 28 && sizeof(MountPoint) == 16);
+  Loader::SymbolDatabase symbols;
+  Libs::InitAppContent_1(&symbols);
+  Libs::LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(&symbols);
+  const auto resolve = [&](const char* nid) {
+    const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "add-on export resolves");
+    return symbol->vaddr;
+  };
+  const auto initialize = reinterpret_cast<int (KYTY_SYSV_ABI *)(const void*, void*)>(
+      resolve("jO8DM8oyego"));
+  const auto list = reinterpret_cast<int (KYTY_SYSV_ABI *)(uint32_t, Info*, uint32_t, uint32_t*)>(
+      resolve("TFyU+KFBv54"));
+  const auto get = reinterpret_cast<int (KYTY_SYSV_ABI *)(uint32_t, const Label*, Info*)>(
+      resolve("xddD23+8TfQ"));
+  const auto mount = reinterpret_cast<int (KYTY_SYSV_ABI *)(uint32_t, const Label*, MountPoint*)>(
+      resolve("VANhIWcqYak"));
+  const auto unmount = reinterpret_cast<int (KYTY_SYSV_ABI *)(const MountPoint*)>(
+      resolve("3rHWaV-1KC4"));
+  std::array<char, 32> init {}, boot {};
+  Check(initialize(init.data(), boot.data()) == OK, "initialize add-on entitlements");
+  uint32_t count = 0;
+  Check(list(0, nullptr, 0, &count) == OK && count == 68,
+        "query existing and detected add-ons together");
+  Check(list(0, nullptr, 1, &count) == OK && count == 68,
+        "count-only query ignores output capacity");
+  Check(list(1, nullptr, 0, &count) == OK && count == 68,
+        "existing service-label handling remains unchanged");
+  std::array<Info, 5> info {};
+  info[4].package_type = 99;
+  Check(list(0, info.data(), 4, &count) == OK && count == 68 && info[4].package_type == 99,
+        "truncated entitlement list reports total and respects output capacity");
+  constexpr std::array<const char*, 3> existing {"85y-je", "5d5c48", "_mtqu6"};
+  Info single {};
+  for (size_t i = 0; i < existing.size(); ++i) {
+    Check(std::strcmp(info[i].label.data, existing[i]) == 0 &&
+              info[i].package_type == 3 && info[i].download_status == 4 &&
+              get(1, &info[i].label, &single) == OK &&
+              std::memcmp(&single, &info[i], sizeof(single)) == 0,
+          "GTA V entitlements retain their order, metadata, and individual lookups");
+  }
+  Check(std::strcmp(info[3].label.data, label(0).c_str()) == 0 &&
+            info[3].package_type == 2 && info[3].download_status == 4 &&
+            get(0, &info[3].label, &single) == OK &&
+            std::memcmp(&single, &info[3], sizeof(single)) == 0,
+        "detected add-ons follow existing entitlements with matching individual lookups");
+  Label missing {};
+  std::memcpy(missing.data, "MISSING000000000", 16);
+  MountPoint point {};
+  Check(get(0, &missing, &single) == static_cast<int>(0x817d0007u) &&
+            mount(0, &missing, &point) == static_cast<int>(0x80d90005u),
+        "unknown add-on returns entitlement and mount errors");
+  Check(mount(0, nullptr, &point) == static_cast<int>(0x80d90002u) &&
+            list(0, nullptr, 0, nullptr) == static_cast<int>(0x817d0002u),
+        "null add-on parameters return parameter errors");
+  Check(mount(0, &info[3].label, &point) == OK, "mount owned add-on");
+  const std::string mounted_file = std::string(point.data) + "/payload.txt";
+  const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
+  std::array<char, 11> payload {};
+  Check(fd >= 3 && FileSystem::KernelRead(fd, payload.data(), payload.size()) == payload.size() &&
+            std::string_view(payload.data(), payload.size()) == "DLC payload" &&
+            FileSystem::KernelClose(fd) == OK,
+        "guest reads files from the selected title's add-on");
+  MountPoint repeated {};
+  Check(mount(0, &info[3].label, &repeated) == static_cast<int>(0x80d90003u),
+        "duplicate mount returns BUSY");
+  Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
+            unmount(&point) == static_cast<int>(0x80d90004u),
+        "unmount removes mapping and repeated unmount reports NOT_MOUNTED");
+  std::array<MountPoint, 64> mounts {};
+  for (unsigned i = 0; i < mounts.size(); ++i) {
+    Label entitlement {};
+    std::memcpy(entitlement.data, label(i).c_str(), 17);
+    Check(mount(0, &entitlement, &mounts[i]) == OK, "mount up to the simultaneous mount limit");
+  }
+  Label extra {};
+  std::memcpy(extra.data, label(64).c_str(), 17);
+  Check(mount(0, &extra, &point) == static_cast<int>(0x80d90006u),
+        "65th simultaneous mount returns MOUNT_FULL");
+  Check(unmount(&mounts[0]) == OK && mount(0, &extra, &point) == OK,
+        "freed mount slot can be reused");
+  Check(unmount(&point) == OK, "unmount reused slot");
+  for (size_t i = 1; i < mounts.size(); ++i) {
+    Check(unmount(&mounts[i]) == OK, "unmount fixture");
+  }
+  Loader::AddContentLoad(folder / "missing", "PPSA11111");
+  Check(list(0, info.data(), 4, &count) == OK && count == 3,
+        "missing add-ons folder retains GTA V entitlements");
+  for (size_t i = 0; i < existing.size(); ++i) {
+    Check(std::strcmp(info[i].label.data, existing[i]) == 0 &&
+              get(0, &info[i].label, &single) == OK,
+          "GTA V entitlement lookup works without detected add-ons");
+  }
+}
+
 void TestSaveOpenVisibility() {
   constexpr char Path[] = "/savedata0/visible-save.dat";
   constexpr char Payload[] = "saved progress";
@@ -288,6 +472,136 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
+void TestSaveTruncate() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto* symbol = symbols.Find(
+      {"WlyEA-sLDf0", "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  Check(symbol != nullptr, "sceKernelTruncate export resolves");
+  const auto truncate =
+      reinterpret_cast<int (KYTY_SYSV_ABI *)(const char*, int64_t)>(symbol->vaddr);
+  constexpr char Path[] = "/savedata0/truncate-save.dat";
+  constexpr char Payload[] = "profile data";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload) - 1) ==
+                       sizeof(Payload) - 1,
+        "populate path truncation fixture");
+  FileSystem::FileStat stat {};
+  std::array<char, 8> bytes {};
+  Check(truncate(Path, 3) == OK &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == 3 &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == 3 &&
+            std::memcmp(bytes.data(), Payload, 3) == 0,
+        "path truncate discards the tail without moving an open descriptor");
+  bytes.fill('x');
+  Check(truncate(Path, bytes.size()) == OK &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == bytes.size() &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), Payload, 3) == 0 &&
+            std::all_of(bytes.begin() + 3, bytes.end(), [](char byte) { return byte == 0; }) &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1,
+        "path truncate extends with zero bytes and preserves the descriptor position");
+  Check(truncate(Path, -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            truncate(nullptr, 0) == Kernel::KERNEL_ERROR_EFAULT &&
+            truncate("truncate-save.dat", 0) == Kernel::KERNEL_ERROR_EINVAL &&
+            truncate("/savedata0/missing-save.dat", 0) == Kernel::KERNEL_ERROR_ENOENT &&
+            truncate("/savedata0", 0) == Kernel::KERNEL_ERROR_EISDIR &&
+            truncate("/savedata0/truncate-save.dat/child", 0) == Kernel::KERNEL_ERROR_ENOTDIR &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == bytes.size() &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1,
+        "path truncate errors preserve file size and descriptor position");
+  Check(truncate("/dev/urandom", 0) == OK,
+        "path truncate is a no-op for a nonregular nondirectory file");
+  std::string long_path = "/savedata0";
+  long_path.resize(1024, '/');
+  Check(truncate(long_path.c_str(), 0) == Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "path truncate rejects a pathname beyond the guest length limit");
+  long_path.pop_back();
+  Check(truncate(long_path.c_str(), 0) == Kernel::KERNEL_ERROR_EISDIR &&
+            truncate((std::string("/savedata0/") + std::string(256, 'a')).c_str(), 0) ==
+                Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "path truncate permits the pathname length limit and bounds each component");
+  Check(FileSystem::KernelClose(fd) == OK, "close path truncation fixture");
+}
+
+void TestSaveWritev() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto resolve = [&](const char* nid) {
+    const auto* symbol = symbols.Find(
+        {nid, "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+    Check(symbol != nullptr, "vectored write export resolves");
+    return symbol->vaddr;
+  };
+  const auto writev = reinterpret_cast<int64_t (KYTY_SYSV_ABI *)(
+      int, const FileSystem::KernelIovec*, int)>(resolve("kAt6VDbHmro"));
+  const auto pwritev = reinterpret_cast<int64_t (KYTY_SYSV_ABI *)(
+      int, const FileSystem::KernelIovec*, int, int64_t)>(resolve("mBd4AfLP+u8"));
+  constexpr char Path[] = "/savedata0/vector-save.dat";
+  char first[] = "abc";
+  char second[] = "DE";
+  const std::array<FileSystem::KernelIovec, 3> buffers {{
+      {first, 3}, {nullptr, 0}, {second, 2}}};
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "_", 1) == 1 &&
+            writev(fd, buffers.data(), buffers.size()) == 5 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6,
+        "writev writes consecutive segments and advances the descriptor position");
+  std::array<char, 6> bytes {};
+  Check(FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_abcDE", bytes.size()) == 0,
+        "writev preserves the prefix and writes every nonempty segment in order");
+  char replacement[] = "12";
+  const std::array<FileSystem::KernelIovec, 2> patch {{
+      {replacement, 1}, {replacement + 1, 1}}};
+  Check(pwritev(fd, patch.data(), patch.size(), 1) == 2 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_12cDE", bytes.size()) == 0,
+        "pwritev shares segment ordering while preserving the descriptor position");
+
+  const std::array<FileSystem::KernelIovec, 2> invalid {{
+      {first, 1}, {nullptr, 1}}};
+  const std::array<FileSystem::KernelIovec, 2> oversized {{
+      {first, 1}, {second, static_cast<size_t>(std::numeric_limits<int>::max())}}};
+  Check(writev(fd, nullptr, 1) == Kernel::KERNEL_ERROR_EFAULT &&
+            writev(fd, invalid.data(), invalid.size()) == Kernel::KERNEL_ERROR_EFAULT &&
+            writev(fd, buffers.data(), -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(fd, buffers.data(), 1025) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(fd, oversized.data(), oversized.size()) == Kernel::KERNEL_ERROR_EINVAL &&
+            pwritev(fd, patch.data(), patch.size(), -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(-1, buffers.data(), buffers.size()) == Kernel::KERNEL_ERROR_EBADF &&
+            writev(fd, nullptr, 0) == 0 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_12cDE", bytes.size()) == 0,
+        "invalid vectors fail before writing any segment or moving the descriptor");
+  const int reader = FileSystem::KernelOpen(Path, 0, 0);
+  Check(reader >= 3 && writev(reader, buffers.data(), buffers.size()) ==
+                           Kernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelLseek(reader, 0, 1) == 0 &&
+            FileSystem::KernelClose(reader) == OK,
+        "writev rejects a read-only descriptor without moving it");
+
+  const int append = FileSystem::KernelOpen(Path, 0xa, 0);
+  Check(append >= 3 && FileSystem::KernelLseek(append, 1, 0) == 1 &&
+            writev(append, buffers.data(), buffers.size()) == 5 &&
+            FileSystem::KernelLseek(append, 0, 1) == 11 &&
+            FileSystem::KernelLseek(append, 1, 0) == 1 &&
+            pwritev(append, patch.data(), patch.size(), 0) == 2 &&
+            FileSystem::KernelLseek(append, 0, 1) == 1,
+        "append vectored writes target EOF while positional writes preserve the cursor");
+  std::array<char, 13> appended {};
+  Check(FileSystem::KernelPread(fd, appended.data(), appended.size(), 0) == appended.size() &&
+            std::memcmp(appended.data(), "_12cDEabcDE12", appended.size()) == 0,
+        "append writes retain the original contents and ordered segments");
+  Check(FileSystem::KernelClose(append) == OK && FileSystem::KernelClose(fd) == OK,
+        "close vectored write fixtures");
 }
 
 void TestAioBatches() {
@@ -657,6 +971,12 @@ void CheckArchiveMount(const std::filesystem::path &root) {
             FileSystem::KernelFtruncate(fd, 0) ==
             Libs::LibKernel::KERNEL_ERROR_EBADF,
         "archive read-only descriptors reject write and truncate");
+  Check(FileSystem::KernelTruncate(GuestMember, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelFstat(fd, &descriptor_stat) == OK &&
+            descriptor_stat.st_size == payload.size() &&
+            FileSystem::KernelLseek(fd, 0, 1) == payload.size(),
+        "path truncate rejects a read-only archive and preserves its member");
 
   const auto unicode_guest = std::string("/app0/") + std::string(ArchiveTests::UnicodeFilename);
   const int unicode = FileSystem::KernelOpen(unicode_guest.c_str(), 0, 0);
@@ -1851,9 +2171,11 @@ int main(int, char**) {
   graphics->CreateVulkan();
 
   TempDirectory temporary;
+  CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
+  TestAddContent(temporary.Path());
   TestRandomDevices();
   TestFileDescriptorFlags();
   CheckMountRoot(temporary.Path());
@@ -1865,6 +2187,8 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestSaveTruncate();
+  TestSaveWritev();
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

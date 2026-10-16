@@ -238,6 +238,7 @@ uint32_t              EmitBallot(ValueEmitContext& ctx, IR::Value predicate);
 uint32_t              EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -246,6 +247,7 @@ void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& in
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
+uint32_t              EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitGetAddressResource = EmitGetSrtResource;
 inline constexpr auto EmitGetScratchResource = EmitGetSrtResource;
 inline constexpr auto EmitGetImageResource   = EmitGetSrtResource;

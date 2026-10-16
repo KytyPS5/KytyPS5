@@ -42,9 +42,9 @@ void* KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver);
 int KYTY_SYSV_ABI   AgcCreateShader(Shader** dst, void* header, const volatile void* code);
 int KYTY_SYSV_ABI   AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* front,
                                                  const Shader* back);
-int KYTY_SYSV_ABI   AgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* front,
+int KYTY_SYSV_ABI   AgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front,
                                                const Shader* back, void* scratch_mem);
-int KYTY_SYSV_ABI   AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
+int KYTY_SYSV_ABI   AgcFuseShaderHalves(Shader* fused_result, const Shader* front,
                                           const Shader* back, void* scratch_mem);
 int KYTY_SYSV_ABI   AgcSetCxRegIndirectPatchSetAddress(uint32_t*                      cmd,
                                                        const volatile ShaderRegister* regs);
@@ -161,7 +161,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
                                                       const volatile void* object_ids,
                                                       uint32_t instance_count, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexMultiInstancedGetSize();
-int KYTY_SYSV_ABI AgcUnknownIkfdtRIqCE(uint32_t* cmd, uint64_t arg1,
+int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
                                        const volatile uint32_t* target, uint32_t size_in_dwords,
                                        uint64_t arg4, uint64_t arg5);
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_count,
@@ -260,7 +260,7 @@ uint32_t KYTY_SYSV_ABI  AgcDcbCondExecGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t condition, uint8_t op,
                                              uint8_t wait_op, const volatile void* address,
                                              uint32_t count_in_dwords);
-uint32_t* KYTY_SYSV_ABI AgcUnknownKRzWekV120(CommandBuffer* buf, uint32_t arg1, uint32_t arg2,
+uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize_0600(CommandBuffer* buf, uint32_t arg1, uint32_t arg2,
                                              uint32_t arg3);
 int KYTY_SYSV_ABI       AgcDmaDataPatchSetDstAddressOrOffset(uint32_t* cmd,
                                                              uint64_t  dst_address_or_offset);
@@ -340,7 +340,7 @@ uint32_t KYTY_SYSV_ABI AgcDriverGetEqContextId(const LibKernel::EventQueue::Kern
 int KYTY_SYSV_ABI      AgcDriverSetTFRing(const volatile void* base, uint32_t size);
 int KYTY_SYSV_ABI  AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, uint64_t value2);
 bool KYTY_SYSV_ABI AgcDriverIsCaptureInProgress();
-int KYTY_SYSV_ABI  AgcDriverUnknownU9ueyEhSkF4();
+int KYTY_SYSV_ABI  AgcDriverRegisterDefaultOwner();
 
 } // namespace Gen5Driver
 

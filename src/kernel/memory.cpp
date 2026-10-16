@@ -232,15 +232,15 @@ public:
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 
-		if (start == 0 || size == 0) {
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
 		}
 		auto position = LowerBound(start);
 		if ((position != m_ranges.end() &&
-		     VirtualRangesOverlap(start, size, position->start, position->size)) ||
+		     VirtualRangesOverlap(start, size, position->second.start, position->second.size)) ||
 		    (position != m_ranges.begin() &&
-		     VirtualRangesOverlap(start, size, std::prev(position)->start,
-		                          std::prev(position)->size))) {
+		     VirtualRangesOverlap(start, size, std::prev(position)->second.start,
+		                          std::prev(position)->second.size))) {
 			return false;
 		}
 
@@ -253,23 +253,21 @@ public:
 		r.type           = type;
 		r.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(r.name, name);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
-		m_ranges.insert(position, r);
-		MergeAroundUnlocked(index);
+		auto inserted = m_ranges.emplace_hint(position, start, r);
+		UpdatePageTableEntries(inserted->second, true);
+		MergeAroundUnlocked(inserted);
 		return true;
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size) {
-			m_ranges.erase(position);
+		auto position = m_ranges.find(start);
+		if (position != m_ranges.end() && position->second.size == size) {
+			EraseUnlocked(position);
 			return true;
 		}
-		auto removed = RemoveUnlocked(start, size);
-		MergeUnlocked();
-		return removed;
+		return RemoveUnlocked(start, size);
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
@@ -293,40 +291,31 @@ public:
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
-		for (size_t index = 0; index < m_ranges.size(); index++) {
-			auto& r = m_ranges[index];
-			if (r.start == start && r.size == size && IsReservedRangeType(r.type)) {
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				return true;
-			}
+		auto position = m_ranges.find(start);
+		if (position != m_ranges.end() && position->second.size == size &&
+		    IsReservedRangeType(position->second.type)) {
+			EraseUnlocked(position);
 		}
 		return true;
 	}
 
-	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type,
-	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
-	                 const char* name, bool disallow_merge = false) {
+	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type, uint64_t offset,
+	                 int protection, int memory_type, VirtualRangeType type, const char* name,
+	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
 		}
 
-		auto current = start;
-		const auto end = start + size;
-		while (current < end) {
-			const Range* candidate = nullptr;
-			for (const auto& r: m_ranges) {
-				if (r.type == expected_type && current >= r.start &&
-				    current < End(r.start, r.size)) {
-					candidate = &r;
-					break;
-				}
-			}
-			if (candidate == nullptr) {
+		auto       current = start;
+		const auto end     = start + size;
+		for (auto candidate = FindContaining(start); current < end; ++candidate) {
+			if (candidate == m_ranges.end() || candidate->second.start > current ||
+			    candidate->second.type != expected_type) {
 				return false;
 			}
-			current = std::min(end, End(candidate->start, candidate->size));
+			current = std::min(end, End(candidate->second.start, candidate->second.size));
 		}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -344,21 +333,27 @@ public:
 		replacement.type           = type;
 		replacement.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(replacement.name, name);
-		RemoveUnlocked(start, size);
-		auto position = LowerBound(start);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
-		m_ranges.insert(position, replacement);
-		MergeAroundUnlocked(index);
+		// Validation precedes all mutations. Keep the first node for the replacement so
+		// replacing an existing arena does not allocate another tree node.
+		auto first = SplitAtUnlocked(start);
+		auto last  = SplitAtUnlocked(end);
+		for (auto it = std::next(first); it != last;) {
+			it = EraseUnlocked(it);
+		}
+		UpdatePageTableEntries(first->second, false);
+		first->second = replacement;
+		UpdatePageTableEntries(first->second, true);
+		MergeAroundUnlocked(first);
 		return true;
 	}
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
 
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size) {
-			CopyVirtualRangeName(position->name, name);
-			MergeAroundUnlocked(static_cast<size_t>(position - m_ranges.begin()));
+		auto position = m_ranges.find(start);
+		if (position != m_ranges.end() && position->second.size == size) {
+			CopyVirtualRangeName(position->second.name, name);
+			MergeAroundUnlocked(position);
 			return;
 		}
 		EditUnlocked(start, size, [name](Range* r) { CopyVirtualRangeName(r->name, name); });
@@ -375,13 +370,11 @@ public:
 
 		Common::LockGuard lock(m_mutex);
 
-		auto next = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
+		auto next = m_ranges.upper_bound(addr);
 		if (next != m_ranges.begin()) {
 			auto current = std::prev(next);
-			if (addr < End(current->start, current->size)) {
-				*out = *current;
+			if (addr < End(current->second.start, current->second.size)) {
+				*out = current->second;
 				return true;
 			}
 		}
@@ -389,7 +382,7 @@ public:
 			return false;
 		}
 
-		*out = *next;
+		*out = next->second;
 		return true;
 	}
 
@@ -404,11 +397,9 @@ public:
 
 		const auto end     = start + size;
 		auto       current = start;
-		for (const auto& range: m_ranges) {
-			const auto range_end = End(range.start, range.size);
-			if (range_end <= current) {
-				continue;
-			}
+		for (auto it = FindContaining(start); it != m_ranges.end(); ++it) {
+			const auto& range     = it->second;
+			const auto  range_end = End(range.start, range.size);
 			if (range.start > current) {
 				break;
 			}
@@ -437,27 +428,19 @@ public:
 			return 0;
 		}
 
-		auto vma = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), virtual_addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
-		if (vma == m_ranges.begin()) {
+		auto vma = FindContaining(virtual_addr);
+		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
-		--vma;
-
-		const auto vma_end = End(vma->start, vma->size);
-		if (virtual_addr < vma->start || virtual_addr >= vma_end ||
-		    !IsCommittedRangeType(vma->type)) {
-			return 0;
-		}
+		const auto vma_end = End(vma->second.start, vma->second.size);
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
 		++vma;
 
-		while (vma != m_ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
-		       clamped_size < size) {
-			const auto chunk = std::min(size - clamped_size, vma->size);
+		while (vma != m_ranges.end() && vma->second.start == expected &&
+		       IsCommittedRangeType(vma->second.type) && clamped_size < size) {
+			const auto chunk = std::min(size - clamped_size, vma->second.size);
 			clamped_size += chunk;
 			expected += chunk;
 			++vma;
@@ -468,27 +451,7 @@ public:
 
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
-
-		uint64_t used = 0;
-		for (const auto& r: m_ranges) {
-			if (!IsCommittedRangeType(r.type) || r.size == 0) {
-				continue;
-			}
-
-			const bool has_cpu_access =
-			    (r.protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC)) != 0;
-			const bool has_gpu_access = (r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0;
-			if (gpu ? !has_gpu_access : !has_cpu_access) {
-				continue;
-			}
-
-			const auto end         = End(r.start, r.size);
-			const auto first_entry = r.start / PAGE_TABLE_GRANULARITY;
-			const auto last_entry  = (end - 1) / PAGE_TABLE_GRANULARITY;
-			used += last_entry - first_entry + 1;
-		}
-
-		return used;
+		return gpu ? m_gpu_page_table_entries : m_cpu_page_table_entries;
 	}
 
 private:
@@ -507,51 +470,112 @@ private:
 		       std::strncmp(left.name, right.name, KERNEL_MAXIMUM_NAME_LENGTH) == 0;
 	}
 
-	static void AddPiece(std::vector<Range>* ranges, const Range& source, uint64_t start,
-	                     uint64_t end) {
-		EXIT_IF(ranges == nullptr);
+	// Keys are range starts; ranges are nonempty, non-overlapping and locally coalesced.
+	// A tree avoids shifting unrelated ranges when streaming edits split or remove an arena.
+	using RangeMap = std::map<uint64_t, Range>;
+	using Iterator = RangeMap::iterator;
 
-		if (end <= start) {
-			return;
-		}
+	Iterator LowerBound(uint64_t start) { return m_ranges.lower_bound(start); }
 
-		Range piece = source;
-		piece.start = start;
-		piece.size  = end - start;
-		if (piece.type == VirtualRangeType::Direct) {
-			piece.offset += start - source.start;
+	Iterator FindContaining(uint64_t address) {
+		auto next = m_ranges.upper_bound(address);
+		if (next == m_ranges.begin()) {
+			return m_ranges.end();
 		}
-		ranges->push_back(piece);
+		auto current = std::prev(next);
+		return address < End(current->second.start, current->second.size) ? current
+		                                                                  : m_ranges.end();
 	}
 
-	std::vector<Range>::iterator LowerBound(uint64_t start) {
-		return std::lower_bound(
-		    m_ranges.begin(), m_ranges.end(), start,
-		    [](const Range& range, uint64_t value) { return range.start < value; });
+	static bool CanMerge(const Range& left, const Range& right) {
+		return End(left.start, left.size) == right.start && SameMergeKey(left, right);
 	}
 
-	void MergeAroundUnlocked(size_t index) {
-		if (index >= m_ranges.size()) {
+	void UpdatePageTableEntries(const Range& range, bool add) {
+		if (!IsCommittedRangeType(range.type)) {
 			return;
 		}
-		if (index != 0) {
-			auto& previous = m_ranges[index - 1];
-			auto& current  = m_ranges[index];
-			if (End(previous.start, previous.size) == current.start &&
-			    SameMergeKey(previous, current)) {
-				previous.size += current.size;
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				index--;
+		// Preserve the statistics API's per-range accounting: splitting within a page-table
+		// entry counts it for each fragment, and merging removes that duplicate contribution.
+		const auto entries = (End(range.start, range.size) - 1) / PAGE_TABLE_GRANULARITY -
+		                     range.start / PAGE_TABLE_GRANULARITY + 1;
+		if ((range.protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC)) != 0) {
+			m_cpu_page_table_entries =
+			    add ? m_cpu_page_table_entries + entries : m_cpu_page_table_entries - entries;
+		}
+		if ((range.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+			m_gpu_page_table_entries =
+			    add ? m_gpu_page_table_entries + entries : m_gpu_page_table_entries - entries;
+		}
+	}
+
+	Iterator EraseUnlocked(Iterator position) {
+		UpdatePageTableEntries(position->second, false);
+		return m_ranges.erase(position);
+	}
+
+	Iterator MergeNextUnlocked(Iterator left, Iterator right) {
+		UpdatePageTableEntries(left->second, false);
+		left->second.size += right->second.size;
+		auto next = EraseUnlocked(right);
+		UpdatePageTableEntries(left->second, true);
+		return next;
+	}
+
+	void MergeAroundUnlocked(Iterator current) {
+		if (current != m_ranges.begin()) {
+			auto previous = std::prev(current);
+			if (CanMerge(previous->second, current->second)) {
+				MergeNextUnlocked(previous, current);
+				current = previous;
 			}
 		}
-		while (index + 1 < m_ranges.size()) {
-			auto& current = m_ranges[index];
-			auto& next    = m_ranges[index + 1];
-			if (End(current.start, current.size) != next.start || !SameMergeKey(current, next)) {
+		for (auto next = std::next(current); next != m_ranges.end();) {
+			if (!CanMerge(current->second, next->second)) {
 				break;
 			}
-			current.size += next.size;
-			m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index + 1));
+			next = MergeNextUnlocked(current, next);
+		}
+	}
+
+	Iterator SplitAtUnlocked(uint64_t address) {
+		auto position = LowerBound(address);
+		if (position != m_ranges.begin()) {
+			auto&      previous     = std::prev(position)->second;
+			const auto previous_end = End(previous.start, previous.size);
+			if (previous.start < address && address < previous_end) {
+				Range right = previous;
+				right.start = address;
+				right.size  = previous_end - address;
+				if (right.type == VirtualRangeType::Direct) {
+					right.offset += address - previous.start;
+				}
+				position = m_ranges.emplace_hint(position, address, right);
+				UpdatePageTableEntries(previous, false);
+				previous.size = address - previous.start;
+				UpdatePageTableEntries(previous, true);
+				UpdatePageTableEntries(right, true);
+			}
+		}
+		return position;
+	}
+
+	void MergeSpanUnlocked(Iterator first, Iterator last) {
+		if (first == last) {
+			return;
+		}
+		// Include both neighbors. The right neighbor itself can be erased by a merge,
+		// so the sentinel must be the node after it, which this loop never touches.
+		const auto stop = last == m_ranges.end() ? last : std::next(last);
+		if (first != m_ranges.begin()) {
+			--first;
+		}
+		for (auto next = std::next(first); next != stop;) {
+			if (CanMerge(first->second, next->second)) {
+				next = MergeNextUnlocked(first, next);
+			} else {
+				first = next++;
+			}
 		}
 	}
 
@@ -560,102 +584,51 @@ private:
 		if (size == 0) {
 			return;
 		}
-
-		std::vector<Range> out;
-		auto               edit_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			auto mid_start = std::max(start, r.start);
-			auto mid_end   = std::min(edit_end, r_end);
-
-			AddPiece(&out, r, r.start, mid_start);
-
-			Range mid = r;
-			mid.start = mid_start;
-			mid.size  = mid_end - mid_start;
-			if (mid.type == VirtualRangeType::Direct) {
-				mid.offset += mid_start - r.start;
-			}
-			edit(&mid);
-			out.push_back(mid);
-
-			AddPiece(&out, r, mid_end, r_end);
+		auto first = SplitAtUnlocked(start);
+		auto last  = SplitAtUnlocked(End(start, size));
+		for (auto it = first; it != last; ++it) {
+			UpdatePageTableEntries(it->second, false);
+			edit(&it->second);
+			UpdatePageTableEntries(it->second, true);
 		}
-
-		m_ranges = out;
-		MergeUnlocked();
+		MergeSpanUnlocked(first, last);
 	}
 
 	bool RemoveUnlocked(uint64_t start, uint64_t size) {
 		if (size == 0) {
 			return false;
 		}
-
-		std::vector<Range> out;
-		bool               removed = false;
-		auto               rem_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			removed = true;
-			AddPiece(&out, r, r.start, std::max(start, r.start));
-			AddPiece(&out, r, std::min(rem_end, r_end), r_end);
+		auto first = SplitAtUnlocked(start);
+		auto last  = SplitAtUnlocked(End(start, size));
+		if (first == last) {
+			return false;
 		}
-
-		m_ranges = out;
-		return removed;
-	}
-
-	void MergeUnlocked() {
-		if (m_ranges.size() < 2) {
-			return;
+		while (first != last) {
+			first = EraseUnlocked(first);
 		}
-
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
-
-		std::vector<Range> merged;
-		for (const auto& r: m_ranges) {
-			if (!merged.empty()) {
-				auto& last = merged[merged.size() - 1];
-				if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
-					last.size += r.size;
-					continue;
-				}
-			}
-			merged.push_back(r);
-		}
-		m_ranges = merged;
+		// Removal leaves an address gap, so it cannot make surviving ranges mergeable.
+		return true;
 	}
 
 	Range* FindOverlap(uint64_t start, uint64_t size) {
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() &&
-		    VirtualRangesOverlap(start, size, position->start, position->size)) {
-			return &*position;
+		    VirtualRangesOverlap(start, size, position->second.start, position->second.size)) {
+			return &position->second;
 		}
 		if (position != m_ranges.begin()) {
 			auto previous = std::prev(position);
-			if (VirtualRangesOverlap(start, size, previous->start, previous->size)) {
-				return &*previous;
+			if (VirtualRangesOverlap(start, size, previous->second.start, previous->second.size)) {
+				return &previous->second;
 			}
 		}
 		return nullptr;
 	}
 
-	std::vector<Range> m_ranges;
-	Common::Mutex      m_mutex;
+	RangeMap      m_ranges;
+	Common::Mutex m_mutex;
+	uint64_t      m_cpu_page_table_entries = 0;
+	uint64_t      m_gpu_page_table_entries = 0;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

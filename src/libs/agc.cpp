@@ -804,13 +804,13 @@ static int fuse_shader_halves(Shader* fused_result, const Shader* front,
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* front,
+int KYTY_SYSV_ABI AgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front,
                                            const Shader* back, void* scratch_mem) {
 	PRINT_NAME();
 	return fuse_shader_halves(fused_result, front, back, scratch_mem, true);
 }
 
-int KYTY_SYSV_ABI AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
+int KYTY_SYSV_ABI AgcFuseShaderHalves(Shader* fused_result, const Shader* front,
                                       const Shader* back, void* scratch_mem) {
 	PRINT_NAME();
 	return fuse_shader_halves(fused_result, front, back, scratch_mem, false);
@@ -2636,7 +2636,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstancedGetSize() {
 	return 9u * 4u;
 }
 
-int KYTY_SYSV_ABI AgcUnknownIkfdtRIqCE(uint32_t* cmd, uint64_t arg1,
+int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
                                        const volatile uint32_t* target, uint32_t size_in_dwords,
                                        uint64_t arg4, uint64_t arg5) {
 	PRINT_NAME();
@@ -3022,38 +3022,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 		     engine, cb_db_op, gcr_cntl, reinterpret_cast<uint64_t>(base), size_bytes, poll_cycles);
 	}
 
-	bool no_size = (static_cast<int64_t>(size_bytes) == -1);
-	auto vaddr   = reinterpret_cast<uint64_t>(base);
-
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	static std::atomic<uint32_t> warning_log_count {0};
-	const bool                   log_warning = (warning_log_count.fetch_add(1) < 64);
-	if (!no_size && (size_bytes & 0xffu) != 0) {
-		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is not 256-byte aligned\n");
-		}
-	}
-	if (!no_size && (size_bytes >> 40u) != 0) {
-		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is too large\n");
-		}
-	}
-	if ((vaddr & 0xffu) != 0) {
-		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: base is not 256-byte aligned\n");
-		}
-	}
-	if ((vaddr >> 40u) != 0) {
-		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: base is too high\n");
-		}
-	}
-	if (engine > 1) {
-		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: unsupported engine 0x%02" PRIx8 "\n", engine);
-		}
-	}
 
 	auto* cmd = buf->AllocateDW(8);
 
@@ -3062,14 +3031,19 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 		return nullptr;
 	}
 
-	cmd[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ACQUIRE_MEM);
-	cmd[1] = (static_cast<uint32_t>(engine & 1u) << 31u) | cb_db_op;
-	cmd[2] = (no_size ? 0 : static_cast<uint32_t>(size_bytes >> 8u));
-	cmd[3] = 0;
+	constexpr uint64_t address_mask = 0xffffffffffffull;
+	const auto vaddr = reinterpret_cast<uint64_t>(base);
+	// Cover the byte range in 256-byte units, bounded by the 48-bit address space.
+	const auto size = std::min((((vaddr & 0xffu) + size_bytes) & address_mask) + 0xffu,
+	                           (address_mask & ~uint64_t {0xff}) - vaddr) >> 8u;
+	cmd[0] = KYTY_PM4(8, Pm4::IT_ACQUIRE_MEM, 0u);
+	cmd[1] = (static_cast<uint32_t>(engine) << 31u) | (cb_db_op & 0x06007fc0u);
+	cmd[2] = static_cast<uint32_t>(size);
+	cmd[3] = static_cast<uint32_t>((size >> 32u) & 0xffu);
 	cmd[4] = static_cast<uint32_t>(vaddr >> 8u);
-	cmd[5] = 0;
-	cmd[6] = poll_cycles / 40;
-	cmd[7] = gcr_cntl;
+	cmd[5] = static_cast<uint32_t>(vaddr >> 40u);
+	cmd[6] = std::min(poll_cycles >> 4u, 0xffffu);
+	cmd[7] = gcr_cntl & 0x7ffffu;
 
 	return cmd;
 }
@@ -3083,7 +3057,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbAcquireMemGetSize() {
 uint32_t* KYTY_SYSV_ABI AgcAcbAcquireMem(CommandBuffer* buf, uint32_t gcr_cntl,
                                          const volatile void* base, uint64_t size_bytes,
                                          uint32_t poll_cycles) {
-	return AgcDcbAcquireMem(buf, 1, 0, gcr_cntl, base, size_bytes, poll_cycles);
+	return AgcDcbAcquireMem(buf, 0, 0, gcr_cntl, base, size_bytes, poll_cycles);
 }
 
 uint32_t KYTY_SYSV_ABI AgcAcbAcquireMemGetSize() {
@@ -3536,7 +3510,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t conditi
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcUnknownKRzWekV120(CommandBuffer* buf, uint32_t arg1, uint32_t arg2,
+uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize_0600(CommandBuffer* buf, uint32_t arg1, uint32_t arg2,
                                              uint32_t arg3) {
 	PRINT_NAME();
 
@@ -4477,7 +4451,7 @@ bool KYTY_SYSV_ABI AgcDriverIsCaptureInProgress() {
 	return false;
 }
 
-int KYTY_SYSV_ABI AgcDriverUnknownU9ueyEhSkF4() {
+int KYTY_SYSV_ABI AgcDriverRegisterDefaultOwner() {
 	PRINT_NAME();
 
 	return static_cast<int>(0x8a6c9018u);

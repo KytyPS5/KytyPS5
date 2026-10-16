@@ -177,9 +177,6 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
 			DepthFatal("invalid HTile metadata address");
 		}
-		if (z.depth_view.slice_max >= 32) {
-			DepthFatal("HTile clear tracking supports at most 32 slices");
-		}
 	}
 	if (!z.size.valid) {
 		DepthFatal("missing depth extent");

@@ -85,6 +85,14 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
+	if (ctx.state.object_primitive_id_variable != 0) {
+		auto& state = ctx.state;
+		const auto primitive = EmitGetBuiltin(
+		    ctx, IR::Value {static_cast<uint32_t>(IR::StageInputKind::PrimitiveId)}, IR::Value {0u});
+		const auto object = EmitPushDataLoad(state, ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpStore, state.object_primitive_id_variable,
+		                          EmitAddU32(state, object, primitive));
+	}
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
@@ -226,8 +234,9 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
-	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
-		// Both operations already combine both emulated halves into one whole-wave result.
+	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane ||
+	                     inst.GetOpcode() == IR::ValueOpcode::SubgroupUMinU32)) {
+		// These operations combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
@@ -347,6 +356,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto initial_parent = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 
+	state.current_block = nullptr;
 	EmitLabel(state, dispatcher.header_label);
 	const auto pc      = state.builder.AllocateId();
 	const auto next_pc = state.builder.AllocateId();
@@ -382,6 +392,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		next_pc_words.push_back(state.current_label);
 		state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
 	}
+	state.current_block = nullptr;
 	EmitLabel(state, dispatcher.after_switch_label);
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
@@ -665,6 +676,8 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	DefineGetBdaPointer(state);
+	DefineIndirectBufferLoads(ctx);
+	DefineIndirectBufferFormats(ctx);
 	DefineBvhIntersect(state);
 	if (program.info.uses_swizzle) {
 		ctx.scratch_u32_variable = state.builder.AllocateId();
@@ -744,6 +757,7 @@ void EmitProgram(EmitterState& state) {
 		EmitStructuredFunction(ctx);
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
+	state.current_block = nullptr;
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}

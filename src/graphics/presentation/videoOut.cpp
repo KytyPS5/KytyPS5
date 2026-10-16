@@ -145,6 +145,7 @@ struct VideoOutOutputStatus {
 	uint64_t flags        = 0;
 	uint64_t reserved[3]  = {};
 };
+static_assert(sizeof(VideoOutOutputStatus) == 0x30); // Also used by VideoOutVrrStatus.
 
 struct VideoOutOutputOptions {
 	uint32_t internalData[16] = {};

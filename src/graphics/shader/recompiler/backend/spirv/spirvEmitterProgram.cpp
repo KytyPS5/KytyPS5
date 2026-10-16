@@ -1,12 +1,15 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <functional>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -232,10 +235,25 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+// A scalar load reads the same address for the whole wave, so both emulated halves compute the same value; the
+// second half reuses the first one's result instead of emitting the whole load again (RT kernels).
+bool IsWaveUniformScalarLoad(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (!ctx.state.program.rt_plain_formatted_indirect)
+		return false;
+	switch (inst.GetOpcode()) {
+		case IR::ValueOpcode::ReadConst: return true;
+		case IR::ValueOpcode::LoadAddressU32: return ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress;
+		case IR::ValueOpcode::ReadConstBuffer:
+			return ctx.Memory(inst).kind == IR::ResourceKind::ScalarBuffer;
+		default: return false;
+	}
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
 	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane ||
-	                     inst.GetOpcode() == IR::ValueOpcode::SubgroupUMinU32)) {
+	                     inst.GetOpcode() == IR::ValueOpcode::SubgroupUMinU32 ||
+	                     IsWaveUniformScalarLoad(ctx, inst))) {
 		// These operations combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
@@ -330,17 +348,271 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 	}
 }
 
+// A shader that reads memory through device addresses sees a page it touches for the first time as zero until
+// the fault buffer maps it for the next dispatch. A list walk fed zeros never ends, and the device is lost
+// before that dispatch happens. With ray tracing on, every loop whose continue block branches straight back to
+// its header counts its iterations and leaves through its merge block after LoopWatchdogLimit of them: the
+// result of that invocation is wrong, the fault gets handled and the next dispatch sees the data.
+constexpr uint32_t LoopWatchdogLimit = 4096u;
+
+struct LoopWatchdog {
+	const IR::Block* header  = nullptr;
+	const IR::Block* cont    = nullptr;
+	const IR::Block* merge   = nullptr;
+	uint32_t         counter = 0; // phi in the header
+	uint32_t         next    = 0; // counter + 1, defined in the continue block
+	DeferredPhi      phi {};
+	bool             has_phi = false;
+	// The latch branched straight back: its new exit adds a predecessor to the merge block, whose phis take an
+	// undefined value from it (the loop was cut short).
+	bool                                   exit_edge = false;
+	// The latch branched straight back and a value of the loop is used past it: a new edge to the merge block
+	// would break dominance, so an exhausted budget ends the invocation instead.
+	bool                                   exit_return = false;
+	std::unordered_map<uint32_t, uint32_t> undefs; // phi type -> OpUndef in the latch
+};
+
+// True when an instruction of the loop (the blocks that reach the latch without passing the header) is used
+// outside it. A phi use counts at its incoming block, so the merge block's phis do not count: the watchdog gives
+// them an undefined value on its own edge.
+bool LoopValueEscapes(const IR::Program& program, const IR::Block* header, const IR::Block* latch) {
+	std::unordered_set<const IR::Block*> body {header, latch};
+	std::vector<const IR::Block*>        pending {latch};
+	while (!pending.empty()) {
+		const auto* block = pending.back();
+		pending.pop_back();
+		if (block == header) continue;
+		for (const auto* pred: block->ImmPredecessors()) {
+			if (body.insert(pred).second) pending.push_back(pred);
+		}
+	}
+	const auto defined_inside = [&](IR::Value value) {
+		const auto* definition = value.IsEmpty() ? nullptr : value.TryInstruction();
+		return definition != nullptr && body.contains(definition->Parent());
+	};
+	for (const auto* block: program.blocks) {
+		if (body.contains(block)) continue;
+		for (const auto& inst: *block) {
+			for (size_t index = 0; index < inst.NumArgs(); index++) {
+				if (!defined_inside(inst.Arg(index))) continue;
+				if (inst.GetOpcode() == IR::ValueOpcode::Phi && body.contains(inst.PhiBlock(index))) continue;
+				return true;
+			}
+		}
+		if (defined_inside(block->condition) || defined_inside(block->indirect_target)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+struct WatchdogExtraIncoming {
+	DeferredPhi      phi {};
+	uint32_t         type  = 0;
+	size_t           slot  = 0;
+	const IR::Block* latch = nullptr;
+};
+
+
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	std::unordered_set<const IR::Inst*> emitted;
+	std::vector<LoopWatchdog>          watchdogs;
+	std::vector<WatchdogExtraIncoming> extra_incomings;
+	// Ray tracing programs get a watchdog on their loops.
+	if (program.info.uses_dma && (program.gpu_selected_call_payloads || program.info.bvh)) {
+		for (size_t index = 0; index < program.blocks.size(); index++) {
+			const auto& term = program.blocks[index]->terminator;
+			if (!term.loop_header) {
+				continue;
+			}
+			const auto* header = program.blocks[index];
+			const auto* cont   = term.continue_block;
+			const auto* merge  = term.merge_block;
+			if (cont == nullptr || merge == nullptr || cont == header) {
+				continue;
+			}
+			const auto& cont_term     = cont->terminator;
+			const auto targets_header = [&](const IR::Block* target) { return target == header; };
+			const bool back_edge =
+			    (cont_term.kind == CFG::TerminatorKind::Branch && targets_header(cont_term.true_block)) ||
+			    (cont_term.kind == CFG::TerminatorKind::ConditionalBranch &&
+			     (targets_header(cont_term.true_block) || targets_header(cont_term.false_block)));
+			if (!back_edge || cont_term.loop_header) {
+				continue;
+			}
+			const bool escapes = cont_term.kind == CFG::TerminatorKind::Branch && LoopValueEscapes(program, header, cont);
+			if (escapes && term.kind != CFG::TerminatorKind::Branch) {
+				// A function returning a value cannot just return; such a loop runs unguarded.
+				continue;
+			}
+			LoopWatchdog watchdog;
+			watchdog.header    = header;
+			watchdog.cont      = cont;
+			watchdog.merge     = merge;
+			watchdog.exit_edge   = cont_term.kind == CFG::TerminatorKind::Branch && !escapes;
+			watchdog.exit_return = escapes;
+			watchdog.counter   = ctx.state.builder.AllocateId();
+			watchdog.next      = ctx.state.builder.AllocateId();
+			watchdogs.push_back(watchdog);
+		}
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
+		const LoopWatchdog* cut_merge = nullptr;
+		for (const auto& watchdog: watchdogs) {
+			if (watchdog.exit_edge && watchdog.merge == block) {
+				cut_merge = &watchdog;
+			}
+		}
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
+			if (cut_merge != nullptr && inst.GetOpcode() == IR::ValueOpcode::Phi) {
+				const auto type = TypeId(lane.state, inst.GetType());
+				if (type == 0 || inst.NumArgs() == 0) {
+					lane.Fail(inst, "has no native SPIR-V representation");
+				}
+				const auto phi =
+				    lane.state.builder.AddDeferredPhi(type, lane.Result(inst), inst.NumArgs() + 1u);
+				structured.deferred_phis.push_back({phi, &inst, lane.half});
+				extra_incomings.push_back({phi, type, inst.NumArgs(), cut_merge->cont});
+				return;
+			}
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		for (auto& watchdog: watchdogs) {
+			if (watchdog.header == block) {
+				// The header is a dedicated empty block: its phis come right after the label.
+				std::vector<const IR::Block*> preds;
+				for (const auto* pred: block->ImmPredecessors()) {
+					if (std::ranges::find(preds, pred) == preds.end()) {
+						preds.push_back(pred);
+					}
+				}
+				watchdog.phi     = ctx.state.builder.AddDeferredPhi(TypeU32(ctx.state), watchdog.counter, preds.size());
+				watchdog.has_phi = true;
+			}
+		}
+		for (const auto& inst: *block) emitted.insert(&inst);
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
-		EmitStructuredTerminator(ctx, block);
+		// A return inside a continue construct breaks structural post-dominance.
+		// Check escaping loops at their body entrance, keeping the latch unconditional.
+		const auto returning = std::ranges::find_if(watchdogs, [&](const LoopWatchdog& watchdog) {
+			return watchdog.header == block && watchdog.exit_return;
+		});
+		if (returning != watchdogs.end()) {
+			auto& state = ctx.state;
+			const auto under = Binary(state, spv::OpULessThan, TypeBool(state), returning->counter,
+			                          ConstantU32(state, LoopWatchdogLimit));
+			const auto guard = state.builder.AllocateId();
+			const auto stay = state.builder.AllocateId();
+			const auto ending = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoopMerge, returning->merge->Definition(),
+			                          returning->cont->Definition(), spv::LoopControlMaskNone);
+			state.builder.AddFunction(spv::OpBranch, guard);
+			EmitLabel(state, guard);
+			state.builder.AddFunction(spv::OpSelectionMerge, stay, spv::SelectionControlMaskNone);
+			state.builder.AddFunction(spv::OpBranchConditional, under, stay, ending);
+			EmitLabel(state, ending);
+			state.builder.AddFunction(spv::OpReturn);
+			EmitLabel(state, stay);
+			state.builder.AddFunction(spv::OpBranch, block->terminator.true_block->Definition());
+			structured.block_exit_labels[block] = stay;
+			continue;
+		}
+		LoopWatchdog* latch = nullptr;
+		for (auto& watchdog: watchdogs) {
+			if (watchdog.cont == block) {
+				latch = &watchdog;
+			}
+		}
+		if (latch == nullptr) {
+			EmitStructuredTerminator(ctx, block);
+			continue;
+		}
+		auto&       state = ctx.state;
+		const auto& term  = block->terminator;
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), latch->next, latch->counter, ConstantU32(state, 1u));
+		const auto under = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), under, latch->next,
+		                          ConstantU32(state, LoopWatchdogLimit));
+		const auto* header = latch->header;
+		const auto* merge  = latch->merge;
+		if (latch->exit_return) {
+			state.builder.AddFunction(spv::OpBranch, header->Definition());
+			continue;
+		}
+		if (term.kind == CFG::TerminatorKind::Branch) {
+
+			// One undefined value per phi type of the merge block, for the new edge.
+			for (const auto& inst: *merge) {
+				if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
+					break;
+				}
+				const auto type = TypeId(state, inst.GetType());
+				if (type != 0 && !latch->undefs.contains(type)) {
+					const auto undef = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpUndef, type, undef);
+					latch->undefs.emplace(type, undef);
+				}
+			}
+			state.builder.AddFunction(spv::OpBranchConditional, under, header->Definition(), merge->Definition());
+			continue;
+		}
+		const auto* true_block  = term.true_block;
+		const auto* false_block = term.false_block;
+		const auto  condition   = ctx.Def(block->condition);
+		const auto  guarded     = state.builder.AllocateId();
+		if (true_block == header) {
+			// Stay only while the loop wants to and the budget lasts.
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), guarded, condition, under);
+		} else {
+			const auto over = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), over, under);
+			state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), guarded, condition, over);
+		}
+		const auto* exit_block = true_block == header ? false_block : true_block;
+		if (exit_block != merge) {
+			// The loop leaves elsewhere; keep the original branch (the counter still runs).
+			state.builder.AddFunction(spv::OpBranchConditional, condition, true_block->Definition(),
+			                          false_block->Definition());
+			continue;
+		}
+		state.builder.AddFunction(spv::OpBranchConditional, guarded, true_block->Definition(), false_block->Definition());
+	}
+	for (const auto& watchdog: watchdogs) {
+		if (!watchdog.has_phi) {
+			continue;
+		}
+		size_t                        operand = 0;
+		std::vector<const IR::Block*> preds;
+		for (const auto* pred: watchdog.header->ImmPredecessors()) {
+			if (std::ranges::find(preds, pred) != preds.end()) {
+				continue;
+			}
+			preds.push_back(pred);
+			const auto found = structured.block_exit_labels.find(pred);
+			if (found == structured.block_exit_labels.end()) {
+				continue;
+			}
+			ctx.state.builder.PatchDeferredPhi(
+			    watchdog.phi, operand++, pred == watchdog.cont ? watchdog.next : ConstantU32(ctx.state, 0u),
+			    found->second);
+		}
+	}
+	for (const auto& extra: extra_incomings) {
+		const LoopWatchdog* owner = nullptr;
+		for (const auto& watchdog: watchdogs) {
+			if (watchdog.cont == extra.latch) {
+				owner = &watchdog;
+			}
+		}
+		const auto label = structured.block_exit_labels.find(extra.latch);
+		if (owner == nullptr || label == structured.block_exit_labels.end() || !owner->undefs.contains(extra.type)) {
+			EXIT("loop watchdog: merge-block phi has no latch value");
+		}
+		ctx.state.builder.PatchDeferredPhi(extra.phi, extra.slot, owner->undefs.at(extra.type), label->second);
 	}
 	PatchStructuredPhis(ctx, structured);
 }

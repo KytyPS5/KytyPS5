@@ -39,6 +39,14 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
+		// A null-based pointer from the guest's tables (an unused resource) can never be guest
+		// memory: read zeros, which decode as a null descriptor, instead of faulting.
+		constexpr uint64_t no_guest_memory_below = 0x10000ull;
+		if (address < no_guest_memory_below) {
+			std::fill(values.begin(), values.end(), 0u);
+			capture.m_ranges.emplace_back(address, values.size_bytes());
+			return true;
+		}
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());

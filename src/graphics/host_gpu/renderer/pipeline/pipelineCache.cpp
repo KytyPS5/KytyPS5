@@ -44,6 +44,13 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
+// After a pipeline that took this long to create, the driver cache is written sooner, but no more
+// often than SlowCreationSaveInterval: the whole cache is written each time (hundreds of MB for some
+// games), and with cold caches (a manifest replayed while the game loads) nearly every creation is
+// slow.
+constexpr auto SlowCreation             = std::chrono::seconds {5};
+constexpr auto SlowCreationSaveInterval = std::chrono::seconds {20};
+constexpr auto DriverCacheTimerPeriod   = std::chrono::milliseconds {250};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -567,15 +574,42 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	// The pipelines created last are written although no other creation follows to find the
+	// cache due.
+	m_driver_cache_posted = std::chrono::steady_clock::now();
+	m_driver_cache_timer = std::jthread([this](const std::stop_token& stop) {
+		while (!stop.stop_requested()) {
+			std::this_thread::sleep_for(DriverCacheTimerPeriod);
+			std::lock_guard lock(m_driver_cache_mutex);
+			PostDueDriverCache();
+		}
+	});
 }
 
-void PipelineCache::CheckpointDriverCache() {
+void PipelineCache::CheckpointDriverCache(bool slow_creation) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	std::lock_guard lock(m_driver_cache_mutex);
 	m_driver_cache_dirty = true;
+	if (slow_creation) {
+		m_next_driver_cache_save = std::min(m_next_driver_cache_save,
+		                                    m_driver_cache_posted + SlowCreationSaveInterval);
+	}
+	PostDueDriverCache();
+}
+
+void PipelineCache::NoteCreatedPipeline(std::chrono::steady_clock::time_point started) {
+	CheckpointDriverCache(std::chrono::steady_clock::now() - started >= SlowCreation);
+}
+
+void PipelineCache::PostDueDriverCache() {
+	if (!m_driver_cache_dirty) {
+		return;
+	}
 	if (const auto now = std::chrono::steady_clock::now(); now >= m_next_driver_cache_save) {
 		m_driver_cache_dirty     = false;
+		m_driver_cache_posted    = now;
 		m_next_driver_cache_save = now + DriverCacheSaveInterval;
 		// The cache object is internally synchronized, so pipelines may be created meanwhile.
 		m_store.Post([this] { WriteDriverCache(); });
@@ -583,9 +617,14 @@ void PipelineCache::CheckpointDriverCache() {
 }
 
 void PipelineCache::Save() {
+	m_driver_cache_timer = {};
 	m_store.Finish();
-	if (m_driver_cache_dirty) {
-		m_driver_cache_dirty = false;
+	bool dirty = false;
+	{
+		std::lock_guard lock(m_driver_cache_mutex);
+		dirty = std::exchange(m_driver_cache_dirty, false);
+	}
+	if (dirty) {
 		WriteDriverCache();
 	}
 }
@@ -1071,6 +1110,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
+	const auto started = std::chrono::steady_clock::now();
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -1078,7 +1118,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
 	StorePipeline(key);
-	CheckpointDriverCache();
+	NoteCreatedPipeline(started);
 
 	return pipeline;
 }
@@ -1098,13 +1138,14 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
+	const auto started = std::chrono::steady_clock::now();
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}
-	CheckpointDriverCache();
+	NoteCreatedPipeline(started);
 
 	return pipeline;
 }

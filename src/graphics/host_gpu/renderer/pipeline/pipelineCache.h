@@ -255,13 +255,19 @@ private:
 	ProgramKey                             m_lookup_key;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	// Guards the driver cache state below, which the timer thread also reads.
+	std::mutex                    m_driver_cache_mutex;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
+	// When the store thread was last given the driver cache to write.
+	std::chrono::steady_clock::time_point m_driver_cache_posted;
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
+	// Checks every quarter second whether the driver cache is due; stopped by Save().
+	std::jthread      m_driver_cache_timer;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -271,8 +277,14 @@ private:
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
 	void InitializeDriverCache();
-	// Marks the driver cache changed and, once per interval, has the store thread write it.
-	void CheckpointDriverCache();
+	// Marks the driver cache changed and, once per interval, has the store thread write it; sooner
+	// after a slow creation.
+	void CheckpointDriverCache(bool slow_creation = false);
+	// Checkpoints the driver cache after a pipeline whose creation began at `started`.
+	void NoteCreatedPipeline(std::chrono::steady_clock::time_point started);
+	// Has the store thread write the driver cache if it changed and is due. The caller holds
+	// m_driver_cache_mutex.
+	void PostDueDriverCache();
 	void WriteDriverCache() const;
 
 	// pipelineSerialization.cpp

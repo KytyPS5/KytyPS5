@@ -676,6 +676,8 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	DefineGetBdaPointer(state);
+	DefineLoadBdaDword(state);
+	DefineIndirectBufferBounds(state);
 	DefineIndirectBufferLoads(ctx);
 	DefineIndirectBufferFormats(ctx);
 	DefineBvhIntersect(state);

@@ -828,6 +828,10 @@ void DefineModule(EmitterState& state) {
 		// FP64 denormal preservation is temporarily disabled.
 		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
 		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
+		// RoundingModeRTE is not declared. Round-to-nearest-even is what every Vulkan device
+		// does for FP32 arithmetic anyway, so the declaration adds nothing -- and the NVIDIA
+		// compiler never returns from vkCreateComputePipelines for a large compute module that
+		// carries it.
 	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.program.info.compute_derivatives ? 2u : 1u;

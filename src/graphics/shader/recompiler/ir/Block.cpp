@@ -20,7 +20,10 @@ Inst& Block::AppendNewInst(ValueOpcode opcode, std::initializer_list<Value> args
 Block::iterator Block::PrependNewInst(iterator insertion_point, ValueOpcode opcode,
                                       std::initializer_list<Value> args, uint64_t flags) {
 	const auto expected = NumArgsOf(opcode);
-	EXIT_IF(expected != std::numeric_limits<size_t>::max() && expected != args.size());
+	if (expected != std::numeric_limits<size_t>::max() && expected != args.size()) {
+		EXIT("IR instruction %s takes %zu arguments, %zu were given\n", ValueOpcodeName(opcode),
+		     static_cast<size_t>(expected), static_cast<size_t>(args.size()));
+	}
 	const auto inst = instructions.emplace(insertion_point, opcode, flags);
 	inst->SetParent(this);
 	size_t index = 0;

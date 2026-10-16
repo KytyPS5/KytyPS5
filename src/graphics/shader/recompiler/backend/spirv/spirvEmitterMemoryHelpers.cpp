@@ -515,6 +515,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicIAdd32:
 		case IR::ValueOpcode::ImageAtomicIAdd64:
 		case IR::ValueOpcode::BufferAtomicIAdd32:
+		case IR::ValueOpcode::BufferAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:

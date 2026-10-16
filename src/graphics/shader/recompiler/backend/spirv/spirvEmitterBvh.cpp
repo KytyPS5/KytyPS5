@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/RtFeedback.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -322,6 +323,25 @@ void DefineBvhIntersect(EmitterState& s) {
 	});
 	s.builder.AddFunction(spv::OpReturnValue, result);
 	s.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+// RtFeedback.h: an active lane stores 1 to usage[slot][byte offset >> 2] in the host-visible feedback buffer. The buffer
+// is addressed by its device address directly (it is host memory, not guest memory).
+void EmitRtFeedbackLog(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& s       = ctx.state;
+	const auto address = RtFeedback::GetBuffer().device_address.load();
+	if (address == 0u || !inst.Arg(0).IsImmediate()) return;
+	const auto slot_base = address + uint64_t {inst.Arg(0).U32()} * RtFeedback::RegionDwords * sizeof(uint32_t);
+	const auto then_label = s.builder.AllocateId(), merge_label = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	s.builder.AddFunction(spv::OpBranchConditional, ctx.Arg(inst, 2), then_label, merge_label);
+	EmitLabel(s, then_label);
+	const auto offset  = Unary(s, spv::OpUConvert, TypeU64(s), ctx.Arg(inst, 1));
+	const auto pointer = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s),
+	                           Binary(s, spv::OpIAdd, TypeU64(s), ConstantU64(s, slot_base), offset));
+	s.builder.AddFunction(spv::OpStore, pointer, ConstantU32(s, 1u), spv::MemoryAccessAlignedMask, 4u);
+	s.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(s, merge_label);
 }
 
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {

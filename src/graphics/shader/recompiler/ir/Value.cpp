@@ -213,6 +213,7 @@ void Inst::SetParent(Block* block) {
 
 void Inst::SetArg(size_t index, Value value) {
 	const auto old = Arg(index);
+	if (old == value) return;
 	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
 		RemoveUse(old_inst, index);
 	}
@@ -239,8 +240,8 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
 	const auto old_uses = uses;
-	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
+	for (auto use = old_uses.rbegin(); use != old_uses.rend(); ++use) {
+		use->user->SetArg(use->operand, replacement);
 	}
 	Invalidate();
 	if (preserve) {
@@ -256,13 +257,18 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found != used->uses.end());
+	// SetArg removes the previous edge before adding a different one, and
+	// AddPhiOperand always appends a new operand index. Neither can duplicate
+	// an edge. ValidateProgram checks reverse-edge uniqueness in one pass.
+	EXIT_IF(Arg(operand).TryInstruction() != used);
 	used->uses.push_back({this, operand});
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {
+	if (!used->uses.empty() && used->uses.back().user == this && used->uses.back().operand == operand) {
+		used->uses.pop_back();
+		return;
+	}
 	const auto found = std::ranges::find_if(
 	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
 	EXIT_IF(found == used->uses.end());

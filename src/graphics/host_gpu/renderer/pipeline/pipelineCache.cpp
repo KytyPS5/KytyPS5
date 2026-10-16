@@ -15,6 +15,8 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/RtFeedback.h"
+#include <set>
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -24,6 +26,11 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <functional>
+#include <semaphore>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -37,9 +44,17 @@
 
 namespace Libs::Graphics {
 
+
+
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+
+// Compiles of ray tracing kernels that are inside the driver right now.
+std::atomic<int> g_active_rt_compiles {0};
+// Kernels asked for so far and finished: the progress the log shows while the game waits for them.
+std::atomic<int> g_rt_requested {0};
+std::atomic<int> g_rt_finished {0};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -216,10 +231,13 @@ struct PipelineCache::ProgramCache {
 		uint64_t              hash            = 0;
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
+		// Ray tracing kernels called through different tables are different programs (see FindProgram).
+		uint32_t              variant         = 0;
 		std::vector<uint32_t> static_state;
 
 		bool operator==(const ProgramKey&) const = default;
 	};
+
 
 	struct Permutation {
 		std::vector<uint32_t>                       function_code;
@@ -270,6 +288,9 @@ struct PipelineCache::ProgramCache {
 
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
+		std::vector<ShaderRecompiler::CallInputRead> call_inputs;
+		std::vector<ShaderRecompiler::RtFeedbackSite> rt_sites;
+		std::chrono::steady_clock::time_point         translated_at {};
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
@@ -284,9 +305,12 @@ struct PipelineCache::ProgramCache {
 			}
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
+			PipelineKeyHash::Mix(hash, key.variant);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
-			// Bucket same-shape static variants by source. ProgramKey equality performs the one
-			// exact state comparison needed on a stable hit without hashing the full state first.
+			// The static state is hashed too: without it every static variant of a shader shares one bucket and
+			// each lookup compares the full state of all of them (measured ~17 us per program lookup).
+			PipelineKeyHash::Mix(hash, static_cast<std::size_t>(
+			                               XXH3_64bits(key.static_state.data(), key.static_state.size() * sizeof(uint32_t))));
 			return hash;
 		}
 	};
@@ -342,15 +366,172 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (needs_group_z.contains(lookup_key)) {
+				input_info.needs_group_z = true;
+				return ShaderProgram {};
+			}
+			if (uses_function_calls.contains(lookup_key)) {
+				input_info.uses_function_calls = true;
+				return ShaderProgram {};
+			}
+			if (const auto passes = needs_call_passes.find(lookup_key); passes != needs_call_passes.end()) {
+				input_info.needs_call_passes = passes->second;
+				return ShaderProgram {};
+			}
+		}
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
+		}
+		// A kernel retranslated for new call-table records keeps running its previous program until the pipeline of the
+		// new one is compiled: the compile of a ray tracing kernel takes minutes, and holding the game for it is a freeze.
+		// What the old program has not inlined yet takes the same path it did before the retranslation.
+		const auto settle = [&](const ShaderProgram& handle) -> ShaderProgram {
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				const auto old = retired.find(lookup_key);
+				if (old == retired.end()) return handle;
+				if (pipeline_ready(handle.id)) {
+					retired.erase(old);
+					return handle;
+				}
+				auto& source = old->second;
+				uint32_t cursor = 0u;
+				Permutation* fallback = nullptr;
+				if (source.call_source) {
+					source.RefreshCallSource(runtime);
+					fallback = source.FindPermutation<true>(runtime, cursor);
+				} else {
+					fallback = source.FindPermutation<false>(runtime, cursor);
+				}
+				if (fallback == nullptr || !pipeline_ready(fallback->handle.id)) return handle;
+				start_compile(input_info, handle);
+				input_info.stage = {.program = &fallback->program, .resources = &source.resources};
+				push_data_cursor = cursor;
+				fallback->program.bindings.AdvancePushData(push_data_cursor);
+				return fallback->handle;
+			} else {
+				return handle;
+			}
+		};
+		// A ray tracing kernel inlines the functions of its call table. The same kernel is dispatched with different
+		// tables (one per ray tracing pass), so each table gets its own program: a variant of the same key. A dispatch
+		// uses the first variant whose table matches; a table nothing matches is translated as a new variant.
+		enum class Match { Same, OtherTable, MoreRecords };
+		std::string mismatch_note;
+		const auto classify = [&](const SourceEntry& source) {
+			for (const auto& input: source.call_inputs) {
+				std::vector<uint32_t> words(input.words.size());
+				if ((input.relative_to_srt || input.table_vsharp_srt_offset != UINT32_MAX) && user_data.size() < 2u)
+					return Match::OtherTable;
+				const uint64_t srt_base = user_data.size() >= 2u ? user_data[0] | (uint64_t(user_data[1]) << 32u) : 0u;
+				uint64_t       address  = input.relative_to_srt ? srt_base + input.address : input.address;
+				if (input.table_vsharp_srt_offset != UINT32_MAX) {
+					std::vector<uint32_t> vsharp(4u);
+					if (!ReadShaderGuestMemory(nullptr, srt_base + input.table_vsharp_srt_offset, vsharp))
+						return Match::OtherTable;
+					address = (vsharp[0] | (uint64_t(vsharp[1] & 0xffffu) << 32u)) + input.address;
+				}
+				if (!ReadShaderGuestMemory(nullptr, address, words) || words != input.words) {
+					char note[200];
+					std::snprintf(note, sizeof(note), "input #%zu at 0x%llx table=%d expected %08x %08x got %08x %08x",
+					              static_cast<size_t>(&input - source.call_inputs.data()), static_cast<unsigned long long>(address),
+					              input.table_vsharp_srt_offset != UINT32_MAX ? 1 : 0, input.words.empty() ? 0u : input.words[0],
+					              input.words.size() > 1 ? input.words[1] : 0u, words.empty() ? 0u : words[0],
+					              words.size() > 1 ? words[1] : 0u);
+					mismatch_note = note;
+					return Match::OtherTable;
+				}
+			}
+			bool grown = false;
+			for (const auto& site: source.rt_sites) {
+				// Scanning a site's feedback region (4096 flags) on every dispatch of every variant cost most of the program
+				// lookup time; growth is batched over seconds anyway, so a site is looked at no more than every 100 ms.
+				static std::array<std::chrono::steady_clock::time_point, ShaderRecompiler::RtFeedback::RegionCount> last_scan {};
+				const auto scan_now = std::chrono::steady_clock::now();
+				if (site.slot < last_scan.size()) {
+					if (scan_now - last_scan[site.slot] < std::chrono::milliseconds(100)) continue;
+					last_scan[site.slot] = scan_now;
+				}
+				if (site.shared) {
+					// Shared-body sites inline one copy per function. A logged record is a call that found no copy:
+					// the function its record holds now joins the learned set (it survives restarts), and the
+					// program grows once a learned function is not inlined.
+					const auto logged = ShaderRecompiler::RtFeedback::DrainLogged(site.slot);
+					if (!logged.empty() && user_data.size() >= 2u) {
+						const uint64_t srt_base = user_data[0] | (uint64_t(user_data[1]) << 32u);
+						std::vector<uint32_t> vsharp(4u);
+						if (ReadShaderGuestMemory(nullptr, srt_base + site.table_srt_offset, vsharp)) {
+							const uint64_t base  = vsharp[0] | (uint64_t(vsharp[1] & 0xffffu) << 32u);
+							const uint32_t count = std::min<uint32_t>(vsharp[2], 4096u);
+							std::vector<uint32_t> table(size_t {count} * 4u);
+							if (count != 0u && ReadShaderGuestMemory(nullptr, base, table)) {
+								for (const auto index: logged) {
+									if (index < count)
+										ShaderRecompiler::RtFeedback::AddLearnedFunction(site.site_hash, site.pc, table[index * 4u]);
+								}
+							}
+						}
+					}
+					for (const auto low: ShaderRecompiler::RtFeedback::LearnedFunctions(site.site_hash, site.pc)) {
+						if (site.group_count != 0u && ShaderRecompiler::CallGroupOf(low, site.group_count) != site.group_pass) continue;
+						if (!std::ranges::binary_search(site.functions, low)) grown = true;
+					}
+					continue;
+				}
+				for (const auto index: ShaderRecompiler::RtFeedback::UsedRecords(site.slot)) {
+					if (!std::ranges::binary_search(site.records, index)) grown = true;
+				}
+			}
+			// Batch the growth: at most one retranslation per few seconds, so a scene that reveals its materials
+			// over several frames does not trigger a compile for every one of them.
+			if (grown && std::chrono::steady_clock::now() - source.translated_at >= std::chrono::seconds(5))
+				return Match::MoreRecords;
+			return Match::Same;
+		};
+		constexpr uint32_t MaxVariants = 16u;
+		lookup_key.variant = 0u;
+		auto entry = programs.find(lookup_key);
+		while (entry != programs.end() &&
+		       (!entry->second.call_inputs.empty() || !entry->second.rt_sites.empty())) {
+			const auto match = classify(entry->second);
+			if (match == Match::Same) break;
+			if (match == Match::MoreRecords) {
+				for (const auto& old_permutation: entry->second.permutations) {
+					ShaderRecompiler::RtFeedback::MarkSuperseded(old_permutation.handle.id);
+				}
+				std::fprintf(stderr, "RT calls: new call-table records used; retranslating hash=0x%llx variant %u\n",
+				             static_cast<unsigned long long>(params.hash), lookup_key.variant);
+				// The program that was running stays available as the fallback until the new one is compiled. A fallback
+				// that was itself still waiting for its pipeline is not worth keeping: the older one stays.
+				if (auto kept = retired.find(lookup_key); kept == retired.end() || !pipeline_ready(kept->second.permutations.back().handle.id)) {
+					if (kept != retired.end()) retired.erase(kept);
+					retired.emplace(lookup_key, std::move(entry->second));
+				}
+				programs.erase(entry);
+				entry = programs.end();
+				break;
+			}
+			if (lookup_key.variant + 1u >= MaxVariants) {
+				// Too many tables for this kernel: reuse the first variant's slot.
+				lookup_key.variant = 0u;
+				programs.erase(programs.find(lookup_key));
+				entry = programs.end();
+				break;
+			}
+			{
+				static std::atomic<uint32_t> variant_reports {0};
+				if (variant_reports.fetch_add(1) < 40u)
+					std::fprintf(stderr, "RT calls: variant %u does not match (%s)\n", lookup_key.variant, mismatch_note.c_str());
+			}
+			lookup_key.variant++;
+			entry = programs.find(lookup_key);
 		}
 		bool source_changed = false;
 		if (entry != programs.end()) {
@@ -365,7 +546,7 @@ struct PipelineCache::ProgramCache {
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
-				return permutation->handle;
+				return settle(permutation->handle);
 			}
 		}
 
@@ -400,6 +581,8 @@ struct PipelineCache::ProgramCache {
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		// A cached program translated again (for another specialization) keeps its inlined call targets.
+		if (entry != programs.end() && !entry->second.rt_sites.empty()) options.fixed_sites = &entry->second.rt_sites;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -427,10 +610,43 @@ struct PipelineCache::ProgramCache {
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (translated.needs_group_z) {
+				lookup_key.variant = 0u;
+				needs_group_z.insert(lookup_key);
+				input_info.needs_group_z = true;
+				LOGF("ProgramCache: compute hash=0x%016" PRIx64
+				     " selects descriptors by workgroup z, compiled per z slice\n",
+				     params.hash);
+				return ShaderProgram {};
+			}
+			if (translated.needs_call_passes != 0u) {
+				lookup_key.variant = 0u;
+				needs_call_passes[lookup_key] = translated.needs_call_passes;
+				input_info.needs_call_passes  = translated.needs_call_passes;
+				LOGF("ProgramCache: compute hash=0x%016" PRIx64 " calls a function table, dispatched in %u groups\n",
+				     params.hash, translated.needs_call_passes);
+				return ShaderProgram {};
+			}
+			if (translated.uses_function_calls) {
+				lookup_key.variant = 0u;
+				uses_function_calls.insert(lookup_key);
+				input_info.uses_function_calls = true;
+				LOGF("ProgramCache: compute hash=0x%016" PRIx64
+				     " calls functions (ray tracing shader, not supported yet), its dispatches are not run\n",
+				     params.hash);
+				return ShaderProgram {};
+			}
+		} else {
+			EXIT_IF(translated.uses_function_calls);
+		}
 		if (entry == programs.end()) {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+			entry->second.call_inputs = translated.call_inputs;
+			entry->second.rt_sites      = translated.rt_sites;
+			entry->second.translated_at = std::chrono::steady_clock::now();
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
@@ -439,7 +655,7 @@ struct PipelineCache::ProgramCache {
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
-				return permutation->handle;
+				return settle(permutation->handle);
 			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
@@ -462,7 +678,7 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::Local)],
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-		return permutation.handle;
+		return settle(permutation.handle);
 	}
 
 	explicit ProgramCache(GraphicContext& graphics): graphics(graphics) {
@@ -478,6 +694,13 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	// Programs replaced by a retranslation whose successor has no pipeline yet (see settle in Get).
+	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> retired;
+	std::function<bool(uint64_t)>                               pipeline_ready;
+	std::function<void(const ShaderComputeInputInfo&, const ShaderProgram&)> start_compile;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              needs_group_z;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              uses_function_calls;
+	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash>    needs_call_passes;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
 	uint64_t                                                    next_shader_id = 0;
@@ -487,11 +710,29 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_program_cache->pipeline_ready = [this](uint64_t id) { return ComputePipelineReady(id); };
+	m_program_cache->start_compile  = [this](const ShaderComputeInputInfo& input_info, const ShaderProgram& program) {
+		StartAsyncCompute(input_info, program);
+	};
 	InitializeDriverCache();
 }
 
+struct PipelineCache::AsyncCompute {
+	ShaderRecompiler::IR::CompiledShaderInfo program;
+	ShaderComputeInputInfo                   input;
+	std::unique_ptr<Pipeline>                pipeline;
+	std::atomic<bool>                        ready {false};
+};
+
 PipelineCache::~PipelineCache() {
 	Save();
+	if (std::ranges::any_of(m_async_compute, [](const auto& job) { return !job.second->ready.load(); })) {
+		// A driver compile that cannot be cancelled is still running on a worker thread; destroying the device
+		// under it would crash, so the process ends here.
+		std::fprintf(stderr, "RT calls: a pipeline is still compiling at shutdown, ending the process\n");
+		std::fflush(nullptr);
+		std::_Exit(0);
+	}
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -1005,6 +1246,103 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	CheckpointDriverCache();
 
 	return *iter->second;
+}
+
+
+PipelineCache::Pipeline*
+PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&          compute_program) {
+	EXIT_IF(!compute_program);
+	if (auto iter = m_compute_pipelines.find(compute_program.id); iter != m_compute_pipelines.end()) {
+		return iter->second.get();
+	}
+	const bool async = Config::RaytracingEnabled() && input_info.stage.program != nullptr &&
+	                   input_info.stage.program->rt_expanded_calls;
+	if (!async) {
+		return &GetComputePipeline(input_info, compute_program);
+	}
+	if (!m_async_compute.contains(compute_program.id)) {
+		StartAsyncCompute(input_info, compute_program);
+		// The request only starts the compile: the rest of the frame then starts the compiles of every other
+		// kernel too, and they all run in parallel.
+		return nullptr;
+	}
+	auto& slot = m_async_compute[compute_program.id];
+	// The next request waits for the compile: a skipped call-group dispatch leaves its part of the image unlit
+	// (the reflections), so the game holds until the kernels it dispatches exist.
+	return TakeAsyncCompute(compute_program.id, slot);
+}
+
+bool PipelineCache::ComputePipelineReady(uint64_t program_id) const {
+	if (m_compute_pipelines.contains(program_id)) return true;
+	const auto it = m_async_compute.find(program_id);
+	return it != m_async_compute.end() && it->second->ready.load() && it->second->pipeline != nullptr;
+}
+
+void PipelineCache::StartAsyncCompute(const ShaderComputeInputInfo& input_info, const ShaderProgram& compute_program) {
+	auto& slot = m_async_compute[compute_program.id];
+	if (!slot) {
+		slot                      = std::make_shared<AsyncCompute>();
+		slot->program             = *input_info.stage.program;
+		slot->input               = input_info;
+		slot->input.stage.program = &slot->program;
+		g_rt_requested.fetch_add(1);
+		std::thread([job = slot, module = compute_program.module, cache = m_driver_cache,
+		             graphics = &m_graphics, program_id = compute_program.id] {
+			// Twelve driver compiles at once by default (KYTY_RT_COMPILE_SLOTS=1..16 changes it): each holds gigabytes
+			// while it runs (16 peaked at about 16 GB), so low-memory machines should lower it.
+			static const auto slots = [] {
+				const char* value = std::getenv("KYTY_RT_COMPILE_SLOTS");
+				return value != nullptr ? std::clamp(std::atoi(value), 1, 16) : 12;
+			}();
+			static std::counting_semaphore<16> compile_slots(slots);
+			compile_slots.acquire();
+			const auto compile_begin = std::chrono::steady_clock::now();
+			g_active_rt_compiles.fetch_add(1);
+			if (ShaderRecompiler::RtFeedback::IsSuperseded(program_id)) {
+				// The used set grew while this waited: a newer program replaced it.
+				std::fprintf(stderr, "RT calls: dropping the compile of superseded pipeline %llu\n",
+				             static_cast<unsigned long long>(program_id));
+				g_rt_finished.fetch_add(1);
+				g_active_rt_compiles.fetch_sub(1);
+				job->ready.store(true);
+				compile_slots.release();
+				return;
+			}
+			auto pipeline = std::make_unique<Pipeline>();
+			CreatePipelineInternal(*graphics, *pipeline, job->input, module, cache);
+			const int finished = g_rt_finished.fetch_add(1) + 1;
+			std::fprintf(stderr, "RT calls: compiled pipeline %d of %d requested so far (this one took %lld s)\n",
+			             finished, g_rt_requested.load(), static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(
+			                 std::chrono::steady_clock::now() - compile_begin).count()));
+			job->pipeline = std::move(pipeline);
+			g_active_rt_compiles.fetch_sub(1);
+			job->ready.store(true);
+			compile_slots.release();
+		}).detach();
+	}
+}
+
+PipelineCache::Pipeline* PipelineCache::TakeAsyncCompute(uint64_t program_id, std::shared_ptr<AsyncCompute>& slot) {
+	while (!slot->ready.load()) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	if (slot->pipeline == nullptr) {
+		return nullptr;
+	}
+	auto [iter, inserted] = m_compute_pipelines.emplace(program_id, std::move(slot->pipeline));
+	EXIT_IF(!inserted);
+	m_async_compute.erase(program_id);
+	// A compile of one of these kernels takes minutes. Write the driver cache out as they finish (not more than
+	// once in 30 s), so that a run that ends badly does not lose them.
+	// Never while another compile is inside the driver: reading the cache back during a compile crashed it.
+	static auto last_save = std::chrono::steady_clock::time_point {};
+	if (const auto now = std::chrono::steady_clock::now();
+	    now - last_save >= std::chrono::seconds(30) && g_active_rt_compiles.load() == 0) {
+		last_save = now;
+		Save();
+	}
+	return iter->second.get();
 }
 
 PipelineCache::Pipeline&

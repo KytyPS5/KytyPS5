@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <unordered_set>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -38,6 +39,7 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -221,9 +223,39 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+// Some shaders select their image/buffer descriptors by the workgroup's z index, which the host
+// cannot know when it resolves descriptors once per dispatch. Such a dispatch is issued as one
+// dispatch per z slice, each compiled with that slice index folded in.
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	bool want_slices = false;
+	uint32_t want_passes = 0;
+	DispatchDirectSlice(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+	                    UINT32_MAX, &want_slices, UINT32_MAX, &want_passes, async_compute);
+	// A kernel that calls a table of functions runs once per group of those functions.
+		for (uint32_t pass = 0; pass < want_passes; ++pass) {
+		DispatchDirectSlice(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+		                    UINT32_MAX, nullptr, pass, nullptr, async_compute);
+	}
+	if (want_slices) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("GraphicsRenderDispatchDirect: splitting %ux%ux%u dispatch into %u z slices\n",
+			     thread_group_x, thread_group_y, thread_group_z, thread_group_z);
+		}
+		for (uint32_t z = 0; z < thread_group_z; ++z) {
+			DispatchDirectSlice(submit_id, buffer, thread_group_x, thread_group_y, 1, mode, z,
+			                    nullptr, UINT32_MAX, nullptr, async_compute);
+		}
+	}
+}
+
+void RenderExecutor::DispatchDirectSlice(uint64_t submit_id, CommandBuffer& buffer,
+                                         uint32_t thread_group_x, uint32_t thread_group_y,
+                                         uint32_t thread_group_z, uint32_t mode,
+                                         uint32_t fixed_group_z, bool* want_slices, uint32_t call_pass,
+                                         uint32_t* want_passes, bool async_compute) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -281,6 +313,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.async_compute = async_compute;
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	input_info.fixed_group_z              = fixed_group_z;
+	input_info.call_pass                  = call_pass;
 	input_info.workgroup_counts[0] = thread_group_x;
 	input_info.workgroup_counts[1] = thread_group_y;
 	input_info.workgroup_counts[2] = thread_group_z;
@@ -295,6 +329,26 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program && input_info.uses_function_calls) {
+		ResetBindings();
+		return;
+	}
+	if (!compute_program && input_info.needs_call_passes != 0u) {
+		if (want_passes != nullptr) *want_passes = input_info.needs_call_passes;
+		ResetBindings();
+		return;
+	}
+	if (!compute_program && input_info.needs_group_z && want_slices != nullptr &&
+	    !use_thread_dimensions && thread_group_z >= 1 && thread_group_z <= 16) {
+		*want_slices = true;
+		ResetBindings();
+		return;
+	}
+	if (!compute_program) {
+		EXIT("compute shader 0x%016" PRIx64 " needs per-slice compilation that this dispatch cannot use "
+		     "(thread dimensions or more than 16 z groups)\n",
+		     sh_ctx.GetCs().cs_regs.data_addr);
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -332,9 +386,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	auto* pending_pipeline = m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pending_pipeline == nullptr) {
+		// A ray tracing kernel still compiling on a worker thread: this dispatch does not run.
+		ResetBindings();
+		return;
+	}
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = *pending_pipeline;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -456,13 +515,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
-	ShaderComputeInputInfo input_info {};
-	input_info.async_compute = async_compute;
-	input_info.indirect_args_address = args_addr;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	const auto run = [&](ShaderComputeInputInfo& input_info, const ShaderProgram& compute_program) {
+	auto* pending_pipeline =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pending_pipeline == nullptr) {
+		ResetBindings();
+		return;
+	}
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = *pending_pipeline;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
@@ -502,6 +563,43 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	};
+	ShaderComputeInputInfo input_info {};
+	input_info.async_compute = async_compute;
+	input_info.indirect_args_address = args_addr;
+	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (!compute_program && input_info.needs_call_passes != 0u) {
+		// A kernel that calls a table of functions runs once per group of those functions, as in DispatchDirect.
+		const uint32_t passes = input_info.needs_call_passes;
+		static std::unordered_set<uint64_t> logged;
+		if (logged.insert(cs_regs.cs_regs.data_addr).second) {
+			std::fprintf(stderr, "RT calls: indirect dispatch of a call-table kernel at 0x%llx runs in %u groups%c",
+			             static_cast<unsigned long long>(cs_regs.cs_regs.data_addr), passes, 10);
+		}
+		const auto program_for = [&](uint32_t pass, ShaderComputeInputInfo& info) {
+			info               = {};
+			info.async_compute = async_compute;
+			info.indirect_args_address = args_addr;
+			info.call_pass     = pass;
+			return m_context.GetPipelineCache().GetComputeProgram(cs_regs, buffer.GetRegisters().GetShaderRegisters(),
+			                                                      info);
+		};
+		for (uint32_t pass = 0; pass < passes; ++pass) {
+			ShaderComputeInputInfo info {};
+			if (const auto program = program_for(pass, info)) {
+				run(info, program);
+			}
+		}
+		ResetBindings();
+		return;
+	}
+	if (!compute_program && (input_info.uses_function_calls || input_info.needs_call_passes != 0u)) {
+		ResetBindings();
+		return;
+	}
+	EXIT_IF(!compute_program);
+	run(input_info, compute_program);
 }
 
 } // namespace Libs::Graphics

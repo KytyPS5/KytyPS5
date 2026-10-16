@@ -286,6 +286,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.amd_cpu_enabled) {
 		args << "--amd-cpu";
 	}
+	if (info.raytracing_enabled) {
+		args << "--raytracing";
+	}
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {
 		args << "--redzone";

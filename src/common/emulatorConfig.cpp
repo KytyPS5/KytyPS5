@@ -180,6 +180,10 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
+bool RaytracingEnabled() {
+	return g_config->raytracing_enabled;
+}
+
 bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }

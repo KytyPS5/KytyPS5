@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/RtFeedback.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -73,6 +74,11 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_CMP_EQ_U32:
 		case O::S_CMP_EQ_I32:
+			if (inst.src0.kind == Decoder::OperandKind::LiteralConstant &&
+			    (inst.src0.value & RtFeedback::LogMask) == RtFeedback::LogMagic) {
+				// The ray tracing call-table feedback marker (RtFeedback.h); the compare below is harmless.
+				RtRecordLog(inst);
+			}
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual32, IR::Type::U32, true, false);
 			return;
 		case O::S_CMP_LG_U32:

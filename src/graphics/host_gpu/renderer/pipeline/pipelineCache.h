@@ -141,6 +141,10 @@ public:
 	                              const GraphicsPrograms& programs);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// Like GetComputePipeline, but a ray tracing kernel is compiled on a worker thread (the driver can take
+	// minutes to hours on one) and null is returned until it is ready; the caller skips the dispatch.
+	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                const ShaderProgram&          compute_program);
 
 private:
 	struct ProgramCache;
@@ -179,6 +183,12 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	struct AsyncCompute;
+	// True when the pipeline of the program can be used without waiting.
+	bool ComputePipelineReady(uint64_t program_id) const;
+	void StartAsyncCompute(const ShaderComputeInputInfo& input_info, const ShaderProgram& compute_program);
+	Pipeline* TakeAsyncCompute(uint64_t program_id, std::shared_ptr<AsyncCompute>& slot);
+	std::unordered_map<uint64_t, std::shared_ptr<AsyncCompute>> m_async_compute;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();

@@ -148,6 +148,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
 	    .has_address_writes = has_address_writes,
+	    .rt_expanded_calls  = gpu_selected_call_payloads,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};
@@ -175,6 +176,37 @@ bool EquivalentSelectorDomain(const ResourcePlan& program,
 }
 
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
+	value            = value.Resolve();
+	const auto* root = value.TryInstruction();
+	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+		return value;
+	}
+	Value                           invariant;
+	std::vector<Value>              pending {value};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		const auto current = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = current.TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+			if (!visited.insert(inst).second) {
+				continue;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				pending.push_back(inst->Arg(index));
+			}
+			continue;
+		}
+		if (invariant.IsEmpty()) {
+			invariant = current;
+		} else if (!EquivalentValue(program, invariant, current)) {
+			return {};
+		}
+	}
+	return invariant;
+}
+
+Value ResolveInvariantPhi(const Program& program, Value value) {
 	value            = value.Resolve();
 	const auto* root = value.TryInstruction();
 	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
@@ -276,6 +308,24 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		return Fail("value IR entry block has a predecessor");
 	}
 
+	const auto use_less = [](const Use& a, const Use& b) {
+		return a.user == b.user ? a.operand < b.operand : std::less<Inst*>{}(a.user, b.user);
+	};
+	std::unordered_map<const Inst*, std::vector<Use>> indexed_uses;
+	for (const auto& [inst, position]: instruction_positions) {
+		auto uses = inst->Uses();
+		std::sort(uses.begin(), uses.end(), use_less);
+		for (size_t i = 0; i < uses.size(); ++i) {
+			const auto& use = uses[i];
+			if (use.user == nullptr ||
+			    use.operand >= use.user->NumArgs() ||
+			    use.user->Arg(use.operand).TryInstruction() != inst)
+				return Fail("value IR reverse use has no matching argument");
+			if (i != 0u && uses[i - 1].user == use.user && uses[i - 1].operand == use.operand)
+				return Fail("value IR reverse use is duplicated");
+		}
+		if (uses.size() > 32u) indexed_uses.emplace(inst, std::move(uses));
+	}
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
 		const auto*                      block = program.blocks[block_index];
 		std::unordered_set<const Block*> predecessors;
@@ -479,8 +529,18 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					return Fail(fmt::format("{} has a non-buffer resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
-				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+				// --raytracing: a formatted two-to-four dword load with no data or number format in the
+				// instruction is served as raw dwords (ResourceTracking.cpp plain_formatted).
+				const auto indirect_op = inst.GetOpcode();
+				const bool plain_formatted =
+				    program.rt_plain_formatted_indirect && !memory.typed && memory.formatted &&
+				    memory.data_bits == 32u && memory.data_format == 0u && memory.number_format == 0u &&
+				    (indirect_op == ValueOpcode::LoadBufferU32x2 ||
+				     indirect_op == ValueOpcode::LoadBufferU32x3 ||
+				     indirect_op == ValueOpcode::LoadBufferU32x4);
+				if (memory.kind == ResourceKind::IndirectBuffer && !plain_formatted &&
+				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode()) &&
+				    !memory.SupportsIndirectBufferStore(inst.GetOpcode())) {
 					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
 					            "or formatted X load");
 				}
@@ -579,11 +639,14 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					return Fail("value IR argument has a foreign definition");
 				}
 				if (const auto* definition = arg.TryInstruction(); definition != nullptr) {
-					const auto& uses = definition->Uses();
-					const auto  use  = std::ranges::find_if(uses, [&](const Use& candidate) {
-						return candidate.user == &inst && candidate.operand == arg_index;
-					});
-					if (use == uses.end()) {
+					const auto indexed = indexed_uses.find(definition);
+					const bool present = indexed != indexed_uses.end()
+					    ? std::binary_search(indexed->second.begin(), indexed->second.end(),
+					                         Use {const_cast<Inst*>(&inst), arg_index}, use_less)
+					    : std::ranges::any_of(definition->Uses(), [&](const Use& candidate) {
+					        return candidate.user == &inst && candidate.operand == arg_index;
+					      });
+					if (!present) {
 						return Fail(fmt::format("{} argument {} is absent from {} reverse uses",
 						                        ValueOpcodeName(inst.GetOpcode()), arg_index,
 						                        ValueOpcodeName(definition->GetOpcode())));
@@ -614,31 +677,67 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		return Fail("value IR contains an unreachable block");
 	}
 
-	std::vector<std::vector<bool>> dominators(program.blocks.size(),
-	                                          std::vector<bool>(program.blocks.size(), true));
-	dominators.front().assign(program.blocks.size(), false);
-	dominators.front().front() = true;
-	bool changed               = true;
+	// Immediate dominators keep validation linear in graph storage. The former
+	// all-block bit matrix repeatedly intersected every candidate for each edge.
+	const auto count = program.blocks.size();
+	std::vector<size_t> rpo;
+	std::vector<bool> seen(count, false);
+	struct Cursor { size_t block; size_t successor; };
+	std::vector<Cursor> stack {{0u, 0u}};
+	seen[0] = true;
+	while (!stack.empty()) {
+		auto& cursor = stack.back();
+		const auto successors = program.blocks[cursor.block]->ImmSuccessors();
+		if (cursor.successor < successors.size()) {
+			const auto next = block_indices.at(successors[cursor.successor++]);
+			if (!seen[next]) { seen[next] = true; stack.push_back({next, 0u}); }
+		} else { rpo.push_back(cursor.block); stack.pop_back(); }
+	}
+	std::reverse(rpo.begin(), rpo.end());
+	std::vector<size_t> rank(count);
+	for (size_t i = 0; i < rpo.size(); ++i) rank[rpo[i]] = i;
+	std::vector<size_t> idom(count, SIZE_MAX);
+	idom[0] = 0;
+	const auto intersect = [&](size_t a, size_t b) {
+		while (a != b) {
+			while (rank[a] > rank[b]) a = idom[a];
+			while (rank[b] > rank[a]) b = idom[b];
+		}
+		return a;
+	};
+	bool changed = true;
 	while (changed) {
 		changed = false;
-		for (size_t block_index = 1; block_index < program.blocks.size(); block_index++) {
-			std::vector<bool> next(program.blocks.size(), true);
-			for (const auto* predecessor: program.blocks[block_index]->ImmPredecessors()) {
-				const auto predecessor_index = block_indices.at(predecessor);
-				for (size_t candidate = 0; candidate < next.size(); candidate++) {
-					next[candidate] = next[candidate] && dominators[predecessor_index][candidate];
-				}
+		for (size_t i = 1; i < rpo.size(); ++i) {
+			const auto block = rpo[i];
+			size_t next = SIZE_MAX;
+			for (const auto* predecessor: program.blocks[block]->ImmPredecessors()) {
+				const auto pred = block_indices.at(predecessor);
+				if (idom[pred] != SIZE_MAX) next = next == SIZE_MAX ? pred : intersect(next, pred);
 			}
-			next[block_index] = true;
-			if (next != dominators[block_index]) {
-				dominators[block_index] = std::move(next);
-				changed                 = true;
-			}
+			if (next != idom[block]) { idom[block] = next; changed = true; }
 		}
 	}
-
+	std::vector<std::vector<size_t>> children(count);
+	for (size_t block = 1; block < count; ++block) {
+		if (idom[block] == SIZE_MAX) return Fail("value IR block has no immediate dominator");
+		children[idom[block]].push_back(block);
+	}
+	std::vector<size_t> enter(count), leave(count);
+	size_t clock = 0;
+	stack.push_back({0u, 0u});
+	enter[0] = clock++;
+	while (!stack.empty()) {
+		auto& cursor = stack.back();
+		if (cursor.successor < children[cursor.block].size()) {
+			const auto next = children[cursor.block][cursor.successor++];
+			enter[next] = clock++;
+			stack.push_back({next, 0u});
+		} else { leave[cursor.block] = clock++; stack.pop_back(); }
+	}
 	const auto dominates = [&](const Block* definition, const Block* use) {
-		return dominators[block_indices.at(use)][block_indices.at(definition)];
+		const auto a = block_indices.at(definition), b = block_indices.at(use);
+		return enter[a] <= enter[b] && leave[b] <= leave[a];
 	};
 	const auto control_dominates = [&](Value value, const Block* use) {
 		const auto* definition = value.TryInstruction();
@@ -731,6 +830,12 @@ std::string ProgramToString(const Program& program) {
 				} else {
 					text += value_string(inst.Arg(index));
 				}
+			}
+			if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
+				const auto index = inst.Flags<MemoryFlags>().index;
+				if (index < program.memory_info.size())
+					text += fmt::format(" [memoff={} kind={} res={}]", program.memory_info[index].offset,
+					                    static_cast<uint32_t>(program.memory_info[index].kind), program.memory_info[index].resource);
 			}
 			text +=
 			    fmt::format(" ({}; uses={})\n", TypeName(Value(const_cast<Inst*>(&inst)).GetType()),

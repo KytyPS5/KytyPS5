@@ -6,8 +6,10 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <array>
+#include <algorithm>
 #include <bit>
 #include <cstring>
 #include <iostream>
@@ -4165,7 +4167,7 @@ void TestCountedRowImageSelector() {
               memory.words.begin() + (MaterialBase + 32u - memory.base) / 4u);
   at(MaterialBase + 32u) = 0x104u;
   at(MaterialBase + 256u) = 0x200u;
-  at(MaterialBase + 260u) = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k8SScaled) << 20u;
+  at(MaterialBase + 260u) = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k1_5_5_5UNorm) << 20u;
   at(MaterialBase + 268u) = at(MaterialBase + 196u);
   std::array<uint32_t, 12> user_data{KeyBase, 4u << 16u, 64u, 0x14004u,
       CountBase, 4u << 16u, 4u, 0x14004u, MaterialBase, 396u << 16u, 4u, 0x14004u};
@@ -5376,6 +5378,244 @@ void TestSrtFlatteningAndRuntimeMemoization() {
         "flattened typed SRT reads were not collected");
 }
 
+void TestValidatorDominanceAndReverseLinks() {
+  {
+    Fixture fixture;
+    const auto source = fixture.UserData(0);
+    for (uint32_t i = 0; i < 128u; ++i) fixture.Emit(ValueOpcode::ReferenceU32, {source});
+    ValidateProgram(fixture.program, false);
+    auto& uses = const_cast<std::vector<Use>&>(source.Instruction()->Uses());
+    const auto missing = uses.back(); uses.pop_back();
+    CheckFatal([&] { ValidateProgram(fixture.program, false); }, "reverse uses",
+               "indexed reverse-use validation accepted a missing edge");
+    uses.push_back(missing);
+    uses.push_back(missing);
+    CheckFatal([&] { ValidateProgram(fixture.program, false); }, "reverse use is duplicated",
+               "reverse-use validation accepted a duplicate edge");
+    uses.pop_back();
+  }
+  {
+    Fixture fixture;
+    auto* entry = fixture.block;
+    auto* left = fixture.AddBlock(); auto* right = fixture.AddBlock(); auto* join = fixture.AddBlock();
+    entry->AddBranch(left); entry->AddBranch(right); left->AddBranch(join); right->AddBranch(join);
+    namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+    fixture.program.blocks[0]->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                                               .true_block = left, .false_block = right};
+    fixture.program.blocks[0]->condition = Value(true);
+    fixture.program.blocks[1]->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = join};
+    fixture.program.blocks[2]->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = join};
+    fixture.program.blocks[3]->terminator.kind = CFG::TerminatorKind::Return;
+    const auto root = fixture.UserData(0);
+    const auto local = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))}, 0, left);
+    auto& phi = join->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(left, local); phi.AddPhiOperand(right, root);
+    const auto sink = fixture.Emit(ValueOpcode::ReferenceU32, {Value(&phi)}, 0, join);
+    ValidateProgram(fixture.program, false);
+    sink.Instruction()->SetArg(0, local);
+    CheckFatal([&] { ValidateProgram(fixture.program, false); }, "does not dominate its use",
+               "immediate-dominator validation accepted a sibling branch definition");
+    sink.Instruction()->SetArg(0, Value(&phi));
+    phi.SetArg(1, local);
+    CheckFatal([&] { ValidateProgram(fixture.program, false); }, "does not dominate its edge",
+               "immediate-dominator validation accepted a wrong phi predecessor");
+    phi.SetArg(1, root);
+  }
+}
+void TestLoopCarriedScalarSsa() {
+  Fixture fixture;
+  auto* entry = fixture.block;
+  auto* header = fixture.AddBlock();
+  auto* body = fixture.AddBlock();
+  auto* exit = fixture.AddBlock();
+  entry->AddBranch(header); header->AddBranch(body); header->AddBranch(exit); body->AddBranch(header);
+  const auto reg = Value(static_cast<ScalarReg>(0));
+  fixture.Emit(ValueOpcode::SetScalarRegister, {reg, Value(41u)}, 0, entry);
+  const auto value = fixture.Emit(ValueOpcode::GetScalarRegister, {reg}, 0, header);
+  const auto increment = fixture.Emit(ValueOpcode::IAdd32, {value, Value(1u)}, 0, body);
+  fixture.Emit(ValueOpcode::SetScalarRegister, {reg, increment}, 0, body);
+  const auto output = fixture.Emit(ValueOpcode::GetScalarRegister, {reg}, 0, exit);
+  const auto sink = fixture.Emit(ValueOpcode::ReferenceU32, {output}, 0, exit);
+  RewriteToSsa(fixture.program.blocks);
+  const auto* phi = sink.Instruction()->Arg(0).ResolveInstruction();
+  Check(phi && phi->GetOpcode() == ValueOpcode::Phi && phi->NumArgs() == 2u &&
+        phi->Arg(0).Resolve() == Value(41u) && phi->Arg(1).Resolve() == increment &&
+        increment.Instruction()->Arg(0).Resolve() == Value(const_cast<Inst*>(phi)),
+        "early SSA sealing lost the loop-carried scalar backedge");
+}
+void TestRoutingVariableSsaValues() {
+  Fixture fixture;
+  auto* entry = fixture.block;
+  auto* left = fixture.AddBlock();
+  auto* right = fixture.AddBlock();
+  auto* join = fixture.AddBlock();
+  entry->AddBranch(left); entry->AddBranch(right);
+  left->AddBranch(join); right->AddBranch(join);
+  const auto initial = fixture.Emit(ValueOpcode::GetGotoVariable, {Value(17u)}, 0, entry);
+  const auto initial_sink = fixture.Emit(ValueOpcode::Reference, {initial}, 0, entry);
+  fixture.Emit(ValueOpcode::SetGotoVariable, {Value(17u), Value(true)}, 0, entry);
+  const auto inherited = fixture.Emit(ValueOpcode::GetGotoVariable, {Value(17u)}, 0, left);
+  const auto inherited_sink = fixture.Emit(ValueOpcode::Reference, {inherited}, 0, left);
+  fixture.Emit(ValueOpcode::SetGotoVariable, {Value(17u), Value(false)}, 0, left);
+  const auto predicate = fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(0), Value(0u)}, 0, entry);
+  fixture.Emit(ValueOpcode::SetGotoVariable, {Value(17u), predicate}, 0, right);
+  const auto result = fixture.Emit(ValueOpcode::GetGotoVariable, {Value(17u)}, 0, join);
+  const auto sink = fixture.Emit(ValueOpcode::Reference, {result}, 0, join);
+  RewriteToSsa(fixture.program.blocks);
+  Check(initial_sink.Instruction()->Arg(0).Resolve() == Value(false) &&
+        inherited_sink.Instruction()->Arg(0).Resolve() == Value(true),
+        "routing SSA lost its default or inherited Boolean value");
+  const auto* phi = sink.Instruction()->Arg(0).ResolveInstruction();
+  Check(phi && phi->GetOpcode() == ValueOpcode::Phi && phi->GetType() == Type::U1 &&
+        phi->NumArgs() == 2u && phi->Arg(0).Resolve() == Value(false) &&
+        phi->Arg(1).Resolve() == predicate,
+        "routing SSA mixed immediate Boolean and instruction definitions across branches");
+}
+void TestBulkUseReplacementLinks() {
+  Fixture fixture;
+  const auto source = fixture.UserData(0);
+  const auto replacement = fixture.UserData(1);
+  std::vector<Inst*> consumers;
+  for (uint32_t i = 0; i < 2048u; ++i)
+    consumers.push_back(fixture.Emit(ValueOpcode::IAdd32, {source, source}).Instruction());
+  source.Instruction()->ReplaceUsesWith(replacement);
+  Check(source.Instruction()->GetOpcode() == ValueOpcode::Identity &&
+        source.Instruction()->Uses().empty() && replacement.Instruction()->UseCount() == 4097u,
+        "bulk replacement lost or duplicated reverse use links");
+  for (auto* consumer: consumers) {
+    Check(consumer->Arg(0) == replacement && consumer->Arg(1) == replacement,
+          "bulk replacement failed to update both operands of a user");
+    consumer->SetArg(0, replacement);
+  }
+  Check(replacement.Instruction()->UseCount() == 4097u,
+        "setting an unchanged operand duplicated its use link");
+}
+void TestLongTrivialPhiChain() {
+  Fixture fixture;
+  fixture.block->AddBranch(fixture.block);
+  auto value = fixture.Emit(ValueOpcode::GetScalarRegister, {Value(static_cast<ScalarReg>(0))});
+  for (uint32_t i = 0; i < 16384u; ++i) {
+    auto& phi = fixture.block->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(fixture.block, value);
+    phi.AddPhiOperand(fixture.block, Value(0u));
+    value = Value(&phi);
+  }
+  const auto sink = fixture.Emit(ValueOpcode::ReferenceU32, {value});
+  RewriteToSsa(fixture.program.blocks);
+  const auto result = sink.Instruction()->Arg(0).Resolve();
+  Check(result.IsImmediate() && result.U32() == 0u,
+        "long trivial phi chain did not reach the initial scalar value");
+}
+void TestExpandedCallResourceNamespaces() {
+  Fixture fixture;
+  fixture.program.gpu_selected_call_payloads = true;
+  for (uint32_t i = 0; i < 80u; ++i) {
+    const auto image = fixture.Image({Value(0u), Value(i << 8u), Value(0u), Value(0u),
+                                     Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto sampler = fixture.Sampler({Value(i % 40u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(memory, i * 4u));
+  }
+  for (uint32_t i = 0; i < 80u; ++i) {
+    const auto buffer = fixture.Buffer({Value(0u), Value(4u << 16u), Value(64u + i), Value(0x16204u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+        {buffer, Value(0u), Value(0u), Value(0u), Value(0u), Value(false)},
+        fixture.AddMemory(memory, 0x200u + i * 4u));
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 80u &&
+            fixture.program.info.samplers.size() == 40u &&
+            fixture.program.info.sampled_pairs.size() == 80u && fixture.program.info.buffers.size() == 80u,
+        "expanded calls lost independent image/sampler namespaces");
+  const auto plan = ExtractResourcePlan(fixture.program);
+  std::array<uint32_t, 80> user_data {};
+  const SrtRuntime runtime {.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "expanded call resource table failed materialization");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  ShaderComputeInputInfo compute {};
+  CollectShaderInfo(fixture.program, {.compute = &compute});
+  Check(fixture.program.info.buffers.size() == 80u &&
+            std::ranges::count_if(fixture.program.info.buffers, [](const auto& buffer) { return buffer.live; }) == 80,
+        "expanded buffer namespace was truncated during shader info collection");
+  Check(fixture.program.info.images.size() == 80u && fixture.program.info.samplers.size() == 40u,
+        "native specialization truncated expanded call resources");
+}
+void TestRtScalarPayloadStaysOnGpu() {
+  for (const bool descriptor_dependency : {false, true}) {
+    Fixture fixture;
+    fixture.program.gpu_selected_call_payloads = true;
+    const auto address = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    const auto read = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {address, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 4));
+    if (descriptor_dependency) {
+      const auto buffer = fixture.Buffer({read, Value(0u), Value(64u), Value(0u)}, 8);
+      MemoryInfo memory;
+      memory.kind = ResourceKind::Buffer;
+      fixture.Emit(ValueOpcode::StoreBufferU32,
+          {buffer, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)}, fixture.AddMemory(memory, 8));
+    }
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    TestMemory memory;
+    memory.words[0] = 0x12345678u;
+    std::array<uint32_t, 2> user_data{descriptor_dependency ? 0x1000u : 0u, 0u};
+    SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
+        .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+    std::vector<uint32_t> flat;
+    Check(SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+          "RT payload planning attempted to read an inactive null pointer");
+    if (descriptor_dependency) {
+      Check(flat.size() == 1 && flat[0] == 0x12345678u && memory.reads == 1,
+            "RT descriptor dependency was no longer materialized");
+    } else {
+      Check(flat.empty() && memory.reads == 0 &&
+            read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+            !fixture.program.memory_info[0].planning_only,
+            "RT scalar payload was flattened instead of executing on GPU");
+    }
+  }
+}
+void TestRtNestedBufferPayloadStaysOnGpu() {
+  Fixture fixture;
+  fixture.program.gpu_selected_call_payloads = true;
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto root = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  const auto pointer = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {root, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 4));
+  const auto payload_address = fixture.Address(pointer, Value(0u), 8);
+  scalar.offset = 0x30;
+  const auto payload = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {payload_address, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 8));
+  const auto buffer = fixture.Buffer({payload, Value(0u), Value(64u), Value(0u)}, 12);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  const auto load = fixture.Emit(ValueOpcode::LoadBufferU32,
+      {buffer, Value(0u), Value(0u), Value(0u), Value(false)}, fixture.AddMemory(memory, 12));
+  fixture.PlanAndTrack();
+  Check(fixture.program.srt_reads.empty() && fixture.program.info.buffers.empty() &&
+        fixture.program.memory_info[load.ResolveInstruction()->Flags<MemoryFlags>().index].kind ==
+            ResourceKind::IndirectBuffer,
+        "RT nested payload buffer was host-bound instead of using its runtime descriptor");
+  TestMemory backing;
+  backing.words[0] = 0u;
+  std::array<uint32_t, 2> user_data{0x1000u, 0u};
+  auto plan = ExtractResourcePlan(fixture.program);
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(plan, {.user_data = user_data, .read_memory = ReadTestMemory,
+                        .userdata = &backing}).RefreshFlatBuffer(flat) && backing.reads == 0,
+        "inactive RT buffer dereferenced its null payload on the host");
+}
 void TestDynamicSrtReadRemainsExplicit() {
   Fixture fixture;
   const auto base =
@@ -8278,6 +8518,14 @@ int main() {
     Run("shared append selector bounds", TestSharedAppendSelectorBounds);
     Run("descending image range", TestDescendingImageRange);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
+    Run("validator dominance and reverse links", TestValidatorDominanceAndReverseLinks);
+    Run("loop-carried scalar SSA", TestLoopCarriedScalarSsa);
+    Run("routing SSA values", TestRoutingVariableSsaValues);
+    Run("bulk use replacement", TestBulkUseReplacementLinks);
+    Run("long trivial phi chain", TestLongTrivialPhiChain);
+    Run("expanded call resource namespaces", TestExpandedCallResourceNamespaces);
+  Run("RT scalar payload", TestRtScalarPayloadStaysOnGpu);
+    Run("RT nested buffer payload", TestRtNestedBufferPayloadStaysOnGpu);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
@@ -8352,6 +8600,7 @@ void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 #include "graphics/shader/recompiler/ir/Program.cpp"
 #include "graphics/shader/recompiler/ir/Type.cpp"
 #include "graphics/shader/recompiler/ir/Value.cpp"
+#include "graphics/shader/recompiler/ir/passes/SsaRewrite.cpp"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"

@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/RtFeedback.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <algorithm>
@@ -180,8 +181,17 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
 }
 
+uint32_t LoadBdaDwordState(EmitterState& state, uint32_t address, bool coherent = false);
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
-	auto&      state   = ctx.state;
+	return LoadBdaDwordState(ctx.state, address, coherent);
+}
+uint32_t LoadBdaDwordState(EmitterState& state, uint32_t address, bool coherent) {
+	if (!coherent && state.load_bda_dword_function != 0u) {
+		const auto call = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), call, state.load_bda_dword_function,
+		                          address);
+		return call;
+	}
 	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
@@ -213,39 +223,48 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	});
 }
 
+// The unaligned read at a guest address: the aligned dword, the next one when the value crosses into it, funnel-shifted.
+uint32_t LoadBdaUnalignedBody(EmitterState& state, uint32_t address, uint32_t bits, bool coherent) {
+	const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+	                            ConstantU64(state, ~uint64_t {3}));
+	const auto first   = LoadBdaDwordState(state, aligned, coherent);
+	const auto byte =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
+	const auto crosses =
+	    bits == 8u ? ConstantBool(state, false)
+	               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
+	                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
+	const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
+		return LoadBdaDwordState(state, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
+		                                       ConstantU64(state, sizeof(uint32_t))), coherent);
+	});
+	const auto shift =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
+	const auto upper_shift =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                  Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 4), byte),
+	                  ConstantU32(state, 3)),
+	           ConstantU32(state, 3));
+	const auto merged =
+	    Binary(state, spv::OpBitwiseOr, TypeU32(state),
+	           Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, shift),
+	           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), second, upper_shift));
+	return bits == 32u ? merged
+	                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
+	                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+}
+
 uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
                  bool coherent = false) {
 	auto& state = ctx.state;
+	const auto function = coherent ? 0u : state.load_bda_unaligned_function[bits == 8u ? 0 : bits == 16u ? 1 : 2];
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
-		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
-		                            ConstantU64(state, ~uint64_t {3}));
-		const auto first   = LoadBdaDword(ctx, aligned, coherent);
-		const auto byte =
-		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
-		const auto crosses =
-		    bits == 8u ? ConstantBool(state, false)
-		               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
-		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
-		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
-			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
-			                                ConstantU64(state, sizeof(uint32_t))), coherent);
-		});
-		const auto shift =
-		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
-		const auto upper_shift =
-		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-		           Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-		                  Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 4), byte),
-		                  ConstantU32(state, 3)),
-		           ConstantU32(state, 3));
-		const auto merged =
-		    Binary(state, spv::OpBitwiseOr, TypeU32(state),
-		           Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, shift),
-		           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), second, upper_shift));
-		return bits == 32u ? merged
-		                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
-		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+		if (function == 0u) return LoadBdaUnalignedBody(state, address, bits, coherent);
+		const auto call = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), call, function, address);
+		return call;
 	});
 }
 
@@ -959,8 +978,8 @@ IndirectBufferAccess PrepareIndirectBuffer(EmitterState& state,
 	};
 }
 
-uint32_t IndirectBufferInBounds(EmitterState& state, const IndirectBufferAccess& buffer,
-                                uint32_t displacement, uint32_t bytes, bool formatted) {
+uint32_t InlineIndirectBufferInBounds(EmitterState& state, const IndirectBufferAccess& buffer,
+                                      uint32_t displacement, uint32_t bytes, bool formatted) {
 	const auto offset = displacement == 0u ? buffer.offset : Binary(
 	    state, spv::OpIAdd, TypeU32(state), buffer.offset, ConstantU32(state, displacement));
 	const auto has_payload = [&](uint32_t size) {
@@ -994,6 +1013,23 @@ uint32_t IndirectBufferInBounds(EmitterState& state, const IndirectBufferAccess&
 	return in_bounds;
 }
 
+// --raytracing: the bounds arithmetic of a one-dword access (offset, stride, swizzle, the four OOB modes) is a
+// shared function. Inline it is ~100 SPIR-V words per access and the large kernels have tens of thousands.
+uint32_t IndirectBufferInBounds(EmitterState& state, const IndirectBufferAccess& buffer,
+                                uint32_t displacement, uint32_t bytes, bool formatted) {
+	if (state.indirect_bounds_function == 0 || formatted || bytes != ConstantU32(state, 4u)) {
+		return InlineIndirectBufferInBounds(state, buffer, displacement, bytes, formatted);
+	}
+	const auto offset = displacement == 0u ? buffer.offset : Binary(
+	    state, spv::OpIAdd, TypeU32(state), buffer.offset, ConstantU32(state, displacement));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeBool(state), result, state.indirect_bounds_function,
+	                          offset, buffer.stride, buffer.swizzle, buffer.mode, buffer.records,
+	                          buffer.index_in_bounds, buffer.scalar_in_bounds, buffer.raw_records,
+	                          buffer.raw_index_in_bounds);
+	return result;
+}
+
 uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
                             uint32_t bits, uint32_t components, bool coherent) {
 	auto& state = ctx.state;
@@ -1023,7 +1059,8 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 			        ConstantU32(state, bits));
 		    });
 	}
-	return ConstructU32Composite(state, components, values);
+	// A single dword is a scalar, not a one-element vector.
+	return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -1078,7 +1115,8 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
-	if (mem.kind == IR::ResourceKind::IndirectBuffer && mem.formatted) {
+	if (mem.kind == IR::ResourceKind::IndirectBuffer && mem.formatted &&
+	    !(state.program.rt_plain_formatted_indirect && mem.data_format == 0u && mem.number_format == 0u)) {
 		return LoadIndirectFormattedX(ctx, inst);
 	}
 	return EmitValueOrDefaultIfCondition(
@@ -1195,8 +1233,15 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			const auto components = IR::BufferComponentCount(inst.GetOpcode());
 			if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) continue;
 			const auto& memory = ctx.Memory(inst);
-			if (memory.kind != IR::ResourceKind::IndirectBuffer || memory.formatted ||
-			    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) continue;
+			if (memory.kind != IR::ResourceKind::IndirectBuffer) continue;
+			// --raytracing: a formatted load with no data or number format is a plain dword fetch
+			// (ResourceTracking.cpp plain_formatted), served like a raw one: decoding each against the V# format
+			// makes the large kernels too big for the driver to compile in reasonable time.
+			const bool plain_formatted = state.program.rt_plain_formatted_indirect && memory.formatted && !memory.typed && memory.data_bits == 32u &&
+			    memory.data_format == 0u && memory.number_format == 0u;
+			if (plain_formatted ? false
+			                    : (memory.formatted || !memory.SupportsIndirectBufferLoad(inst.GetOpcode())))
+				continue;
 			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(
 			    std::array {memory.data_bits, components, uint32_t(memory.coherent)}, 0u);
 			if (!inserted) continue;
@@ -1209,7 +1254,9 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			                  std::to_string(components) + (memory.coherent ? "_coherent" : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
-			                          spv::FunctionControlMaskNone, signature);
+			                          state.program.rt_plain_formatted_indirect ? spv::FunctionControlDontInlineMask
+			                                                                    : spv::FunctionControlMaskNone,
+			                          signature);
 			std::array<uint32_t, 8> args;
 			for (auto& arg: args) {
 				arg = state.builder.AllocateId();
@@ -1304,6 +1351,69 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	    });
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+void DefineIndirectBufferBounds(EmitterState& state) {
+	if (!state.program.rt_plain_formatted_indirect) {
+		return;
+	}
+	const auto u             = TypeU32(state);
+	const auto b             = TypeBool(state);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, b, u, u, b, u, u, b, b, u, b);
+	state.indirect_bounds_function = state.builder.AllocateId();
+	state.builder.AddName(state.indirect_bounds_function, "indirect_buffer_dword_in_bounds");
+	state.builder.AddFunction(spv::OpFunction, b, state.indirect_bounds_function,
+	                          spv::FunctionControlDontInlineMask, function_type);
+	std::array<uint32_t, 9>       args {};
+	const std::array<uint32_t, 9> types {u, u, b, u, u, b, b, u, b};
+	for (size_t i = 0; i < args.size(); ++i) {
+		args[i] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionParameter, types[i], args[i]);
+	}
+	EmitLabel(state, state.builder.AllocateId());
+	const IndirectBufferAccess buffer {
+	    .offset = args[0], .stride = args[1], .swizzle = args[2], .mode = args[3], .records = args[4],
+	    .index_in_bounds = args[5], .scalar_in_bounds = args[6], .raw_records = args[7],
+	    .raw_index_in_bounds = args[8],
+	};
+	const auto result = InlineIndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, 4u), false);
+	state.builder.AddFunction(spv::OpReturnValue, result);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+// Every guest dword read through an address pairs the page-table lookup with a guarded load; the large ray
+// tracing kernels have thousands. One function holds them (RT kernels only: the others stay inline).
+void DefineLoadBdaDword(EmitterState& state) {
+	if (!state.program.rt_plain_formatted_indirect || !state.program.info.uses_dma) {
+		return;
+	}
+	const auto type          = TypeU64(state);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, TypeU32(state), type);
+	const auto function      = state.builder.AllocateId();
+	const auto address       = state.builder.AllocateId();
+	state.builder.AddName(function, "load_bda_dword");
+	state.builder.AddFunction(spv::OpFunction, TypeU32(state), function, spv::FunctionControlDontInlineMask,
+	                          function_type);
+	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
+	EmitLabel(state, state.builder.AllocateId());
+	const auto value = LoadBdaDwordState(state, address);
+	state.builder.AddFunction(spv::OpReturnValue, value);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+	state.load_bda_dword_function = function;
+	// The unaligned forms wrap it: one function per width, thousands of call sites in a call-table kernel.
+	for (size_t index = 0; state.program.gpu_selected_call_payloads && index < 3u; ++index) {
+		const uint32_t bits  = index == 0u ? 8u : index == 1u ? 16u : 32u;
+		const auto     fn_id = state.builder.AllocateId();
+		const auto     param = state.builder.AllocateId();
+		state.builder.AddName(fn_id, bits == 8u ? "load_bda_u8" : bits == 16u ? "load_bda_u16" : "load_bda_u32");
+		state.builder.AddFunction(spv::OpFunction, TypeU32(state), fn_id, spv::FunctionControlDontInlineMask,
+		                          function_type);
+		state.builder.AddFunction(spv::OpFunctionParameter, type, param);
+		EmitLabel(state, state.builder.AllocateId());
+		state.builder.AddFunction(spv::OpReturnValue, LoadBdaUnalignedBody(state, param, bits, false));
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		state.load_bda_unaligned_function[index] = fn_id;
+	}
 }
 
 void DefineGetBdaPointer(EmitterState& state) {
@@ -1608,12 +1718,54 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.Define(inst, value);
 }
 
+// Raw dword stores through a GPU-selected descriptor: the address, bounds and format rules of the loads, one
+// guarded store per dword straight to guest memory.
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+		                                 ConstantU32(state, 0));
+		const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                         ConstantU64(state, ~uint64_t {3}));
+		const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
+		for (uint32_t component = 0; component < components; ++component) {
+			const auto address = component == 0u ? base
+			                                     : Binary(state, spv::OpIAdd, TypeU64(state), base,
+			                                              ConstantU64(state, component * 4u));
+			uint32_t value = data;
+			if (components > 1u) {
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, data, component);
+			}
+			EmitIfCondition(
+			    state, AndCondition(state, valid_format,
+			                        IndirectBufferInBounds(state, buffer, component * 4u, ConstantU32(state, 4u), false)),
+			    [&]() {
+				    const auto bda     = GetBdaPointer(state, address);
+				    const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+				                                ConstantU64(state, 0));
+				    EmitIfCondition(state, present, [&]() {
+					    const auto pointer = Unary(state, spv::OpConvertUToPtr,
+					                               TypePhysicalU32Pointer(state), bda);
+					    state.builder.AddFunction(spv::OpStore, pointer, value,
+					                              spv::MemoryAccessAlignedMask, 4u);
+				    });
+			    });
+		}
+	});
+}
+
 void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op                = inst.GetOpcode();
 	const auto& mem               = ctx.Memory(inst);
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		StoreIndirectBuffer(ctx, inst, std::max(1u, buffer_components));
+		return;
+	}
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
 	else if (buffer_components > 1u)

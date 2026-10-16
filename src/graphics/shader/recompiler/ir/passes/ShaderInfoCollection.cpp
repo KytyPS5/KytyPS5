@@ -1,5 +1,9 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 

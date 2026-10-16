@@ -132,8 +132,39 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+	if ((adjustment % sizeof(uint32_t) != 0 && !resource.written) || adjustment >= 256 ||
+	    size > max_range - adjustment) {
+		// The shader packs each buffer's byte offset into 8 bits, so a base that is not dword
+		// aligned (or sits 256+ bytes past the aligned offset) cannot be expressed. Read-only
+		// data is bound from a private aligned copy in the stream ring instead: the copy is made
+		// on the GPU, so contents the GPU produced survive, and the shader sees zero adjustment.
+		if (!resource.written) {
+			auto& stream                 = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+			auto [mapped, stream_offset] = stream.Map(size, alignment);
+			auto& command                = context.GetCommandScheduler().Current();
+			if (mapped != nullptr && !command.IsInvalid() &&
+			    (stream_offset & (alignment - 1u)) == 0) {
+				stream.CopyFrom(command, *buffer, offset, stream_offset, size);
+				stream.Commit();
+				static std::atomic_uint realign_log_count {0};
+				if (realign_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("WARNING: descriptors: realigned storage buffer via stream copy: "
+					     "address=0x%016" PRIx64 " size=0x%016" PRIx64 " adjustment=0x%016" PRIx64
+					     "\n",
+					     static_cast<uint64_t>(address), static_cast<uint64_t>(size),
+					     static_cast<uint64_t>(adjustment));
+				}
+				buffer_offset = 0;
+				return {stream.Handle(), stream_offset, size};
+			}
+		}
+		EXIT("storage buffer offset adjustment is unsupported: address=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " offset=0x%016" PRIx64 " alignment=0x%016" PRIx64
+		     " adjustment=0x%016" PRIx64 " max_range=0x%016" PRIx64 " written=%d formatted=%d\n",
+		     static_cast<uint64_t>(address), static_cast<uint64_t>(size),
+		     static_cast<uint64_t>(offset), static_cast<uint64_t>(alignment),
+		     static_cast<uint64_t>(adjustment), static_cast<uint64_t>(max_range),
+		     resource.written ? 1 : 0, resource.formatted ? 1 : 0);
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
@@ -583,6 +614,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
 		                           view_base)) {
+			// A candidate of a GPU-selected table (the table also lists records that hold other kinds of data) whose
+			// mip view cannot be laid out: bind a null image, the shader never selects it.
+			if (resource.indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage) {
+				static std::atomic_uint null_view_log_count {0};
+				if (null_view_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+					LOGF("WARNING: descriptors: indirect image candidate with an unusable mip view bound as a null image: "
+					     "address=0x%016" PRIx64 " indirect_root=%u first_use_pc=0x%x\n",
+					     static_cast<uint64_t>(address), resource.indirect_root, resource.first_use_pc);
+				}
+				return {.layout = vk::ImageLayout::eGeneral};
+			}
 			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
 			     "extent=%ux%ux%u tile=%u\n",
 			     base_level, last_level, max_mip, width, height, depth,
@@ -592,8 +634,27 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.UpdateSize();
 	}
 	const auto alignment = desc.info.DataAlignment();
-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+	if (desc.info.data.size == 0 || alignment == 0 ||
+	    (address & (static_cast<uint64_t>(alignment) - 1u)) != 0) {
+		// A candidate of an indirect table that no surface can sit behind (the table also lists records that
+		// hold no texture): bind a null image, the shader never selects it.
+		if (resource.indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage) {
+			static std::atomic_uint null_surface_log_count {0};
+			if (null_surface_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("WARNING: descriptors: indirect image candidate without a valid surface bound as a null image: "
+				     "address=0x%016" PRIx64 " size=%llu indirect_root=%u first_use_pc=0x%x\n",
+				     address, static_cast<unsigned long long>(desc.info.data.size), resource.indirect_root,
+				     resource.first_use_pc);
+			}
+			return {.layout = vk::ImageLayout::eGeneral};
+		}
+		EXIT("texture layout has no valid surface: size=%llu align=%u addr=0x%016" PRIx64 " extent=%ux%ux%u levels=%u "
+		     "tile=%u type=%u format=%u storage=%d indirect_root=%u first_use_pc=0x%x dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     static_cast<unsigned long long>(desc.info.data.size), alignment, address, width, height, depth, physical_levels,
+		     static_cast<uint32_t>(tile), static_cast<uint32_t>(type), static_cast<uint32_t>(format), storage,
+		     resource.indirect_root, resource.first_use_pc, descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+		     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
@@ -764,7 +825,19 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			size = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+			if (size == 0) {
+				// Nothing is mapped at the base yet. Streaming titles bind regions they back later; an
+				// unbacked region reads zero and drops writes on the hardware, and binding null does too.
+				static std::atomic<uint32_t> reported = 0;
+				if (reported.fetch_add(1) < 8) {
+					LOGF("WARNING: RenderExecutor: buffer descriptor %u outside mapped memory: stage=%u "
+					     "base=0x%016" PRIx64 "\n",
+					     resource, static_cast<uint32_t>(program.stage), static_cast<uint64_t>(address));
+				}
+				source = {};
+				continue;
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}

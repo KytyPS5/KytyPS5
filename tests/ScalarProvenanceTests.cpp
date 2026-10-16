@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+#include "graphics/shader/recompiler/ir/passes/PhiWebs.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -7,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cstdlib>
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
@@ -256,6 +258,41 @@ void TestCarryAndBitFields() {
   Check(result.dwords[0] == 1u && result.dwords[1] == 1u &&
             result.dwords[2] == 0x89abcdefu && result.dwords[3] == 0xffffffffu,
         "typed carry or bit-field runtime evaluation is incorrect");
+}
+
+void TestDuplicateBitcastsStayWithinBlock() {
+  Fixture fixture(2);
+  const auto source = fixture.Emit(ValueOpcode::GetBuiltin, {Value(0u), Value(0u)});
+  const auto first = fixture.Emit(ValueOpcode::BitCastF32U32, {source});
+  const auto second = fixture.Emit(ValueOpcode::BitCastF32U32, {source});
+  const auto use = fixture.Emit(ValueOpcode::FPMul32, {first, second});
+  const auto other = fixture.Emit(ValueOpcode::BitCastF32U32, {source}, 0, 1);
+  const auto other_use = fixture.Emit(ValueOpcode::FPMul32, {other, other}, 0, 1);
+  Check(EliminateDuplicateBitcasts(fixture.program.blocks) == 1u,
+        "must merge only duplicate bitcasts in one block");
+  Check(use.TryInstruction()->Arg(1).Resolve() == first,
+        "duplicate bitcast must use the earlier equivalent definition");
+  Check(other_use.TryInstruction()->Arg(0).Resolve() == other,
+        "must not reuse a bitcast from another block");
+}
+void TestSharedPhiWebKeepsDynamicInput() {
+  Fixture fixture(3);
+  const auto dynamic = fixture.Emit(ValueOpcode::GetBuiltin,
+                                   {Value(0u), Value(0u)});
+  auto &shared = fixture.BlockAt(1).AppendNewInst(ValueOpcode::Phi);
+  shared.SetFlags(Type::U32);
+  shared.AddPhiOperand(&fixture.BlockAt(0), dynamic);
+  shared.AddPhiOperand(&fixture.BlockAt(2), Value(0u));
+  auto &root = fixture.BlockAt(2).AppendNewInst(ValueOpcode::Phi);
+  root.SetFlags(Type::U32);
+  root.AddPhiOperand(&fixture.BlockAt(0), Value(&shared));
+  root.AddPhiOperand(&fixture.BlockAt(1), Value(0u));
+  const auto use = fixture.Emit(ValueOpcode::IAdd32,
+                                {Value(&root), Value(1u)}, 0, 2);
+  Check(SimplifyPhiWebs(fixture.program) == 0u,
+        "shared phi web must retain its dynamic external input");
+  Check(use.TryInstruction()->Arg(0).Resolve() == Value(&root),
+        "shared phi must not be replaced by zero");
 }
 
 void TestInvariantAndDivergentPhi() {
@@ -864,6 +901,8 @@ int main() {
     TestNestedSrtWalk();
     TestShaderBaseAndUserData();
     TestCarryAndBitFields();
+    TestDuplicateBitcastsStayWithinBlock();
+    TestSharedPhiWebKeepsDynamicInput();
     TestInvariantAndDivergentPhi();
     TestOperandMutationLifecycle();
     TestControlDependentStandaloneLoadStaysTyped();
@@ -896,3 +935,7 @@ int main() {
 #include "../src/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
+
+#include "../src/graphics/shader/recompiler/ir/passes/PhiWebs.cpp"
+
+

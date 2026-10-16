@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -50,7 +51,30 @@ using Variable =
                  ExecTag, ExecLoTag, ExecHiTag, VccTag, VccLoTag, VccHiTag, M0Tag>;
 using ValueMap = std::unordered_map<Block*, Value>;
 
+// Routing variables are Boolean. Dense block indices avoid a hash node allocation for
+// every (routing variable, block) pair. Pages also keep sparsely used variables small.
+struct GotoValueMap {
+	static constexpr uint32_t PageValues = 64u;
+	std::unordered_map<uint32_t, std::array<uintptr_t, PageValues>> pages;
+	Value Get(uint32_t index) const {
+		const auto page = pages.find(index / PageValues);
+		if (page == pages.end()) return {};
+		const auto value = page->second[index % PageValues];
+		if (value == 0u) return {};
+		if (value <= 2u) return Value(value == 2u);
+		return Value(reinterpret_cast<Inst*>(value));
+	}
+	void Set(uint32_t index, Value value) {
+		EXIT_IF(value.GetType() != Type::U1);
+		pages[index / PageValues][index % PageValues] = value.IsImmediate() ? (value.U1() ? 2u : 1u)
+		                                                 : reinterpret_cast<uintptr_t>(value.Instruction());
+	}
+};
 struct DefTable {
+	explicit DefTable(const BlockList& blocks) {
+		for (uint32_t i = 0; i < blocks.size(); ++i) block_indices.emplace(blocks[i], i);
+	}
+	std::unordered_map<Block*, uint32_t> block_indices;
 	const Value& Get(Block* block, ScalarReg reg) {
 		if (RegIndex(reg) >= NumScalarRegs) {
 			EXIT("SSA scalar read index is out of range: %u", RegIndex(reg));
@@ -88,11 +112,11 @@ struct DefTable {
 		EXIT_IF(RegIndex(reg) >= NumVectorRegs);
 		block->ssa_vreg_values[RegIndex(reg)] = value;
 	}
-	const Value& Get(Block* block, GotoVariable value) {
-		return goto_variables[value.index][block];
+	Value Get(Block* block, GotoVariable value) {
+		return goto_variables[value.index].Get(block_indices.at(block));
 	}
 	void Set(Block* block, GotoVariable value, Value definition) {
-		goto_variables[value.index][block] = definition;
+		goto_variables[value.index].Set(block_indices.at(block), definition);
 	}
 
 	const Value& Get(Block* block, SccTag) { return scc[block]; }
@@ -120,7 +144,7 @@ struct DefTable {
 	ValueMap                               vcc_lo;
 	ValueMap                               vcc_hi;
 	ValueMap                               m0;
-	std::unordered_map<uint32_t, ValueMap> goto_variables;
+	std::unordered_map<uint32_t, GotoValueMap> goto_variables;
 };
 
 Value InitialValue(ScalarReg) {
@@ -175,6 +199,7 @@ struct ReadState {
 
 class Pass {
 public:
+	explicit Pass(const BlockList& blocks): definitions(blocks) {}
 	template <typename T>
 	void Write(T variable, Block* block, Value value) {
 		definitions.Set(block, variable, value);
@@ -263,28 +288,32 @@ private:
 	}
 
 	Value TryRemoveTrivialPhi(Inst& phi, Value initial_value) {
-		Value same;
-		for (size_t index = 0; index < phi.NumArgs(); index++) {
-			const auto operand = phi.Arg(index).Resolve();
-			if (operand == same.Resolve() || operand == Value(&phi)) {
-				continue;
+		std::vector<Inst*> pending {&phi};
+		std::unordered_set<Inst*> queued {&phi};
+		while (!pending.empty()) {
+			auto* current = pending.back();
+			pending.pop_back();
+			queued.erase(current);
+			if (current->GetOpcode() != ValueOpcode::Phi) continue;
+			Value same;
+			bool trivial = true;
+			for (size_t index = 0; index < current->NumArgs(); ++index) {
+				const auto operand = current->Arg(index).Resolve();
+				if (operand == same.Resolve() || operand == Value(current)) continue;
+				if (!same.IsEmpty()) { trivial = false; break; }
+				same = operand;
 			}
-			if (!same.IsEmpty()) {
-				return Value(&phi);
-			}
-			same = operand;
-		}
-		if (same.IsEmpty()) {
-			same = initial_value;
-		}
-		const auto users = phi.Uses();
-		phi.ReplaceUsesWith(same);
-		for (const auto& use: users) {
-			if (use.user->GetOpcode() == ValueOpcode::Phi) {
-				TryRemoveTrivialPhi(*use.user, initial_value);
+			if (!trivial) continue;
+			if (same.IsEmpty()) same = initial_value;
+			// Only one use list stays live; a long phi chain no longer consumes the call stack.
+			const auto users = current->Uses();
+			current->ReplaceUsesWith(same);
+			for (const auto& use: users) {
+				if (use.user->GetOpcode() == ValueOpcode::Phi && queued.insert(use.user).second)
+					pending.push_back(use.user);
 			}
 		}
-		return same;
+		return Value(&phi).Resolve();
 	}
 
 	std::unordered_map<Block*, std::map<Variable, Inst*>> incomplete_phis;
@@ -348,14 +377,47 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 } // namespace
 
 void RewriteToSsa(const BlockList& blocks) {
-	Pass pass;
-	for (auto* block: blocks) {
-		for (auto& inst: *block) {
-			VisitInstruction(pass, block, inst);
+	Pass pass(blocks);
+	// Visit predecessors before successors wherever the graph permits it. Sealing an
+	// acyclic block as soon as its incoming definitions exist avoids placeholder phis
+	// for every routing variable in every inlined call arm.
+	BlockList order;
+	std::unordered_set<Block*> seen;
+	struct Cursor { Block* block; size_t successor; };
+	std::vector<Cursor> pending;
+	for (auto* root: blocks) {
+		if (!seen.insert(root).second) continue;
+		const auto first = order.size();
+		pending.push_back({root, 0u});
+		while (!pending.empty()) {
+			auto& cursor = pending.back();
+			const auto successors = cursor.block->ImmSuccessors();
+			if (cursor.successor < successors.size()) {
+				auto* next = successors[cursor.successor++];
+				if (seen.insert(next).second) pending.push_back({next, 0u});
+			} else {
+				order.push_back(cursor.block);
+				pending.pop_back();
+			}
+		}
+		std::reverse(order.begin() + first, order.end());
+	}
+	std::unordered_set<Block*> processed;
+	const auto ready = [&](Block* block) {
+		return std::ranges::all_of(block->ImmPredecessors(),
+		                          [&](Block* predecessor) { return processed.contains(predecessor); });
+	};
+	for (auto* block: order) {
+		if (!block->IsSsaSealed() && ready(block)) pass.Seal(block);
+		for (auto& inst: *block) VisitInstruction(pass, block, inst);
+		processed.insert(block);
+		for (auto* successor: block->ImmSuccessors()) {
+			if (processed.contains(successor) && !successor->IsSsaSealed() && ready(successor))
+				pass.Seal(successor);
 		}
 	}
 	for (auto* block: blocks) {
-		pass.Seal(block);
+		if (!block->IsSsaSealed()) pass.Seal(block);
 	}
 }
 

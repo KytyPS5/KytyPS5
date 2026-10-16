@@ -617,6 +617,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
@@ -670,6 +671,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_CMPSWAP:
 		case Opcode::BUFFER_ATOMIC_SWAP_X2:
 		case Opcode::BUFFER_ATOMIC_ADD:
+		case Opcode::BUFFER_ATOMIC_ADD_X2:
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
 		case Opcode::BUFFER_ATOMIC_UMIN:

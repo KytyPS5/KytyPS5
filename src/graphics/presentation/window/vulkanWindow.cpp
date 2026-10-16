@@ -19,6 +19,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/RtFeedback.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -1046,6 +1047,42 @@ void WindowContext::CreateVulkan() {
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
+	}
+
+	// --raytracing: host-visible record-usage flags for the ray tracing call tables
+	// (shader/recompiler/RtFeedback.h). A kernel logs the call-table records it could not inline here.
+	if (Config::RaytracingEnabled()) {
+		constexpr vk::DeviceSize size = vk::DeviceSize {ShaderRecompiler::RtFeedback::RegionDwords} *
+		                                ShaderRecompiler::RtFeedback::RegionCount * sizeof(uint32_t);
+		vk::BufferCreateInfo buffer_info;
+		buffer_info.size  = size;
+		buffer_info.usage = vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eStorageBuffer;
+		auto        buffer = graphic_ctx.device.createBuffer(buffer_info).value;
+		auto        req    = graphic_ctx.device.getBufferMemoryRequirements(buffer);
+		const auto& props  = graphic_ctx.physical_device_memory_properties;
+		uint32_t    type   = ~0u;
+		for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+			const auto want = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+			if ((req.memoryTypeBits & (1u << i)) != 0u && (props.memoryTypes[i].propertyFlags & want) == want) {
+				type = i;
+				break;
+			}
+		}
+		EXIT_IF(type == ~0u);
+		vk::MemoryAllocateFlagsInfo flags;
+		flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+		vk::MemoryAllocateInfo alloc;
+		alloc.pNext           = &flags;
+		alloc.allocationSize  = req.size;
+		alloc.memoryTypeIndex = type;
+		auto memory = graphic_ctx.device.allocateMemory(alloc).value;
+		graphic_ctx.device.bindBufferMemory(buffer, memory, 0);
+		auto* mapped = static_cast<uint32_t*>(graphic_ctx.device.mapMemory(memory, 0, size).value);
+		std::memset(mapped, 0, size);
+		vk::BufferDeviceAddressInfo address_info;
+		address_info.buffer = buffer;
+		ShaderRecompiler::RtFeedback::GetBuffer().device_address.store(graphic_ctx.device.getBufferAddress(address_info));
+		ShaderRecompiler::RtFeedback::GetBuffer().host.store(mapped);
 	}
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);

@@ -45,6 +45,7 @@ struct SrtReadFlags {
 
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
+bool ValidateRuntimeValue(const Program& program, Value value, RuntimeValueType type = RuntimeValueType::Any);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uniform across a compute wave, including values derived from its workgroup ID.

@@ -265,6 +265,12 @@
              </widget>
             </item>
             <item>
+             <widget class="QCheckBox" name="checkBox_raytracing">
+              <property name="toolTip"><string>Run ray tracing shaders. Disabled by default; ray tracing support is experimental.</string></property>
+              <property name="text"><string>Enable ray tracing (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
              <widget class="QCheckBox" name="checkBox_red_zone_protection">
               <property name="toolTip"><string>Helps prevent crashes in some games on Windows</string></property>
               <property name="text"><string>Windows SysV red zone crash protection (experimental)</string></property>

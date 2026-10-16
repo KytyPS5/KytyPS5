@@ -514,7 +514,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
-		case ValueOpcode::SubgroupUMinU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::SubgroupReduceU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {

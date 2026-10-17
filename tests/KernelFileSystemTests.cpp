@@ -413,7 +413,9 @@ void TestAddContent(const std::filesystem::path& root) {
   Check(mount(0, nullptr, &point) == static_cast<int>(0x80d90002u) &&
             list(0, nullptr, 0, nullptr) == static_cast<int>(0x817d0002u),
         "null add-on parameters return parameter errors");
-  Check(mount(0, &info[3].label, &point) == OK, "mount owned add-on");
+  Check(mount(0, &info[3].label, &point) == OK &&
+            !std::string_view(point.data).ends_with('/'),
+        "mount owned add-on without trailing slash");
   const std::string mounted_file = std::string(point.data) + "/payload.txt";
   const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
   std::array<char, 11> payload {};
@@ -422,8 +424,9 @@ void TestAddContent(const std::filesystem::path& root) {
             FileSystem::KernelClose(fd) == OK,
         "guest reads files from the selected title's add-on");
   MountPoint repeated {};
-  Check(mount(0, &info[3].label, &repeated) == static_cast<int>(0x80d90003u),
-        "duplicate mount returns BUSY");
+  Check(mount(0, &info[3].label, &repeated) == OK &&
+            std::strcmp(repeated.data, point.data) == 0,
+        "duplicate mount returns the same mount point");
   Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
             unmount(&point) == static_cast<int>(0x80d90004u),
         "unmount removes mapping and repeated unmount reports NOT_MOUNTED");

@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace Libs::Controller {
@@ -119,8 +120,7 @@ public:
 	int ClosePort(int handle);
 	int CheckPortHandle(int handle);
 
-	void Connect(int id);
-	void Disconnect(int id);
+	void SetDevices(int active_id);
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
 	void RightStick(int id, int x, int y);
@@ -130,7 +130,6 @@ public:
 	void ResetOrientation();
 	void ToggleGyroEmulation(int id);
 	void ResetInputState();
-	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	int  GetActiveControllerId();
@@ -151,7 +150,6 @@ private:
 
 	const int m_player;
 
-	void CheckActive();
 	void AddState();
 	// Emulated tilt: the right stick drives pitch and roll instead of the stick axes.
 	void UpdateEmulatedTilt();
@@ -162,7 +160,6 @@ private:
 
 	Common::Mutex    m_mutex;
 	PortState        m_port_state      = PortState::Uninitialized;
-	std::vector<int> m_connected_ids;
 	int              m_active_id       = -1;
 	bool             m_connected       = false;
 	int              m_connected_count = 0;
@@ -189,13 +186,16 @@ private:
 	std::array<std::atomic<uint32_t>, 3> m_setting_steps {};
 };
 
-static GameController* g_players[Config::MAX_PLAYERS] = {};
+static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_players;
 
 // Maps host gamepads to players; the keyboard follows the configured keyboard player.
 static Common::Mutex g_router_mutex;
 static std::vector<std::pair<int, int>> g_pad_players;
 
 static uint32_t g_keyboard_player = 0;
+
+static void RefreshPlayers();
+static void StopHostPad(SDL_Gamepad* pad);
 
 static int KeyboardPlayer() {
 	return g_keyboard_player == 0 ? 0 : static_cast<int>(g_keyboard_player) - 1;
@@ -204,19 +204,20 @@ static int KeyboardPlayer() {
 // Caller holds g_router_mutex.
 static GameController* PlayerForDevice(int id) {
 	if (id == HOST_INPUT_CONTROLLER_ID) {
-		return g_players[KeyboardPlayer()];
+		return g_players[KeyboardPlayer()].get();
 	}
 	for (const auto& [pad, player]: g_pad_players) {
 		if (pad == id) {
-			return g_players[player];
+			return player >= 0 ? g_players[player].get() : nullptr;
 		}
 	}
 	return nullptr;
 }
 
 static GameController* PlayerForHandle(int handle) {
-	const int player = handle - PAD_HANDLE;
-	return player >= 0 && player < Config::MAX_PLAYERS ? g_players[player] : nullptr;
+	return handle >= PAD_HANDLE && handle < PAD_HANDLE + Config::MAX_PLAYERS
+	           ? g_players[handle - PAD_HANDLE].get()
+	           : nullptr;
 }
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
@@ -261,7 +262,7 @@ constexpr std::array SPEAKER_VOLUME = {1.0f, 0.0f, 0.02f, 0.12f, 0.42f};
 constexpr std::array INTENSITY      = {1.0f, 0.0f, 0.33f, 0.66f};
 
 void CycleSetting(Setting setting) {
-	for (auto* player: g_players) {
+	for (const auto& player: g_players) {
 		if (player != nullptr) {
 			player->CycleSetting(setting);
 		}
@@ -442,41 +443,50 @@ void Initialize() {
 	EXIT_IF(g_players[0] != nullptr);
 
 	for (int i = 0; i < Config::MAX_PLAYERS; i++) {
-		g_players[i] = new GameController(i);
+		g_players[i] = std::make_unique<GameController>(i);
 	}
 	g_keyboard_player = Config::GetKeyboardPlayer();
-	Connect(HOST_INPUT_CONTROLLER_ID);
+	RefreshPlayers();
 }
 
 void Shutdown() {
 	EmergencyShutdown();
-	for (auto*& player: g_players) {
-		delete player;
-		player = nullptr;
+	for (auto& player: g_players) {
+		player.reset();
 	}
 }
 
 void EmergencyShutdown() {
 	Common::LockGuard lock(g_router_mutex);
-	for (auto* player: g_players) {
-		if (player != nullptr) {
-			player->ReleaseHostPads();
+	DualSenseHaptics::Shutdown();
+	std::vector<SDL_Gamepad*> pads;
+	for (const auto& [id, player]: g_pad_players) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id))) {
+			StopHostPad(pad);
+			pads.push_back(pad);
+		}
+	}
+	if (!pads.empty()) {
+		SDL_Delay(RELEASE_FLUSH_MS);
+		for (auto* pad: pads) {
+			SDL_CloseGamepad(pad);
 		}
 	}
 	g_pad_players.clear();
+	for (const auto& player: g_players) {
+		if (player != nullptr) {
+			player->SetDevices(-1);
+		}
+	}
 }
 
-void GameController::Connect(int id) {
+void GameController::SetDevices(int active_id) {
 	Common::LockGuard lock(m_mutex);
-
-	if (std::find(m_connected_ids.begin(), m_connected_ids.end(), id) != m_connected_ids.end()) {
+	if (m_active_id == active_id) {
 		return;
 	}
-
-	m_connected_ids.push_back(id);
-
-	if (id != HOST_INPUT_CONTROLLER_ID) {
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
+	if (active_id != HOST_INPUT_CONTROLLER_ID && active_id != -1) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(active_id));
 		    pad != nullptr) {
 			if (const auto& color = Config::GetControllerColor()) {
 				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
@@ -490,42 +500,11 @@ void GameController::Connect(int id) {
 		}
 	}
 
-	CheckActive();
-}
-
-void GameController::Disconnect(int id) {
-	Common::LockGuard lock(m_mutex);
-
-	const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
-	EXIT_IF(it == m_connected_ids.end());
-
-	m_connected_ids.erase(it);
-
-	CheckActive();
-}
-
-void GameController::CheckActive() {
-	int  new_active_id = -1;
-	bool new_connected = false;
-
-	if (!m_connected_ids.empty()) {
-		new_active_id = m_connected_ids[0];
-		for (const auto id: m_connected_ids) {
-			if (id != HOST_INPUT_CONTROLLER_ID) {
-				new_active_id = id;
-				break;
-			}
-		}
-		new_connected = true;
-	}
-
-	if (m_connected == new_connected && m_active_id == new_active_id) {
-		return;
-	}
+	const bool new_connected = active_id != -1;
 	if (!m_connected && new_connected) {
 		m_connected_count++;
 	}
-	m_active_id     = new_active_id;
+	m_active_id     = active_id;
 	m_connected     = new_connected;
 	m_state         = {};
 	m_gyro_time     = 0;
@@ -557,7 +536,7 @@ void GameController::AddState() {
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
-	// The keyboard shares the player-1 pad with the active gamepad.
+	// Keyboard events are routed to the configured player's port.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
@@ -842,39 +821,16 @@ void GameController::ResetInputState() {
 	AddState();
 }
 
-void GameController::ReleaseHostPads() {
-	Common::LockGuard lock(m_mutex);
-	DualSenseHaptics::Shutdown();
-
-	std::vector<SDL_Gamepad*> pads;
-	for (const auto id: m_connected_ids) {
-		if (id == HOST_INPUT_CONTROLLER_ID) {
-			continue;
-		}
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
-		    pad != nullptr) {
-			if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
-				DualSenseEffects effect {};
-				effect.enable_bits     = 0x0c;
-				effect.right_trigger[0] = 0x05;
-				effect.left_trigger[0]  = 0x05;
-				(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
-			}
-			(void)SDL_RumbleGamepad(pad, 0, 0, 0);
-			(void)SDL_SetGamepadLED(pad, 0, 0, 0);
-			pads.push_back(pad);
-		}
+static void StopHostPad(SDL_Gamepad* pad) {
+	if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
+		DualSenseEffects effect {};
+		effect.enable_bits     = 0x0c;
+		effect.right_trigger[0] = 0x05;
+		effect.left_trigger[0]  = 0x05;
+		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 	}
-
-	if (!pads.empty()) {
-		SDL_Delay(RELEASE_FLUSH_MS);
-		for (auto* pad: pads) {
-			SDL_CloseGamepad(pad);
-		}
-	}
-
-	m_connected_ids.clear();
-	CheckActive();
+	(void)SDL_RumbleGamepad(pad, 0, 0, 0);
+	(void)SDL_SetGamepadLED(pad, 0, 0, 0);
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
@@ -1045,69 +1001,78 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 	return ret_num;
 }
 
-static void ConnectLocked(int id);
+// Keep every opened pad, including those waiting for a free player slot.
+// Caller holds g_router_mutex.
+static void RefreshPlayers() {
+	std::array<bool, Config::MAX_PLAYERS> taken {};
+	const int keyboard = KeyboardPlayer();
+	if (g_keyboard_player != 0) {
+		taken[keyboard] = true;
+	}
+	for (auto& [id, player]: g_pad_players) {
+		if (g_keyboard_player != 0 && player == keyboard) {
+			player = -1;
+		}
+		if (player >= 0) {
+			taken[player] = true;
+		}
+	}
+	for (auto& [id, player]: g_pad_players) {
+		if (player >= 0) {
+			continue;
+		}
+		const auto free = std::find(taken.begin(), taken.end(), false);
+		if (free != taken.end()) {
+			player = static_cast<int>(free - taken.begin());
+			*free  = true;
+			LOGF("Controller %d assigned to player %d\n", id, player + 1);
+		}
+	}
+	std::array<int, Config::MAX_PLAYERS> active;
+	active.fill(-1);
+	active[keyboard] = HOST_INPUT_CONTROLLER_ID;
+	for (const auto& [id, player]: g_pad_players) {
+		if (player >= 0) {
+			active[player] = id;
+		}
+	}
+	// Stop old owners before configuring new owners of the same physical pad.
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		const int previous = g_players[player]->GetActiveControllerId();
+		if (previous != active[player]) {
+			if (player == 0) {
+				(void)DualSenseHaptics::SetVibration(previous, 0, 0, 0);
+			}
+			if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(previous))) {
+				StopHostPad(pad);
+			}
+		}
+	}
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		g_players[player]->SetDevices(active[player]);
+	}
+}
 
 void Connect(int id) {
 	Common::LockGuard lock(g_router_mutex);
-	ConnectLocked(id);
-}
-
-static void ConnectLocked(int id) {
-	if (id == HOST_INPUT_CONTROLLER_ID) {
-		g_players[KeyboardPlayer()]->Connect(id);
+	if (std::any_of(g_pad_players.begin(), g_pad_players.end(),
+	                [id](const auto& pad) { return pad.first == id; })) {
 		return;
 	}
-	if (PlayerForDevice(id) != nullptr) {
-		return;
-	}
-
-	// A dedicated keyboard player is skipped; otherwise the keyboard shares its player with a pad.
-	const int keyboard_player = g_keyboard_player != 0 ? KeyboardPlayer() : -1;
-	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
-		const bool taken = player == keyboard_player ||
-		                   std::any_of(g_pad_players.begin(), g_pad_players.end(),
-		                               [player](const auto& p) { return p.second == player; });
-		if (!taken) {
-			g_pad_players.emplace_back(id, player);
-			g_players[player]->Connect(id);
-			LOGF("Controller %d assigned to player %d\n", id, player + 1);
-			return;
-		}
-	}
-	LOGF("Controller %d ignored: all %d players are taken\n", id, Config::MAX_PLAYERS);
+	g_pad_players.emplace_back(id, -1);
+	RefreshPlayers();
 }
 
 void Disconnect(int id) {
 	Common::LockGuard lock(g_router_mutex);
-
-	auto* player = PlayerForDevice(id);
-	if (player == nullptr) {
-		return;
-	}
-	player->Disconnect(id);
-	std::erase_if(g_pad_players, [id](const auto& p) { return p.first == id; });
+	std::erase_if(g_pad_players, [id](const auto& pad) { return pad.first == id; });
+	RefreshPlayers();
 }
 
 void CycleKeyboardPlayer() {
 	Common::LockGuard lock(g_router_mutex);
-	if (g_players[0] == nullptr) {
-		return;
-	}
-
-	// Disconnect everything, then reconnect in the original order under the new setting.
-	std::vector<int> pads;
-	for (const auto& [pad, player]: g_pad_players) {
-		g_players[player]->Disconnect(pad);
-		pads.push_back(pad);
-	}
-	g_pad_players.clear();
-	g_players[KeyboardPlayer()]->Disconnect(HOST_INPUT_CONTROLLER_ID);
-
 	g_keyboard_player = (g_keyboard_player + 1) % (Config::MAX_PLAYERS + 1);
-	ConnectLocked(HOST_INPUT_CONTROLLER_ID);
-	for (const auto pad: pads) {
-		ConnectLocked(pad);
-	}
+	RefreshPlayers();
 	if (g_keyboard_player == 0) {
 		LOGF("Keyboard shared with player 1\n");
 	} else {
@@ -1158,18 +1123,15 @@ void ToggleGyroEmulation(int id) {
 }
 
 void ResetInputState() {
-	for (auto* player: g_players) {
+	for (const auto& player: g_players) {
 		if (player != nullptr) {
 			player->ResetInputState();
 		}
 	}
 }
 
-int GetActiveControllerId(int player) {
-	if (player < 0 || player >= Config::MAX_PLAYERS || g_players[player] == nullptr) {
-		return -1;
-	}
-	return g_players[player]->GetActiveControllerId();
+int GetActiveControllerId() {
+	return g_players[0] != nullptr ? g_players[0]->GetActiveControllerId() : -1;
 }
 
 bool IsPlayerConnected(int player) {
@@ -1248,7 +1210,7 @@ int PadCheckHandle(int handle) {
 
 int KYTY_SYSV_ABI PadInit() {
 	PRINT_NAME();
-	for (auto* player: g_players) {
+	for (const auto& player: g_players) {
 		(void)player->InitPort();
 	}
 	return OK;
@@ -1263,9 +1225,8 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 	     "\t param   = 0x%016" PRIx64 "\n",
 	     user_id, type, index, reinterpret_cast<uint64_t>(param));
 
-	// An unknown user falls back to player 1's port, which rejects it with the usual error.
-	const int player = std::max(Config::GetPlayerFromUserId(user_id), 0);
-	return g_players[player]->OpenPort(user_id, type, index);
+	const int player = Config::GetPlayerFromUserId(user_id);
+	return player >= 0 ? g_players[player]->OpenPort(user_id, type, index) : PAD_ERROR_INVALID_ARG;
 }
 
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
@@ -1276,8 +1237,9 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 	     "\t index   = %d\n",
 	     user_id, type, index);
 
-	const int player = std::max(Config::GetPlayerFromUserId(user_id), 0);
-	return g_players[player]->GetPortHandle(user_id, type, index);
+	const int player = Config::GetPlayerFromUserId(user_id);
+	return player >= 0 ? g_players[player]->GetPortHandle(user_id, type, index)
+	                   : PAD_ERROR_NO_HANDLE;
 }
 
 int KYTY_SYSV_ABI PadClose(int handle) {
@@ -1407,8 +1369,8 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	bool            connected       = false;
 	ControllerState states[64]      = {};
 
-	auto* player    = PlayerForHandle(handle);
-	int   ret_num   = player->ReadStates(states, num, &connected, &connected_count);
+	auto* player  = PlayerForHandle(handle);
+	int   ret_num = player->ReadStates(states, num, &connected, &connected_count);
 
 	if (!connected || ret_num == 0) {
 		if (connected) {
@@ -1426,6 +1388,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 	PRINT_NAME();
+	Common::LockGuard lock(g_router_mutex);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
@@ -1455,6 +1418,7 @@ int KYTY_SYSV_ABI PadResetLightBar(int handle) {
 
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 	PRINT_NAME();
+	Common::LockGuard lock(g_router_mutex);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
@@ -1470,6 +1434,7 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 
 int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param) {
 	PRINT_NAME();
+	Common::LockGuard lock(g_router_mutex);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;

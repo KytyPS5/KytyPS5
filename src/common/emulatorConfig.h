@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <array>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -37,11 +38,14 @@ constexpr int32_t DEFAULT_USER_ID           = 1000;
 
 constexpr int     MAX_PLAYERS         = 4;
 constexpr int32_t PLAYER_USER_ID_STEP = 0x100;
+constexpr int32_t MAX_USER_ID =
+    std::numeric_limits<int32_t>::max() - (MAX_PLAYERS - 1) * PLAYER_USER_ID_STEP;
 
 constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 	constexpr int32_t USER_ID_EVERYONE = 0xfe;
 	constexpr int32_t USER_ID_SYSTEM   = 0xff;
-	return user_id >= 0 && user_id != USER_ID_EVERYONE && user_id != USER_ID_SYSTEM;
+	return user_id >= 0 && user_id <= MAX_USER_ID && user_id != USER_ID_EVERYONE &&
+	       user_id != USER_ID_SYSTEM;
 }
 
 struct ConfigOptions {
@@ -55,7 +59,7 @@ struct ConfigOptions {
 	uint32_t               controller_vibration_intensity = 100;
 	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
 	uint32_t               keyboard_player                = 0;
-	PresentMode             present_mode                = PresentMode::Mailbox;
+	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;

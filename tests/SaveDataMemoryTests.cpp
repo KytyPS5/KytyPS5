@@ -378,7 +378,7 @@ void TestClassicSavePaths() {
 		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
 	}
 	Reset("CLASSIC");
-	for (const char* text: {"", ".", "..", "../save1", "save/1", "save\\1"}) {
+	for (const char* text: {"", ".", "..", "../save1", "save/1", "save\\1", "[users]"}) {
 		auto                  name = DirName(text);
 		struct SaveDataMount3 mount {};
 		mount.user_id    = 1;
@@ -394,6 +394,57 @@ void TestClassicSavePaths() {
 		CHECK(SaveDataDelete(&del) == SAVE_DATA_ERROR_PARAMETER);
 	}
 	CHECK(Search(1) == names);
+}
+
+void TestGuestSaveIsolation() {
+	Reset("MULTIUSER");
+	const auto name = DirName("slot");
+	const std::array<int32_t, 3> users {Config::GetUserId(), Config::GetPlayerUserId(1),
+	                                  Config::GetPlayerUserId(2)};
+	std::array<fs::path, users.size()> paths;
+	for (size_t i = 0; i < users.size(); ++i) {
+		CHECK(Search(users[i]).empty());
+		struct SaveDataMount3 mount {};
+		mount.user_id    = users[i];
+		mount.dir_name   = &name;
+		mount.mount_mode = 4;
+		mount.blocks     = 48;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK);
+		paths[i] = g_mounted_directory;
+		std::ofstream(paths[i] / "progress") << users[i];
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+		CHECK(Search(users[i]) == std::vector<std::string> {"slot"});
+	}
+	CHECK(paths[0] == fs::path("_SaveData") / "MULTIUSER" / "slot");
+	CHECK(paths[0] != paths[1] && paths[1] != paths[2] && paths[0] != paths[2]);
+	SceSaveDataTitleId title {};
+	std::strcpy(title.data, "MULTIUSER");
+	Reset("OTHER");
+	for (size_t i = 0; i < users.size(); ++i) {
+		CHECK(Search(users[i]).empty());
+		CHECK(Search(users[i], &title) == std::vector<std::string> {"slot"});
+		struct SaveDataTransferringMount transfer {};
+		transfer.user_id  = users[i];
+		transfer.title_id = &title;
+		transfer.dir_name = &name;
+		SaveDataMountResult result {};
+		CHECK(SaveDataTransferringMount(&transfer, &result) == OK);
+		CHECK(g_mounted_directory == paths[i]);
+		std::ifstream progress(paths[i] / "progress");
+		int saved_user = -1;
+		progress >> saved_user;
+		CHECK(saved_user == users[i]);
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	}
+	struct SaveDataDelete remove {};
+	remove.user_id  = users[1];
+	remove.title_id = &title;
+	remove.dir_name = &name;
+	CHECK(SaveDataDelete(&remove) == OK);
+	CHECK(Search(users[1], &title).empty());
+	CHECK(Search(users[0], &title) == std::vector<std::string> {"slot"});
+	CHECK(Search(users[2], &title) == std::vector<std::string> {"slot"});
 }
 
 void TestSaveAllocations() {
@@ -596,6 +647,7 @@ void RunChild(const fs::path& executable, const char* mode) {
 } // namespace
 
 int main(int argc, char** argv) {
+	Config::Initialize();
 	if (argc == 2) {
 		if (std::string_view(argv[1]) == "write") {
 			WriteRestartFixture();
@@ -603,6 +655,7 @@ int main(int argc, char** argv) {
 			CHECK(std::string_view(argv[1]) == "read");
 			ReadRestartFixture();
 		}
+		Config::Shutdown();
 		return 0;
 	}
 	const auto executable = fs::absolute(argv[0]);
@@ -617,10 +670,12 @@ int main(int argc, char** argv) {
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
 	TestClassicSavePaths();
+	TestGuestSaveIsolation();
 	TestSaveAllocations();
 	TestClassicSaveParams();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);
+	Config::Shutdown();
 	return 0;
 }

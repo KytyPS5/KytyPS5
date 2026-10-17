@@ -209,6 +209,7 @@ static void ListInit(QComboBox* combo, T value) {
 void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
+	m_ui->spinBox_user_id->setMaximum(Config::MAX_USER_ID);
 	m_ui->spinBox_user_id->setValue(info.user_id);
 	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
 	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
@@ -216,7 +217,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	auto* keyboard_player = m_ui->comboBox_keyboard_player;
 	keyboard_player->clear();
 	keyboard_player->addItem(tr("Shared with player 1 (default)"), 0);
-	for (int player = 1; player <= 4; player++) {
+	for (int player = 1; player <= Config::MAX_PLAYERS; player++) {
 		keyboard_player->addItem(tr("Player %1").arg(player), player);
 	}
 	keyboard_player->setCurrentIndex(

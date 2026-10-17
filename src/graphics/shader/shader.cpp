@@ -438,7 +438,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
 		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.domain, tess.partitioning, tess.output_topology});
+		                       tess.domain, tess.partitioning, tess.output_topology,
+		                       tess.patch_base, tess.patch_size});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -646,7 +647,11 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {
+		// The strides stay zero; translating the stages then reports the unsupported interface.
+		LOGF("Tessellation interface not reflected: LS 0x%016" PRIx64 " HS 0x%016" PRIx64 "\n",
+		     local_hash, control_hash);
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}

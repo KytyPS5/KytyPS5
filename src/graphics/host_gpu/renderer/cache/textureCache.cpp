@@ -422,6 +422,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, id](uint64_t page) { m_image_page_table[page].push_back(id); });
+	m_region_generation++;
 	image.registered         = true;
 	image.lru_id             = m_lru_cache.Insert(id, m_gc_tick);
 	image.frame_touched_last = m_frame_index.load(std::memory_order_relaxed);
@@ -445,6 +446,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_region_generation++;
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -646,6 +648,28 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
+	const auto key   = (address >> 12u) * 0x9e3779b97f4a7c15ull ^ size ^ (page_overlap ? 1u : 0u);
+	auto&      entry = m_region_queries[(key ^ (key >> 29u)) % m_region_queries.size()];
+	if (entry.generation == m_region_generation && entry.address == address && entry.size == size &&
+	    entry.page_overlap == page_overlap) {
+		ImageIds result;
+		for (const auto id: entry.ids) {
+			result.push_back(id);
+		}
+		return result;
+	}
+	auto result        = FindImagesInRegionUncached(address, size, page_overlap);
+	entry.generation   = m_region_generation;
+	entry.address      = address;
+	entry.size         = size;
+	entry.page_overlap = page_overlap;
+	entry.ids.clear();
+	result.ForEach([&](ImageId id) { entry.ids.push_back(id); });
+	return result;
+}
+
+TextureCache::ImageIds TextureCache::FindImagesInRegionUncached(uint64_t address, uint64_t size,
+                                                                bool page_overlap) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return {};

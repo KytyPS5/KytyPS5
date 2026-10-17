@@ -317,6 +317,17 @@ struct TextureCacheTestAccess {
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
 
+  // FindImagesInRegion through the memo, or a fresh walk of the page owner index.
+  static std::vector<ImageId> RegionQuery(TextureCache &cache, uint64_t address, uint64_t size,
+                                          bool memo) {
+    std::lock_guard lock(cache.m_lock);
+    const auto ids = memo ? cache.FindImagesInRegion(address, size, false)
+                          : cache.FindImagesInRegionUncached(address, size, false);
+    std::vector<ImageId> result;
+    ids.ForEach([&](ImageId id) { result.push_back(id); });
+    return result;
+  }
+
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
@@ -397,7 +408,8 @@ struct TextureCacheTestAccess {
   static std::vector<ImageId> FindImages(TextureCache &cache, uint64_t address,
                                          uint64_t size, bool page_overlap) {
     std::lock_guard lock(cache.m_lock);
-    const auto found = cache.FindImagesInRegion(address, size, page_overlap);
+    // The page-owner walk itself; RegionQuery covers the memo in front of it.
+    const auto found = cache.FindImagesInRegionUncached(address, size, page_overlap);
     std::vector<ImageId> result;
     result.reserve(found.size());
     for (const auto id : found) {
@@ -434,6 +446,7 @@ struct TextureCacheTestAccess {
         .m_image_page_table[static_cast<size_t>(
             address >> TextureCache::ImagePageTable::kPageBits)]
         .push_back(id);
+    cache.m_region_generation++;
   }
 
   static bool RemovePageOwner(TextureCache &cache, uint64_t address,
@@ -441,6 +454,7 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
+    cache.m_region_generation++;
     return owners != nullptr && owners->Erase(id);
   }
 
@@ -21188,6 +21202,8 @@ public:
             "stencil plane direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
+
+#include "RegionQueryMemoTests.inc"
 
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
@@ -62165,6 +62181,11 @@ int main(int argc, char **argv) {
     CheckScalarSelectIntoVccFeedsDescriptor(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--region-query-memo-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRegionQueryMemo();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--layout-memo-only") == 0) {
     CheckImageLayoutMemo();
     return 0;
@@ -63019,6 +63040,7 @@ int main(int argc, char **argv) {
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    vulkan.CheckRegionQueryMemo();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
     return 0;

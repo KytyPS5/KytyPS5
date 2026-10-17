@@ -193,12 +193,15 @@ void VisitInput(Info& info, F& field) {
 		for (auto& mapping: info.target_export_mapping) {
 			field(mapping.packed);
 		}
+		field(info.target_packed_unorm_mask);
+		field(info.target_round_mode);
 		field(info.scratch_size_dwords);
 		field(info.ps_pos_x);
 		field(info.ps_pos_y);
 		field(info.ps_pos_z);
 		field(info.ps_pos_w);
 		field(info.ps_front_face);
+		field(info.ps_front_face_all_bits);
 		field(info.ps_ancillary);
 		field(info.ps_no_perspective);
 		field(info.parameter_mode);
@@ -207,6 +210,7 @@ void VisitInput(Info& info, F& field) {
 		field(info.ps_sample_mask_export_enable);
 		field(info.ps_sample_shading);
 		field(info.dual_source_blending);
+		field(info.object_primitive_id);
 		field(info.alpha_blend_source);
 		field(info.ps_early_z);
 		field(info.ps_execute_on_noop);

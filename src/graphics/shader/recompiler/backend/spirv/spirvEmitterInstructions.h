@@ -238,7 +238,7 @@ uint32_t              EmitBallot(ValueEmitContext& ctx, IR::Value predicate);
 uint32_t              EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);

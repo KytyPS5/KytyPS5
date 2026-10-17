@@ -2366,6 +2366,161 @@ void TestGuardedDirectImageTable() {
   }
 }
 
+void TestImageCounterLoopBound() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  namespace Prospero = Libs::Graphics::Prospero;
+  enum class Update { None, Shifted, NestedShifted, WrongMask, Raw, Increasing, CarriedRaw,
+                      Stops, PartialStop };
+  const auto make_plan = [](Update update, bool masked_index = false, bool restore_active = false) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto branch = [](Block *from, Block *to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    branch(entry, header);
+    header->AddBranch(exit);
+    header->AddBranch(body);
+    header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = exit, .false_block = body};
+    branch(body, header);
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    std::array<Value, 8> counter_words;
+    for (uint32_t word = 0; word < counter_words.size(); ++word)
+      counter_words[word] = fixture.UserData(word + 2u);
+    MemoryInfo image_memory;
+    image_memory.kind = ResourceKind::Image;
+    image_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    image_memory.data_dwords = 1u;
+    image_memory.dmask = 1u;
+    const auto counter = fixture.Emit(ValueOpcode::ImageRead,
+        {fixture.Image(counter_words, 4u), fixture.ImageAddress(), Value(true)},
+        fixture.AddMemory(image_memory, 4u));
+    const auto initial = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {counter, Value(0u)});
+    const auto local = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32, {local, Value(0u)});
+    auto &key = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &count = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &active = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    const auto in_range = fixture.Emit(ValueOpcode::ULessThan32, {Value(&key), Value(&count)}, 0, header);
+    const auto execute = fixture.Emit(ValueOpcode::LogicalAnd, {Value(&active), in_range}, 0, header);
+    const auto stopped = fixture.Emit(ValueOpcode::LogicalNot, {execute}, 0, header);
+    header->condition = fixture.Emit(ValueOpcode::ConditionRef, {stopped},
+                                     CFG::BranchCondition::ExecZero, header);
+    fixture.block = body;
+    const auto table = fixture.Address(fixture.UserData(0u), fixture.UserData(1u));
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(&key), Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = 0x100u + word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x20u));
+    }
+    const auto read = fixture.Emit(ValueOpcode::ImageRead,
+        {fixture.Image(words, 0x24u), fixture.ImageAddress(), execute},
+        fixture.AddMemory(image_memory, 0x24u));
+    const auto raw = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {read, Value(0u)});
+    fixture.Emit(ValueOpcode::ReferenceU32, {raw});
+    const auto unrelated = fixture.Emit(ValueOpcode::IEqual32, {local, Value(7u)});
+    auto &carried = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    carried.AddPhiOperand(entry, local);
+    carried.AddPhiOperand(body, raw);
+    auto next = Value(&count);
+    if (update != Update::None) {
+      const auto shifted = fixture.Emit(ValueOpcode::ShiftRightLogical32, {raw, Value(20u)});
+      auto preserved = fixture.Emit(ValueOpcode::SelectU32,
+          {update == Update::WrongMask ? unrelated : execute, shifted,
+           update == Update::CarriedRaw ? Value(&carried) : raw});
+      if (update == Update::NestedShifted)
+        preserved = fixture.Emit(ValueOpcode::SelectU32, {unrelated, preserved,
+            fixture.Emit(ValueOpcode::SelectU32, {execute,
+                fixture.Emit(ValueOpcode::BitwiseAnd32, {raw, Value(3u)}), raw})});
+      const auto index = masked_index
+          ? fixture.Emit(ValueOpcode::BitwiseAnd32, {Value(&key), Value(255u)}) : Value(&key);
+      const auto writes = fixture.Emit(ValueOpcode::LogicalAnd,
+          {execute, fixture.Emit(ValueOpcode::IEqual32, {index, Value(6u)})});
+      next = fixture.Emit(ValueOpcode::SelectU32,
+          {writes, update == Update::Raw ? raw : update == Update::Increasing
+              ? fixture.Emit(ValueOpcode::IAdd32, {Value(&count), Value(1u)}) : preserved,
+           update == Update::CarriedRaw ? Value(&carried) : Value(&count)});
+      if (update == Update::Stops || update == Update::PartialStop) {
+        const auto later = fixture.Emit(ValueOpcode::LogicalAnd,
+            {execute, fixture.Emit(ValueOpcode::IEqual32, {index, Value(10u)})});
+        next = fixture.Emit(ValueOpcode::SelectU32, {later, preserved, Value(&count)});
+        const auto stops = update == Update::PartialStop
+            ? fixture.Emit(ValueOpcode::LogicalAnd, {writes, unrelated}) : writes;
+        next = fixture.Emit(ValueOpcode::SelectU32,
+            {stops, fixture.Emit(ValueOpcode::BitwiseAnd32, {raw, Value(3u)}), next});
+      }
+    }
+    key.AddPhiOperand(entry, Value(0u));
+    key.AddPhiOperand(body, fixture.Emit(ValueOpcode::IAdd32, {Value(&key), Value(1u)}));
+    count.AddPhiOperand(entry, initial);
+    count.AddPhiOperand(body, next);
+    active.AddPhiOperand(entry, initial_active);
+    active.AddPhiOperand(body, restore_active ? initial_active : execute);
+    fixture.PlanAndTrack();
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto check_bound = [](auto &&plan, Prospero::BufferFormat counter_format,
+                              Prospero::BufferFormat row_format, uint32_t expected,
+                              const char *reason, std::initializer_list<uint32_t> rows = {6u}) {
+    const auto &indirect = plan.descriptor_sources[plan.info.images[1].source].indirect_descriptor;
+    Check(indirect && !indirect->key_count.IsEmpty(), "image counter did not bound its descriptor loop");
+    LinearTestMemory metadata;
+    std::array<uint32_t, 10> data{static_cast<uint32_t>(metadata.base), 0u, 0u,
+                                  static_cast<uint32_t>(counter_format) << 20u};
+    for (const uint32_t row : rows)
+      metadata.words[(0x100u + row * 32u + 4u) / 4u] = static_cast<uint32_t>(row_format) << 20u;
+    FakeGuestMemory fake(ReadLinearTestMemory, &metadata);
+    uint32_t bound = 0u;
+    Check(EvaluateSrtValue(plan, {.user_data = data}, indirect->key_count, bound) &&
+              bound == expected, reason);
+  };
+  for (const auto update : {Update::None, Update::Shifted, Update::NestedShifted}) {
+    auto plan = make_plan(update);
+    for (const auto [format, maximum] : {
+        std::pair{Prospero::BufferFormat::k8UInt, 255u},
+        std::pair{Prospero::BufferFormat::k8_8_8_8UInt, 255u},
+        std::pair{Prospero::BufferFormat::k16UInt, 65535u},
+        std::pair{Prospero::BufferFormat::k16_16UInt, 65535u},
+        std::pair{Prospero::BufferFormat::k32UInt, UINT32_MAX},
+        std::pair{Prospero::BufferFormat::k8UNorm, UINT32_MAX}})
+      check_bound(plan, format, Prospero::BufferFormat::k32UInt,
+                  std::max(maximum, update != Update::None ? 4095u : 0u),
+                  "image counter bound ignored its format or a predicated relative write");
+  }
+  for (const bool masked_index : {false, true}) {
+    auto plan = make_plan(Update::Shifted, masked_index);
+    for (const bool byte_counter : {false, true})
+      for (const auto format : {Prospero::BufferFormat::k8UInt,
+                                Prospero::BufferFormat::k16UInt,
+                                Prospero::BufferFormat::k32UInt})
+        check_bound(plan,
+                    byte_counter ? Prospero::BufferFormat::k8UInt : Prospero::BufferFormat::k16UInt,
+                    format,
+                    format != Prospero::BufferFormat::k32UInt ? 7u : !byte_counter ? 65535u : 4095u,
+                    "relative image-count write lost its narrow loop invariant or ignored a wide source");
+  }
+  for (const auto update : {Update::WrongMask, Update::Raw, Update::Increasing, Update::CarriedRaw})
+    CheckFatal([&] { make_plan(update); }, "not a valid runtime value",
+               "image counter loop accepted an unbounded or incorrectly predicated write");
+  check_bound(make_plan(Update::Shifted, true, true), Prospero::BufferFormat::k8UInt,
+              Prospero::BufferFormat::k8UInt, 255u,
+              "a stopping write constrained lanes reactivated after its iteration");
+  for (const auto update : {Update::Stops, Update::PartialStop})
+    check_bound(make_plan(update, true), Prospero::BufferFormat::k8UInt,
+                Prospero::BufferFormat::k32UInt, update == Update::Stops ? 7u : 4095u,
+                "mandatory stopping write lost its final row or a partial write stopped other lanes",
+                {6u, 10u});
+}
+
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Clamp { None, Right, Left, Dynamic };
@@ -9679,6 +9834,7 @@ int main() {
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("image counter loop bound", TestImageCounterLoopBound);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("indexed material image keys", TestIndexedMaterialImageKeys);

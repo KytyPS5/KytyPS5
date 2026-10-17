@@ -1823,6 +1823,283 @@ private:
 		return value.Resolve();
 	}
 
+	Value RuntimeSelectorMaximum(Value value, Value key = {}, Value carried = {},
+	                             uint32_t key_maximum = UINT32_MAX, Value executing = {},
+	                             Value assumption = {}) {
+		const auto emit = [&](ValueOpcode op, std::initializer_list<Value> args) {
+			auto& node = m_program.value_storage.emplace_back(op);
+			size_t index = 0;
+			for (const auto arg: args) node.SetArg(index++, arg);
+			return Value(&node);
+		};
+		uint32_t remaining = 4096u;
+		const auto maximum = [&](Value a, Value b) {
+			if (a == Value(UINT32_MAX) || b == Value(UINT32_MAX)) return Value(UINT32_MAX);
+			if (a == Value(0u) || a == b) return b;
+			if (b == Value(0u)) return a;
+			return emit(ValueOpcode::UMax32, {a, b});
+		};
+		const auto matches_key = [&](Value candidate, uint32_t maximum_key) {
+			candidate = candidate.Resolve();
+			if (candidate == key) return true;
+			const auto* mask = candidate.TryInstruction();
+			if (mask == nullptr || mask->GetOpcode() != ValueOpcode::BitwiseAnd32) return false;
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
+				uint32_t bits;
+				if (mask->Arg(arg).Resolve() == key && ImmediateU32(mask->Arg(arg ^ 1u), bits) &&
+				    (bits & (bits + 1u)) == 0u && maximum_key <= bits) return true;
+			}
+			return false;
+		};
+		std::map<std::pair<const Inst*, const Inst*>, Value> projected;
+		const auto project = [&](auto&& self, Value at, Value guard, uint32_t depth) -> Value {
+			if (remaining == 0u) return Value(UINT32_MAX);
+			--remaining;
+			at = ActiveValue(at, guard);
+			if (depth > 64u || key.IsEmpty()) return at;
+			if (at == key) {
+				const auto equal = EqualLocalValue(guard, [&](Value candidate) {
+					return matches_key(candidate, key_maximum);
+				});
+				uint32_t literal;
+				if (ImmediateU32(equal, literal) && literal <= key_maximum) return equal;
+				return at;
+			}
+			if (ValidateRuntimeValue(m_program, at, RuntimeValueType::Integer)) return at;
+			const auto* inst = at.TryInstruction();
+			if (inst == nullptr || inst->GetOpcode() == ValueOpcode::Phi) return at;
+			const auto [cached, inserted] = projected.emplace(std::pair {inst, guard.TryInstruction()}, at);
+			if (!inserted) return cached->second;
+			Inst* copy = nullptr;
+			for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) {
+				const auto replacement = self(self, inst->Arg(arg), guard, depth + 1u);
+				if (replacement == inst->Arg(arg).Resolve()) continue;
+				if (copy == nullptr) {
+					copy = &m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
+					for (uint32_t i = 0; i < inst->NumArgs(); ++i) copy->SetArg(i, inst->Arg(i));
+				}
+				copy->SetArg(arg, replacement);
+			}
+			if (copy != nullptr) cached->second = Value(copy);
+			return cached->second;
+		};
+		bool image_bound = false;
+		std::vector<const Inst*> visiting;
+		const auto visit = [&](auto&& self, Value at, uint32_t depth, Value guard) -> Value {
+			if (remaining == 0u) return Value(UINT32_MAX);
+			--remaining;
+			at = guard.IsEmpty() ? at.Resolve() : ActiveValue(at, guard);
+			if (depth > 64u || at.GetType() != Type::U32) return Value(UINT32_MAX);
+			if (!carried.IsEmpty() && at == carried) return Value(key_maximum);
+			if (ValidateRuntimeValue(m_program, at, RuntimeValueType::Integer)) return at;
+			const auto* inst = at.TryInstruction();
+			if (inst == nullptr) return Value(UINT32_MAX);
+			// Only copies and non-increasing operations below can traverse a cycle.
+			if (std::ranges::find(visiting, inst) != visiting.end()) return Value(0u);
+			visiting.push_back(inst);
+			const auto finish = [&](Value result) { visiting.pop_back(); return result; };
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				if (inst->Parent() != nullptr) {
+					for (const auto& parallel: *inst->Parent()) {
+						const auto parallel_value = Value(const_cast<Inst*>(&parallel));
+						if (parallel.GetOpcode() != ValueOpcode::Phi ||
+						    !EquivalentValue(m_program, at, parallel_value)) continue;
+						const auto* bound = BoundedLoop(parallel_value, nullptr);
+						if (bound != nullptr && bound->GetOpcode() == ValueOpcode::ULessThan32) {
+							return finish(bound->Arg(1));
+						}
+					}
+				}
+				std::vector<Value> arguments;
+				// A current assignment mask does not constrain values from earlier iterations.
+				for (uint32_t arm = 0; arm < inst->NumArgs(); ++arm) {
+					arguments.push_back(self(self, inst->Arg(arm), depth + 1u, {}));
+					if (remaining == 0u) return finish(Value(UINT32_MAX));
+				}
+				if (arguments.empty() || std::ranges::find(arguments, Value(UINT32_MAX)) != arguments.end())
+					return finish(Value(UINT32_MAX));
+				if (inst->NumPhiBlocks() == arguments.size()) {
+					std::vector<uint32_t> predecessors;
+					for (uint32_t arm = 0; arm < arguments.size(); ++arm) {
+						const auto block = std::ranges::find(m_program.blocks, inst->PhiBlock(arm));
+						if (block == m_program.blocks.end()) break;
+						predecessors.push_back(static_cast<uint32_t>(block - m_program.blocks.begin()));
+					}
+					if (predecessors.size() == arguments.size()) {
+						auto& bound = m_program.value_storage.emplace_back(ValueOpcode::Phi, uint64_t(Type::U32));
+						for (const auto argument: arguments) bound.AddPhiOperand(nullptr, argument);
+						m_program.maximum_phi_predecessors.emplace(&bound, std::move(predecessors));
+						return finish(Value(&bound));
+					}
+				}
+				Value result(0u);
+				for (const auto argument: arguments) result = maximum(result, argument);
+				return finish(result);
+			}
+			if (inst->GetOpcode() == ValueOpcode::SelectU32) {
+				const auto selected = guard.IsEmpty() ? inst->Arg(0)
+				    : emit(ValueOpcode::LogicalAnd, {guard, inst->Arg(0)});
+				const auto a = self(self, inst->Arg(1), depth + 1u, selected);
+				const auto b = self(self, inst->Arg(2), depth + 1u, guard);
+				return finish(ValidateRuntimeValue(m_program, inst->Arg(0), RuntimeValueType::Integer)
+				    ? emit(ValueOpcode::SelectU32, {inst->Arg(0), a, b}) : maximum(a, b));
+			}
+			if (inst->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
+				uint32_t shift;
+				if (ImmediateU32(inst->Arg(1), shift)) {
+					const auto upper = self(self, inst->Arg(0), depth + 1u, guard);
+					return finish(upper == Value(UINT32_MAX) ? Value(UINT32_MAX >> (shift & 31u))
+					    : emit(ValueOpcode::ShiftRightLogical32, {upper, Value(shift & 31u)}));
+				}
+			}
+			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+				const auto bits = PossibleU32Bits(at);
+				return finish(Value(bits));
+			}
+			if (inst->GetOpcode() == ValueOpcode::CompositeExtractU32x4) {
+				const auto* read = inst->Arg(0).Resolve().TryInstruction();
+				const auto* handle = read != nullptr && read->GetOpcode() == ValueOpcode::ImageRead
+				    ? read->Arg(0).Resolve().TryInstruction() : nullptr;
+				if (handle != nullptr && handle->GetOpcode() == ValueOpcode::GetImageResource) {
+					DescriptorSource source;
+					const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+					MakeSource(*handle, 8u, false, false, memory.resource * 4u, source,
+					           read->Flags<MemoryFlags>().pc);
+					const auto word = !guard.IsEmpty() && !carried.IsEmpty()
+					    ? project(project, source.dwords[1], guard, 0u) : source.dwords[1];
+					if (ValidateRuntimeValue(m_program, word, RuntimeValueType::Integer)) {
+						const auto format = emit(ValueOpcode::BitFieldUExtract, {word, Value(20u), Value(9u)});
+						Value result(UINT32_MAX);
+						for (const auto [native, bits]: std::array {
+						    std::pair {Prospero::BufferFormat::k8UInt, 8u},
+						    std::pair {Prospero::BufferFormat::k8_8UInt, 8u},
+						    std::pair {Prospero::BufferFormat::k8_8_8_8UInt, 8u},
+						    std::pair {Prospero::BufferFormat::k16UInt, 16u},
+						    std::pair {Prospero::BufferFormat::k16_16UInt, 16u},
+						    std::pair {Prospero::BufferFormat::k16_16_16_16UInt, 16u}}) {
+							const auto matches = emit(ValueOpcode::IEqual32, {format, Value(static_cast<uint32_t>(native))});
+							result = emit(ValueOpcode::SelectU32, {matches, Value((1u << bits) - 1u), result});
+						}
+						image_bound = true;
+						return finish(result);
+					}
+				}
+			}
+			return finish(Value(UINT32_MAX));
+		};
+		const auto result = visit(visit, value, 0u, assumption);
+		if (remaining == 0u) return {};
+		auto original = image_bound && result != Value(UINT32_MAX) ? result : Value {};
+		if (key.IsEmpty() || !carried.IsEmpty()) return original;
+		const auto induction = MatchInduction(key,
+		    [](uint32_t first, uint32_t step) { return first == 0u && step == 1u; });
+		const auto parallel_phi = [&](const Inst* candidate) {
+			return candidate != nullptr && candidate->GetOpcode() == ValueOpcode::Phi &&
+			       candidate->Parent() == induction->phi->Parent() && candidate->NumArgs() == 2u &&
+			       candidate->NumPhiBlocks() == 2u &&
+			       candidate->PhiBlock(0) == induction->phi->PhiBlock(0) &&
+			       candidate->PhiBlock(1) == induction->phi->PhiBlock(1);
+		};
+		const auto* count = value.Resolve().TryInstruction();
+		if (original.IsEmpty() || !induction || !parallel_phi(count)) return original;
+		const auto next_value = count->Arg(induction->initial_arm ^ 1u);
+		const auto* active = executing.Resolve().TryInstruction();
+		bool shrinking = false;
+		if (active != nullptr && active->GetOpcode() == ValueOpcode::LogicalAnd) {
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
+				const auto* compare = active->Arg(arg).Resolve().TryInstruction();
+				const auto* mask = active->Arg(arg ^ 1u).Resolve().TryInstruction();
+				shrinking |= compare != nullptr && compare->GetOpcode() == ValueOpcode::ULessThan32 &&
+				    compare->Arg(0).Resolve() == key && compare->Arg(1).Resolve() == value &&
+				    parallel_phi(mask) &&
+				    mask->Arg(induction->initial_arm ^ 1u).Resolve() == executing;
+			}
+		}
+		if (shrinking) {
+			std::vector<Value> pending {next_value};
+			std::vector<const Inst*> visited;
+			std::vector<uint32_t> stops;
+			for (size_t at = 0; at < pending.size(); ++at) {
+				const auto* inst = pending[at].Resolve().TryInstruction();
+				if (inst == nullptr || inst == count || std::ranges::find(visited, inst) != visited.end()) continue;
+				visited.push_back(inst);
+				if (inst->GetOpcode() == ValueOpcode::IEqual32) {
+					for (uint32_t arg = 0; arg < 2u; ++arg) {
+						uint32_t index;
+						if (matches_key(inst->Arg(arg), 255u) &&
+						    ImmediateU32(inst->Arg(arg ^ 1u), index) && index < 255u)
+							stops.push_back(index);
+					}
+				}
+				if (inst->GetOpcode() == ValueOpcode::SelectU32 || inst->GetOpcode() == ValueOpcode::LogicalAnd ||
+				    inst->GetOpcode() == ValueOpcode::LogicalOr || inst->GetOpcode() == ValueOpcode::Phi)
+					for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) pending.push_back(inst->Arg(arg));
+			}
+			std::ranges::sort(stops);
+			stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
+			ResourcePlan evaluator;
+			for (const auto index: stops) {
+				std::map<const Inst*, Value> predicates;
+				const auto substitute = [&](auto&& self, Value at, uint32_t depth) -> Value {
+					at = at.Resolve();
+					if (at == key) return Value(index);
+					if (at == executing) return Value(true);
+					const auto* inst = at.TryInstruction();
+					if (depth > 32u || inst == nullptr) return at;
+					const auto op = inst->GetOpcode();
+					if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr &&
+					    op != ValueOpcode::LogicalNot && op != ValueOpcode::IEqual32 &&
+					    op != ValueOpcode::INotEqual32 && op != ValueOpcode::BitwiseAnd32) return at;
+					const auto [cached, inserted] = predicates.emplace(inst, at);
+					if (!inserted) return cached->second;
+					auto& copy = m_program.value_storage.emplace_back(op, inst->Flags<uint64_t>());
+					for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg)
+						copy.SetArg(arg, self(self, inst->Arg(arg), depth + 1u));
+					return cached->second = Value(&copy);
+				};
+				const auto normalize = [&](Value at) {
+					for (uint32_t depth = 0; depth < 32u; ++depth) {
+						at = at.Resolve();
+						if (at == key) return Value(index);
+						const auto* selected = at.TryInstruction();
+						if (selected == nullptr || selected->GetOpcode() != ValueOpcode::SelectU32) return at;
+						uint32_t condition;
+						const auto predicate = substitute(substitute, selected->Arg(0), 0u);
+						CompileSrtWalker(evaluator, {&predicate, 1});
+						std::vector<uint32_t> flat;
+						if (!WalkSrt(evaluator, {}, flat, nullptr) ||
+						    !WalkedValue(evaluator, predicate, condition)) return at;
+						at = selected->Arg(condition != 0u ? 1u : 2u);
+					}
+					return at;
+				};
+				// A mandatory write below the next index prevents every later table access.
+				if (PossibleU32Bits(next_value, normalize) <= index + 1u)
+					return emit(ValueOpcode::UMin32, {original, Value(index + 1u)});
+				const auto at_index = emit(ValueOpcode::LogicalAnd,
+				    {executing, emit(ValueOpcode::IEqual32, {key, Value(index)})});
+				const auto next = RuntimeSelectorMaximum(normalize(next_value), key, value,
+				    UINT32_MAX, {}, at_index);
+				if (!next.IsEmpty()) {
+					const auto stops_at_index =
+					    emit(ValueOpcode::ULessThanEqual32, {next, Value(index + 1u)});
+					original = emit(ValueOpcode::SelectU32,
+					    {stops_at_index, emit(ValueOpcode::UMin32, {original, Value(index + 1u)}),
+					     original});
+				}
+			}
+		}
+		const auto initial = RuntimeSelectorMaximum(count->Arg(induction->initial_arm));
+		const auto next = RuntimeSelectorMaximum(count->Arg(induction->initial_arm ^ 1u), key, value, 255u);
+		if (initial.IsEmpty() || next.IsEmpty()) return original;
+		// Close the 8-bit invariant before using it to unwrap a relative VGPR index.
+		const auto bounded = emit(ValueOpcode::LogicalAnd,
+		    {emit(ValueOpcode::ULessThanEqual32, {initial, Value(255u)}),
+		     emit(ValueOpcode::ULessThanEqual32, {next, Value(255u)})});
+		return emit(ValueOpcode::SelectU32,
+		    {bounded, emit(ValueOpcode::UMin32, {original, Value(255u)}), original});
+	}
+
 	Value FloatIndexSource(Value value, Value guard) const {
 		const auto* result = ActiveValue(value, guard, true).TryInstruction();
 		if (result == nullptr || result->GetOpcode() != ValueOpcode::ConvertS32F32) return {};
@@ -3344,6 +3621,19 @@ private:
 						indirect.selector_first = Value(first);
 						indirect.signed_count = false;
 					}
+				} else if (const auto* loop = BoundedLoop(key, handle.Parent(), [](const Inst& compare, uint32_t) {
+					return compare.GetOpcode() == ValueOpcode::ULessThan32;
+				})) {
+					Value executing;
+					for (const auto& use: handle.Uses()) {
+						if (use.operand != 0u || use.user->GetOpcode() != ValueOpcode::ImageRead ||
+						    (!executing.IsEmpty() && executing != use.user->Arg(2).Resolve())) {
+							executing = {};
+							break;
+						}
+						executing = use.user->Arg(2).Resolve();
+					}
+					indirect.key_count = RuntimeSelectorMaximum(loop->Arg(1), key, {}, UINT32_MAX, executing);
 				}
 			}
 			if (indirect.key_count.IsEmpty() &&

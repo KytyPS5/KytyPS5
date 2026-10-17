@@ -288,6 +288,9 @@ private:
 			              (m_wave_uniform ? axis.U32() < 3u : axis.U32() == m_workgroup_axis));
 		}
 		if (op == ValueOpcode::Phi) {
+			if (m_program.maximum_phi_predecessors.contains(inst)) {
+				return finish(ValidateArguments(*inst, true));
+			}
 			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
 				return finish(false);
 			}
@@ -555,7 +558,8 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 		}
 		case ValueOpcode::GetShaderBase: return {{Kind::ShaderBase}};
 		case ValueOpcode::Phi:
-			if (!m_plan.control_phi_predecessors.contains(inst)) {
+			if (!m_plan.control_phi_predecessors.contains(inst) &&
+			    !m_plan.maximum_phi_predecessors.contains(inst)) {
 				const auto invariant = ResolveInvariantPhi(m_plan, value);
 				return invariant.IsEmpty() ? Ref {} : Evaluate(invariant, context);
 			}
@@ -831,20 +835,28 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 	}
 	switch (node.inst->GetOpcode()) {
 		case ValueOpcode::Phi: {
-			// Only predecessors reached by this walk contribute, and they must agree. The state is 3
+			// Only reached predecessors contribute. The state is 3
 			// once one of them has stored the value; callers read it like 1, as unknown.
-			const auto& blocks = m_plan.control_phi_predecessors.at(node.inst);
+			const bool maximum = m_plan.maximum_phi_predecessors.contains(node.inst);
+			const auto& blocks = maximum ? m_plan.maximum_phi_predecessors.at(node.inst)
+			                             : m_plan.control_phi_predecessors.at(node.inst);
 			const auto  state  = c.byte[c.rdx + node.state];
 			for (size_t i = 0; i < args.size(); ++i) {
 				Xbyak::Label next, first;
-				c.cmp(c.byte[c.rdx + m_reach + blocks[i]], 0);
-				c.je(next, Near);
+				if (!m_plan.control_flow.empty()) {
+					c.cmp(c.byte[c.rdx + m_reach + blocks[i]], 0);
+					c.je(next, Near);
+				}
 				Fetch(args[i], m_ret);
 				c.cmp(state, 1);
 				c.je(first, Near);
 				c.cmp(c.rax, c.qword[c.rdx + node.slot]);
-				c.jne(m_ret, Near);
-				c.jmp(next, Near);
+				if (maximum) {
+					c.cmovb(c.rax, c.qword[c.rdx + node.slot]);
+				} else {
+					c.jne(m_ret, Near);
+					c.jmp(next, Near);
+				}
 				c.L(first);
 				c.mov(c.qword[c.rdx + node.slot], c.rax);
 				c.mov(state, 3);
@@ -1284,7 +1296,9 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 			const auto& node = m_nodes[index];
 			if (node.inst->GetOpcode() != ValueOpcode::Phi || node.result != Operand {Kind::Node, index}) continue;
-			for (const auto block: m_plan.control_phi_predecessors.at(node.inst)) rechecks[block].push_back(node.state);
+			const auto& predecessors = m_plan.maximum_phi_predecessors.contains(node.inst)
+			    ? m_plan.maximum_phi_predecessors.at(node.inst) : m_plan.control_phi_predecessors.at(node.inst);
+			for (const auto block: predecessors) rechecks[block].push_back(node.state);
 		}
 		std::vector<Xbyak::Label> starts(blocks.size());
 		c.mov(c.byte[c.rdx + m_reach], 1);

@@ -693,6 +693,7 @@ struct ResourcePlan {
 	std::vector<uint32_t>               selector_groups;
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
+	std::unordered_map<const Inst*, std::vector<uint32_t>> maximum_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

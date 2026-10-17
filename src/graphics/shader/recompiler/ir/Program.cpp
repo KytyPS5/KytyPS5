@@ -72,6 +72,14 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 	    lhs->NumArgs() != rhs->NumArgs()) {
 		return false;
 	}
+	if (lhs->GetOpcode() == ValueOpcode::Phi) {
+		const auto left_maximum = program.maximum_phi_predecessors.find(lhs);
+		const auto right_maximum = program.maximum_phi_predecessors.find(rhs);
+		if ((left_maximum == program.maximum_phi_predecessors.end()) !=
+		    (right_maximum == program.maximum_phi_predecessors.end()) ||
+		    (left_maximum != program.maximum_phi_predecessors.end() &&
+		     left_maximum->second != right_maximum->second)) return false;
+	}
 	if (std::ranges::find(visited, std::pair {lhs, rhs}) != visited.end()) {
 		return true;
 	}

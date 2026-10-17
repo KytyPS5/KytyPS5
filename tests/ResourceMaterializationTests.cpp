@@ -1019,7 +1019,7 @@ void TestBallotControlAssumptions() {
     entry.terminator = {.kind = TerminatorKind::ConditionalBranch, .true_block = &yes, .false_block = &no};
     entry.AddBranch(&yes);
     entry.AddBranch(&no);
-    auto plan = ExtractResourcePlan(program);
+    auto plan = Extract(program);
     const std::array data_words{0u};
     uint32_t condition = 99u;
     Check(EvaluateSrtValue(plan, {.user_data = data_words}, plan.control_flow[0].condition, condition) == empty && (!empty || condition == 0u),
@@ -1415,7 +1415,7 @@ void TestSharedDescriptorImageActivity() {
       .SetFlags(MemoryFlags{.index = 0u});
   atomic.AppendNewInst(ValueOpcode::ImageAtomicUMax64,
       {image, address, Value(uint64_t{1}), Value(true)}).SetFlags(MemoryFlags{.index = 1u});
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   for (const uint32_t flag : {3u, 4u, UINT32_MAX, 3u}) {
@@ -1543,6 +1543,110 @@ void TestShaderCacheRecords() {
         "damaged resource plan was accepted");
 }
 
+void TestReachableMaximumPhi() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &entry = AddValueBlock(program);
+  auto &left = AddValueBlock(program);
+  auto &right = AddValueBlock(program);
+  auto &merge = AddValueBlock(program);
+  const auto flag = Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
+  entry.condition = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {flag, Value(0u)}));
+  entry.terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                     .true_block = &left, .false_block = &right};
+  entry.AddBranch(&left);
+  entry.AddBranch(&right);
+  for (auto *arm : {&left, &right}) {
+    arm->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = &merge};
+    arm->AddBranch(&merge);
+  }
+  merge.terminator.kind = CFG::TerminatorKind::Return;
+  auto &maximum = program.value_storage.emplace_back(ValueOpcode::Phi, uint64_t(Type::U32));
+  maximum.AddPhiOperand(nullptr, Value(255u));
+  maximum.AddPhiOperand(nullptr, Value(4095u));
+  program.maximum_phi_predecessors.emplace(&maximum, std::vector<uint32_t>{1u, 2u});
+  auto &reversed = program.value_storage.emplace_back(ValueOpcode::Phi, uint64_t(Type::U32));
+  reversed.AddPhiOperand(nullptr, Value(255u));
+  reversed.AddPhiOperand(nullptr, Value(4095u));
+  program.maximum_phi_predecessors.emplace(&reversed, std::vector<uint32_t>{2u, 1u});
+  Check(!EquivalentValue(program, Value(&maximum), Value(&reversed)),
+        "maximum Phis with different predecessor mappings became equivalent");
+  DescriptorSource source;
+  source.dword_count = 4u;
+  source.dwords = {Value(0x1000u), Value(4u << 16u), Value(&maximum), Value(0x14004u)};
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0u, .read = true});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer});
+  const auto buffer = Value(&merge.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]}));
+  merge.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {buffer, Value(0u), Value(0u), Value(0u), Value(true)}).SetFlags(MemoryFlags{});
+  auto plan = Extract(program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  std::array<uint32_t, 1> data{};
+  for (const auto flag_value : {0u, 1u, 0u}) {
+    data[0] = flag_value;
+    Check(MaterializeResources(plan, {.user_data = data}, snapshot, specialization) &&
+              snapshot.buffers[0].dwords[2] == (flag_value ? 255u : 4095u),
+          "maximum Phi retained an inactive predecessor or a previous dispatch's bound");
+  }
+  const auto known_condition = plan.control_flow[0].condition;
+  plan.control_flow[0].condition = Value(&plan.value_storage.emplace_back(ValueOpcode::UndefU1));
+  CompileSrtWalker(plan);
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[2] == 4095u,
+        "unknown control flow narrowed a maximum Phi");
+  plan.control_flow[0].condition = known_condition;
+
+  auto control_flow = std::move(plan.control_flow);
+  plan.control_flow.clear();
+  CompileSrtWalker(plan);
+  for (const auto flag_value : {0u, 1u, 0u}) {
+    data[0] = flag_value;
+    Check(MaterializeResources(plan, {.user_data = data}, snapshot, specialization) &&
+              snapshot.buffers[0].dwords[2] == 4095u,
+          "maximum Phi without control flow lost a predecessor");
+  }
+  plan.control_flow = std::move(control_flow);
+
+  const auto *phi = plan.descriptor_sources[0].dwords[2].TryInstruction();
+  const auto predecessors = plan.maximum_phi_predecessors.at(phi);
+  for (const auto &damaged : {std::vector<uint32_t>{1u},
+                               std::vector<uint32_t>{1u, 2u, 3u},
+                               std::vector<uint32_t>{1u, uint32_t(plan.control_flow.size())},
+                               std::vector<uint32_t>{UINT32_MAX, 2u}}) {
+    plan.maximum_phi_predecessors.at(phi) = damaged;
+    ResourcePlan loaded;
+    Check(!LoadResourcePlan(SaveResourcePlan(plan), loaded),
+          "damaged maximum Phi predecessors were accepted");
+  }
+  plan.maximum_phi_predecessors.at(phi) = predecessors;
+
+  auto &derived = plan.value_storage.emplace_back(ValueOpcode::IAdd32);
+  derived.SetArg(0, plan.descriptor_sources[0].dwords[2]);
+  derived.SetArg(1, Value(1u));
+  auto &condition = plan.value_storage.emplace_back(ValueOpcode::ULessThan32);
+  condition.SetArg(0, Value(&derived));
+  condition.SetArg(1, Value(512u));
+  plan.control_flow[3].condition = Value(&condition);
+  plan.control_flow[3].successors = {4u, 5u};
+  plan.control_flow.resize(6u);
+  plan.descriptor_sources[0].dwords[2] = Value(&derived);
+  for (const auto flag_value : {1u, 0u, 1u}) {
+    data[0] = flag_value;
+    const auto reached = ReachedBlocks(plan, {.user_data = data});
+    DescriptorValue descriptor;
+    Check(reached[4] == (flag_value != 0u) && reached[5] == (flag_value == 0u) &&
+              WalkedDescriptor(plan, 0u, descriptor) &&
+              descriptor.dwords[2] == (flag_value ? 256u : 4096u),
+          "a cached maximum Phi or its users retained an unreachable predecessor");
+  }
+}
+
 void TestArrayColorComparison() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
@@ -1667,6 +1771,7 @@ int main() {
   TestSharedDescriptorImageActivity();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestShaderCacheRecords();
+  TestReachableMaximumPhi();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

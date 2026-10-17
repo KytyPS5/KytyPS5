@@ -1479,6 +1479,15 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 // State an extracted or loaded plan derives from its fields: one key set per selector group, which
 // extraction numbers densely in order of first use (false when they are not), and the walker.
 static bool DerivePlanState(ResourcePlan& plan) {
+	for (const auto* phis: {&plan.control_phi_predecessors, &plan.maximum_phi_predecessors}) {
+		for (const auto& [phi, blocks]: *phis) {
+			if (phi->GetOpcode() != ValueOpcode::Phi || blocks.size() != phi->NumArgs()) return false;
+			if (!plan.control_flow.empty() &&
+			    std::ranges::any_of(blocks, [&](uint32_t block) {
+				    return block >= plan.control_flow.size();
+			    })) return false;
+		}
+	}
 	for (const auto group: plan.selector_groups) {
 		if (group == plan.selector_keys.size()) plan.selector_keys.emplace_back();
 		if (group != UINT32_MAX && group >= plan.selector_keys.size()) return false;
@@ -1497,6 +1506,7 @@ static bool DerivePlanState(ResourcePlan& plan) {
 			group.srt_reads = plan.srt_reads;
 			group.control_flow = plan.control_flow;
 			group.control_phi_predecessors = plan.control_phi_predecessors;
+			group.maximum_phi_predecessors = plan.maximum_phi_predecessors;
 			CompileSrtWalker(group, {&indirect->workgroup_key, 1});
 		}
 		CompileSrtWalker(plan);
@@ -1553,6 +1563,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		cloned.emplace(source, &target);
 		if (source->GetOpcode() == ValueOpcode::Phi) {
+			if (const auto maximum = program.maximum_phi_predecessors.find(source);
+			    maximum != program.maximum_phi_predecessors.end())
+				plan.maximum_phi_predecessors.emplace(&target, maximum->second);
 			for (size_t index = 0; index < source->NumArgs(); index++) {
 				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
 			}
@@ -2228,7 +2241,8 @@ using ControlPhis = decltype(ResourcePlan::control_phi_predecessors);
 
 // Instructions come first, so that any value can refer to them by index, then their arguments.
 // Plan Phis have no blocks; a control Phi lists the plan blocks of its arguments after them.
-void IoValues(Writer& writer, const std::list<Inst>& values, const ControlPhis& phis) {
+void IoValues(Writer& writer, const std::list<Inst>& values, const ControlPhis& phis,
+              const ControlPhis& maximum_phis) {
 	IoAll(writer, static_cast<uint32_t>(values.size()));
 	for (const auto& inst: values) {
 		writer.index.emplace(&inst, static_cast<uint32_t>(writer.index.size()));
@@ -2245,11 +2259,13 @@ void IoValues(Writer& writer, const std::list<Inst>& values, const ControlPhis& 
 			args.push_back(inst.Arg(index));
 		}
 		const auto found = phis.find(&inst);
-		IoAll(writer, args, found != phis.end() ? found->second : std::vector<uint32_t> {});
+		const auto maximum = maximum_phis.find(&inst);
+		IoAll(writer, args, found != phis.end() ? found->second : std::vector<uint32_t> {},
+		      maximum != maximum_phis.end() ? maximum->second : std::vector<uint32_t> {});
 	}
 }
 
-void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
+void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis, ControlPhis& maximum_phis) {
 	uint32_t count = 0;
 	Io(reader, count);
 	count = reader.Count(count);
@@ -2271,20 +2287,24 @@ void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
 		}
 		std::vector<Value>    args;
 		std::vector<uint32_t> predecessors;
-		IoAll(reader, args, predecessors);
+		std::vector<uint32_t> maximum_predecessors;
+		IoAll(reader, args, predecessors, maximum_predecessors);
+		reader.ok = reader.ok && (predecessors.empty() || predecessors.size() == args.size()) &&
+		            (maximum_predecessors.empty() || maximum_predecessors.size() == args.size());
 		for (const auto arg: args) inst->AddPhiOperand(nullptr, arg);
 		if (!predecessors.empty()) phis.emplace(inst, std::move(predecessors));
+		if (!maximum_predecessors.empty()) maximum_phis.emplace(inst, std::move(maximum_predecessors));
 	}
 }
 
 // Binds every plan field: one added later fails to compile here until it is stored or derived.
 template <class S, class P> void IoPlan(S& io, P& plan) {
 	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info, descriptor_sources,
-	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
+	       selector_groups, control_flow, control_phis, maximum_phis, srt_reads, source_reads, capture_specialization_reads,
 	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
 	       srt_code, workgroup_plans, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
-	IoValues(io, values, control_phis);
+	IoValues(io, values, control_phis, maximum_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,
 	      srt_plan_complete, resource_tracking_complete, info, uniform_fill);

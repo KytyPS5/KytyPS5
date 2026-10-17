@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/perVertexVsStore.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -469,12 +470,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {graphics_stages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	const vk::PushConstantRange push_constants {
+	    graphics_stages, 0,
+	    PvVsStorePushRangeBytes(ShaderRecompiler::IR::NativePushConstantSize,
+	                            programs.pv_store_layout != nullptr)};
 
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	vk::PipelineLayoutCreateInfo  pipeline_layout_info {};
+	const vk::DescriptorSetLayout layouts[] {pipeline.descriptor_set_layout,
+	                                         programs.pv_store_layout};
+	pipeline_layout_info.setLayoutCount         = programs.pv_store_layout ? 2u : 1u;
+	pipeline_layout_info.pSetLayouts            = layouts;
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 

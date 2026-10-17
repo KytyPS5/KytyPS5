@@ -3,8 +3,10 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/perVertexVsStore.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -111,6 +113,13 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
+	// PerVertex VS-store: cap records (set 1 b0), PS index buffer (set 1 b1), the flat instance
+	// carried VS -> PS (location 31) and the VS record computed once at the start of main.
+	const PvStoreInfo*                                 pv_store             = nullptr;
+	uint32_t                                           pv_cap_buffer        = 0;
+	uint32_t                                           pv_index_buffer      = 0;
+	uint32_t                                           pv_instance_variable = 0;
+	uint32_t                                           pv_vertex_record     = 0;
 	std::vector<uint32_t>                           memory_byte_offsets;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
@@ -273,6 +282,12 @@ struct DppTargetLane {
 	uint32_t lane  = 0;
 	uint32_t valid = 0;
 };
+
+void     DefinePvStore(EmitterState& state);
+void     InitializePvStore(EmitterState& state);
+void     EmitPvStoreParameter(EmitterState& state, uint32_t host_location, uint32_t value);
+uint32_t EmitPvLoadCorner(EmitterState& state, uint32_t host_location, uint32_t corner,
+                          uint32_t chan);
 
 struct ImageSampleLayout {
 	uint32_t offset = NoImageComponent;

@@ -836,7 +836,8 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh grew reusable resource storage after warmup");
 }
 
-void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool counted_loop = false) {
+void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool counted_loop = false,
+                                               bool loop_test = false) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
   Program program;
@@ -875,7 +876,7 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
   const auto count = emit(entry, ValueOpcode::LoadAddressU32,
       {address, Value(0u), Value(0u), Value(true)});
   count.Instruction()->SetFlags(MemoryFlags{.index = 0});
-  if (counted_loop) {
+  if (counted_loop || loop_test) {
     branch(entry, loop);
   } else {
     const auto rejected = emit(entry, ValueOpcode::ULessThanEqual32, {count, lane});
@@ -888,12 +889,16 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
   auto &carried = loop.AppendNewInst(ValueOpcode::Phi);
   carried.SetFlags(Type::U32);
   const auto next = emit(body, ValueOpcode::IAdd32, {Value(&carried), Value(1u)});
-  carried.AddPhiOperand(&entry, counted_loop ? Value(0u) : lane);
+  carried.AddPhiOperand(&entry, counted_loop ? Value(0u) : loop_test ? initial : lane);
   carried.AddPhiOperand(&body, next);
-  const auto condition = counted_loop
-      ? emit(loop, ValueOpcode::ULessThan32, {Value(&carried), count})
-      : emit(loop, ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)});
-  branch(loop, counted_loop ? use : body, condition, &merge);
+  if (counted_loop) {
+    branch(loop, use, emit(loop, ValueOpcode::ULessThan32, {Value(&carried), count}), &merge);
+  } else if (loop_test) {
+    branch(loop, body, emit(loop, ValueOpcode::UGreaterThan32, {count, lane}), &merge);
+  } else {
+    branch(loop, body, emit(loop, ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)}),
+        &merge);
+  }
   loop.terminator.loop_header = true;
   loop.terminator.continue_block = &body;
   loop.terminator.merge_block = &merge;
@@ -904,10 +909,24 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
   } else {
     auto &selected = merge.AppendNewInst(ValueOpcode::Phi);
     selected.SetFlags(Type::U32);
-    selected.AddPhiOperand(&entry, initial);
+    if (!loop_test) selected.AddPhiOperand(&entry, initial);
     selected.AddPhiOperand(&loop, Value(&carried));
     const auto valid = emit(merge, ValueOpcode::INotEqual32, {Value(&selected), Value(UINT32_MAX)});
-    branch(merge, use, emit(merge, ValueOpcode::LogicalAnd, {active, valid}), &exit);
+    auto found = emit(merge, ValueOpcode::LogicalAnd, {active, valid});
+    if (loop_test) {
+      const auto ballot = emit(merge, ValueOpcode::Ballot, {found});
+      const auto low = emit(merge, ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+      const auto high = emit(merge, ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+      const auto first = emit(merge, ValueOpcode::SelectU32,
+          {emit(merge, ValueOpcode::INotEqual32, {low, Value(0u)}),
+           emit(merge, ValueOpcode::FindILsb32, {low}),
+           emit(merge, ValueOpcode::SelectU32,
+               {emit(merge, ValueOpcode::INotEqual32, {high, Value(0u)}),
+                emit(merge, ValueOpcode::IAdd32,
+                    {emit(merge, ValueOpcode::FindILsb32, {high}), Value(32u)}), Value(UINT32_MAX)})});
+      found = emit(merge, ValueOpcode::INotEqual32, {first, Value(UINT32_MAX)});
+    }
+    branch(merge, use, found, &exit);
     branch(use, exit);
   }
   DescriptorSource source;
@@ -971,6 +990,43 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
         Check(read == std::pair<uint64_t, uint64_t>{0x1000u, 4u},
               "empty traversal proof captured an unrelated memory range");
     }
+  }
+}
+
+void TestBallotControlAssumptions() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  for (const bool empty : {false, true}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &entry = AddValueBlock(program);
+    auto &yes = AddValueBlock(program);
+    auto &no = AddValueBlock(program);
+    const auto emit = [&](ValueOpcode op, std::initializer_list<Value> args = {}) {
+      return Value(&entry.AppendNewInst(op, args));
+    };
+    const auto active = emit(ValueOpcode::UndefU1);
+    const auto inverse = emit(ValueOpcode::LogicalNot, {active});
+    const auto predicate = empty ? emit(ValueOpcode::LogicalAnd, {active, inverse}) : inverse;
+    const auto ballot = emit(ValueOpcode::Ballot, {predicate});
+    const auto word = emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+    const auto any = emit(ValueOpcode::INotEqual32, {word, Value(0u)});
+    const auto selected = emit(ValueOpcode::LogicalAnd, {active, any});
+    const auto data = emit(ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+    const auto uniform = emit(ValueOpcode::IEqual32, {data, Value(0u)});
+    entry.condition = emit(ValueOpcode::LogicalAnd, {uniform, selected});
+    entry.terminator = {.kind = TerminatorKind::ConditionalBranch, .true_block = &yes, .false_block = &no};
+    entry.AddBranch(&yes);
+    entry.AddBranch(&no);
+    auto plan = ExtractResourcePlan(program);
+    const std::array data_words{0u};
+    uint32_t condition = 99u;
+    Check(EvaluateSrtValue(plan, {.user_data = data_words}, plan.control_flow[0].condition, condition) == empty && (!empty || condition == 0u),
+          "a local EXEC assumption escaped into a subgroup ballot");
+    Check(ReachedBlocks(plan, {.user_data = data_words}) ==
+              std::vector<uint8_t>({1u, uint8_t(!empty), 1u}),
+          "ballot reachability lost another lane or retained a proven empty mask");
   }
 }
 
@@ -1599,8 +1655,10 @@ int main() {
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();
   for (const bool independent_mask : {false, true})
-    TestEmptyTraversalSkipsUnmappedDescriptor(independent_mask);
+    for (const bool loop_test : {false, true})
+      TestEmptyTraversalSkipsUnmappedDescriptor(independent_mask, false, loop_test);
   TestEmptyTraversalSkipsUnmappedDescriptor(false, true);
+  TestBallotControlAssumptions();
   TestCyclicControlPredicatesRemainUnknown();
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();

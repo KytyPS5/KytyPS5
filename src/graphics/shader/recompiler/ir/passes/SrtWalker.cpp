@@ -99,6 +99,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
+		case ValueOpcode::FindILsb32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -593,6 +594,18 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 	};
 	const auto constant = [](uint64_t value) { return Operand {Kind::Constant, value}; };
 	switch (inst.GetOpcode()) {
+		case ValueOpcode::CompositeExtractU32x4: {
+			const auto* ballot = inst.Arg(0).Resolve().TryInstruction();
+			const auto component = inst.Arg(1).Resolve();
+			if (ballot == nullptr || ballot->GetOpcode() != ValueOpcode::Ballot ||
+			    !component.IsImmediate() || component.GetType() != Type::U32 || component.U32() >= 2u)
+				return {};
+			const auto predicate = Evaluate(ballot->Arg(0), 0).operand;
+			if (predicate.kind == Kind::Constant) return predicate.value == 0u ? constant(0u) : Operand {};
+			if (predicate.kind == Kind::Unknown) return {};
+			node.args = {predicate};
+			return self;
+		}
 		case ValueOpcode::Phi: {
 			bool known = false;
 			for (size_t i = 0; i < inst.NumArgs(); ++i) {
@@ -614,14 +627,15 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 			return node.args[1].kind == Kind::Unknown && node.args[2].kind == Kind::Unknown ? Operand {} : self;
 		}
 		case ValueOpcode::ULessThan32:
+		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::ULessThanEqual32: {
 			// No U32 is below zero and every U32 is at least zero, including an unknown loop-carried
 			// or varying lane value. args[0] is that zero-tested bound.
-			const bool less  = inst.GetOpcode() == ValueOpcode::ULessThan32;
-			const auto bound = arg(inst.Arg(less ? 1 : 0));
+			const bool less  = inst.GetOpcode() != ValueOpcode::ULessThanEqual32;
+			const auto bound = arg(inst.Arg(inst.GetOpcode() == ValueOpcode::ULessThan32 ? 1 : 0));
 			if (bound.kind == Kind::Unknown) return {};
 			if (bound.kind == Kind::Constant && static_cast<uint32_t>(bound.value) == 0u) return constant(!less);
-			node.args = {bound, arg(inst.Arg(less ? 0 : 1))};
+			node.args = {bound, arg(inst.Arg(inst.GetOpcode() == ValueOpcode::ULessThan32 ? 0 : 1))};
 			return node.args[1].kind == Kind::Unknown && bound.kind == Kind::Constant ? Operand {} : self;
 		}
 		case ValueOpcode::LogicalOr:
@@ -845,6 +859,12 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		case ValueOpcode::LoadAddressU32:
 		case ValueOpcode::ReadConstBuffer:
 		case ValueOpcode::LoadBufferU32: EmitRead(node); return;
+		case ValueOpcode::CompositeExtractU32x4:
+			Fetch(args[0], m_ret);
+			c.test(c.rax, c.rax);
+			c.jnz(m_ret, Near);
+			Store(node);
+			return;
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: {
@@ -860,8 +880,9 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 			return;
 		}
 		case ValueOpcode::ULessThan32:
+		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::ULessThanEqual32: {
-			const bool less = node.inst->GetOpcode() == ValueOpcode::ULessThan32;
+			const bool less = node.inst->GetOpcode() != ValueOpcode::ULessThanEqual32;
 			Xbyak::Label bound_zero;
 			Fetch(args[0], m_ret);
 			c.test(c.eax, c.eax);
@@ -1084,6 +1105,11 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 			c.L(done);
 			break;
 		}
+		case ValueOpcode::FindILsb32:
+			c.bsf(c.eax, c.eax);
+			c.mov(c.ecx, UINT32_MAX);
+			c.cmovz(c.eax, c.ecx);
+			break;
 		case ValueOpcode::FPMul32:
 			c.movd(c.xmm0, c.eax);
 			c.movd(c.xmm1, c.ecx);

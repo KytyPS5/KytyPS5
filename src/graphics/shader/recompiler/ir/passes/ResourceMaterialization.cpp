@@ -1643,10 +1643,34 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		const auto op = inst->GetOpcode();
 		if (op == ValueOpcode::ConditionRef) return finish(ClonePredicate(inst->Arg(0)));
+		if (op == ValueOpcode::CompositeExtractU32x4) {
+			const auto* ballot = inst->Arg(0).Resolve().TryInstruction();
+			const auto component = inst->Arg(1).Resolve();
+			if (ballot == nullptr || ballot->GetOpcode() != ValueOpcode::Ballot ||
+			    !component.IsImmediate() || component.GetType() != Type::U32 ||
+			    component.U32() >= 2u) return finish(opaque());
+			auto& mask = predicates[ballot];
+			if (mask.value.IsEmpty()) {
+				auto& cloned_ballot = plan.value_storage.emplace_back(ValueOpcode::Ballot);
+				mask = {Value(&cloned_ballot), true};
+				cloned_ballot.SetArg(0, ClonePredicate(ballot->Arg(0)));
+			}
+			auto& node = plan.value_storage.emplace_back(op);
+			node.SetArg(0, mask.value);
+			node.SetArg(1, component);
+			return finish(Value(&node));
+		}
 		if (op == ValueOpcode::Phi) {
-			if (inst->Parent() == nullptr || inst->Parent()->terminator.loop_header ||
+			if (inst->Parent() == nullptr ||
 			    inst->NumPhiBlocks() != inst->NumArgs() || inst->NumArgs() == 0u ||
 			    (value.GetType() != Type::U1 && value.GetType() != Type::U32)) return finish(opaque());
+			const auto* carried = inst->Parent()->terminator.loop_header
+			    ? inst->Parent()->terminator.continue_block : nullptr;
+			if (inst->Parent()->terminator.loop_header &&
+			    (inst->NumArgs() != 2u || inst->Parent()->ImmPredecessors().size() != 2u ||
+			     carried == nullptr || carried->terminator.kind != CFG::TerminatorKind::Branch ||
+			     std::ranges::count(std::array {inst->PhiBlock(0), inst->PhiBlock(1)}, carried) != 1u ||
+			     carried->terminator.true_block != inst->Parent())) return finish(opaque());
 			std::vector<uint32_t> predecessors;
 			for (size_t index = 0; index < inst->NumArgs(); ++index) {
 				const auto predecessor = std::ranges::find(program.blocks, inst->PhiBlock(index));
@@ -1655,14 +1679,21 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			}
 			auto& node = plan.value_storage.emplace_back(op, inst->Flags<uint64_t>());
 			plan.control_phi_predecessors.emplace(&node, std::move(predecessors));
-			for (size_t index = 0; index < inst->NumArgs(); ++index)
-				node.AddPhiOperand(nullptr, ClonePredicate(inst->Arg(index)));
+			for (size_t index = 0; index < inst->NumArgs(); ++index) {
+				// A backedge stays unknown even under assumptions about the current EXEC.
+				const auto incoming = carried != nullptr && inst->PhiBlock(index) == carried
+				    ? Value(&plan.value_storage.emplace_back(value.GetType() == Type::U1
+				        ? ValueOpcode::UndefU1 : ValueOpcode::UndefU32)) : ClonePredicate(inst->Arg(index));
+				node.AddPhiOperand(nullptr, incoming);
+			}
 			return finish(Value(&node));
 		}
 		if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr &&
 		    op != ValueOpcode::LogicalNot && op != ValueOpcode::IEqual32 &&
 		    op != ValueOpcode::INotEqual32 && op != ValueOpcode::ULessThan32 &&
 		    op != ValueOpcode::ULessThanEqual32 &&
+		    op != ValueOpcode::UGreaterThan32 &&
+		    op != ValueOpcode::FindILsb32 && op != ValueOpcode::IAdd32 &&
 		    op != ValueOpcode::SelectU1 && op != ValueOpcode::SelectU32) return finish(opaque());
 		auto& node = plan.value_storage.emplace_back(op);
 		for (size_t index = 0; index < inst->NumArgs(); ++index)

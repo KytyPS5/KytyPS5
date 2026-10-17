@@ -1236,6 +1236,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	m_context.GetBufferCache().RecordPendingWrites(
+	    std::any_of(stages.begin(), stages.end(), [](const PreparedBindings* stage) {
+		    return stage->runtime->program->has_address_writes;
+	    }));
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

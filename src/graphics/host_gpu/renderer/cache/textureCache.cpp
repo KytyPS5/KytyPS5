@@ -1752,6 +1752,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	MarkUnsubmittedWrite(image.info.data.address, copy_size);
 	return true;
 }
 

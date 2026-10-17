@@ -1254,11 +1254,26 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 		return KERNEL_ERROR_EROFS;
 	}
 
+	// Hosts like Windows report a missing path (not ENOTDIR) when a parent component is a regular file.
+	const auto parent_is_file = [&real_name] {
+		for (auto parent = real_name.parent_path(); !parent.empty() && parent != parent.parent_path();
+		     parent = parent.parent_path()) {
+			std::error_code parent_error;
+			const auto      parent_status = std::filesystem::status(parent, parent_error);
+			if (!parent_error && std::filesystem::is_regular_file(parent_status)) {
+				return true;
+			}
+			if (!parent_error && std::filesystem::exists(parent_status)) {
+				return false;
+			}
+		}
+		return false;
+	};
 	std::error_code error;
 	const auto      status = std::filesystem::status(real_name, error);
 	if (!error) {
 		if (!std::filesystem::exists(status)) {
-			return KERNEL_ERROR_ENOENT;
+			return parent_is_file() ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_ENOENT;
 		}
 		if (std::filesystem::is_directory(status)) {
 			return KERNEL_ERROR_EISDIR;
@@ -1269,7 +1284,7 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	}
 	if (error) {
 		switch (static_cast<std::errc>(error.default_error_condition().value())) {
-			case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;
+			case std::errc::no_such_file_or_directory: return parent_is_file() ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_ENOENT;
 			case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
 			case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
 			case std::errc::permission_denied: return KERNEL_ERROR_EACCES;

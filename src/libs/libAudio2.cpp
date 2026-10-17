@@ -175,6 +175,7 @@ struct AudioOut2ContextState {
 	AudioOut2ContextHandle handle              = 0;
 	uint32_t               queue_depth         = 4;
 	uint32_t               queued              = 0;
+	uint32_t               downstream          = 0;
 	uint32_t               num_grains          = 512;
 	uint64_t               last_update         = 0;
 	int                    object_audio_handle = 0;
@@ -252,6 +253,21 @@ static AudioOut2ContextState* audioout2_find_context_locked(AudioOut2ContextHand
 static uint32_t audioout2_grain_micros(uint32_t grains) {
 	const auto sample_count = (grains == 0 ? 512u : grains);
 	return std::max<uint32_t>((sample_count * 1000000u) / 48000u, 1000u);
+}
+
+// The system mixer takes pushed grains into its own output buffer as soon as it has room, so
+// the context queue empties ahead of playback. Games that refill the queue once per frame
+// rely on this; without it a 30 fps pump cannot keep a shallow queue fed.
+constexpr uint64_t AUDIO_OUT2_SYSTEM_BUFFER_US = 40000;
+
+static uint32_t audioout2_downstream_grains(uint32_t grains) {
+	const auto grain_micros = audioout2_grain_micros(grains);
+	return static_cast<uint32_t>((AUDIO_OUT2_SYSTEM_BUFFER_US + grain_micros - 1) / grain_micros);
+}
+
+// Grains still waiting in the context queue, excluding those held by the system mixer.
+static uint32_t audioout2_queue_level(const AudioOut2ContextState& state) {
+	return state.queued > state.downstream ? state.queued - state.downstream : 0;
 }
 
 static uint8_t audioout2_data_format_channels(uint32_t data_format) {
@@ -507,6 +523,7 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	state->handle              = *ctx;
 	state->queue_depth         = params->queue_depth == 0 ? 4u : params->queue_depth;
 	state->num_grains          = num_grains;
+	state->downstream          = audioout2_downstream_grains(num_grains);
 	state->last_update         = LibKernel::KernelGetProcessTime();
 	state->object_audio_handle = object_audio_handle;
 	g_audioout2_state_mutex.Unlock();
@@ -588,11 +605,12 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 			    blocking != 0 && audioout2_context_has_queueable_device(*state);
 			audioout2_update_context_locked(state);
 			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
+			const auto capacity = state->queue_depth + state->downstream;
+			if (state->queued < capacity || use_device_clock) {
 				if (state->queued == 0) {
 					state->last_update = LibKernel::KernelGetProcessTime();
 				}
-				if (state->queued < state->queue_depth) {
+				if (state->queued < capacity) {
 					state->queued++;
 				}
 				g_audioout2_state_mutex.Unlock();
@@ -622,12 +640,12 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 		audioout2_update_context_locked(state);
+		const auto level = audioout2_queue_level(*state);
 		if (queue_level != nullptr) {
-			*queue_level = state->queued;
+			*queue_level = level;
 		}
 		if (available_queues != nullptr) {
-			*available_queues =
-			    (state->queued < state->queue_depth ? state->queue_depth - state->queued : 0);
+			*available_queues = (level < state->queue_depth ? state->queue_depth - level : 0);
 		}
 	}
 	g_audioout2_state_mutex.Unlock();

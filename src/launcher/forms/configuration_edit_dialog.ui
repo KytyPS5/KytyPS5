@@ -347,6 +347,16 @@
             </item>
            </layout>
           </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="label_keyboard_player">
+            <property name="text"><string>Keyboard player:</string></property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QComboBox" name="comboBox_keyboard_player">
+            <property name="toolTip"><string>Gamepads fill the remaining players in connection order. Every player uses the same input mapping.</string></property>
+           </widget>
+          </item>
          </layout>
         </widget>
        </item>

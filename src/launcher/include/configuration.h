@@ -48,11 +48,14 @@ struct ControllerSettings {
 	QString color;
 	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
+	// 0 shares player 1 with the first gamepad; 1-4 dedicates that player to the keyboard.
+	int     keyboard_player     = 0;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
+		s->setValue("controller_keyboard_player", keyboard_player);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -65,6 +68,7 @@ struct ControllerSettings {
 		};
 		speaker_volume      = read_percent("controller_speaker_volume", 50);
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
+		keyboard_player     = qBound(0, s->value("controller_keyboard_player", 0).toInt(), 4);
 	}
 };
 

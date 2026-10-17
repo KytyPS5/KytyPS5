@@ -24,6 +24,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
+	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
 }
@@ -58,6 +59,23 @@ uint32_t GetControllerSpeakerVolume() {
 
 uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
+}
+
+uint32_t GetKeyboardPlayer() {
+	return g_config->keyboard_player;
+}
+
+int32_t GetPlayerUserId(int player) {
+	return g_config->user_id + player * PLAYER_USER_ID_STEP;
+}
+
+int GetPlayerFromUserId(int32_t user_id) {
+	for (int player = 0; player < MAX_PLAYERS; player++) {
+		if (user_id == GetPlayerUserId(player)) {
+			return player;
+		}
+	}
+	return -1;
 }
 
 PresentMode GetPresentMode() {

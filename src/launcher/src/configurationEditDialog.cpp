@@ -213,6 +213,14 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
 	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
 	m_ui->slider_controller_volume->setValue(info.controller.speaker_volume);
+	auto* keyboard_player = m_ui->comboBox_keyboard_player;
+	keyboard_player->clear();
+	keyboard_player->addItem(tr("Shared with player 1 (default)"), 0);
+	for (int player = 1; player <= 4; player++) {
+		keyboard_player->addItem(tr("Player %1").arg(player), player);
+	}
+	keyboard_player->setCurrentIndex(
+	    qMax(0, keyboard_player->findData(info.controller.keyboard_player)));
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -458,6 +466,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
 		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
 		info.controller.speaker_volume      = ui.slider_controller_volume->value();
+		info.controller.keyboard_player     = ui.comboBox_keyboard_player->currentData().toInt();
 	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());

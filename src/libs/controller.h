@@ -75,7 +75,9 @@ void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ToggleGyroEmulation(int id);
 void ResetInputState();
-int  GetActiveControllerId();
+int  GetActiveControllerId(int player = 0);
+// True when the player has a keyboard or gamepad assigned.
+bool IsPlayerConnected(int player);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 

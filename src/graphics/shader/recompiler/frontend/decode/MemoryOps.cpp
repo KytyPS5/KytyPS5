@@ -457,6 +457,9 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");
 	}
+	if (inst.gds && inst.opcode == Opcode::DS_CMPST_RTN_B32) {
+		SetUnsupported(inst, Family::DS, opcode, "DS compare-store return B32 GDS variant is not implemented");
+	}
 	if (inst.gds &&
 	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_PERMUTE_B32 ||
 	     inst.opcode == Opcode::DS_BPERMUTE_B32 ||

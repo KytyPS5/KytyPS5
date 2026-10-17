@@ -8130,6 +8130,11 @@ void TestDsCompareStore32Decoder() {
             decoded.src1.reg == 5u && decoded.src2.reg == 19u && decoded.dst.reg == 4u &&
             decoded.offset == 0u && !decoded.gds,
         "captured DS_CMPST_RTN_B32 lost its comparison/replacement order or aliases");
+
+  const uint32_t gds_words[] = {words[0] | (1u << 17u), words[1]};
+  DecodeInstruction(gds_words, 0u, decoded);
+  Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.word_count == 2u && decoded.gds,
+        "DS_CMPST_RTN_B32 must reject the unimplemented GDS variant");
 }
 
 void TestDsFloatMinMaxDecoder() {

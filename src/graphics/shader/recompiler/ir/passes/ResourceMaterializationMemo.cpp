@@ -423,6 +423,9 @@ MaterializeMemoConfig& MaterializeMemoConfig::Get() {
 		result.self_compare       = !EnvFlag("KYTY_MEMO_NO_SELF_COMPARE");
 		result.descriptor_patch   = !EnvFlag("KYTY_MEMO_NO_DESCRIPTOR_PATCH");
 		result.hot_replay         = !EnvFlag("KYTY_MEMO_NO_HOT_REPLAY");
+		result.patch_targets      = !EnvFlag("KYTY_NO_MEMO_PATCH_TARGETS");
+		result.shared_operands    = !EnvFlag("KYTY_NO_MEMO_SHARED_OPERANDS");
+		result.fast_evaluate      = !EnvFlag("KYTY_NO_MEMO_FAST_EVALUATE");
 		return result;
 	}();
 	return config;
@@ -707,8 +710,61 @@ void MaterializeMemo::Compile(const ResourcePlan& plan, Value value) {
 	}
 }
 
+// A program holds at most one value per operation, so the array cannot overflow.
 uint64_t MaterializeMemo::Evaluate(uint32_t begin, uint32_t end,
                                    std::span<const uint32_t> user_data) const {
+	constexpr uint32_t MaxFastOps = 32;
+	if (!MaterializeMemoConfig::Get().fast_evaluate || end - begin > MaxFastOps) {
+		return EvaluateScratch(begin, end, user_data);
+	}
+	std::array<uint64_t, MaxFastOps> stack;
+	uint32_t                         top = 0;
+	for (uint32_t index = begin; index < end; index++) {
+		const auto& op = m_ops[index];
+		switch (op.kind) {
+			case Op::Imm: stack[top++] = op.imm; break;
+			case Op::UserData: stack[top++] = user_data[op.index]; break;
+			case Op::Key: stack[top++] = m_key_words[op.index]; break;
+			default: {
+				const auto rhs = stack[--top];
+				const auto lhs = static_cast<uint32_t>(stack[top - 1]);
+				const auto low = static_cast<uint32_t>(rhs);
+				auto&      out = stack[top - 1];
+				switch (op.kind) {
+					case Op::Sub32: out = static_cast<uint32_t>(lhs - low); break;
+					case Op::Mul32: out = static_cast<uint32_t>(lhs * low); break;
+					case Op::And32: out = lhs & low; break;
+					case Op::Or32: out = lhs | low; break;
+					case Op::Shl32: out = static_cast<uint32_t>(lhs << (low & 31u)); break;
+					case Op::Shr32: out = lhs >> (low & 31u); break;
+					default: {
+						const auto sum = static_cast<uint64_t>(lhs) + low;
+						out = op.kind == Op::CarryHigh ? sum >> 32u : static_cast<uint32_t>(sum);
+						break;
+					}
+				}
+				break;
+			}
+		}
+	}
+	return stack[top - 1];
+}
+
+// Equal programs read the same registers and key words, so one evaluation serves every read.
+uint64_t MaterializeMemo::SharedOperand(const HotOperand&         derived,
+                                        std::span<const uint32_t> user_data) {
+	if (!MaterializeMemoConfig::Get().shared_operands) {
+		return Evaluate(derived.begin, derived.end, user_data);
+	}
+	if (m_shared_stamps[derived.shared] != m_shared_epoch) {
+		m_shared_stamps[derived.shared] = m_shared_epoch;
+		m_shared_values[derived.shared] = Evaluate(derived.begin, derived.end, user_data);
+	}
+	return m_shared_values[derived.shared];
+}
+
+uint64_t MaterializeMemo::EvaluateScratch(uint32_t begin, uint32_t end,
+                                          std::span<const uint32_t> user_data) const {
 	// One scratch stack for every memo: it stays in cache, a per-memo one does not.
 	static thread_local std::vector<uint64_t> stack;
 	auto&                                     m_stack = stack;
@@ -921,6 +977,26 @@ bool MaterializeMemo::Build(const ResourcePlan& plan, const ResourceSnapshot& sn
 			patch.op_end[dword] = static_cast<uint32_t>(m_ops.size());
 		}
 	}
+	m_patch_targets.clear();
+	for (auto& patch: m_patches) {
+		patch.target_begin = static_cast<uint32_t>(m_patch_targets.size());
+		for (uint32_t i = 0; i < plan.info.buffers.size(); i++) {
+			if (plan.info.buffers[i].source == patch.source) {
+				m_patch_targets.push_back({PatchTarget::Buffer, plan.info.buffers[i].written, i});
+			}
+		}
+		for (uint32_t i = 0; i < plan.info.images.size(); i++) {
+			if (plan.info.images[i].source == patch.source) {
+				m_patch_targets.push_back({PatchTarget::Image, false, i});
+			}
+		}
+		for (uint32_t i = 0; i < plan.info.samplers.size(); i++) {
+			if (plan.info.samplers[i].source == patch.source) {
+				m_patch_targets.push_back({PatchTarget::Sampler, false, i});
+			}
+		}
+		patch.target_end = static_cast<uint32_t>(m_patch_targets.size());
+	}
 	// Slots the walk pruned stay zero, so only the slots it filled follow a re-read word.
 	std::vector<uint8_t> filled(snapshot.flattened_srt.size(), 0u);
 	if (plan.control_flow.empty()) {
@@ -1029,6 +1105,35 @@ void MaterializeMemo::Commit(const ResourcePlan& plan, const ResourceSnapshot& s
 void MaterializeMemo::BuildHot(const ResourcePlan& plan) {
 	m_hot.resize(m_recorded.size());
 	m_hot_operands.clear();
+	// Distinct operand programs, keyed by their operations.
+	struct Program {
+		uint32_t begin = 0;
+		uint32_t size  = 0;
+		uint32_t id    = 0;
+	};
+	std::unordered_map<uint64_t, std::vector<Program>> programs;
+	uint32_t                                           shared_count = 0;
+	const auto SharedProgram = [&](uint32_t begin, uint32_t end) {
+		uint64_t hash = 0xcbf29ce484222325ull;
+		for (uint32_t index = begin; index < end; index++) {
+			const auto& op = m_ops[index];
+			for (const uint64_t part: {uint64_t {op.kind}, uint64_t {op.index}, op.imm}) {
+				hash = (hash ^ part) * 0x100000001b3ull;
+			}
+		}
+		auto& candidates = programs[hash];
+		for (const auto& other: candidates) {
+			if (other.size == end - begin &&
+			    std::equal(m_ops.begin() + begin, m_ops.begin() + end, m_ops.begin() + other.begin,
+			               [](const Op& a, const Op& b) {
+				               return a.kind == b.kind && a.index == b.index && a.imm == b.imm;
+			               })) {
+				return other.id;
+			}
+		}
+		candidates.push_back({begin, end - begin, shared_count});
+		return shared_count++;
+	};
 	for (uint32_t index = 0; index < m_recorded.size(); index++) {
 		const auto& read = m_recorded[index];
 		const auto& step = m_steps[index];
@@ -1047,7 +1152,9 @@ void MaterializeMemo::BuildHot(const ResourcePlan& plan) {
 		hot.operand_begin = static_cast<uint32_t>(m_hot_operands.size());
 		for (uint32_t operand = 0; operand < read.operands.size(); operand++) {
 			if ((step.derived_mask & (1u << operand)) != 0u) {
-				m_hot_operands.push_back({step.op_begin[operand], step.op_end[operand], operand});
+				m_hot_operands.push_back(
+				    {step.op_begin[operand], step.op_end[operand], operand,
+				     SharedProgram(step.op_begin[operand], step.op_end[operand])});
 			}
 		}
 		hot.operand_count = static_cast<uint8_t>(m_hot_operands.size() - hot.operand_begin);
@@ -1064,10 +1171,17 @@ void MaterializeMemo::BuildHot(const ResourcePlan& plan) {
 		    (!step.refused && m_key_first[step.key] == index ? HotStep::FirstKey : 0u) |
 		    (shape_ok ? HotStep::ShapeOk : 0u));
 	}
+	m_shared_values.assign(shared_count, 0u);
+	m_shared_stamps.assign(shared_count, 0u);
+	m_shared_epoch = 0;
 }
 
 // The recorded-read loop of Replay over the packed records; same checks, same order.
 bool MaterializeMemo::ReplayReadsHot(const SrtRuntime& runtime, bool moved, bool& captured_moved) {
+	if (++m_shared_epoch == 0u) {
+		std::ranges::fill(m_shared_stamps, 0u);
+		m_shared_epoch = 1;
+	}
 	for (uint32_t index = 0; index < m_hot.size(); index++) {
 		const auto& hot     = m_hot[index];
 		uint64_t    address = hot.address;
@@ -1077,7 +1191,7 @@ bool MaterializeMemo::ReplayReadsHot(const SrtRuntime& runtime, bool moved, bool
 			bool                    changed = false;
 			for (uint32_t i = 0; i < hot.operand_count; i++) {
 				const auto& derived = m_hot_operands[hot.operand_begin + i];
-				const auto  value   = Evaluate(derived.begin, derived.end, runtime.user_data);
+				const auto  value   = SharedOperand(derived, runtime.user_data);
 				changed = changed ||
 				          static_cast<uint32_t>(value) != hot.operands[derived.operand] ||
 				          (value >> 32u) != 0u;
@@ -1183,7 +1297,23 @@ bool MaterializeMemo::PatchDescriptors(const ResourcePlan& plan, const SrtRuntim
 		m_miss = Miss::StructureChanged;
 		return false;
 	}
-	for (size_t index = 0; index < m_patches.size(); index++) {
+	const bool targeted = MaterializeMemoConfig::Get().patch_targets;
+	for (size_t index = 0; targeted && index < m_patches.size(); index++) {
+		const auto& patch = m_patches[index];
+		const auto& value = values[index];
+		for (uint32_t target = patch.target_begin; target < patch.target_end; target++) {
+			const auto& bound   = m_patch_targets[target];
+			const auto& current = bound.kind == PatchTarget::Buffer ? snapshot.buffers[bound.index]
+			                      : bound.kind == PatchTarget::Image
+			                          ? snapshot.images[bound.index]
+			                          : snapshot.samplers[bound.index];
+			if (!(current == value)) {
+				changed         = true;
+				written_changed = written_changed || bound.written;
+			}
+		}
+	}
+	for (size_t index = 0; !targeted && index < m_patches.size(); index++) {
 		const auto  source = m_patches[index].source;
 		const auto& value  = values[index];
 		for (uint32_t i = 0; i < info.buffers.size(); i++) {
@@ -1218,7 +1348,17 @@ bool MaterializeMemo::PatchDescriptors(const ResourcePlan& plan, const SrtRuntim
 	next.images         = snapshot.images;
 	next.samplers       = snapshot.samplers;
 	next_specialization = *specialization;
-	for (size_t index = 0; index < m_patches.size(); index++) {
+	for (size_t index = 0; targeted && index < m_patches.size(); index++) {
+		const auto& patch = m_patches[index];
+		for (uint32_t target = patch.target_begin; target < patch.target_end; target++) {
+			const auto& bound = m_patch_targets[target];
+			auto&       slot  = bound.kind == PatchTarget::Buffer  ? next.buffers[bound.index]
+			                    : bound.kind == PatchTarget::Image ? next.images[bound.index]
+			                                                       : next.samplers[bound.index];
+			slot              = values[index];
+		}
+	}
+	for (size_t index = 0; !targeted && index < m_patches.size(); index++) {
 		const auto  source = m_patches[index].source;
 		const auto& value  = values[index];
 		for (uint32_t i = 0; i < info.buffers.size(); i++) {

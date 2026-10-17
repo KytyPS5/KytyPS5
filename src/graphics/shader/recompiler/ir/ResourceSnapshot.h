@@ -37,6 +37,8 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// Guest ranges (address, size) the shader may address; they need cache buffers before it runs.
+	std::vector<std::pair<uint64_t, uint64_t>> address_ranges;
 	UniformFill                 uniform_fill;
 };
 

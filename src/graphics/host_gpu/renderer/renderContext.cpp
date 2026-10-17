@@ -134,6 +134,20 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+// A shader reads a guest page without a cache buffer as zero and drops its stores there: the BDA
+// fault only creates the buffer after the shader ran. Ranges proven before the dispatch get one.
+void RenderContext::MakeAddressRangeResident(uint64_t vaddr, uint64_t size) {
+	// Larger proofs stay on the fault route, as FindBuffers caps unbounded descriptor ranges.
+	constexpr uint64_t MaxResidentRange = uint64_t {256} * 1024 * 1024;
+	if (size > MaxResidentRange || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
+		(void)m_buffer_cache.FindBuffer(start, end - start);
+	});
+}
+
 void RenderContext::RunGarbageCollector() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

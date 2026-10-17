@@ -354,6 +354,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x16cu, Opcode::V_MUL_HI_I32},
     {0x2ffu, Opcode::V_LSHLREV_B64},
     {0x300u, Opcode::V_LSHRREV_B64},
+    {0x301u, Opcode::V_ASHRREV_I64},
     {0x303u, Opcode::V_ADD_NC_U16},
     {0x304u, Opcode::V_SUB_NC_U16},
     {0x305u, Opcode::V_MUL_LO_U16},
@@ -1335,6 +1336,7 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 		case Opcode::V_SUB_NC_I16:
 		case Opcode::V_LSHLREV_B64:
 		case Opcode::V_LSHRREV_B64:
+		case Opcode::V_ASHRREV_I64:
 		case Opcode::V_LSHLREV_B16:
 		case Opcode::V_LSHRREV_B16:
 		case Opcode::V_ASHRREV_I16:

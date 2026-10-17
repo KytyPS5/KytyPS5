@@ -43,6 +43,7 @@ public:
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
+	PageManager&        GetPageManager() { return m_page_manager; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }

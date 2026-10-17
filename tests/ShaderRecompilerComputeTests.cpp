@@ -2571,6 +2571,29 @@ public:
                 scheduler.CurrentTick() == cpu_only_tick,
             "CPU-only unmaps submitted GPU work or lost full PRT coverage");
 
+    LibKernel::Memory::InstallGpuResources(&context);
+    const auto code = LibKernel::Memory::AllocateProgramMemory(
+        0, page, Common::VirtualMemory::Mode::ReadWrite, "tracked_code_protection");
+    Require("GpuMappedRangeLifecycle", "code allocation", code != 0, "code allocation failed");
+    for (const bool kernel_protect : {false, true}) {
+      const bool protected_code = kernel_protect
+          ? LibKernel::Memory::KernelMprotect(reinterpret_cast<void *>(code), page, 0x5) == 0
+          : LibKernel::Memory::ProtectGuestMemory(code, page, Common::VirtualMemory::Mode::Read);
+      Require("GpuMappedRangeLifecycle", "host-writable tracked code",
+              protected_code && context.GetPageManager().IsGuestAccessAllowed(code, PageFaultAccess::Write) &&
+                  context.GetPageManager().IsGuestAccessAllowed(code, PageFaultAccess::Execute) == kernel_protect,
+              "a guest protection update removed code patch access or changed execute permission");
+      *reinterpret_cast<volatile uint32_t *>(code) = kernel_protect ? 0x87654321u : 0x12345678u;
+      LibKernel::Memory::VirtualQueryInfo query{};
+      Require("GpuMappedRangeLifecycle", "semantic code protection",
+              LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void *>(code), 0,
+                  &query, sizeof(query)) == 0 && query.protection == (kernel_protect ? 0x5 : 0x1),
+              "host-writable code lost the guest-requested protection");
+    }
+    Require("GpuMappedRangeLifecycle", "code release", LibKernel::Memory::FreeGuestMemory(code, page),
+            "code release failed");
+    LibKernel::Memory::InstallGpuResources(nullptr);
+
     scheduler.Finish();
     context.ShutdownGpu();
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
@@ -2984,13 +3007,57 @@ public:
                 &direct_offset) == 0, "semaphore allocation failed");
     void *mapped = reinterpret_cast<void *>(base);
     Require(name, "mapping", LibKernel::Memory::KernelMapDirectMemory(
-                &mapped, size, 0x3, 0x10, direct_offset, size) == 0 &&
+                &mapped, size, 0x1, 0x10, direct_offset, size) == 0 &&
                 mapped == reinterpret_cast<void *>(base), "semaphore mapping failed");
-    std::memset(mapped, 0xa5, size);
     RenderContext context(m_runtime_context);
     context.InitializeGpu(nullptr);
     context.MapMemory(base, size);
     LibKernel::Memory::InstallGpuResources(&context);
+    Require(name, "initial read-only protection",
+            context.GetPageManager().IsGuestAccessAllowed(base, PageFaultAccess::Read) &&
+                !context.GetPageManager().IsGuestAccessAllowed(base, PageFaultAccess::Write),
+            "GPU setup lost the mapping's initial protection");
+    context.GetPageManager().UpdatePageWatchers<true>(base, size);
+    context.GetPageManager().UpdatePageWatchers<false>(base, size);
+    Require(name, "read-only protection",
+            LibKernel::Memory::KernelMprotect(mapped, size, 0x1) == 0 &&
+                !context.GetPageManager().IsGuestAccessAllowed(base, PageFaultAccess::Write),
+            "semaphore protection failed");
+    Require(name, "remap unmap", LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "semaphore unmap failed");
+    Require(name, "unmapped guest protection",
+            !context.GetPageManager().IsGuestAccessAllowed(base, PageFaultAccess::Read) &&
+                !context.GetPageManager().IsGuestAccessAllowed(base, PageFaultAccess::Write),
+            "unmap retained the old guest protection");
+    Require(name, "guard mapping", LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0, 0x10, direct_offset, size) == 0,
+            "guard mapping failed");
+    context.GetPageManager().UpdatePageWatchers<true>(base, size);
+    context.GetPageManager().UpdatePageWatchers<false>(base, size);
+    Require(name, "guard protection",
+            !context.GetPageManager().IsGuestAccessAllowed(base, PageFaultAccess::Read) &&
+                !context.GetPageManager().IsGuestAccessAllowed(base, PageFaultAccess::Write) &&
+                !context.HandleFault(PageFaultAccess::Read, base),
+            "tracking granted access to an initial guard mapping");
+    Require(name, "guard unmap", LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "guard unmap failed");
+    Require(name, "remapping", LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, size) == 0,
+            "semaphore remap failed");
+    for (uint64_t offset = 0; offset < size; offset += context.GetPageManager().GetPageSize()) {
+      Require(name, "remapped guest protection",
+              context.GetPageManager().IsGuestAccessAllowed(base + offset, PageFaultAccess::Read) &&
+                  context.GetPageManager().IsGuestAccessAllowed(base + offset, PageFaultAccess::Write) &&
+                  !context.GetPageManager().IsGuestAccessAllowed(base + offset, PageFaultAccess::Execute),
+              "remapping retained the previous mapping's guest protection");
+    }
+    context.GetPageManager().UpdatePageWatchers<true>(base, size);
+    context.GetPageManager().UpdatePageWatchers<false>(base, size);
+    RegionBits watched;
+    watched.SetRange(0, 1);
+    context.GetPageManager().UpdatePageWatchersForRegion<true, true>(base, watched);
+    context.GetPageManager().UpdatePageWatchersForRegion<false, true>(base, watched);
+    std::memset(mapped, 0xa5, size);
     auto &gpu = context.GetGpu();
     auto &scheduler = context.GetCommandScheduler();
     auto &cache = context.GetBufferCache();
@@ -3246,11 +3313,20 @@ public:
     Require(name, "queue scheduling", results == std::array<uint32_t, 2>{1, 2} &&
                 counter.load() == 0,
             "blocked compute queues failed to resume or consumed the wrong number of tokens");
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      gpu_fill_counter(7);
+      Require(name, "unmap staged GPU ownership", cache.StageDownload(address, sizeof(uint64_t)) != 0,
+              "fixture did not stage a GPU-owned page");
+    });
+    Require(name, "guest unmap with read watchers",
+            LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+                !context.GetPageManager().IsGuestAccessAllowed(base, PageFaultAccess::Read),
+            "unmapping GPU-owned pages retained watchers or failed");
     gpu.SendCommandSync([&] { context.UnmapMemory(base, size); scheduler.Finish(); });
     context.ShutdownGpu();
     LibKernel::Memory::InstallGpuResources(nullptr);
-    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0 &&
-                LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+    Require(name, "unmap", LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
             "semaphore mapping or allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -4425,6 +4501,62 @@ public:
                 !empty_copy_dirty,
             "write invalidation without a remaining copy did not establish CPU "
             "ownership");
+
+    LibKernel::Memory::InstallGpuResources(&context);
+    for (const bool gpu_dirty : {false, true}) {
+      constexpr std::array<uint32_t, 4> old_words{
+          0x11800000u, 0xc3800000u, 0x0003c003u, 0xa5a5a5a5u};
+      constexpr std::array<uint32_t, 4> cpu_words{0, 1, 1, 2};
+      gpu.SendCommandSync([&] {
+        resources.InvalidateMemory(immediate_dst, sizeof(old_words));
+      });
+      std::memcpy(reinterpret_cast<void *>(immediate_dst), old_words.data(), sizeof(old_words));
+      gpu.SendCommandSync([&] {
+        auto [buffer, offset] = buffer_cache.ObtainBuffer(immediate_dst, sizeof(old_words), true);
+        if (gpu_dirty) {
+          buffer->Fill(offset, sizeof(old_words), 0xbad0bad0u);
+        } else {
+          buffer_cache.ReadMemory(immediate_dst, sizeof(old_words));
+        }
+      });
+      const auto protect_result = gpu_dirty
+          ? LibKernel::Memory::KernelMtypeprotect(reinterpret_cast<void *>(fault_base),
+                                                  0x4000, 0, 0x33)
+          : LibKernel::Memory::KernelMprotect(reinterpret_cast<void *>(fault_base), 0x4000, 0x33);
+      Require("GpuCommandLane", "tracked memory protection", protect_result == 0,
+              "changing tracked direct-memory protection failed");
+      std::memcpy(reinterpret_cast<void *>(immediate_dst), cpu_words.data(), sizeof(cpu_words));
+      gpu.SendCommandSync([&] {
+        auto [buffer, offset] = buffer_cache.ObtainBuffer(immediate_dst, sizeof(cpu_words), true);
+        buffer->Fill(offset, sizeof(uint32_t), 3);
+        buffer_cache.ReadMemory(immediate_dst, sizeof(cpu_words));
+      });
+      std::array<uint32_t, 4> actual{};
+      Require("GpuCommandLane", "CPU writes after tracked memory protection",
+              LibKernel::Memory::TryReadBacking(immediate_dst, actual.data(), sizeof(actual)) &&
+                  actual == std::array<uint32_t, 4>{3, 1, 1, 2},
+              "changing protection lost CPU writes or unwritten GPU buffer components");
+    }
+    Require("GpuCommandLane", "read-only guest protection",
+            LibKernel::Memory::KernelMprotect(reinterpret_cast<void *>(fault_base), 0x4000, 0x1) == 0,
+            "changing tracked memory to read-only failed");
+    Require("GpuCommandLane", "unknown guest fault treated as read",
+            resources.HandleFault(PageFaultAccess::Unknown, immediate_dst),
+            "GPU fault handling rejected an unknown access to readable memory");
+    Require("GpuCommandLane", "guest write fault rejected",
+            !resources.HandleFault(PageFaultAccess::Write, immediate_dst),
+            "GPU fault handling accepted a guest write to read-only memory");
+    Require("GpuCommandLane", "inaccessible guest protection",
+            LibKernel::Memory::KernelMprotect(reinterpret_cast<void *>(fault_base), 0x4000, 0) == 0,
+            "removing tracked guest access failed");
+    Require("GpuCommandLane", "guest read fault rejected",
+            !resources.HandleFault(PageFaultAccess::Read, immediate_dst) &&
+                !resources.HandleFault(PageFaultAccess::Unknown, immediate_dst),
+            "GPU fault handling accepted a guest read from inaccessible memory");
+    Require("GpuCommandLane", "restore guest protection",
+            LibKernel::Memory::KernelMprotect(reinterpret_cast<void *>(fault_base), 0x4000, 0x33) == 0,
+            "restoring tracked guest access failed");
+    LibKernel::Memory::InstallGpuResources(nullptr);
 
     resources.UnmapMemory(fault_base, fault_size);
     Require("GpuCommandLane", "processor fault unmap",

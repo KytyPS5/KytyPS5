@@ -3655,6 +3655,9 @@ void TestProgramMemoryAllocationAndProtection() {
 	      "ProtectGuestMemory(first page) failed");
 	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRead, 0, 0,
 	            0, 1, "program_test");
+	*reinterpret_cast<volatile uint32_t*>(base) = 0x12345678u;
+	Check(test, *reinterpret_cast<volatile uint32_t*>(base) == 0x12345678u,
+	      "guest read-only protection removed writable code backing");
 
 	Common::VirtualMemory::Mode previous_mode = Common::VirtualMemory::Mode::NoAccess;
 	Check(test,
@@ -3678,6 +3681,14 @@ void TestProgramMemoryAllocationAndProtection() {
 	      "ProtectGuestMemory(last page) failed");
 	ExpectRange(test, Query(test, base + SceKernelPageSize * 2), base + SceKernelPageSize * 2,
 	            base + size, SceKernelProtCpuRead, 0, 0, 0, 1, "program_test");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void*>(base), size,
+	                                                     SceKernelProtCpuRead | SceKernelProtCpuExec),
+	        "KernelMprotect(read-execute code)");
+	ExpectRange(test, Query(test, base), base, base + size,
+	            SceKernelProtCpuRead | SceKernelProtCpuExec, 0, 0, 0, 1, "program_test");
+	*reinterpret_cast<volatile uint32_t*>(base + size - sizeof(uint32_t)) = 0x87654321u;
+	Check(test, *reinterpret_cast<volatile uint32_t*>(base + size - sizeof(uint32_t)) == 0x87654321u,
+	      "guest execute protection removed writable code backing");
 
 	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(base, size), "program guest free failed");
 	Check(test, AvailableFlexibleMemory(test) == available,
@@ -3691,6 +3702,39 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
 	      "module relocation did not retain writable host memory and semantic guest protection");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestGuestProtectionPartialFailure() {
+	const char* test = "GuestProtectionPartialFailure";
+	using namespace Libs::LibKernel::Memory;
+	using Common::VirtualMemory::Mode;
+	const auto page = SceKernelPageSize;
+	for (const bool code_first: {false, true}) {
+		const auto base = code_first
+		                      ? AllocateProgramMemory(0x900000000, page, Mode::ReadWrite, "partial_first")
+		                      : AllocateRuntimeMemory(0x900000000, page, Mode::ReadWrite, "partial_first");
+		Check(test, base != 0, "first allocation failed");
+		const auto second = code_first
+		                        ? AllocateRuntimeMemory(base + page, page, Mode::ReadWrite, "partial_second", true)
+		                        : AllocateProgramMemory(base + page, page, Mode::ReadWrite, "partial_second");
+		Check(test, second == base + page, "adjacent allocation failed");
+		TestFailGuestProtectionAfter(1);
+		Check(test, !ProtectGuestMemory(base, 2 * page, Mode::ExecuteRead),
+		      "the second host protection update did not fail");
+		ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRead | SceKernelProtCpuRw,
+		            0, 0, 0, 1, "partial_first");
+		ExpectRange(test, Query(test, second), second, second + page, SceKernelProtCpuRead | SceKernelProtCpuRw,
+		            0, 0, 0, 1, "partial_second");
+		*reinterpret_cast<volatile uint32_t*>(base) = 0x12345678u;
+		*reinterpret_cast<volatile uint32_t*>(second) = 0x87654321u;
+		Mode previous = Mode::NoAccess;
+		Check(test, ProtectGuestMemory(base, page, Mode::ReadWrite, &previous) && previous == Mode::ReadWrite,
+		      "the failed operation changed the prefix protection");
+		Check(test, ProtectGuestMemory(second, page, Mode::ReadWrite, &previous) && previous == Mode::ReadWrite,
+		      "the failed operation changed the suffix protection");
+		Check(test, FreeGuestMemory(base, 2 * page), "mixed allocation release failed");
+	}
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5015,6 +5059,7 @@ int main(int argc, char** argv) {
 		RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 		RunTest(TestMemoryPoolMultiRangeDecommit);
 		RunTest(TestProgramMemoryAllocationAndProtection);
+		RunTest(TestGuestProtectionPartialFailure);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
@@ -5142,6 +5187,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolMultiRangeDecommit);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
+	RunTest(TestGuestProtectionPartialFailure);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);

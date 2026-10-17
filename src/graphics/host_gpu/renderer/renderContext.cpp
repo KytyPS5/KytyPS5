@@ -59,7 +59,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	const auto checked = access == PageFaultAccess::Unknown ? PageFaultAccess::Read : access;
+	if (!IsMapped(fault_vaddr, fault_size) ||
+	    !m_page_manager.IsGuestAccessAllowed(fault_vaddr, checked)) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
@@ -113,7 +115,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
-		m_buffer_cache.InvalidateMemory(vaddr, size);
+		m_buffer_cache.UnmapMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);

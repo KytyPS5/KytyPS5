@@ -343,6 +343,12 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	QueueBdaSync(vaddr, size);
 }
 
+void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	InvalidateMemory(vaddr, size);
+	InvalidateStagedDownloads(vaddr, size);
+	m_memory_tracker.UntrackMemory(vaddr, size);
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "

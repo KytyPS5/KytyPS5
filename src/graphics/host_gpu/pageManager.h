@@ -19,6 +19,9 @@ public:
 	KYTY_CLASS_NO_COPY(PageManager);
 
 	[[nodiscard]] uint64_t GetPageSize() const;
+	[[nodiscard]] bool IsGuestAccessAllowed(uint64_t vaddr, PageFaultAccess access) const;
+	void ProtectMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+	void UnmapMemory(uint64_t vaddr, uint64_t size);
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

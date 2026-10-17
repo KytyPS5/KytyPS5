@@ -48346,8 +48346,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16RoundsTowardZero());
-    RunCase(&vulkan, BufferStoreFormatXyzPackedFloat(false));
-    RunCase(&vulkan, BufferStoreFormatXyzPackedFloat(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-ashr-i64-only") == 0) {

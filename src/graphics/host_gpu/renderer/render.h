@@ -144,6 +144,10 @@ private:
 	friend class CommandScheduler;
 };
 
+namespace Pssr {
+struct Request;
+} // namespace Pssr
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
@@ -153,6 +157,8 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
+	// PS5 Pro upscaling request (graphics/guest_gpu/pssr.h), recorded into `buffer`.
+	void ProcessPssr(uint64_t submit_id, CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);

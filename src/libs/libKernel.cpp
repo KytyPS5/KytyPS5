@@ -1323,13 +1323,15 @@ static void* KYTY_SYSV_ABI KernelGetProcParam() {
 static int KYTY_SYSV_ABI KernelIsTrinityMode() {
 	static std::atomic_uint32_t call_count {0};
 
-	auto count = call_count.fetch_add(1, std::memory_order_relaxed);
+	const int pro   = Config::Ps5ProEnabled() ? 1 : 0;
+	auto      count = call_count.fetch_add(1, std::memory_order_relaxed);
 	if (count < 8 || (count % 1024) == 0) {
 		PRINT_NAME();
-		LOGF("\tcall = %u, return = 0 (base PS5 mode)\n", count + 1);
+		LOGF("\tcall = %u, return = %d (%s)\n", count + 1, pro,
+		     pro != 0 ? "PS5 Pro mode" : "base PS5 mode");
 	}
 
-	return 0;
+	return pro;
 }
 
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {

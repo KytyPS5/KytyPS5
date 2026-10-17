@@ -68,6 +68,9 @@ static void PrintUsage() {
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
+	::printf(
+	    "  --ps5-pro                            Report a PS5 Pro so games take their Pro path\n"
+	    "                                       (PSSR upscaling is replaced by a linear scale). Experimental.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
@@ -226,6 +229,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--hdr") {
 			options.config.hdr_enabled = true;
+			continue;
+		}
+
+		if (arg == "--ps5-pro") {
+			options.config.ps5_pro_enabled = true;
 			continue;
 		}
 

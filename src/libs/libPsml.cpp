@@ -1,8 +1,12 @@
+#include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
 #include <atomic>
+#include <cinttypes>
+#include <cstring>
 #include <cstdint>
 
 namespace Libs {
@@ -91,11 +95,10 @@ static int CheckInitialized() {
 static void MarkSharedResources(void* resources, const SharedResourcesInitParameters& params) {
 	auto* bytes = static_cast<uint8_t*>(resources);
 
+	// The game's object is only 16 bytes (Astro Bot keeps its own globals right after it), so
+	// only the magic and the block list go there.
 	*reinterpret_cast<uint32_t*>(bytes)                        = SHARED_RESOURCES_MAGIC;
 	*reinterpret_cast<const DirectMemoryBlock**>(bytes + 0x08) = params.blocks;
-	*reinterpret_cast<uint64_t*>(bytes + 0x18)                 = params.block_count;
-	*reinterpret_cast<uint32_t*>(bytes + 0x20)                 = params.type;
-	*reinterpret_cast<uint64_t*>(bytes + 0x28)                 = params.virtual_address_start;
 }
 
 static bool HasKnownObjectMagic(const void* object) {
@@ -213,9 +216,16 @@ static int KYTY_SYSV_ABI PsmlContextInitialize(void* context, const void* params
 		return PSML_ERROR_INVALID_POINTER;
 	}
 
-	*reinterpret_cast<uint32_t*>(bytes)        = CONTEXT_MAGIC;
-	*reinterpret_cast<void**>(bytes + 0x360)   = shared_resources;
-	*reinterpret_cast<uint8_t*>(bytes + 0x368) = 0;
+	// The game keeps the first qword of its context object as the handle it passes to the other
+	// Psml functions (dispatch, work area size, progress), so it gets a pointer to a record that
+	// starts with the context magic.
+	struct ContextRecord {
+		uint32_t magic;
+		uint32_t reserved;
+		void*    shared_resources;
+	};
+	auto* record = new ContextRecord {CONTEXT_MAGIC, 0, shared_resources};
+	*reinterpret_cast<ContextRecord**>(bytes) = record;
 
 	return OK;
 }
@@ -255,6 +265,14 @@ static int KYTY_SYSV_ABI PsmlGetWorkAreaSize(const void* object, uint32_t* out_s
 	return OK;
 }
 
+// The caller passes {command buffer cursor, reserved dwords} (the size from GetWorkAreaSize) and
+// the upscale request. The native library writes its GPU work there; Kyty writes one IT_NOP
+// packet that hands a copy of the request to the command processor (graphics/guest_gpu/pssr.h).
+struct CommandSpace {
+	uint32_t* cmd;
+	uint32_t  dwords;
+};
+
 static int KYTY_SYSV_ABI PsmlDispatch(void* context, uint64_t command, uint64_t params) {
 	PRINT_NAME();
 
@@ -269,6 +287,35 @@ static int KYTY_SYSV_ABI PsmlDispatch(void* context, uint64_t command, uint64_t 
 		return PSML_ERROR_INVALID_POINTER;
 	}
 
+	const auto& space = *reinterpret_cast<const CommandSpace*>(command);
+	constexpr uint32_t packet_dwords = 1 + Graphics::Pssr::RequestDwords;
+	if (space.cmd == nullptr || space.dwords < packet_dwords) {
+		LOGF("Psml: dispatch space too small (%u dwords)\n", space.dwords);
+		return PSML_ERROR_INVALID_VALUE;
+	}
+	Graphics::Pssr::Request request {};
+	request.magic          = Graphics::Pssr::Magic;
+	request.version        = Graphics::Pssr::Version;
+	request.params_address = params;
+	std::memcpy(request.params, reinterpret_cast<const void*>(params), sizeof(request.params));
+	for (uint32_t slot = 0; slot < Graphics::Pssr::TextureSlots; slot++) {
+		const auto descriptor = reinterpret_cast<const uint64_t*>(params)[slot];
+		if (descriptor != 0) {
+			std::memcpy(request.textures[slot], reinterpret_cast<const void*>(descriptor), 32);
+			request.texture_mask |= 1u << slot;
+		}
+	}
+	// One packet covers the whole reserved space, which the caller skips after the call.
+	namespace Pm4 = Graphics::Pm4; // used by KYTY_PM4
+	space.cmd[0]  = KYTY_PM4(space.dwords, Pm4::IT_NOP, Pm4::R_PSSR);
+	std::memcpy(space.cmd + 1, &request, sizeof(request));
+	std::memset(space.cmd + packet_dwords, 0, (space.dwords - packet_dwords) * sizeof(uint32_t));
+
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1) < 4) {
+		LOGF("Psml: PSSR request 0x%016" PRIx64 " slots=0x%02x into %u dwords\n", params,
+		     request.texture_mask, space.dwords);
+	}
 	return OK;
 }
 

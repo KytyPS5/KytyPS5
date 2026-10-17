@@ -3642,8 +3642,17 @@ private:
 			    !MatchReversedImageRange(key, indirect) &&
 			    !MatchBufferFloatKey(key, handle, indirect)) {
 				const auto maximum = BoundedImageKey(key, handle);
-				if (maximum >= MaxIndirectDescriptorProbes) return false;
-				indirect.key_count = Value(maximum + 1u);
+				if (maximum < MaxIndirectDescriptorProbes) {
+					indirect.key_count = Value(maximum + 1u);
+				} else if (key_inst != nullptr && key_inst->GetOpcode() == ValueOpcode::FindILsb32 &&
+				           table_offset == table_stride) {
+					// FF1 selects bits 0..31 or -1 for zero. When the bias equals
+					// the stride, the sentinel wraps to the first table record.
+					indirect.selector_first = Value(UINT32_MAX);
+					indirect.key_count = Value(33u);
+				} else {
+					return false;
+				}
 			}
 			if ((table_offset & 3u) != 0u) return false;
 		} else {

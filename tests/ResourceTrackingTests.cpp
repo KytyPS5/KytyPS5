@@ -8846,6 +8846,66 @@ void TestFiniteInlineSampler() {
              "finite sampler planning accepted a shared SampleAdjust handle");
 }
 
+void TestImageTableBitScanSentinel() {
+  Fixture fixture;
+  const auto mask = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(uint32_t(StageInputKind::LocalInvocationIndex)), Value(0u)});
+  const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+  const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(32u)});
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = word * 4u;
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {table, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x12cu));
+  }
+  const auto image = fixture.Image(words, 0x170u);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+      {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x170u));
+  fixture.PlanAndTrack();
+  const auto source = fixture.program.info.images[0].source;
+  const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+  Check(indirect && indirect->selector_first == Value(UINT32_MAX) &&
+            indirect->key_count == Value(33u) && indirect->table_offset == 32u &&
+            indirect->table_stride == 32u && image.Instruction()->Arg(0) == key,
+        "image table bit scan lost its zero-input sentinel or GPU key");
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  LinearTestMemory memory;
+  for (uint32_t record = 0; record < 33u; ++record) {
+    memory.words[record * 8u] = 0x100u + record;
+    memory.words[record * 8u + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[record * 8u + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  const std::array<uint32_t, 2> user_data{0x1000u, 0u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 33u && memory.descriptor_reads == 33u,
+        "bit scan table did not capture its complete descriptor domain");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 33u,
+        "bit scan mapping lost a candidate");
+  for (uint32_t entry = 0; entry < 33u; ++entry) {
+    const auto expected_key = entry == 32u ? UINT32_MAX : entry;
+    const auto ordinal = snapshot.flattened_srt[mapping + 2u + entry * 2u];
+    Check(snapshot.flattened_srt[mapping + 1u + entry * 2u] == expected_key &&
+              snapshot.images[ordinal].dwords[0] == 0x100u + uint32_t(expected_key + 1u),
+          "bit scan sentinel did not wrap to descriptor zero or changed a bit position");
+  }
+}
+
 void TestFiniteImageBitScanSentinel() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   for (const bool nonzero : {false, true}) {
@@ -9869,6 +9929,7 @@ int main() {
     Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
+    Run("image table bit scan sentinel", TestImageTableBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);

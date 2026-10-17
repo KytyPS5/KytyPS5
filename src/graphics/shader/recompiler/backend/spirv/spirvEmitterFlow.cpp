@@ -763,8 +763,20 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
+	const auto exec   = inst.Arg(1).Resolve();
 	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto lane   = ctx.FirstLane(ballot);
+	auto       lane   = ctx.FirstLane(ballot);
+	if (!exec.IsImmediate() || !exec.U1()) {
+		const auto low  = state.builder.AllocateId();
+		const auto high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+		lane =
+		    Select(state, TypeU32(state),
+		           EmitCompareU32Constant(state, spv::OpINotEqual, EmitOrU32(state, low, high), 0u),
+		           lane, ConstantU32(state, 0));
+	}
 	return ctx.Shuffle(inst, 0, lane);
 }
 

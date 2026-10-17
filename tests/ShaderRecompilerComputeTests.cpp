@@ -22541,6 +22541,40 @@ TestCase ScalarZeroBitOps() {
   return test;
 }
 
+TestCase VectorReadFirstLaneEmptyExec(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 32 ? "VectorReadFirstLaneEmptyExecWave32"
+                              : "VectorReadFirstLaneEmptyExecWave64";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(64), 0));
+  code.push_back(EncodeSop1(0x04, 126, 128));
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(1)));
+  code.push_back(EncodeSop1(0x04, 126, 193));
+  code.push_back(EncodeVopc(0xd4, InlineU32(0), 0));
+  code.push_back(EncodeVop1(0x02, 21, Vgpr(1)));
+  code.push_back(EncodeSop1(0x04, 126, 193));
+  code.push_back(EncodeVopc(0xd1, InlineU32(32), 0));
+  code.push_back(EncodeVop1(0x02, 22, Vgpr(1)));
+  code.push_back(EncodeSop1(0x04, 126, 193));
+  const u32 expected[] = {64u, 64u, wave_size == 64 ? 97u : 64u};
+  for (u32 word = 0; word < 3u; ++word) {
+    AppendStoreSgprAtLaneDwordOffset(&code, 20u + word, 0, test.expected.size());
+    test.expected.insert(test.expected.end(), wave_size, expected[word]);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_ADD_NC_U32, O::S_MOV_B64, O::V_READFIRSTLANE_B32,
+                  O::V_CMPX_GT_U32, O::V_CMPX_LT_U32, O::V_MOV_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarSextMasks(u32 bits, u32 wave_size) {
   using O = ShaderOpcode;
   TestCase test;
@@ -42165,6 +42199,8 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(ScalarSextMasks(bits, 32));
     cases.push_back(ScalarSextMasks(bits, 64));
   }
+  cases.push_back(VectorReadFirstLaneEmptyExec(32));
+  cases.push_back(VectorReadFirstLaneEmptyExec(64));
   AddCase(ScalarSextConstantsAndAliases);
   cases.push_back(ScalarBrevB64OperandsAndMasks(32));
   cases.push_back(ScalarBrevB64OperandsAndMasks(64));

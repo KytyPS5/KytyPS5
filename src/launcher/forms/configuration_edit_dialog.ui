@@ -259,8 +259,8 @@
            <layout class="QVBoxLayout" name="compatibilityLayout">
             <item>
              <widget class="QCheckBox" name="checkBox_amd_cpu">
-              <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
-              <property name="text"><string>AMD CPU patch (experimental)</string></property>
+              <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU. Partially checked = automatic: patch only when the host CPU lacks SSE4a, RDPID or CLWB.</string></property>
+              <property name="text"><string>AMD CPU patch (auto)</string></property>
              </widget>
             </item>
             <item>

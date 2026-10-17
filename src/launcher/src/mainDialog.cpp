@@ -286,8 +286,10 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--profile";
 	}
 	args << "--spirv-debug-printf" << "false";
-	if (info.amd_cpu_enabled) {
+	if (info.amd_cpu_mode == Common::AmdCpuMode::On) {
 		args << "--amd-cpu";
+	} else if (info.amd_cpu_mode == Common::AmdCpuMode::Off) {
+		args << "--no-amd-cpu";
 	}
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {

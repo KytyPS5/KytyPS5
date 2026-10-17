@@ -262,6 +262,31 @@ bool DepthTwinsEnabled() {
 	return enabled;
 }
 
+// KYTY_NO_ALIAS_SYNC_SUPERSEDED=1: a same-layout alias with any superseded bytes is never synced.
+[[nodiscard]] bool AliasSyncSupersededEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_ALIAS_SYNC_SUPERSEDED");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+// The ranges a buffer wrote after the alias's last GPU write travel with the copy.
+[[nodiscard]] bool SupersededAliasCanSync(const Image& alias) {
+	if (!alias.IsSuperseded()) {
+		return true;
+	}
+	if (!AliasSyncSupersededEnabled()) {
+		return false;
+	}
+	if (!alias.SupersededAfterLastGpuWrite()) {
+		// Older buffer writes were reconciled into the alias before it was written again.
+		return true;
+	}
+	return !alias.SupersededSinceGpuWriteRanges().empty() &&
+	       !alias.SupersededSinceGpuWrite(alias.info.data.address, alias.info.data.size);
+}
+
 [[nodiscard]] bool LayoutAliasCandidate(const Image& image) {
 	return image.registered && !image.dormant && !image.depth_id && !image.info.data.Empty() &&
 	       image.backing.image != nullptr && image.backing.samples == 1 &&
@@ -1552,7 +1577,7 @@ void TextureCache::SyncLayoutAlias(ImageId id, const ImageIds& candidates) {
 		// A linear alias reaches its siblings through readback and guest memory instead.
 		if (candidate == id || alias == nullptr || !LayoutAliasCandidate(*alias) ||
 		    ImageOwnsGuestBytes(*alias) || !alias->IsGpuModified() || alias->IsBufferModified() ||
-		    alias->IsSuperseded() || !SameAliasLayout(alias->info, image->info) ||
+		    !SupersededAliasCanSync(*alias) || !SameAliasLayout(alias->info, image->info) ||
 		    alias->ContentEpoch() <= newest_epoch) {
 			continue;
 		}
@@ -1562,11 +1587,20 @@ void TextureCache::SyncLayoutAlias(ImageId id, const ImageIds& candidates) {
 	if (!newest) {
 		return;
 	}
+	std::vector<std::pair<uint64_t, uint64_t>> newer_in_memory;
+	if (const auto& source = m_slot_images[newest]; source.SupersededAfterLastGpuWrite()) {
+		const auto ranges = source.SupersededSinceGpuWriteRanges();
+		newer_in_memory.assign(ranges.begin(), ranges.end());
+	}
 	CopyImage(id, newest);
 	auto& synced = m_slot_images[id];
 	if (synced.IsGpuModified()) {
 		synced.alias_stamp_epoch   = synced.GpuWriteEpoch();
 		synced.alias_content_epoch = newest_epoch;
+	}
+	// The copy carried the source's stale bytes there too; FindImage's reconcile replaces them.
+	for (const auto& [begin, end]: newer_in_memory) {
+		(void)synced.Supersede(begin, end - begin);
 	}
 }
 

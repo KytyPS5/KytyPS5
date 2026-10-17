@@ -74,6 +74,12 @@ template <typename T, typename Enumerator>
 	}
 }
 
+// Unbound textures bind VK_NULL_HANDLE only when robustness2.nullDescriptor is supported and enabled on
+// the device (MoltenVK does not report it); otherwise they bind a 1x1 stand-in image.
+[[nodiscard]] constexpr inline bool UseNativeNullDescriptor(bool null_descriptor_feature) {
+	return null_descriptor_feature;
+}
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_VULKANCOMMON_H_

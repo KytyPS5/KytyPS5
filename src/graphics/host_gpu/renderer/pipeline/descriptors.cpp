@@ -356,6 +356,40 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
+// Stand-in for a null T# on devices without robustness2.nullDescriptor.
+static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
+                                               TextureCache::BindingType                  binding) {
+	TextureCache::ImageDesc desc {};
+	switch (resource.numeric_class) {
+		case Prospero::TextureNumericClass::Float:
+			desc.info.guest_format = Prospero::BufferFormat::k32Float;
+			break;
+		case Prospero::TextureNumericClass::Uint:
+			desc.info.guest_format = resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
+			                                         : Prospero::BufferFormat::k32UInt;
+			break;
+		case Prospero::TextureNumericClass::Sint:
+			desc.info.guest_format = Prospero::BufferFormat::k32SInt;
+			break;
+		default: EXIT("null image has unsupported numeric class\n");
+	}
+	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
+	desc.info.type            = Prospero::ImageType::kColor2D;
+	desc.info.extent          = {1, 1, 1};
+	desc.info.resources       = {1, 1};
+	desc.info.bytes_per_block = Prospero::NumBytesPerElement(desc.info.guest_format);
+	desc.info.samples         = 1;
+	desc.info.mip_layout[0]   = {0, 0, 1, 1};
+	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
+	desc.view_info.type       = vk::ImageViewType::e2D;
+	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
+	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
+	                                ? vk::ImageUsageFlagBits::eStorage
+	                                : vk::ImageUsageFlagBits::eSampled;
+	desc.type                 = binding;
+	return desc;
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -491,7 +525,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
+		if (m_context.GetGraphics().null_descriptor_enabled) {
+			return {.layout = vk::ImageLayout::eGeneral};
+		}
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
 	}
 
 	const auto address         = descriptor.Base40();
@@ -665,6 +705,9 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 		return;
 	}
 	auto& image = m_context.GetTextureCache().GetImage(id);
+	if (image.info.data.Empty()) {
+		return;
+	}
 	if (image.binding.is_bound) {
 		image.binding.force_general |= image.binding.shader_write != storage;
 	}
@@ -819,7 +862,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || !old_image->registered ||
+		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
@@ -870,7 +913,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
 		const auto old_image = cache.m_slot_images.try_get(target.image_id);
-		if (old_image == nullptr || !old_image->registered ||
+		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
@@ -987,7 +1030,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-			if (image.binding.is_target) {
+			if (image.info.data.Empty()) {
+				image.Transit(vk::ImageLayout::eGeneral,
+				              storage ? vk::AccessFlagBits2::eShaderRead |
+				                            vk::AccessFlagBits2::eShaderWrite
+				                      : vk::AccessFlagBits2::eShaderRead,
+				              range, vk_buffer);
+			} else if (image.binding.is_target) {
 				const auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
 				if (image.info.IsDepth()) {

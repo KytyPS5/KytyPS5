@@ -294,7 +294,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              "shaderStorageBufferArrayNonUniformIndexing",
 		              required_features12.shaderStorageBufferArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
+#if defined(__APPLE__)
+		// MoltenVK does not report nullDescriptor; unbound textures then bind a 1x1 stand-in image.
+		if (robustness2.nullDescriptor != VK_TRUE) {
+			LOGF("nullDescriptor is not supported\n");
+		}
+#else
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
+#endif
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
 		check_feature(features13.synchronization2, "synchronization2",
@@ -633,7 +640,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #endif
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
-	robustness2.nullDescriptor      = VK_TRUE;
+	robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
+	graphics.null_descriptor_enabled = UseNativeNullDescriptor(robustness2.nullDescriptor == VK_TRUE);
+	LOGF("Vulkan nullDescriptor: %s\n", graphics.null_descriptor_enabled ? "native" : "stand-in image");
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 	features13.pNext = &robustness2;

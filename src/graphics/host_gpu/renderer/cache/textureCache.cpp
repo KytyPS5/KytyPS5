@@ -200,7 +200,9 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
-	RegisterImage(id);
+	if (!info.data.Empty()) {
+		RegisterImage(id);
+	}
 	return id;
 }
 
@@ -398,12 +400,35 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled()) {
+	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
 		m_download_images.insert(id);
 	}
+}
+
+// Placeholder for a null T# when the device lacks robustness2.nullDescriptor: an unregistered
+// 1x1 image with no guest backing, kept per pixel format.
+ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
+	const auto format = desc.info.pixel_format;
+	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
+		return found->second;
+	}
+	ImageInfo info {};
+	info.pixel_format    = desc.info.pixel_format;
+	info.guest_format    = desc.info.guest_format;
+	info.type            = Prospero::ImageType::kColor2D;
+	info.extent          = {1, 1, 1};
+	info.resources       = {1, 1};
+	info.pitch           = 1;
+	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
+	info.samples         = 1;
+	info.tile_mode       = Prospero::TileMode::kLinear;
+	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
+	const auto id        = InsertImage(info);
+	m_null_images.emplace(format, id);
+	return id;
 }
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
@@ -997,6 +1022,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	if (image.info.data.Empty()) {
+		return;
+	}
 	TrackImage(id);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (image.IsCpuDirty()) {
@@ -1183,7 +1211,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
 	ValidateImageDesc(desc);
-	EXIT_IF(desc.info.data.Empty());
+	if (desc.info.data.Empty()) {
+		std::scoped_lock lock {m_lock};
+		return GetNullImage(desc);
+	}
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
@@ -1335,30 +1366,36 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
-	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+	if (!image.info.data.Empty()) {
+		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+		}
 	}
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
 	}
-	RefreshImage(id);
-	if (image.info.HasStencil() &&
-	    desc.info.data.address >= image.info.stencil.address &&
-	    desc.info.data.End() <= image.info.stencil.End()) {
-		for (const auto stencil_id:
-		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
-			const auto* stencil = m_slot_images.try_get(stencil_id);
-			if (stencil != nullptr && stencil->depth_id == id &&
-			    stencil->info.data == image.info.stencil) {
-				RefreshImage(stencil_id);
-				break;
+	if (!image.info.data.Empty()) {
+		RefreshImage(id);
+		if (image.info.HasStencil() &&
+		    desc.info.data.address >= image.info.stencil.address &&
+		    desc.info.data.End() <= image.info.stencil.End()) {
+			for (const auto stencil_id:
+			     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
+				const auto* stencil = m_slot_images.try_get(stencil_id);
+				if (stencil != nullptr && stencil->depth_id == id &&
+				    stencil->info.data == image.info.stencil) {
+					RefreshImage(stencil_id);
+					break;
+				}
 			}
 		}
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
-			CommitGpuWrite(image);
+			if (!image.info.data.Empty()) {
+				CommitGpuWrite(image);
+			}
 			TrackImageDownload(id, image);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");

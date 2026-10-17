@@ -35,6 +35,8 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	// robustness2.nullDescriptor enabled: unbound textures bind VK_NULL_HANDLE; otherwise a 1x1 stand-in image.
+	bool                               null_descriptor_enabled               = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

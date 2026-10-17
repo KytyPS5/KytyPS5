@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -252,7 +253,11 @@ void TextureCache::DeleteImage(ImageId id) {
 		return;
 	}
 	if (image->depth_id) {
-		std::erase(m_slot_images[image->depth_id].stencil_ids, id);
+		// The depth owner may already be retired (evicted while this association
+		// survived through another reference); unlink only when it is still alive.
+		if (auto* depth = m_slot_images.try_get(image->depth_id)) {
+			std::erase(depth->stencil_ids, id);
+		}
 	} else {
 		// Detach first: deleting each association also unlinks it from its depth owner.
 		for (const auto association: std::exchange(image->stencil_ids, {})) {
@@ -272,9 +277,18 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
-	auto& image = m_slot_images[id];
-	if (image.IsGpuModified()) {
-		image.ClearGpuModified();
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr) {
+		// Link fixups can race eviction: freeing an already-retired image is a no-op.
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("TextureCache: FreeImage skipped for retired image (index=%u generation=%u)\n",
+			     id.index, id.generation);
+		}
+		return;
+	}
+	if (image->IsGpuModified()) {
+		image->ClearGpuModified();
 	}
 	DeleteImage(id);
 }
@@ -1171,8 +1185,12 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		plane.bytes_per_block = 1;
 		plane.UpdateSize();
 		if (record.depth_id != depth_id) {
+			// The previous depth owner may have been evicted already; only unlink
+			// when it is still alive. record.depth_id is overwritten below.
 			if (record.depth_id) {
-				std::erase(m_slot_images[record.depth_id].stencil_ids, association);
+				if (auto* old_depth = m_slot_images.try_get(record.depth_id)) {
+					std::erase(old_depth->stencil_ids, association);
+				}
 			}
 			depth.stencil_ids.push_back(association);
 		}

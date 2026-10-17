@@ -84,7 +84,7 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   readback_linear_images      = false;
+	bool                   readback_linear_images      = true;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   support_zmask               = false;
 	bool                   tessellation_enabled        = false;

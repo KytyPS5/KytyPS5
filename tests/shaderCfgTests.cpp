@@ -16150,6 +16150,193 @@ void TestSpirvConditionVotes() {
   }
 }
 
+// A VS that writes host location 31 (the one that carries the instance index) is still emitted and the
+// location is recorded; the interface check, not the emitter, keeps such a pair off the VS-store path.
+void TestPvVsStoreLocation31() {
+  using namespace ShaderRecompiler;
+  const uint32_t vs_code[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
+                              EncodeExp0(0x3f, 0xf), EncodeExp1(4, 5, 6, 7),
+                              EncodeSopp(0x01)};
+  const auto vs_options = MakeCompileOptions(ShaderType::Vertex);
+  auto vs = RecompileForTest(vs_code, vs_options);
+  uint32_t mask = 0;
+  Spirv::PvStoreInfo info;
+  info.role = Spirv::PvStoreInfo::Role::Vertex;
+  info.location_mask = &mask;
+  (void)Spirv::EmitProgram(vs.program, vs_options.input_info, 0, false, false, &info);
+  Check(mask == (1u << 31), "VS-store VS does not record host location 31");
+  Check(ClassifyPvVsStoreInterface(mask, 1u) == PvVsStoreInterfaceVerdict::Param31,
+        "a pair that uses host location 31 is not rejected");
+}
+
+// VS-store: the VS writes its PerVertex parameters to the cap buffer, the PS reads the
+// three corners of its primitive from it instead of PerVertexKHR.
+void TestPvVsStoreEmission() {
+  using namespace ShaderRecompiler;
+  const auto count = [](const std::string &text, const std::string &needle) {
+    size_t n = 0;
+    for (size_t at = text.find(needle); at != std::string::npos;
+         at = text.find(needle, at + needle.size())) {
+      n++;
+    }
+    return n;
+  };
+  // --- vertex side
+  const uint32_t vs_code[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
+                              EncodeExp0(0x20, 0xf), EncodeExp1(4, 5, 6, 7),
+                              EncodeSopp(0x01)};
+  const auto vs_options = MakeCompileOptions(ShaderType::Vertex);
+  auto vs = RecompileForTest(vs_code, vs_options);
+  Spirv::PvStoreInfo vs_info;
+  vs_info.role = Spirv::PvStoreInfo::Role::Vertex;
+  uint32_t parameters = 0;
+  for (const auto &output : vs.program.info.outputs) {
+    if (output.kind == IR::StageOutputKind::Parameter) {
+      vs_info.parameter_slots[output.location] = parameters++;
+    }
+  }
+  Check(parameters == 1, "test VS must have one parameter output");
+  vs_info.record_stride_vec4 = parameters;
+  const auto vs_words = Spirv::EmitProgram(vs.program, vs_options.input_info, 0, false, false, &vs_info);
+  CheckSpirvBinaryValidates(vs_words);
+  const auto vs_text = DisassembleSpirvBinary(vs_words);
+  Check(count(vs_text, "OpAccessChain %_ptr_StorageBuffer_v4uint %pv_cap") == parameters,
+        "VS does not store each parameter export to the cap buffer");
+  Check(vs_text.find("Location 31") != std::string::npos &&
+            vs_text.find("%pv_instance Flat") != std::string::npos,
+        "VS does not carry the instance index in the flat location-31 varying");
+  Check(vs_text.find("Coherent") == std::string::npos &&
+            vs_text.find("OpMemoryBarrier") == std::string::npos,
+        "coherent/barrier must stay behind the flag");
+  Check(vs_text.find("Offset 128") != std::string::npos,
+        "VS push block lacks the VS-store parameters");
+  vs_info.coherent = true;
+  const auto vs_coherent_text = DisassembleSpirvBinary(
+      Spirv::EmitProgram(vs.program, vs_options.input_info, 0, false, false, &vs_info));
+  Check(vs_coherent_text.find("OpDecorate %pv_cap Coherent") != std::string::npos &&
+            vs_coherent_text.find("OpMemoryBarrier") != std::string::npos,
+        "coherent flag did not reach the VS");
+  Check(Spirv::EmitProgram(vs.program, vs_options.input_info) == vs.spirv,
+        "VS SPIR-V changed without the VS-store switch");
+  // stride 0 = slot is the host location, the stride comes from push dword 7, the touched
+  // locations are reported through location_mask.
+  {
+    uint32_t vs_mask = 0;
+    Spirv::PvStoreInfo dynamic;
+    dynamic.role = Spirv::PvStoreInfo::Role::Vertex;
+    dynamic.location_mask = &vs_mask;
+    const auto dynamic_words = Spirv::EmitProgram(vs.program, vs_options.input_info, 0, false, false, &dynamic);
+    CheckSpirvBinaryValidates(dynamic_words);
+    uint32_t expect_mask = 0;
+    for (const auto &output : vs.program.info.outputs) {
+      if (output.kind == IR::StageOutputKind::Parameter) expect_mask |= 1u << output.location;
+    }
+    Check(vs_mask != 0 && vs_mask == expect_mask,
+          "dynamic-stride VS reported other locations than its parameter outputs");
+    Check(DisassembleSpirvBinary(dynamic_words).find("%vsharp %uint_1 %uint_7") != std::string::npos,
+          "dynamic stride is not read from push dword 7");
+    Check(vs_text.find("%vsharp %uint_1 %uint_7") == std::string::npos,
+          "fixed-stride VS reads the dynamic stride");
+  }
+
+  // --- pixel side
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  const uint32_t ps_code[] = {
+      EncodeVintrp(2, 12, 0, 3, 2), EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(2, 14, 0, 3, 1), EncodeVop2(0x03, 15, 12 + 256, 0),
+      EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+      EncodeExp1(15, 16, 14, 12), 0xbf810000u};
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 1;
+  ps_info.ps_system_input_base = 2;
+  ps_info.custom_interpolation_mask = 1;
+  ps_info.ps_perspective_center_vgpr = 0;
+  SetIdentityInterpolatorSettings(&ps_info);
+  ps_info.interpolator_settings[0] = 0x00000420u;
+  options.input_info.pixel = &ps_info;
+  auto ps = RecompileForTest(ps_code, options);
+  Spirv::PvStoreInfo ps_pv;
+  ps_pv.role = Spirv::PvStoreInfo::Role::Pixel;
+  ps_pv.record_stride_vec4 = 1;
+  ps_pv.parameter_slots[0] = 0;
+  const auto ps_words = Spirv::EmitProgram(ps.program, options.input_info, 0, false, false, &ps_pv);
+  CheckSpirvBinaryValidates(ps_words);
+  const auto text = DisassembleSpirvBinary(ps_words);
+  const auto legacy = DisassembleSpirvBinary(ps.spirv);
+  if (std::getenv("KYTY_X_PV_DUMP") != nullptr) {
+    std::fprintf(stderr, "---- legacy PS\n%s\n---- pv PS\n%s\n", legacy.c_str(), text.c_str());
+  }
+  Check(legacy.find("PerVertexKHR") != std::string::npos,
+        "test PS lost its PerVertexKHR input");
+  Check(text.find("PerVertexKHR") == std::string::npos,
+        "VS-store PS still declares PerVertexKHR");
+  Check(text.find("BuiltIn PrimitiveId") != std::string::npos &&
+            text.find("Capability Tessellation") != std::string::npos,
+        "PS does not read the primitive id");
+  Check(text.find("Capability Geometry") == std::string::npos,
+        "PS needs the Geometry capability, which the device does not enable");
+  Check(text.find("BuiltIn BaryCoordKHR") != std::string::npos,
+        "PS lost the barycentric weights");
+  Check(text.find("%pv_indices Binding 1") != std::string::npos &&
+            text.find("%pv_cap NonWritable") != std::string::npos,
+        "PS does not bind the index buffer / read-only cap");
+  Check(text.find("%pv_instance Flat") != std::string::npos,
+        "PS does not read the flat instance index");
+  Check(Spirv::EmitProgram(ps.program, options.input_info) == ps.spirv,
+        "PS SPIR-V changed without the VS-store switch");
+  {
+    uint32_t ps_mask = 0;
+    Spirv::PvStoreInfo dynamic;
+    dynamic.role = Spirv::PvStoreInfo::Role::Pixel;
+    dynamic.location_mask = &ps_mask;
+    const auto dynamic_words = Spirv::EmitProgram(ps.program, options.input_info, 0, false, false, &dynamic);
+    CheckSpirvBinaryValidates(dynamic_words);
+    Check(ps_mask != 0 && (ps_mask & (1u << 31)) == 0,
+          "dynamic-stride PS did not report its per-vertex locations");
+    Check(DisassembleSpirvBinary(dynamic_words).find("%vsharp %uint_1 %uint_7") != std::string::npos,
+          "dynamic stride is not read from push dword 7");
+  }
+  // Corner k of the guest read must be element k of the primitive: the order of the vertex
+  // numbers in the PerVertexKHR array accesses equals the order of the corner constants added to
+  // first_index + primitive * 3.
+  const auto corners = [&](const std::string &module) {
+    std::vector<std::string> sequence;
+    std::istringstream lines(module);
+    std::string line, previous, before_previous;
+    while (std::getline(lines, line)) {
+      const auto marker = line.find("OpIAdd %uint ");
+      if (marker != std::string::npos && previous.find("OpIAdd %uint ") != std::string::npos &&
+          before_previous.find("OpIMul %uint ") != std::string::npos &&
+          before_previous.find(" %uint_3") != std::string::npos) {
+        sequence.push_back(line.substr(line.rfind('%')));
+      }
+      before_previous = previous;
+      previous = line;
+    }
+    return sequence;
+  };
+  const auto pv_corners = corners(text);
+  std::vector<std::string> legacy_vertices;
+  {
+    std::istringstream lines(legacy);
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (line.find("OpAccessChain %_ptr_Input_float %in_") != std::string::npos &&
+          line.find("BaryCoord") == std::string::npos) {
+        const auto last = line.rfind(' ');
+        const auto prev = line.rfind(' ', last - 1);
+        legacy_vertices.push_back(line.substr(prev + 1, last - prev - 1));
+      }
+    }
+  }
+  Check(!pv_corners.empty() && pv_corners.size() == legacy_vertices.size(),
+        "VS-store PS reads a different number of corners than the PerVertexKHR PS");
+  for (size_t i = 0; i < pv_corners.size() && i < legacy_vertices.size(); i++) {
+    Check(pv_corners[i] == legacy_vertices[i],
+          "VS-store PS reads another corner than the PerVertexKHR PS (first/third swapped?)");
+  }
+}
+
 void TestRepeatedExportsHaveOneInterface() {
   const uint32_t shader[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
                              EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
@@ -16477,6 +16664,8 @@ int main() {
 
   EnsureConfigInitialized();
   TestRayTracingInstructions();
+  TestPvVsStoreEmission();
+  TestPvVsStoreLocation31();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

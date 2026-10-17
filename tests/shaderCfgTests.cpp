@@ -4305,6 +4305,44 @@ void TestNewShaderRecompilerScalarB64LaneTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerF32ProductAddNoContraction() {
+  const uint32_t shader[] = {
+      EncodeVop2(0x08, 2, 256 + 0, 1), // v_mul_f32 v2, v0, v1
+      EncodeVop2(0x04, 3, 256 + 2, 0), // v_sub_f32 v3, v2, v0
+      EncodeVop2(0x04, 7, 256 + 0, 2), // v_sub_f32 v7, v0, v2
+      EncodeVop2(0x08, 4, 256 + 1, 1), // v_mul_f32 v4, v1, v1
+      EncodeVop3Word0(0x103, 5),
+      EncodeVop3Word1(256 + 4, 256 + 0, 0) | (1u << 29u), // v_add_f32 v5, -v4, v0
+      EncodeVop2(0x03, 6, 256 + 0, 1),                     // v_add_f32 v6, v0, v1
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(3, 12, 0),
+      EncodeMubuf0(0x1c, 4, false),
+      EncodeMubuf1(5, 12, 0),
+      EncodeMubuf0(0x1c, 8, false),
+      EncodeMubuf1(6, 12, 0),
+      EncodeMubuf0(0x1c, 12, false),
+      EncodeMubuf1(7, 12, 0),
+      EncodeSopp(0x01),
+  };
+  const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  const auto no_contraction = [&](const std::string &op) {
+    std::vector<bool> marks;
+    for (auto pos = source.find(" = " + op + " %float "); pos != std::string::npos;
+         pos = source.find(" = " + op + " %float ", pos + 1)) {
+      const auto begin = source.rfind('%', pos);
+      const auto id = source.substr(begin, pos - begin);
+      marks.push_back(source.find("OpDecorate " + id + " NoContraction") != std::string::npos);
+    }
+    return marks;
+  };
+  Check(no_contraction("OpFSub") == std::vector<bool>{true, true} &&
+            no_contraction("OpFAdd") == std::vector<bool>{true, false} &&
+            no_contraction("OpFMul") == std::vector<bool>{false, false},
+        "only an add or subtract of a product (or a negated product) must be NoContraction");
+}
+
 void TestFloatComparisonInputModes() {
   using namespace ShaderRecompiler;
   const uint32_t shader[] = {
@@ -16502,6 +16540,7 @@ int main() {
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
+  TestNewShaderRecompilerF32ProductAddNoContraction();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

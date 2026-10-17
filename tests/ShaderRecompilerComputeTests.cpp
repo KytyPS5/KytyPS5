@@ -27020,6 +27020,32 @@ TestCase VectorMadF32FlushesDenorms() {
   return test;
 }
 
+TestCase VectorMulThenSubF32RoundsProduct() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 source = 0; source < 6; source++) {
+    AppendVMovU32(&code, 30, source * sizeof(u32));
+    AppendBufferLoadDword(&code, source, 30);
+  }
+  code.push_back(EncodeVop2(0x08, 6, 256 + 0, 1));                     // v_mul_f32 v6, v0, v1
+  code.push_back(EncodeVop2(0x04, 7, 256 + 6, 2));                     // v_sub_f32 v7, v6, v2
+  code.push_back(EncodeVop2(0x08, 8, 256 + 3, 4));                     // v_mul_f32 v8, v3, v4
+  AppendVop3(&code, 0x103, 9, Vgpr(8), Vgpr(5), 0, 0, 0, false, 0, 1); // v_add_f32 v9, -v8, v5
+  AppendStoreVgpr(&code, 7, 0);
+  AppendStoreVgpr(&code, 9, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorMulThenSubF32RoundsProduct";
+  test.code = std::move(code);
+  test.initial = {0x3f800001u, 0x3f7ffffeu, 0x3f800000u, 0x3f800001u, 0x3f7ffffeu, 0x3f800000u};
+  test.expected = {0u, 0u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MUL_F32, O::V_SUB_F32, O::V_ADD_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase Vop3FmacF32NegatedSourceAccumulates() {
   using O = ShaderOpcode;
 
@@ -42368,6 +42394,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
+  AddCase(VectorMulThenSubF32RoundsProduct);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);

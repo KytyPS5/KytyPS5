@@ -34,7 +34,18 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 	                          state.pixel_valid_mask_variable);
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active, mask_value,
 	                          ConstantU32(state, 0));
-	EmitKillIfBoolFalse(state, active);
+	// Helper invocations already have zero coverage; only discard real fragments.
+	const auto helper_variable =
+	    InputVariableForKind(state, IR::StageInputKind::HelperInvocation);
+	if (helper_variable == 0) {
+		EmitKillIfBoolFalse(state, active);
+		return;
+	}
+	const auto helper = state.builder.AllocateId();
+	const auto retain = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeBool(state), helper, helper_variable);
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), retain, active, helper);
+	EmitKillIfBoolFalse(state, retain);
 }
 
 uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {

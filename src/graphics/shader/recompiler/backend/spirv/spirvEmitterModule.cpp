@@ -467,6 +467,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::InstanceIndex: return spv::BuiltInInstanceIndex;
 		case IR::StageInputKind::FragCoord: return spv::BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return spv::BuiltInFrontFacing;
+		case IR::StageInputKind::HelperInvocation: return spv::BuiltInHelperInvocation;
 		case IR::StageInputKind::Layer: return spv::BuiltInLayer;
 		case IR::StageInputKind::SampleId: return spv::BuiltInSampleId;
 		case IR::StageInputKind::BaryCoordSmooth: return spv::BuiltInBaryCoordKHR;
@@ -535,7 +536,8 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::TessCoord:
 			case IR::StageInputKind::BaryCoordSmooth:
 			case IR::StageInputKind::BaryCoordNoPerspective: type = TypeF32Vector(state, 3); break;
-			case IR::StageInputKind::FrontFacing: type = TypeBool(state); break;
+			case IR::StageInputKind::FrontFacing:
+			case IR::StageInputKind::HelperInvocation: type = TypeBool(state); break;
 			case IR::StageInputKind::Parameter:
 				if (state.program.stage == ShaderType::Vertex ||
 				    state.program.stage == ShaderType::Local) {

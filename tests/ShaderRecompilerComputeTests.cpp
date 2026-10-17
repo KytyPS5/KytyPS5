@@ -22728,6 +22728,77 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   std::printf("[graphics] %-31s ok\n", test.name);
 }
 
+void CheckPixelInitialExec(VulkanHarness &vulkan) {
+  if (!vulkan.RasterizationSupported()) {
+    vulkan.SkipRasterizationCases(1);
+    return;
+  }
+  GraphicsCase overwritten;
+  overwritten.name = "PixelValidMaskWithoutHelperInput";
+  overwritten.fragment_code = {EncodeSop1(0x04, 126, 193)};
+  AppendVMovLiteral(&overwritten.fragment_code, 2, 0x3f800000u);
+  overwritten.fragment_code.insert(overwritten.fragment_code.end(),
+      {EncodeExp0(0x00, 0xf, true, false, true), EncodeExp1(2, 2, 2, 2)});
+  AppendEnd(&overwritten.fragment_code);
+  overwritten.expected_pixel.assign(4, 0x3f800000u);
+  auto without_initial_exec = CompileFragmentCase(overwritten);
+  std::erase_if(without_initial_exec.program.info.inputs, [](const auto &input) {
+    return input.kind == ShaderRecompiler::IR::StageInputKind::HelperInvocation;
+  });
+  without_initial_exec.program.info.pixel_valid_mask = true;
+  ShaderPixelInputInfo folded_input{};
+  folded_input.input_num = 1;
+  without_initial_exec.spirv = ShaderRecompiler::Spirv::EmitProgram(
+      without_initial_exec.program, {.pixel = &folded_input}, 0, Maintenance8Profile, true);
+  ValidateSpirv(overwritten.name, without_initial_exec.spirv);
+  CompareGraphicsWords(overwritten, vulkan.RenderFragment(overwritten, without_initial_exec));
+  std::printf("[graphics] %-31s ok\n", overwritten.name);
+  GraphicsCase test;
+  test.name = "PixelInitialExecExcludesHelpers";
+  auto &code = test.fragment_code;
+  code = {EncodeSop1(0x04, 8, 126), EncodeSop1(0x04, 126, 193)};
+  AppendVMovLiteral(&code, 2, 0u);
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  AppendVMovLiteral(&code, 2, 0x3f800000u);
+  code.push_back(EncodeSop1(0x0a, 126, 126));
+  code.insert(code.end(),
+              {EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2)});
+  AppendEnd(&code);
+  test.expected_pixel.assign(4, 0xbf800000u);
+  auto compiled = CompileFragmentCase(test);
+
+  // A derivative exposes the helper lane's value after restoring exact EXEC and WQM.
+  compiled.spirv.insert(compiled.spirv.begin() + 5,
+                       {(2u << 16u) | spv::OpCapability, spv::CapabilityDerivativeControl});
+  std::vector<u32> types(compiled.spirv[3]);
+  std::set<u32> outputs;
+  u32 derivatives = 0;
+  for (size_t offset = 5; offset < compiled.spirv.size();) {
+    const u32 count = compiled.spirv[offset] >> 16u;
+    const auto op = static_cast<spv::Op>(compiled.spirv[offset] & 0xffffu);
+    bool result = false, type = false;
+    spv::HasResultAndType(op, &result, &type);
+    if (result && type) types[compiled.spirv[offset + 2]] = compiled.spirv[offset + 1];
+    if (op == spv::OpVariable && compiled.spirv[offset + 3] == spv::StorageClassOutput)
+      outputs.insert(compiled.spirv[offset + 2]);
+    if (op == spv::OpStore && outputs.contains(compiled.spirv[offset + 1])) {
+      const u32 value = compiled.spirv[offset + 2];
+      const u32 derivative = compiled.spirv[3]++;
+      compiled.spirv.insert(compiled.spirv.begin() + offset,
+                           {(4u << 16u) | spv::OpDPdxFine, types[value], derivative, value});
+      offset += 4;
+      compiled.spirv[offset + 2] = derivative;
+      ++derivatives;
+    }
+    offset += count;
+  }
+  Require(test.name, "helper observation", derivatives == 1,
+          "expected one color export for the derivative observation");
+  ValidateSpirv(test.name, compiled.spirv);
+  CompareGraphicsWords(test, vulkan.RenderFragment(test, compiled));
+  std::printf("[graphics] %-31s ok\n", test.name);
+}
+
 enum class CoverageClass {
   Covered,
   ControlOrMarker,
@@ -51883,6 +51954,13 @@ int main(int argc, char **argv) {
         RunCase(&vulkan, VectorPermlane16InactiveSource(op_sel, wave_size));
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--pixel-exec-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPixelInitialExec(vulkan);
+    RunGraphicsCase(&vulkan, GraphicsSparseWaveMinimum());
+    RunGraphicsCase(&vulkan, GraphicsInterpolationExport());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpxOrderedCapturedExecMask());
@@ -53022,6 +53100,7 @@ int main(int argc, char **argv) {
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);
   }
+  CheckPixelInitialExec(vulkan);
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckMemSemaphoreGpu();
   vulkan.CheckGpuCommandLane();

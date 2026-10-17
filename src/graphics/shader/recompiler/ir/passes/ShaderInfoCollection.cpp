@@ -151,6 +151,9 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::FrontFacing:
 			AddInput(info, kind, 0, 1, "gl_FrontFacing");
 			break;
+		case StageInputKind::HelperInvocation:
+			AddInput(info, kind, 0, 1, "gl_HelperInvocation");
+			break;
 		case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
 		case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
 		case StageInputKind::BaryCoordSmoothSample:
@@ -435,6 +438,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					return Fail("packed pixel ancillary input has an unsupported live use");
 				case StageInputKind::Layer:
 				case StageInputKind::SampleId:
+				case StageInputKind::HelperInvocation:
 					if (program.stage != ShaderType::Pixel || component != 0u) {
 						return Fail("typed pixel scalar input is invalid");
 					}
@@ -604,6 +608,9 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel:
 			CollectPixelInputs(input_info.pixel, info, inputs.per_vertex, inputs.components);
+			if (info.pixel_valid_mask) {
+				AddBuiltinInput(info, StageInputKind::HelperInvocation);
+			}
 			if (input_info.pixel->object_primitive_id) {
 				if (std::ranges::any_of(info.outputs, [](const StageOutput& output) {
 					    return output.kind == StageOutputKind::Mrt && output.location == 7u;

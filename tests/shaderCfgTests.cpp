@@ -5178,7 +5178,7 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
       }
     }
   }
-  Check(class_compares == 1u && dynamic_exec_writes == 1u,
+  Check(class_compares == 1u && dynamic_exec_writes == 2u,
         "captured V_CMPX_CLASS_F32 did not lower to class compare plus EXEC update");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
@@ -13595,9 +13595,11 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
         pixel_options.wave_size = wave_size;
         const auto pixel_result = RecompileForTest(pixel_shader, pixel_options);
         CheckSpirvBinaryValidates(pixel_result.spirv);
-        Check(DisassembleSpirvBinary(pixel_result.spirv).find("OpGroupNonUniformBallot") ==
-                  std::string::npos,
-              "entry WQM lost the known live predicate through a scalar ballot");
+        Check(ProgramHasInput(pixel_result.program,
+                              ShaderRecompiler::IR::StageInputKind::HelperInvocation) &&
+                  DisassembleSpirvBinary(pixel_result.spirv).find("OpGroupNonUniformBallot") !=
+                      std::string::npos,
+              "entry WQM lost the helper-aware live mask");
       }
     }
   }

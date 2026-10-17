@@ -241,6 +241,7 @@ enum class StageInputKind {
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
+	HelperInvocation,
 	PackedAncillary,
 	Layer,
 	SampleId,

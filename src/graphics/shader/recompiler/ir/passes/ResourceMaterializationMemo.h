@@ -39,6 +39,8 @@ struct MaterializeMemoConfig {
 	bool shared_operands = true;
 	// KYTY_NO_MEMO_FAST_EVALUATE=1: programs run on the growable scratch stack.
 	bool fast_evaluate = true;
+	// KYTY_NO_MEMO_PATCH_HANDLES=1: a descriptor that is also a scalar-read handle stays structure.
+	bool patch_handles = true;
 
 	static MaterializeMemoConfig& Get();
 };

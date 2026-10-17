@@ -1928,6 +1928,113 @@ void TestMaterializeMemoNestedSharedOperands() {
   config = saved;
 }
 
+// A V# read from a table is bound as a buffer and is also the handle of a scalar read of that
+// buffer, whose word lands in a flat SRT slot: a constant buffer the shader both binds and loads.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MemoHandleDescriptorPlan() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &lo = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  auto &hi = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))});
+  auto &root = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(&lo), Value(&hi)});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  DescriptorSource source;
+  std::array<Value, 4> words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.planning_only = true;
+    memory.offset = dword * 4u;
+    program.memory_info.push_back(memory);
+    auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                    {Value(&root), Value(0u), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = dword, .pc = 0x40u + dword * 4u});
+    program.srt_reads.push_back({Value(&raw), dword});
+    auto &read = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(dword)});
+    source.dwords[dword] = Value(&read);
+    words[dword] = Value(&read);
+  }
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetBufferResource,
+                                     {words[0], words[1], words[2], words[3]});
+  MemoryInfo constant;
+  constant.kind = ResourceKind::Buffer;
+  constant.planning_only = true;
+  constant.offset = 8u;
+  program.memory_info.push_back(constant);
+  auto &load = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+                                   {Value(&handle), Value(0u), Value(0u), Value(0u), Value(true)});
+  load.SetFlags(MemoryFlags{.index = 4u, .pc = 0x80u});
+  program.srt_reads.push_back({Value(&load), 4u});
+  return ExtractResourcePlan(program);
+}
+
+// Moving that V# relocates the scalar read and rebinds the buffer in one replay, like a walk.
+void TestMaterializeMemoPatchedHandle() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto &config = MaterializeMemoConfig::Get();
+  const auto saved = config;
+  for (const bool patch_handles : {true, false}) {
+    config.patch_handles = patch_handles;
+    std::array<std::array<uint32_t, 16>, 3> buffers{};
+    for (uint32_t b = 0; b < buffers.size(); b++) {
+      for (uint32_t i = 0; i < 16; i++) {
+        buffers[b][i] = 0x100u * (b + 1u) + i;
+      }
+    }
+    std::array<uint32_t, 4> table{};
+    const auto bind = [&](uint32_t b) {
+      const auto base = reinterpret_cast<uint64_t>(buffers[b].data());
+      table = {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32u) & 0xffffu, 64u,
+               0x00027facu};
+    };
+    const auto table_address = reinterpret_cast<uint64_t>(table.data());
+    const std::array<uint32_t, 2> user_data{static_cast<uint32_t>(table_address),
+                                            static_cast<uint32_t>(table_address >> 32u)};
+    const SrtRuntime runtime{.user_data = user_data,
+                             .read_memory = MemoRead,
+                             .read_specialization_memory = MemoRead};
+    const auto plan = MemoHandleDescriptorPlan();
+    MaterializeMemo memo;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    bind(0);
+    Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization),
+          "the handle plan did not materialize");
+    Check(snapshot.flattened_srt.size() > 4u && snapshot.flattened_srt[4] == buffers[0][2],
+          "the handle plan did not load its constant");
+    memo.Commit(plan, snapshot);
+    Check(memo.Valid(), "the handle plan was not memoized");
+    for (const uint32_t b : {1u, 2u, 0u, 2u}) {
+      bind(b);
+      const bool hit = memo.Replay(plan, runtime, snapshot, &specialization);
+      if (!patch_handles) {
+        Check(!hit && memo.LastMiss() == MaterializeMemo::Miss::StructureChanged,
+              "a moved handle descriptor replayed with handle patching off");
+        Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization),
+              "the handle plan did not walk");
+        memo.Commit(plan, snapshot);
+        continue;
+      }
+      ResourceSnapshot fresh;
+      ResourceSpecialization fresh_specialization;
+      Check(hit && MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+                fresh.buffers == snapshot.buffers &&
+                fresh.flattened_srt == snapshot.flattened_srt &&
+                fresh_specialization == specialization &&
+                snapshot.flattened_srt[4] == buffers[b][2] &&
+                snapshot.buffers[0].dwords[0] == table[0],
+            "a moved handle descriptor did not replay like a walk");
+    }
+  }
+  config = saved;
+}
+
 // Every binding of a patched descriptor follows a moved V#, with and without the target lists.
 void TestMaterializeMemoPatchTargets() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -2053,6 +2160,7 @@ int main() {
   TestMaterializeMemoDescriptorPatch();
   TestMaterializeMemoPatchTargets();
   TestMaterializeMemoNestedSharedOperands();
+  TestMaterializeMemoPatchedHandle();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

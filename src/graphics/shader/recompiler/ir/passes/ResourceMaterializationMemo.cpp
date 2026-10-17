@@ -339,7 +339,8 @@ struct MaterializeMemo::Analysis {
 
 	// A source qualifies when only plain buffers, images and samplers evaluate it, never a table.
 	void ClassifyPatchable() {
-		const auto count = plan.descriptor_sources.size();
+		const bool patch_handles = MaterializeMemoConfig::Get().patch_handles;
+		const auto count         = plan.descriptor_sources.size();
 		patchable.assign(count, 0u);
 		if (!MaterializeMemoConfig::Get().descriptor_patch) {
 			return;
@@ -391,9 +392,11 @@ struct MaterializeMemo::Analysis {
 			    source.dword_count > 8u) {
 				continue;
 			}
+			// A handle's scalar reads re-derive their addresses from the same words.
 			bool derivable = true;
 			for (uint32_t d = 0; d < source.dword_count && derivable; d++) {
-				derivable = Derivable(source.dwords[d]) && !ServesAsHandle(source.dwords[d]);
+				derivable = Derivable(source.dwords[d]) &&
+				            (patch_handles || !ServesAsHandle(source.dwords[d]));
 			}
 			patchable[s] = derivable ? 1u : 0u;
 		}
@@ -426,6 +429,7 @@ MaterializeMemoConfig& MaterializeMemoConfig::Get() {
 		result.patch_targets      = !EnvFlag("KYTY_NO_MEMO_PATCH_TARGETS");
 		result.shared_operands    = !EnvFlag("KYTY_NO_MEMO_SHARED_OPERANDS");
 		result.fast_evaluate      = !EnvFlag("KYTY_NO_MEMO_FAST_EVALUATE");
+		result.patch_handles      = !EnvFlag("KYTY_NO_MEMO_PATCH_HANDLES");
 		return result;
 	}();
 	return config;

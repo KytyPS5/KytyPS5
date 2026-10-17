@@ -638,10 +638,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 const ShaderRecompiler::IR::DescriptorValue& value,
+                                 bool allow_depth_compare) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
-	if (!sampler.depth_compare) {
+	if (!sampler.depth_compare || !allow_depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
 	if (sampler.force_point_filtering) {
@@ -709,10 +710,37 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
+	// A comparison sampler may only be combined with a depth/stencil image view
+	// (VUID-vkCmdDispatch-None-06479). Guests can pair a compare sampler with a colour view;
+	// that is undefined behaviour for the host GPU and has been observed to end in a device
+	// lost. The sampled value is undefined either way, so drop the compare state on the
+	// offending samplers to keep the binding legal and make the guest bug visible instead of
+	// hanging the GPU.
+	std::vector<bool> sampler_compare_ok(program.info.samplers.size(), true);
+	bool              guest_compare_mismatch = false;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.image >= prepared.images.size() || pair.sampler >= program.info.samplers.size() ||
+		    !program.info.samplers[pair.sampler].depth_compare) {
+			continue;
+		}
+		const auto& bound = prepared.images[pair.image];
+		const auto& image = m_context.GetTextureCache().GetImage(bound.image_id);
+		if (!image.info.IsDepth()) {
+			sampler_compare_ok[pair.sampler] = false;
+			guest_compare_mismatch           = true;
+		}
+	}
+	if (guest_compare_mismatch) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "Descriptors: compare sampler on a non-depth image view, dropping compare state "
+		           "(shader=0x%016" PRIx64 ", stage=%u)\n",
+		           program.shader_hash, static_cast<uint32_t>(program.stage));
+	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
+		    sampler_compare_ok[i]));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {

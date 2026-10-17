@@ -1107,6 +1107,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	if (mesh_active && !state.programs.vertex[0]) {
+		// GetGraphicsPrograms skips mesh pipelines the host cannot build (no mesh
+		// shader support, or the workgroup exceeds host limits). Drop the draw.
+		return;
+	}
 	uint32_t   mesh_groups   = 0;
 	uint32_t   mesh_instances = 0;
 	if (mesh_active) {

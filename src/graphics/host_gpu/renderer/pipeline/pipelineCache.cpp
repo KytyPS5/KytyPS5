@@ -679,7 +679,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		if (!m_graphics.mesh_shader_enabled) {
+			// Issue #1447: RDNA 1 and other hosts lack VK_EXT_mesh_shader. The game
+			// needs a mesh pipeline the host cannot build, so skip the draw instead
+			// of aborting the emulator. The caller drops draws with no programs.
+			static std::atomic_bool mesh_unsupported_warned = false;
+			if (!mesh_unsupported_warned.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Warning: mesh shader draw skipped: "
+				            "VK_EXT_mesh_shader is not supported on this device\n");
+			}
+			return {};
+		}
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
@@ -692,8 +702,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    mesh.max_vertices > limits.maxMeshOutputVertices ||
 		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			// The mesh workgroup itself does not fit the host (threads, outputs, or
+			// LDS). Unlike an oversized dispatch count, this cannot be clamped, so
+			// skip the draw with a one-time warning instead of aborting.
+			static std::atomic_bool mesh_limits_warned = false;
+			if (!mesh_limits_warned.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Warning: mesh shader skipped: exceeds host limits: "
+				            "threads=%u vertices=%u primitives=%u LDS=%u\n",
+				            host_threads, mesh.max_vertices, mesh.max_primitives,
+				            mesh.lds_size_dwords);
+			}
+			return {};
 		}
 	}
 	ShaderParams pixel_params;

@@ -147,6 +147,7 @@ struct EmitterState {
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
+	bool                       clip_distance_in_per_vertex           = false;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
@@ -304,6 +305,9 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
+
+// Pointer to gl_ClipDistance[index]: member 1 of gl_PerVertex or the gl_ClipDistance variable.
+uint32_t ClipDistancePointer(EmitterState& state, uint32_t index);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 

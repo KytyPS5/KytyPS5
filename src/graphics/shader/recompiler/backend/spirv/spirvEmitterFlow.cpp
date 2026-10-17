@@ -397,6 +397,8 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 			uint32_t pointer;
 			if (state.program.stage == ShaderType::Mesh) {
 				pointer = MeshOutputPointer(state, kind, index);
+			} else if (kind == IR::StageOutputKind::ClipDistance) {
+				pointer = ClipDistancePointer(state, index);
 			} else {
 				pointer = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpAccessChain,
@@ -609,7 +611,6 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto equal = state.builder.AllocateId();
 				const auto invalid = state.builder.AllocateId();
 				const auto distance = state.builder.AllocateId();
-				const auto distance_pointer = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal,
 				                          value, zero);
 				state.builder.AddFunction(spv::OpAll, TypeBool(state), invalid, equal);
@@ -619,10 +620,8 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                          ConstantF32Value(state, -1.0f),
 				                          ConstantF32Value(state, 0.0f));
 				state.builder.AddFunction(
-				    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
-				    distance_pointer, state.clip_distance_variable,
-				    ConstantU32(state, state.invalid_position_clip_distance));
-				state.builder.AddFunction(spv::OpStore, distance_pointer, distance);
+				    spv::OpStore, ClipDistancePointer(state, state.invalid_position_clip_distance),
+				    distance);
 				static std::atomic_bool logged = false;
 				if (!logged.exchange(true, std::memory_order_relaxed)) {
 					Log::WriteToConsoleAndLog(

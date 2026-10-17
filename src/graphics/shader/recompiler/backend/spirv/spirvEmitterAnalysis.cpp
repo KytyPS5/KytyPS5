@@ -48,6 +48,19 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 	return 0;
 }
 
+uint32_t ClipDistancePointer(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto type    = TypePointer(state, spv::StorageClassOutput, TypeF32(state));
+	if (state.clip_distance_in_per_vertex) {
+		state.builder.AddFunction(spv::OpAccessChain, type, pointer, state.per_vertex_variable,
+		                          ConstantU32(state, 1), ConstantU32(state, index));
+	} else {
+		state.builder.AddFunction(spv::OpAccessChain, type, pointer, state.clip_distance_variable,
+		                          ConstantU32(state, index));
+	}
+	return pointer;
+}
+
 uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

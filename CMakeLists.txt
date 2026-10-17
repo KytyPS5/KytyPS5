@@ -440,6 +440,13 @@ add_executable(vdecsw_tests EXCLUDE_FROM_ALL
 target_link_libraries(vdecsw_tests common FFmpeg::ffmpeg)
 target_include_directories(vdecsw_tests PRIVATE ${inc_headers})
 
+add_executable(guest_printf_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestPrintfTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/guestPrintf.cpp"
+)
+target_link_libraries(guest_printf_tests common fmt::fmt)
+target_include_directories(guest_printf_tests PRIVATE ${inc_headers})
+
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
@@ -636,6 +643,14 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME guest_printf COMMAND ${CMAKE_COMMAND} -E env KYTY_GUEST_STDOUT=1
+		$<TARGET_FILE:guest_printf_tests> enabled)
+	add_test(NAME guest_printf_disabled COMMAND ${CMAKE_COMMAND} -E env KYTY_GUEST_STDOUT=0
+		$<TARGET_FILE:guest_printf_tests> disabled)
+	add_test(NAME guest_printf_default COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_GUEST_STDOUT
+		$<TARGET_FILE:guest_printf_tests> disabled)
+	add_test(NAME guest_printf_invalid COMMAND ${CMAKE_COMMAND} -E env KYTY_GUEST_STDOUT=true
+		$<TARGET_FILE:guest_printf_tests> disabled)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -714,6 +729,7 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests
+		guest_printf_tests
 		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests

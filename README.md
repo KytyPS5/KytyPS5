@@ -418,6 +418,13 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
 
+To diagnose games that exit without showing their own error messages, set `KYTY_GUEST_STDOUT=1`
+before starting the launcher or emulator. Guest `printf`/`vprintf` calls are additionally sent to
+standard error with a `GUEST_STDOUT:` prefix and flushed immediately, even when
+`--printf-direction Silent` is selected. This option is read on the first guest print call;
+unset it or use `0` before the next launch to disable forwarding. Guest `snprintf` calls only
+write to their destination buffer.
+
 ### AI Use
 
 AI tools may be used for research, reverse engineering, and development assistance. Contributors

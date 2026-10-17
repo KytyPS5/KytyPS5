@@ -4147,7 +4147,14 @@ int Initialize() {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
 		return result;
 	}
+#if defined(__APPLE__)
+	// The PS5 address lies above the guest ranges a macOS host reserves (system reserved ends at
+	// 0x0fbfffffff), so the kernel places the block elsewhere; the driver tables only need a
+	// guest-visible address.
+	EXIT_IF(address == nullptr);
+#else
 	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
+#endif
 	std::memset(address, 0, DriverDmemSize);
 	struct FunctionShaderBindings {
 		uint64_t code;
@@ -4161,7 +4168,7 @@ int Initialize() {
 	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
 	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
 	};
-	const auto base = DriverDmemBase + AgcDmemOffset;
+	const auto base           = reinterpret_cast<uint64_t>(address) + AgcDmemOffset;
 	const auto function_table = base + 0x60;
 	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
 	std::array<FunctionShaderBindings, 8> functions {};

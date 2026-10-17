@@ -46791,8 +46791,6 @@ void CheckShaderFusion() {
 
 void CheckAgcSystemTable(RenderContext &renderer) {
   constexpr const char *name = "AgcSystemTable";
-  constexpr uint64_t driver_base = 0x0fe0000000ull;
-  constexpr uint64_t table_address = driver_base + 0x40000;
   constexpr std::array<uint32_t, 16> native_validator{
       0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,
       0xbf800000, 0x8590807e, 0xb96a0a18, 0xbf066a80,
@@ -46817,11 +46815,24 @@ void CheckAgcSystemTable(RenderContext &renderer) {
   uint32_t state = 0xabcdef01u;
   Require(name, "driver startup", Gen5::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
           "Agc startup required free guest memory or changed its ignored public state pointer");
+  // The driver block sits at 0x0fe0000000 except on macOS, where the kernel may place it
+  // elsewhere; find it by name.
   LibKernel::Memory::VirtualQueryInfo mapping{};
+  uint64_t query_address = 0;
+  bool found = false;
+  while (!found && LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void *>(query_address),
+                                                         1, &mapping, sizeof(mapping)) == 0) {
+    found = std::strcmp(mapping.name, "SceAgcDriver") == 0;
+    query_address = mapping.end;
+  }
+  const uint64_t driver_base = found ? mapping.start : 0;
+  const uint64_t table_address = driver_base + 0x40000;
+#if !defined(__APPLE__)
+  Require(name, "driver base", driver_base == 0x0fe0000000ull,
+          "driver block left the PS5 address");
+#endif
   Require(name, "shared driver backing",
-          LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void *>(driver_base), 0,
-                                                 &mapping, sizeof(mapping)) == 0 &&
-              mapping.start == driver_base && mapping.end == driver_base + 0x200000 &&
+          found && mapping.end == driver_base + 0x200000 &&
               mapping.memory_type == 12 && mapping.protection == 0x33 && mapping.is_direct &&
               std::strcmp(mapping.name, "SceAgcDriver") == 0 &&
               renderer.IsMapped(driver_base, 0x200000),

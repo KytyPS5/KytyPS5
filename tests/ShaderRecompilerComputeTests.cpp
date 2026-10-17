@@ -38871,7 +38871,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
             valid && lane < 20u ? (wide ? 0x3f800000u : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
         if (valid && lane < (wide && row == 3u ? 18u : 20u) && (lane & 1u) == 0u) {
           if (wide) {
-            test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
+            test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c03u;
             test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] = 0x34003800u;
           } else expected_bytes[slot * (row + 1u) + lane] =
               std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);

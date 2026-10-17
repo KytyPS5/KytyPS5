@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -954,6 +955,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
 		const auto copies = info.BufferCopies(linear.offset);
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;
 	}
 
@@ -999,6 +1001,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		copies[0].imageExtent       = info.extent;
 	}
 	destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
 void TextureCache::InitializeImage(ImageId id) {
@@ -1774,6 +1777,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	download.Flush(offset, range.size);
 
 	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -1943,6 +1947,7 @@ void TextureCache::RunGarbageCollector() {
 				}
 			}
 			FreeImage(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

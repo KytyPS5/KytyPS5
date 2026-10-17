@@ -130,6 +130,7 @@ public:
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
+	bool                   perf_overlay_enabled        = false;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
 	int                    vblank_frequency            = 60;
@@ -168,6 +169,7 @@ public:
 		tessellation_enabled        = other.tessellation_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
+		perf_overlay_enabled        = other.perf_overlay_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
 		vblank_frequency            = other.vblank_frequency;

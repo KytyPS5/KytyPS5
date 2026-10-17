@@ -292,6 +292,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
+	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -484,6 +485,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.trophy_duration_seconds   = ui.spinBox_trophy_duration->value();
+	info.perf_overlay_enabled      = ui.checkBox_perf_overlay->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();

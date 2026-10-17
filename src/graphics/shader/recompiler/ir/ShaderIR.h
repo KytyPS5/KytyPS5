@@ -220,7 +220,8 @@ enum class TessellationAttribute {
 	ControlOutput,
 	EvaluationInput,
 	PatchOutput,
-	Factor
+	Factor,
+	PatchInput
 };
 
 enum class StageInputKind {

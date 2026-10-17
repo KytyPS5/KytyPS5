@@ -20,10 +20,12 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -437,8 +439,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.domain, tess.partitioning, tess.output_topology});
+		key.insert(key.end(),
+		           {tess.output_control_points, tess.ls_stride, tess.hs_stride, tess.domain,
+		            tess.partitioning, tess.output_topology, tess.patch_begin, tess.patch_end});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -646,7 +649,22 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	// The ring layout depends only on the LS/HS code and the control point counts.
+	static std::mutex mutex;
+	static std::map<std::tuple<uint64_t, uint64_t, uint32_t, uint32_t>, ShaderTessellationInputInfo>
+	                 layouts;
+	const auto       key = std::tuple {local_hash, control_hash, tess.input_control_points,
+	                                   tess.output_control_points};
+	std::scoped_lock lock(mutex);
+	if (const auto found = layouts.find(key); found != layouts.end()) {
+		tess.ls_stride   = found->second.ls_stride;
+		tess.hs_stride   = found->second.hs_stride;
+		tess.patch_begin = found->second.patch_begin;
+		tess.patch_end   = found->second.patch_end;
+	} else {
+		ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+		layouts.emplace(key, tess);
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}

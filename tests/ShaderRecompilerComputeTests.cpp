@@ -27485,6 +27485,40 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorMed3F32DenormalInputs() {
+  using O = ShaderOpcode;
+  constexpr u32 inputs[5][3] = {{0x00000000u, 0x00019000u, 0x00000000u},
+                                {0x00000001u, 0x00000003u, 0x00000002u},
+                                {0x80000005u, 0x80000001u, 0x80000003u},
+                                {0x80000001u, 0x00000002u, 0x80000003u},
+                                {0x7fc00000u, 0x00000003u, 0x00000001u}};
+  constexpr u32 medians[5] = {0x00000000u, 0x00000002u, 0x80000003u,
+                              0x80000001u, 0x00000001u};
+  TestCase test;
+  test.name = "VectorMed3F32DenormalInputs";
+  test.compute_info.float_mode = 0xf0;
+  test.has_compute_info = true;
+  for (const auto &triple : inputs) {
+    test.initial.insert(test.initial.end(), std::begin(triple),
+                        std::end(triple));
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < std::size(inputs); i++) {
+    for (u32 j = 0; j < 3u; j++) {
+      AppendVMovU32(&test.code, 31, (i * 3u + j) * 4u);
+      AppendBufferLoadDword(&test.code, j, 31);
+    }
+    AppendVop3(&test.code, 0x157, 4, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendStoreVgpr(&test.code, 4, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(medians[i]);
+  }
+  test.initial.resize(test.expected.size());
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorMed3F32NanUsesMin3Path() {
   using O = ShaderOpcode;
 
@@ -42382,6 +42416,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);
+  AddCase(VectorMed3F32DenormalInputs);
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);

@@ -485,7 +485,15 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
-		EXIT_NOT_IMPLEMENTED(source.call.has_value() || options.stage != ShaderType::Compute);
+		if (source.call.has_value() || options.stage != ShaderType::Compute) {
+			uint32_t calls = 0;
+			for (const auto& inst: source.decoded.instructions)
+				calls += inst.opcode == Decoder::Opcode::S_SWAPPC_B64;
+			EXIT("shader calls are only supported once in compute shaders: stage=%s hash=0x%016" PRIx64
+			     " calls=%u pc=0x%08x\n",
+			     StageName(options.stage), options.shader_hash, calls,
+			     source.decoded.instructions[i].pc);
+		}
 		source.call = ShaderSource::Call {.instruction = i};
 	}
 	EXIT_IF(options.input_info.compute == nullptr);

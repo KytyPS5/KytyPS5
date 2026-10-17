@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -947,12 +948,28 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
-				for (const auto& resource: program.info.buffers) {
+				for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
+					const auto& resource = program.info.buffers[index];
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						const auto& reader_program = *reader->runtime->program;
+						const auto  descriptor     = DecodeNativeDescriptor<ShaderBufferResource>(
+						    writer->runtime->resources->buffers[index]);
+						EXIT("scalar resource reads overlap a shader buffer write\n"
+						     "reader: stage=%d hash=0x%016" PRIx64 " read=[0x%" PRIx64 ", +0x%" PRIx64
+						     ") reads=%zu\n"
+						     "writer: stage=%d hash=0x%016" PRIx64 " buffer=%u write=[0x%" PRIx64
+						     ", +0x%" PRIx64 ") stride=%u records=0x%x scalar=%d formatted=%d "
+						     "atomic=%d read=%d max_extent=0x%x\n",
+						     static_cast<int>(reader_program.stage), reader_program.shader_hash,
+						     address, size, reads.size(), static_cast<int>(program.stage),
+						     program.shader_hash, index, written.address, written.size,
+						     static_cast<uint32_t>(descriptor.Stride()), descriptor.NumRecords(),
+						     static_cast<int>(resource.scalar), static_cast<int>(resource.formatted),
+						     static_cast<int>(resource.atomic), static_cast<int>(resource.read),
+						     resource.max_byte_extent);
 					}
 				}
 			}

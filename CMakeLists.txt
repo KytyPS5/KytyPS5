@@ -783,6 +783,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stencil-plane-default-only)
 	set_tests_properties(texture_cache_stencil_plane_kill_switch
 		PROPERTIES ENVIRONMENT "KYTY_NO_STENCIL_PLANE_REDIRECT=1")
+	add_test(NAME gpu_submission_merge
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submission-merge-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME color_render_target_1d

@@ -71,6 +71,7 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	void              FlushMergedSubmissions();
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
@@ -86,6 +87,8 @@ private:
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
+	// Completed submissions recorded but not yet handed to Vulkan; see Process().
+	std::atomic_bool                               m_merge_pending {false};
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;

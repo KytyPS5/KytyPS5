@@ -8,7 +8,30 @@ void Translator::FailMissingTranslation(const Decoder::Instruction& inst) {
 	     Decoder::InstructionToString(inst).c_str(), inst.pc);
 }
 
+void Translator::SetLaunchedMasks(const LaunchedMasks& masks, bool quads) {
+	launched_masks = masks;
+	whole_quads    = quads;
+	track_masks    = true;
+}
+
+void Translator::SkipInstruction(const Decoder::Instruction& inst) {
+	if (track_masks) {
+		wave_or_scan.reset();
+		launched_masks.Update(inst, whole_quads);
+	}
+}
+
 void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
+	if (!track_masks) {
+		return TranslateDecoded(inst);
+	}
+	const auto before = launched_masks;
+	TranslateDecoded(inst);
+	TrackWaveOrScan(inst, before);
+	launched_masks.Update(inst, whole_quads);
+}
+
+void Translator::TranslateDecoded(const Decoder::Instruction& inst) {
 	current_opcode = inst.opcode;
 	current_pc     = inst.pc;
 

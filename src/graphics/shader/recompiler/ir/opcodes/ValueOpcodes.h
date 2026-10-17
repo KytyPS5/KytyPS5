@@ -52,6 +52,11 @@ struct PermlaneFlags {
 static_assert(sizeof(PermlaneFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<PermlaneFlags>);
 
+// Lane sets of a wave64 OR scan whose lanes outside the host subgroup contribute zero:
+// RowPairScan is a row_shr 1/2/4/8 scan followed by OR with permlanex16 of row lane 15,
+// OppositeRow is that permlanex16 result alone.
+enum class WaveOrPattern : uint32_t { RowPairScan, OppositeRow };
+
 struct FPCompareFlags {
 	bool flush_input_denorms = false;
 };

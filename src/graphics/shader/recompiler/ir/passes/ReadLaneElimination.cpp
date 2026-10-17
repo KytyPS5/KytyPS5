@@ -206,6 +206,32 @@ private:
 	Block* block;
 	Value  saved_exec;
 };
+// A fixed lane of a wave OR pattern is one reduction over a lane set.
+uint32_t RewritePatternLanes(Program& program, uint32_t wave_size) {
+	uint32_t rewritten = 0;
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
+			if (inst.GetOpcode() != ValueOpcode::ReadLane) {
+				continue;
+			}
+			const auto  selector = inst.Arg(1).Resolve();
+			const auto* producer = inst.Arg(0).Resolve().TryInstruction();
+			if (!selector.IsImmediate() || selector.GetType() != Type::U32 || producer == nullptr ||
+			    producer->GetOpcode() != ValueOpcode::WaveOrPatternU32) {
+				continue;
+			}
+			const auto pattern = producer->Flags<WaveOrPattern>();
+			const auto lane =
+			    block->PrependNewInst(it, ValueOpcode::WaveOrPatternLaneU32,
+			                          {producer->Arg(0), Value(selector.U32() % wave_size)},
+			                          static_cast<uint64_t>(pattern));
+			inst.ReplaceUsesWith(Value(&*lane));
+			rewritten++;
+		}
+	}
+	return rewritten;
+}
 
 } // namespace
 
@@ -214,6 +240,7 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	if (wave_size != 32u && wave_size != 64u) {
 		return stats;
 	}
+	stats.rewritten_reads += RewritePatternLanes(program, wave_size);
 
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {

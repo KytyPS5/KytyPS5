@@ -268,6 +268,8 @@ struct InputUsage {
 	std::array<StageInputKind, static_cast<size_t>(StageInputKind::Parameter)> builtins {};
 	uint32_t builtin_mask = 0;
 	uint32_t builtin_count = 0;
+	// Buffers read other than by an in-range constant ReadConstBuffer.
+	std::vector<bool> not_constant;
 
 	void AddBuiltin(StageInputKind kind) {
 		const auto bit = 1u << static_cast<uint32_t>(kind);
@@ -312,11 +314,21 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					return Fail("buffer operation has invalid resource metadata");
 				}
 				info.buffers[memory.resource].live = true;
+				const auto offset = op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer
+				                        ? inst.Arg(1).Resolve() : Value {};
+				const bool constant =
+				    offset.IsImmediate() && offset.GetType() == Type::U32 &&
+				    (static_cast<uint64_t>(offset.U32() & ~3u) + memory.offset + sizeof(uint32_t) <=
+				     UniformBufferBytes - UniformBufferBaseSlack);
+				if (!constant) {
+					inputs.not_constant[memory.resource] = true;
+				}
 				for (const auto child: info.buffers[memory.resource].indirect_resources) {
 					if (child >= info.buffers.size()) {
 						return Fail("indirect buffer operation has invalid resource metadata");
 					}
 					info.buffers[child].live = true;
+					inputs.not_constant[child] = true;
 				}
 			}
 		}
@@ -600,6 +612,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 =
 	    info.float16 = false;
 	InputUsage inputs;
+	inputs.not_constant.assign(info.buffers.size(), false);
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
@@ -607,6 +620,13 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);
+	}
+	for (uint32_t index = 0; index < info.buffers.size(); index++) {
+		auto& buffer         = info.buffers[index];
+		buffer.constant_only = buffer.live && !inputs.not_constant[index] &&
+		                       !buffer.written && !buffer.atomic && !buffer.formatted &&
+		                       buffer.indirect_root == BufferResource::NoIndirectBuffer &&
+		                       buffer.indirect_resources.empty() && !buffer.indirect_write_table;
 	}
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;

@@ -131,6 +131,7 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
+	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_variable            = 0;

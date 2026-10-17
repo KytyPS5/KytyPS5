@@ -1694,6 +1694,22 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (!offset.IsImmediate() && mem.offset >= 4u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, mem.offset >> 2u));
 	}
+	if (const auto& resource = state.program.info.buffers.at(mem.resource);
+	    resource.uniform_index != UINT32_MAX) {
+		// The uniform view shares the storage view's base, so the same byte offset applies.
+		const auto element = Binary(
+		    state, spv::OpIAdd, TypeU32(state), index,
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		           state.memory_byte_offsets[resource.descriptor_index], ConstantU32(state, 2)));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassUniform, TypeU32(state)),
+		                          pointer, state.uniform_buffer_variable,
+		                          ConstantU32(state, resource.uniform_index), ConstantU32(state, 0),
+		                          element);
+		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer));
+		return;
+	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	// Scalar buffer addressing aligns the base and each offset independently.
 	auto element = Binary(

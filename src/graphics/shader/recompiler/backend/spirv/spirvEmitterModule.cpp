@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -189,6 +190,15 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 
 namespace {
 
+// KYTY_UNIFORM_BUFFERS=0 reads constant buffers through their storage buffer descriptors.
+bool UniformBuffersEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_UNIFORM_BUFFERS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint32_t PushConstantArrayType(EmitterState& state) {
 	const auto count = ConstantU32(state, IR::PushData::DwordCount);
 	return state.builder.DecoratedType(
@@ -238,6 +248,14 @@ void DefineDescriptors(EmitterState& state) {
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
 	for (auto& buffer: info.buffers) {
 		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
+	}
+	// Constant buffers read through the constant cache: one load, bounds checked by the device
+	// (robustBufferAccess2), where a storage buffer read computes and checks the address.
+	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
+	for (auto& buffer: info.buffers) {
+		buffer.uniform_index = UniformBuffersEnabled() && state.robust_buffer_access2 &&
+		                               buffer.descriptor_index != UINT32_MAX && buffer.constant_only
+		                           ? uniform_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -361,6 +379,17 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Gds:
 				state.gds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "gds");
 				break;
+			case IR::DescriptorBindingKind::UniformBuffers: {
+				const auto array = state.builder.DecoratedType(
+				    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}},
+				    TypeU32(state), ConstantU32(state, IR::UniformBufferBytes / 4u));
+				const auto block = state.builder.DecoratedType(
+				    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+				                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
+				state.uniform_buffer_variable =
+				    Define(ArrayType(block), "uniform_buffers", spv::StorageClassUniform);
+				break;
+			}
 			case IR::DescriptorBindingKind::SharedMemory:
 				state.lds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "lds_dwords");
 				state.builder.AddAnnotation(spv::OpDecorate, state.lds_variable, spv::DecorationCoherent);

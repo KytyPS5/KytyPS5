@@ -79,6 +79,8 @@ struct PreparedBindings {
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
+	// The uniform views of the buffers that have a uniform_index, by that index.
+	std::vector<vk::DescriptorBufferInfo> uniform_buffers;
 	std::vector<TextureBinding>           images;
 	// The distinct bindless table elements, with the T# and the root image each was resolved
 	// for, and, for every slot of every table range in binding order, the element it binds.

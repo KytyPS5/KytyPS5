@@ -67,6 +67,7 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
 		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::UniformBuffers: return vk::DescriptorType::eUniformBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -143,7 +144,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		return {nullptr, 0, vk::WholeSize};
 	}
 	const auto& graphics  = context.GetGraphics();
-	const auto  alignment = graphics.StorageMinAlignment();
+	// A buffer with a uniform view aligns both views alike: they share the base adjustment.
+	const auto  alignment =
+	    resource.uniform_index == UINT32_MAX
+	        ? graphics.StorageMinAlignment()
+	        : std::max<vk::DeviceSize>(
+	              graphics.StorageMinAlignment(),
+	              graphics.GetPhysicalDeviceProperties().limits.minUniformBufferOffsetAlignment);
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
@@ -2047,6 +2054,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& layout   = program.bindings;
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+	prepared.uniform_buffers.resize(
+	    layout.descriptor_counts[static_cast<size_t>(BindingKind::UniformBuffers)]);
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -2064,6 +2073,16 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+		if (resource.uniform_index != UINT32_MAX) {
+			auto view = prepared.buffers[index];
+			// A null descriptor (empty binding) keeps offset 0 and the whole size, as Vulkan requires.
+			if (view.buffer != nullptr) {
+				view.range = std::min<vk::DeviceSize>(
+				    {view.range, ShaderRecompiler::IR::UniformBufferBytes,
+				     m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange});
+			}
+			prepared.uniform_buffers[resource.uniform_index] = view;
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -2436,6 +2455,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				switch (kind) {
 					case BindingKind::Buffers:
 						write.pBufferInfo = descriptors.buffers.data();
+						break;
+					case BindingKind::UniformBuffers:
+						EXIT_IF(descriptors.uniform_buffers.size() != write.descriptorCount);
+						for (const auto& view: descriptors.uniform_buffers) {
+							EXIT_IF(view.range == 0);
+						}
+						write.pBufferInfo = descriptors.uniform_buffers.data();
 						break;
 					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {

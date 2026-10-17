@@ -64,6 +64,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	        .descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
 	        .descriptorBindingUpdateUnusedWhilePending    = VK_TRUE,
 	        .descriptorBindingPartiallyBound              = VK_TRUE,
+	        .uniformBufferStandardLayout                  = VK_TRUE,
 	        .timelineSemaphore                            = VK_TRUE,
 	        .bufferDeviceAddress                          = VK_TRUE,
 	        .shaderOutputViewportIndex                    = VK_TRUE,
@@ -252,6 +253,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.descriptorBindingPartiallyBound,
 		              "descriptorBindingPartiallyBound");
 		check_feature(features12.shaderFloat16, "shaderFloat16");
+		check_feature(features12.uniformBufferStandardLayout, "uniformBufferStandardLayout");
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering");

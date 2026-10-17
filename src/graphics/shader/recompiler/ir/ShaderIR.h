@@ -126,6 +126,9 @@ struct BufferResource {
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
+	// The buffer's slot among the uniform buffers too (DescriptorBindingKind::UniformBuffers),
+	// which its constant reads use, or UINT32_MAX.
+	uint32_t               uniform_index      = UINT32_MAX;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
 	uint32_t               packed_stride      = 0;
@@ -137,6 +140,9 @@ struct BufferResource {
 	bool                   formatted          = false;
 	bool                   scalar             = false;
 	bool                   live               = false;
+	// Only read by ReadConstBuffer at immediate offsets inside UniformBufferBytes, so it can be
+	// bound as a uniform buffer too (see ShaderInfoCollection).
+	bool                   constant_only      = false;
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
@@ -382,11 +388,17 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	SharedMemory,
+	UniformBuffers,
 	Count,
 };
 
+// The uniform buffer range every host binds (maxUniformBufferRange is at least 64 KiB on the
+// GPUs that run the emulator); constant reads stay below it with the base adjustment.
+inline constexpr uint32_t UniformBufferBytes = 65536u;
+inline constexpr uint32_t UniformBufferBaseSlack = 256u;
+
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 59u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;

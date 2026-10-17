@@ -466,6 +466,13 @@ void WindowContext::ProcessEvent(double time_s) {
 		}
 		return;
 	}
+	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
+	    event->key.key == SDLK_F8) {
+		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
+			Controller::CycleKeyboardPlayer();
+		}
+		return;
+	}
 	if (ProcessSystemOverlayInput(*event)) {
 		return;
 	}

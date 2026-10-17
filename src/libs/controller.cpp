@@ -195,9 +195,10 @@ static GameController* g_players[Config::MAX_PLAYERS] = {};
 static Common::Mutex g_router_mutex;
 static std::vector<std::pair<int, int>> g_pad_players;
 
+static uint32_t g_keyboard_player = 0;
+
 static int KeyboardPlayer() {
-	const auto player = Config::GetKeyboardPlayer();
-	return player == 0 ? 0 : static_cast<int>(player) - 1;
+	return g_keyboard_player == 0 ? 0 : static_cast<int>(g_keyboard_player) - 1;
 }
 
 // Caller holds g_router_mutex.
@@ -443,6 +444,7 @@ void Initialize() {
 	for (int i = 0; i < Config::MAX_PLAYERS; i++) {
 		g_players[i] = new GameController(i);
 	}
+	g_keyboard_player = Config::GetKeyboardPlayer();
 	Connect(HOST_INPUT_CONTROLLER_ID);
 }
 
@@ -1043,9 +1045,14 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 	return ret_num;
 }
 
+static void ConnectLocked(int id);
+
 void Connect(int id) {
 	Common::LockGuard lock(g_router_mutex);
+	ConnectLocked(id);
+}
 
+static void ConnectLocked(int id) {
 	if (id == HOST_INPUT_CONTROLLER_ID) {
 		g_players[KeyboardPlayer()]->Connect(id);
 		return;
@@ -1055,7 +1062,7 @@ void Connect(int id) {
 	}
 
 	// A dedicated keyboard player is skipped; otherwise the keyboard shares its player with a pad.
-	const int keyboard_player = Config::GetKeyboardPlayer() != 0 ? KeyboardPlayer() : -1;
+	const int keyboard_player = g_keyboard_player != 0 ? KeyboardPlayer() : -1;
 	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
 		const bool taken = player == keyboard_player ||
 		                   std::any_of(g_pad_players.begin(), g_pad_players.end(),
@@ -1079,6 +1086,33 @@ void Disconnect(int id) {
 	}
 	player->Disconnect(id);
 	std::erase_if(g_pad_players, [id](const auto& p) { return p.first == id; });
+}
+
+void CycleKeyboardPlayer() {
+	Common::LockGuard lock(g_router_mutex);
+	if (g_players[0] == nullptr) {
+		return;
+	}
+
+	// Disconnect everything, then reconnect in the original order under the new setting.
+	std::vector<int> pads;
+	for (const auto& [pad, player]: g_pad_players) {
+		g_players[player]->Disconnect(pad);
+		pads.push_back(pad);
+	}
+	g_pad_players.clear();
+	g_players[KeyboardPlayer()]->Disconnect(HOST_INPUT_CONTROLLER_ID);
+
+	g_keyboard_player = (g_keyboard_player + 1) % (Config::MAX_PLAYERS + 1);
+	ConnectLocked(HOST_INPUT_CONTROLLER_ID);
+	for (const auto pad: pads) {
+		ConnectLocked(pad);
+	}
+	if (g_keyboard_player == 0) {
+		LOGF("Keyboard shared with player 1\n");
+	} else {
+		LOGF("Keyboard assigned to player %u\n", g_keyboard_player);
+	}
 }
 
 void SetButton(int id, uint32_t button, bool down) {

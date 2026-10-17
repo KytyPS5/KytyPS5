@@ -445,21 +445,6 @@ static AudioOut2ObjectBus audioout2_object_bus(AudioOut2ContextHandle ctx) {
 	                        : AudioOut2ObjectBus {};
 }
 
-static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
-	const auto        bus = audioout2_object_bus(ctx);
-	Common::LockGuard lock(g_audioout2_port_mutex);
-	for (const auto& state: g_audioout2_ports) {
-		if (state.used && state.context == ctx && !state.pcm_data.empty()) {
-			const int handle = audioout2_port_type_is_object(state.port_type) ? bus.audio_handle
-			                                                                  : state.audio_handle;
-			if (handle > 0 && AudioInternal::AudioOutHasDevice(handle)) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
 using AudioOut2StereoGains = std::array<float, 2>;
 
 using AudioOut2AmbisonicsTable = std::array<AudioOut2StereoGains, 36>;
@@ -687,7 +672,7 @@ static bool audioout2_take_advanced_grain(AudioOut2ContextHandle ctx, AudioOut2G
 	return true;
 }
 
-static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking, bool cushion) {
+static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx) {
 	std::shared_lock output_lock(g_audioout2_output_mutex);
 
 	AudioOut2Grain     grain;
@@ -716,8 +701,9 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 		    AudioInternal::OutputParam {entry.audio_handle, entry.pcm.data(), entry.gains.data()});
 	}
 	if (!params.empty()) {
+		// The modelled queue paces every push, so the device only needs a jitter cushion.
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
-		                                     blocking, cushion);
+		                                     false, true);
 	}
 }
 
@@ -916,20 +902,15 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 	}
 
 	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
-		const bool use_device_clock = blocking != 0 && audioout2_context_has_queueable_device(ctx);
-
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 			audioout2_update_context_locked(state);
-			if (state->queued < state->queue_depth || use_device_clock) {
+			if (state->queued < state->queue_depth) {
 				audioout2_accept_grain_locked(state);
 				g_audioout2_context_mutex.Unlock();
-				// Without a device the modelled queue is the only clock; don't sleep twice.
-				audioout2_queue_context_audio(ctx, use_device_clock, blocking == 0);
-				if (blocking != 0 && !use_device_clock) {
+				audioout2_queue_context_audio(ctx);
+				// Wwise renders only into a free slot after a synchronous push returns.
+				if (blocking != 0) {
 					audioout2_wait_for_free_slot(ctx);
 				}
 				return OK;

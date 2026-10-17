@@ -267,14 +267,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #if !defined(__APPLE__)
 		check_feature(device_features2.features.depthClamp, "depthClamp");
 #endif
-		// fragmentShaderBarycentric is optional: the SPIR-V backend only emits the
-		// capability for pixel shaders with per-vertex/barycentric inputs, so GPUs
-		// without VK_KHR_fragment_shader_barycentric (e.g. Pascal, RDNA 1) can still
-		// run games that do not use custom barycentrics. Shaders that need it fail
-		// at pipeline creation instead of blocking startup for every game.
-		if (fragment_barycentric.fragmentShaderBarycentric != VK_TRUE) {
-			LOGF("fragmentShaderBarycentric is not supported\n");
-		}
 
 		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
 		              required_features12.samplerMirrorClampToEdge);
@@ -516,8 +508,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
-		LOGF("VK_KHR_fragment_shader_barycentric is not supported on this device. "
-		     "Pixel shaders requiring custom barycentrics may fail or produce visual artifacts.\n");
+		Log::WriteToConsoleAndLog(
+		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "
+		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
@@ -990,8 +983,6 @@ void WindowContext::CreateVulkan() {
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
-	// VK_KHR_fragment_shader_barycentric is optional (see the selection check
-	// above); it is appended after device selection only when available.
 #endif
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF

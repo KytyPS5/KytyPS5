@@ -750,13 +750,18 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
-					// Sentinel write ranges end before tables captured by any bound stage.
+					// Sentinel write ranges end before tables captured by any bound stage. A
+					// compute dispatch's own scalar reads may overlap its writes (see
+					// CommitBindings), so a table at the start of its own range is allowed; later
+					// tables still end the range so it never grows past the existing limits.
 					for (const auto* reader: stages) {
+						const bool own_compute_reads =
+						    reader == stage && program.stage == ShaderType::Compute;
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
+							} else if (address - read_address < read_size && !own_compute_reads) {
 								EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}
@@ -947,6 +952,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
+				// A compute dispatch reading a buffer it writes itself through scalar loads is racy
+				// on hardware: the scalar cache is not coherent with the dispatch's own vector
+				// writes, so the value captured at dispatch start is a valid result. The next
+				// dispatch re-materializes its specialization from memory, so the writes are still
+				// observed from then on.
+				if (writer == reader && program.stage == ShaderType::Compute) continue;
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];

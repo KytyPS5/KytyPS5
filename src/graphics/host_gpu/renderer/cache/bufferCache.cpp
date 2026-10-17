@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -647,7 +648,12 @@ void BufferCache::RunGarbageCollector() {
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
-		auto& buffer = m_slot_buffers[id];
+		auto* buffer_ptr = m_slot_buffers.try_get(id);
+		if (buffer_ptr == nullptr) {
+			// Already retired by an overlapping invalidation; nothing to collect.
+			return false;
+		}
+		auto& buffer = *buffer_ptr;
 		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
@@ -674,7 +680,12 @@ void BufferCache::RunGarbageCollector() {
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
-		auto& buffer = m_slot_buffers[id];
+		auto* buffer_ptr = m_slot_buffers.try_get(id);
+		if (buffer_ptr == nullptr) {
+			// Retired while queued downloads were published; nothing left to release.
+			continue;
+		}
+		auto& buffer = *buffer_ptr;
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
 		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
@@ -707,7 +718,18 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		--it;
 	}
 	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
+		auto* buffer_ptr = m_slot_buffers.try_get(it->second);
+		if (buffer_ptr == nullptr) {
+			// The address map can briefly outlive a retired buffer; skip it.
+			static std::atomic_uint log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("BufferCache: skipped synchronization for retired buffer "
+				     "(index=%u generation=%u)\n",
+				     it->second.index, it->second.generation);
+			}
+			continue;
+		}
+		auto&      buffer = *buffer_ptr;
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 		if (start < finish) {

@@ -1169,10 +1169,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
+	auto* pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	if (pipeline == nullptr) {
+		// The host rejected this pipeline configuration (details were logged when
+		// creation failed). Skip the draw instead of aborting the game.
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("RenderDraw: skipped draw with host-rejected pipeline (VS=%llu PS=%llu)\n",
+			     static_cast<unsigned long long>(state.programs.vertex[0].id),
+			     static_cast<unsigned long long>(state.ps_active ? state.programs.pixel.id
+			                                                   : 0));
+		}
+		return;
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1189,7 +1201,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, *pipeline, stages);
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1210,7 +1222,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
+		vk_buffer.pushConstants(pipeline->pipeline_layout, draw_stages, 0,
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 
@@ -1225,7 +1237,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

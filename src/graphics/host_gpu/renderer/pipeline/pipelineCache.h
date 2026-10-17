@@ -15,6 +15,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics {
 
@@ -133,7 +134,8 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	// Returns null when the host rejected this configuration; the caller must skip the draw.
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
@@ -178,6 +180,9 @@ private:
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// Configurations the host rejected (unsupported state or limits). Remembered so later
+	// draws with the same state skip creation instead of aborting or retrying every frame.
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_failed_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
 	void InitializeDriverCache();
@@ -185,7 +190,8 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+// Returns false when the host rejected the configuration; the pipeline is left empty.
+bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
                             std::span<const ShaderVertexInputInfo> vertex_info,

@@ -20,7 +20,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <vector>
@@ -230,8 +232,38 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
 }
 
+// Releases handles created before pipeline creation failed, so a dropped configuration
+// does not leak host objects. All members are null on return.
+static void DestroyPartialPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline) {
+	if (pipeline.pipeline != nullptr) {
+		graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		pipeline.pipeline = nullptr;
+	}
+	if (pipeline.pipeline_layout != nullptr) {
+		graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+		pipeline.pipeline_layout = nullptr;
+	}
+	if (pipeline.descriptor_set_layout != nullptr) {
+		graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+		pipeline.descriptor_set_layout = nullptr;
+	}
+}
+
+// Reports a host-rejected pipeline configuration (throttled). The caller skips draws that
+// need it instead of aborting the game, so the message must carry enough state to identify
+// the unsupported configuration from a user log.
+static void LogSkippedPipelineConfig(const std::string& details) {
+	static std::atomic_uint log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) >= 8) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format("Graphics pipeline creation failed ({}). Draws using "
+	                                      "this configuration will be skipped.\n",
+	                                      details));
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
                             std::span<const ShaderVertexInputInfo> vertex_info,
@@ -491,9 +523,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+	if (result != vk::Result::eSuccess || pipeline.pipeline_layout == nullptr) {
+		LogSkippedPipelineConfig(fmt::format("vkCreatePipelineLayout result={} VS={} PS={}",
+		                                     vk::to_string(result), vertex_program.id,
+		                                     ps_active ? pixel_program.id : 0));
+		DestroyPartialPipeline(graphics, pipeline);
+		if (tess_control_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+		}
+		if (tess_eval_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+		}
+		return false;
+	}
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
@@ -569,9 +611,31 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+		// The host rejected this configuration (unsupported sample count, exceeded
+		// limits, ...). Report it and let the caller skip the draw.
+		std::string color_formats;
+		for (uint32_t i = 0; i < rendering.color_count; i++) {
+			color_formats += vk::to_string(rendering.color_formats[i]);
+			color_formats += ' ';
+		}
+		LogSkippedPipelineConfig(fmt::format(
+		    "vkCreateGraphicsPipelines result={} VS={} PS={} topology={} colors=[{}]depth={} "
+		    "stencil={} samples={} stages={} dynamic_states={}",
+		    vk::to_string(result), vertex_program.id, ps_active ? pixel_program.id : 0,
+		    vk::to_string(static_params.topology), color_formats,
+		    vk::to_string(rendering.depth_format), vk::to_string(rendering.stencil_format),
+		    static_params.samples, shader_stage_count,
+		    static_cast<uint32_t>(dynamic_states.size())));
+		DestroyPartialPipeline(graphics, pipeline);
+		if (tess_control_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+		}
+		if (tess_eval_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+		}
+		return false;
+	}
 
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -579,6 +643,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
+	return true;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

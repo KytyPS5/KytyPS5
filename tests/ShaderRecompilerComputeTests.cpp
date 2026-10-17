@@ -38966,7 +38966,11 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     ValidateSpirv(test.name, compiled.spirv);
     test.required_spirv.clear();
     test.forbidden_spirv = {"PhysicalStorageBuffer", "OpArrayLength"};
-    if (!single && !null_child && layout != Layout::DifferentStride) {
+    const bool shared = !single && !null_child && layout != Layout::DifferentStride;
+    Require(test.name, "shader-data placement",
+            program.bindings.UsesPushData() == (!shared && push_start != PushData::NoStart),
+            "per-lane buffer slots must read shader data from the storage buffer");
+    if (shared) {
       test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
       test.forbidden_spirv.push_back("OpSwitch");
       std::set<u32> nonuniform;

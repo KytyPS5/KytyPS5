@@ -224,11 +224,13 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexing);
 		state.builder.AddAnnotation(spv::OpDecorate, access.object_pointer, spv::DecorationNonUniform);
-		const auto& bindings      = state.program.bindings;
-		const auto  data_start    = bindings.UsesPushData() ? bindings.push_data_start_dword : 0u;
-		const auto  offsets_start = bindings.memory_offset_dword + data_start;
+		const auto& bindings = state.program.bindings;
+		if (bindings.UsesPushData()) {
+			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+			                             "per-lane buffer slot data is in push constants");
+		}
 		const auto word = EmitShaderDataDwordLoadAt(state, EmitAddU32(
-		    state, ConstantU32(state, offsets_start),
+		    state, ConstantU32(state, bindings.memory_offset_dword),
 		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))));
 		const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), array_index, ConstantU32(state, 3)),
@@ -236,8 +238,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 		    state, word, shift, ConstantU32(state, 8));
 		range = EmitShaderDataDwordLoadAt(
-		    state, EmitAddU32(state, ConstantU32(state, bindings.MemoryRangeDword() + data_start),
-		                      array_index));
+		    state, EmitAddU32(state, ConstantU32(state, bindings.MemoryRangeDword()), array_index));
 	} else {
 		access.byte_offset = state.memory_byte_offsets[static_index];
 		range              = state.memory_byte_ranges[static_index];

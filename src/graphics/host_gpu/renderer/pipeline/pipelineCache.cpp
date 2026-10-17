@@ -257,8 +257,7 @@ struct PipelineCache::ProgramCache {
 			    resource_plan, runtime, resources, specialization));
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords()) ||
+				if (layout.push_data_start_dword != layout.PushDataStartFor(push_data_cursor) ||
 				    candidate.specialization != specialization) {
 					continue;
 				}

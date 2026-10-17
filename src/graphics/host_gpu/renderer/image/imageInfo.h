@@ -28,6 +28,7 @@ struct ImageMetadataInfo {
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
 	uint32_t            control              = 0;
 	uint64_t            clear_word           = 0;
+	vk::Format          clear_format         = vk::Format::eUndefined;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
@@ -403,6 +404,10 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 			next.float32[1] = float16(packed >> 16u);
 			[[fallthrough]];
 		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[2] = static_cast<float>((clear_words >> 32u) & 0xffffu) / 65535.0f;
+			next.float32[3] = static_cast<float>(clear_words >> 48u) / 65535.0f;
+			[[fallthrough]];
 		case vk::Format::eR16G16Unorm:
 			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
 			[[fallthrough]];
@@ -414,6 +419,9 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 			next.float32[1] = std::bit_cast<float>(static_cast<uint32_t>(clear_words >> 32u));
 			[[fallthrough]];
 		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
+		case vk::Format::eR32G32Uint:
+			next.uint32[1] = static_cast<uint32_t>(clear_words >> 32u);
+			[[fallthrough]];
 		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
 		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
 		case vk::Format::eR8G8B8A8Srgb:

@@ -82,6 +82,8 @@ public:
 		return m_dispatch_indirect_args_base_addr;
 	}
 	void SetNumInstances(uint32_t num_instances);
+	// NUM_INSTANCES, read back from the GPU when an indirect draw latched it there.
+	[[nodiscard]] uint32_t NumInstances();
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
@@ -90,6 +92,12 @@ public:
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
+	// Draws with GPU-written arguments without reading them back; false leaves the packet to
+	// the CPU path.
+	[[nodiscard]] bool DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_count_or_count,
+	                                     const volatile uint32_t* count_addr,
+	                                     uint32_t stride_in_bytes, IndirectDrawRegisters registers,
+	                                     bool indexed);
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,
@@ -172,6 +180,8 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// Set when the last indirect draw ran on the GPU: NUM_INSTANCES is latched there.
+	bool m_num_instances_on_gpu = false;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

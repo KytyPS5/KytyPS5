@@ -149,16 +149,20 @@ bool ImmediateBits(Value value, uint64_t& bits) {
 }
 
 // Scratch layout in bytes: per descriptor source its eight DWORDs and a known DWORD, one
-// activity byte per source, then one qword per walked value (all ones when unknown). The
-// walker's value slots, captured addresses, reachability and states follow.
+// activity byte per source and image, then one qword per walked value (all ones when unknown).
+// The walker's value slots, captured addresses, reachability and states follow.
 constexpr uint32_t DescriptorStride = 9u * sizeof(uint32_t);
 
 uint32_t ActiveOffset(const ResourcePlan& plan) {
 	return static_cast<uint32_t>(plan.descriptor_sources.size()) * DescriptorStride;
 }
 
+uint32_t ImageActiveOffset(const ResourcePlan& plan) {
+	return ActiveOffset(plan) + static_cast<uint32_t>(plan.descriptor_sources.size());
+}
+
 uint32_t OutputOffset(const ResourcePlan& plan) {
-	return (ActiveOffset(plan) + static_cast<uint32_t>(plan.descriptor_sources.size()) + 7u) & ~7u;
+	return (ImageActiveOffset(plan) + static_cast<uint32_t>(plan.info.images.size()) + 7u) & ~7u;
 }
 
 const uint8_t* Scratch(const ResourcePlan& plan) {
@@ -1338,6 +1342,25 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 				c.mov(active, 1);
 			}
 		}
+		// Image uses sharing a source can have different activity.
+		for (uint32_t source = 0; source < m_plan.info.images.size(); ++source) {
+			bool listed = false;
+			for (uint32_t block = 0; block < blocks.size(); ++block) {
+				if (std::ranges::find(blocks[block].images, source) == blocks[block].images.end()) continue;
+				if (listed) {
+					c.or_(c.al, c.byte[c.rdx + m_reach + block]);
+				} else {
+					c.mov(c.al, c.byte[c.rdx + m_reach + block]);
+				}
+				listed = true;
+			}
+			const auto active = c.byte[c.rdx + ImageActiveOffset(m_plan) + source];
+			if (listed) {
+				c.mov(active, c.al);
+			} else {
+				c.mov(active, blocks.empty() ? 1 : 0);
+			}
+		}
 		for (uint32_t source = 0; source < sources.size(); ++source) {
 			if (gates[source].empty()) continue;
 			Xbyak::Label skip;
@@ -1438,6 +1461,10 @@ bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue
 
 bool WalkedActive(const ResourcePlan& plan, uint32_t source) {
 	return Scratch(plan)[ActiveOffset(plan) + source] != 0u;
+}
+
+bool WalkedImageActive(const ResourcePlan& plan, uint32_t image) {
+	return Scratch(plan)[ImageActiveOffset(plan) + image] != 0u;
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,

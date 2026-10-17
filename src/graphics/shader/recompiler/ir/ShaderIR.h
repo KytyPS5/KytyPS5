@@ -641,6 +641,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> images;
 	std::vector<uint32_t> srt_reads;
 };
 

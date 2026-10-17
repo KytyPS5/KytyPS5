@@ -1327,6 +1327,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 				block.sources.push_back(program.info.buffers.at(memory.resource).source);
 			} else {
 				block.sources.push_back(program.info.images.at(memory.resource).source);
+				block.images.push_back(memory.resource);
 				if (image.needs_sampler) {
 					block.sources.push_back(program.info.samplers.at(memory.sampler).source);
 				}
@@ -1820,6 +1821,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		    .indirect_search_iterations = image.indirect_search_iterations,
 		    .cube = image.cube,
 		};
+		if (!WalkedImageActive(program, i)) {
+			snapshot.images[i] = {.dword_count = 8u};
+			continue;
+		}
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
 			return false;

@@ -1314,6 +1314,80 @@ void TestSignedStorageSpecialization() {
   }
 }
 
+void TestSharedDescriptorImageActivity() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  using Libs::Graphics::Prospero::BufferFormat;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 1u;
+  auto &entry = AddValueBlock(program);
+  auto &atomic = AddValueBlock(program);
+  auto &exit = AddValueBlock(program);
+  const auto flag = Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
+  entry.condition = Value(&entry.AppendNewInst(ValueOpcode::SLessThan32, {Value(3u), flag}));
+  entry.terminator = {.kind = TerminatorKind::ConditionalBranch,
+      .true_block = &atomic, .false_block = &exit};
+  entry.AddBranch(&atomic);
+  entry.AddBranch(&exit);
+  atomic.terminator = {.kind = TerminatorKind::Branch, .true_block = &exit};
+  atomic.AddBranch(&exit);
+  exit.terminator.kind = TerminatorKind::Return;
+  DescriptorSource source;
+  source.dword_count = 8u;
+  source.dwords.fill(Value(0u));
+  source.dwords[0] = Value(0x100u);
+  source.dwords[1] = Value(uint32_t(BufferFormat::k8_8_8_8UNorm) << 20u);
+  source.dwords[3] = Value(uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  program.descriptor_sources.push_back(source);
+  program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Sampled,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D, .read = true});
+  auto storage = program.info.images[0];
+  storage.resource_class = ImageResourceClass::Storage;
+  storage.written = storage.atomic = storage.atomic64 = true;
+  program.info.images.push_back(storage);
+  program.memory_info.push_back({.kind = ResourceKind::Image, .resource = 0u});
+  program.memory_info.push_back({.kind = ResourceKind::Image, .resource = 1u});
+  const auto image = Value(&entry.AppendNewInst(ValueOpcode::GetImageResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3],
+       source.dwords[4], source.dwords[5], source.dwords[6], source.dwords[7]}));
+  const auto address = Value(&entry.AppendNewInst(ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)}));
+  entry.AppendNewInst(ValueOpcode::ImageRead, {image, address, Value(true)})
+      .SetFlags(MemoryFlags{.index = 0u});
+  atomic.AppendNewInst(ValueOpcode::ImageAtomicUMax64,
+      {image, address, Value(uint64_t{1}), Value(true)}).SetFlags(MemoryFlags{.index = 1u});
+  auto plan = ExtractResourcePlan(program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t flag : {3u, 4u, UINT32_MAX, 3u}) {
+    const std::array user_data{flag};
+    const bool active = flag == 4u;
+    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) == !active,
+          "shared image descriptor hid an active invalid atomic format or validated an inactive use");
+    Check(snapshot.images[0].dwords[0] == 0x100u &&
+              (snapshot.images[1].dwords[0] != 0u) == active,
+          "image activity was merged across descriptor uses or retained a stale branch result");
+  }
+  const auto known_condition = entry.condition;
+  const auto lane = Value(&entry.AppendNewInst(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)}));
+  entry.condition = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {lane, Value(0u)}));
+  auto unknown = Extract(program);
+  const std::array unknown_data{0u};
+  Check(!MaterializeResources(unknown, {.user_data = unknown_data}, snapshot, specialization) &&
+            snapshot.images[1].dwords[0] == 0x100u,
+        "an unknown branch skipped a potentially active atomic image or failed before image activity");
+  entry.condition = known_condition;
+  program.has_address_writes = true;
+  auto conservative = Extract(program);
+  const std::array user_data{3u};
+  Check(!MaterializeResources(conservative, {.user_data = user_data}, snapshot, specialization),
+        "address writes allowed unsafe pruning of an image use");
+}
+
 void TestIndirectImageSamplerClasses(bool mixed) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::Prospero::BufferFormat;
@@ -1532,6 +1606,7 @@ int main() {
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
+  TestSharedDescriptorImageActivity();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestShaderCacheRecords();
   std::puts("ResourceMaterializationTests: all cases passed");

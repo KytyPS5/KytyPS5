@@ -38650,7 +38650,7 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     test.decoded_counts = {{direct_gt ? "V_CMPX_GT_U32" : "V_CMP_LE_U32", 1u}};
     if (outer_loop) test.decoded_counts.insert(test.decoded_counts.end(),
         {{"V_CMPX_EQ_U32", 2u}, {"S_CBRANCH_SCC1", 2u}});
-    test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "Volatile"};
+    test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "OpAtomicLoad"};
     test.forbidden_spirv = {"load_indirect_buffer_", "indirect_buffer_format_geometry"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     for (const auto &descriptor : compiled.resources.buffers) {

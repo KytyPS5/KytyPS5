@@ -200,6 +200,8 @@ private:
 		size_t                  writes_start = 0;
 	};
 	void PublishCompletedHotWriteBacks(uint64_t max_tick = UINT64_MAX);
+	// Tick after which pending hot write-backs carry every GPU-written byte of the range, or 0.
+	[[nodiscard]] uint64_t PendingHotWriteBackTick(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] size_t   OpenWriteLog();
 	[[nodiscard]] bool     WrittenSince(size_t start, uint64_t begin, uint64_t end) const;
 	void                   CloseWriteLog(size_t start);

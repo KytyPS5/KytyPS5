@@ -436,8 +436,14 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 }
 
 IR::U32 Translator::PackHalf2x16(IR::F32 low, IR::F32 high) {
-	const auto pair = ir.Emit(IR::ValueOpcode::CompositeConstructF32x2, {low, high});
-	return IR::U32(ir.Emit(IR::ValueOpcode::PackHalf2x16, {pair}));
+	// f16 ALU results round to nearest even, as ConvertF16F32 does on every host.
+	const auto half_bits = [&](IR::F32 value) {
+		const auto half = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
+		return IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16,
+		                       {IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}))}));
+	};
+	return ir.BitwiseOr(half_bits(low),
+	                    ir.ShiftLeftLogical(half_bits(high), IR::U32(IR::Value(16u))));
 }
 
 void Translator::Write16Bits(const Decoder::Operand& operand, IR::U32 value) {

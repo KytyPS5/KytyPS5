@@ -12929,6 +12929,118 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckVolumeShapeReuse() {
+    constexpr const char *name = "VolumeShapeReuse";
+    constexpr uintptr_t base = 0x0000000203f00000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t reuse_offset = 0x4000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "volume allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "volume mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+
+      // PPSA15246 reuses one allocation for differently shaped volumes. Up to
+      // 8x8 texels, every R32 level lies in the 4 KiB mip tail, so the shapes
+      // share their pitch and mip placement and differ only in block slices.
+      const auto volume = [](uint64_t address, vk::Extent3D extent) {
+        auto desc = MakeLinearDesc(address, 0, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor3D, extent, 1, 4, 1);
+        desc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        desc.info.resources = {3, 1};
+        desc.info.pitch = 0;
+        desc.info.UpdateSize();
+        desc.view_info.level_count = 3;
+        return desc;
+      };
+      const auto same_placement = [](const ImageInfo &left, const ImageInfo &right) {
+        return left.pitch == right.pitch &&
+               std::equal(left.mip_layout.begin(), left.mip_layout.end(),
+                          right.mip_layout.begin(),
+                          [](const ImageMipInfo &a, const ImageMipInfo &b) {
+                            return a.offset == b.offset && a.size == b.size &&
+                                   a.pitch == b.pitch && a.height == b.height &&
+                                   a.tail_x == b.tail_x && a.tail_y == b.tail_y &&
+                                   a.surface_z == b.surface_z;
+                          });
+      };
+
+      auto cached_desc = volume(base, {4, 8, 8});
+      auto grown_desc = volume(base, {8, 8, 16});
+      Require(name, "contained volume layout",
+              cached_desc.info.data.size == 0x1000 &&
+                  grown_desc.info.data.size == 0x2000 &&
+                  same_placement(cached_desc.info, grown_desc.info),
+              "the volumes no longer share an equal-address mip-tail layout");
+      const auto cached_id = cache.FindImage(cached_desc);
+      vk::ClearValue painted{};
+      painted.color.uint32 = std::array{0x12345678u, 0u, 0u, 0u};
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), cached_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 3, 0, 8},
+                                         painted);
+      const auto grown_id = cache.FindImage(grown_desc);
+      const auto &grown = cache.GetImage(grown_id);
+      Require(name, "contained volume expansion",
+              grown_id != cached_id &&
+                  !TextureCacheTestAccess::Contains(cache, cached_id) &&
+                  grown.backing.extent == vk::Extent3D{8, 8, 16} &&
+                  grown.backing.mip_levels == 3 && grown.IsGpuModified(),
+              "a wider and deeper volume did not replace the contained native volume");
+      Require(name, "expansion preserves native prefix and guest remainder",
+              ReadCachedTexel(name, context, grown_id, {3, 7, 7}) ==
+                      std::vector<u32>{0x12345678u} &&
+                  ReadCachedTexel(name, context, grown_id, {7, 0, 0}) ==
+                      std::vector<u32>{0x5a5a5a5au} &&
+                  ReadCachedTexel(name, context, grown_id, {0, 0, 15}) ==
+                      std::vector<u32>{0x5a5a5a5au},
+              "volume expansion lost GPU writes or copied beyond the old extent");
+
+      auto wide_desc = volume(base + reuse_offset, {8, 8, 8});
+      auto deep_desc = volume(base + reuse_offset, {4, 8, 16});
+      Require(name, "reshaped volume layout",
+              wide_desc.info.data.size == 0x1000 &&
+                  deep_desc.info.data.size == 0x2000 &&
+                  same_placement(wide_desc.info, deep_desc.info),
+              "the volumes no longer share an equal-address mip-tail layout");
+      const auto wide_id = cache.FindImage(wide_desc);
+      const auto deep_id = cache.FindImage(deep_desc);
+      Require(name, "reshaped volume is a separate image",
+              deep_id != wide_id && TextureCacheTestAccess::Contains(cache, wide_id) &&
+                  cache.GetImage(deep_id).backing.extent == vk::Extent3D{4, 8, 16} &&
+                  cache.FindImage(deep_desc) == deep_id,
+              "a volume neither containing nor contained by the cached volume "
+              "reused or discarded its native image");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "volume backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorStandardTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
@@ -13433,6 +13545,18 @@ public:
         check_range(0x3000, "finite structured read preserves native range");
         value.dwords[2] = UINT32_MAX;
         check_range(mapped_tail, "read-only structured sentinel preserves smaller mapping");
+        // PPSA15246 writes through a sentinel whose tables precede it.
+        writer.info.buffers[0].written = true;
+        writer.info.buffers[0].read = false;
+        writer_snapshot.specialization_reads = {{address - 0x40, 0x40}};
+        reader_snapshot.specialization_reads.clear();
+        storage_limit = 0x2000;
+        check_range(storage_limit - (graphics.StorageMinAlignment() - 1),
+                    "unbounded write after its tables uses the read window");
+        Require(name, "write native range fits device", writer_bindings.buffers[0].range <= storage_limit,
+                "unbounded write exceeded the device storage range");
+        storage_limit = original_limit;
+        check_range(mapped_tail, "unbounded write after its tables preserves smaller mapping");
       }
 
       for (const auto format : {Prospero::BufferFormat::k8UNorm,
@@ -48972,6 +49096,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckVolumeShapeReuse();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
@@ -49285,6 +49410,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
+  vulkan.CheckVolumeShapeReuse();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
     vulkan.CheckRenderExecutorColorDiscovery();

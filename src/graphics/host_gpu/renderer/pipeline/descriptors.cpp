@@ -761,12 +761,14 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 							}
 						}
 					}
-				} else {
-					const auto& graphics = m_context.GetGraphics();
-					const auto limit = uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
-					                   (graphics.StorageMinAlignment() - 1);
-					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
+				// A sentinel range otherwise extends to the end of the mapping. PPSA15246 writes
+				// through one whose tables precede it, which bound gigabytes of guest memory.
+				const auto& graphics = m_context.GetGraphics();
+				const auto  limit =
+				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+				    (graphics.StorageMinAlignment() - 1);
+				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			source = {address, size, cache.FindBuffer(address, size)};

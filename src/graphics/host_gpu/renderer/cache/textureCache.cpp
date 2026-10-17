@@ -814,14 +814,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
 			return {ExpandImage(requested, cached_id)};
 		}
-		// Volume depth is not an array-layer count. A larger depth can retain the
-		// same block-slice layout while requiring a larger native image.
+		// Volume depth is not an array-layer count. A larger depth, or a larger width
+		// within the same pitch, can retain the same block-slice layout while requiring
+		// a larger native image.
+		const bool volume_contains_cached = requested.type == cached.info.type &&
+		                                    requested.resources == cached.info.resources &&
+		                                    requested.extent.width >= cached.info.extent.width &&
+		                                    requested.extent.height >= cached.info.extent.height &&
+		                                    requested.extent.depth >= cached.info.extent.depth;
 		if ((requested.IsVolume() || cached.info.IsVolume()) &&
 		    (requested.data.size == cached.info.data.size ||
-		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
-		      requested.extent.width == cached.info.extent.width &&
-		      requested.extent.height == cached.info.extent.height &&
-		      requested.extent.depth > cached.info.extent.depth))) {
+		     (volume_contains_cached && requested.data.size > cached.info.data.size))) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
@@ -858,15 +861,26 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
+		// PPSA15246
+		// A volume allocation reused for a differently shaped volume. Neither extent
+		// contains the other, so the requested volume is a separate guest image.
+		if (requested.IsVolume() && cached.info.IsVolume()) {
+			if (safe_to_delete) {
+				FreeImage(cached_id);
+			}
+			return {merged_id};
+		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
 		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
+		     " type=%u/%u tile=%u/%u extent=%ux%ux%u/%ux%ux%u pitch=%u\n",
 		     requested.data.address, requested.resources.levels, requested.resources.layers,
 		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
 		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		     static_cast<uint32_t>(cached.info.tile_mode), requested.extent.width,
+		     requested.extent.height, requested.extent.depth, cached.info.extent.width,
+		     cached.info.extent.height, cached.info.extent.depth, requested.pitch);
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);

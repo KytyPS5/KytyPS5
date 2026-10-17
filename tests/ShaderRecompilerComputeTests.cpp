@@ -31682,7 +31682,6 @@ TestCase VectorFractF16CapturedAndEdges() {
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
   test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
 
@@ -31794,7 +31793,6 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
   test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
 
@@ -31840,7 +31838,6 @@ TestCase VectorSinF16SdwaAndEdges() {
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
   test.required_spirv = {" Fract ", " Sin ", " PackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
 
@@ -57727,6 +57724,18 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVop3CompareNeU64OnGpu());
     RunCase(&vulkan, VectorVopcCmpxNeU64CapturedExecMask());
     RunCase(&vulkan, VectorVop3CmpxNeI64CapturedExecMask());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--packed-f16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorLaneAndPackedOps());
+    RunCase(&vulkan, Vop2PkFmacF16AccumulatesPackedHalvesIndependently());
+    RunCase(&vulkan, Vop2PkFmacF16DppNegatesBothPackedHalves());
+    RunCase(&vulkan, Vop3pOpselHiUsesArchitecturalSourceBits());
+    RunCase(&vulkan, PackedMinMaxF16NanAndSignedZeroEdges());
+    RunCase(&vulkan, FloatInlineConstantF16UsesNumericValue());
+    RunCase(&vulkan, VectorCosF16CapturedSdwaAndEdges());
+    RunCase(&vulkan, VectorSinF16SdwaAndEdges());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {

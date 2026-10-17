@@ -286,6 +286,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	const auto address_access = AddressOpcodeInfoOf(op).access;
 	const auto shared_access = SharedAccessOf(op);
 	info.float64 |= inst.GetType() == Type::F64;
+	info.float16 |= op == ValueOpcode::PackedFPAdd16x2 || op == ValueOpcode::PackedFPMul16x2 ||
+	                op == ValueOpcode::PackedFPFma16x2 || op == ValueOpcode::PackedFPMin16x2 ||
+	                op == ValueOpcode::PackedFPMax16x2 || inst.GetType() == Type::F16;
+	for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+		info.float16 |= inst.Arg(arg).GetType() == Type::F16;
+	}
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||
@@ -591,7 +597,8 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
-	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
+	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 =
+	    info.float16 = false;
 	InputUsage inputs;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {

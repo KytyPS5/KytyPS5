@@ -108,6 +108,7 @@ bool IsLaneLocal(ValueOpcode op) {
 		case ValueOpcode::ConvertU8U32:
 		case ValueOpcode::ConvertU32U8:
 		case ValueOpcode::ConvertF32F16:
+		case ValueOpcode::ConvertF32F16Lane:
 		case ValueOpcode::ConvertF16F32:
 		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertU32F32:
@@ -237,6 +238,21 @@ bool IsLaneLocal(ValueOpcode op) {
 		case ValueOpcode::FPMax32:
 		case ValueOpcode::FPMin64:
 		case ValueOpcode::FPMax64:
+		case ValueOpcode::PackedFPAdd16x2:
+		case ValueOpcode::PackedFPMul16x2:
+		case ValueOpcode::PackedFPFma16x2:
+		case ValueOpcode::PackedFPMin16x2:
+		case ValueOpcode::PackedFPMax16x2:
+		case ValueOpcode::FPAdd16:
+		case ValueOpcode::FPSub16:
+		case ValueOpcode::FPMul16:
+		case ValueOpcode::FPFma16:
+		case ValueOpcode::FPMin16:
+		case ValueOpcode::FPMax16:
+		case ValueOpcode::FPAbs16:
+		case ValueOpcode::FPNeg16:
+		case ValueOpcode::ExtractF16Lane:
+		case ValueOpcode::InsertF16Lane:
 		case ValueOpcode::FPMinTri32:
 		case ValueOpcode::FPMaxTri32:
 		case ValueOpcode::FPMedTri32:

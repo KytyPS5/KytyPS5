@@ -187,6 +187,17 @@ uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signe
 	              src, fract);
 }
 
+uint32_t EmitConvertF32F16Lane(EmitterState& state, uint32_t bits, IR::Value lane) {
+	// UnpackHalf2x16 reads either half directly; hosts select the half in the conversion.
+	const auto unpacked = state.builder.AllocateId();
+	const auto ret      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state),
+	                          GLSLstd450UnpackHalf2x16, bits);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), ret, unpacked,
+	                          lane.Resolve().U32() != 0u ? 1u : 0u);
+	return ret;
+}
+
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {
 	const auto unpacked = state.builder.AllocateId();
 	const auto ret      = state.builder.AllocateId();

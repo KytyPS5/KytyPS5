@@ -29,6 +29,8 @@ inline Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 using LaneSpills = std::array<std::pair<uint32_t, uint32_t>, IR::NumVectorRegs>;
 inline constexpr LaneSpills NoLaneSpills {};
 
+[[nodiscard]] bool NativeF16Enabled();
+
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
@@ -65,6 +67,9 @@ private:
 	std::array<IR::U32, 2> ReadU32Pair(const Decoder::Operand& operand);
 	IR::U64                ReadU64(const Decoder::Operand& operand);
 	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane);
+	IR::U32 ReadPackedF16(const Decoder::Operand& operand);
+	IR::F16 ReadF16Lane(const Decoder::Operand& operand, bool high_lane);
+	bool    WriteF16Lane(const Decoder::Operand& operand, IR::F16 value);
 	IR::F32 ReadF16AsF32(const Decoder::Operand& operand);
 	IR::F32 ReadMixF32(const Decoder::Operand& operand);
 	IR::U32 ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane, bool sign_extend);
@@ -169,6 +174,7 @@ private:
 	void V_CVT_PK_U8_F32(const Decoder::Instruction& inst);
 	void V_CVT_PK_16_32(const Decoder::Instruction& inst, bool signed_value);
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
+	IR::U32 QuietPackedSnan(const Decoder::Instruction& inst, IR::U32 result);
 	void PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
 	void Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,

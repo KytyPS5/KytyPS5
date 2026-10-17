@@ -146,11 +146,117 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 	return EmitNative<spv::OpBitwiseAnd, IR::Type::U8>(state, arg0, ConstantU32(state, 0xffu));
 }
 
-uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
+// The F16 bits of an F32 in the low half of a U32 (PackHalf2x16 rounding).
+uint32_t EmitF32ToF16Bits(EmitterState& state, uint32_t arg0) {
 	const auto pair = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
 	                          ConstantF32(state, 0));
 	return EmitPackHalf2x16(state, pair);
+}
+
+namespace {
+
+uint32_t HalfOfU32(EmitterState& state, uint32_t bits, uint32_t lane) {
+	const auto halves = Unary(state, spv::OpBitcast, TypeF16x2(state), bits);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF16(state), result, halves, lane);
+	return result;
+}
+
+uint32_t LaneOf(IR::Value lane) {
+	return lane.Resolve().U32() != 0u ? 1u : 0u;
+}
+
+uint32_t HalfOperation(EmitterState& state, spv::Op opcode, uint32_t glsl,
+                       std::initializer_list<uint32_t> args, bool exact) {
+	const auto result = state.builder.AllocateId();
+	const auto* arg   = args.begin();
+	if (opcode != spv::OpExtInst) {
+		if (args.size() == 1) {
+			state.builder.AddFunction(opcode, TypeF16(state), result, arg[0]);
+		} else {
+			state.builder.AddFunction(opcode, TypeF16(state), result, arg[0], arg[1]);
+		}
+	} else if (args.size() == 1) {
+		state.builder.AddFunction(spv::OpExtInst, TypeF16(state), result, GlslStd450(state), glsl,
+		                          arg[0]);
+	} else if (args.size() == 2) {
+		state.builder.AddFunction(spv::OpExtInst, TypeF16(state), result, GlslStd450(state), glsl,
+		                          arg[0], arg[1]);
+	} else {
+		state.builder.AddFunction(spv::OpExtInst, TypeF16(state), result, GlslStd450(state), glsl,
+		                          arg[0], arg[1], arg[2]);
+	}
+	if (exact) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
+	return result;
+}
+
+} // namespace
+
+// F16 values are native halves; U16 values and F16 bits live in the low half of a U32.
+uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
+	return HalfOfU32(state, EmitF32ToF16Bits(state, arg0), 0u);
+}
+
+uint32_t EmitConvertF32F16(EmitterState& state, uint32_t arg0) {
+	return Unary(state, spv::OpFConvert, TypeF32(state), arg0);
+}
+
+uint32_t EmitBitCastF16U16(EmitterState& state, uint32_t arg0) {
+	return HalfOfU32(state, arg0, 0u);
+}
+
+uint32_t EmitBitCastU16F16(EmitterState& state, uint32_t arg0) {
+	const auto halves = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF16x2(state), halves, arg0,
+	                          state.builder.Constant(spv::OpConstant, TypeF16(state), 0u));
+	return Unary(state, spv::OpBitcast, TypeU32(state), halves);
+}
+
+uint32_t EmitExtractF16Lane(EmitterState& state, uint32_t bits, IR::Value lane) {
+	return HalfOfU32(state, bits, LaneOf(lane));
+}
+
+uint32_t EmitInsertF16Lane(EmitterState& state, uint32_t bits, uint32_t value, IR::Value lane) {
+	const auto halves   = Unary(state, spv::OpBitcast, TypeF16x2(state), bits);
+	const auto inserted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeInsert, TypeF16x2(state), inserted, value, halves,
+	                          LaneOf(lane));
+	return Unary(state, spv::OpBitcast, TypeU32(state), inserted);
+}
+
+uint32_t EmitFPAdd16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return HalfOperation(state, spv::OpFAdd, 0, {arg0, arg1}, true);
+}
+
+uint32_t EmitFPSub16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return HalfOperation(state, spv::OpFSub, 0, {arg0, arg1}, true);
+}
+
+uint32_t EmitFPMul16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return HalfOperation(state, spv::OpFMul, 0, {arg0, arg1}, true);
+}
+
+uint32_t EmitFPFma16(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	return HalfOperation(state, spv::OpExtInst, GLSLstd450Fma, {arg0, arg1, arg2}, true);
+}
+
+uint32_t EmitFPMin16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return HalfOperation(state, spv::OpExtInst, GLSLstd450NMin, {arg0, arg1}, false);
+}
+
+uint32_t EmitFPMax16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return HalfOperation(state, spv::OpExtInst, GLSLstd450NMax, {arg0, arg1}, false);
+}
+
+uint32_t EmitFPAbs16(EmitterState& state, uint32_t arg0) {
+	return HalfOperation(state, spv::OpExtInst, GLSLstd450FAbs, {arg0}, false);
+}
+
+uint32_t EmitFPNeg16(EmitterState& state, uint32_t arg0) {
+	return HalfOperation(state, spv::OpFNegate, 0, {arg0}, false);
 }
 
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {
@@ -253,6 +359,57 @@ uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF32Value(state, arg0, arg1, true);
+}
+
+namespace {
+
+// Packed F16 values stay U32 in the module; each operation bitcasts its operands to an F16
+// vector, which host compilers fold into one native two-lane instruction (HFMA2 and kin).
+uint32_t PackedF16Operation(EmitterState& state, spv::Op opcode, uint32_t glsl,
+                            std::initializer_list<uint32_t> args) {
+	std::array<uint32_t, 3> halves {};
+	size_t                  count = 0;
+	for (const auto arg: args) {
+		halves[count++] = Unary(state, spv::OpBitcast, TypeF16x2(state), arg);
+	}
+	const auto result = state.builder.AllocateId();
+	if (opcode == spv::OpExtInst) {
+		if (count == 2) {
+			state.builder.AddFunction(spv::OpExtInst, TypeF16x2(state), result, GlslStd450(state),
+			                          glsl, halves[0], halves[1]);
+		} else {
+			state.builder.AddFunction(spv::OpExtInst, TypeF16x2(state), result, GlslStd450(state),
+			                          glsl, halves[0], halves[1], halves[2]);
+		}
+	} else {
+		state.builder.AddFunction(opcode, TypeF16x2(state), result, halves[0], halves[1]);
+	}
+	// Each guest operation rounds once; keep the host compiler from fusing a mul and an add.
+	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	return Unary(state, spv::OpBitcast, TypeU32(state), result);
+}
+
+} // namespace
+
+uint32_t EmitPackedFPAdd16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return PackedF16Operation(state, spv::OpFAdd, 0, {arg0, arg1});
+}
+
+uint32_t EmitPackedFPMul16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return PackedF16Operation(state, spv::OpFMul, 0, {arg0, arg1});
+}
+
+uint32_t EmitPackedFPFma16x2(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450Fma, {arg0, arg1, arg2});
+}
+
+uint32_t EmitPackedFPMin16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	// One NaN operand yields the other, as for the F32 forms (see EmitMinMaxF32Value).
+	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450NMin, {arg0, arg1});
+}
+
+uint32_t EmitPackedFPMax16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450NMax, {arg0, arg1});
 }
 
 uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1) {

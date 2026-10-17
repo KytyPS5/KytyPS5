@@ -653,6 +653,7 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	bool                            float16                       = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

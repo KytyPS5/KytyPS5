@@ -274,7 +274,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_id          = m_lru_cache.Insert(id, LruKey());
+		buffer.last_used_frame = m_texture_cache.FrameIndex();
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -389,9 +390,10 @@ void BufferCache::MakePageTableResident(uint64_t table_offset, uint64_t size) {
 	EXIT_IF(m_graphics.device.resetFences(1, &m_bda_table_fence) != vk::Result::eSuccess);
 }
 
-void BufferCache::TouchBuffer(const Buffer& buffer) {
+void BufferCache::TouchBuffer(Buffer& buffer) {
 	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		m_lru_cache.Touch(buffer.lru_id, LruKey());
+		buffer.last_used_frame = m_texture_cache.FrameIndex();
 	}
 }
 
@@ -1590,6 +1592,33 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+namespace {
+
+// KYTY_NO_BUFFER_GC_FRAME_AGE=1: judge buffer staleness in collector runs, one per submission.
+bool BufferFrameAgeEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_BUFFER_GC_FRAME_AGE");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+// KYTY_NO_BUFFER_GC_FRAME_LRU=1: key the LRU by collector run and scan it on every run.
+bool BufferFrameLruEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_BUFFER_GC_FRAME_LRU");
+		return BufferFrameAgeEnabled() &&
+		       (text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0);
+	}();
+	return enabled;
+}
+
+} // namespace
+
+uint64_t BufferCache::LruKey() const {
+	return BufferFrameLruEnabled() ? m_texture_cache.FrameIndex() : m_gc_tick;
+}
+
 void BufferCache::RunGarbageCollector() {
 	PruneGpuWriteMarks();
 	const auto tick = m_gc_tick++;
@@ -1606,13 +1635,25 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 	const bool     keep_pins  = !aggressive || !RefaultPinsOnly();
+	const uint64_t frame      = m_texture_cache.FrameIndex();
+	const bool     frame_lru  = BufferFrameLruEnabled();
+	if (frame_lru && !aggressive && frame == m_gc_frame) {
+		return;
+	}
+	m_gc_frame = frame;
+	const uint64_t clean_idle =
+	    aggressive ? Headroom::ReleaseMinIdleFramesOver : Headroom::ReleaseMinIdleFrames;
+	if (frame_lru && frame < clean_idle) {
+		return;
+	}
+	const uint64_t age       = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const uint64_t threshold = frame_lru ? frame - clean_idle : tick - age;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(threshold, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
@@ -1623,6 +1664,15 @@ void BufferCache::RunGarbageCollector() {
 		}
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
+			// Not requeued: critical pressure must find it at once. The pass runs once a frame.
+			return false;
+		}
+		const uint64_t idle     = frame - std::min(frame, buffer.last_used_frame);
+		const uint64_t min_idle = dirty        ? Headroom::EvictMinIdleFramesCritical
+		                          : aggressive ? Headroom::ReleaseMinIdleFramesOver
+		                                       : Headroom::ReleaseMinIdleFrames;
+		if (BufferFrameAgeEnabled() && idle < min_idle) {
+			m_lru_cache.Touch(buffer.lru_id, frame_lru ? frame : tick);
 			return false;
 		}
 		if (dirty) {

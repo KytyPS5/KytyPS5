@@ -109,8 +109,8 @@ void RememberPvVsStoreShader(const ShaderProgram& program, ShaderRecompiler::Com
 	info.location_mask = &entry.mask;
 	// Emitting again writes the same backend ids and descriptor indices into the program, so the
 	// layout the pipeline is built from does not change.
-	auto words = ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info,
-	                                                  push_data_start_dword, &info);
+	auto words = ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info, push_data_start_dword,
+	                                                  options.maintenance8_enabled, false, &info);
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
 	tools.SetMessageConsumer(
 	    [&](spv_message_level_t, const char*, const spv_position_t& position, const char* message) {
@@ -125,6 +125,14 @@ void RememberPvVsStoreShader(const ShaderProgram& program, ShaderRecompiler::Com
 	}
 	std::lock_guard lock(s_mutex);
 	s_shaders.emplace(program.id, std::move(entry));
+}
+
+const std::vector<uint32_t>* PvVsStoreStoredWords(uint64_t program_id, uint32_t* location_mask) {
+	std::lock_guard lock(s_mutex);
+	const auto      it = s_shaders.find(program_id);
+	if (it == s_shaders.end() || it->second.words.empty()) return nullptr;
+	if (location_mask != nullptr) *location_mask = it->second.mask;
+	return &it->second.words;
 }
 
 vk::DescriptorSetLayout PvVsStoreSetLayout(GraphicContext& graphics) {

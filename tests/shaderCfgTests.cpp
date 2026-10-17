@@ -26,6 +26,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/host_gpu/renderer/perVertexVsStoreRuntime.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
@@ -16012,6 +16013,57 @@ void TestPvVsStoreLocation31() {
 
 // VS-store: the VS writes its PerVertex parameters to the cap buffer, the PS reads the
 // three corners of its primitive from it instead of PerVertexKHR.
+// RememberPvVsStoreShader is the one place the VS-store variants are emitted for the game: it must pass the pv_store info
+// to the emitter (a call that drops an argument compiles, converts the pointer to bool and stores the plain module).
+void TestPvVsStoreRemember() {
+  using namespace ShaderRecompiler;
+  ResolvePvVsStoreEnabled(false, true); // auto mode on MoltenVK without fragment shader barycentrics
+  Check(PvVsStoreEnabled(), "the VS-store path must be enabled for the test");
+  // VS with one parameter export.
+  const uint32_t vs_code[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
+                              EncodeExp0(0x20, 0xf), EncodeExp1(4, 5, 6, 7),
+                              EncodeSopp(0x01)};
+  auto vs_options = MakeCompileOptions(ShaderType::Vertex);
+  auto vs = RecompileForTest(vs_code, vs_options);
+  CompileResult vs_result{std::move(vs.spirv), std::move(vs.decoded_dump), std::move(vs.ir_dump), std::move(vs.program)};
+  RememberPvVsStoreShader(ShaderProgram{0x5388'0001ull, nullptr}, vs_result, vs_options, 0);
+  uint32_t vs_mask = 0;
+  const auto* vs_words = PvVsStoreStoredWords(0x5388'0001ull, &vs_mask);
+  Check(vs_words != nullptr, "RememberPvVsStoreShader stored no VS variant");
+  if (vs_words != nullptr) {
+    const auto text = DisassembleSpirvBinary(*vs_words);
+    Check(vs_mask != 0, "the stored VS variant reports no stored host location (pv_store info did not reach the emitter)");
+    Check(text.find("%pv_cap") != std::string::npos, "the stored VS variant has no pv_cap buffer");
+  }
+  // PS with a per-vertex input.
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  const uint32_t ps_code[] = {
+      EncodeVintrp(2, 12, 0, 3, 2), EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(2, 14, 0, 3, 1), EncodeVop2(0x03, 15, 12 + 256, 0),
+      EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+      EncodeExp1(15, 16, 14, 12), 0xbf810000u};
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 1;
+  ps_info.ps_system_input_base = 2;
+  ps_info.custom_interpolation_mask = 1;
+  ps_info.ps_perspective_center_vgpr = 0;
+  SetIdentityInterpolatorSettings(&ps_info);
+  ps_info.interpolator_settings[0] = 0x00000420u;
+  options.input_info.pixel = &ps_info;
+  auto ps = RecompileForTest(ps_code, options);
+  CompileResult ps_result{std::move(ps.spirv), std::move(ps.decoded_dump), std::move(ps.ir_dump), std::move(ps.program)};
+  RememberPvVsStoreShader(ShaderProgram{0x5388'0002ull, nullptr}, ps_result, options, 0);
+  uint32_t ps_mask = 0;
+  const auto* ps_words = PvVsStoreStoredWords(0x5388'0002ull, &ps_mask);
+  Check(ps_words != nullptr, "RememberPvVsStoreShader stored no PS variant");
+  if (ps_words != nullptr) {
+    const auto text = DisassembleSpirvBinary(*ps_words);
+    Check(ps_mask != 0, "the stored PS variant reports no per-vertex location (pv_store info did not reach the emitter)");
+    Check(text.find("%pv_indices") != std::string::npos && text.find("PerVertexKHR") == std::string::npos,
+          "the stored PS variant does not read the corners from the index buffer and the cap");
+  }
+}
+
 void TestPvVsStoreEmission() {
   using namespace ShaderRecompiler;
   const auto count = [](const std::string &text, const std::string &needle) {
@@ -16506,6 +16558,7 @@ int main() {
   EnsureConfigInitialized();
   TestRayTracingInstructions();
   TestPvVsStoreEmission();
+  TestPvVsStoreRemember();
   TestPvVsStoreLocation31();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

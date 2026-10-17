@@ -6,6 +6,7 @@
 set(KYTY_PV_MUTANT_DIR "${CMAKE_CURRENT_BINARY_DIR}/pv_vsstore_mutants")
 set(KYTY_PV_HEADER_REL "graphics/host_gpu/renderer/perVertexVsStore.h")
 set(KYTY_PV_EMITTER_REL "graphics/shader/recompiler/backend/spirv/spirvEmitterPvStore.cpp")
+set(KYTY_PV_RUNTIME_REL "graphics/host_gpu/renderer/perVertexVsStoreRuntime.cpp")
 
 # kyty_pv_make_mutant(<name> <path relative to src> <from> <to>) writes <dir>/<name>/<path> and sets
 # KYTY_PV_MUTANT_ROOT to <dir>/<name>. `from` has to occur exactly once.
@@ -161,3 +162,11 @@ add_kyty_full_emulator_test(shader_cfg_pv_vsstore_mutant_capability_geometry_tes
 	"${KYTY_SOURCE_DIR}/${KYTY_PV_EMITTER_REL}" "${KYTY_PV_MUTANT_DIR}/capability_geometry/${KYTY_PV_EMITTER_REL}")
 add_kyty_full_emulator_test(shader_cfg_pv_vsstore_mutant_location31_exit_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp"
 	"${KYTY_SOURCE_DIR}/${KYTY_PV_EMITTER_REL}" "${KYTY_PV_MUTANT_DIR}/location31_exit/${KYTY_PV_EMITTER_REL}")
+
+# Runtime mutant: RememberPvVsStoreShader calls EmitProgram with four arguments, so the pv_store pointer lands on the
+# maintenance8 flag and the stored module is the plain one.
+kyty_pv_make_mutant(args4 "${KYTY_PV_RUNTIME_REL}"
+	"push_data_start_dword,\n\t                                                  options.maintenance8_enabled, false, &info);"
+	"push_data_start_dword, &info);")
+add_kyty_full_emulator_test(shader_cfg_pv_vsstore_mutant_args4_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp"
+	"${KYTY_SOURCE_DIR}/${KYTY_PV_RUNTIME_REL}" "${KYTY_PV_MUTANT_DIR}/args4/${KYTY_PV_RUNTIME_REL}")

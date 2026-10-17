@@ -35,6 +35,10 @@ void RememberPvVsStoreShader(const ShaderProgram& program, ShaderRecompiler::Com
                              const ShaderRecompiler::CompileOptions& options,
                              uint32_t                                push_data_start_dword);
 
+// The stored VS-store variant of a compiled program (nullptr: nothing was emitted, or the variant did not validate) and
+// the host locations it stores / reads. For the tests.
+const std::vector<uint32_t>* PvVsStoreStoredWords(uint64_t program_id, uint32_t* location_mask = nullptr);
+
 struct PvVsStorePrograms {
 	PvVsStoreInterfaceVerdict       verdict     = PvVsStoreInterfaceVerdict::NoPerVertex;
 	uint32_t                        stride_vec4 = 0;

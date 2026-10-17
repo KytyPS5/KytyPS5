@@ -643,6 +643,8 @@ if(BUILD_TESTING)
 		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_stride_dword_tests> 2>&1 | grep -q 'not read from push dword 7'")
 		add_test(NAME shader_cfg_pv_vsstore_mutant_capability_geometry
 		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_capability_geometry_tests> 2>&1 | grep -q 'PS needs the Geometry capability'")
+		add_test(NAME shader_cfg_pv_vsstore_mutant_args4
+		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_args4_tests> 2>&1 | grep -q 'pv_store info did not reach the emitter'")
 		add_test(NAME shader_cfg_pv_vsstore_mutant_location31_exit
 		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_location31_exit_tests> 2>&1 | grep -q 'spirvEmitterPvStore.cpp'")
 	endif()
@@ -737,6 +739,7 @@ if(BUILD_TESTING)
 		shader_cfg_pv_vsstore_mutant_stride_dword_tests
 		shader_cfg_pv_vsstore_mutant_capability_geometry_tests
 		shader_cfg_pv_vsstore_mutant_location31_exit_tests
+		shader_cfg_pv_vsstore_mutant_args4_tests
 		per_vertex_vsstore_tests
 		per_vertex_vsstore_test_mutant_no_clamp_tests
 		per_vertex_vsstore_test_mutant_no_tail_check_tests

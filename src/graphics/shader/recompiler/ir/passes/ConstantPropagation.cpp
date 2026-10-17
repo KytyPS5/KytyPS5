@@ -51,19 +51,24 @@ public:
 	}
 
 	void QueueUsers(const std::vector<Use>& users) {
-		++generation;
-		affected.clear();
 		for (const auto& use: users) affected.push_back(use.user);
-		// Pattern folds inspect nested operands even when intermediate operations
-		// stay dynamic. Visit consumers once per change, including cyclic Phi edges.
+	}
+
+	// Pattern folds inspect nested operands even when intermediate operations stay dynamic.
+	// Visit the consumers of a whole round once, including cyclic Phi edges: a walk per
+	// change would revisit the same users after every fold.
+	void QueueAffected() {
+		++generation;
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
 			const auto found = locations.find(inst);
 			if (found == locations.end() || found->second.visited == generation) continue;
 			found->second.visited = generation;
+			++revisited_users;
 			Queue(inst);
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
+		affected.clear();
 	}
 
 	Block::iterator Prepend(Block& block, Block::iterator before, ValueOpcode opcode,
@@ -76,6 +81,8 @@ public:
 	std::unordered_map<Inst*, Location> locations;
 	std::vector<Inst*> pending;
 	std::unordered_set<Inst*> lowered_ancillary;
+
+	uint64_t revisited_users = 0;
 
 private:
 	std::vector<Inst*> affected;
@@ -969,15 +976,21 @@ private:
 
 } // namespace
 
-void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
+ConstantPropagationStats ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	FoldWorklist worklist;
 	LaneMaskProjection mask_projection(worklist);
 	for (auto* block: blocks)
 		for (auto inst = block->begin(); inst != block->end(); ++inst) worklist.Register(inst);
 	std::vector<Use> users;
 	std::vector<Value> operands;
+
 	const auto drain = [&] {
-		for (size_t i = 0; i < worklist.pending.size(); ++i) {
+		for (size_t i = 0, round_end = 0;; ++i) {
+			if (i == round_end) {
+				worklist.QueueAffected();
+				round_end = worklist.pending.size();
+				if (i == round_end) break;
+			}
 			auto* inst = worklist.pending[i];
 			auto& location = worklist.locations.at(inst);
 			location.queued = false;
@@ -986,7 +999,8 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 			const auto where = location.instruction;
 			users.assign(inst->Uses().begin(), inst->Uses().end());
 			operands.clear();
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+				operands.push_back(inst->Arg(arg));
 			mask_projection.Fold(*inst, wave_size);
 			FoldInstruction(*inst->Parent(), where, worklist);
 			bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
@@ -1023,6 +1037,7 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		}
 		drain();
 	} while (normalized);
+	return {worklist.revisited_users};
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -12894,6 +12894,37 @@ void TestLateConstantPropagation() {
         "an ungrounded Phi cycle acquired a constant");
 }
 
+void TestConstantPropagationSharedUsers() {
+  using namespace ShaderRecompiler::IR;
+  // Every identity fold below changes one link of a long dynamic chain, so all later links
+  // are its transitive users. Walking them once per fold is quadratic in the chain length.
+  constexpr uint32_t length = 1u << 12;
+  Block block;
+  IREmitter ir(&block);
+  const auto input = ir.GetUserData(static_cast<ScalarReg>(0));
+  std::vector<Value> sources;
+  std::vector<Value> links;
+  U32 chain = input;
+  for (uint32_t index = 0; index < length; ++index) {
+    // A private source per link keeps every use list short.
+    sources.push_back(ir.Emit(ValueOpcode::BitwiseNot32, {input}));
+    const auto link = ir.IAdd(U32(sources.back()), U32(Value(0u)));
+    chain = ir.BitwiseXor(chain, link);
+    links.push_back(chain);
+  }
+  const auto stats = ConstantPropagationPass({&block});
+  bool folded = true;
+  for (size_t index = 0; index < links.size(); ++index) {
+    const auto *link = links[index].Resolve().TryInstruction();
+    const auto previous = index == 0 ? Value(input) : links[index - 1].Resolve();
+    folded &= link != nullptr && link->GetOpcode() == ValueOpcode::BitwiseXor32 &&
+              link->Arg(0).Resolve() == previous && link->Arg(1).Resolve() == sources[index];
+  }
+  Check(folded, "identity folds did not reach every link of a shared user chain");
+  Check(stats.revisited_users <= 2ull * length,
+        "constant propagation revisited shared users once per fold");
+}
+
 void TestMaskedShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
   for (const uint32_t count : {0u, 1u, 8u, 31u, 32u, 33u, 40u, 63u, 64u, UINT32_MAX}) {
@@ -16596,6 +16627,7 @@ int main() {
   TestValuePhiValidation();
   TestLaneMaskProjection();
   TestLateConstantPropagation();
+  TestConstantPropagationSharedUsers();
   TestMaskedShiftConstantPropagation();
   TestU64ShiftConstantPropagation();
   TestU64RegisterPairRoundTrip();

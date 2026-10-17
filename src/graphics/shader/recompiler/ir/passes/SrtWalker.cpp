@@ -118,6 +118,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::SLessThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
 		case ValueOpcode::INotEqual64:
@@ -1190,6 +1191,10 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 		case ValueOpcode::UGreaterThan32:
 			c.cmp(c.eax, c.ecx);
 			Set(&Xbyak::CodeGenerator::seta);
+			break;
+		case ValueOpcode::SLessThan32:
+			c.cmp(c.eax, c.ecx);
+			Set(&Xbyak::CodeGenerator::setl);
 			break;
 		case ValueOpcode::SGreaterThanEqual32:
 			c.cmp(c.eax, c.ecx);

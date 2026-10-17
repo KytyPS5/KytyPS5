@@ -9619,6 +9619,117 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckOversizedImageReadback() {
+    constexpr const char *name = "OversizedImageReadback";
+    constexpr uintptr_t base = 0x0000000220000000ull;
+    constexpr uint64_t allocation_size = 80ull << 20;
+    constexpr uint64_t alignment = 0x200000;
+    constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
+    constexpr auto tile = Prospero::TileMode::kRenderTarget;
+    constexpr uint32_t width = 4096;
+    constexpr uint32_t height = 2304;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, alignment, 0, &direct_offset) == 0,
+            "oversized image direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "oversized image fixed mapping failed");
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      auto &resources = context;
+      resources.MapMemory(base, allocation_size);
+      const uint32_t pitch = TileGetTexturePitch(format, width, tile);
+      TileSizeAlign total{};
+      TileSizeOffset mip{};
+      TilePaddedSize padded{};
+      TileGetTextureSize(format, width, height, 1, tile, &total, &mip, &padded);
+      // Larger than the 64 MiB reusable download buffer.
+      Require(name, "layout",
+              total.size > (64ull << 20) && total.size <= allocation_size,
+              "oversized image layout does not exceed the download buffer");
+      std::memset(mapped, 0x5a, total.size);
+
+      ImageDesc desc{};
+      desc.type = BindingType::RenderTarget;
+      desc.info.data = {base, total.size};
+      desc.info.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+      desc.info.guest_format = format;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = {width, height, 1};
+      desc.info.resources = {1, 1};
+      desc.info.pitch = pitch;
+      desc.info.bytes_per_block = 8;
+      desc.info.samples = 1;
+      desc.info.tile_mode = tile;
+      desc.info.UpdateSize();
+      desc.view_info.format = desc.info.pixel_format;
+      desc.view_info.type = vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+
+      auto &cache = resources.GetTextureCache();
+      const auto id = cache.FindImage(desc);
+      (void)cache.FindRenderTarget(id, desc);
+      auto &image = cache.GetImage(id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                    vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      vk::ClearColorValue clear{};
+      clear.float32[0] = 1.0f;
+      clear.float32[1] = 2.0f;
+      clear.float32[2] = 3.0f;
+      clear.float32[3] = 4.0f;
+      const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0,
+                                            1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(
+          image.backing.image, vk::ImageLayout::eTransferDstOptimal, clear,
+          range);
+      cache.MarkGpuWritten(id);
+      Require(name, "guest readback queue",
+              TextureCacheTestAccess::TryDownload(cache, id),
+              "oversized image guest readback was rejected");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+
+      std::vector<uint64_t> backing(total.size / sizeof(uint64_t));
+      Require(name, "guest backing",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  base, backing.data(), backing.size() * sizeof(uint64_t)),
+              "oversized image guest backing is unreadable");
+      constexpr uint64_t texel = 0x4400420040003c00ull; // 1.0h, 2.0h, 3.0h, 4.0h
+      Require(name, "guest contents",
+              static_cast<uint64_t>(std::count(backing.begin(), backing.end(),
+                                               texel)) >=
+                  uint64_t{width} * height,
+              "oversized image readback did not reach guest memory");
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "oversized image fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "oversized image direct-memory release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBgra16Readback() {
     constexpr const char *name = "Bgra16Readback";
     constexpr uintptr_t base = 0x0000000204000000ull;
@@ -48148,6 +48259,7 @@ int main(int argc, char **argv) {
     vulkan.CheckPackedTextureComponents();
     CheckSigned16ImageStore(vulkan);
     vulkan.CheckBgra16Readback();
+    vulkan.CheckOversizedImageReadback();
     RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
     RunCase(&vulkan, ImageLoadPackedUnorm<false, false>());
     RunCase(&vulkan, ImageLoadPackedUnorm<false, true>());
@@ -48690,6 +48802,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    vulkan.CheckOversizedImageReadback();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
@@ -49007,6 +49120,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckBgra16Readback();
+    vulkan.CheckOversizedImageReadback();
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);

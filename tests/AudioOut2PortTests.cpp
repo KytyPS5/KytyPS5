@@ -361,7 +361,8 @@ void TestContextDestroyCancelsPendingCreate() {
 	Check(LiveDeviceCount() == 0, "cancelled port create leaked a device");
 }
 
-void TestSynchronousDevicePushBypassesModelledQueue() {
+// A sync push waits for the modelled queue: Wwise renders only into a free slot.
+void TestSynchronousDevicePushWaitsForModelledQueue() {
 	const auto context = CreateContext(1);
 	const auto param   = MakeParam();
 	AudioOut2::AudioOut2PortHandle port = 0;
@@ -374,10 +375,10 @@ void TestSynchronousDevicePushBypassesModelledQueue() {
 
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "first sync push failed");
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK,
-	      "device-paced sync push was blocked by modelled queue");
+	      "sync push did not complete once the modelled queue drained");
 	const auto calls = OutputCalls();
 	Check(calls.size() == 2, "sync pushes did not reach the device backend");
-	Check(calls[0] && calls[1], "sync pushes lost their blocking mode");
+	Check(!calls[0] && !calls[1], "sync pushes were paced by the device as well as the queue");
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
@@ -401,7 +402,7 @@ void TestFloat12ChannelPortOutputsPcm() {
 	ResetOutputCalls();
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "12-channel PCM push failed");
 	const auto calls = OutputCalls();
-	Check(calls.size() == 1 && calls[0], "12-channel PCM did not reach the device backend");
+	Check(calls.size() == 1, "12-channel PCM did not reach the device backend");
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	Check(LiveDeviceCount() == 0, "12-channel port leaked its audio device");
@@ -459,12 +460,16 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+// Wwise renders into the queue only after a sync push returns with a free slot.
+void CheckSynchronousPushLeavesRoom(uint16_t port_type) {
 	constexpr uint64_t grain_micros = (512u * 1000000u) / 48000u;
 
 	const auto context = CreateContext(1);
 	auto       param   = MakeParam();
+	param.port_type    = port_type;
 	AudioOut2::AudioOut2PortHandle port = 0;
 	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "port create failed");
 	float pcm[512 * 2] {};
 	SetPcm(port, pcm);
 	ResetOutputCalls();
@@ -483,15 +488,20 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 				(void)Libs::LibKernel::KernelGetProcessTime();
 			}
 		}
+		Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "sync push failed");
 		if (i == 1) {
 			first_return = Libs::LibKernel::KernelGetProcessTime();
 		}
 	}
 	const auto end = Libs::LibKernel::KernelGetProcessTime();
 
+	Check(end - start >= 3 * grain_micros, "sync pushes were not paced by the modelled queue");
 	Check(end - first_return < grain_micros + 5000, "refill time delayed the output clock");
 	const auto calls = OutputCalls();
+	Check(calls.size() == 3, "sync pushes did not reach the backend");
 	Check(std::none_of(calls.begin(), calls.end(), [](bool blocking) { return blocking; }),
+	      "a sync push was paced twice");
+	Check(g_last_cushion, "sync push did not ask the backend for a jitter cushion");
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
@@ -1007,10 +1017,12 @@ int main() {
 	TestFullTableRecovers();
 	TestConcurrentCreates();
 	TestContextDestroyCancelsPendingCreate();
-	TestSynchronousDevicePushBypassesModelledQueue();
+	TestSynchronousDevicePushWaitsForModelledQueue();
 	TestFloat12ChannelPortOutputsPcm();
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
+	CheckSynchronousPushLeavesRoom(6);
+	CheckSynchronousPushLeavesRoom(0);
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestAdvancedGrainsPushInOrder();
 	TestPushWithoutAdvanceIsSilent();

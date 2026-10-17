@@ -443,7 +443,6 @@ static size_t audioout2_pcm_size(const AudioOut2PortStateEntry& state) {
 	       audioout2_data_format_channels(state.data_format) * bytes_per_sample;
 }
 
-	for (const auto& state: g_audioout2_ports) {
 using AudioOut2StereoGains = std::array<float, 2>;
 
 using AudioOut2AmbisonicsTable = std::array<AudioOut2StereoGains, 36>;
@@ -491,7 +490,6 @@ static AudioOut2AmbisonicsTable audioout2_build_ambisonics_table() {
 			}
 		}
 	}
-	return false;
 	double front = flat[0][0];
 	for (int l = 1; l <= order; l++) {
 		front += flat[l * l + 2 * l][0] * sn3d[l];
@@ -632,7 +630,9 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2S
 	}
 	g_audioout2_state_mutex.Unlock();
 	if (!params.empty()) {
+		// The modelled queue paces every push, so the device only needs a jitter cushion.
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
+		                                     false, true);
 	}
 }
 
@@ -819,18 +819,19 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 	}
 
 	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
 		// Every push, synchronous or not, takes a slot of the modelled queue.
 		g_audioout2_state_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 			audioout2_update_context_locked(state);
-			if (state->queued < state->queue_depth || use_device_clock) {
+			if (state->queued < state->queue_depth) {
 				audioout2_accept_grain_locked(state);
 				auto& submission = audioout2_submission(*state);
 				g_audioout2_state_mutex.Unlock();
+				audioout2_queue_context_audio(ctx, submission);
+				// Wwise renders only into a free slot after a synchronous push returns.
+				if (blocking != 0) {
 					audioout2_wait_for_free_slot(ctx);
+				}
 				return OK;
 			}
 			sleep_micros = audioout2_micros_to_next_tick_locked(*state);

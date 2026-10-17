@@ -1111,7 +1111,27 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
 		                    block.sources.end());
 	}
-	for (auto& block: blocks) block.condition = predicate(block.condition);
+	// A condition whose successors reach no resources cannot change the active set; following
+	// both edges is exact for it, and it must not capture scalar reads (e.g. assert traps).
+	std::vector<uint8_t> reaches_resources(blocks.size());
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (uint32_t i = 0; i < blocks.size(); i++) {
+			if (reaches_resources[i]) continue;
+			const auto& block = blocks[i];
+			if (!block.sources.empty() || !block.srt_reads.empty() ||
+			    std::ranges::any_of(block.successors,
+			                        [&](uint32_t successor) { return reaches_resources[successor] != 0; })) {
+				reaches_resources[i] = 1;
+				changed              = true;
+			}
+		}
+	}
+	for (auto& block: blocks) {
+		const bool relevant = std::ranges::any_of(
+		    block.successors, [&](uint32_t successor) { return reaches_resources[successor] != 0; });
+		block.condition = relevant ? predicate(block.condition) : Value {};
+	}
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
 		return {};

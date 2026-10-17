@@ -32,6 +32,26 @@ AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   return *result;
 }
 
+// Control conditions are retained only when a successor reaches a resource.
+void AddBufferRead(Libs::Graphics::ShaderRecompiler::IR::Program &program,
+                   Libs::Graphics::ShaderRecompiler::IR::Block &block) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  DescriptorSource source;
+  source.dwords = {Value(0u), Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  const auto source_index = static_cast<uint32_t>(program.descriptor_sources.size());
+  program.descriptor_sources.push_back(source);
+  const auto resource = static_cast<uint32_t>(program.info.buffers.size());
+  program.info.buffers.push_back({.source = source_index, .read = true});
+  const auto memory = static_cast<uint32_t>(program.memory_info.size());
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = resource});
+  auto &buffer = block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  block.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {Value(&buffer), Value(0u), Value(0u), Value(0u), Value(true)})
+      .SetFlags(MemoryFlags{.index = memory});
+}
+
 Libs::Graphics::ShaderRecompiler::IR::Program SrtProgram(uint64_t address) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -631,6 +651,47 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   }
 }
 
+void TestResourceFreeBranchSkipsMemoryPredicate() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 1;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(0u), Value(0u), Value(false)});
+  read.SetFlags(MemoryFlags{.index = 0});
+  DescriptorSource source;
+  source.dwords = {Value(0x2000u), Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true, .atomic = true});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  // Status word update followed by a memory-predicated trap: neither edge uses resources.
+  auto &output = block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  block.AppendNewInst(ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 1});
+  auto &condition = block.AppendNewInst(ValueOpcode::IEqual32, {Value(&read), Value(0u)});
+  AddValueBlock(program);
+  AddValueBlock(program);
+  program.blocks[0]->condition = Value(&condition);
+  program.blocks[0]->terminator.kind = TerminatorKind::ConditionalBranch;
+  program.blocks[0]->terminator.true_block = program.blocks[1];
+  program.blocks[0]->terminator.false_block = program.blocks[2];
+  program.blocks[1]->terminator.kind = TerminatorKind::Return;
+  program.blocks[2]->terminator.kind = TerminatorKind::Return;
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.control_flow.empty() && !plan.capture_specialization_reads,
+        "resource-free branch captured its memory predicate");
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -666,6 +727,7 @@ void TestSharedControlPredicates() {
     condition = emit(ValueOpcode::LogicalNot, {condition});
     condition = emit(ValueOpcode::ConditionRef, {condition});
     for (uint32_t i = 0; i < 3; ++i) AddValueBlock(program);
+    AddBufferRead(program, *program.blocks[3]);
     for (uint32_t i = 0; i < 2; ++i) {
       program.blocks[i]->condition = condition;
       program.blocks[i]->terminator.kind = TerminatorKind::ConditionalBranch;
@@ -1050,6 +1112,7 @@ void TestCyclicControlPredicatesRemainUnknown() {
   branch(entry, u, left, right);
   branch(left, a, right, exit);
   branch(right, b, left, exit);
+  AddBufferRead(program, exit);
   auto plan = ExtractResourcePlan(program);
   SrtWalker walker(plan, {});
   uint32_t value = 99;
@@ -1362,6 +1425,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   for (const bool memory_condition : {false, true})
     TestWrittenDescriptorPredicateReads(memory_condition);
+  TestResourceFreeBranchSkipsMemoryPredicate();
   TestFailedMaterializationRejectsStage();
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();

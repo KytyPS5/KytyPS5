@@ -43677,6 +43677,24 @@ void CheckShaderCacheRecordPadding() {
                 decoded.async_compute && key(decoded) == key(async),
             "the queue of an async compute program was lost in its record");
   }
+  {
+    // Every pixel field of the program key survives the record.
+    ShaderPixelInputInfo pixel{};
+    pixel.ps_front_face_all_bits = true;
+    pixel.object_primitive_id = true;
+    pixel.target_packed_unorm_mask = 0x5;
+    pixel.target_round_mode = 0x4;
+    ShaderPixelInputInfo decoded{};
+    const auto key = [](const ShaderPixelInputInfo &info) {
+      std::vector<u32> words;
+      BuildStageStaticKey(info, words);
+      return words;
+    };
+    Require(name, "pixel key",
+            DecodeShaderCacheInput(EncodeShaderCacheInput(pixel), decoded) &&
+                key(decoded) == key(pixel),
+            "a pixel input field of the program key was lost in its record");
+  }
   ShaderComputeInputInfo decoded{};
   auto encoded = recipes[0]->input;
   Require(name, "decode",

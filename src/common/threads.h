@@ -49,6 +49,23 @@ private:
 	std::unique_ptr<ThreadPrivate> m_thread;
 };
 
+struct ThreadWithStackPrivate;
+
+// A thread with the same stack reserve on every host. std::thread gets the host default: 1 MiB
+// on Windows, 512 KiB for secondary threads on macOS, usually 8 MiB on Linux.
+class ThreadWithStack {
+public:
+	ThreadWithStack(thread_func_t func, void* arg, size_t stack_size);
+	~ThreadWithStack();
+
+	void Join();
+
+	KYTY_CLASS_NO_COPY(ThreadWithStack);
+
+private:
+	std::unique_ptr<ThreadWithStackPrivate> m_thread;
+};
+
 class Mutex {
 public:
 	Mutex();

@@ -704,7 +704,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     base_level, last_level, max_mip, width, height, depth,
 			     static_cast<uint32_t>(tile));
 		}
-	} else {
+	} else if (!in_place) {
 		desc.info.UpdateSize();
 	}
 	const auto alignment = desc.info.DataAlignment();

@@ -390,6 +390,16 @@ public:
 		}
 		ForwardPrivateLds();
 		FoldBoundedLoopSelectors();
+		if (std::ranges::any_of(m_program.blocks, [](const Block* block) {
+			    return std::ranges::any_of(*block, [](const Inst& inst) {
+				    return inst.GetOpcode() == ValueOpcode::ScalarCacheInvalidate;
+			    });
+		    })) {
+			for (auto& memory: m_program.memory_info) {
+				if (memory.kind == ResourceKind::ScalarAddress || memory.kind == ResourceKind::ScalarBuffer)
+					memory.coherent = true;
+			}
+		}
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectDescriptors();
@@ -860,6 +870,7 @@ private:
 		if (memory == nullptr) return;
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
+		if (memory->coherent) return;
 		m_scalar_reads.push_back(inst);
 	}
 

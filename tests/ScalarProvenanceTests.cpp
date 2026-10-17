@@ -149,6 +149,30 @@ void TestImmediateFlatteningAndGvn() {
         "flattened SRT did not evaluate its canonical read once");
 }
 
+void TestCoherentScalarReadsRemainTyped() {
+  for (const auto kind : {ResourceKind::ScalarAddress, ResourceKind::ScalarBuffer}) {
+    Fixture fixture;
+    const auto memory = fixture.AddMemory(kind);
+    const auto handle = kind == ResourceKind::ScalarAddress
+        ? Address(fixture, Value(0x1000u), Value(0u))
+        : fixture.Emit(ValueOpcode::GetBufferResource,
+                       {Value(0x1000u), Value(4u << 16u), Value(16u), Value(0x14004u)});
+    fixture.Emit(ValueOpcode::ScalarCacheInvalidate);
+    const auto read = kind == ResourceKind::ScalarAddress
+        ? RawRead(fixture, handle, Value(0u), memory)
+        : fixture.EmitMemory(ValueOpcode::ReadConstBuffer, {handle, Value(0u)}, memory);
+    LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+    fixture.Plan();
+    Check(fixture.program.srt_reads.empty() &&
+              !fixture.program.memory_info[memory].planning_only &&
+              fixture.program.memory_info[memory].coherent &&
+              read.ResolveInstruction()->GetOpcode() ==
+                  (kind == ResourceKind::ScalarAddress ? ValueOpcode::LoadAddressU32
+                                                       : ValueOpcode::ReadConstBuffer),
+          "cache-invalidated scalar read was replaced by a flattened SRT value");
+  }
+}
+
 void TestRawScalarComponentAlignment() {
   Fixture fixture;
   const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 2);
@@ -869,6 +893,7 @@ void DbgExit(int) { std::abort(); }
 int main() {
   try {
     TestImmediateFlatteningAndGvn();
+    TestCoherentScalarReadsRemainTyped();
     TestRawScalarComponentAlignment();
     TestScalarMemoryDomainMismatchFails();
     TestDynamicReadRemainsTyped();

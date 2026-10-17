@@ -704,6 +704,11 @@ void EmitDataCacheInvalidate(EmitterState& state) {
 	                          spv::MemorySemanticsImageMemoryMask));
 }
 
+void EmitScalarCacheInvalidate(EmitterState& state) {
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+	    ConstantU32(state, spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask));
+}
+
 void EmitBarrier(EmitterState& state) {
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
 	if (!tessellation && ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {

@@ -35915,7 +35915,8 @@ TestCase FlatLoadDlcCaptured(u32 wave_size) {
   test.bda_mappings = {{0x1f00000000ull, 32}};
   test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::FLAT_LOAD_DWORDX2,
                   O::BUFFER_STORE_DWORD, O::S_WAITCNT_VSCNT, O::S_ENDPGM};
-  test.required_spirv = {"OpDecorate %buffers Coherent", " 0 Coherent", "Volatile|Aligned 4"};
+  test.required_spirv = {"OpDecorate %buffers Coherent", "Volatile|Aligned 4"};
+  test.forbidden_spirv = {" 0 Coherent"};
   test.decoded_counts = {{"dlc=1", 2}};
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
@@ -36190,6 +36191,8 @@ TestCase ScalarLoadAlignsDynamicBase() {
   AppendSMovLiteral(&code, 9, 0);
   code.push_back(EncodeSop2(0x00, 8, 8, 4)); // group ID supplies each base low-bit pattern
   AppendSMovLiteral(&code, 10, 7);
+  code.push_back(EncodeSmem0(0x20, 0)); // S_DCACHE_INV.
+  code.push_back(EncodeSmem1(0, 125));
   code.push_back(EncodeSmem0(0x01, 12, 4));
   code.push_back(EncodeSmem1(7, 10)); // all three address components align independently
   code.push_back(EncodeVop1(0x01, 0, 12));
@@ -36213,10 +36216,12 @@ TestCase ScalarLoadAlignsDynamicBase() {
     test.expected[group * 2 + 1] = test.initial[19];
   }
   test.bda_mappings = {{GuestBase, 64}};
-  test.required_spirv = {"get_bda_pointer"};
-  test.forbidden_spirv = {"flattened_srt"};
+  test.required_spirv = {"get_bda_pointer", "Volatile|Aligned 4",
+                          "OpMemoryBarrier %uint_1 %uint_66"};
+  test.forbidden_spirv = {"flattened_srt", " 0 Coherent"};
   test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_LOAD_DWORDX2, O::V_MOV_B32,
-                  O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::S_DCACHE_INV, O::S_ENDPGM};
   test.compute_info.wave_size = 32;
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = 1;
@@ -36241,6 +36246,8 @@ TestCase ScalarBufferFromLoopReadlane(u32 wave_size) {
   AppendSMovLiteral(&code, 28, 0);
   const auto loop = static_cast<u32>(code.size());
   code.push_back(EncodeSop1(0x04, 126, InlineU32(0))); // SMEM ignores EXEC.
+  code.push_back(EncodeSmem0(0x20, 0)); // S_DCACHE_INV.
+  code.push_back(EncodeSmem1(0, 125));
   code.push_back(EncodeSmem0(0x03, 16, 4)); // descriptor and runtime soffset
   code.push_back(EncodeSmem1(3, 125)); // null keeps this a flattening candidate.
   code.push_back(EncodeSmem0(0x0a, 32, 8));
@@ -36287,13 +36294,14 @@ TestCase ScalarBufferFromLoopReadlane(u32 wave_size) {
                    0x44444444u, 0x55555555u, 0x66666666u, 0x77777777u,
                    0, 0, 0, 0};
   test.bda_mappings = {{GuestBase, 512}};
-  test.required_spirv = {"get_bda_pointer", "OpLoopMerge", "OpGroupNonUniformShuffle"};
-  test.forbidden_spirv = {"flattened_srt"};
+  test.required_spirv = {"get_bda_pointer", "OpLoopMerge", "OpGroupNonUniformShuffle",
+                          "Volatile|Aligned 4", "OpMemoryBarrier %uint_1 %uint_66"};
+  test.forbidden_spirv = {"flattened_srt", " 0 Coherent"};
   test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_MOV_B32,
                   O::S_MOV_B64, O::S_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX4,
                   O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::V_ADD_NC_U32,
                   O::S_ADD_U32, O::V_READLANE_B32, O::S_CMP_LT_U32,
-                  O::S_CBRANCH_SCC1, O::S_ENDPGM};
+                  O::S_CBRANCH_SCC1, O::S_DCACHE_INV, O::S_ENDPGM};
   test.compute_info.wave_size = wave_size;
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
@@ -38153,11 +38161,12 @@ TestCase CoherentBufferPairContention(u32 wave_size) {
 }
 
 TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
-                                  bool store_completion = false) {
+                                  bool store_completion = false, bool scalar_cache = false) {
   using O = ShaderOpcode;
   constexpr u32 groups = 31;
   TestCase test;
-  test.name = store_completion ? (wave_size == 64 ? "Wave64StoreCompletionPublication"
+  test.name = scalar_cache ? (wave_size == 64 ? "ScalarCachePublicationWave64" : "ScalarCachePublicationWave32")
+             : store_completion ? (wave_size == 64 ? "Wave64StoreCompletionPublication"
                                                  : "Wave32StoreCompletionPublication")
              : dlc_only ? "BufferWorkgroupPublicationDlc"
              : wave_size == 64 ? "BufferWorkgroupPublicationWave64"
@@ -38185,8 +38194,18 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
     AppendVMovU32(&code, 3, 0);
     AppendBufferStoreOpcode(&code, 0x32, 3, 4, true);
   }
-  code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
-  code.push_back(EncodeMubuf1(2, 12, 20));
+  if (scalar_cache) {
+    code.push_back(EncodeSmem0(0x20, 0));
+    code.push_back(EncodeSmem1(0, 125));
+    code.push_back(EncodeVop1(0x02, 24, Vgpr(20)));
+    code.push_back(EncodeSmem0(0x08, 23, 24));
+    code.push_back(EncodeSmem1(0, 24));
+    code.push_back(EncodeSopp(0x0c, 0));
+    code.push_back(EncodeVop1(0x01, 2, 23));
+  } else {
+    code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
+    code.push_back(EncodeMubuf1(2, 12, 20));
+  }
   code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
   code.push_back(EncodeVop1(0x02, 23, Vgpr(store_completion ? 3 : 2)));
   code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
@@ -38237,6 +38256,13 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                   O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  if (scalar_cache) {
+    test.opcodes.push_back(O::S_DCACHE_INV);
+    test.opcodes.push_back(O::S_BUFFER_LOAD_DWORD);
+    test.required_spirv.push_back("OpMemoryBarrier %uint_1 %uint_66");
+    test.forbidden_spirv.push_back("OpControlBarrier");
+    std::erase(test.opcodes, O::BUFFER_LOAD_DWORD);
+  }
   if (store_completion) {
     test.opcodes.push_back(O::S_WAITCNT_VSCNT);
     test.opcodes.push_back(O::S_LSHL_B64);
@@ -45043,6 +45069,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferWorkgroupPublication(32, true));
   cases.push_back(BufferWorkgroupPublication(32, false, true));
   cases.push_back(BufferWorkgroupPublication(64, false, true));
+  cases.push_back(BufferWorkgroupPublication(32, false, false, true));
+  cases.push_back(BufferWorkgroupPublication(64, false, false, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
@@ -52319,7 +52347,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-publication-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarLoadAlignsDynamicBase());
     for (const u32 wave : {32u, 64u}) {
+      RunCase(&vulkan, ScalarBufferFromLoopReadlane(wave));
+      RunCase(&vulkan, FlatLoadDlcCaptured(wave));
       for (const u32 prefix : {0u, 4u})
         RunCase(&vulkan, CoherentBufferLoadDwordx2Bounds(wave, prefix));
       RunCase(&vulkan, CoherentBufferPairContention(wave));
@@ -52330,6 +52361,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferWorkgroupPublication(32, true));
     RunCase(&vulkan, BufferWorkgroupPublication(32, false, true));
     RunCase(&vulkan, BufferWorkgroupPublication(64, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, false, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(64, false, false, true));
     RunCase(&vulkan, BufferAtomicVariants());
     return 0;
   }

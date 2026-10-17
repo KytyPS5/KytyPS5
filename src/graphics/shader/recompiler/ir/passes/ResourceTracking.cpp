@@ -2203,15 +2203,17 @@ private:
 				if (memory == nullptr || memory->offset != 0u ||
 				    !MatchTableOffset(count->Arg(1), row, count_offset, count_stride) ||
 				    count_offset != 0u || count_stride != 4u) return false;
-				if (selected_lane) {
-					const auto* row_lane = row.TryInstruction();
-					if (row_lane == nullptr || row_lane->GetOpcode() != ValueOpcode::ReadFirstLane ||
-					    !ValidateWaveUniformValue(m_program,
+				const auto* row_lane = row.TryInstruction();
+				if (selected_lane && row_lane != nullptr && row_lane->GetOpcode() == ValueOpcode::ReadFirstLane) {
+					if (!ValidateWaveUniformValue(m_program,
 					        EquivalentValue(m_program, row_lane->Arg(1), lane->Arg(1))
 					            ? row : row_lane->Arg(0))) return false;
 					// Equal EXEC masks select the same row; differing masks need a globally
 					// uniform row to keep count and key addresses correlated.
 					row = ActiveValue(row_lane->Arg(0), lane->Arg(1));
+				} else if (selected_lane && !ValidateWaveUniformValue(m_program, row)) {
+					// Read-lane elimination drops the first-lane read of an already uniform row.
+					return false;
 				}
 				const auto affine = AffineIndex<3>(element,
 				    [&](Value value) { return selected_lane ? ActiveValue(value, lane->Arg(1)) : value.Resolve(); },
@@ -2904,13 +2906,19 @@ private:
 					return false;
 				const auto executing = use.user->Arg(use.user->NumArgs() - 1u);
 				if (!Implies(executing, active)) return false;
-				const auto outer = EqualLocalKey(executing, read->Arg(1));
+				auto outer = EqualLocalKey(executing, read->Arg(1));
 				const auto* lane = outer.TryInstruction();
-				if (lane == nullptr || lane->GetOpcode() != ValueOpcode::ReadFirstLane ||
-				    !EquivalentValue(m_program, lane->Arg(0), read->Arg(1)) ||
-				    !EquivalentValue(m_program, lane->Arg(1), active) ||
-				    !AvailableBefore(*lane, handle) ||
-				    (!key.IsEmpty() && !EquivalentValue(m_program, key, outer))) return false;
+				if (lane == nullptr || lane->GetOpcode() != ValueOpcode::ReadFirstLane) {
+					// Read-lane elimination drops the first-lane read of an already uniform row.
+					outer = read->Arg(1).Resolve();
+					lane = outer.TryInstruction();
+					if (!ValidateWaveUniformValue(m_program, outer) ||
+					    (lane != nullptr && !AvailableBefore(*lane, handle)) ||
+					    (!key.IsEmpty() && !EquivalentValue(m_program, key, outer))) return false;
+				} else if (!EquivalentValue(m_program, lane->Arg(0), read->Arg(1)) ||
+				           !EquivalentValue(m_program, lane->Arg(1), active) ||
+				           !AvailableBefore(*lane, handle) ||
+				           (!key.IsEmpty() && !EquivalentValue(m_program, key, outer))) return false;
 				key = outer;
 			}
 			if (!SetExactTableMaximum(key, indirect, &handle) ||

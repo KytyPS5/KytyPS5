@@ -15050,6 +15050,59 @@ public:
                   ReadCachedTexel(name, context, binding.image_id) ==
                       std::vector<u32>{0x3c003c00u, 0x00003c00u},
               "an alias holding only guest bytes drained the GPU-written clear");
+      {
+        // Dead Space reuses transient memory: an image the GPU wrote earlier in the frame
+        // covers the metadata, and the metadata fill then supersedes those bytes.
+        constexpr uint64_t stale_address = dcc_address + 0x1000;
+        constexpr uint64_t stale_size = metadata_size - 0x1000 + 0x8000;
+        auto stale = MakeLinearDesc(stale_address, stale_size, vk::Format::eR8Unorm,
+                                    Prospero::BufferFormat::k8UNorm,
+                                    Prospero::ImageType::kColor2D,
+                                    {4096, static_cast<uint32_t>(stale_size / 4096), 1}, 1, 1, 1);
+        const auto stale_id = cache.FindImage(stale);
+        vk::ClearValue painted{};
+        painted.color.float32 = std::array{0.5f, 0.0f, 0.0f, 0.0f};
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), stale_id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                                           painted);
+        (void)buffers.ObtainBuffer(dcc_address, metadata_size, true);
+        buffers.FillBuffer(dcc_address, metadata_size, 0x40404040u, false);
+        Require(name, "stale alias still holds GPU bytes past the metadata",
+                cache.GetImage(stale_id).IsGpuModified() &&
+                    cache.GetImage(stale_id).SupersededSinceGpuWrite(dcc_address, metadata_size) &&
+                    !cache.GetImage(stale_id).SupersededSinceGpuWrite(dcc_address,
+                                                                      metadata_size + 0x1000),
+                "the metadata fill did not supersede exactly the alias bytes it replaced");
+        binding.image_id = cache.FindImage(binding.desc);
+        (void)cache.FindTexture(binding.image_id, binding.desc);
+        Require(name, "sampled clear beside a superseded GPU alias",
+                binding.image_id != stale_id &&
+                    buffers.IsRegionGpuModified(dcc_address, metadata_size) &&
+                    ReadCachedTexel(name, context, binding.image_id, {3839, 2159, 0}) ==
+                        std::vector<u32>{0, 0x3c000000u},
+                "an alias whose metadata bytes a buffer write replaced drained the clear");
+        Require(name, "superseded alias keeps its other texels",
+                cache.GetImage(stale_id).IsGpuModified(),
+                "the GPU decision released the alias's bytes past the metadata");
+        buffers.ReadMemory(dcc_address, metadata_size);
+        Require(name, "GPU decision beside an alias expands native metadata",
+                LibKernel::Memory::TryReadBacking(dcc_address, expanded_metadata.data(),
+                                                 expanded_metadata.size()) &&
+                    std::all_of(expanded_metadata.begin(), expanded_metadata.end(),
+                                [](uint8_t byte) { return byte == 0xff; }),
+                "the GPU decision beside an alias retained native clear keys");
+        // An alias the GPU writes after the metadata fill still holds the newest bytes.
+        (void)buffers.ObtainBuffer(dcc_address, metadata_size, true);
+        buffers.FillBuffer(dcc_address, metadata_size, 0x80808080u, false);
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), stale_id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                                           painted);
+        binding.image_id = cache.FindImage(binding.desc);
+        (void)cache.FindTexture(binding.image_id, binding.desc);
+        Require(name, "newer GPU alias keeps the CPU decision",
+                !buffers.IsRegionGpuModified(dcc_address, metadata_size),
+                "an alias written after the metadata fill was treated as stale");
+      }
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();

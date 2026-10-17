@@ -263,6 +263,8 @@ private:
 	void SyncLayoutAlias(ImageId id, const ImageIds& candidates);
 	void RefreshImage(ImageId id);
 	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
+	// InvalidateMemoryFromGPU for a caller holding m_lock; `keep` is left untouched.
+	void InvalidateMemoryFromGPULocked(uint64_t address, uint64_t size, ImageId keep);
 	// False when the target cannot take the GPU draw and the metadata must be read back.
 	[[nodiscard]] bool
 	     MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,

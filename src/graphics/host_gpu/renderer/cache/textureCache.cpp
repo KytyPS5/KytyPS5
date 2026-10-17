@@ -106,6 +106,15 @@ constexpr std::array<uint8_t, 1> ColorClearCmaskCodes {0x00};
 	return true;
 }
 
+// KYTY_NO_COLOR_CLEAR_STALE_ALIAS=1: any GPU-modified image over the metadata forces a readback.
+[[nodiscard]] bool ColorClearStaleAliasEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_COLOR_CLEAR_STALE_ALIAS");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
 // A draw may flush a subnormal or quiet a NaN payload that a transfer clear keeps.
 [[nodiscard]] bool ColorSurvivesDraw(const std::array<float, 4>& color) {
 	return std::ranges::all_of(color, [](float value) {
@@ -1877,8 +1886,9 @@ bool TextureCache::MaterializeColorClearOnGpu(
 	    })) {
 		return false;
 	}
-	const auto address = desc.info.metadata.range.address + slice_size * first;
-	const auto size    = slice_size * count;
+	const auto address       = desc.info.metadata.range.address + slice_size * first;
+	const auto size          = slice_size * count;
+	const bool stale_aliases = ColorClearStaleAliasEnabled();
 	{
 		std::scoped_lock lock {m_lock};
 		auto&            image = m_slot_images[id];
@@ -1898,6 +1908,11 @@ bool TextureCache::MaterializeColorClearOnGpu(
 		for (const auto other: FindImagesInRegion(address, size, false)) {
 			const auto& alias = m_slot_images[other];
 			if (!strict_aliases && (other == id || !alias.IsGpuModified())) {
+				continue;
+			}
+			// The decision reads the buffer; an alias whose bytes a buffer write replaced is stale.
+			if (!strict_aliases && stale_aliases &&
+			    (alias.IsBufferModified() || alias.SupersededSinceGpuWrite(address, size))) {
 				continue;
 			}
 			if (alias.Overlaps(address, size)) {
@@ -1929,6 +1944,10 @@ bool TextureCache::MaterializeColorClearOnGpu(
 	const auto native = command.Handle();
 	m_color_clear_helper.Classify(native, metadata->Handle(), offset, slice_size, count, candidates,
 	                              consume);
+	if (consume && stale_aliases) {
+		// The consumed keys are a GPU buffer write like any other: images over them are stale.
+		InvalidateMemoryFromGPULocked(address, size, id);
+	}
 	const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
 	                           std::max(image.info.extent.height >> view.base_level, 1u)};
 	for (uint32_t slice = 0; slice < count; slice++) {
@@ -3607,6 +3626,10 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	InvalidateMemoryFromGPULocked(address, size, {});
+}
+
+void TextureCache::InvalidateMemoryFromGPULocked(uint64_t address, uint64_t size, ImageId keep) {
 	{
 		constexpr uint64_t PageBits = 16;
 		const auto         epoch    = NextImageWriteEpoch();
@@ -3616,7 +3639,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (!image.Overlaps(address, size)) {
+		if (id == keep || !image.Overlaps(address, size)) {
 			continue;
 		}
 		if ((image.info.data.address != address || SupersedeAtBaseEnabled()) &&

@@ -2126,7 +2126,10 @@ void TestBoundedComputeImageLoop() {
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->selector.has_value() == material &&
               indirect->table_offset == 0x6b0u &&
-              (post_test || first == 0u ? indirect->key_count.Resolve() == count.Resolve()
+              (post_test && first != 0u
+                   ? indirect->selector_first == Value(first) &&
+                         indirect->key_count.Resolve() == Value(post_bound - first)
+               : post_test || first == 0u ? indirect->key_count.Resolve() == count.Resolve()
                            : indirect->selector_first == Value(first) && !indirect->signed_count),
           "bounded compute loop lost its runtime image count");
     if (first != 0u)
@@ -2193,9 +2196,11 @@ void TestBoundedComputeImageLoop() {
                "post-tested image loop accepted a nonpositive signed bound");
   CheckFatal([&] { post_test_plan(PostTest::Unsigned, 0u); }, "not a valid runtime value",
              "post-tested image loop accepted a zero unsigned bound");
-  for (const auto first : {1u, UINT32_MAX})
+  // A nonzero immediate start below the bound enumerates [first, bound).
+  post_test_plan(PostTest::Unsigned, 6u, 1u);
+  for (const auto first : {6u, UINT32_MAX})
     CheckFatal([&] { post_test_plan(PostTest::Unsigned, 6u, first); }, "not a valid runtime value",
-               "post-tested image loop accepted a nonzero or wrapping initial value");
+               "post-tested image loop accepted an initial value at or past its bound");
   CheckFatal([&] { post_test_plan(PostTest::Signed, 6u, 0u, Variant::WrongStep); },
              "not a valid runtime value", "post-tested image loop accepted a two-step induction");
 
@@ -2671,6 +2676,134 @@ void TestDescendingImageRange() {
               return read.first >= memory.fail_address;
             }),
         "a complete bitmap domain read redundant chunks or lost candidate keys");
+}
+
+void TestPostTestedImageLoop() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // GotG PS 0xb86c8dfc3f2471af: s_mov_b32 s48, 1; loop: s_load_dwordx8 from s48 << 5;
+  // two image_sample_l; s_add_i32 s48, s48, 1; s_cmp_lt_u32 s48, 16; s_cbranch_scc1 loop.
+  enum class Variant {
+    Unsigned, Signed, ZeroStart, StartAtLimit, NegativeSigned, WrongStep, FalseEdge, AnyLane
+  };
+  const auto make_plan = [](Variant variant, uint32_t start) {
+    Fixture fixture(ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *proxy = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(body);
+    body->AddBranch(latch);
+    latch->AddBranch(proxy);
+    proxy->AddBranch(header);
+    proxy->AddBranch(exit);
+    const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    for (auto *from : {entry, header, body, latch}) {
+      from->terminator = {.kind = CFG::TerminatorKind::Branch,
+                          .true_block = fixture.program.blocks[from->id + 1u]};
+    }
+    const bool false_edge = variant == Variant::FalseEdge;
+    proxy->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = false_edge ? exit : header,
+                         .false_block = false_edge ? header : exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto key = Value(&phi);
+    fixture.block = body;
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * sizeof(uint32_t);
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, offset, Value(0u), Value(true)},
+                                 fixture.AddMemory(memory, 0x588));
+    }
+    // The same descriptor is sampled twice.
+    for (const uint32_t pc : {0x604u, 0x610u}) {
+      const auto image = fixture.Image(words, pc);
+      const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+      MemoryInfo sample;
+      sample.kind = ResourceKind::Image;
+      sample.image_dimension = Decoder::ImageDimension::Dim2D;
+      fixture.Emit(ValueOpcode::ImageSampleRaw,
+                   {image, sampler, fixture.ImageAddress(), Value(true)},
+                   fixture.AddMemory(sample, pc));
+    }
+    const auto next = fixture.Emit(
+        ValueOpcode::IAdd32, {key, Value(variant == Variant::WrongStep ? 2u : 1u)}, 0, latch);
+    const auto in_range = fixture.Emit(
+        variant == Variant::Signed || variant == Variant::NegativeSigned
+            ? ValueOpcode::SLessThan32 : ValueOpcode::ULessThan32,
+        {next, Value(16u)}, 0, latch);
+    proxy->condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {in_range},
+        variant == Variant::AnyLane ? CFG::BranchCondition::VccNonZero
+                                    : CFG::BranchCondition::SccNonZero, latch);
+    phi.AddPhiOperand(entry, Value(start));
+    phi.AddPhiOperand(proxy, next);
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.images.size() == 1u,
+          "twice-sampled loop descriptor did not share one image binding");
+    for (const auto &image : fixture.program.info.images) {
+      const auto &indirect = fixture.program.descriptor_sources[image.source].indirect_descriptor;
+      Check(indirect && !indirect->selector.has_value() && indirect->table_offset == 0u &&
+                indirect->table_stride == 32u &&
+                // A zero start keeps main's zero-based post-tested count.
+                (start == 0u ? indirect->selector_first.IsEmpty()
+                             : indirect->selector_first.Resolve() == Value(start)) &&
+                indirect->key_count.Resolve() == Value(16u - start),
+            "post-tested image loop lost its start or its bound");
+    }
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  auto plan = make_plan(Variant::Unsigned, 1u);
+  make_plan(Variant::Signed, 1u);
+  make_plan(Variant::ZeroStart, 0u);
+  make_plan(Variant::Unsigned, 15u);
+  for (const auto &[variant, start] :
+       {std::pair{Variant::StartAtLimit, 16u}, std::pair{Variant::StartAtLimit, 17u},
+        std::pair{Variant::NegativeSigned, UINT32_MAX}, std::pair{Variant::WrongStep, 1u},
+        std::pair{Variant::FalseEdge, 1u}, std::pair{Variant::AnyLane, 1u}}) {
+    CheckFatal([&] { make_plan(variant, start); }, "not a valid runtime value",
+               "post-tested image loop accepted keys outside its iteration range");
+  }
+
+  LinearTestMemory memory;
+  constexpr uint32_t table = 0x1800u;
+  for (uint32_t key = 0; key < 16u; ++key) {
+    const auto word = (table - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 2> user_data{table, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            !specialization.images.empty(),
+        "post-tested image loop did not materialize");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 15u && snapshot.flattened_srt[mapping + 1u] == 1u &&
+            snapshot.flattened_srt[mapping + 29u] == 15u &&
+            snapshot.images[0].dwords[0] == 0x101u,
+        "post-tested image loop did not enumerate keys 1 to 15");
+  Check(std::ranges::none_of(snapshot.images, [](const auto &image) {
+          return image.dwords[0] == 0x100u;
+        }),
+        "post-tested image loop read the record before its start value");
 }
 
 void TestUniformizedMaterialImageKeys() {
@@ -8268,6 +8401,7 @@ int main() {
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
+    Run("post-tested image loop", TestPostTestedImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);

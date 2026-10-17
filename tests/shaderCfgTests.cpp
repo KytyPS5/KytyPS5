@@ -8119,6 +8119,19 @@ void TestDsReturningAtomic64Decoder() {
         "captured DS_CMPST_RTN_B64 lost its comparison/replacement pairs or aliases");
 }
 
+void TestDsCompareStore32Decoder() {
+  using namespace ShaderRecompiler::Decoder;
+  // CS04b812daaacd532f pc 0x3e8 (AC Valhalla, #281).
+  const uint32_t words[] = {0xd8c00000u, 0x04130504u};
+  Instruction decoded;
+  DecodeInstruction(words, 0u, decoded);
+  Check(decoded.opcode == Opcode::DS_CMPST_RTN_B32 && decoded.word_count == 2u &&
+            decoded.data_dwords == 1u && decoded.src_count == 3u && decoded.src0.reg == 4u &&
+            decoded.src1.reg == 5u && decoded.src2.reg == 19u && decoded.dst.reg == 4u &&
+            decoded.offset == 0u && !decoded.gds,
+        "captured DS_CMPST_RTN_B32 lost its comparison/replacement order or aliases");
+}
+
 void TestDsFloatMinMaxDecoder() {
   using namespace ShaderRecompiler::Decoder;
   for (bool max_value : {false, true}) {
@@ -16312,6 +16325,7 @@ int main() {
   TestScalarAshrI64Decoder();
   TestImageAtomicWidthDecoder();
   TestDsReturningAtomic64Decoder();
+  TestDsCompareStore32Decoder();
   TestDsFloatMinMaxDecoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();

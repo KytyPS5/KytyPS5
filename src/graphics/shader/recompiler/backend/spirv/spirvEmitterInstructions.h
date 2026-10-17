@@ -325,6 +325,7 @@ inline constexpr auto EmitSharedAtomicSMin32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicUMin32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicSMax32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicUMax64    = EmitSharedAtomic64;
+inline constexpr auto EmitSharedAtomicCmpSwap32 = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicCmpSwap64 = EmitSharedAtomic64;
 inline constexpr auto EmitSharedAtomicUMax32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicAnd32     = EmitAtomic32;

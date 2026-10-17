@@ -35721,6 +35721,51 @@ void CheckWave64WholeWaveResults() {
           "emulated halves repeated the first-active-lane broadcast");
 }
 
+// A wave64 pixel shader can run on a host subgroup that lacks some of its lanes (#1101).
+void CheckPixelCrossLaneMissingLanes() {
+  using O = ShaderOpcode;
+  constexpr const char *name = "PixelCrossLaneMissingLanes";
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 1, 250)); // v_mov_b32_dpp v1, v0 row_shr:1
+  code.push_back(EncodeVop1Dpp(0, 0x111));
+  code.push_back(EncodeSMovB32(0, InlineU32(1)));
+  code.push_back(EncodeSMovB32(1, InlineU32(0)));
+  AppendVop3(&code, 0x378, 2, Vgpr(0), 0, 1);          // v_permlanex16_b32 v2, v0, s0, s1
+  AppendVop3(&code, 0x360, 4, Vgpr(1), InlineU32(63)); // v_readlane_b32 s4, v1, 63
+  code.push_back(EncodeVop1(0x01, 3, 4));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(1, 2, 3, 3));
+  AppendEnd(&code);
+
+  GraphicsCase test;
+  test.name = name;
+  test.fragment_code = code;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_PERMLANEX16_B32,
+                  O::V_READLANE_B32, O::EXP, O::S_ENDPGM};
+  const auto pixel = CompileFragmentCase(test);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  Require(name, "disassembly", tools.Disassemble(pixel.spirv, &text),
+          "failed to disassemble the pixel shader");
+  Require(name, "wave64 readlane wrap",
+          text.find("BuiltIn SubgroupSize") != std::string::npos,
+          "lane 63 was not wrapped to the host subgroup size");
+  Require(name, "missing readlane source",
+          CountText(text, "OpGroupNonUniformBallotFindMSB ") == 1,
+          "a missing readlane source does not fall back to the highest present lane");
+  Require(name, "missing DPP and permlane sources",
+          CountText(text, "OpGroupNonUniformBallot ") >= 5u,
+          "DPP or permlane reads are not guarded by the present-lane ballot");
+
+  const auto compute = CompileCase(VectorReadlaneSelectsTwoKeysWithinWave());
+  std::string compute_text;
+  Require(name, "compute disassembly", tools.Disassemble(compute.spirv, &compute_text),
+          "failed to disassemble the compute shader");
+  Require(name, "pixel-only fallback",
+          compute_text.find("OpGroupNonUniformBallotFindMSB") == std::string::npos,
+          "the missing-lane fallback leaked into a compute shader");
+}
+
 TestCase Wave64RawMasksAndScalarBranch() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -49268,6 +49313,7 @@ int main(int argc, char **argv) {
   CheckFiniteFirstLaneImageChoice(vulkan);
   CheckFiniteInlineSamplerPhi(vulkan);
   CheckWave64WholeWaveResults();
+  CheckPixelCrossLaneMissingLanes();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();

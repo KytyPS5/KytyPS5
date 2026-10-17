@@ -546,9 +546,11 @@ IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_la
 	auto bits             = ReadRawU32(operand);
 	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
 		// Inline floats encode the operand's width before SDWA or OP_SEL selects bits.
-		const auto half      = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {ir.BitCastF32(bits)}));
-		const auto half_bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}));
-		bits                = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {half_bits}));
+		const auto value = operand.value;
+		bits             = IR::U32(IR::Value(value == 0x3e22f983u
+		                                         ? 0x3118u
+		                                         : ((value >> 16u) & 0x8000u) |
+		                                               ((((value >> 23u) & 0xffu) - 112u) << 10u)));
 	}
 	bits = ApplyBitSourceModifiers(raw_operand, bits);
 	uint32_t offset = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;

@@ -15,8 +15,9 @@ namespace Libs::Graphics {
 
 namespace {
 
-using Buffer = ShaderRecompiler::IR::ResourceSpecialization::Buffer;
-using Image  = ShaderRecompiler::IR::ResourceSpecialization::Image;
+using Buffer  = ShaderRecompiler::IR::ResourceSpecialization::Buffer;
+using Image   = ShaderRecompiler::IR::ResourceSpecialization::Image;
+using Sampler = ShaderRecompiler::IR::ResourceSpecialization::Sampler;
 
 constexpr size_t MaxRecordBytes = 64u << 20u;
 
@@ -236,6 +237,7 @@ void VisitBuffer(Info& buffer, F& field) {
 	field(buffer.descriptor_format);
 	field(buffer.descriptor_swizzle);
 	field(buffer.zero_stride_oob);
+	field(buffer.scalar_empty);
 	field(buffer.indirect_root);
 	field(buffer.indirect_mapping_offset);
 	field(buffer.indirect_search_iterations);
@@ -255,6 +257,13 @@ void VisitImage(Info& image, F& field) {
 	field(image.fmask);
 }
 
+template <typename Info, typename F>
+void VisitSampler(Info& sampler, F& field) {
+	field(sampler.indirect_root);
+	field(sampler.indirect_mapping_offset);
+	field(sampler.indirect_search_iterations);
+}
+
 template <typename T>
 void PutFields(std::vector<uint8_t>& out, const T& value) {
 	auto put = [&out](const auto& field) { PutField(out, field); };
@@ -262,6 +271,8 @@ void PutFields(std::vector<uint8_t>& out, const T& value) {
 		VisitBuffer(value, put);
 	} else if constexpr (std::is_same_v<T, Image>) {
 		VisitImage(value, put);
+	} else if constexpr (std::is_same_v<T, Sampler>) {
+		VisitSampler(value, put);
 	} else {
 		VisitInput(value, put);
 	}
@@ -275,6 +286,8 @@ bool GetFields(Reader& reader, T& value) {
 		VisitBuffer(value, get);
 	} else if constexpr (std::is_same_v<T, Image>) {
 		VisitImage(value, get);
+	} else if constexpr (std::is_same_v<T, Sampler>) {
+		VisitSampler(value, get);
 	} else {
 		VisitInput(value, get);
 	}
@@ -332,11 +345,13 @@ std::vector<uint8_t> EncodeRecipe(const ShaderCacheRecipe& recipe) {
 	Put(out, static_cast<uint32_t>(recipe.input.size()));
 	Put(out, static_cast<uint32_t>(recipe.specialization.buffers.size()));
 	Put(out, static_cast<uint32_t>(recipe.specialization.images.size()));
+	Put(out, static_cast<uint32_t>(recipe.specialization.samplers.size()));
 	PutArray(out, recipe.code);
 	PutArray(out, recipe.back_code);
 	PutArray(out, recipe.input);
 	PutFieldsArray(out, recipe.specialization.buffers);
 	PutFieldsArray(out, recipe.specialization.images);
+	PutFieldsArray(out, recipe.specialization.samplers);
 	return out;
 }
 
@@ -348,10 +363,11 @@ bool DecodeRecipe(std::span<const uint8_t> payload, ShaderCacheRecipe& recipe) {
 	uint32_t input_bytes = 0;
 	uint32_t buffers     = 0;
 	uint32_t images      = 0;
+	uint32_t samplers    = 0;
 	if (!reader.Get(stage) || !reader.Get(recipe.user_data_count) ||
 	    !reader.Get(recipe.push_data_start) || !reader.Get(recipe.hash) ||
 	    !reader.Get(code_words) || !reader.Get(back_words) || !reader.Get(input_bytes) ||
-	    !reader.Get(buffers) || !reader.Get(images)) {
+	    !reader.Get(buffers) || !reader.Get(images) || !reader.Get(samplers)) {
 		return false;
 	}
 	recipe.stage = static_cast<ShaderType>(stage);
@@ -362,7 +378,9 @@ bool DecodeRecipe(std::span<const uint8_t> payload, ShaderCacheRecipe& recipe) {
 	       reader.GetArray(recipe.back_code, back_words) &&
 	       reader.GetArray(recipe.input, input_bytes) &&
 	       GetFieldsArray(reader, recipe.specialization.buffers, buffers) &&
-	       GetFieldsArray(reader, recipe.specialization.images, images) && reader.Remaining() == 0;
+	       GetFieldsArray(reader, recipe.specialization.images, images) &&
+	       GetFieldsArray(reader, recipe.specialization.samplers, samplers) &&
+	       reader.Remaining() == 0;
 }
 
 } // namespace

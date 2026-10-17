@@ -43723,7 +43723,11 @@ void CheckShaderCacheFileFormat() {
     recipe->input.assign(ShaderCacheInputSize(recipe->stage), static_cast<uint8_t>(i + 1));
     recipe->specialization.buffers.resize(i + 1);
     recipe->specialization.buffers[0].packed_stride = 16;
+    recipe->specialization.buffers[0].scalar_empty = i == 1;
     recipe->specialization.images.resize(i);
+    recipe->specialization.samplers.resize(i + 1);
+    recipe->specialization.samplers[i].indirect_root = 0;
+    recipe->specialization.samplers[i].indirect_search_iterations = 3;
     recipes.push_back(std::move(recipe));
   }
   const auto data = SerializeShaderCache("KytySC1:test\n", recipes);

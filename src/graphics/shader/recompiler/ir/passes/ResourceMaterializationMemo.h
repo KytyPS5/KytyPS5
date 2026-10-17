@@ -94,6 +94,17 @@ private:
 		uint32_t                dword_count = 0;
 		std::array<uint32_t, 8> op_begin {};
 		std::array<uint32_t, 8> op_end {};
+		// The resources bound from `source`, as a range of m_patch_targets.
+		uint32_t target_begin = 0;
+		uint32_t target_end   = 0;
+	};
+
+	// One buffer, image or sampler binding a patched descriptor feeds.
+	struct PatchTarget {
+		enum Kind : uint8_t { Buffer, Image, Sampler };
+		Kind     kind    = Buffer;
+		bool     written = false;
+		uint32_t index   = 0;
 	};
 
 	struct HotStep {
@@ -122,6 +133,8 @@ private:
 		uint32_t begin   = 0;
 		uint32_t end     = 0;
 		uint32_t operand = 0;
+		// Index into m_shared_values: reads whose programs are identical share one evaluation.
+		uint32_t shared = 0;
 	};
 
 	// One heap root's acquisition: a replay acquires it again and needs the same kinds.
@@ -153,10 +166,18 @@ private:
 	static bool     GpuOwned(void* userdata, uint64_t address, uint64_t size);
 	static void     WalkRestarted(void* userdata);
 	static void     ZeroRead(void* userdata);
+	bool Note(Reader reader, bool read, uint64_t address, std::span<const uint32_t> values);
+	bool Build(const ResourcePlan& plan, const ResourceSnapshot& snapshot);
+	bool CanDerive(const ResourcePlan& plan, Value value, uint32_t before) const;
+	void Compile(const ResourcePlan& plan, Value value);
 	template <typename Stack>
 	static void            ApplyOp(Op::Kind kind, Stack& stack, uint32_t& top);
 	[[nodiscard]] uint64_t Evaluate(uint32_t begin, uint32_t end,
 	                                std::span<const uint32_t> user_data) const;
+	[[nodiscard]] uint64_t EvaluateScratch(uint32_t begin, uint32_t end,
+	                                       std::span<const uint32_t> user_data) const;
+	[[nodiscard]] uint64_t SharedOperand(const HotOperand&         derived,
+	                                     std::span<const uint32_t> user_data);
 	[[nodiscard]] bool     SameShape(const ResourcePlan& plan) const;
 	[[nodiscard]] uint32_t KeyOf(Value value) const;
 	void                   BuildHot(const ResourcePlan& plan);
@@ -204,8 +225,13 @@ private:
 	std::vector<Op>               m_ops;
 	std::vector<uint8_t>          m_visited_blocks;
 	std::vector<DescriptorPatch>  m_patches;
+	std::vector<PatchTarget>      m_patch_targets;
 	std::vector<HotStep>          m_hot;
 	std::vector<HotOperand>       m_hot_operands;
+	// One value per distinct operand program, valid while its stamp equals m_shared_epoch.
+	std::vector<uint64_t> m_shared_values;
+	std::vector<uint32_t> m_shared_stamps;
+	uint32_t              m_shared_epoch = 0;
 
 public:
 	MaterializeMemo();

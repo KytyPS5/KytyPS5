@@ -2320,6 +2320,188 @@ void TestMaterializeMemoDescriptorPatch() {
   table_b[2] = 128u;
 }
 
+// N plain buffer V#s read from one table; every dword re-derives, so a replay patches them all.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MemoManyDescriptorPlan(uint32_t count,
+                                                                          bool shared = false) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &lo = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  auto &hi = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(&lo), Value(&hi)});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  for (uint32_t index = 0; index < count; index++) {
+    DescriptorSource source;
+    for (uint32_t dword = 0; dword < 4; dword++) {
+      const auto flat = index * 4u + dword;
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.planning_only = true;
+      memory.offset = flat * 4u;
+      program.memory_info.push_back(memory);
+      auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                      {Value(&handle), Value(0u), Value(0u), Value(true)});
+      raw.SetFlags(MemoryFlags{.index = flat, .pc = 0x40u + flat * 4u});
+      program.srt_reads.push_back({Value(&raw), flat});
+      auto &read = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(flat)});
+      source.dwords[dword] = Value(&read);
+    }
+    source.dword_count = 4;
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = index});
+  }
+  if (shared) {
+    // One source feeding several bindings: a second buffer and a sampler.
+    program.info.buffers.push_back({.source = 0});
+    program.info.samplers.push_back({.source = count - 1u});
+  }
+  return ExtractResourcePlan(program);
+}
+
+// A root table at the user-data pointer holding the address of a child table of `count` V#s.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MemoNestedDescriptorPlan(uint32_t count) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &lo = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  auto &hi = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))});
+  auto &root = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(&lo), Value(&hi)});
+  std::array<Inst *, 2> pointer{};
+  for (uint32_t word = 0; word < 2; word++) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.planning_only = true;
+    memory.offset = word * 4u;
+    program.memory_info.push_back(memory);
+    pointer[word] = &block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                         {Value(&root), Value(0u), Value(0u), Value(true)});
+    pointer[word]->SetFlags(
+        MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u),
+                    .pc = 0x20u + word * 4u});
+  }
+  auto &child = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                    {Value(pointer[0]), Value(pointer[1])});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  for (uint32_t index = 0; index < count; index++) {
+    DescriptorSource source;
+    for (uint32_t dword = 0; dword < 4; dword++) {
+      const auto flat = index * 4u + dword;
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.planning_only = true;
+      memory.offset = flat * 4u;
+      program.memory_info.push_back(memory);
+      auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                      {Value(&child), Value(0u), Value(0u), Value(true)});
+      raw.SetFlags(MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u),
+                               .pc = 0x40u + flat * 4u});
+      program.srt_reads.push_back({Value(&raw), flat});
+      auto &read = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(flat)});
+      source.dwords[dword] = Value(&read);
+    }
+    source.dword_count = 4;
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = index});
+  }
+  return ExtractResourcePlan(program);
+}
+
+// Child tables moved through re-read root words replay like a walk.
+void TestMaterializeMemoNestedSharedOperands() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  constexpr uint32_t Count = 6;
+  std::vector<uint32_t> children[3];
+  for (uint32_t t = 0; t < 3; t++) {
+    children[t].resize(Count * 4u);
+    for (uint32_t index = 0; index < Count; index++) {
+      const uint32_t v[4] = {0x10000000u * (t + 1u) + index * 0x100u, (16u << t) << 16u,
+                             32u + t + index, 0x00027facu};
+      std::memcpy(&children[t][index * 4u], v, sizeof(v));
+    }
+  }
+  std::array<uint32_t, 2> root{};
+  const auto aim = [&](const std::vector<uint32_t> &table) {
+    const auto where = reinterpret_cast<uint64_t>(table.data());
+    root = {Low(where), High(where)};
+  };
+  const auto root_address = reinterpret_cast<uint64_t>(root.data());
+  const std::array<uint32_t, 2> user_data{Low(root_address), High(root_address)};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = MemoRead,
+                           .read_specialization_memory = MemoRead};
+  const auto plan = MemoNestedDescriptorPlan(Count);
+  MaterializeMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  aim(children[0]);
+  Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization),
+        "the nested plan did not materialize");
+  memo.Commit(plan, snapshot, specialization);
+  Check(memo.Valid(), "the nested plan was not memoized");
+  for (const uint32_t t : {1u, 2u, 2u, 0u, 1u, 0u}) {
+    aim(children[t]);
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    Check(memo.Replay(plan, runtime, snapshot, &specialization) &&
+              MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+              fresh.buffers == snapshot.buffers && fresh.flattened_srt == snapshot.flattened_srt &&
+              fresh_specialization == specialization &&
+              snapshot.buffers[Count - 1u].dwords[0] == children[t][(Count - 1u) * 4u],
+          "a child table moved through root words did not replay like a walk");
+  }
+}
+
+// Every binding of a patched descriptor follows a moved V#.
+void TestMaterializeMemoPatchTargets() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  constexpr uint32_t Count = 3;
+  std::vector<uint32_t> tables[3];
+  for (uint32_t t = 0; t < 3; t++) {
+    tables[t].resize(Count * 4u);
+    for (uint32_t index = 0; index < Count; index++) {
+      const uint32_t v[4] = {0x10000000u * (t + 1u) + index * 0x1000u, (16u << t) << 16u,
+                             64u + t, 0x00027facu};
+      std::memcpy(&tables[t][index * 4u], v, sizeof(v));
+    }
+  }
+  std::array<uint32_t, 2> user_data{};
+  const auto point = [&](const std::vector<uint32_t> &table) {
+    const auto where = reinterpret_cast<uint64_t>(table.data());
+    user_data = {Low(where), High(where)};
+  };
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = MemoRead,
+                           .read_specialization_memory = MemoRead};
+  const auto plan = MemoManyDescriptorPlan(Count, true);
+  MaterializeMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  point(tables[0]);
+  Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization),
+        "the shared-source plan did not materialize");
+  memo.Commit(plan, snapshot, specialization);
+  Check(memo.Valid(), "the shared-source plan was not memoized");
+  for (const uint32_t t : {1u, 2u, 2u, 0u, 1u}) {
+    point(tables[t]);
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    Check(memo.Replay(plan, runtime, snapshot, &specialization) &&
+              MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+              fresh.buffers == snapshot.buffers && fresh.samplers == snapshot.samplers &&
+              fresh.flattened_srt == snapshot.flattened_srt &&
+              fresh_specialization == specialization &&
+              snapshot.buffers[Count].dwords[0] == tables[t][0] &&
+              snapshot.samplers[0].dwords[0] == tables[t][(Count - 1u) * 4u],
+          "a shared-source descriptor patch did not replay like a walk");
+  }
+}
+
 void TestMaterializeMemoBackoff() {
   using Backoff = Libs::Graphics::ShaderRecompiler::IR::MaterializeMemoBackoff;
   Backoff backoff;
@@ -2612,6 +2794,8 @@ int main() {
   TestMaterializeMemoExtensions();
   TestMaterializeMemoBackoff();
   TestMaterializeMemoDescriptorPatch();
+  TestMaterializeMemoPatchTargets();
+  TestMaterializeMemoNestedSharedOperands();
   TestMaterializeMemoCarryAddress();
   TestMaterializeMemoZeroRead();
   std::puts("ResourceMaterializationTests: all cases passed");

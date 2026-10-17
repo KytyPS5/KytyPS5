@@ -20,6 +20,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -89,6 +90,7 @@ struct EmitterState {
 	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
 	bool                                            maintenance8_enabled;
+	std::unordered_set<uint32_t>                    f32_products;
 	uint32_t                                        debug_source = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
@@ -202,6 +204,18 @@ uint32_t EmitNative(EmitterState& state, Args... args) {
 	if constexpr (type == IR::Type::F64 &&
 	              (opcode == spv::OpFMul || opcode == spv::OpFDiv || opcode == spv::OpExtInst)) {
 		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
+	if constexpr (type == IR::Type::F32 && opcode == spv::OpFMul) {
+		state.f32_products.insert(result);
+	} else if constexpr (type == IR::Type::F32 && opcode == spv::OpFNegate) {
+		if ((state.f32_products.contains(args) || ...)) {
+			state.f32_products.insert(result);
+		}
+	} else if constexpr (type == IR::Type::F32 &&
+	                     (opcode == spv::OpFAdd || opcode == spv::OpFSub)) {
+		if ((state.f32_products.contains(args) || ...)) {
+			state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+		}
 	}
 	return result;
 }

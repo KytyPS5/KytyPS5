@@ -528,6 +528,12 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                     vk::to_string(result), vertex_program.id,
 		                                     ps_active ? pixel_program.id : 0));
 		DestroyPartialPipeline(graphics, pipeline);
+		if (tess_control_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+		}
+		if (tess_eval_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+		}
 		return false;
 	}
 

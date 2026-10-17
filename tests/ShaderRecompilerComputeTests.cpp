@@ -17349,10 +17349,13 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().GetGraphicsPipeline(
+      auto *selected = context.GetPipelineCache().GetGraphicsPipeline(
           std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
           topology, false,
           PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
+      Require(name, "graphics pipeline", selected != nullptr,
+              "the host rejected the graphics pipeline configuration");
+      return *selected;
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,

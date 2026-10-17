@@ -136,6 +136,7 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 void EmitMemoryOffsets(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
+	state.memory_byte_ranges.resize(count);
 	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
 		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
@@ -153,6 +154,8 @@ void EmitMemoryOffsets(EmitterState& state) {
 			if (dynamic_offsets[i + lane]) continue;
 			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
+			state.memory_byte_ranges[i + lane] = EmitShaderDataDwordLoad(
+			    state, state.program.bindings.MemoryRangeDword() + i + lane);
 		}
 	}
 }
@@ -215,13 +218,15 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
 	                          buffer.variable, array_index);
+	uint32_t range = 0;
 	if (non_uniform) {
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexing);
 		state.builder.AddAnnotation(spv::OpDecorate, access.object_pointer, spv::DecorationNonUniform);
-		const auto offsets_start = state.program.bindings.memory_offset_dword +
-		    (state.program.bindings.UsesPushData() ? state.program.bindings.push_data_start_dword : 0u);
+		const auto& bindings      = state.program.bindings;
+		const auto  data_start    = bindings.UsesPushData() ? bindings.push_data_start_dword : 0u;
+		const auto  offsets_start = bindings.memory_offset_dword + data_start;
 		const auto word = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, offsets_start),
 		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))));
@@ -230,12 +235,19 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		    ConstantU32(state, 3));
 		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 		    state, word, shift, ConstantU32(state, 8));
+		range = EmitShaderDataDwordLoadAt(
+		    state, EmitAddU32(state, ConstantU32(state, bindings.MemoryRangeDword() + data_start),
+		                      array_index));
 	} else {
 		access.byte_offset = state.memory_byte_offsets[static_index];
+		range              = state.memory_byte_ranges[static_index];
 	}
-	access.length      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
-	                          access.object_pointer, 0);
+	// Bound by the descriptor range, not OpArrayLength: hosts may round that up to 4 bytes, and
+	// some give every lane of a NonUniform pointer the first lane's length.
+	const auto element_shift = static_cast<uint32_t>(&buffer - state.storage_buffers.data());
+	access.length = element_shift == 0u ? range
+	                                    : Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	                                             range, ConstantU32(state, element_shift));
 	return access;
 }
 

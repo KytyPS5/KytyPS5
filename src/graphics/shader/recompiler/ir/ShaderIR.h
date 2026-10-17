@@ -475,9 +475,14 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// The packed 8-bit byte offsets are followed by each storage buffer's range in bytes.
+	[[nodiscard]] uint32_t MemoryRangeDword() const {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return MemoryRangeDword() +
+		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

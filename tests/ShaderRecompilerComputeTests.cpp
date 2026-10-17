@@ -13363,7 +13363,8 @@ public:
                 bindings.buffers[0].buffer == owner.Handle() &&
                     bindings.buffers[0].offset + 2 == owner.Offset(buffer_address) &&
                     bindings.buffers[0].range == 14 &&
-                    bindings.shader_data[buffer_program.bindings.memory_offset_dword] == 2,
+                    bindings.shader_data[buffer_program.bindings.memory_offset_dword] == 2 &&
+                    bindings.shader_data[buffer_program.bindings.MemoryRangeDword()] == 14,
                 "native binding lost the byte adjustment or rounded the final halfword range");
       }
 
@@ -16680,6 +16681,8 @@ public:
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
+    Require(test.name, "dispatch", shader_data.size() == layout.ShaderDataDwords(),
+            "shader data does not match the binding layout");
     if (layout.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
       Require(test.name, "dispatch dimensions", test.has_compute_info,
               "runtime thread extents are required by the compiled shader");
@@ -16894,6 +16897,8 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
+        // As RenderExecutor::RebindBuffers: the shader bounds the slot by its exact range.
+        shader_data[layout.MemoryRangeDword() + index] = static_cast<u32>(info.range);
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -39037,7 +39042,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     compiled.packed_user_data[program.bindings.memory_offset_dword] = 12u | (108u << 8u);
     ValidateSpirv(test.name, compiled.spirv);
     test.required_spirv.clear();
-    test.forbidden_spirv = {"PhysicalStorageBuffer"};
+    test.forbidden_spirv = {"PhysicalStorageBuffer", "OpArrayLength"};
     if (!single && !null_child && layout != Layout::DifferentStride) {
       test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
       test.forbidden_spirv.push_back("OpSwitch");
@@ -39049,13 +39054,12 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
           nonuniform.insert(words[1]);
-        if (opcode == spv::OpArrayLength) accessed_pointers.push_back(words[3]);
         if (opcode == spv::OpStore) accessed_pointers.push_back(words[1]);
         if (opcode == spv::OpBitFieldUExtract) ++prefix_extracts;
         offset += words.size();
       }
       Require(test.name, "shared store and nonuniform pointers",
-              prefix_extracts == 1u && accessed_pointers.size() == 2u &&
+              prefix_extracts == 1u && accessed_pointers.size() == 1u &&
                   std::ranges::all_of(accessed_pointers, [&](u32 pointer) {
                     return nonuniform.contains(pointer);
                   }),

@@ -730,56 +730,157 @@ private:
 			if (projected != nullptr) cached->second = Value(projected);
 			return cached->second;
 		}
-		if (inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->GetType() != Type::U32) {
-			return value;
+		if (const auto lowered = LowerDiamondPhi(*inst); !lowered.IsEmpty()) {
+			cached->second = lowered;
+			return cached->second;
 		}
-		const auto* merge = inst->Parent();
-		const auto* branch = inst->PhiBlock(0);
-		if (merge == nullptr || branch == nullptr || inst->PhiBlock(1) == nullptr ||
-		    branch == inst->PhiBlock(1)) {
-			return value;
+		if (const auto lowered = LowerStructuredPhi(*inst); !lowered.IsEmpty()) {
+			cached->second = lowered;
+			return cached->second;
+		}
+		return value;
+	}
+
+	// A two-arm diamond whose arms are single-predecessor tails into the merge.
+	Value LowerDiamondPhi(const Inst& inst) {
+		if (inst.NumArgs() != 2u || inst.NumPhiBlocks() != 2u || inst.GetType() != Type::U32) {
+			return {};
+		}
+		const auto* merge  = inst.Parent();
+		const auto* branch = inst.PhiBlock(0);
+		if (merge == nullptr || branch == nullptr || inst.PhiBlock(1) == nullptr ||
+		    branch == inst.PhiBlock(1)) {
+			return {};
 		}
 		if (branch->ImmSuccessors().size() != 2u) {
 			if (branch->ImmPredecessors().size() != 1u) {
-				return value;
+				return {};
 			}
 			branch = branch->ImmPredecessors()[0];
 		}
 		if (branch == merge || branch->ImmSuccessors().size() != 2u) {
-			return value;
+			return {};
 		}
 		std::array<const Block*, 2> targets;
 		for (uint32_t arm = 0; arm < 2; arm++) {
-			const auto* incoming = inst->PhiBlock(arm);
+			const auto* incoming = inst.PhiBlock(arm);
 			if (incoming == merge ||
 			    (incoming != branch &&
 			     (incoming->ImmPredecessors().size() != 1u ||
 			      incoming->ImmPredecessors()[0] != branch ||
 			      incoming->ImmSuccessors().size() != 1u ||
 			      incoming->ImmSuccessors()[0] != merge))) {
-				return value;
+				return {};
 			}
 			targets[arm] = incoming == branch ? merge : incoming;
 		}
-		const auto& info = *branch;
-		const auto& term = info.terminator;
+		const auto& term = branch->terminator;
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
 		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(0)) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(1))) {
-			return value;
+		    !ValidateRuntimeValue(m_program, branch->condition, m_shader_writes
+		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
+			return {};
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
-		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
-		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
-		selected.SetArg(0, info.condition);
-		selected.SetArg(1, inst->Arg(true_arg));
-		selected.SetArg(2, inst->Arg(true_arg ^ 1u));
-		cached->second = Value(&selected);
-		return cached->second;
+		const auto true_arg    = term.true_block == targets[0] ? 0u : 1u;
+		const auto true_value  = LowerDescriptorValue(inst.Arg(true_arg));
+		const auto false_value = LowerDescriptorValue(inst.Arg(true_arg ^ 1u));
+		if (!ValidateRuntimeValue(m_program, true_value) ||
+		    !ValidateRuntimeValue(m_program, false_value)) {
+			return {};
+		}
+		auto& selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+		selected.SetArg(0, branch->condition);
+		selected.SetArg(1, true_value);
+		selected.SetArg(2, false_value);
+		return Value(&selected);
+	}
+
+	static bool ReachesBefore(const Block* from, const Block* target, const Block* stop) {
+		if (from == nullptr || target == nullptr) {
+			return false;
+		}
+		std::vector<const Block*> pending {from};
+		std::vector<const Block*> visited;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == nullptr || block == stop ||
+			    std::ranges::find(visited, block) != visited.end()) {
+				continue;
+			}
+			visited.push_back(block);
+			if (block == target) {
+				return true;
+			}
+			for (const auto* successor: block->ImmSuccessors()) {
+				pending.push_back(successor);
+			}
+		}
+		return false;
+	}
+
+	// A structured merge whose controlling conditional branch nominates this block as its
+	// merge. The two arms may themselves contain nested merges, so lower them recursively.
+	Value LowerStructuredPhi(const Inst& inst) {
+		if (inst.NumArgs() != 2u || inst.NumPhiBlocks() != 2u || inst.GetType() != Type::U32) {
+			return {};
+		}
+		const auto* merge = inst.Parent();
+		if (merge == nullptr) {
+			return {};
+		}
+		const Block* branch = nullptr;
+		for (const auto* candidate: m_program.blocks) {
+			if (candidate->terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+			    candidate->terminator.merge_block == merge) {
+				branch = candidate;
+				break;
+			}
+		}
+		if (branch == nullptr ||
+		    !ValidateRuntimeValue(m_program, branch->condition, m_shader_writes
+		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
+			return {};
+		}
+		const auto& term = branch->terminator;
+		std::array<Value, 2> values;
+		std::array<bool, 2>  found {};
+		for (uint32_t arm = 0; arm < inst.NumArgs(); ++arm) {
+			const auto* incoming = inst.PhiBlock(arm);
+			uint32_t    side     = 2u;
+			if (incoming == branch) {
+				if (term.true_block == merge) {
+					side = 0u;
+				} else if (term.false_block == merge) {
+					side = 1u;
+				}
+			} else if (ReachesBefore(term.true_block, incoming, merge)) {
+				side = 0u;
+			} else if (ReachesBefore(term.false_block, incoming, merge)) {
+				side = 1u;
+			}
+			if (side >= 2u || found[side]) {
+				return {};
+			}
+			found[side]  = true;
+			values[side] = inst.Arg(arm);
+		}
+		if (!found[0] || !found[1]) {
+			return {};
+		}
+		const auto true_value  = LowerDescriptorValue(values[0]);
+		const auto false_value = LowerDescriptorValue(values[1]);
+		if (!ValidateRuntimeValue(m_program, true_value) ||
+		    !ValidateRuntimeValue(m_program, false_value)) {
+			return {};
+		}
+		auto& selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+		selected.SetArg(0, branch->condition);
+		selected.SetArg(1, true_value);
+		selected.SetArg(2, false_value);
+		return Value(&selected);
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,

@@ -724,8 +724,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			continue;
 		}
 		const auto& bound = prepared.images[pair.image];
-		const auto& image = m_context.GetTextureCache().GetImage(bound.image_id);
-		if (!image.info.IsDepth()) {
+		// Null and already-retired bindings have no image to inspect; the descriptor path
+		// reports those on its own, so leave the sampler untouched here.
+		const auto* image =
+		    m_context.GetTextureCache().m_slot_images.try_get(bound.image_id);
+		if (image == nullptr) {
+			continue;
+		}
+		if (!image->info.IsDepth()) {
 			sampler_compare_ok[pair.sampler] = false;
 			guest_compare_mismatch           = true;
 		}

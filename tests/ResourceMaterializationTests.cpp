@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 
@@ -277,6 +278,171 @@ void TestNativeNestedSrtRefresh() {
   pointer_high.Instruction()->SetArg(1, Value(8u));
   Check(ExtractResourcePlan(program).srt_code == nullptr,
         "native SRT accepted nonadjacent nested pointer words");
+}
+
+void TestCompiledSrtReadsFollowBlocks() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  const auto pointer_words = [](const void *pointer) {
+    const auto address = reinterpret_cast<uint64_t>(pointer);
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address) | 3u,
+                                  static_cast<uint32_t>(address >> 32u) | 0xabcd0000u};
+  };
+  std::array<uint32_t, 4> child{0u, 0x11111111u, 0x22222222u, 0x33333333u};
+  const auto child_words = pointer_words(child.data());
+  // Pointer to the child table, a plain DWORD, the branch DWORD and a DWORD for a clean read.
+  std::array<uint32_t, 6> root{child_words[0], child_words[1], 0x44444444u, 1u, 0x55555555u, 0u};
+  const auto root_words = pointer_words(root.data());
+  std::array<uint32_t, 3> user_data{root_words[0], root_words[1], 0u};
+
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &entry = AddValueBlock(program);
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto low = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(4))});
+  const auto high = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(5))});
+  const auto root_handle = emit(entry, ValueOpcode::GetAddressResource, {low, high});
+  const auto load = [&](Value handle, uint32_t offset) {
+    const auto value = emit(entry, ValueOpcode::LoadAddressU32,
+                            {handle, Value(offset), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    return value;
+  };
+  const auto pointer_low = load(root_handle, 0u);
+  const auto pointer_high = load(root_handle, 4u);
+  const auto child_handle =
+      emit(entry, ValueOpcode::GetAddressResource, {pointer_low, pointer_high});
+  const auto srt = emit(entry, ValueOpcode::GetSrtResource, {});
+  // Slots: 0 plain, 1 pointer word, 2 clean, 3 nested (true edge), 4 nested (false edge).
+  const std::array slot_values{load(root_handle, 8u), pointer_high, load(root_handle, 16u),
+                               load(child_handle, 4u), load(child_handle, 8u)};
+  // Flat offsets run backwards so that a slot index is never taken for its flat offset.
+  for (uint32_t slot = 0; slot < slot_values.size(); ++slot)
+    program.srt_reads.push_back({slot_values[slot], 4u - slot});
+  for (uint32_t slot = 0; slot < 3; ++slot)
+    emit(entry, ValueOpcode::ReadConst, {srt, Value(slot)});
+  DescriptorSource source;
+  source.dwords = {slot_values[2], Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  // A written buffer keeps its descriptor reads on the strict reader.
+  program.info.buffers.push_back({.source = 0, .written = true});
+  const auto condition = emit(entry, ValueOpcode::INotEqual32, {load(root_handle, 12u), Value(0u)});
+  for (uint32_t slot = 3; slot < 5; ++slot)
+    emit(AddValueBlock(program), ValueOpcode::ReadConst, {srt, Value(slot)});
+  entry.condition = condition;
+  entry.terminator.kind = TerminatorKind::ConditionalBranch;
+  entry.terminator.true_block = program.blocks[1];
+  entry.terminator.false_block = program.blocks[2];
+  program.blocks[1]->terminator.kind = TerminatorKind::Return;
+  program.blocks[2]->terminator.kind = TerminatorKind::Return;
+
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.capture_specialization_reads && plan.control_flow.size() == 3 &&
+            plan.srt_code == nullptr && plan.srt_read_code != nullptr &&
+            plan.srt_read_entries ==
+                std::vector<uint32_t>{plan.srt_read_entries[0], plan.srt_read_entries[1],
+                                      UINT32_MAX, plan.srt_read_entries[3],
+                                      plan.srt_read_entries[4]} &&
+            plan.srt_read_entries[0] != UINT32_MAX && plan.srt_read_entries[4] != UINT32_MAX,
+        "captured block plan did not compile exactly its ordinary scalar reads");
+  auto interpreted = ExtractResourcePlan(program);
+  interpreted.srt_read_code.reset();
+  struct Strict { uint32_t reads = 0; } strict;
+  const auto runtime = [&](std::span<const uint32_t> words) {
+    return SrtRuntime{
+        .user_data = words,
+        .userdata = &strict,
+        .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> out) {
+          ++static_cast<Strict *>(data)->reads;
+          std::memcpy(out.data(), reinterpret_cast<const void *>(address), out.size_bytes());
+          return true;
+        }};
+  };
+  for (const uint32_t branch : {1u, 0u}) {
+    root[3] = branch;
+    ResourceSnapshot compiled_snapshot;
+    ResourceSnapshot interpreted_snapshot;
+    ResourceSpecialization specialization;
+    strict = {};
+    Check(MaterializeResources(interpreted, runtime(user_data), interpreted_snapshot,
+                               specialization),
+          "interpreted block plan failed");
+    const auto interpreted_strict = strict.reads;
+    strict = {};
+    Check(MaterializeResources(plan, runtime(user_data), compiled_snapshot, specialization),
+          "compiled block plan failed");
+    const std::vector<uint32_t> expected{branch ? 0u : child[2], branch ? child[1] : 0u,
+                                         root[4], root[1], root[2]};
+    Check(compiled_snapshot.flattened_srt == expected &&
+              interpreted_snapshot.flattened_srt == expected,
+          "compiled SRT slots lost a value, a block edge or pointer masking");
+    Check(compiled_snapshot.specialization_reads == interpreted_snapshot.specialization_reads &&
+              strict.reads == interpreted_strict && strict.reads != 0u &&
+              compiled_snapshot.buffers[0].dwords[0] == root[4],
+          "compiled SRT slots changed the captured reads or the strict reader policy");
+  }
+  root[3] = 1u;
+  {
+    // The walker memo keeps the value the compiled slot read.
+    const auto direct = runtime(user_data);
+    SrtWalker clean(plan, CleanRuntime(direct));
+    SrtWalker walker(plan, direct, &clean);
+    std::vector<uint32_t> flat;
+    Check(walker.RefreshFlatBuffer(flat), "uncaptured compiled refresh failed");
+    const auto loaded = child[1];
+    child[1] ^= 0xffffffffu;
+    uint32_t value = 0;
+    Check(walker.Evaluate(plan.srt_reads[3].value, value) && value == loaded &&
+              flat[1] == loaded,
+          "descriptor evaluation reloaded a value already read by a compiled slot");
+    child[1] = loaded;
+  }
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  {
+    // The first slot already needs the missing pointer DWORD.
+    const auto truncated = runtime(std::span(user_data).first(1));
+    SrtWalker clean(plan, CleanRuntime(truncated));
+    SrtWalker walker(plan, truncated, &clean);
+    std::vector<uint32_t> flat;
+    Check(!walker.RefreshFlatBuffer(flat) && flat == std::vector<uint32_t>(5, 0u),
+          "compiled SRT slots accepted truncated user data");
+  }
+  uint32_t callbacks = 0;
+  const SrtRuntime callback_runtime{
+      .user_data = user_data,
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> out) {
+        ++*static_cast<uint32_t *>(data);
+        std::memcpy(out.data(), reinterpret_cast<const void *>(address), out.size_bytes());
+        return true;
+      },
+      .userdata = &callbacks};
+  std::vector<uint32_t> flat;
+  // Without a strict reader the clean slot fails; the ordinary slots before it use the callback.
+  Check(!SrtWalker(interpreted, callback_runtime).RefreshFlatBuffer(flat) && callbacks == 2u,
+        "interpreted walk changed its memory callbacks");
+  callbacks = 0;
+  Check(!SrtWalker(plan, callback_runtime).RefreshFlatBuffer(flat) && callbacks == 2u,
+        "compiled SRT slots bypassed a memory callback");
+  for (const int32_t offset : {-0x100, 0x7ffffff0}) {
+    program.memory_info[0].offset = static_cast<uint32_t>(offset);
+    auto bounded = ExtractResourcePlan(program);
+    auto reference = ExtractResourcePlan(program);
+    reference.srt_read_code.reset();
+    std::array<uint32_t, 3> edge = offset < 0 ? std::array<uint32_t, 3>{0x80u, 0u, 0u}
+                                              : std::array<uint32_t, 3>{0xfffffff0u, 0xffffu, 0u};
+    Check(bounded.srt_read_code != nullptr &&
+              !MaterializeResources(bounded, runtime(edge), snapshot, specialization) &&
+              !MaterializeResources(reference, runtime(edge), snapshot, specialization),
+          "compiled SRT slots accepted address underflow or 48-bit overflow");
+  }
 }
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
@@ -1355,6 +1521,7 @@ void DbgExit(int) { std::abort(); }
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
+  TestCompiledSrtReadsFollowBlocks();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();

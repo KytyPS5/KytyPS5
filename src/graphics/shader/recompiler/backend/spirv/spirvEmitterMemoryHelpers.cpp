@@ -379,6 +379,51 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	return EmitBitcastF32ToU32(state, result);
 }
 
+uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t value, uint32_t bits) {
+	// As native r11f_g11f_b10f and 16-bit float stores on RDNA2 and RDNA4: round toward zero, clamp
+	// finite values to the largest finite one, keep NaN. Negative values store 0 (11- and 10-bit
+	// formats). bits counts the exponent and mantissa: 11, 10, or 15 for the magnitude of a 16-bit
+	// float.
+	const auto mantissa_bits = bits - 5u;
+	const auto shift         = 23u - mantissa_bits;
+	const auto infinity      = 31u << mantissa_bits;
+	const auto magnitude     = EmitAndConstant(state, value, 0x7fffffffu);
+	const auto exponent =
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, magnitude, ConstantU32(state, 23u));
+	const auto normal =
+	    EmitBinaryU32(state, spv::OpShiftRightLogical,
+	                  EmitBinaryU32(state, spv::OpISub, magnitude, ConstantU32(state, 112u << 23u)),
+	                  ConstantU32(state, shift));
+	const auto subnormal_shift = EmitUMin32(
+	    state,
+	    EmitBinaryU32(state, spv::OpISub, ConstantU32(state, 136u - mantissa_bits), exponent),
+	    ConstantU32(state, 31u));
+	const auto subnormal = EmitBinaryU32(
+	    state, spv::OpShiftRightLogical,
+	    EmitOrU32(state, EmitAndConstant(state, value, 0x7fffffu), ConstantU32(state, 0x800000u)),
+	    subnormal_shift);
+	auto result =
+	    Select(state, TypeU32(state),
+	           EmitCompareU32Constant(state, spv::OpULessThan, exponent, 113u), subnormal, normal);
+	result = Select(state, TypeU32(state),
+	                EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, magnitude, 143u << 23u),
+	                ConstantU32(state, infinity - 1u), result);
+	result = Select(state, TypeU32(state),
+	                EmitCompareU32Constant(state, spv::OpIEqual, magnitude, 0x7f800000u),
+	                ConstantU32(state, infinity), result);
+	result = Select(state, TypeU32(state),
+	                EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, value, 0x80000000u),
+	                ConstantU32(state, 0u), result);
+	const auto payload = EmitUMax32(state,
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical,
+	                                              EmitAndConstant(state, value, 0x7fffffu),
+	                                              ConstantU32(state, shift)),
+	                                ConstantU32(state, 1u));
+	return Select(state, TypeU32(state),
+	              EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x7f800000u),
+	              EmitOrU32(state, payload, ConstantU32(state, infinity)), result);
+}
+
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw) {
 	const auto bits = info.component_bits[component];
@@ -481,9 +526,15 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
 	}
 	if (bits == 16u && info.type == Format::ComponentType::Float) {
-		const auto pair = EmitCompositeConstructF32x2(
-		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
-		return EmitPackHalf2x16(state, pair);
+		const auto sign = EmitAndConstant(
+		    state, EmitBinaryU32(state, spv::OpShiftRightLogical, data, ConstantU32(state, 16u)),
+		    0x8000u);
+		return EmitOrU32(
+		    state, sign,
+		    EmitF32ToUFloatBits(state, EmitAndConstant(state, data, 0x7fffffffu), 15u));
+	}
+	if (bits < 16u && info.type == Format::ComponentType::Float) {
+		return EmitF32ToUFloatBits(state, data, bits);
 	}
 	return data;
 }

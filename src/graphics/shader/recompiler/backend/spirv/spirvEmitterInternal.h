@@ -455,6 +455,7 @@ inline constexpr auto EmitTBufferSelectF32 =
 bool IsSignedFormatComponent(Format::ComponentType type);
 
 uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
+uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t value, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);

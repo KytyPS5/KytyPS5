@@ -179,6 +179,13 @@ static std::string RingHex(uint64_t value) {
   return text;
 }
 
+// In these tests each buffer collector run stands for one presented frame.
+inline void CollectBufferFrame(Libs::Graphics::RenderContext &context,
+                               Libs::Graphics::BufferCache &cache) {
+  context.GetTextureCache().AdvanceFrame();
+  cache.RunGarbageCollector();
+}
+
 struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
@@ -6291,7 +6298,7 @@ public:
                        false);
 
       for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
+        CollectBufferFrame(context, cache);
       }
       Require(name, "age before pressure",
               cache.IsRegionRegistered(base, allocation_size),
@@ -6299,7 +6306,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       const auto gc_submission_tick = scheduler.CurrentTick();
-      cache.RunGarbageCollector();
+      CollectBufferFrame(context, cache);
       uint32_t first_before_completion = 0;
       uint32_t second_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + first_offset,
@@ -6343,7 +6350,7 @@ public:
         }
         release_older_publication.release();
       });
-      cache.RunGarbageCollector();
+      CollectBufferFrame(context, cache);
       gc_returned = true;
       release_publication.join();
       scheduler.WaitPriorityOperations(older_publication_tick);
@@ -6385,7 +6392,7 @@ public:
                          false);
       }
       for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
+        CollectBufferFrame(context, cache);
       }
       constexpr uint64_t starvation_clean_offset =
           starvation_offset + starvation_count * starvation_stride;
@@ -6395,11 +6402,11 @@ public:
               static_cast<bool>(starvation_clean),
               "failed to create the clean starvation candidate");
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        CollectBufferFrame(context, cache);
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      cache.RunGarbageCollector();
+      CollectBufferFrame(context, cache);
       Require(
           name, "normal-GC dirty bypass",
           cache.IsRegionRegistered(base + starvation_offset,
@@ -6414,7 +6421,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
       const auto starvation_retired =
           BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
-      cache.RunGarbageCollector();
+      CollectBufferFrame(context, cache);
       Require(name, "critical-GC starvation cleanup",
               !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
@@ -6438,7 +6445,7 @@ public:
       const auto obtained =
           cache.FindBuffer(base + obtained_offset, residency_size);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        CollectBufferFrame(context, cache);
       }
       Require(name, "lookup-only owner identity",
               cache.FindBuffer(base + lookup_only_offset, residency_size) ==
@@ -6448,7 +6455,7 @@ public:
           base + obtained_offset, residency_size, false, false, obtained);
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      cache.RunGarbageCollector();
+      CollectBufferFrame(context, cache);
       Require(name, "lookup versus acquisition residency",
               !cache.IsRegionRegistered(base + lookup_only_offset,
                                         residency_size) &&
@@ -6567,7 +6574,7 @@ public:
         cache.FillBuffer(base + large_offset, large_size, large_value, false);
         const auto large_submission_tick = scheduler.CurrentTick();
         for (uint32_t tick = 0; tick <= 160; tick++) {
-          cache.RunGarbageCollector();
+          CollectBufferFrame(context, cache);
         }
         // The capacity-sized case can wrap the ring; the oversized case must
         // keep its separate staging allocation alive through publication.
@@ -6617,6 +6624,7 @@ public:
               "failed to allocate the over-capacity dirty native buffer");
       cache.FillBuffer(base + over_offset, over_size, over_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
+        CollectBufferFrame(context, cache);
       }
       std::vector<uint32_t> over_published(over_size / sizeof(uint32_t));
       Require(name, "over-capacity Buffer publication contents",
@@ -6654,7 +6662,7 @@ public:
       cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
                        grouped_second_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        CollectBufferFrame(context, cache);
       }
       Require(name, "per-owner fixed-ring retirement",
               !cache.IsRegionRegistered(base + grouped_first_offset,
@@ -6756,7 +6764,7 @@ public:
               "sparse GC fixtures merged into one source owner");
       const auto sparse_gc_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; ++tick) {
-        cache.RunGarbageCollector();
+        CollectBufferFrame(context, cache);
       }
       Require(name, "sparse multi-owner GC submission",
               scheduler.CurrentTick() == sparse_gc_tick + 1 &&
@@ -6784,7 +6792,7 @@ public:
       cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
                        disjoint_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        CollectBufferFrame(context, cache);
       }
       Require(name, "disjoint synchronized retirement",
               !cache.IsRegionRegistered(base + disjoint_owner_offset,
@@ -6846,7 +6854,7 @@ public:
       cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
                        reacquire_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        CollectBufferFrame(context, cache);
       }
       Require(name, "reacquire synchronized retirement",
               !cache.IsRegionRegistered(base + reacquire_owner_offset,
@@ -7197,6 +7205,7 @@ public:
       const auto collect = [&](uint64_t critical) {
         BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, critical);
         for (uint32_t tick = 0; tick < collections; tick++) {
+          CollectBufferFrame(context, cache);
         }
         BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, unlimited, unlimited);
       };
@@ -7229,6 +7238,52 @@ public:
       collect(0);
       Require(name, "unmap forgets pin", !owner_of(bda_offset),
               "a BDA pin survived the unmap of its page");
+
+      // A buffer used this frame survives every collector run in it.
+      constexpr uint64_t frame_offset = 20 * page;
+      const auto frame_owner = cache.FindBuffer(base + frame_offset, page);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+      for (uint32_t run = 0; run < collections; run++) {
+        cache.RunGarbageCollector();
+      }
+      Require(name, "same-frame survival", owner_of(frame_offset) == frame_owner,
+              "collector runs inside one frame evicted a buffer used in that frame");
+      for (uint32_t frame = 0; frame < 4; frame++) {
+        CollectBufferFrame(context, cache);
+      }
+      // Kept buffers are requeued, so the collector reaches this one again only after its tick age.
+      for (uint32_t run = 0; run < collections; run++) {
+        cache.RunGarbageCollector();
+      }
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, unlimited, unlimited);
+      Require(name, "idle frames evict", !owner_of(frame_offset),
+              "a buffer idle for several frames survived critical collection");
+
+      // Below critical pressure the eviction pass runs once a frame.
+      constexpr uint32_t batch = 40;
+      constexpr uint64_t batch_offset = 24 * page;
+      for (uint32_t i = 0; i < batch; i++) {
+        (void)cache.FindBuffer(base + batch_offset + i * page, page);
+      }
+      for (uint32_t frame = 0; frame <= 8; frame++) {
+        context.GetTextureCache().AdvanceFrame();
+      }
+      const auto batch_left = [&] {
+        uint32_t left = 0;
+        for (uint32_t i = 0; i < batch; i++) {
+          left += owner_of(batch_offset + i * page) ? 1u : 0u;
+        }
+        return left;
+      };
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, unlimited);
+      cache.RunGarbageCollector();
+      cache.RunGarbageCollector();
+      const auto left_in_frame = batch_left();
+      CollectBufferFrame(context, cache);
+      const auto left_next_frame = batch_left();
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, unlimited, unlimited);
+      Require(name, "one pass per frame", left_in_frame == batch - 32 && left_next_frame == 0,
+              "the normal-pressure eviction pass did not run exactly once per frame");
 
       cache.ResolveBdaFault(base + bda_offset, page);
       const auto refaulted = owner_of(bda_offset);

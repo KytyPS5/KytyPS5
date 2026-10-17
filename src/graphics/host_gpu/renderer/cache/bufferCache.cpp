@@ -194,7 +194,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_id          = m_lru_cache.Insert(id, m_texture_cache.FrameIndex());
+		buffer.last_used_frame = m_texture_cache.FrameIndex();
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -227,7 +228,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
-void BufferCache::TouchBuffer(const Buffer& buffer) {
 void BufferCache::MakePageTableResident(uint64_t table_offset, uint64_t size) {
 	if (!m_bda_pagetable_buffer.IsSparse() || size == 0) {
 		return;
@@ -309,8 +309,10 @@ void BufferCache::MakePageTableResident(uint64_t table_offset, uint64_t size) {
 	EXIT_IF(m_graphics.device.resetFences(1, &m_bda_table_fence) != vk::Result::eSuccess);
 }
 
+void BufferCache::TouchBuffer(Buffer& buffer) {
 	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		m_lru_cache.Touch(buffer.lru_id, m_texture_cache.FrameIndex());
+		buffer.last_used_frame = m_texture_cache.FrameIndex();
 	}
 }
 
@@ -1516,12 +1518,22 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
+	const uint64_t frame      = m_texture_cache.FrameIndex();
+	if (!aggressive && frame == m_gc_frame) {
+		return;
+	}
+	m_gc_frame = frame;
+	const uint64_t clean_idle =
+	    aggressive ? Headroom::ReleaseMinIdleFramesOver : Headroom::ReleaseMinIdleFrames;
+	if (frame < clean_idle) {
+		return;
+	}
+	const uint64_t threshold = frame - clean_idle;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(threshold, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
@@ -1532,6 +1544,15 @@ void BufferCache::RunGarbageCollector() {
 		}
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
+			// Not requeued: critical pressure must find it at once. The pass runs once a frame.
+			return false;
+		}
+		const uint64_t idle     = frame - std::min(frame, buffer.last_used_frame);
+		const uint64_t min_idle = dirty        ? Headroom::EvictMinIdleFramesCritical
+		                          : aggressive ? Headroom::ReleaseMinIdleFramesOver
+		                                       : Headroom::ReleaseMinIdleFrames;
+		if (idle < min_idle) {
+			m_lru_cache.Touch(buffer.lru_id, frame);
 			return false;
 		}
 		if (dirty) {

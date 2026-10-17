@@ -132,6 +132,7 @@ private:
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void ReadMemoryAttempt(uint64_t vaddr, uint64_t size, bool is_write, uint32_t attempt);
+	void TouchBuffer(Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
@@ -267,6 +268,7 @@ private:
 	uint64_t      m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t      m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t      m_gc_tick            = 0;
+	uint64_t      m_gc_frame           = UINT64_MAX;
 
 	PageDiff                                          m_page_diff;
 	std::deque<PreciseWrite>                          m_precise_writes;

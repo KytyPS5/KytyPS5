@@ -397,6 +397,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.maintenance8_enabled = graphics.maintenance8_enabled;
+		options.denorm_preserve_f32  = graphics.denorm_preserve_f32;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;

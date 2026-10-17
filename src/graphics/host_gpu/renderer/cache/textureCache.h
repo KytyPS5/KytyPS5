@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -239,6 +240,8 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	[[nodiscard]] ImageIds      FindImagesInRegionUncached(uint64_t address, uint64_t size,
+	                                                       bool page_overlap) const;
 	[[nodiscard]] ImageId       StencilPlaneOwner(const ImageDesc& desc) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
@@ -339,6 +342,16 @@ private:
 	// Advances whenever a registered image stops being servable: unregistered, parked, stencil
 	// proxy.
 	uint64_t         m_retire_epoch           = 0;
+	// Bumped by RegisterImage and UnregisterImage, the only editors of the page owner index.
+	struct RegionQuery {
+		uint64_t             generation   = UINT64_MAX;
+		uint64_t             address      = 0;
+		uint64_t             size         = 0;
+		bool                 page_overlap = false;
+		std::vector<ImageId> ids;
+	};
+	uint64_t                             m_region_generation = 0;
+	mutable std::array<RegionQuery, 256> m_region_queries {};
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 

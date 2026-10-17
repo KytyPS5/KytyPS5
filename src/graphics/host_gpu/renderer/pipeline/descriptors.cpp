@@ -604,6 +604,15 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+// KYTY_NO_TEXTURE_LAYOUT_IN_PLACE=1: lay a texture out on a probe copy, then again on the binding.
+static bool TextureLayoutInPlaceEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_TEXTURE_LAYOUT_IN_PLACE");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -745,7 +754,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		probe.resources.levels = probe_levels;
 		return probe.TryUpdateSize();
 	};
-	if (!layout_supported(levels) ||
+	// A refused layout binds the null surface, so the full chain can be laid out in place.
+	const bool in_place = levels <= physical_levels && TextureLayoutInPlaceEnabled();
+	if (!(in_place ? desc.info.TryUpdateSize() : layout_supported(levels)) ||
 	    (levels > physical_levels && !layout_supported(physical_levels))) {
 		char repeat[32] = "";
 		if (ShouldReportTextureRefusal(address, 0, TextureRefusal::SurfaceSize, repeat)) {
@@ -765,7 +776,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     base_level, last_level, max_mip, width, height, depth,
 			     static_cast<uint32_t>(tile));
 		}
-	} else {
+	} else if (!in_place) {
 		desc.info.UpdateSize();
 	}
 	const auto alignment =

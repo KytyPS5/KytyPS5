@@ -8109,7 +8109,8 @@ void TestPackedScalarBufferSelection() {
 
 ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,
                                     bool nonuniform = false,
-                                    bool writable = false) {
+                                    bool writable = false, bool predicated = false,
+                                    bool wrong_mask = false) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture(ShaderType::Pixel);
   auto *entry = fixture.block;
@@ -8159,6 +8160,10 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
         fixture.AddMemory(memory, 0x170));
   }
 
+  const auto active = fixture.Emit(ValueOpcode::IEqual32,
+      {fixture.Emit(ValueOpcode::GetBuiltin,
+          {Value(static_cast<uint32_t>(StageInputKind::HelperInvocation)), Value(0u)}), Value(0u)});
+  const auto stale = fixture.Emit(ValueOpcode::LaneId);
   std::array<Value, 4> sampler_words;
   for (uint32_t word = 0; word < sampler_words.size(); ++word) {
     const auto read = [&](Block *block, uint32_t address, uint32_t pc) {
@@ -8167,9 +8172,11 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
       MemoryInfo memory;
       memory.kind = ResourceKind::ScalarAddress;
       memory.offset = word * 4;
-      return fixture.Emit(ValueOpcode::LoadAddressU32,
+      const auto loaded = fixture.Emit(ValueOpcode::LoadAddressU32,
                           {handle, Value(0u), Value(0u), Value(true)},
                           fixture.AddMemory(memory, pc), block);
+      return predicated ? fixture.Emit(ValueOpcode::SelectU32, {active, loaded, stale}, 0, block)
+                        : loaded;
     };
     // PS 2190adcc312b2e6e selects SRT+448 or SRT+480 before its sample at
     // 0x4d4.
@@ -8192,7 +8199,13 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
                      Value(0u), Value(0u), Value(0u)});
   const auto address = fixture.ImageAddress();
   for (uint32_t use = 0; use < 2; ++use) {
-    const auto sampler = fixture.Sampler(sampler_words);
+    auto words = sampler_words;
+    if (predicated) {
+      const auto mask = wrong_mask && use == 1
+          ? fixture.Emit(ValueOpcode::LogicalNot, {active}) : active;
+      for (auto &word : words) word = fixture.Emit(ValueOpcode::ReadFirstLane, {word, mask});
+    }
+    const auto sampler = fixture.Sampler(words);
     MemoryInfo sample;
     sample.kind = ResourceKind::Image;
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
@@ -8219,33 +8232,35 @@ void TestConditionalSamplerPhi() {
   for (const bool diamond : {false, true}) {
     for (const bool reverse : {false, true}) {
       for (const bool reverse_phi : {false, true}) {
-        auto plan = ConditionalSamplerPlan(diamond, reverse, reverse_phi);
-        const auto source = plan.info.samplers[0].source;
-        LinearTestMemory memory;
-        for (uint32_t word = 448 / 4; word < (480 + 16) / 4; ++word) {
-          memory.words[word] = 0x400u + word;
-        }
-        FakeGuestMemory fake(ReadLinearTestMemory, &memory);
-        // Sampler selection compares a signed value against zero.
-        for (const auto flag : {-1, 0, 1, INT32_MIN, INT32_MAX}) {
-          memory.words[(0x1000 + 196) / 4] = std::bit_cast<uint32_t>(flag);
-          const uint32_t first = (flag < 0) != reverse ? 480 / 4 : 448 / 4;
-          memory.fail_address = 0x1000 + (first == 448 / 4 ? 480u : 448u);
-          DescriptorValue selected;
-          Check(EvaluateSrtDescriptor(plan, {}, source, selected),
-                "conditional sampler did not survive detached plan lifetime");
-          for (uint32_t word = 0; word < 4; ++word) {
-            Check(selected.dwords[word] == memory.words[first + word],
-                  "conditional sampler chose the wrong incoming descriptor");
+        for (const bool predicated : {false, true}) {
+          auto plan = ConditionalSamplerPlan(diamond, reverse, reverse_phi, false, false, predicated);
+          const auto source = plan.info.samplers[0].source;
+          LinearTestMemory memory;
+          for (uint32_t word = 448 / 4; word < (480 + 16) / 4; ++word) {
+            memory.words[word] = 0x400u + word;
           }
+          FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+          // Sampler selection compares a signed value against zero.
+          for (const auto flag : {-1, 0, 1, INT32_MIN, INT32_MAX}) {
+            memory.words[(0x1000 + 196) / 4] = std::bit_cast<uint32_t>(flag);
+            const uint32_t first = (flag < 0) != reverse ? 480 / 4 : 448 / 4;
+            memory.fail_address = 0x1000 + (first == 448 / 4 ? 480u : 448u);
+            DescriptorValue selected;
+            Check(EvaluateSrtDescriptor(plan, {}, source, selected),
+                  "conditional sampler did not survive detached plan lifetime");
+            for (uint32_t word = 0; word < 4; ++word) {
+              Check(selected.dwords[word] == memory.words[first + word],
+                    "conditional sampler chose the wrong incoming descriptor");
+            }
+          }
+          // An unreadable negative predicate reads as zero and selects the nonnegative edge.
+          memory.words[(0x1000 + 196) / 4] = UINT32_MAX;
+          memory.fail_address = 0x2000 + 196;
+          DescriptorValue selected;
+          Check(EvaluateSrtDescriptor(plan, {}, source, selected) &&
+                    selected.dwords[0] == memory.words[reverse ? 480 / 4 : 448 / 4],
+                "conditional sampler did not read unavailable predicate memory as zero");
         }
-        // An unreadable negative predicate reads as zero and selects the nonnegative edge.
-        memory.words[(0x1000 + 196) / 4] = UINT32_MAX;
-        memory.fail_address = 0x2000 + 196;
-        DescriptorValue selected;
-        Check(EvaluateSrtDescriptor(plan, {}, source, selected) &&
-                  selected.dwords[0] == memory.words[reverse ? 480 / 4 : 448 / 4],
-              "conditional sampler did not read unavailable predicate memory as zero");
       }
     }
     CheckFatal([&] { ConditionalSamplerPlan(diamond, false, false, true); },
@@ -8255,6 +8270,9 @@ void TestConditionalSamplerPhi() {
         [&] { ConditionalSamplerPlan(diamond, false, false, false, true); },
         "not a valid runtime value",
         "shader-written sampler predicate was accepted");
+    CheckFatal([&] { ConditionalSamplerPlan(diamond, false, false, false, false, true, true); },
+               "not a valid runtime value",
+               "first-lane sampler reused a different execution mask's projection");
   }
 }
 

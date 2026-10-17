@@ -715,19 +715,26 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
-	Value LowerDescriptorValue(Value value) {
-		value            = value.Resolve();
+	Value LowerDescriptorValue(Value value, Value active = {}) {
+		const auto resolved = ResolveActiveU32(value, active);
+		value = resolved.IsEmpty() ? value.Resolve() : resolved;
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return value;
 		// The scalar planner owns reads and lowers their address handles separately.
 		uint32_t memory_index = 0;
 		if (ScalarReadMemory(*inst, memory_index) != nullptr) return value;
-		const auto [cached, inserted] = m_descriptor_values.emplace(inst, value);
+		const auto [cached, inserted] =
+		    m_descriptor_values.emplace(std::pair {inst, active.TryInstruction()}, value);
 		if (!inserted) return cached->second;
 		if (inst->GetOpcode() != ValueOpcode::Phi) {
 			Inst* projected = nullptr;
 			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-				const auto lowered = LowerDescriptorValue(inst->Arg(arg));
+				auto argument_active = active;
+				if (inst->GetOpcode() == ValueOpcode::ReadFirstLane) {
+					const auto mask = inst->Arg(1).Resolve();
+					argument_active = arg == 0 && mask.TryInstruction() != nullptr ? mask : Value {};
+				}
+				const auto lowered = LowerDescriptorValue(inst->Arg(arg), argument_active);
 				if (lowered == inst->Arg(arg).Resolve()) continue;
 				if (projected == nullptr) {
 					projected = &m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
@@ -775,17 +782,21 @@ private:
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
 		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
 		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(0)) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(1))) {
+		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
+			return value;
+		}
+		const std::array arguments {LowerDescriptorValue(inst->Arg(0), active),
+		                            LowerDescriptorValue(inst->Arg(1), active)};
+		if (!ValidateRuntimeValue(m_program, arguments[0]) ||
+		    !ValidateRuntimeValue(m_program, arguments[1])) {
 			return value;
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
 		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
 		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
 		selected.SetArg(0, info.condition);
-		selected.SetArg(1, inst->Arg(true_arg));
-		selected.SetArg(2, inst->Arg(true_arg ^ 1u));
+		selected.SetArg(1, arguments[true_arg]);
+		selected.SetArg(2, arguments[true_arg ^ 1u]);
 		cached->second = Value(&selected);
 		return cached->second;
 	}
@@ -4387,7 +4398,7 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
-	std::map<const Inst*, Value>              m_descriptor_values;
+	std::map<std::pair<const Inst*, const Inst*>, Value> m_descriptor_values;
 	bool                                       m_shader_writes = false;
 };
 

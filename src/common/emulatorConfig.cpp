@@ -78,6 +78,10 @@ int GetPlayerFromUserId(int32_t user_id) {
 	return -1;
 }
 
+bool IsGuestUserId(int32_t user_id) {
+	return GetPlayerFromUserId(user_id) > 0;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }

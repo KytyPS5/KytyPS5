@@ -110,6 +110,8 @@ uint32_t GetKeyboardPlayer();
 int32_t  GetPlayerUserId(int player);
 // Returns -1 when the user ID does not belong to any player.
 int      GetPlayerFromUserId(int32_t user_id);
+// Players after the first are guests: they have no profile, trophies or NP account.
+bool     IsGuestUserId(int32_t user_id);
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();

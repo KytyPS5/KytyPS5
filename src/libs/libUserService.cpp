@@ -109,7 +109,7 @@ static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t 
 
 	const int player = Config::GetPlayerFromUserId(user_id);
 	const auto& base_name = Config::GetUserName();
-	const auto  user_name = player > 0 ? "Player " + std::to_string(player + 1) : base_name;
+	const auto  user_name = player > 0 ? "Guest " + std::to_string(player + 1) : base_name;
 	int         s         = snprintf(name, size, "%s", user_name.c_str());
 
 	EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= size);

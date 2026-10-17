@@ -93,6 +93,8 @@ struct ImageInfo {
 	void                                           UpdateSize();
 	// False where the guest layout has no host tiling; UpdateSize exits there instead.
 	[[nodiscard]] bool                             TryUpdateSize();
+	// TryUpdateSize without the per-thread memo of earlier layouts.
+	[[nodiscard]] bool                             TryUpdateSizeUncached();
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,

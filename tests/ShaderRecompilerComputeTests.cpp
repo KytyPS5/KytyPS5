@@ -53626,6 +53626,7 @@ void CheckDepthFeedbackAspects() {
   std::printf("[host]    %-32s ok\n", "DepthFeedbackAspects");
 }
 
+#include "ImageLayoutMemoTests.inc"
 void CheckDynamicRenderingState() {
   RenderState first{};
   first.width = 64;
@@ -56023,6 +56024,10 @@ int main(int argc, char **argv) {
     CheckScalarSelectIntoVccFeedsDescriptor(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--layout-memo-only") == 0) {
+    CheckImageLayoutMemo();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--long-recording-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLongRecordingSubmit();
@@ -57086,6 +57091,7 @@ int main(int argc, char **argv) {
   CheckDepthFeedbackAspects();
   CheckDynamicRenderingState();
   CheckDepthTargetFootprints();
+  CheckImageLayoutMemo();
   CheckImageDownloadPlan();
   CheckSlotVectorLifetime();
 #else

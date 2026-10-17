@@ -43,6 +43,10 @@ target_link_libraries(common
 		ZArchive::zarchive
 		nlohmann_json::nlohmann_json
 )
+if(WIN32)
+	# threads.cpp raises the system timer resolution for millisecond-based waits.
+	target_link_libraries(common PRIVATE winmm)
+endif()
 if(APPLE)
 	# hostStats.cpp reads GPU utilization from the IOAccelerator registry entries.
 	target_link_libraries(common PRIVATE "-framework CoreFoundation" "-framework IOKit")

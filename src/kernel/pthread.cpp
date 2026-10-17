@@ -526,6 +526,25 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	}
 }
 
+// Host condition variable timeouts are millisecond granular. Finish the last stretch of a guest
+// timed wait with short high-resolution sleeps, so periodic guest loops do not drift late.
+template <typename ConditionVariable, typename Lock>
+static void CondTimedWaitSlice(ConditionVariable& cv, Lock& lock,
+                               std::chrono::steady_clock::duration remaining) {
+	constexpr std::chrono::steady_clock::duration precise = std::chrono::microseconds(2000);
+	constexpr std::chrono::steady_clock::duration step    = std::chrono::microseconds(100);
+	constexpr std::chrono::steady_clock::duration poll =
+	    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS);
+	if (remaining > precise) {
+		cv.wait_for(lock, std::min(remaining - precise, poll));
+		return;
+	}
+	lock.unlock();
+	Common::Thread::SleepMicro(static_cast<uint32_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::min(remaining, step)).count()));
+	lock.lock();
+}
+
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	if (nanoseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -2881,12 +2900,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 				break;
 			}
 
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			thread->cond_cv.wait_for(cond_lock, poll);
+			CondTimedWaitSlice(thread->cond_cv, cond_lock, deadline - now);
 
 			if (!ready()) {
 				cond_lock.unlock();
@@ -2966,12 +2980,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 			break;
 		}
 
-		const auto remaining = deadline - now;
-		const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-		                            ? remaining
-		                            : std::chrono::steady_clock::duration(
-		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		thread->cond_cv.wait_for(cond_lock, poll);
+		CondTimedWaitSlice(thread->cond_cv, cond_lock, deadline - now);
 
 		if (!ready()) {
 			cond_lock.unlock();

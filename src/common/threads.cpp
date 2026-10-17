@@ -20,6 +20,7 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+#include <timeapi.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 
@@ -181,6 +182,11 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Condition variable and event timeouts round up to the system tick (15.6 ms by default).
+	// Guest timed waits finish with high-resolution sleeps, but only within 1 ms ticks.
+	timeBeginPeriod(1);
+#endif
 }
 
 Thread::Thread(thread_func_t func, void* arg)

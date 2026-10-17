@@ -19520,6 +19520,153 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Dead Space: a GPU buffer write in the 1D/2D pair's padding must not hide the 1D texel.
+  void CheckRowAliasPaddingWrite() {
+    constexpr const char *name = "RowAliasPaddingWrite";
+    constexpr uintptr_t base = 0x0000000216000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr auto tile = Prospero::TileMode::kStandard64KB;
+    constexpr uint32_t guest_bytes = 0xffffffffu;
+    constexpr uint32_t first_bits = 0x11111111u;
+    constexpr uint32_t displacer_bits = 0x22222222u;
+    constexpr uint32_t written_bits = 0x3f800000u;
+    constexpr uint64_t padding_offset = 0x8000;
+    constexpr uint64_t padding_size = 0x1000;
+    EnsureRuntimeContext();
+
+    const auto make_desc = [&](Prospero::ImageType type, vk::Extent3D extent, vk::Format format,
+                               Prospero::BufferFormat guest_format, uint32_t block) {
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(guest_format, extent.width, extent.height, 1, 1, tile, false,
+                              total);
+      TileSizeOffset offsets[16]{};
+      TilePaddedSize padded[16]{};
+      TileGetTextureSize(guest_format, extent.width, extent.height, 1, tile, nullptr, offsets,
+                         padded);
+      ImageDesc desc{};
+      desc.type = BindingType::Texture;
+      desc.info.data = {base, total.size};
+      desc.info.pixel_format = format;
+      desc.info.guest_format = guest_format;
+      desc.info.type = type;
+      desc.info.extent = extent;
+      desc.info.resources = {1, 1};
+      desc.info.pitch = TileGetTexturePitch(guest_format, extent.width, tile);
+      desc.info.bytes_per_block = block;
+      desc.info.tile_mode = tile;
+      desc.info.mip_layout[0] = {
+          offsets[0].src_size != 0 ? offsets[0].src_offset : offsets[0].offset,
+          offsets[0].src_size != 0 ? offsets[0].src_size : offsets[0].size, padded[0].width,
+          padded[0].height};
+      desc.info.UpdateSize();
+      desc.view_info.format = format;
+      desc.view_info.type = type == Prospero::ImageType::kColor1D ? vk::ImageViewType::e1D
+                                                                  : vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.level_count = 1;
+      desc.view_info.layer_count = 1;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      return desc;
+    };
+    auto row = make_desc(Prospero::ImageType::kColor1D, {1, 1, 1}, vk::Format::eR32Uint,
+                         Prospero::BufferFormat::k32UInt, sizeof(uint32_t));
+    row.type = BindingType::Storage;
+    row.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+    auto value = make_desc(Prospero::ImageType::kColor2D, {1, 1, 1}, vk::Format::eR32Uint,
+                           Prospero::BufferFormat::k32UInt, sizeof(uint32_t));
+    auto displacer = make_desc(Prospero::ImageType::kColor2D, {64, 64, 1},
+                               vk::Format::eR32G32Uint, Prospero::BufferFormat::k32_32UInt,
+                               2 * sizeof(uint32_t));
+    Require(name, "one guest layout",
+            row.info.data == value.info.data && row.info.mip_layout == value.info.mip_layout &&
+                row.info.data.size >= padding_offset + padding_size &&
+                displacer.info.data.address == base && displacer.info.data.size <= allocation_size,
+            "the 1D and 2D descriptions do not share one block with padding after the texel");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "alias allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "alias mapping failed");
+    std::fill_n(static_cast<uint32_t *>(mapped), allocation_size / sizeof(uint32_t),
+                guest_bytes);
+    {
+      // The reconcile that merges a superseded span reads guest memory through the GPU thread.
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+
+      const auto fill = [&](ImageId id, uint32_t bits) {
+        auto &image = cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                      vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        const auto clear = vk::ClearColorValue{}.setUint32({bits, bits, 0, 0});
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+        cache.MarkGpuWritten(id);
+      };
+      const auto expect = [&](const char *check, ImageId id, uint32_t bits) {
+        const auto texel = ReadCachedTexel(name, context, id).at(0);
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "the 2D image holds 0x%08x, expected 0x%08x",
+                      texel, bits);
+        Require(name, check, texel == bits, detail);
+      };
+
+      fill(cache.FindImage(row), first_bits);
+      const auto value_id = cache.FindImage(value);
+      expect("2D view reads the 1D write", value_id, first_bits);
+
+      fill(cache.FindImage(displacer), displacer_bits);
+      Require(name, "2D image parked", cache.GetImage(value_id).dormant,
+              "the displacing transient did not park the 2D image");
+
+      const auto row_id = cache.FindImage(row);
+      fill(row_id, written_bits);
+      // Another surface's GPU buffer write lands in the block's padding, not on the texel.
+      cache.InvalidateMemoryFromGPU(base + padding_offset, padding_size);
+      Require(name, "1D image superseded only in its padding",
+              cache.GetImage(row_id).IsGpuModified() && cache.GetImage(row_id).IsSuperseded(),
+              "the padding write did not leave the 1D image GPU-written with a superseded span");
+
+      Require(name, "2D image woken", cache.FindImage(value) == value_id,
+              "the 2D lookup did not wake its parked image");
+      expect("woken 2D image reads the 1D write beside the padding write", value_id,
+             written_bits);
+      Require(name, "padding span reconciled into the 2D image",
+              !cache.GetImage(value_id).IsSuperseded() &&
+                  cache.GetImage(value_id).IsBufferModified(),
+              "the 1D image's superseded span did not reach the woken 2D image's reconcile");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "alias backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // RE4: remapped streamed pages must replace the zeros uploaded while unmapped.
   void CheckRemapReloadsTexture() {
     constexpr const char *name = "RemapReloadsTexture";
@@ -62750,6 +62897,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckLayoutAliasSync();
     vulkan.CheckRowAliasWake();
+    vulkan.CheckRowAliasPaddingWrite();
     vulkan.CheckRemapReloadsTexture();
     vulkan.CheckSparseBufferBinding();
     vulkan.CheckDepthOnlyCopyKeepsStencilOwner();

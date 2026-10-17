@@ -116,6 +116,7 @@ public:
 		m_gpu_modified = true;
 		++m_gpu_write_serial;
 		m_gpu_write_epoch = NextImageWriteEpoch();
+		m_superseded_since_gpu_write.clear();
 		std::fill(layer_content.begin(), layer_content.end(), m_gpu_write_epoch);
 	}
 	void ClearGpuModified() noexcept { m_gpu_modified = false; }
@@ -137,6 +138,7 @@ public:
 		m_buffer_modified    = true;
 		m_buffer_write_epoch = epoch;
 		m_superseded.clear();
+		m_superseded_since_gpu_write.clear();
 		HeapChanged();
 	}
 	// Guest bytes a later GPU buffer write replaced; never written back from this image.
@@ -147,6 +149,17 @@ public:
 	}
 	[[nodiscard]] bool SupersededAfterLastGpuWrite() const noexcept {
 		return IsSuperseded() && m_superseded_epoch > m_gpu_write_epoch;
+	}
+	// Whether GPU buffer writes after the last GPU write replaced all of the range.
+	[[nodiscard]] bool SupersededSinceGpuWrite(uint64_t address, uint64_t size) const noexcept;
+	// Empty while SupersededAfterLastGpuWrite() holds means too many ranges to keep.
+	[[nodiscard]] std::span<const std::pair<uint64_t, uint64_t>>
+	SupersededSinceGpuWriteRanges() const noexcept {
+		return m_superseded_since_gpu_write;
+	}
+	void ClearSuperseded() noexcept {
+		m_superseded.clear();
+		m_superseded_since_gpu_write.clear();
 	}
 	void ClearBufferModified() noexcept { m_buffer_modified = false; }
 
@@ -232,6 +245,8 @@ private:
 	uint64_t                                   m_gpu_write_epoch    = 0;
 	uint64_t                                   m_buffer_write_epoch = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> m_superseded;
+	// Exact, never widened: the ranges of m_superseded written after m_gpu_write_epoch.
+	std::vector<std::pair<uint64_t, uint64_t>> m_superseded_since_gpu_write;
 	uint64_t                                   m_superseded_epoch = 0;
 	bool                                       m_gpu_modified     = false;
 	bool                                       m_buffer_modified  = false;

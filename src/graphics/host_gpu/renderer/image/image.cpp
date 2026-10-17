@@ -927,6 +927,23 @@ bool Image::Supersede(uint64_t address, uint64_t size) {
 	}
 	m_superseded.emplace_back(begin, end);
 	m_superseded_epoch = NextImageWriteEpoch();
+	if (m_superseded_since_gpu_write.size() < MaxRanges) {
+		auto& fresh = m_superseded_since_gpu_write;
+		fresh.emplace_back(begin, end);
+		std::ranges::sort(fresh);
+		size_t kept = 0;
+		for (size_t i = 1; i < fresh.size(); i++) {
+			if (fresh[i].first <= fresh[kept].second) {
+				fresh[kept].second = std::max(fresh[kept].second, fresh[i].second);
+			} else {
+				fresh[++kept] = fresh[i];
+			}
+		}
+		fresh.resize(kept + 1);
+	} else {
+		// Too many pieces to keep exactly: forget them, which only ever claims less.
+		m_superseded_since_gpu_write.clear();
+	}
 	std::ranges::sort(m_superseded);
 	size_t merged = 0;
 	for (size_t i = 1; i < m_superseded.size(); i++) {
@@ -945,6 +962,16 @@ bool Image::Supersede(uint64_t address, uint64_t size) {
 	       m_superseded.front().second == image_end;
 }
 
+bool Image::SupersededSinceGpuWrite(uint64_t address, uint64_t size) const noexcept {
+	// Only the bytes this image covers can be newer here.
+	const auto begin = std::max(address, info.data.address);
+	const auto end   = std::min(address + size, info.data.address + info.data.size);
+	if (begin >= end) {
+		return true;
+	}
+	return std::ranges::any_of(m_superseded_since_gpu_write, [&](const auto& range) {
+		return range.first <= begin && end <= range.second;
+	});
 }
 
 uint64_t Image::HashGuestEdges() const {

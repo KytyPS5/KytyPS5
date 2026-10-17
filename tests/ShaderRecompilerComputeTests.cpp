@@ -26829,13 +26829,24 @@ TestCase VectorMadF32RoundsProduct() {
   test.code = std::move(code);
   test.initial = {0x3f800001u, 0x3f7ffffeu, 0xbf800000u};
   // (1+2^-23)*(1-2^-23)-1 rounds to zero for MAD, but -2^-46 for FMA.
+#if defined(__APPLE__)
+  // macOS fuses legacy MADs in compute shaders, so they give the FMA result.
+  test.expected = {0xa8800000u, 0xa8800000u, 0xa8800000u, 0xa8800000u,
+                   0xa8800000u, 0xa8800000u, 0xa8800000u, 0xa8800000u,
+                   0xa8800000u, 0xa8800000u};
+#else
   test.expected = {0u, 0u, 0u, 0u, 0u, 0xa8800000u, 0xa8800000u,
                    0xa8800000u, 0xa8800000u, 0xa8800000u};
+#endif
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAC_F32,
                   O::V_MAD_F32, O::V_MADMK_F32, O::V_MADAK_F32,
                   O::V_FMAC_F32, O::V_FMA_F32, O::V_FMAMK_F32, O::V_FMAAK_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+#if defined(__APPLE__)
+  test.required_spirv = {"Fma"};
+#else
   test.required_spirv = {"OpFMul", "OpFAdd", "NoContraction", "Fma"};
+#endif
   return test;
 }
 
@@ -26864,7 +26875,12 @@ TestCase VectorMadF32FlushesDenorms() {
                   0u, 0x3f800000u, 0x00400000u,
                   0x00800000u, 0x3f000000u, 0x00800000u,
                   0x00800000u, 0x3f800000u, 0x80800001u};
+#if defined(__APPLE__)
+  // macOS fuses legacy MADs in compute shaders: the 2^-127 product of sample 3 is kept, not flushed.
+  test.expected = {0u, 0u, 0u, 0x00c00000u, 0x80000000u};
+#else
   test.expected = {0u, 0u, 0u, 0x00800000u, 0x80000000u};
+#endif
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   // Legacy MAD always flushes, even when the shader requests denorm preservation.

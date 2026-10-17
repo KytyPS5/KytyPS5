@@ -3787,6 +3787,7 @@ private:
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
 		image.unfiltered_access_only &= op == ValueOpcode::ImageRead || op == ValueOpcode::ImageWrite;
+		image.queries_size = image.queries_size || op == ValueOpcode::ImageQueryDimensions;
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

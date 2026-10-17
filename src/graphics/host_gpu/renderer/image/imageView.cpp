@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -309,6 +311,17 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const auto& image      = backing;
 	auto        normalized = view_info;
+	if (normalized.min_lod != 0 && normalized.level_count != 0 &&
+	    !m_graphics.supports_image_view_min_lod) {
+		// VK_EXT_image_view_min_lod is missing (MoltenVK): remap the base level so the
+		// view still clamps whole mip levels. This runs before the view cache lookup so
+		// the remapped key is what gets cached and reused.
+		const uint32_t skip =
+		    std::min(normalized.min_lod / 256u, normalized.level_count - 1u);
+		normalized.base_level += skip;
+		normalized.level_count -= skip;
+		normalized.min_lod %= 256u;
+	}
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
 	const auto  image_aspect = FullAspectMask(image.format);
 	if (image_aspect & vk::ImageAspectFlagBits::eDepth &&
@@ -361,7 +374,10 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
-	if (normalized.min_lod != 0) {
+	// Without VK_EXT_image_view_min_lod the pNext struct itself is invalid, so only
+	// chain it when the device supports it; otherwise whole-level clamping was already
+	// folded into base_level above and any sub-level fraction is dropped.
+	if (normalized.min_lod != 0 && m_graphics.supports_image_view_min_lod) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;

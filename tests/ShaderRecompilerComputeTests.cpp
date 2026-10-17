@@ -31487,7 +31487,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u) {
     test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
   }
   test.opcodes.insert(test.opcodes.end(), {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORDX4});
-  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "Volatile"};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "OpAtomicLoad"};
   return test;
 }
 
@@ -31665,7 +31665,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
-  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "OpAtomicLoad"};
   if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
                                          "indirect_buffer_format_geometry"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
@@ -33667,7 +33667,7 @@ TestCase FlatLoadDlcCaptured(u32 wave_size) {
   test.bda_mappings = {{0x1f00000000ull, 32}};
   test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::FLAT_LOAD_DWORDX2,
                   O::BUFFER_STORE_DWORD, O::S_WAITCNT_VSCNT, O::S_ENDPGM};
-  test.required_spirv = {"OpDecorate %buffers Coherent", " 0 Coherent", "Volatile|Aligned 4"};
+  test.required_spirv = {"OpDecorate %buffers Coherent", " 0 Coherent", "OpAtomicLoad"};
   test.decoded_counts = {{"dlc=1", 2}};
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
@@ -35988,7 +35988,7 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                   O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
                   O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  test.required_spirv = {"Coherent", "OpAtomicLoad", "OpAtomicIAdd", "OpLoopMerge"};
   if (store_completion) {
     test.opcodes.push_back(O::S_WAITCNT_VSCNT);
     test.opcodes.push_back(O::S_LSHL_B64);

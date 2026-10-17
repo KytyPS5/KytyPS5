@@ -167,6 +167,15 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
+// Coherent (GLC) loads may read what other invocations store concurrently, such as a value another
+// workgroup publishes while this one polls it. A non-atomic load of such a value is a data race,
+// and a compiler may move it out of the polling loop.
+void EmitCoherentLoad(EmitterState& state, uint32_t value, uint32_t pointer) {
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+}
+
 void RecordBdaFault(EmitterState& state, uint32_t page) {
 	const auto word =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5));
@@ -205,10 +214,12 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 		}
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
+		if (coherent) {
+			EmitCoherentLoad(state, value, pointer);
+			return value;
+		}
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-		                          spv::MemoryAccessAlignedMask |
-		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
-		                          alignment);
+		                          spv::MemoryAccessAlignedMask, alignment);
 		return value;
 	});
 }
@@ -408,6 +419,10 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	if (resource.memory_access == spv::MemoryAccessVolatileMask) {
+		EmitCoherentLoad(ctx.state, value, pointer);
+		return value;
+	}
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
 	                              resource.memory_access);
 	return value;

@@ -769,6 +769,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME texture_cache_meta_slice_clear
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --meta-slice-clear-only)
+	add_test(NAME shader_wave64_execz_loop_exit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --execz-loop-exit-only)
+	add_test(NAME texture_cache_stencil_plane_equal_footprint
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stencil-plane-only)
+	add_test(NAME gpu_submission_merge
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submission-merge-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME color_render_target_1d

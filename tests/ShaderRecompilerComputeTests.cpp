@@ -3125,6 +3125,102 @@ public:
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");
   }
 
+  // Queued guest submissions reach Vulkan as one submission, before the GPU thread idles.
+  void CheckGpuSubmissionMerge() {
+    constexpr const char *name = "GpuSubmissionMerge";
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    auto &scheduler = context.GetCommandScheduler();
+    const auto write = [](uint32_t *packet, uint32_t *destination, uint32_t value) {
+      const auto address = reinterpret_cast<uint64_t>(destination);
+      packet[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+      packet[1] = 0;
+      packet[2] = static_cast<uint32_t>(address);
+      packet[3] = static_cast<uint32_t>(address >> 32u);
+      packet[4] = value;
+    };
+    const auto current_tick = [&] {
+      uint64_t tick = 0;
+      gpu.SendCommandSync([&] { tick = scheduler.CurrentTick(); });
+      return tick;
+    };
+
+    constexpr uint32_t Lists = 32;
+    std::array<uint32_t, Lists> values{};
+    std::array<std::array<uint32_t, 5>, Lists> lists{};
+    for (uint32_t i = 0; i < Lists; ++i) {
+      write(lists[i].data(), &values[i], 100 + i);
+    }
+    gpu.WaitForIdle();
+    const auto idle_tick = current_tick();
+    std::binary_semaphore lane_entered{0};
+    std::binary_semaphore release_lane{0};
+    gpu.SendCommand([&] {
+      lane_entered.release();
+      release_lane.acquire();
+    });
+    lane_entered.acquire();
+    for (uint32_t i = 0; i < Lists; ++i) {
+      gpu.Submit(lists[i]);
+    }
+    release_lane.release();
+    gpu.WaitForIdle();
+    const auto merged_tick = current_tick();
+    bool all_written = true;
+    for (uint32_t i = 0; i < Lists; ++i) {
+      all_written &= values[i] == 100 + i;
+    }
+    Require(name, "lists complete", all_written, "a merged command list did not run");
+    Require(name, "submitted before idle", merged_tick > idle_tick,
+            "the GPU thread reported idle with merged command lists still unsubmitted");
+    Require(name, "merged", merged_tick - idle_tick < Lists / 2,
+            "queued command lists were not merged into one Vulkan submission");
+    scheduler.GetMasterSemaphore().Wait(merged_tick - 1);
+
+    // A list that blocks must not wait behind merged work that never reached Vulkan.
+    alignas(16) uint32_t label = 0;
+    uint32_t first = 0;
+    uint32_t second = 0;
+    std::array<uint32_t, 5> head{};
+    write(head.data(), &first, 7);
+    std::array<uint32_t, 12> blocked{};
+    const auto label_address = reinterpret_cast<uint64_t>(&label);
+    blocked[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+    blocked[1] = 0x10u | 3u;
+    blocked[2] = static_cast<uint32_t>(label_address);
+    blocked[3] = static_cast<uint32_t>(label_address >> 32u);
+    blocked[4] = 1;
+    blocked[5] = UINT32_MAX;
+    write(blocked.data() + 7, &second, 9);
+    gpu.SendCommand([&] {
+      lane_entered.release();
+      release_lane.acquire();
+    });
+    lane_entered.acquire();
+    const auto before_block = scheduler.CurrentTick();
+    gpu.Submit(head);
+    gpu.Submit(blocked);
+    release_lane.release();
+    bool flushed = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!flushed && std::chrono::steady_clock::now() < deadline) {
+      flushed = current_tick() > before_block && first == 7;
+      std::this_thread::yield();
+    }
+    gpu.SendCommandSync([&] { label = 1; });
+    gpu.WaitForIdle();
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    Require(name, "blocked queue flushes", flushed && second == 9,
+            "a blocked list waited on merged work that was never submitted");
+    context.ShutdownGpu();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckGpuSuspendPoint() {
     constexpr const char *name = "GpuSuspendPoint";
     EnsureRuntimeContext();
@@ -62657,6 +62753,11 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuSuspendPoint();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--submission-merge-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuSubmissionMerge();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--guest-bit-ops-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, GuestNaniteStripFirstBitHigh());
@@ -63362,6 +63463,7 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, test);
   }
   vulkan.CheckGpuSuspendPoint();
+  vulkan.CheckGpuSubmissionMerge();
   CheckMultiMrtExportOutputs(false);
   CheckMultiMrtExportOutputs(true);
   CheckCompressedExportDecode(&vulkan);

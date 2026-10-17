@@ -11781,6 +11781,57 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerSetpcDwordJumpTableAliasedSelector() {
+  // NHL 27 (PPSA34063) shape: the table load overwrites its own index register.
+  const uint32_t shader[] = {
+      EncodeSop2(0x07, 6, 0, 130), // s_min_u32 s6, s0, 2
+      EncodeSop2(0x1e, 6, 6, 130), // s_lshl_b32 s6, s6, 2
+      EncodeSop1(0x1f, 4, 0),      // s_getpc_b64 s[4:5]
+      EncodeSop2(0x00, 4, 4, 255), // s_add_u32 s4, s4, literal
+      0x00000034u,
+      EncodeSop2(0x04, 5, 5, 128), // s_addc_u32 s5, s5, 0
+      EncodeSmem0(0x00, 6, 2),
+      (6u << 25u),                 // s_load_dword s6, s[4:5], s6
+      EncodeSopp(0x0c, 0),         // s_waitcnt 0
+      EncodeSop2(0x01, 4, 4, 6),   // s_sub_u32 s4, s4, s6
+      EncodeSop2(0x05, 5, 5, 128), // s_subb_u32 s5, s5, 0
+      EncodeSop1(0x20, 0, 4),      // s_setpc_b64 s[4:5]
+      EncodeSMovB32(1, 129),       // case 0 at pc 0x30
+      EncodeSopp(0x02, 1),
+      EncodeSMovB32(2, 129), // case 1 at pc 0x38
+      EncodeSopp(0x01, 0),
+      0x00000010u,
+      0x00000008u,
+      0x00000010u, // table at pc 0x40, targets relative backward from pc 0x40
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
+        "aliased-selector S_SETPC_B64 table did not select dispatcher fallback");
+  const auto jump = std::find_if(
+      result.program.blocks.begin(), result.program.blocks.end(),
+      [](const auto *block) { return !block->terminator.cases.empty(); });
+  Check(jump != result.program.blocks.end() &&
+            (*jump)->ImmSuccessors().size() == 2 &&
+            (*jump)->terminator.indexed &&
+            (*jump)->terminator.cases.size() == 3 &&
+            (*jump)->terminator.cases[0].value == 0u &&
+            (*jump)->terminator.cases[0].target->start_pc == 0x30u &&
+            (*jump)->terminator.cases[1].value == 4u &&
+            (*jump)->terminator.cases[1].target->start_pc == 0x38u &&
+            (*jump)->terminator.cases[2].value == 8u &&
+            (*jump)->terminator.cases[2].target->start_pc == 0x30u,
+        "aliased-selector S_SETPC_B64 table targets or selector mapping changed");
+  Check((result.ir_dump.find("SLoadDword") == std::string::npos),
+        "aliased-selector S_SETPC_B64 table load reached normal IR");
+  Check(SpirvContainsOpcode(result.spirv, 251),
+        "aliased-selector S_SETPC_B64 dispatcher lacks OpSwitch");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerExpVertexOutputs() {
   const uint32_t shader[] = {
       EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), // POS0
@@ -16589,6 +16640,7 @@ int main() {
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();
+  TestNewShaderRecompilerSetpcDwordJumpTableAliasedSelector();
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();

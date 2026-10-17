@@ -82,6 +82,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::CompositeConstructU64:
 		case ValueOpcode::CompositeExtractU64:
@@ -1055,6 +1056,26 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 			c.ucomiss(c.xmm0, c.xmm1);
 			c.jae(done, Near);
 			c.cvttss2si(c.rax, c.xmm0);
+			c.L(done);
+			break;
+		}
+		case ValueOpcode::ConvertS32F32: {
+			Xbyak::Label done;
+			c.movd(c.xmm0, c.eax);
+			c.xor_(c.eax, c.eax);
+			c.ucomiss(c.xmm0, c.xmm0);
+			c.jp(done, Near);
+			c.mov(c.ecx, 0xcf000000u);
+			c.movd(c.xmm1, c.ecx);
+			c.mov(c.eax, 0x80000000u);
+			c.ucomiss(c.xmm0, c.xmm1);
+			c.jbe(done, Near);
+			c.mov(c.ecx, 0x4f000000u);
+			c.movd(c.xmm1, c.ecx);
+			c.mov(c.eax, 0x7fffffffu);
+			c.ucomiss(c.xmm0, c.xmm1);
+			c.jae(done, Near);
+			c.cvttss2si(c.eax, c.xmm0);
 			c.L(done);
 			break;
 		}

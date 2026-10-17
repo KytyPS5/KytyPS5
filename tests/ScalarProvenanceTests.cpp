@@ -539,6 +539,42 @@ void TestFloatComparisonDescriptorInputs() {
   }
 }
 
+void TestSignedFloatDescriptorInputs() {
+  Fixture fixture;
+  const auto user = fixture.Emit(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+  const auto floating = fixture.Emit(ValueOpcode::BitCastF32U32, {user});
+  const auto converted = fixture.Emit(ValueOpcode::ConvertS32F32, {floating});
+  const auto packed = fixture.Emit(ValueOpcode::ReadFirstLane,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {converted, Value(8u)}), Value(true)});
+  Check(ValidateRuntimeValue(fixture.program, packed),
+        "uniform signed float conversion was rejected");
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {converted, packed}, .dword_count = 2});
+  auto plan = ExtractResourcePlan(fixture.program);
+  struct Input { uint32_t bits; uint32_t expected; };
+  constexpr std::array inputs = {
+      Input{0x40600000u, 0x00000003u},
+      Input{0xc0600000u, 0xfffffffdu},
+      Input{0x00000001u, 0u},
+      Input{0x80000001u, 0u},
+      Input{0xcf000000u, 0x80000000u},
+      Input{0x4effffffu, 0x7fffff80u},
+      Input{0x4f000000u, 0x7fffffffu},
+      Input{0xcf000001u, 0x80000000u},
+      Input{0x7fc00000u, 0u},
+      Input{0x7f800000u, 0x7fffffffu},
+      Input{0xff800000u, 0x80000000u}};
+  for (const auto &input : inputs) {
+    const std::array user_data{input.bits};
+    DescriptorValue result;
+    Check(EvaluateSource(plan, {.user_data = user_data}, 0, result) &&
+              result.dwords[0] == input.expected &&
+              result.dwords[1] == (input.expected << 8u),
+          "signed descriptor conversion disagrees with saturating conversion");
+  }
+}
+
 void TestSharedIntegerRuntimeDependencies() {
   Fixture fixture;
   const auto lane = fixture.Emit(ValueOpcode::LaneId);
@@ -906,6 +942,7 @@ int main() {
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
     TestFloatComparisonDescriptorInputs();
+    TestSignedFloatDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();

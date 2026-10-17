@@ -1116,7 +1116,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	uint32_t   mesh_instances = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
-		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
+		if (mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable)) {
+			// Fast-launch indexing/restart semantics are not implemented; dropping
+			// the draw is safer than executing it wrong. Warn once, skip always.
+			static std::atomic_bool fast_launch_warned = false;
+			if (!fast_launch_warned.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Warning: fast-launch mesh draw skipped: indexed=%u restart=%u\n",
+				            draw.IsIndexed(), primitive_restart_enable);
+			}
+			return;
+		}
 		static std::atomic_bool restart_warned = false;
 		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
 			std::printf("Warning: primitive restart is not implemented for mesh shaders; "
@@ -1124,8 +1133,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			            static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed());
 		}
 		if (mesh.primitives_per_group == 0) {
-			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
-			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
+			// No group size means the group count is undefined (and the division
+			// below would fault). Skip the draw instead of aborting.
+			static std::atomic_bool ppg_warned = false;
+			if (!ppg_warned.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Warning: mesh draw skipped: primitives_per_group=0 "
+				            "(primitive=%u indexed=%u restart=%u)\n",
+				            static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(),
+				            primitive_restart_enable);
+			}
+			return;
 		}
 		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
 		if (primitives == 0 || draw.instance_count == 0) {

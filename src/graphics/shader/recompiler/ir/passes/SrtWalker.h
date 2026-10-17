@@ -27,6 +27,8 @@ public:
 	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
 	    m_source(source), m_ranges(ranges) {}
 	SrtRuntime ObservedRuntime();
+	// True when the runtime's ordinary reads copy host memory directly.
+	static bool ReadsHostMemory(const SrtRuntime& runtime);
 
 private:
 	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);

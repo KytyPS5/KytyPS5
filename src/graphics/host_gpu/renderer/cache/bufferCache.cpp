@@ -61,6 +61,15 @@ bool FaultPublishes() {
 	return enabled;
 }
 
+// KYTY_NO_FAULT_WAITS_HOT_WRITEBACK=1: a guest fault downloads bytes a hot write-back carries.
+bool FaultWaitsHotWriteBack() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_FAULT_WAITS_HOT_WRITEBACK");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
 // KYTY_NO_ASYNC_GUEST_DOWNLOAD=1: a guest fault's download blocks the GPU thread until it lands.
 bool AsyncGuestDownloads() {
 	static const bool enabled = [] {
@@ -927,6 +936,37 @@ void BufferCache::PublishCompletedHotWriteBacks(uint64_t max_tick) {
 	}
 }
 
+uint64_t BufferCache::PendingHotWriteBackTick(uint64_t vaddr, uint64_t size) {
+	if (m_hot_batches.empty()) {
+		return 0;
+	}
+	// The guest's page settles only once every GPU-written byte on it is published.
+	RangeSet needed;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    needed.Add(start, end - start);
+		    });
+	    });
+	if (needed.Empty()) {
+		return 0;
+	}
+	uint64_t tick = 0;
+	// Newest batch first: a newer copy of a range is the one PublishHotWriteBack keeps.
+	for (auto batch = m_hot_batches.rbegin(); batch != m_hot_batches.rend() && !needed.Empty();
+	     ++batch) {
+		for (const auto& copy: batch->copies) {
+			if (!needed.Intersects(copy.address, copy.size) ||
+			    WrittenSince(batch->writes_start, copy.address, copy.address + copy.size)) {
+				continue;
+			}
+			needed.Subtract(copy.address, copy.size);
+			tick = std::max(tick, batch->tick);
+		}
+	}
+	return needed.Empty() ? tick : 0;
+}
+
 void BufferCache::PublishHotWriteBack(const std::vector<HotCopy>& copies, const uint8_t* mapped,
                                       size_t writes_start) {
 	RangeSet published;
@@ -1015,8 +1055,9 @@ void BufferCache::ReadMemoryAttempt(uint64_t vaddr, uint64_t size, bool is_write
 	// A guest thread's access runs here on the GPU thread, outside any zone of its own.
 	const bool guest_access = !GuestGpu::IsGpuThread();
 	GuestDownload download;
+	uint64_t      hot_tick = 0;
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, guest_access,
-	                                                &download] {
+	                                                &download, &hot_tick, attempt] {
 		static constexpr tracy::SourceLocationData guest_read {
 		    "BufferCache::ReadMemory for a guest CPU read", TracyFunction, TracyFile,
 		    static_cast<uint32_t>(__LINE__), 0};
@@ -1034,6 +1075,15 @@ void BufferCache::ReadMemoryAttempt(uint64_t vaddr, uint64_t size, bool is_write
 					m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 				}
 				return;
+			}
+			// A submitted hot write-back already carries the bytes; the guest thread waits for it.
+			if (FaultWaitsHotWriteBack() && attempt == 0) {
+				hot_tick = PendingHotWriteBackTick(vaddr, size);
+				if (hot_tick != 0) {
+					// Still a fault on this page: keep it hot so the next write is copied too.
+					NoteGuestFault(vaddr, size);
+					return;
+				}
 			}
 		}
 		if (guest_access && PrepareDetachedDownload(vaddr, size) != 0) {
@@ -1060,6 +1110,23 @@ void BufferCache::ReadMemoryAttempt(uint64_t vaddr, uint64_t size, bool is_write
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+	if (hot_tick != 0) {
+		m_scheduler.GetMasterSemaphore().Wait(hot_tick);
+		bool settled = false;
+		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, &settled] {
+			PublishCompletedHotWriteBacks();
+			settled = !m_memory_tracker.IsRegionGpuModified(vaddr, size);
+			if (settled && is_write && IsRegionRegistered(vaddr, size)) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+		});
+		if (settled) {
+			return;
+		}
+		// A newer GPU or guest write overtook the batch; the ordinary download takes over.
+		ReadMemoryAttempt(vaddr, size, is_write, attempt + 1);
+		return;
+	}
 	if (download.slot >= 0) {
 		m_scheduler.WaitDetached({download.slot, download.fence});
 		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, &download] {

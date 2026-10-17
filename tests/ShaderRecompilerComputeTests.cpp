@@ -205,6 +205,14 @@ struct BufferCacheTestAccess {
     cache.NoteGuestFault(address, size);
   }
 
+  static uint64_t PendingHotWriteBackTick(BufferCache &cache, uint64_t address, uint64_t size) {
+    return cache.PendingHotWriteBackTick(address, size);
+  }
+
+  static void PublishCompletedHotWriteBacks(BufferCache &cache) {
+    cache.PublishCompletedHotWriteBacks();
+  }
+
   static void FinishGuestDownload(BufferCache &cache, GuestDownload &download,
                                   uint64_t address, uint64_t size) {
     cache.m_scheduler.WaitDetached({download.slot, download.fence});
@@ -5236,6 +5244,35 @@ public:
               backing(hot_offset) == hot_value + 4u &&
                   !cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)),
               "a hot page overtaken by a join was not copied again");
+
+      // Dead Space polls GPU-written fences: a fault that a submitted hot copy already carries
+      // waits for that copy instead of downloading the page again.
+      write_on_gpu(hot_offset, hot_value + 5u);
+      scheduler.Flush();
+      const auto carried_tick = scheduler.CurrentTick() - 1u;
+      const auto pending =
+          BufferCacheTestAccess::PendingHotWriteBackTick(cache, base + hot_offset, 1);
+      Require(name, "submitted hot copy carries the fault",
+              pending == carried_tick &&
+                  cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)),
+              "a fault on a hot page found no submitted copy of its GPU bytes");
+      Require(name, "pages without a hot copy are not carried",
+              BufferCacheTestAccess::PendingHotWriteBackTick(cache, base + guest_offset, 1) == 0,
+              "a page no hot copy holds was reported as carried");
+      scheduler.GetMasterSemaphore().Wait(pending);
+      BufferCacheTestAccess::PublishCompletedHotWriteBacks(cache);
+      Require(name, "carried fault settles after the wait",
+              backing(hot_offset) == hot_value + 5u &&
+                  !cache.IsRegionGpuModified(base + hot_offset, sizeof(hot_value)),
+              "waiting for the carrying copy did not publish the faulted page");
+
+      write_on_gpu(hot_offset, hot_value + 6u);
+      scheduler.Flush();
+      write_on_gpu(hot_offset, hot_value + 7u);
+      Require(name, "overtaken hot copy does not carry the fault",
+              BufferCacheTestAccess::PendingHotWriteBackTick(cache, base + hot_offset, 1) == 0,
+              "a fault would wait for a copy older than the newest GPU write");
+      settle();
 
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();

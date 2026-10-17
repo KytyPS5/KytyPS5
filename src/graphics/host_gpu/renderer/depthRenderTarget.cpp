@@ -295,12 +295,21 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 		return;
 	}
-	if (rc.copy_stencil_to_color ||
-	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
-	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
-	    (has_stencil && !z.depth_view.stencil_write_disable &&
-	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+	// Depth-to-color copies are validated below; these register states are not modelled.
+	if (rc.copy_stencil_to_color) {
+		DepthFatal("copy_stencil_to_color is not modelled");
+	}
+	if (dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
+		DepthFatal("zfunc=%u is past eAlways", dc.zfunc);
+	}
+	if (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) {
+		DepthFatal("depth write base 0x%08x differs from read base 0x%08x", z.z_write_base_addr,
+		           z.z_read_base_addr);
+	}
+	if (has_stencil && !z.depth_view.stencil_write_disable &&
+	    z.stencil_write_base_addr != z.stencil_read_base_addr) {
+		DepthFatal("stencil write base 0x%08x differs from read base 0x%08x",
+		           z.stencil_write_base_addr, z.stencil_read_base_addr);
 	}
 	if (rc.copy_depth_to_color &&
 	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||

@@ -47,6 +47,15 @@ struct ShaderSource {
 	struct Call {
 		uint32_t instruction;
 		std::array<IR::Value, 2> target;
+		// Scalar registers that later call targets read across this call.
+		std::vector<uint32_t> preserved;
+		// The target is only known per dispatch on the GPU (e.g. a shader binding table entry
+		// selected by a ray hit). Such a call is linked as an immediate return.
+		bool dynamic = false;
+		// The linked leaf: its guest address and its words within the appended function code.
+		uint64_t address = 0;
+		uint32_t offset  = 0;
+		uint32_t words   = 0;
 	};
 	struct Linked {
 		std::vector<uint32_t> code;
@@ -56,7 +65,7 @@ struct ShaderSource {
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
-	std::optional<Call> call;
+	std::vector<Call> calls;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;

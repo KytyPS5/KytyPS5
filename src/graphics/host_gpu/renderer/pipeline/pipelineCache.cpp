@@ -33,6 +33,7 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -347,6 +348,10 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		if (unsupported.contains(lookup_key)) {
+			input_info.stage = {};
+			return {};
+		}
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
@@ -422,7 +427,7 @@ struct PipelineCache::ProgramCache {
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
-			if (current->call) {
+			if (!current->calls.empty()) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
 				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 				translated.program.source_reads = current->reads;
@@ -432,8 +437,20 @@ struct PipelineCache::ProgramCache {
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			// Skipping a GPU-chosen call can leave a traversal loop without its exit condition, which
+			// hangs the host GPU; skip the whole dispatch like GPU pointer writes.
+			const bool dynamic_calls = current != nullptr && std::ranges::any_of(current->calls,
+			                               [](const auto& call) { return call.dynamic; });
+			if (translated.program.has_address_writes || dynamic_calls) {
+				// The caller skips this dispatch; see SkipUnsupportedCompute in renderCompute.cpp.
+				unsupported.insert(lookup_key);
+				input_info.stage = {};
+				return {};
+			}
+		}
 		if (entry == programs.end()) {
-			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
+			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -483,6 +500,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	// Compute programs that need GPU pointer writes or GPU-chosen calls, which are not emulated yet.
+	std::unordered_set<ProgramKey, ProgramKeyHash> unsupported;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
 	uint64_t                                                    next_shader_id = 0;

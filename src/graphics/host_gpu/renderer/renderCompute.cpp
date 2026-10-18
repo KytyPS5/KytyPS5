@@ -30,15 +30,36 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
+// The pipeline cache returns no program for compute shaders that write through GPU pointers
+// (FLAT/GLOBAL stores) or make GPU-chosen function calls, which are not emulated yet. Skip such
+// dispatches instead of failing.
+static bool SkipUnsupportedCompute(const ShaderProgram& program, uint64_t shader_address) {
+	if (program) {
+		return false;
+	}
+	// Callers hold the render context mutex, which serializes this set.
+	static std::unordered_set<uint64_t> warned;
+	if (warned.insert(shader_address).second) {
+		std::printf("Warning: skipping compute shader at 0x%016" PRIx64 ", which uses GPU pointer "
+		            "writes or GPU-chosen function calls (not emulated yet); its effect will be "
+		            "missing. (%zu skipped so far)\n",
+		            shader_address, warned.size());
+	}
+	return true;
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -297,6 +318,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (SkipUnsupportedCompute(compute_program, cs_regs.cs_regs.data_addr)) {
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -464,6 +488,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.indirect_args_address = args_addr;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (SkipUnsupportedCompute(compute_program, cs_regs.cs_regs.data_addr)) {
+		return;
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;

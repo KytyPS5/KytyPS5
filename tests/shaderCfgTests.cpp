@@ -10752,8 +10752,8 @@ void TestMemoryFedScalarLeafCall() {
   IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
   const auto options = MakeCompileOptions(ShaderType::Compute);
   auto source = PrepareShaderSource(shader, options);
-  Check(source.call && source.decoded.has_swap_pc &&
-            source.decoded.instructions[source.call->instruction].branch_target == UINT32_MAX,
+  Check(source.calls.size() == 1 && source.decoded.has_swap_pc &&
+            source.decoded.instructions[source.calls[0].instruction].branch_target == UINT32_MAX,
         "memory-fed SWAPPC did not retain an unresolved target");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal([&] { (void)TranslateProgram(source.decoded, options); },
@@ -10761,7 +10761,7 @@ void TestMemoryFedScalarLeafCall() {
 #endif
   const auto& linked = RefreshShaderSource(source, runtime);
   Check(linked.has_swap_pc && source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
-            linked.instructions[source.call->instruction].branch_target == 0x44 &&
+            linked.instructions[source.calls[0].instruction].branch_target == 0x44 &&
             source.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x100, 12},
         "aliased call target, exact leaf range, or continuation was lost");
   const auto* storage = linked.instructions.data();
@@ -10853,17 +10853,114 @@ void TestMemoryFedScalarLeafCall() {
   auto pair_source = PrepareShaderSource(high_writer, options);
   IR::SrtWalker pair_walker(pair_source.call_targets, runtime);
   uint32_t high = 1;
-  Check(pair_walker.Evaluate(pair_source.call->target[1], high) && high == 0,
+  Check(pair_walker.Evaluate(pair_source.calls[0].target[1], high) && high == 0,
         "scalar pair producer used a stale preceding high-half definition");
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
       EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
               "ambiguous reaching definitions were accepted for a call target");
-  const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
-              "call metadata bypassed the multiple-call rejection");
 #endif
+}
+
+void TestMultipleScalarLeafCalls() {
+  using namespace ShaderRecompiler;
+  constexpr uint32_t base = 0x10000000u;
+  // Two calls to different leaves; the second target's high half crosses the first call.
+  const uint32_t shader[] = {
+      EncodeSMovB32(20, 128),                       // 0x00 s_mov_b32 s20, 0
+      EncodeSMovB32(14, 255), base + 0x100,         // 0x04 s_mov_b32 s14, leaf A
+      EncodeSMovB32(15, 20),                        // 0x0c s_mov_b32 s15, s20
+      EncodeSop1(0x21, 14, 14),                     // 0x10 s_swappc_b64 s[14:15], s[14:15]
+      EncodeSMovB32(14, 255), base + 0x180,         // 0x14 s_mov_b32 s14, leaf B
+      EncodeSMovB32(15, 20),                        // 0x1c s_mov_b32 s15, s20
+      EncodeSop1(0x21, 14, 14),                     // 0x20 s_swappc_b64 s[14:15], s[14:15]
+      EncodeSopp(0x01)};                            // 0x24 s_endpgm
+  struct Memory {
+    std::array<uint32_t, 128> words{};
+  } memory;
+  memory.words[64] = EncodeSMovB32(3, 129);       // leaf A: s_mov_b32 s3, 1
+  memory.words[65] = EncodeSop1(0x21, 125, 14);   // s_setpc_b64 s[14:15]
+  memory.words[96] = EncodeSMovB32(4, 130);       // leaf B: s_mov_b32 s4, 2
+  memory.words[97] = EncodeSop1(0x21, 125, 14);
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    const uint64_t end = base + sizeof(m.words);
+    if (address < base || address > end || out.size_bytes() > end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.calls.size() == 2 && source.calls[0].instruction == 3 && source.calls[1].instruction == 6 &&
+            source.calls[0].preserved == std::vector<uint32_t>{20} && source.calls[1].preserved.empty(),
+        "second call target lost the register it reads across the first call");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  const auto& leaf_a = linked.instructions[8];
+  const auto& leaf_b = linked.instructions[10];
+  Check(source.revision == 1 && linked.instructions.size() == 12 &&
+            linked.instructions[3].branch_target == 0x28 && linked.instructions[6].branch_target == 0x30 &&
+            leaf_a.pc == 0x28 && leaf_b.pc == 0x30 &&
+            linked.instructions[9].branch_target == 0x14 && linked.instructions[11].branch_target == 0x24 &&
+            source.reads == std::vector<std::pair<uint64_t, uint64_t>>{{base + 0x100, 8}, {base + 0x180, 8}},
+        "multiple calls did not link separate leaves returning to their own call sites");
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 && source.reads.size() == 2, "unchanged leaves were relinked");
+  memory.words[96] = EncodeSMovB32(4, 131);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 2 && source.linked->code.back() == EncodeSop1(0x21, 125, 14) &&
+            source.linked->code[source.linked->code.size() - 2] == EncodeSMovB32(4, 131),
+        "a changed second leaf retained stale code");
+  auto translated = TranslateProgram(source.linked->decoded, options);
+  Check(!translated.program.blocks.empty(), "linked multiple-call program did not translate");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  memory.words[64] = EncodeSMovB32(20, 129);
+  ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
+              "leaf clobbering a later call target input was linked");
+#endif
+}
+
+void TestDynamicScalarCallReturnsImmediately() {
+  using namespace ShaderRecompiler;
+  constexpr uint32_t base = 0x10000000u;
+  // The first target is chosen per lane on the GPU; the second is a static leaf.
+  const uint32_t shader[] = {
+      EncodeVop1(0x02, 14, 256),                    // 0x00 v_readfirstlane_b32 s14, v0
+      EncodeSMovB32(15, 128),                       // 0x04 s_mov_b32 s15, 0
+      EncodeSop1(0x21, 14, 14),                     // 0x08 s_swappc_b64 s[14:15], s[14:15]
+      EncodeSMovB32(14, 255), base + 0x100,         // 0x0c s_mov_b32 s14, leaf
+      EncodeSMovB32(15, 128),                       // 0x14 s_mov_b32 s15, 0
+      EncodeSop1(0x21, 14, 14),                     // 0x18 s_swappc_b64 s[14:15], s[14:15]
+      EncodeSopp(0x01)};                            // 0x1c s_endpgm
+  struct Memory {
+    std::array<uint32_t, 128> words{};
+  } memory;
+  memory.words[64] = EncodeSMovB32(3, 129);
+  memory.words[65] = EncodeSop1(0x21, 125, 14);
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    const uint64_t end = base + sizeof(m.words);
+    if (address < base || address > end || out.size_bytes() > end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.calls.size() == 2 && source.calls[0].dynamic && !source.calls[1].dynamic,
+        "a GPU-selected call target was not recognized as dynamic");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(linked.instructions[2].branch_target == 0x0c && linked.instructions[5].branch_target == 0x20 &&
+            linked.instructions.back().branch_target == 0x1c &&
+            source.reads == std::vector<std::pair<uint64_t, uint64_t>>{{base + 0x100, 8}},
+        "dynamic call did not return immediately beside a linked static leaf");
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1, "a dynamic call forced relinking");
+  auto translated = TranslateProgram(source.linked->decoded, options);
+  Check(!translated.program.blocks.empty(), "program with a dynamic call did not translate");
 }
 
 void TestNewShaderRecompilerSetpcBranch() {
@@ -10909,7 +11006,7 @@ void TestFusedShaderHandoffPreservesRegisters() {
   for (const auto handoff: {EncodeSop1(0x20, 0, 6), 0xbefd2106u}) {
     front[2] = handoff; // SETPC or captured SWAPPC with NULL destination
     auto source = PrepareShaderSource(front, options);
-    Check(!source.decoded.has_swap_pc && !source.call,
+    Check(!source.decoded.has_swap_pc && source.calls.empty(),
           "fused SETPC handoff entered scalar call preparation");
     auto translated = TranslateProgram(source.decoded, options);
     uint32_t allocations = 0;
@@ -16600,6 +16697,8 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestMultipleScalarLeafCalls();
+  TestDynamicScalarCallReturnsImmediately();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

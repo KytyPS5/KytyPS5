@@ -1688,7 +1688,8 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
 }
 
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code) {
+                              uint32_t before, uint32_t code,
+                              std::vector<std::pair<uint32_t, uint32_t>>* crossed_calls) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
@@ -1698,7 +1699,12 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
 		for (uint32_t i = before; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
-			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
+			if (inst.opcode == Opcode::S_SWAPPC_B64) {
+				// The call's return address is not a usable source; anything else must survive its leaf.
+				EXIT_IF(crossed_calls == nullptr || MayWriteScalarRegister(inst, code));
+				crossed_calls->emplace_back(i, code);
+				continue;
+			}
 			if (MayWriteScalarRegister(inst, code)) return i;
 		}
 		if (block->id == graph.entry_block) return UINT32_MAX;

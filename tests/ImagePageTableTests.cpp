@@ -1,8 +1,14 @@
+#include "graphics/host_gpu/renderer/cache/imagePageCoverage.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -168,6 +174,158 @@ void TestOneMiBBoundaries() {
 	      "final guest byte uses the final one-MiB page");
 }
 
+using Libs::Graphics::ImagePageCoverage;
+using Libs::Graphics::LOWER_ADDRESS_SIZE;
+using Libs::Graphics::TRACKER_PAGE_SIZE;
+using Libs::Graphics::TRACKER_REGION_SIZE;
+constexpr uint64_t ExtendedBase = Libs::LibKernel::Memory::kExtendedMemoryBase;
+constexpr uint64_t ExtendedSize = Libs::LibKernel::Memory::kExtendedMemorySize;
+
+void TestCoverageUsesTrackerPages() {
+	auto coverage = std::make_unique<ImagePageCoverage>();
+	coverage->Add(0x10000, 0x1000);
+	Check(coverage->Covers(0x10000) && coverage->Covers(0x10fff), "exact page is covered");
+	Check(!coverage->Covers(0xffff) && !coverage->Covers(0x11000), "neighbor pages are not");
+
+	coverage->Add(0x21fff, 2);
+	Check(coverage->Covers(0x21000) && coverage->Covers(0x22fff),
+	      "an unaligned two-byte image covers both of its pages");
+	Check(!coverage->Covers(0x20fff) && !coverage->Covers(0x23000),
+	      "an unaligned image covers nothing past its pages");
+
+	coverage->Remove(0x10000, 0x1000);
+	coverage->Remove(0x21fff, 2);
+	Check(!coverage->Covers(0x10000) && !coverage->Covers(0x21000) && !coverage->Covers(0x22000),
+	      "removed images leave no coverage");
+}
+
+void TestCoverageCountsOverlappingImages() {
+	auto coverage = std::make_unique<ImagePageCoverage>();
+	coverage->Add(0x40000, 0x3000);
+	coverage->Add(0x41800, 0x1000);
+	coverage->Remove(0x40000, 0x3000);
+	Check(!coverage->Covers(0x40000) && coverage->Covers(0x41000) &&
+	          coverage->Covers(0x42000) && !coverage->Covers(0x43000),
+	      "a page stays covered while another image still touches it");
+	coverage->Remove(0x41800, 0x1000);
+	Check(!coverage->Covers(0x41000) && !coverage->Covers(0x42000),
+	      "the last image leaving a page uncovers it");
+}
+
+void TestCoverageCrossesRegions() {
+	auto           coverage = std::make_unique<ImagePageCoverage>();
+	const uint64_t boundary = 5 * TRACKER_REGION_SIZE;
+	coverage->Add(boundary - 0x10, 0x20);
+	Check(coverage->Covers(boundary - 1) && coverage->Covers(boundary),
+	      "both sides of a region boundary are covered");
+	Check(!coverage->Covers(boundary - TRACKER_PAGE_SIZE - 1) &&
+	          !coverage->Covers(boundary + TRACKER_PAGE_SIZE),
+	      "a boundary image covers only its two pages");
+
+	coverage->Add(boundary, 3 * TRACKER_REGION_SIZE);
+	Check(coverage->Covers(boundary + 2 * TRACKER_REGION_SIZE + 0x1234) &&
+	          !coverage->Covers(boundary + 3 * TRACKER_REGION_SIZE),
+	      "a multi-region image covers every region it spans and no more");
+	coverage->Remove(boundary, 3 * TRACKER_REGION_SIZE);
+	coverage->Remove(boundary - 0x10, 0x20);
+	Check(!coverage->Covers(boundary) && !coverage->Covers(boundary + TRACKER_REGION_SIZE),
+	      "multi-region removal clears every region");
+}
+
+void TestCoverageAddressRanges() {
+	auto coverage = std::make_unique<ImagePageCoverage>();
+	coverage->Add(LOWER_ADDRESS_SIZE - TRACKER_PAGE_SIZE, 2 * TRACKER_PAGE_SIZE);
+	Check(coverage->Covers(LOWER_ADDRESS_SIZE - 1) && !coverage->Covers(LOWER_ADDRESS_SIZE),
+	      "the lower range ends at its last page");
+
+	coverage->Add(ExtendedBase + 0x123456789, 0x10);
+	coverage->Add(ExtendedBase + ExtendedSize - 1, 1);
+	Check(coverage->Covers(ExtendedBase + 0x123456000) &&
+	          coverage->Covers(ExtendedBase + ExtendedSize - TRACKER_PAGE_SIZE),
+	      "extended memory is covered");
+	Check(!coverage->Covers(ExtendedBase - 1) && !coverage->Covers(ExtendedBase + ExtendedSize) &&
+	          !coverage->Covers(UINT64_MAX),
+	      "addresses past the extended range are never covered");
+
+	coverage->Add(ExtendedBase - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+	Check(!coverage->Covers(ExtendedBase - TRACKER_PAGE_SIZE) && !coverage->Covers(ExtendedBase),
+	      "an image in the guest address gap covers no reachable page");
+	coverage->Remove(ExtendedBase - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+	coverage->Remove(ExtendedBase + ExtendedSize - 1, 1);
+	coverage->Remove(ExtendedBase + 0x123456789, 0x10);
+	coverage->Remove(LOWER_ADDRESS_SIZE - TRACKER_PAGE_SIZE, 2 * TRACKER_PAGE_SIZE);
+	Check(!coverage->Covers(LOWER_ADDRESS_SIZE - 1) && !coverage->Covers(ExtendedBase + 0x123456000),
+	      "removal clears both address ranges");
+}
+
+void TestCoverageMatchesImageList() {
+	struct Range {
+		uint64_t address;
+		uint64_t size;
+	};
+	constexpr uint64_t Span     = 3 * TRACKER_REGION_SIZE;
+	constexpr uint64_t Base     = 7 * TRACKER_REGION_SIZE - TRACKER_REGION_SIZE / 2;
+	auto               coverage = std::make_unique<ImagePageCoverage>();
+	std::vector<Range> images;
+	uint64_t           state = 0x9e3779b97f4a7c15ull;
+	const auto         next  = [&state] {
+		state ^= state << 13u;
+		state ^= state >> 7u;
+		state ^= state << 17u;
+		return state;
+	};
+	for (int step = 0; step < 4000; step++) {
+		if (images.empty() || next() % 3 != 0) {
+			const Range image {Base + next() % Span, 1 + next() % (TRACKER_REGION_SIZE / 2)};
+			coverage->Add(image.address, image.size);
+			images.push_back(image);
+		} else {
+			const auto index = next() % images.size();
+			coverage->Remove(images[index].address, images[index].size);
+			images.erase(images.begin() + static_cast<std::ptrdiff_t>(index));
+		}
+		const uint64_t probe   = Base - TRACKER_PAGE_SIZE + next() % (Span + TRACKER_REGION_SIZE);
+		const uint64_t page    = probe / TRACKER_PAGE_SIZE;
+		const bool     touched = std::any_of(images.begin(), images.end(), [&](const Range& image) {
+			return image.address / TRACKER_PAGE_SIZE <= page &&
+			       page <= (image.address + image.size - 1) / TRACKER_PAGE_SIZE;
+		});
+		Check(coverage->Covers(probe) == touched, "coverage matches the registered image list");
+	}
+}
+
+void TestCoveragePublishesAcrossThreads() {
+	constexpr uint64_t Regions  = 256;
+	constexpr uint64_t Base     = 64 * TRACKER_REGION_SIZE;
+	constexpr uint64_t Pinned   = Base - TRACKER_PAGE_SIZE;
+	auto               coverage = std::make_unique<ImagePageCoverage>();
+	coverage->Add(Pinned, TRACKER_PAGE_SIZE);
+	std::atomic<uint64_t> published {0};
+	std::atomic<bool>     failed {false};
+	std::thread           reader([&] {
+		uint64_t seen = 0;
+		while (seen < Regions) {
+			seen = published.load(std::memory_order_acquire);
+			for (uint64_t region = 0; region < seen; region++) {
+				if (!coverage->Covers(Base + region * TRACKER_REGION_SIZE + 0x2345)) {
+					failed.store(true, std::memory_order_relaxed);
+				}
+			}
+			if (!coverage->Covers(Pinned)) {
+				failed.store(true, std::memory_order_relaxed);
+			}
+		}
+	});
+	for (uint64_t region = 0; region < Regions; region++) {
+		coverage->Add(Base + region * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
+		coverage->Add(Pinned, TRACKER_PAGE_SIZE);
+		coverage->Remove(Pinned, TRACKER_PAGE_SIZE);
+		published.store(region + 1, std::memory_order_release);
+	}
+	reader.join();
+	Check(!failed.load(), "a reader sees every published registration and no transient gap");
+}
+
 } // namespace
 
 int main() {
@@ -179,6 +337,12 @@ int main() {
 	TestOneMiBRegistrationGranularity();
 	TestSharedCoarsePageLifecycle();
 	TestOneMiBBoundaries();
+	TestCoverageUsesTrackerPages();
+	TestCoverageCountsOverlappingImages();
+	TestCoverageCrossesRegions();
+	TestCoverageAddressRanges();
+	TestCoverageMatchesImageList();
+	TestCoveragePublishesAcrossThreads();
 	std::printf("ImagePageTableTests: all cases passed\n");
 	return 0;
 }

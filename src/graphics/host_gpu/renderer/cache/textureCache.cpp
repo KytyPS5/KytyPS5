@@ -422,6 +422,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	ForEachPage(image.info.data.address, image.info.data.size,
 	            [this, id](uint64_t page) { m_image_page_table[page].push_back(id); });
+	m_image_coverage.Add(image.info.data.address, image.info.data.size);
 	m_region_generation++;
 	image.registered         = true;
 	image.lru_id             = m_lru_cache.Insert(id, m_gc_tick);
@@ -446,6 +447,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_image_coverage.Remove(image.info.data.address, image.info.data.size);
 	m_region_generation++;
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -2834,6 +2836,13 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
+}
+
+void TextureCache::InvalidateWriteFault(uint64_t address) {
+	// An image registered after the read installs its own watch.
+	if (m_image_coverage.Covers(address)) {
+		InvalidateMemory(address, 1);
+	}
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {

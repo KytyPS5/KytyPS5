@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/mipStats.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -492,6 +493,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
 		return {.layout = vk::ImageLayout::eGeneral};
+	}
+	if (!storage && !resource.r128 && descriptor.MipStatsCntEn() && MipStats::Enabled()) {
+		MipStats::NoteSampled(descriptor.MipStatsCntId());
 	}
 
 	const auto address         = descriptor.Base40();

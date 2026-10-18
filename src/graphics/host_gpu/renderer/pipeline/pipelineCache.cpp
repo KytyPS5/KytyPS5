@@ -30,6 +30,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -295,12 +296,18 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
-	Permutation CompilePermutation(const char*                                  stage_name,
-	                               const ShaderRecompiler::CompileOptions&      options,
-	                               ShaderRecompiler::TranslateResult            translated,
-	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> function_code) {
+	bool ProgramNeedsCullDistance(const ShaderRecompiler::IR::Program& program) {
+		return std::ranges::any_of(program.info.outputs, [](const auto& output) {
+			return output.kind == ShaderRecompiler::IR::StageOutputKind::CullDistance;
+		});
+	}
+
+	std::optional<Permutation>
+	CompilePermutation(const char*                                  stage_name,
+	                   const ShaderRecompiler::CompileOptions&      options,
+	                   ShaderRecompiler::TranslateResult            translated,
+	                   ShaderRecompiler::IR::ResourceSpecialization specialization,
+	                   uint32_t push_data_start_dword, std::span<const uint32_t> function_code) {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
@@ -314,18 +321,34 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
+		if (!graphics.shader_cull_distance_enabled && ProgramNeedsCullDistance(result.program)) {
+			// The host cannot consume gl_CullDistance: skip draws using this program
+			// instead of emitting SPIR-V the driver must reject (module creation
+			// aborts the emulator). The key is remembered below so later draws fail
+			// fast instead of recompiling every frame.
+			static std::atomic_uint log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("%s hash=0x%016" PRIx64
+				     ": shader uses cull distance but the host does not support it; draws "
+				     "using this program will be skipped\n",
+				     options.dump_label, options.shader_hash);
+			}
+			return std::nullopt;
+		}
+
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
-		return {
+		Permutation permutation {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = ++next_shader_id, .module = module},
 		};
+		return permutation;
 	}
 
 	template <typename InputInfo>
@@ -347,6 +370,10 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		if (unsupported_programs.contains(lookup_key)) {
+			// A previous compile needed device features the host lacks; fail fast.
+			return ShaderProgram{};
+		}
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
@@ -447,9 +474,14 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
-		    entry->second.FunctionCode()));
+		auto compiled = CompilePermutation(stage_name, options, std::move(translated),
+		                                     entry->second.specialization, push_data_cursor,
+		                                     entry->second.FunctionCode());
+		if (!compiled) {
+			unsupported_programs.insert(lookup_key);
+			return ShaderProgram{};
+		}
+		entry->second.permutations.push_back(std::move(*compiled));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -483,6 +515,9 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	// Programs whose compiled outputs need device features the host lacks (currently
+	// cull distance). Remembered so later draws fail fast instead of recompiling.
+	std::unordered_set<ProgramKey, ProgramKeyHash> unsupported_programs;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
 	uint64_t                                                    next_shader_id = 0;

@@ -11879,8 +11879,11 @@ public:
         const auto metadata_words = static_cast<uint32_t>(metadata_size / 4);
         if (fill_case.goat) {
           WriteMetadata(context, dcc_address, metadata_size, 0xa5a5a5a5u);
+          // A programmed target would consume the fill at once and expand its slice.
+          registers.SetColorBase(0, {.addr = 0});
         }
         fill_metadata(metadata_words);
+        registers.SetColorBase(0, {.addr = base});
         Require(name, "metadata before descriptor",
                 !texture_cache.IsMeta(dcc_address),
                 "the native fill guessed an unbound metadata allocation's type");
@@ -12058,8 +12061,12 @@ public:
         Require(name, "partial same-value metadata fill",
                 retains_painted_texel(),
                 "a partial same-value write reused stale clear bytes after rendering");
+        // With no slot naming the metadata, the native writes are not resolved yet and stay
+        // GPU-owned when the proven fill arrives.
+        registers.SetColorBase(0, {.addr = 0});
         fill_metadata(metadata_words, true);
         fill_metadata(metadata_words);
+        registers.SetColorBase(0, {.addr = base});
         Require(name, "already GPU-owned metadata stays ordered",
                 resources.GetBufferCache().HasGpuDirtyBytes(dcc_address, metadata_size),
                 "a fill discarded pending native writes to its metadata pages");

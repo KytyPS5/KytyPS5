@@ -204,6 +204,8 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		// Metadata need not have an image backing yet. Keep proven fills in guest memory
 		// when CPU-owned, so color-clear discovery can read them without a GPU download.
 		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
+		// Like the native dispatch it replaces, the fill clears the targets naming it.
+		TrackMetaFills(input, command);
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {

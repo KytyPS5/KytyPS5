@@ -1,33 +1,54 @@
-#ifndef LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
+﻿#ifndef LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
 #define LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
 
 #include <QDialog>
+#include <QHash>
+#include <QSet>
 #include <QStringList>
 
+class ControllerPreview;
+class DualSenseWidget;
+class QLabel;
 class QPushButton;
+class QCheckBox;
+class QComboBox;
 class QDoubleSpinBox;
-class QTreeWidget;
-class QTreeWidgetItem;
+class QTabWidget;
 class QWidget;
 
 class InputMappingDialog final: public QDialog {
 public:
-	explicit InputMappingDialog(const QStringList& mapping, QWidget* parent = nullptr);
+	explicit InputMappingDialog(const QStringList& mapping, ControllerPreview* preview,
+	                            QWidget* parent = nullptr);
+	~InputMappingDialog() override;
 
 	[[nodiscard]] QStringList Mapping() const;
 
 private:
-	void ChangeBinding();
-	void ClearBinding();
-	void RestoreDefaults();
-	void SetBinding(QTreeWidgetItem* item, const QString& binding);
-	void UpdateButtons();
+	QWidget* BuildTab(bool pad);
+	void     ChangeKeyboardBinding(const QString& id);
+	void     ChangePadBinding(const QString& id);
+	void     ClearBinding(bool pad, const QString& id);
+	void     RestoreDefaults();
+	void     UpdateButtons();
+	void     UpdatePreview();
+	void     UpdateHighlights();
 
-	QTreeWidget*    m_bindings        = nullptr;
-	QPushButton*    m_change_button   = nullptr;
-	QPushButton*    m_clear_button    = nullptr;
-	QDoubleSpinBox* m_sensitivity     = nullptr;
-	bool            m_custom_bindings = false;
+	ControllerPreview*           m_preview;
+	DualSenseWidget*             m_controller = nullptr;
+	QTabWidget*                  m_tabs       = nullptr;
+	QHash<QString, QString>      m_bindings;
+	QHash<QString, QString>      m_pad_bindings;
+	QHash<QString, QPushButton*> m_buttons;
+	QHash<QString, QPushButton*> m_pad_buttons;
+	QSet<QString>                m_pad_pressed;
+	QString                      m_selected;
+	QLabel*                      m_status          = nullptr;
+	QDoubleSpinBox*              m_sensitivity     = nullptr;
+	QComboBox*                   m_particle_skin   = nullptr;
+	QCheckBox*                   m_touch_cursor    = nullptr;
+	bool                         m_custom_bindings = false;
+	bool                         m_custom_pad      = false;
 };
 
 #endif /* LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_ */

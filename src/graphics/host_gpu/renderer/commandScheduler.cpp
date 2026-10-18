@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -226,43 +227,37 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(std::move(operation), true);
+}
+
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_pending_operations.push({std::move(operation), CurrentTick()});
-		return;
-	}
-	if (g_deferred_callback_scheduler == this) {
+		auto& queue = priority ? m_priority_operations : m_pending_operations;
+		queue.push({std::move(operation), CurrentTick()});
 		lock.unlock();
-		operation();
+		if (priority) {
+			m_operation_available.notify_one();
+		}
 		return;
 	}
-	m_operation_available.wait(lock,
-	                           [this] { return m_operation_state == OperationState::Closed; });
+	if (g_deferred_callback_scheduler != this) {
+		m_operation_available.wait(lock,
+		                           [this] { return m_operation_state == OperationState::Closed; });
+	}
 	lock.unlock();
 	operation();
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	CheckActive();
-	EXIT_IF(!operation);
-	std::unique_lock lock(m_operation_mutex);
-	if (m_operation_state == OperationState::Open) {
-		m_priority_operations.push({std::move(operation), CurrentTick()});
-		lock.unlock();
-		m_operation_available.notify_one();
-		return;
-	}
-	if (g_deferred_callback_scheduler == this) {
-		lock.unlock();
-		operation();
-		return;
-	}
-	m_operation_available.wait(lock,
-	                           [this] { return m_operation_state == OperationState::Closed; });
-	lock.unlock();
-	operation();
+bool CommandScheduler::HasPendingPriorityOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return !m_priority_operations.empty() || m_priority_active;
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -340,6 +335,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_dynamic_state.Invalidate();
 	return m_command;
 }
 
@@ -378,6 +374,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,

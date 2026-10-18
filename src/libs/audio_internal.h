@@ -19,8 +19,9 @@ enum class Format {
 };
 
 struct OutputParam {
-	int         handle = 0;
-	const void* data   = nullptr;
+	int          handle = 0;
+	const void*  data   = nullptr;
+	const float* gains  = nullptr;
 };
 
 static constexpr int OUT_PORTS_MAX = 32;

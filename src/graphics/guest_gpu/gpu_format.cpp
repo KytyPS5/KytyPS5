@@ -10,9 +10,9 @@ namespace {
 
 struct FormatInfo {
 	BufferFormat       format;
-	uint32_t           bytes_per_element;
-	uint32_t           block_compressed_bytes_per_block;
-	uint32_t           render_target_bytes_per_element;
+	uint8_t            bytes_per_element;
+	uint8_t            block_compressed_bytes_per_block;
+	uint8_t            render_target_bytes_per_element;
 	bool               sampled_texture;
 	bool               uint_texture;
 	bool               sint_texture = false;
@@ -20,14 +20,17 @@ struct FormatInfo {
 
 constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k8UNorm, 1, 0, 1, true, false},
-	{BufferFormat::k8SNorm, 0, 0, 1, false, false},
+	{BufferFormat::k8UScaled, 1, 0, 0, true, false},
+	{BufferFormat::k8SNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8UInt, 1, 0, 1, true, true},
+	{BufferFormat::k8SInt, 1, 0, 1, true, false, true},
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16SNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16UInt, 2, 0, 2, true, true},
 	{BufferFormat::k16SInt, 2, 0, 2, true, false, true},
 	{BufferFormat::k16Float, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UNorm, 2, 0, 2, true, false},
+	{BufferFormat::k8_8UScaled, 2, 0, 0, true, false},
 	{BufferFormat::k8_8SNorm, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UInt, 2, 0, 2, true, true},
 	{BufferFormat::k8_8SInt, 2, 0, 2, true, false, true},
@@ -39,8 +42,10 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16_16UInt, 4, 0, 4, true, true},
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
+	{BufferFormat::k11_11_10UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
+	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_10_10_2UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k10_10_10_2UInt, 4, 0, 4, true, true},
 	{BufferFormat::k8_8_8_8UNorm, 4, 0, 4, true, false},
@@ -61,13 +66,13 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k32_32_32_32UInt, 16, 0, 16, true, true},
 	{BufferFormat::k32_32_32_32SInt, 16, 0, 16, true, false, true},
 	{BufferFormat::k32_32_32_32Float, 16, 0, 16, true, false},
-	{BufferFormat::k8Srgb, 1, 0, 0, true, false},
-	{BufferFormat::k8_8Srgb, 2, 0, 0, true, false},
+	{BufferFormat::k8Srgb, 1, 0, 1, true, false},
+	{BufferFormat::k8_8Srgb, 2, 0, 2, true, false},
 	{BufferFormat::k8_8_8_8Srgb, 4, 0, 4, true, false},
 	{BufferFormat::k9_9_9_5Float, 4, 0, 0, true, false},
 	{BufferFormat::k5_6_5UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k5_5_5_1UNorm, 2, 0, 2, true, false},
-	{BufferFormat::k1_5_5_5UNorm, 0, 0, 2, false, false},
+	{BufferFormat::k1_5_5_5UNorm, 2, 0, 2, false, false},
 	{BufferFormat::k4_4_4_4UNorm, 2, 0, 2, true, false},
 	{BufferFormat::kFmask8_S2_F1, 1, 0, 1, true, false},
 	{BufferFormat::kFmask8_S4_F1, 1, 0, 1, true, false},
@@ -231,7 +236,13 @@ TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 }
 
 BufferFormat RemapTextureFormat(BufferFormat format) {
-	return format == BufferFormat::k11_11_10UInt ? BufferFormat::k32UInt : format;
+	switch (format) {
+		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
+		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
+		case BufferFormat::k11_11_10UNorm:
+		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
+		default: return format;
+	}
 }
 
 } // namespace Libs::Graphics::Prospero

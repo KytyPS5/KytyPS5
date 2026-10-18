@@ -22,6 +22,10 @@ namespace VideoDec2 {
 LIB_DEFINE(InitVideoDec2_1);
 } // namespace VideoDec2
 
+namespace Vdecsw {
+LIB_DEFINE(InitVdecsw_1);
+} // namespace Vdecsw
+
 namespace LibMouse {
 LIB_DEFINE(InitMouse_1);
 } // namespace LibMouse
@@ -79,8 +83,10 @@ LIB_DEFINE(InitVideoOutVrrStatus_1);
 
 LIB_DEFINE(InitAppContent_1);
 LIB_DEFINE(InitAudio_1);
+LIB_DEFINE(InitBluetoothHid_1);
 LIB_DEFINE(InitConvertKeycode_1);
 LIB_DEFINE(InitDbgAddressSanitizer_1);
+LIB_DEFINE(InitDeviceService_1);
 LIB_DEFINE(InitDialog_1);
 LIB_DEFINE(InitFont_1);
 LIB_DEFINE(InitFontFt_1);
@@ -91,6 +97,7 @@ LIB_DEFINE(InitNet_1);
 LIB_DEFINE(InitPad_1);
 LIB_DEFINE(InitPlayGo_1);
 LIB_DEFINE(InitPngDec_1);
+LIB_DEFINE(InitPngEnc_1);
 LIB_DEFINE(InitPlatform_1);
 LIB_DEFINE(InitRudp_1);
 LIB_DEFINE(InitSaveData_1);
@@ -98,6 +105,7 @@ LIB_DEFINE(InitShare_1);
 LIB_DEFINE(InitSysmodule_1);
 LIB_DEFINE(InitSystemService_1);
 LIB_DEFINE(InitTextToSpeech2_1);
+LIB_DEFINE(InitUsbd_1);
 LIB_DEFINE(InitUserService_1);
 LIB_DEFINE(InitWebBrowserDialog_1);
 
@@ -119,6 +127,9 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitFont_1(s);
 	InitFontFt_1(s);
 	InitAgcDriver_1(s);
+	InitBluetoothHid_1(s);
+	InitDeviceService_1(s);
+	InitUsbd_1(s);
 	InitHmd2_1(s);
 	InitLibKernel_1(s);
 	LibMouse::InitMouse_1(s);
@@ -129,6 +140,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitPlayGo_1(s);
 	LibPsml::InitPsml_1(s);
 	InitPngDec_1(s);
+	InitPngEnc_1(s);
 	InitPlatform_1(s);
 	InitRudp_1(s);
 	LibRtc::InitRtc_1(s);
@@ -140,6 +152,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LibUlt::InitUlt_1(s);
 	InitUserService_1(s);
 	VideoDec2::InitVideoDec2_1(s);
+	Vdecsw::InitVdecsw_1(s);
 	LibGen5::InitVideoOut_1(s);
 	LibGen5::VrrStatus::InitVideoOutVrrStatus_1(s);
 	InitWebBrowserDialog_1(s);

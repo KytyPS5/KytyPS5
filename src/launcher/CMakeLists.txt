@@ -1,5 +1,6 @@
 
 find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
+add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
@@ -20,7 +21,12 @@ add_executable(launcher WIN32
 )
 
 
-target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static kyty_git_version)
+target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static
+	LibAtrac9 kyty_git_version common)
+if(LINUX)
+	find_package(Qt6 COMPONENTS DBus REQUIRED)
+	target_link_libraries(launcher Qt6::DBus)
+endif()
 if(WIN32)
 target_link_libraries(launcher setupapi)
 endif()
@@ -38,7 +44,13 @@ elseif(LINUX)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 endif()
 
-add_dependencies(launcher kyty_emulator)
+add_custom_target(stage_updater
+	COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:launcher>
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:kyty_updater>
+		$<TARGET_FILE_DIR:launcher>/$<TARGET_FILE_NAME:kyty_updater>
+	DEPENDS kyty_updater
+	VERBATIM)
+add_dependencies(launcher kyty_emulator stage_updater)
 
 if(KYTY_CLANG_CL)
 	add_custom_command(TARGET launcher POST_BUILD
@@ -65,7 +77,7 @@ if(WIN32)
 	)
 endif()
 
-set(launcher_name "launcher")
+set(launcher_name "kyty_launcher")
 if(APPLE)
 	set(launcher_name "KytyPS5")
 endif()
@@ -90,8 +102,20 @@ install(TARGETS launcher
 	BUNDLE DESTINATION .
 	RUNTIME DESTINATION .)
 
+if(NOT APPLE)
+	# Older releases require the previous executable name when validating updates.
+	install(CODE "
+		file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}\"
+			TYPE PROGRAM RENAME \"launcher${CMAKE_EXECUTABLE_SUFFIX}\"
+			FILES \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}${CMAKE_EXECUTABLE_SUFFIX}\")
+	")
+endif()
+
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
+	install(TARGETS kyty_updater DESTINATION "KytyPS5.app/Contents/MacOS")
+	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
+	install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/cursors" DESTINATION "KytyPS5.app/Contents/Resources/assets")
 	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
 	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
 	if(NOT KYTY_MACDEPLOYQT)
@@ -105,6 +129,10 @@ if(APPLE)
 			message(FATAL_ERROR \"macdeployqt failed with \${_kyty_deploy_result}\")
 		endif()
 	")
+endif()
+
+if(NOT APPLE)
+	install(TARGETS kyty_updater RUNTIME DESTINATION .)
 endif()
 
 if(WIN32)
@@ -197,3 +225,14 @@ list(APPEND inc_headers
 include_what_you_use_with_mappings(launcher "${inc_headers}" "${iwyu_maps}")
 
 clang_tidy_check(launcher "" "${tidy_dirs}" "${inc_headers}")
+
+if(BUILD_TESTING)
+    add_executable(experimental_settings_tests EXCLUDE_FROM_ALL
+        "${KYTY_TESTS_DIR}/ExperimentalSettingsTests.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/configuration.cpp")
+    target_include_directories(experimental_settings_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(experimental_settings_tests Qt6::Widgets common)
+    set_target_properties(experimental_settings_tests PROPERTIES AUTOMOC ON)
+    target_sources(experimental_settings_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/configuration.h")
+    add_test(NAME experimental_settings COMMAND experimental_settings_tests)
+endif()

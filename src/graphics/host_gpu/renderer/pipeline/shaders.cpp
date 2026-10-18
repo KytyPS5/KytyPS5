@@ -19,6 +19,8 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <limits>
 #include <span>
 #include <vector>
@@ -180,18 +182,41 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
                               vk::ShaderStageFlagBits              stage) {
-	for (const auto& binding: program.bindings.descriptors) {
+	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+		const auto index = std::countr_zero(mask);
+		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
 		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
-		     NativeDescriptorType(binding.kind), NativeDescriptorCount(binding), stage, nullptr});
+		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
+		     program.bindings.descriptor_counts[index], stage, nullptr});
 	}
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	uint32_t descriptor_count = 0;
+	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+	uint64_t descriptor_count = 0;
+	uint64_t storage_buffers = 0;
+	std::array<uint64_t, 32> stage_buffers {}, stage_resources {};
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
+		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
+		if (storage) storage_buffers += binding.descriptorCount;
+		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u) {
+			const auto stage = std::countr_zero(stages);
+			if (storage) stage_buffers[stage] += binding.descriptorCount;
+			if (binding.descriptorType != vk::DescriptorType::eSampler)
+				stage_resources[stage] += binding.descriptorCount;
+			if (stage_buffers[stage] > limits.maxPerStageDescriptorStorageBuffers ||
+			    stage_resources[stage] > limits.maxPerStageResources) {
+				EXIT("native descriptor stage %u exceeds device limits: buffers=%" PRIu64
+				     "/%u resources=%" PRIu64 "/%u\n", stage, stage_buffers[stage],
+				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources);
+			}
+		}
+	}
+	if (storage_buffers > limits.maxDescriptorSetStorageBuffers) {
+		EXIT("native storage-buffer descriptors exceed device limit: %" PRIu64 "/%u\n",
+		     storage_buffers, limits.maxDescriptorSetStorageBuffers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
@@ -327,9 +352,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			}
 		}
 
-		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].AddTid());
-		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].SwizzleEnabled());
-
 		EXIT_IF(registers_num < 1 || registers_num > 4);
 	}
 
@@ -403,8 +425,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    GetBlendFactor(static_params.color_destblend[i]);
 		color_blend_attachment[i].colorBlendOp = GetBlendOp(static_params.color_comb_fcn[i]);
 		color_blend_attachment[i].srcAlphaBlendFactor =
-		    (static_params.separate_alpha_blend[i] ? GetBlendFactor(static_params.alpha_srcblend[i])
-		                                           : color_blend_attachment[i].srcColorBlendFactor);
+		    (static_params.separate_alpha_blend[i]
+		         ? GetBlendFactor(static_params.alpha_srcblend[i])
+		         : color_blend_attachment[i].srcColorBlendFactor);
 		color_blend_attachment[i].dstAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
 		         ? GetBlendFactor(static_params.alpha_destblend[i])
@@ -473,14 +496,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
-	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
-	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
-	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
@@ -499,6 +514,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
+	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}

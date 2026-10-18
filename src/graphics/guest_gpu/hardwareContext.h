@@ -458,6 +458,9 @@ struct PsShaderResource2 {
 
 struct PsStageRegisters {
 	uint64_t          data_addr = 0;
+	uint64_t          user_data_addr = 0;
+	// Hades II uses PS offsets 4:5 for a byte-addressed descriptor table.
+	uint64_t          auxiliary_table_addr = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
 };
@@ -553,6 +556,8 @@ struct ShaderRegisters {
 	uint32_t m_vgtGsMaxVertOut        = 0;
 	uint32_t m_vgtGsOutPrimType       = 0;
 	uint32_t m_vgtPrimitiveIdEn       = 0;
+	uint32_t m_vgtDrawPayloadCntl     = 0;
+	uint32_t m_paClObjprimIdCntl      = 0;
 	uint32_t m_vgtReuseOff            = 0;
 	uint32_t m_vgtTessDistribution    = 0;
 	uint32_t m_vgtLsHsConfig          = 0;
@@ -676,6 +681,10 @@ public:
 
 	void                   SetRenderTargetMask(uint32_t mask) { m_render_target_mask = mask; }
 	[[nodiscard]] uint32_t GetRenderTargetMask() const { return m_render_target_mask; }
+	[[nodiscard]] bool HasObjectPrimitiveIdOutput() const {
+		return (m_sh_regs.m_vgtDrawPayloadCntl & 1u) != 0 &&
+		       (m_render_target_mask & 0xf0000000u) != 0;
+	}
 
 	void                   SetShaderStages(uint32_t flags) { m_shader_stages = flags; }
 	[[nodiscard]] uint32_t GetShaderStages() const { return m_shader_stages; }
@@ -874,6 +883,8 @@ public:
 	void SetGsMaxVertOut(uint32_t value) { m_sh_regs.m_vgtGsMaxVertOut = value; }
 	void SetGsOutPrimType(uint32_t value) { m_sh_regs.m_vgtGsOutPrimType = value; }
 	void SetPrimitiveIdEn(uint32_t value) { m_sh_regs.m_vgtPrimitiveIdEn = value; }
+	void SetDrawPayloadControl(uint32_t value) { m_sh_regs.m_vgtDrawPayloadCntl = value; }
+	void SetObjprimIdControl(uint32_t value) { m_sh_regs.m_paClObjprimIdCntl = value; }
 	void SetReuseOff(uint32_t value) { m_sh_regs.m_vgtReuseOff = value; }
 	void SetTessDistribution(uint32_t value) { m_sh_regs.m_vgtTessDistribution = value; }
 	void SetLsHsConfig(uint32_t value) { m_sh_regs.m_vgtLsHsConfig = value; }
@@ -1017,6 +1028,12 @@ public:
 	void SetGsShaderResource2(const GsShaderResource2& rsrc2) { m_vs.gs_regs.rsrc2 = rsrc2; }
 
 	void SetPsShaderBase(uint64_t addr) { m_ps.ps_regs.data_addr = addr; }
+	void SetPsUserDataAddress(uint32_t word, uint32_t value) {
+		SetUserDataAddressWord(m_ps.ps_regs.user_data_addr, word, value);
+	}
+	void SetPsAuxiliaryTableAddress(uint32_t word, uint32_t value) {
+		SetUserDataAddressWord(m_ps.ps_regs.auxiliary_table_addr, word, value);
+	}
 	void SetPsShaderResource1(const PsShaderResource1& rsrc1) { m_ps.ps_regs.rsrc1 = rsrc1; }
 	void SetPsShaderResource2(const PsShaderResource2& rsrc2) { m_ps.ps_regs.rsrc2 = rsrc2; }
 

@@ -6,6 +6,7 @@
 #include <QStringList>
 class QByteArray;
 class QGroupBox;
+class QLineEdit;
 class QListWidget;
 class QMoveEvent;
 class QResizeEvent;
@@ -28,16 +29,23 @@ public:
 	static void WriteSettings(QSettings& s);
 	static void ReadSettings(QSettings& s);
 
-	void                      SetGameDirectories(const QStringList& dirs);
+	void                      SetGlobalSettings(const QStringList& dirs, const QString& addons_dir);
+	[[nodiscard]] QString     GetAddonsDirectory() const;
 	[[nodiscard]] QStringList GetGameDirectories() const;
+
+signals:
+	void PreviewControllerColor(const QString& color);
+	void ImportGameSettings();
+	void ExportGameSettings();
 
 private:
 	Ui::ConfigurationEditDialog* m_ui = nullptr;
 	Configuration&               m_info;
 	QGroupBox*                   m_game_dirs_group        = nullptr;
 	QListWidget*                 m_game_dirs_list         = nullptr;
+	QLineEdit*                   m_addons_dir_edit        = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
-	bool                         m_show_game_dirs         = false;
+	bool                         m_global_settings        = false;
 
 protected:
 	void Init(const Configuration& info);

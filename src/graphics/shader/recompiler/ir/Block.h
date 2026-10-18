@@ -1,5 +1,6 @@
 #pragma once
 
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/Value.h"
 
@@ -37,6 +38,8 @@ public:
 	[[nodiscard]] const InstructionList&  Instructions() const;
 	[[nodiscard]] std::span<Block* const> ImmPredecessors() const;
 	[[nodiscard]] std::span<Block* const> ImmSuccessors() const;
+	[[nodiscard]] uint32_t Definition() const { return definition; }
+	void SetDefinition(uint32_t value) const { definition = value; }
 
 	void               SsaSeal();
 	[[nodiscard]] bool IsSsaSealed() const;
@@ -46,6 +49,27 @@ public:
 	iterator       end();
 	const_iterator end() const;
 	bool           empty() const;
+
+	struct SwitchCase {
+		uint32_t value;
+		Block*   target;
+	};
+	struct Terminator {
+		CFG::TerminatorKind     kind           = CFG::TerminatorKind::Return;
+		Block*                  true_block     = nullptr;
+		Block*                  false_block    = nullptr;
+		Block*                  merge_block    = nullptr;
+		Block*                  continue_block = nullptr;
+		std::vector<SwitchCase> cases;
+		bool                    indexed     = false;
+		bool                    loop_header = false;
+	};
+	uint32_t   id       = 0;
+	uint32_t   start_pc = 0;
+	uint32_t   end_pc   = 0;
+	Terminator terminator;
+	Value      condition;
+	Value      indirect_target;
 
 	std::array<Value, NumScalarRegs> ssa_sreg_values {};
 	std::array<Value, NumScalarRegs> ssa_thread_bit_sreg_values {};
@@ -57,6 +81,7 @@ private:
 	std::vector<Block*> predecessors;
 	std::vector<Block*> successors;
 	bool                ssa_sealed = false;
+	mutable uint32_t    definition = 0;
 };
 
 using BlockList = std::vector<Block*>;

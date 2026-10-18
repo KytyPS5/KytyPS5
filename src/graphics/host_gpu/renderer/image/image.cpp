@@ -1,16 +1,20 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <fmt/format.h>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -48,12 +52,29 @@ namespace {
 }
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
+	auto usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (info.IsBlock()) {
-		return vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
-		       vk::ImageUsageFlagBits::eSampled;
+		usage |= vk::ImageUsageFlagBits::eSampled;
+		if (graphics.supports_block_texel_view) {
+			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
+			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
+			                                      vk::ImageTiling::eOptimal, storage,
+			                                      ImageCreateFlags(graphics, info),
+			                                      nullptr) == vk::Result::eSuccess) {
+				usage = storage;
+			} else {
+				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+				if (!warned.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Warning: format {} does not support storage access; block-compressed "
+					    "textures written by the guest will not render.\n",
+					    vk::to_string(info.pixel_format)));
+				}
+			}
+		}
+		return usage;
 	}
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
-	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
 	}
@@ -320,7 +341,9 @@ void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	const uint32_t base_depth = backing.image_type == vk::ImageType::e3D
+	const uint32_t base_depth = source.backing.image_type == backing.image_type
+	                                ? std::min(source.backing.extent.depth, backing.extent.depth)
+	                            : backing.image_type == vk::ImageType::e3D
 	                                ? backing.extent.depth
 	                                : source.backing.extent.depth;
 	const auto     source_aspect =
@@ -434,7 +457,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 	return static_cast<uint32_t>(std::min<uint64_t>(rows, capacity / row_size));
 }
 
-void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
+void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -452,6 +475,8 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	const uint32_t destination_block = info.IsBlock() ? 4u : 1u;
 	EXIT_IF(levels == 0 || source_bytes == 0 || source_bytes != destination_bytes ||
 	        source_block != destination_block);
+	const auto source_transform = source.info.GetColorTransform();
+	const auto target_transform = info.GetColorTransform();
 
 	vk::BufferMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
@@ -513,9 +538,19 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 				command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
 				                          source_copy);
-				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
-				command.pipelineBarrier2(dependency);
+				if (source_transform != target_transform) {
+					const TileManager::Result bytes {buffer.Handle(), 0, copy_size};
+					if (source_transform != ColorTransform::None) {
+						tiler.TransformColor(bytes, bytes, source_transform, false);
+					}
+					if (target_transform != ColorTransform::None) {
+						tiler.TransformColor(bytes, bytes, target_transform, true);
+					}
+				} else {
+					barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+					barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+					command.pipelineBarrier2(dependency);
+				}
 				command.copyBufferToImage(buffer.Handle(), backing.image,
 				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
 			}
@@ -628,10 +663,8 @@ void Validate(const ImageInfo& info) {
 			break;
 		case ImageMetadataKind::Dcc:
 		case ImageMetadataKind::Cmask:
-			if (info.metadata.range.address == 0 ||
-			    info.metadata.range.address >= TRACKER_ADDRESS_SIZE ||
-			    (info.metadata.range.size != 0 &&
-			     info.metadata.range.size > TRACKER_ADDRESS_SIZE - info.metadata.range.address) ||
+			if (!GuestRange {info.metadata.range.address,
+			                 std::max<uint64_t>(info.metadata.range.size, 1)}.Valid() ||
 			    info.metadata.compression == VideoOutCompression::Unsupported) {
 				EXIT("invalid color metadata\n");
 			}
@@ -653,7 +686,9 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 } // namespace ImageOps
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
-    : info(image_info), m_graphics(graphics), m_scheduler(scheduler) {
+    : info(image_info),
+      stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
+      m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
 	m_cpu_dirty =

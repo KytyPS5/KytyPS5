@@ -9,7 +9,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-enum class ValueOpcode {
+enum class ValueOpcode : uint16_t {
 #define VALUE_OPCODE(name, ...) name,
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
 #undef VALUE_OPCODE
@@ -51,6 +51,10 @@ struct PermlaneFlags {
 };
 static_assert(sizeof(PermlaneFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<PermlaneFlags>);
+
+struct FPCompareFlags {
+	bool flush_input_denorms = false;
+};
 
 struct MemoryFlags {
 	uint32_t index = 0;

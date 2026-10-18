@@ -23,7 +23,6 @@ constexpr auto MakeRegisterNames() {
 	names[R_DISPATCH_RESET] = "R_DISPATCH_RESET";
 	names[R_PUSH_MARKER]    = "R_PUSH_MARKER";
 	names[R_POP_MARKER]     = "R_POP_MARKER";
-	names[R_ACQUIRE_MEM]    = "R_ACQUIRE_MEM";
 	names[R_WRITE_DATA]     = "R_WRITE_DATA";
 	names[R_FLIP]           = "R_FLIP";
 	names[R_RELEASE_MEM]    = "R_RELEASE_MEM";
@@ -120,15 +119,15 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 		uint32_t len = 0;
 
 		const auto packet_type = static_cast<PacketType>(cmd_id >> 30u);
-		// Type-2 packets are header-only padding; every other packet type requires a body.
-		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2);
+		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2 &&
+		                     PacketSizeDw(cmd_id) != 1u);
 
 		switch (packet_type) {
 			case PacketType::Type3: {
 				const bool    sh_gx = (cmd_id & 0x2u) == 0;
 				const uint8_t op    = ((cmd_id >> 8u) & 0xffu);
 				const auto    r     = KYTY_PM4_R(cmd_id);
-				len                 = ((cmd_id >> 16u) & 0x3fffu) + 1;
+				len                 = PacketSizeDw(cmd_id) - 1u;
 
 				EXIT_NOT_IMPLEMENTED(len >= dw);
 

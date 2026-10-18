@@ -158,6 +158,7 @@ LIB_DEFINE(InitAudio_1_AudioOut2) {
 	LIB_FUNC("bkBN+CMLwRc", AudioOut2::AudioOut2GetSystemState);
 	LIB_FUNC("xywYcRB7nbQ", AudioOut2::AudioOut2UserCreate);
 	LIB_FUNC("IaZXJ9M79uo", AudioOut2::AudioOut2UserDestroy);
+	LIB_FUNC("iE8trxPKnAg", AudioOut2::AudioOut2UserGetSupportedAttributes);
 	LIB_FUNC("G1YOKDJYX2Y", AudioOut2::AudioOut2GetSpeakerArrayMemorySize);
 	LIB_FUNC("+k91hoTuoA8", AudioOut2::AudioOut2SpeakerArrayCreate);
 	LIB_FUNC("erCWQR5eKiQ", AudioOut2::AudioOut2SpeakerArrayDestroy);
@@ -1146,6 +1147,8 @@ LIB_DEFINE(InitAudio_1_Ngs2) {
 	LIB_FUNC("mPYgU4oYpuY", Ngs2::Ngs2SystemCreateWithAllocator);
 	LIB_FUNC("u-WrYDaJA3k", Ngs2::Ngs2SystemDestroy);
 	LIB_FUNC("vU7TQ62pItw", Ngs2::Ngs2SystemGetInfo);
+	LIB_FUNC("gThZqM5PYlQ", Ngs2::Ngs2SystemLock);
+	LIB_FUNC("JXRC5n0RQls", Ngs2::Ngs2SystemUnlock);
 	LIB_FUNC("U546k6orxQo", Ngs2::Ngs2RackCreateWithAllocator);
 	LIB_FUNC("cLV4aiT9JpA", Ngs2::Ngs2RackCreate);
 	LIB_FUNC("0eFLVCfWVds", Ngs2::Ngs2RackQueryBufferSize);

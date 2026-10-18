@@ -294,16 +294,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
-		if (rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
-		    rt.dcc_addr.addr != 0x0000000000000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 metadata addresses cmask=0x%016" PRIx64
-				     " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
-				     rt.cmask.addr, rt.fmask.addr, rt.dcc_addr.addr);
-				logged = true;
-			}
-		}
 	}
 }
 
@@ -394,24 +384,18 @@ static void RcPrint(const char* func, const HW::RenderControl& c) {
 
 	LOGF("\t depth_clear_enable       = %s\n"
 	     "\t stencil_clear_enable     = %s\n"
+	     "\t copy_depth_to_color      = %s\n"
+	     "\t copy_stencil_to_color    = %s\n"
 	     "\t resummarize_enable       = %s\n"
 	     "\t stencil_compress_disable = %s\n"
 	     "\t depth_compress_disable   = %s\n"
 	     "\t copy_centroid            = %s\n"
 	     "\t copy_sample              = %" PRIu8 "\n",
 	     c.depth_clear_enable ? "true" : "false", c.stencil_clear_enable ? "true" : "false",
+	     c.copy_depth_to_color ? "true" : "false", c.copy_stencil_to_color ? "true" : "false",
 	     c.resummarize_enable ? "true" : "false", c.stencil_compress_disable ? "true" : "false",
 	     c.depth_compress_disable ? "true" : "false", c.copy_centroid ? "true" : "false",
 	     c.copy_sample);
-}
-
-static void RcCheck(const HW::RenderControl& c) {
-	// EXIT_NOT_IMPLEMENTED(c.depth_clear_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.stencil_clear_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.stencil_compress_disable != false);
-	// EXIT_NOT_IMPLEMENTED(c.depth_compress_disable != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_centroid != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_sample != 0);
 }
 
 static void McPrint(const char* func, const HW::ModeControl& c) {
@@ -869,9 +853,6 @@ void hw_check(const CommandBuffer& buffer) {
 	VpCheck(vp, smc);
 	log_phase("clip");
 	ClipCheck(c);
-	log_phase("rc");
-	RcCheck(rc);
-	log_phase("depth");
 	log_phase("mode");
 	McCheck(mc);
 	log_phase("blend");
@@ -883,14 +864,33 @@ void hw_check(const CommandBuffer& buffer) {
 	log_phase("done");
 
 	if (graphics_debug_dump_enabled() && RenderTargetMaskHasBoundMrt(buffer)) {
-		LOGF("MRT render target mask: 0x%08" PRIx32 "\n", hw.GetRenderTargetMask());
+		const auto& sh = hw.GetShaderRegisters();
+		LOGF("MRT render target mask: 0x%08" PRIx32
+		     " export_modes={%u,%u,%u,%u,%u,%u,%u,%u}\n",
+		     hw.GetRenderTargetMask(), sh.target_output_mode[0], sh.target_output_mode[1],
+		     sh.target_output_mode[2], sh.target_output_mode[3], sh.target_output_mode[4],
+		     sh.target_output_mode[5], sh.target_output_mode[6], sh.target_output_mode[7]);
 		for (uint32_t i = 0; i < 8; i++) {
 			const auto& mrt = hw.GetRenderTarget(i);
+			const auto& bc  = hw.GetBlendControl(i);
 			LOGF("\t RT%u addr=0x%010" PRIx64 " mask=0x%x fmt=0x%08" PRIx32
-			     " width=%u height=%u tile=%u\n",
+			     " type=%u order=%u shader_mask=0x%x"
+			     " width=%u height=%u tile=%u blend=%u bypass=%u clamp=%u round_mode=%u"
+			     " samples=%u fragments=%u dcc=%u dcc_addr=0x%010" PRIx64
+			     " cmask_clear=%u cmask_addr=0x%010" PRIx64
+			     " dcc_clear_key=%u clear={%08" PRIx32 ",%08" PRIx32 "}\n",
 			     i, mrt.base.addr, (hw.GetRenderTargetMask() >> (i * 4u)) & 0x0fu,
-			     static_cast<uint32_t>(mrt.info.format), mrt.attrib2.width + 1,
-			     mrt.attrib2.height + 1, static_cast<uint32_t>(mrt.attrib3.tile_mode));
+			     static_cast<uint32_t>(mrt.info.format), static_cast<uint32_t>(mrt.info.channel_type),
+			     static_cast<uint32_t>(mrt.info.channel_order), (sh.m_cbShaderMask >> (i * 4u)) & 0x0fu,
+			     mrt.attrib2.width + 1, mrt.attrib2.height + 1,
+			     static_cast<uint32_t>(mrt.attrib3.tile_mode), static_cast<uint32_t>(bc.enable),
+			     static_cast<uint32_t>(mrt.info.blend_bypass), static_cast<uint32_t>(mrt.info.blend_clamp),
+			     static_cast<uint32_t>(mrt.info.round_mode), mrt.attrib.num_samples,
+			     mrt.attrib.num_fragments,
+			     static_cast<uint32_t>(mrt.info.dcc_compression_enable), mrt.dcc_addr.addr,
+			     static_cast<uint32_t>(mrt.info.cmask_fast_clear_enable), mrt.cmask.addr,
+			     static_cast<uint32_t>(mrt.dcc.dcc_clear_key_enable), mrt.clear_word0.word0,
+			     mrt.clear_word1.word1);
 		}
 	}
 	if (rc.depth_clear_enable && hw.GetDepthClearValue() != 0.0f &&

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -77,6 +78,7 @@ public:
 	explicit Instance(const Config& config): m_config(config) {}
 
 	~Instance() {
+		ClearFrames();
 		ClearPictureMetadata();
 		if (m_sws != nullptr) {
 			sws_freeContext(m_sws);
@@ -119,116 +121,138 @@ public:
 
 	[[nodiscard]] uint32_t CodecType() const { return m_config.codec_type; }
 
+	[[nodiscard]] Result Submit(const Input& input, uint32_t* produced) {
+		std::scoped_lock lock(m_mutex);
+		return SubmitInput(input, produced);
+	}
+
+	[[nodiscard]] Result Receive(const FrameBuffer& frame_buffer, Output* output) {
+		std::scoped_lock lock(m_mutex);
+		return ReceiveOutput(frame_buffer, output);
+	}
+
+	[[nodiscard]] Result Finalize() {
+		std::scoped_lock lock(m_mutex);
+		if (m_finalized) return Result::Ok;
+		const auto drained = DrainFrames();
+		if (drained != Result::Ok) return drained;
+		const int result = avcodec_send_packet(m_codec, nullptr);
+		if (result == AVERROR(EAGAIN)) return Result::InputFull;
+		if (result < 0 && result != AVERROR_EOF) return Result::ApiFail;
+		m_finalized = true;
+		return DrainFrames();
+	}
+
 	[[nodiscard]] Result DecodeInput(const Input& input, const FrameBuffer& frame_buffer,
 	                                 Output* output) {
 		std::scoped_lock lock(m_mutex);
 		*output = {};
-
-		AVPacket* packet = av_packet_alloc();
-		AVFrame*  frame  = av_frame_alloc();
-		if (packet == nullptr || frame == nullptr ||
-		    input.size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-			av_packet_free(&packet);
-			av_frame_free(&frame);
-			return Result::ApiFail;
+		uint32_t produced = 0;
+		auto result = SubmitInput(input, &produced);
+		if (result == Result::InputFull) {
+			// The combined API supplies an output buffer together with each AU.
+			result = ReceiveOutput(frame_buffer, output);
+			if (result != Result::Ok) return result;
+			return SubmitInput(input, &produced);
 		}
-
-		int result = av_new_packet(packet, static_cast<int>(input.size));
-		if (result < 0) {
-			LOGF("Videodec2: av_new_packet failed: %s (%d)\n", AvErrorString(result), result);
-			av_packet_free(&packet);
-			av_frame_free(&frame);
-			return Result::ApiFail;
-		}
-		std::memcpy(packet->data, input.data, input.size);
-		packet->pts = ToAvTimestamp(input.pts);
-		packet->dts = ToAvTimestamp(input.dts);
-
-		packet->opaque_ref = av_buffer_alloc(sizeof(PacketMetadata));
-		if (packet->opaque_ref == nullptr) {
-			av_packet_free(&packet);
-			av_frame_free(&frame);
-			return Result::ApiFail;
-		}
-		const PacketMetadata metadata {input.pts, input.dts, input.attached_data};
-		std::memcpy(packet->opaque_ref->data, &metadata, sizeof(metadata));
-
-		bool have_pending_frame = false;
-		result                  = avcodec_send_packet(m_codec, packet);
-		if (result == AVERROR(EAGAIN)) {
-			result = avcodec_receive_frame(m_codec, frame);
-			if (result < 0) {
-				LOGF("Videodec2: decoder rejected an AU while no output was available: %s (%d)\n",
-				     AvErrorString(result), result);
-				av_packet_free(&packet);
-				av_frame_free(&frame);
-				return Result::AccessUnit;
-			}
-			have_pending_frame = true;
-			result             = avcodec_send_packet(m_codec, packet);
-		}
-		if (result < 0) {
-			LOGF("Videodec2: avcodec_send_packet failed: %s (%d)\n", AvErrorString(result), result);
-			av_packet_free(&packet);
-			av_frame_free(&frame);
-			return Result::AccessUnit;
-		}
-
-		Result decode_result = Result::Ok;
-		if (!have_pending_frame) {
-			result = avcodec_receive_frame(m_codec, frame);
-			if (result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
-				if (result < 0) {
-					LOGF("Videodec2: avcodec_receive_frame failed: %s (%d)\n",
-					     AvErrorString(result), result);
-					decode_result = Result::AccessUnit;
-				} else {
-					decode_result = CopyFrame(frame, frame_buffer, output);
-				}
-			}
-		} else {
-			decode_result = CopyFrame(frame, frame_buffer, output);
-		}
-
-		av_packet_free(&packet);
-		av_frame_free(&frame);
-		return decode_result;
+		if (result != Result::Ok) return result;
+		result = ReceiveOutput(frame_buffer, output);
+		return result == Result::NoFrame ? Result::Ok : result;
 	}
 
 	[[nodiscard]] Result FlushOutput(const FrameBuffer& frame_buffer, Output* output) {
 		std::scoped_lock lock(m_mutex);
-		*output = {};
-
-		AVFrame* frame = av_frame_alloc();
-		if (frame == nullptr) {
-			return Result::ApiFail;
-		}
-
-		// Guest Flush collects available pictures between AUs while retaining reference frames.
-		const int receive_result = avcodec_receive_frame(m_codec, frame);
-		if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
-			av_frame_free(&frame);
-			return Result::Ok;
-		}
-		if (receive_result < 0) {
-			LOGF("Videodec2: receiving a flushed frame failed: %s (%d)\n",
-			     AvErrorString(receive_result), receive_result);
-			av_frame_free(&frame);
-			return Result::ApiFail;
-		}
-
-		const auto result = CopyFrame(frame, frame_buffer, output);
-		av_frame_free(&frame);
-		return result;
+		const auto result = ReceiveOutput(frame_buffer, output);
+		return result == Result::NoFrame ? Result::Ok : result;
 	}
 
 	void ResetDecoder() {
 		std::scoped_lock lock(m_mutex);
 		avcodec_flush_buffers(m_codec);
+		ClearFrames();
 		ClearPictureMetadata();
+		m_finalized = m_eof = false;
 	}
 
 private:
+	struct PendingFrame {
+		AVFrame*    frame;
+		PictureInfo picture;
+	};
+
+	void ClearFrames() {
+		for (auto& pending: m_frames) av_frame_free(&pending.frame);
+		m_frames.clear();
+	}
+
+	[[nodiscard]] Result DrainFrames(uint32_t* produced = nullptr) {
+		while (!m_eof && m_frames.size() < m_config.max_pending_frames) {
+			AVFrame* frame = av_frame_alloc();
+			if (frame == nullptr) return Result::ApiFail;
+			const int result = avcodec_receive_frame(m_codec, frame);
+			if (result < 0) {
+				av_frame_free(&frame);
+				if (result == AVERROR_EOF) m_eof = true;
+				if (result == AVERROR(EAGAIN) || m_eof) return Result::Ok;
+				LOGF("Video decoder: avcodec_receive_frame failed: %s (%d)\n",
+				     AvErrorString(result), result);
+				return Result::AccessUnit;
+			}
+			m_frames.push_back({frame, MakePictureInfo(frame)});
+			if (produced != nullptr) ++*produced;
+		}
+		return Result::Ok;
+	}
+
+	[[nodiscard]] Result SubmitInput(const Input& input, uint32_t* produced) {
+		*produced = 0;
+		if (m_finalized) return Result::ApiFail;
+		const auto drained = DrainFrames();
+		if (drained != Result::Ok) return drained;
+		if (m_frames.size() >= m_config.max_pending_frames) return Result::InputFull;
+		if (input.size > static_cast<size_t>(std::numeric_limits<int>::max())) return Result::ApiFail;
+		AVPacket* packet = av_packet_alloc();
+		if (packet == nullptr) return Result::ApiFail;
+		int result = av_new_packet(packet, static_cast<int>(input.size));
+		if (result < 0) {
+			av_packet_free(&packet);
+			return Result::ApiFail;
+		}
+		std::memcpy(packet->data, input.data, input.size);
+		packet->pts = ToAvTimestamp(input.pts);
+		packet->dts = ToAvTimestamp(input.dts);
+		packet->opaque_ref = av_buffer_alloc(sizeof(PacketMetadata));
+		if (packet->opaque_ref == nullptr) {
+			av_packet_free(&packet);
+			return Result::ApiFail;
+		}
+		const PacketMetadata metadata {input.pts, input.dts, input.attached_data};
+		std::memcpy(packet->opaque_ref->data, &metadata, sizeof(metadata));
+		result = avcodec_send_packet(m_codec, packet);
+		av_packet_free(&packet);
+		if (result == AVERROR(EAGAIN)) return Result::InputFull; // The AU was not accepted.
+		if (result < 0) {
+			LOGF("Video decoder: submitting an AU failed: %s (%d)\n", AvErrorString(result), result);
+			return Result::AccessUnit;
+		}
+		// Once accepted, a full output queue cannot turn this AU into a retry.
+		return DrainFrames(produced);
+	}
+
+	[[nodiscard]] Result ReceiveOutput(const FrameBuffer& frame_buffer, Output* output) {
+		*output = {};
+		const auto drained = DrainFrames();
+		if (drained != Result::Ok) return drained;
+		if (m_frames.empty()) return Result::NoFrame;
+		auto& pending = m_frames.front();
+		const auto result = CopyFrame(pending.frame, pending.picture, frame_buffer, output);
+		if (result != Result::Ok) return result;
+		output->last_frame = m_finalized && m_eof && m_frames.size() == 1u;
+		av_frame_free(&pending.frame);
+		m_frames.pop_front();
+		return Result::Ok;
+	}
+
 	[[nodiscard]] PictureInfo MakePictureInfo(const AVFrame* frame) const {
 		PictureInfo result {};
 		if (frame->opaque_ref != nullptr && frame->opaque_ref->size >= sizeof(PacketMetadata)) {
@@ -268,8 +292,8 @@ private:
 		return result;
 	}
 
-	[[nodiscard]] Result CopyFrame(const AVFrame* frame, const FrameBuffer& frame_buffer,
-	                               Output* output) {
+	[[nodiscard]] Result CopyFrame(const AVFrame* frame, const PictureInfo& picture,
+	                               const FrameBuffer& frame_buffer, Output* output) {
 		if (frame->width <= 0 || frame->height <= 0) {
 			return Result::ApiFail;
 		}
@@ -329,7 +353,7 @@ private:
 
 		{
 			std::scoped_lock lock(g_picture_mutex);
-			g_picture_infos[frame_buffer.data] = {this, MakePictureInfo(frame)};
+			g_picture_infos[frame_buffer.data] = {this, picture};
 			m_picture_buffers.insert(frame_buffer.data);
 		}
 		return Result::Ok;
@@ -346,6 +370,9 @@ private:
 		m_picture_buffers.clear();
 	}
 
+	std::deque<PendingFrame>   m_frames;
+	bool                      m_finalized = false;
+	bool                      m_eof       = false;
 	Config                    m_config;
 	AVCodecContext*           m_codec    = nullptr;
 	SwsContext*               m_sws      = nullptr;
@@ -358,7 +385,7 @@ bool IsCodecSupported(uint32_t codec_type) {
 }
 
 Instance* Create(const Config& config) {
-	if (!IsCodecSupported(config.codec_type)) {
+	if (!IsCodecSupported(config.codec_type) || config.max_pending_frames < 2u) {
 		return nullptr;
 	}
 	auto* instance = new Instance(config);
@@ -377,6 +404,18 @@ uint32_t GetCodecType(const Instance* instance) {
 	return instance->CodecType();
 }
 
+Result Submit(Instance* instance, const Input& input, uint32_t* produced) {
+	return instance->Submit(input, produced);
+}
+
+Result Receive(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
+	return instance->Receive(frame_buffer, output);
+}
+
+Result Finalize(Instance* instance) {
+	return instance->Finalize();
+}
+
 Result Decode(Instance* instance, const Input& input, const FrameBuffer& frame_buffer,
               Output* output) {
 	return instance->DecodeInput(input, frame_buffer, output);
@@ -388,6 +427,44 @@ Result Flush(Instance* instance, const FrameBuffer& frame_buffer, Output* output
 
 void Reset(Instance* instance) {
 	instance->ResetDecoder();
+}
+
+AvcPictureInfo MakeAvcPictureInfo(const PictureInfo& decoded, size_t size) {
+	AvcPictureInfo picture {};
+	picture.this_size                      = size;
+	picture.is_valid                       = true;
+	picture.pts_data                       = decoded.pts;
+	picture.dts_data                       = decoded.dts;
+	picture.attached_data                  = decoded.attached_data;
+	picture.idr_picture_flag               = decoded.key_frame ? 1 : 0;
+	picture.profile_idc                    = static_cast<uint8_t>(decoded.profile);
+	picture.level_idc                      = static_cast<uint8_t>(decoded.level);
+	picture.pic_width_in_mbs_minus1        = (decoded.width + 15u) / 16u - 1u;
+	picture.pic_height_in_map_units_minus1 = (decoded.height + 15u) / 16u - 1u;
+	picture.frame_mbs_only_flag            = 1;
+	picture.frame_cropping_flag      = decoded.crop_left != 0 || decoded.crop_right != 0 ||
+	                                           decoded.crop_top != 0 || decoded.crop_bottom != 0
+	                                       ? 1
+	                                       : 0;
+	picture.frame_crop_left_offset   = decoded.crop_left;
+	picture.frame_crop_right_offset  = decoded.crop_right;
+	picture.frame_crop_top_offset    = decoded.crop_top;
+	picture.frame_crop_bottom_offset = decoded.crop_bottom;
+	picture.aspect_ratio_info_present_flag =
+	    decoded.sar_width != 0 && decoded.sar_height != 0 ? 1 : 0;
+	picture.aspect_ratio_idc               = picture.aspect_ratio_info_present_flag ? 255 : 0;
+	picture.sar_width                      = decoded.sar_width;
+	picture.sar_height                     = decoded.sar_height;
+	picture.video_signal_type_present_flag = 1;
+	picture.video_format                   = 5;
+	picture.video_full_range_flag          = decoded.color_range == 2 ? 1 : 0;
+	picture.colour_description_present_flag =
+	    decoded.color_primaries != 0 || decoded.color_trc != 0 || decoded.color_space != 0 ? 1
+	                                                                                       : 0;
+	picture.colour_primaries         = decoded.color_primaries;
+	picture.transfer_characteristics = decoded.color_trc;
+	picture.matrix_coefficients      = decoded.color_space;
+	return picture;
 }
 
 bool GetPictureInfo(void* frame_buffer, PictureInfo* picture_info) {

@@ -299,8 +299,8 @@ bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode
 	if (!TileGetTextureElementLayout(format, element)) {
 		return false;
 	}
-	if ((family == TileBlockFamily::Depth64KB || family == TileBlockFamily::RenderTarget64KB) &&
-	    Prospero::RenderTargetBytesPerElement(format) != element.bytes) {
+	if (family == TileBlockFamily::Depth64KB &&
+	    (element.texel_width != 1 || element.texel_height != 1)) {
 		return false;
 	}
 

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <fmt/format.h>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -350,13 +351,23 @@ void Image::CopyImage(Image& source) {
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
 	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	const auto                 source_block      = vk::blockExtent(source.backing.format);
+	const auto                 destination_block = vk::blockExtent(backing.format);
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width  = std::max(source.backing.extent.width >> level, 1u);
-		const auto height = std::max(source.backing.extent.height >> level, 1u);
-		const auto depth  = std::max(base_depth >> level, 1u);
-		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
+		// The images can differ in size, e.g. when a cache replacement takes a smaller extent.
+		const auto width  = CopyExtent(std::max(source.backing.extent.width >> level, 1u),
+		                               std::max(backing.extent.width >> level, 1u), source_block[0],
+		                               destination_block[0]);
+		const auto height = CopyExtent(std::max(source.backing.extent.height >> level, 1u),
+		                               std::max(backing.extent.height >> level, 1u),
+		                               source_block[1], destination_block[1]);
+		if (width == 0 || height == 0) {
+			continue;
+		}
+		const auto depth                         = std::max(base_depth >> level, 1u);
+		auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 		vk::ImageCopy copy {};
 		copy.srcSubresource = {source_aspect, level, 0, 1};
 		copy.dstSubresource = {destination_aspect, level, 0, 1};
@@ -369,9 +380,12 @@ void Image::CopyImage(Image& source) {
 				copy.extent                    = {width, height, 1};
 			}
 		} else if (source.backing.image_type == vk::ImageType::e2D) {
+			// Layers of the 2D image map to slices of the 3D one.
+			source_layers                  = std::min(source_layers, source.backing.layers);
 			copy.srcSubresource.layerCount = source_layers;
 			copy.extent                    = {width, height, source_layers};
 		} else {
+			destination_layers             = std::min(destination_layers, backing.layers);
 			copy.dstSubresource.layerCount = destination_layers;
 			copy.extent                    = {width, height, destination_layers};
 		}
@@ -450,6 +464,32 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	}
 }
 
+uint32_t Image::CopyExtent(uint32_t source, uint32_t destination, uint32_t source_block,
+                           uint32_t destination_block) noexcept {
+	if (source_block == 0 || destination_block == 0) {
+		return 0;
+	}
+	// Copy regions are measured in source texels and scaled by the block ratio on the
+	// destination, so keep the region inside both images.
+	const auto fit    = static_cast<uint64_t>(destination) * source_block / destination_block;
+	const auto extent = static_cast<uint32_t>(std::min<uint64_t>(source, fit));
+	if (extent % source_block == 0) {
+		return extent;
+	}
+	// A region may end inside a block only at the edge of an image. Keep a partial source block
+	// when it is the source edge and the destination region is whole blocks or ends at its edge.
+	if (extent == source) {
+		const uint64_t written = source_block == destination_block
+		                             ? extent
+		                             : (static_cast<uint64_t>(extent) + source_block - 1) /
+		                                   source_block * destination_block;
+		if (written == destination || (written < destination && written % destination_block == 0)) {
+			return extent;
+		}
+	}
+	return extent - extent % source_block;
+}
+
 uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) noexcept {
 	if (row_size == 0 || rows == 0 || row_size > capacity) {
 		return 0;
@@ -496,8 +536,15 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		const auto width  = CopyExtent(std::max(source.backing.extent.width >> level, 1u),
+		                               std::max(backing.extent.width >> level, 1u), source_block,
+		                               destination_block);
+		const auto height = CopyExtent(std::max(source.backing.extent.height >> level, 1u),
+		                               std::max(backing.extent.height >> level, 1u), source_block,
+		                               destination_block);
+		if (width == 0 || height == 0) {
+			continue;
+		}
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;

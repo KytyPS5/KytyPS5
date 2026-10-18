@@ -567,9 +567,17 @@ struct DescriptorSource {
 
 			bool operator==(const PointerTable& other) const = default;
 		};
+		// The selector reads a 64-bit pointer from its record. Each hop loads the next 64-bit
+		// pointer at that byte offset; the descriptor is read at table_offset of the last one.
+		struct PointerChain {
+			std::vector<uint32_t> hops;
+
+			bool operator==(const PointerChain& other) const = default;
+		};
 		std::optional<SelectorRead> selector;
 		std::optional<uint32_t> table_maximum;
 		std::optional<PointerTable> pointer_table;
+		std::optional<PointerChain> chain;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;

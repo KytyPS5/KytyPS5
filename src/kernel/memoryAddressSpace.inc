@@ -825,7 +825,8 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		// Reads the mapping set only. The page manager serialises watches on the same page.
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 

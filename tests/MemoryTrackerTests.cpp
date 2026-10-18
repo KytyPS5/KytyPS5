@@ -316,6 +316,50 @@ void TestRangeSet() {
         "range set subtraction did not preserve both exact tails");
 }
 
+void TestRangeSetMergesMatchReference() {
+  constexpr uint64_t Units = 512;
+  constexpr uint64_t Base = 0x40000;
+  RangeSet ranges;
+  std::vector<bool> reference(Units, false);
+  uint64_t state = 0x2545f4914f6cdd1dull;
+  const auto next = [&state] {
+    state ^= state << 13u;
+    state ^= state >> 7u;
+    state ^= state << 17u;
+    return state;
+  };
+  for (int step = 0; step < 20000; step++) {
+    const uint64_t begin = next() % Units;
+    const uint64_t size = 1 + next() % std::min<uint64_t>(24, Units - begin);
+    const bool add = next() % 4 != 0;
+    if (add) {
+      ranges.Add(Base + begin, size);
+    } else {
+      ranges.Subtract(Base + begin, size);
+    }
+    for (uint64_t unit = begin; unit < begin + size; unit++) {
+      reference[unit] = add;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> expected;
+    for (uint64_t unit = 0; unit < Units; unit++) {
+      if (!reference[unit]) {
+        continue;
+      }
+      if (!expected.empty() && expected.back().second == Base + unit) {
+        expected.back().second++;
+      } else {
+        expected.emplace_back(Base + unit, Base + unit + 1);
+      }
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> actual;
+    ranges.ForEach([&](uint64_t start, uint64_t end) {
+      actual.emplace_back(start, end);
+    });
+    Check(actual == expected,
+          "range set add/subtract did not match the coalesced reference");
+  }
+}
+
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
@@ -1279,6 +1323,7 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestRangeSetMergesMatchReference();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();

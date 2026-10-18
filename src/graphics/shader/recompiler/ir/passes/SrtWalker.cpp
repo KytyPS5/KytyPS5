@@ -1102,7 +1102,6 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	if (index >= m_context.values.size()) {
 		m_context.values.resize(m_program.evaluation_value_count);
 	}
-	if (m_context.values[index].generation == m_context.generation) {
 	auto& entry = m_context.values[index];
 	if (entry.generation == m_context.generation ||
 	    entry.generation == (m_context.generation | 2u)) {
@@ -1120,8 +1119,6 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		m_state->cycle_root = std::min(m_state->cycle_root, entry.value);
 		return Refuse(SrtRefusal::VaryingPhi);
 	}
-	auto& memo = m_context.values[index];
-		return false;
 	const auto visit     = BeginVisit(entry);
 	uint64_t   out       = 0;
 	const auto plain     = PlainArgCount(inst->GetOpcode());

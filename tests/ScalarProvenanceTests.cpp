@@ -1016,6 +1016,44 @@ void TestFrozenPhiPlansWalkLikeTheProgram() {
 }
 
 // Each layer of `c = c | c` over a refused loop phi doubled the walk while refusals were retried.
+void TestWalkRemembersRefusals() {
+  const auto walk = [](uint32_t layers, bool frozen) {
+    Fixture fixture;
+    auto &block = fixture.BlockAt();
+    const auto entry = UserData(fixture, 0);
+    auto &loop = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &step = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&loop), Value(1u)});
+    loop.AddPhiOperand(&block, entry);
+    loop.AddPhiOperand(&block, Value(&step));
+    auto condition = fixture.Emit(ValueOpcode::IEqual32, {Value(&loop), Value(5u)});
+    for (uint32_t layer = 0; layer < layers; layer++) {
+      condition = fixture.Emit(ValueOpcode::LogicalOr, {condition, condition});
+    }
+    const auto select =
+        fixture.Emit(ValueOpcode::SelectU32, {condition, Value(0x100u), Value(0x200u)});
+    PushDescriptor(fixture, {select, Value(0u), Value(4u), Value(0u)});
+    auto plan = ExtractResourcePlan(fixture.program);
+    plan.frozen_values = frozen;
+    const std::array<uint32_t, 1> user_data{0x10u};
+    DescriptorValue descriptor;
+    SrtRefusal refusal = SrtRefusal::None;
+    const bool evaluated = frozen ? EvaluateWithClean(plan, 0, {.user_data = user_data},
+                                                      descriptor, &refusal)
+                                  : EvaluateWithClean(fixture.program, 0, {.user_data = user_data},
+                                                      descriptor, &refusal);
+    return std::pair{evaluated, refusal};
+  };
+  for (const bool frozen : {false, true}) {
+    const auto shallow = walk(0, frozen);
+    const auto deep = walk(40, frozen);
+    Check(!shallow.first && !deep.first,
+          "a descriptor selected by a loop-varying condition materialized");
+    Check(shallow.second == SrtRefusal::VaryingPhi && deep.second == shallow.second,
+          "a refusal answered from the memo reported another reason than the walk");
+  }
+}
+
+// A vector compare written to an SGPR is stored as ballot words (Translator::WriteMask).
 void TestBallotDescriptorDword() {
   const auto build = [](Fixture &fixture, bool lane_predicate, uint32_t wave_size) {
     fixture.program.wave_size = wave_size;
@@ -1453,6 +1491,7 @@ int main() {
     TestAdvancingLoopPhi();
     TestCyclicPhiEntryCacheAnswersLikeTheWalk();
     TestFrozenPhiPlansWalkLikeTheProgram();
+    TestWalkRemembersRefusals();
     TestBallotDescriptorDword();
     TestLaneIndexOutsideBallot();
     TestBallotLaneSweepForgetsLaneValues();

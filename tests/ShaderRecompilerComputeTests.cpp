@@ -407,10 +407,10 @@ struct RenderExecutorTestAccess {
     executor.DrawAuto(0, command, args);
   }
 
-  static bool TryConsumeComputeImageClear(RenderExecutor &executor,
+  static bool TryConsumeComputeFill(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
-    return executor.TryConsumeComputeImageClear(input, command, x, y, z, mode);
+    return executor.TryConsumeComputeFill(input, command, x, y, z, mode);
   }
 
   static void UpdateComputeMetaClears(RenderExecutor &executor,
@@ -11533,6 +11533,7 @@ public:
       uint32_t clear_word = 0;
       bool eliminate_fast_clear = false;
       uint32_t samples_log2 = 0;
+      bool goat = false;
     };
     constexpr std::array cases{
         FillCase{0x40404040u, {0, 0x3c000000u}},
@@ -11540,7 +11541,7 @@ public:
         FillCase{0x40404040u, {0, 0x3c000000u}, true},
         FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
                  .layout = Prospero::ChannelLayout::k8_8_8_8,
-                 .type = Prospero::ChannelType::kUNorm},
+                 .type = Prospero::ChannelType::kUNorm, .goat = true},
         FillCase{.fill = 0, .texel = {0, 0}, .cmask = true,
                  .eliminate_fast_clear = true},
         FillCase{.fill = 0, .texel = {0, 0x3c000000u}, .cmask = true,
@@ -11605,11 +11606,18 @@ public:
       }
       return words;
     }();
+    // Goat Simulator 3's immediate-zero fill (b0a34a6ed90ebace).
+    static constexpr std::array<uint32_t, 6> goat_fill{
+        0xd7460000u, 0x04010c04u, 0x7e020280u,
+        0xe0102000u, 0x80000100u, 0xbf810000u};
     for (const auto *shader : {&native_fill, &raw_fill}) {
       ShaderMapUserData(reinterpret_cast<uint64_t>(shader->data()),
           {.type = Prospero::ShaderBinaryType::kCs,
            .code_size_bytes = sizeof(native_fill)});
     }
+    ShaderMapUserData(reinterpret_cast<uint64_t>(goat_fill.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = sizeof(goat_fill)});
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -11722,27 +11730,39 @@ public:
           registers.SetColorAttrib2(0, single_mip);
         }
         const auto fill_metadata = [&](uint32_t count, bool raw = false) {
-          const auto *shader = &native_fill;
-          if (raw) {
-            shader = &raw_fill;
-          }
-          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(shader->data()),
+          const bool goat = fill_case.goat && !raw;
+          const auto *shader = goat ? goat_fill.data()
+                                   : raw ? raw_fill.data() : native_fill.data();
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(shader),
                                .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
-                               .wave_size = 64, .user_sgpr = 10, .tgid_x_en = true});
+                               .wave_size = 64, .user_sgpr = goat ? uint8_t{4} : uint8_t{10},
+                               .tgid_x_en = true});
           const std::array<uint32_t, 10> user_data{
               static_cast<uint32_t>(dcc_address),
               static_cast<uint32_t>(dcc_address >> 32u) | (4u << 16u),
               count, 0x00014004u, fill_case.fill, 0, 0x200, 0, count, 1};
-          for (uint32_t i = 0; i < user_data.size(); i++) {
+          for (uint32_t i = 0; i < (goat ? 4u : user_data.size()); i++) {
             shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
           }
           executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u, false);
         };
         const auto metadata_words = static_cast<uint32_t>(metadata_size / 4);
+        if (fill_case.goat) {
+          WriteMetadata(context, dcc_address, metadata_size, 0xa5a5a5a5u);
+        }
         fill_metadata(metadata_words);
         Require(name, "metadata before descriptor",
                 !texture_cache.IsMeta(dcc_address),
                 "the native fill guessed an unbound metadata allocation's type");
+        if (fill_case.goat) {
+          std::vector<uint32_t> filled_metadata(metadata_words);
+          Require(name, "Goat metadata fill stays CPU-owned",
+                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size) &&
+                      LibKernel::Memory::TryReadBacking(dcc_address, filled_metadata.data(), metadata_size) &&
+                      std::ranges::all_of(filled_metadata,
+                          [&](uint32_t word) { return word == fill_case.fill; }),
+                  "Goat's proven metadata fill required a GPU readback or lost its constant value");
+        }
 
         const auto check_expanded_metadata = [&] {
           context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);
@@ -11899,6 +11919,10 @@ public:
                 retains_painted_texel(),
                 "a partial same-value write reused stale clear bytes after rendering");
         fill_metadata(metadata_words, true);
+        fill_metadata(metadata_words);
+        Require(name, "already GPU-owned metadata stays ordered",
+                resources.GetBufferCache().HasGpuDirtyBytes(dcc_address, metadata_size),
+                "a fill discarded pending native writes to its metadata pages");
         bind();
         Require(name, "same-value raw native re-clear",
                 read_texel() == expected,
@@ -11911,6 +11935,11 @@ public:
                 retains_painted_texel(),
                 "a nonuniform metadata allocation cleared the whole target");
         fill_metadata(metadata_words);
+        if (fill_case.goat) {
+          Require(name, "repeated Goat fill stays CPU-owned",
+                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
+                  "re-clearing expanded metadata required another GPU readback");
+        }
         bind();
         Require(name, "complete fill after partial fill",
                 read_texel() == expected,
@@ -16194,9 +16223,9 @@ public:
           {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
           stencil_initial);
       Require(name, "stencil fill coverage",
-          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+          !RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 0, 1, 1, 0x41u) &&
-          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+          !RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 2, 1, 1, 0x41u),
           "incomplete or excessive stencil dispatch was consumed");
       auto &stencil_source = stencil_snapshot.buffers[0];
@@ -16204,12 +16233,12 @@ public:
       stencil_source.dwords[0] = static_cast<uint32_t>(stencil_address);
       stencil_source.dwords[1] = static_cast<uint32_t>(stencil_address >> 32) | (4u << 16);
       Require(name, "stencil fill source alias",
-          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+          !RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 1, 1, 1, 0x41u),
           "an aliased scalar load was consumed as a uniform image clear");
       stencil_source = clean_source;
       Require(name, "stencil IMAGE_STORE clear",
-          RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+          RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 1, 1, 1, 0x41u),
           "captured clear attempted an unsupported depth/stencil storage binding");
       auto stencil_readback = CreateHostBuffer(name, 8,

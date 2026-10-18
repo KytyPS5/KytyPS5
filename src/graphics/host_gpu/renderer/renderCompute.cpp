@@ -128,9 +128,9 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
-bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-                                                CommandBuffer& command, uint32_t group_x,
-                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+                                          CommandBuffer& command, uint32_t group_x,
+                                          uint32_t group_y, uint32_t group_z, uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -186,14 +186,26 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	                              size)) {
 		return false;
 	}
-	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		return false;
+	const bool image_clear =
+	    cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear);
+	if (!image_clear) {
+		// CPU fills invalidate overlapping cached images. Preserve the native dispatch for
+		// partial or ambiguous image backings, including pooled metadata aliases.
+		if ((descriptor.Base48() & 3u) != 0 ||
+		    !m_context.IsMapped(descriptor.Base48(), size) ||
+		    cache.IsRegionRegistered(descriptor.Base48(), size)) {
+			return false;
+		}
+		// Metadata need not have an image backing yet. Keep proven fills in guest memory
+		// when CPU-owned, so color-clear discovery can read them without a GPU download.
+		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
-		LOGF("GraphicsRenderDispatchDirect: compute image clear shader=0x%016" PRIx64
+		LOGF("GraphicsRenderDispatchDirect: compute %s shader=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
+		     image_clear ? "image clear" : "buffer fill", input.stage.program->shader_hash,
+		     descriptor.Base48(), size, packed_clear);
 	}
 	return true;
 }
@@ -308,8 +320,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (resources.specialization_reads.empty()) {
 		// Cached metadata addresses can be reused as ordinary buffers; preserve their guest writes.
 		UpdateComputeMetaClears(input_info, buffer);
-		if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-		                               thread_group_z, mode)) {
+		if (TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
+		                          thread_group_z, mode)) {
 			ResetBindings();
 			return;
 		}

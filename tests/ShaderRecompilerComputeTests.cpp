@@ -27862,38 +27862,61 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase VectorMed3F32DenormalInputs() {
+TestCase VectorMed3F32Denormals(const char *name, u32 float_mode,
+                                std::span<const std::array<u32, 4>> rows) {
   using O = ShaderOpcode;
-  constexpr u32 inputs[5][3] = {{0x00000000u, 0x00019000u, 0x00000000u},
-                                {0x00000001u, 0x00000003u, 0x00000002u},
-                                {0x80000005u, 0x80000001u, 0x80000003u},
-                                {0x80000001u, 0x00000002u, 0x80000003u},
-                                {0x7fc00000u, 0x00000003u, 0x00000001u}};
-  constexpr u32 medians[5] = {0x00000000u, 0x00000002u, 0x80000003u,
-                              0x80000001u, 0x00000001u};
   TestCase test;
-  test.name = "VectorMed3F32DenormalInputs";
-  test.compute_info.float_mode = 0xf0;
+  test.name = name;
+  test.compute_info.float_mode = float_mode;
   test.has_compute_info = true;
-  for (const auto &triple : inputs) {
-    test.initial.insert(test.initial.end(), std::begin(triple),
-                        std::end(triple));
+  for (const auto &row : rows) {
+    test.initial.insert(test.initial.end(), row.begin(), row.begin() + 3);
   }
   test.expected = test.initial;
-  for (u32 i = 0; i < std::size(inputs); i++) {
+  for (u32 i = 0; i < rows.size(); i++) {
     for (u32 j = 0; j < 3u; j++) {
       AppendVMovU32(&test.code, 31, (i * 3u + j) * 4u);
       AppendBufferLoadDword(&test.code, j, 31);
     }
     AppendVop3(&test.code, 0x157, 4, Vgpr(0), Vgpr(1), Vgpr(2));
     AppendStoreVgpr(&test.code, 4, static_cast<u32>(test.expected.size()));
-    test.expected.push_back(medians[i]);
+    test.expected.push_back(rows[i][3]);
   }
   test.initial.resize(test.expected.size());
   AppendEnd(&test.code);
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
+}
+
+TestCase VectorMed3F32DenormalInputs() {
+  static constexpr std::array<std::array<u32, 4>, 6> rows = {
+      {{0x00000000u, 0x00019000u, 0x00000000u, 0x00000000u},
+       {0x00000001u, 0x00000003u, 0x00000002u, 0x00000002u},
+       {0x80000005u, 0x80000001u, 0x80000003u, 0x80000003u},
+       {0x80000001u, 0x00000002u, 0x80000003u, 0x80000001u},
+       {0x7fc00000u, 0x00000003u, 0x00000001u, 0x00000001u},
+       {0x7f800000u, 0x00000001u, 0x00000003u, 0x00000003u}}};
+  return VectorMed3F32Denormals("VectorMed3F32DenormalInputs", 0xf0, rows);
+}
+
+TestCase VectorMed3F32FlushesDenormalInputs() {
+  // FLOAT_MODE 0xc0 flushes f32 denormals, and so does V_MED3_F32 with its
+  // inputs: these are the medians both GPUs return in such a shader.
+  static constexpr std::array<std::array<u32, 4>, 11> rows = {
+      {{0xbf800000u, 0x00019000u, 0x3f800000u, 0x00000000u},
+       {0x00000000u, 0x00019000u, 0x00000000u, 0x00000000u},
+       {0x80019000u, 0xbf800000u, 0x3f800000u, 0x80000000u},
+       {0x3f800000u, 0x00019000u, 0x40000000u, 0x3f800000u},
+       {0x00000001u, 0x00019000u, 0x007fffffu, 0x00000000u},
+       {0xbf800000u, 0x80019000u, 0x3f800000u, 0x80000000u},
+       {0x00019000u, 0x3f800000u, 0xbf800000u, 0x00000000u},
+       {0x7fc00000u, 0x00019000u, 0x3f800000u, 0x00000000u},
+       {0x3f000000u, 0xbf000000u, 0x007fffffu, 0x00000000u},
+       {0x3f000000u, 0xbf000000u, 0x00800000u, 0x00800000u},
+       {0x7f800000u, 0x00019000u, 0x3f800000u, 0x3f800000u}}};
+  return VectorMed3F32Denormals("VectorMed3F32FlushesDenormalInputs", 0xc0,
+                                rows);
 }
 
 TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
@@ -43017,6 +43040,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorMed3F32NanUsesMin3Path(32));
   cases.push_back(VectorMed3F32NanUsesMin3Path(64));
   AddCase(VectorMed3F32DenormalInputs);
+  AddCase(VectorMed3F32FlushesDenormalInputs);
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);

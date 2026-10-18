@@ -160,7 +160,8 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	return sum;
 }
 
-uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+uint32_t EmitFPMedTri32(EmitterState& state, const IR::Inst& inst, uint32_t a, uint32_t b,
+                        uint32_t c) {
 	const auto u     = TypeU32(state);
 	const auto order = [&](uint32_t x) {
 		const auto sign = Binary(state, spv::OpShiftRightArithmetic, u, x, ConstantU32(state, 31));
@@ -176,6 +177,13 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	std::array<uint32_t, 3> bits {}, keys {}, nans {}, masked {};
 	for (uint32_t i = 0; i < 3; i++) {
 		bits[i] = EmitBitcastF32ToU32(state, inputs[i]);
+		if (inst.Flags<IR::FPCompareFlags>().flush_input_denorms) {
+			// In a shader that flushes f32 denormals, V_MED3_F32 flushes its inputs to signed zero.
+			const auto denormal = EmitCompareU32Constant(
+			    state, spv::OpULessThan, EmitAndConstant(state, bits[i], 0x7fffffffu), 0x00800000u);
+			bits[i] =
+			    Select(state, u, denormal, EmitAndConstant(state, bits[i], 0x80000000u), bits[i]);
+		}
 		keys[i] = order(bits[i]);
 		nans[i] = EmitCompareU32Constant(state, spv::OpUGreaterThan,
 		                                 EmitAndConstant(state, bits[i], 0x7fffffffu), 0x7f800000u);

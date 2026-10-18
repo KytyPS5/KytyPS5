@@ -1910,12 +1910,16 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock                           lock {m_lock};
 	const uint64_t                             tick = m_gc_tick++;
 	std::optional<MemoryPressurePolicy::Level> live_pressure;
+	std::optional<uint64_t>                    live_budget;
 	if (m_graphics.CanReportMemoryUsage()) {
 		if (Rev3TextureRetentionEnabled()) {
 			const auto budget   = m_graphics.GetMemoryBudget();
 			m_total_used_memory = budget.usage;
 			const auto level    = m_pressure_policy.Update(budget.usage, budget.budget);
-			if (budget.budget != 0) live_pressure = level;
+			if (budget.budget != 0) {
+				live_pressure = level;
+				live_budget   = budget.budget;
+			}
 		} else {
 			m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 		}
@@ -1978,6 +1982,9 @@ void TextureCache::RunGarbageCollector() {
 		}
 	};
 	collect(false);
+	if (live_budget) {
+		live_pressure = m_pressure_policy.Update(m_total_used_memory, *live_budget);
+	}
 	if (live_pressure ? *live_pressure == MemoryPressurePolicy::Level::Critical
 	                  : m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);

@@ -150,15 +150,13 @@ GraphicContext::MemoryBudget GraphicContext::GetMemoryBudget() const {
 	if (!CanReportMemoryUsage() || allocator == nullptr) return {};
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
-	const bool discrete =
-	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
 	uint64_t budget = 0;
 	uint64_t usage  = 0;
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; ++heap) {
 		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
 		const bool  device_local =
 		    static_cast<bool>(properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal);
-		if (!discrete || device_local) {
+		if (device_local) {
 			if (budgets[heap].budget == 0) return {GetDeviceMemoryUsage(), 0};
 			budget += budgets[heap].budget;
 			usage += budgets[heap].usage;

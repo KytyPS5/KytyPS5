@@ -42280,6 +42280,17 @@ TestCase DispatcherIrreducibleControlFlow() {
   return test;
 }
 
+void CheckDispatcherSpillIdsDeterministic() {
+  // Two lane halves on a 32-wide host: spill IDs must not follow heap addresses.
+  const auto test = DispatcherIrreducibleControlFlow();
+  const auto first = CompileCase(test, 32);
+  const auto second = CompileCase(test, 32);
+  const auto third = CompileCase(test, 32);
+  Require(test.name, "deterministic 32-wide SPIR-V",
+          first.spirv == second.spirv && first.spirv == third.spirv,
+          "the same program compiled to different SPIR-V");
+}
+
 #include "ShaderRayTracingGpuTests.inc"
 
 std::vector<TestCase> MakeCases() {
@@ -48648,6 +48659,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
     CheckWave64WholeWaveResults();
+    CheckDispatcherSpillIdsDeterministic();
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
     RunCase(&vulkan, DsPermuteWave64UsesIndependentHalves());
@@ -49361,6 +49373,7 @@ int main(int argc, char **argv) {
   CheckFiniteFirstLaneImageChoice(vulkan);
   CheckFiniteInlineSamplerPhi(vulkan);
   CheckWave64WholeWaveResults();
+  CheckDispatcherSpillIdsDeterministic();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();

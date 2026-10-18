@@ -623,6 +623,12 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
+		// Both halves get their spill IDs here, in program order.
+		const auto add_spill = [&](const IR::Inst* inst) {
+			for (uint32_t half = 0; half < state.lane_count; half++) {
+				dispatch.spills[half].emplace(inst, state.builder.AllocateId());
+			}
+		};
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
 				if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
@@ -632,7 +638,7 @@ void EmitProgram(EmitterState& state) {
 					ctx.Fail(inst, "cannot be stored by the dispatcher");
 					break;
 				}
-				dispatch.spills[0].emplace(&inst, state.builder.AllocateId());
+				add_spill(&inst);
 			}
 		}
 		const auto mark_cross_block = [&](IR::Value value, const IR::Block* consumer) {
@@ -647,7 +653,7 @@ void EmitProgram(EmitterState& state) {
 				return;
 			}
 			if (!dispatch.spills[0].contains(definition)) {
-				dispatch.spills[0].emplace(definition, state.builder.AllocateId());
+				add_spill(definition);
 			}
 		};
 		for (const auto* block: program.blocks) {
@@ -670,9 +676,6 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
-				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
-			}
 			high.dispatcher_spills = &dispatch.spills[1];
 		}
 	}

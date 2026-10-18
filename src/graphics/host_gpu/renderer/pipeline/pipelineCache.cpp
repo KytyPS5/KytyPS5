@@ -118,7 +118,9 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 bool ReadShaderScalarMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// The walk evaluates loads the shader may never execute, e.g. through a null SRT
 	// table pointer, so unmapped guest memory reads as zeros instead of faulting the host.
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+	// CopySparseMemory (unlike TryReadBacking) also covers private mappings, and still
+	// reports unmapped ranges as failure rather than faulting.
+	if (!Libs::LibKernel::Memory::CopySparseMemory(address, values.data(), values.size_bytes())) {
 		std::ranges::fill(values, 0u);
 	}
 	return true;

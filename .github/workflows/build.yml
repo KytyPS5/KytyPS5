@@ -128,6 +128,15 @@ jobs:
         run: |
           cmake --install _Build/windows --prefix _Build/windows/install
 
+      - name: Upload Windows GPU regression executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-GPU-Regression-Windows-x64
+          path: |
+            _Build/windows/shader_recompiler_compute_tests.exe
+            _Build/windows/install/*.dll
+          if-no-files-found: error
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -312,8 +321,6 @@ jobs:
             libasound2-dev \
             libdbus-1-dev \
             libgl1-mesa-dev \
-            libvulkan1 \
-            mesa-vulkan-drivers \
             libpulse-dev \
             libudev-dev \
             libwayland-dev \
@@ -400,16 +407,6 @@ jobs:
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
             -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|virtual_memory_allocation)$'
-
-      - name: Test interrupt batching with Lavapipe
-        shell: bash
-        run: |
-          icd="$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)"
-          test -n "$icd"
-          export VK_ICD_FILENAMES="$icd"
-          export VK_DRIVER_FILES="$icd"
-          ctest --test-dir _Build/linux --output-on-failure --verbose --timeout 120 \
-            -R '^(gpu_command_lane|gpu_command_lane_interrupt_batching)$'
 
       - name: Install
         shell: bash

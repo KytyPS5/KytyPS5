@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/memoryPressurePolicy.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -32,7 +33,7 @@ struct TextureCacheTestAccess;
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
-void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+void               Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
 class TextureCache {
@@ -97,9 +98,9 @@ private:
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
-		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
+		using FuncReturn                   = typename std::invoke_result<Func, uint64_t>::type;
 		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
-		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
+		const uint64_t        page_end     = (address + size - 1) >> ImagePageTable::kPageBits;
 		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
 			if constexpr (RETURNS_BOOL) {
 				if (func(page)) {
@@ -138,13 +139,12 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
-	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
-	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, uint32_t levels);
+	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
+	void InitializeImage(ImageId id);
+	[[nodiscard]] bool CanDownload(const Image& image) const;
+	void               UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void               DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+	                                 uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
@@ -152,8 +152,8 @@ private:
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
-	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
-	void               CopyImage(ImageId destination, ImageId source);
+	[[nodiscard]] bool    CopyD16(Image& destination, Image& source);
+	void                  CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
@@ -176,10 +176,11 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_gc_tick                = 0;
-	mutable uint32_t m_image_query_epoch      = 0;
-	bool             m_readback_linear_images = false;
+	uint64_t             m_critical_gc_memory = 3ull * 1024 * 1024 * 1024;
+	MemoryPressurePolicy m_pressure_policy;
+	uint64_t             m_gc_tick                = 0;
+	mutable uint32_t     m_image_query_epoch      = 0;
+	bool                 m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

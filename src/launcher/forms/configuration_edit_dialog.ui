@@ -258,6 +258,12 @@
            </property>
            <layout class="QVBoxLayout" name="compatibilityLayout">
             <item>
+             <widget class="QCheckBox" name="checkBox_rev3_texture_retention">
+              <property name="toolTip"><string>Retain textures while GPU memory pressure is low. Restart the game after changing this setting.</string></property>
+              <property name="text"><string>Memory-pressure texture retention (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
              <widget class="QCheckBox" name="checkBox_amd_cpu">
               <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
               <property name="text"><string>AMD CPU patch (experimental)</string></property>

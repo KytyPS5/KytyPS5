@@ -225,3 +225,15 @@ list(APPEND inc_headers
 include_what_you_use_with_mappings(launcher "${inc_headers}" "${iwyu_maps}")
 
 clang_tidy_check(launcher "" "${tidy_dirs}" "${inc_headers}")
+
+if(BUILD_TESTING)
+    add_executable(experimental_settings_tests EXCLUDE_FROM_ALL
+        "${KYTY_TESTS_DIR}/ExperimentalSettingsTests.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/configuration.cpp")
+    target_include_directories(experimental_settings_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(experimental_settings_tests Qt6::Widgets common)
+    add_dependencies(kyty_tests experimental_settings_tests)
+    set_target_properties(experimental_settings_tests PROPERTIES AUTOMOC ON)
+    target_sources(experimental_settings_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include/configuration.h")
+    add_test(NAME experimental_settings COMMAND experimental_settings_tests)
+endif()

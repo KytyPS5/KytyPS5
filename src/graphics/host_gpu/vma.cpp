@@ -39,7 +39,7 @@ bool GraphicContext::CreateAllocator() {
 	info.device           = device;
 	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
-	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+	info.flags            = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
@@ -146,6 +146,25 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+GraphicContext::MemoryBudget GraphicContext::GetMemoryBudget() const {
+	if (!CanReportMemoryUsage() || allocator == nullptr) return {};
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	uint64_t budget = 0;
+	uint64_t usage  = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; ++heap) {
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+		const bool  device_local =
+		    static_cast<bool>(properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+		if (device_local) {
+			if (budgets[heap].budget == 0) return {GetDeviceMemoryUsage(), 0};
+			budget += budgets[heap].budget;
+			usage += budgets[heap].usage;
+		}
+	}
+	return {usage, budget};
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
@@ -154,7 +173,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	const auto       result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
 	image.image = native_image;

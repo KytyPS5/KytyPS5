@@ -48,8 +48,9 @@ struct ControllerSettings {
 	QString color;
 	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
-	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
-	int     keyboard_player     = 0;
+	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the
+	// keyboard.
+	int keyboard_player = 0;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
@@ -68,8 +69,8 @@ struct ControllerSettings {
 		};
 		speaker_volume      = read_percent("controller_speaker_volume", 50);
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
-		keyboard_player = qBound(0, s->value("controller_keyboard_player", 0).toInt(),
-		                         Config::MAX_PLAYERS);
+		keyboard_player =
+		    qBound(0, s->value("controller_keyboard_player", 0).toInt(), Config::MAX_PLAYERS);
 	}
 };
 
@@ -116,38 +117,39 @@ public:
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
 
-	Resolution             screen_resolution           = Resolution::R1280X720;
-	QString                user_name                   = "Kyty";
-	int                    user_id                     = Config::DEFAULT_USER_ID;
+	Resolution             screen_resolution = Resolution::R1280X720;
+	QString                user_name         = "Kyty";
+	int                    user_id           = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
-	PresentMode            present_mode                = PresentMode::Mailbox;
-	int                    gpu_index                   = -1;
-	bool                   fullscreen_enabled          = false;
-	bool                   hdr_enabled                 = false;
-	bool                   hide_cursor_enabled         = false;
-	bool                   readback_linear_images      = false;
-	bool                   sync_raw_image_buffers      = false;
-	bool                   support_zmask               = false;
-	bool                   tessellation_enabled        = false;
-	bool                   trophy_enabled              = true;
-	int                    trophy_duration_seconds     = 6;
-	bool                   perf_overlay_enabled        = false;
-	bool                   skip_notice_screen          = false;
-	bool                   network_connected           = false;
-	int                    vblank_frequency            = 60;
-	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
-	bool                   vulkan_validation_enabled   = false;
-	bool                   shader_validation_enabled   = false;
-	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
-	LogDirection           shader_log_direction        = LogDirection::Silent;
-	QString                shader_log_folder           = "_Shaders";
-	bool                   command_buffer_dump_enabled = false;
-	QString                command_buffer_dump_folder  = "_Buffers";
-	LogDirection           printf_direction            = LogDirection::Silent;
-	QString                printf_output_file          = "_kyty.txt";
-	bool                   profiler_enabled            = false;
-	bool                   renderdoc_enabled           = false;
-	bool                   amd_cpu_enabled             = false;
+	PresentMode            present_mode                   = PresentMode::Mailbox;
+	int                    gpu_index                      = -1;
+	bool                   fullscreen_enabled             = false;
+	bool                   hdr_enabled                    = false;
+	bool                   hide_cursor_enabled            = false;
+	bool                   readback_linear_images         = false;
+	bool                   sync_raw_image_buffers         = false;
+	bool                   support_zmask                  = false;
+	bool                   tessellation_enabled           = false;
+	bool                   trophy_enabled                 = true;
+	int                    trophy_duration_seconds        = 6;
+	bool                   perf_overlay_enabled           = false;
+	bool                   skip_notice_screen             = false;
+	bool                   network_connected              = false;
+	int                    vblank_frequency               = 60;
+	int                    console_language               = DEFAULT_CONSOLE_LANGUAGE;
+	bool                   vulkan_validation_enabled      = false;
+	bool                   shader_validation_enabled      = false;
+	ShaderOptimizationType shader_optimization_type       = ShaderOptimizationType::Performance;
+	LogDirection           shader_log_direction           = LogDirection::Silent;
+	QString                shader_log_folder              = "_Shaders";
+	bool                   command_buffer_dump_enabled    = false;
+	QString                command_buffer_dump_folder     = "_Buffers";
+	LogDirection           printf_direction               = LogDirection::Silent;
+	QString                printf_output_file             = "_kyty.txt";
+	bool                   profiler_enabled               = false;
+	bool                   renderdoc_enabled              = false;
+	bool                   amd_cpu_enabled                = false;
+	bool                   rev3_texture_retention_enabled = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -156,38 +158,39 @@ public:
 	QString elf = QStringLiteral("eboot.bin");
 
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
-		screen_resolution           = other.screen_resolution;
-		user_name                   = other.user_name;
-		user_id                     = other.user_id;
-		audio_input_device          = other.audio_input_device;
-		present_mode                = other.present_mode;
-		gpu_index                   = other.gpu_index;
-		fullscreen_enabled          = other.fullscreen_enabled;
-		hdr_enabled                 = other.hdr_enabled;
-		hide_cursor_enabled         = other.hide_cursor_enabled;
-		readback_linear_images      = other.readback_linear_images;
-		sync_raw_image_buffers      = other.sync_raw_image_buffers;
-		support_zmask               = other.support_zmask;
-		tessellation_enabled        = other.tessellation_enabled;
-		trophy_enabled              = other.trophy_enabled;
-		trophy_duration_seconds     = other.trophy_duration_seconds;
-		perf_overlay_enabled        = other.perf_overlay_enabled;
-		skip_notice_screen          = other.skip_notice_screen;
-		network_connected           = other.network_connected;
-		vblank_frequency            = other.vblank_frequency;
-		console_language            = other.console_language;
-		vulkan_validation_enabled   = other.vulkan_validation_enabled;
-		shader_validation_enabled   = other.shader_validation_enabled;
-		shader_optimization_type    = other.shader_optimization_type;
-		shader_log_direction        = other.shader_log_direction;
-		shader_log_folder           = other.shader_log_folder;
-		command_buffer_dump_enabled = other.command_buffer_dump_enabled;
-		command_buffer_dump_folder  = other.command_buffer_dump_folder;
-		printf_direction            = other.printf_direction;
-		printf_output_file          = other.printf_output_file;
-		profiler_enabled            = other.profiler_enabled;
-		renderdoc_enabled           = other.renderdoc_enabled;
-		amd_cpu_enabled             = other.amd_cpu_enabled;
+		screen_resolution              = other.screen_resolution;
+		user_name                      = other.user_name;
+		user_id                        = other.user_id;
+		audio_input_device             = other.audio_input_device;
+		present_mode                   = other.present_mode;
+		gpu_index                      = other.gpu_index;
+		fullscreen_enabled             = other.fullscreen_enabled;
+		hdr_enabled                    = other.hdr_enabled;
+		hide_cursor_enabled            = other.hide_cursor_enabled;
+		readback_linear_images         = other.readback_linear_images;
+		sync_raw_image_buffers         = other.sync_raw_image_buffers;
+		support_zmask                  = other.support_zmask;
+		tessellation_enabled           = other.tessellation_enabled;
+		trophy_enabled                 = other.trophy_enabled;
+		trophy_duration_seconds        = other.trophy_duration_seconds;
+		perf_overlay_enabled           = other.perf_overlay_enabled;
+		skip_notice_screen             = other.skip_notice_screen;
+		network_connected              = other.network_connected;
+		vblank_frequency               = other.vblank_frequency;
+		console_language               = other.console_language;
+		vulkan_validation_enabled      = other.vulkan_validation_enabled;
+		shader_validation_enabled      = other.shader_validation_enabled;
+		shader_optimization_type       = other.shader_optimization_type;
+		shader_log_direction           = other.shader_log_direction;
+		shader_log_folder              = other.shader_log_folder;
+		command_buffer_dump_enabled    = other.command_buffer_dump_enabled;
+		command_buffer_dump_folder     = other.command_buffer_dump_folder;
+		printf_direction               = other.printf_direction;
+		printf_output_file             = other.printf_output_file;
+		profiler_enabled               = other.profiler_enabled;
+		renderdoc_enabled              = other.renderdoc_enabled;
+		amd_cpu_enabled                = other.amd_cpu_enabled;
+		rev3_texture_retention_enabled = other.rev3_texture_retention_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif

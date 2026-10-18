@@ -35,6 +35,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(profiler_enabled);
 	KYTY_CFG_SET(renderdoc_enabled);
 	KYTY_CFG_SET(amd_cpu_enabled);
+	KYTY_CFG_SET(rev3_texture_retention_enabled);
 #if defined(_WIN32)
 	KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -66,7 +67,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(support_zmask);
 	KYTY_CFG_GET(tessellation_enabled);
-	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
+	trophy_enabled = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);
@@ -87,7 +88,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(printf_output_file);
 	KYTY_CFG_GET(profiler_enabled);
 	KYTY_CFG_GET(renderdoc_enabled);
-	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
+	amd_cpu_enabled                = s.value("amd_cpu_enabled", false).toBool();
+	rev3_texture_retention_enabled = s.value("rev3_texture_retention_enabled", false).toBool();
 #if defined(_WIN32)
 	red_zone_protection_enabled =
 	    s.value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();

@@ -2863,6 +2863,8 @@ public:
   }
 
   void CheckGpuCommandLane() {
+    const auto* batching = std::getenv("KYTY_DEFER_RELEASE_MEM_INTERRUPTS");
+    const bool defer_interrupts = batching != nullptr && batching[0] != '\0' && std::strcmp(batching, "0") != 0;
     EnsureRuntimeContext();
     auto &context = Renderer();
     context.InitializeGpu(nullptr);
@@ -3067,7 +3069,7 @@ public:
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
         const bool interrupt_split_once =
-            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+            gpu_scheduler.CurrentTick() == interrupt_tick + (defer_interrupts ? 0 : 1);
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;

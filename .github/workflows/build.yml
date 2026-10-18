@@ -116,17 +116,33 @@ jobs:
             audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests experimental_settings_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
         run: |
           cmake --install _Build/windows --prefix _Build/windows/install
+
+      - name: Stage Windows GPU regression executable
+        shell: pwsh
+        run: |
+          $fixtureDir = "_Build/windows/gpu-regression"
+          New-Item -ItemType Directory -Force $fixtureDir | Out-Null
+          Copy-Item -LiteralPath "_Build/windows/shader_recompiler_compute_tests.exe" -Destination $fixtureDir
+          Get-ChildItem -LiteralPath "_Build/windows/install" -Filter "*.dll" -File |
+            Copy-Item -Destination $fixtureDir
+
+      - name: Upload Windows GPU regression executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-GPU-Regression-Windows-x64
+          path: _Build/windows/gpu-regression/
+          if-no-files-found: error
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -205,14 +221,14 @@ jobs:
             --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests experimental_settings_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -390,14 +406,14 @@ jobs:
             --target launcher page_manager_tests memory_tracker_tests \
               audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests experimental_settings_tests shader_recompiler_compute_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash

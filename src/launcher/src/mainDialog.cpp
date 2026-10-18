@@ -22,6 +22,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -61,7 +62,7 @@ constexpr DWORD CMD_Y_CHARS = 1000;
 #endif
 constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
-constexpr char SETTINGS_CHECK_UPDATES[]       = "check_updates_on_startup";
+constexpr char SETTINGS_CHECK_UPDATES[]      = "check_updates_on_startup";
 
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
@@ -87,12 +88,12 @@ private:
 	static QByteArray g_last_geometry;
 	static bool       g_check_updates_on_startup;
 
-	Ui::MainDialog* m_ui             = {nullptr};
-	MainDialog*     m_main_dialog    = nullptr;
-	UpdateChecker*  m_update_checker = nullptr;
+	Ui::MainDialog*   m_ui             = {nullptr};
+	MainDialog*       m_main_dialog    = nullptr;
+	UpdateChecker*    m_update_checker = nullptr;
 	ControllerPreview m_controller_preview;
-	TitleSound      m_title_sound;
-	QString         m_interpreter;
+	TitleSound        m_title_sound;
+	QString           m_interpreter;
 
 	QProcess m_process;
 
@@ -116,7 +117,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->setupUi(main_dialog);
 	m_ui->widget->SetControllerPreview(&m_controller_preview);
 
-	m_main_dialog = main_dialog;
+	m_main_dialog    = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
 	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
@@ -425,6 +426,11 @@ static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList
 #endif
 
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
+	auto environment = QProcessEnvironment::systemEnvironment();
+	environment.insert("KYTY_DEFER_RELEASE_MEM_INTERRUPTS",
+	                   info.defer_release_mem_interrupts_enabled ? "1" : "0");
+	process->setProcessEnvironment(environment);
+
 	const auto& interpreter = m_p->GetInterpreter();
 
 	QFileInfo f(interpreter);

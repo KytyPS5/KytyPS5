@@ -3,7 +3,6 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
-#include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -32,6 +31,8 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+
+#include <SDL3/SDL.h>
 
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
@@ -157,8 +158,8 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::LogDirection>(text);
-		        m_ui->lineEdit_shader_log_folder->setEnabled(
-		            log == Configuration::LogDirection::File);
+		        m_ui->lineEdit_shader_log_folder->setEnabled(log ==
+		                                                     Configuration::LogDirection::File);
 	        });
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
@@ -240,8 +241,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		SDL_free(devices);
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 	} else {
-		microphone->setToolTip(tr("Microphones could not be listed: %1")
-		                           .arg(QString::fromUtf8(SDL_GetError())));
+		microphone->setToolTip(
+		    tr("Microphones could not be listed: %1").arg(QString::fromUtf8(SDL_GetError())));
 	}
 	if (microphone->findData(info.audio_input_device) < 0) {
 		microphone->addItem(tr("%1 (unavailable)").arg(info.audio_input_device),
@@ -305,6 +306,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
+	m_ui->checkBox_defer_release_mem_interrupts->setChecked(
+	    info.defer_release_mem_interrupts_enabled);
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
@@ -393,7 +396,8 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const QString& addons_dir) {
+void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs,
+                                                const QString&     addons_dir) {
 	m_global_settings = true;
 	m_addons_dir_edit->setText(QDir::toNativeSeparators(addons_dir));
 	auto* menu = new QMenu(m_ui->settings_button);
@@ -462,8 +466,8 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 }
 
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
-	info.user_name = ui.lineEdit_user_name->text().trimmed();
-	info.user_id   = ui.spinBox_user_id->value();
+	info.user_name          = ui.lineEdit_user_name->text().trimmed();
+	info.user_id            = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
 	if (global_settings) {
 		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
@@ -494,20 +498,22 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
+	info.defer_release_mem_interrupts_enabled =
+	    ui.checkBox_defer_release_mem_interrupts->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
 	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
 	    ui.comboBox_shader_optimization_type->currentText());
-	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
-	    ui.comboBox_shader_log_direction->currentText());
+	info.shader_log_direction =
+	    TextToEnum<Configuration::LogDirection>(ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
 	info.command_buffer_dump_enabled = ui.checkBox_cmd_dump->isChecked();
 	info.command_buffer_dump_folder  = ui.lineEdit_cmd_dump_folder->text();
 	info.printf_direction =
 	    TextToEnum<Configuration::LogDirection>(ui.comboBox_printf_direction->currentText());
 	info.printf_output_file = ui.lineEdit_printf_file->text();
-	info.profiler_enabled = ui.checkBox_profiler->isChecked();
+	info.profiler_enabled   = ui.checkBox_profiler->isChecked();
 }
 
 void ConfigurationEditDialog::save() {

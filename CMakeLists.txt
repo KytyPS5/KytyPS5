@@ -844,3 +844,11 @@ endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
 endif()
+
+if(BUILD_TESTING)
+    set_tests_properties(gpu_command_lane PROPERTIES ENVIRONMENT "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=0")
+    add_test(NAME gpu_command_lane_interrupt_batching
+        COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+    set_tests_properties(gpu_command_lane_interrupt_batching PROPERTIES
+        ENVIRONMENT "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1")
+endif()

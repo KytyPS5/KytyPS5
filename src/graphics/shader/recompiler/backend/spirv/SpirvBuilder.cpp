@@ -160,6 +160,14 @@ void Builder::AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_
 	AppendInstruction(m_entry_points, spv::OpEntryPoint, operands);
 }
 
+uint32_t Builder::AddString(const char* text) {
+	const auto id = AllocateId();
+	std::vector<uint32_t> operands = {id};
+	AppendString(operands, text);
+	AppendInstruction(m_debug, spv::OpString, operands);
+	return id;
+}
+
 void Builder::AddName(uint32_t target, const char* name) {
 	std::vector<uint32_t> operands = {target};
 	AppendString(operands, name);
@@ -171,10 +179,12 @@ void Builder::AddFunction(std::span<const uint32_t> words) {
 }
 
 DeferredPhi Builder::AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count) {
-	std::vector<uint32_t> words {spv::OpPhi, type, result};
-	words.resize(words.size() + incoming_count * 2u);
 	const DeferredPhi phi {m_functions.size()};
-	AddFunction(words);
+	const auto word_count = static_cast<uint32_t>(3u + incoming_count * 2u);
+	m_functions.push_back((word_count << spv::WordCountShift) | spv::OpPhi);
+	m_functions.push_back(type);
+	m_functions.push_back(result);
+	m_functions.resize(m_functions.size() + incoming_count * 2u);
 	m_unpatched_phi_incomings += incoming_count;
 	return phi;
 }

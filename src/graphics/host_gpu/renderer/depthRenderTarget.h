@@ -22,15 +22,13 @@ struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;
 	bool                        depth_clear_enable       = false;
-	bool                        depth_load_clear_enable  = false;
+	vk::ImageAspectFlags        load_clear_aspects;
 	float                       depth_clear_value        = 0.0f;
 	bool                        depth_test_enable        = false;
 	// Effective draw writes; discovery applies test, target-write and clear controls.
 	bool                        depth_write_enable       = false;
 	vk::CompareOp               depth_compare_op         = vk::CompareOp::eNever;
 	bool                        depth_bounds_test_enable = false;
-	float                       depth_min_bounds         = 0.0f;
-	float                       depth_max_bounds         = 0.0f;
 	bool                        stencil_clear_enable     = false;
 	uint8_t                     stencil_clear_value      = 0;
 	bool                        stencil_test_enable      = false;

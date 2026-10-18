@@ -9,9 +9,12 @@ public:
 	static constexpr uint64_t Percent(uint64_t budget, uint64_t percent) {
 		return (budget / 100) * percent + ((budget % 100) * percent) / 100;
 	}
-	// The caller handles an unavailable (zero) budget through its legacy fallback.
+	// A zero budget selects the caller's legacy collection policy and resets hysteresis.
 	Level Update(uint64_t usage, uint64_t budget) {
-		if (budget == 0) return m_level;
+		if (budget == 0) {
+			m_level = Level::None;
+			return m_level;
+		}
 		const auto target = usage >= Percent(budget, 90)   ? Level::Critical
 		                    : usage >= Percent(budget, 80) ? Level::Pressure
 		                    : usage >= Percent(budget, 70) ? Level::Collect
@@ -27,7 +30,9 @@ public:
 		}
 		return m_level;
 	}
-	static constexpr uint64_t TextureAge(Level level) {
+	static constexpr uint64_t TextureAge(Level level, bool has_live_budget) {
+		if (!has_live_budget)
+			return level == Level::Critical ? 160 : level == Level::Pressure ? 80 : 16;
 		return level == Level::Critical ? 16 : level == Level::Pressure ? 80 : 160;
 	}
 

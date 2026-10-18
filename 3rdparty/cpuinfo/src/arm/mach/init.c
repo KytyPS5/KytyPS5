@@ -14,7 +14,7 @@
 #include <cpuinfo/internal-api.h>
 #include <cpuinfo/log.h>
 
-/* Polyfill recent CPUFAMILY_ARM_* values for older SDKs */
+/* Polyfill recent CPUFAMILY_ARM_* values for older platform headers */
 #ifndef CPUFAMILY_ARM_MONSOON_MISTRAL
 	#define CPUFAMILY_ARM_MONSOON_MISTRAL   0xE81E7EF6
 #endif

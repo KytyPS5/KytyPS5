@@ -19,6 +19,10 @@ class File;
 
 namespace Libs::Graphics::Pm4 {
 
+constexpr uint32_t PacketSizeDw(uint32_t header) {
+	return (header & 0x3fffff00u) == 0x3fff1000u ? 1u : KYTY_PM4_LEN(header);
+}
+
 constexpr uint32_t IT_NOP                       = 0x10;
 constexpr uint32_t IT_SET_BASE                  = 0x11;
 constexpr uint32_t IT_CLEAR_STATE               = 0x12;
@@ -82,7 +86,6 @@ constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
 constexpr uint32_t R_DISPATCH_RESET = 0x09;
 constexpr uint32_t R_PUSH_MARKER    = 0x0B;
 constexpr uint32_t R_POP_MARKER     = 0x0C;
-constexpr uint32_t R_ACQUIRE_MEM    = 0x14;
 constexpr uint32_t R_WRITE_DATA     = 0x15;
 constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_RELEASE_MEM    = 0x18;
@@ -697,6 +700,8 @@ constexpr uint32_t CX_NUM = 0x3FF + 1;
 
 /* Shader registers */
 
+constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_PS = 0x2;
+constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_PS = 0x3;
 constexpr uint32_t SPI_SHADER_PACE_ID_PS            = 0x6;
 constexpr uint32_t SPI_GRAPHICS_SHADER_CONTROL_PS    = 0x7;
 constexpr uint32_t SPI_SHADER_PGM_LO_PS              = 0x8;

@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -27,13 +28,13 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <utility>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
 
 namespace {
 
-// Keep the upstream collection policy unless this experiment is explicitly enabled.
 bool Rev3TextureRetentionEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_REV3_TEXTURE_RETENTION");
@@ -45,9 +46,11 @@ bool Rev3TextureRetentionEnabled() {
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
-                                  vk::ClearColorValue& clear) {
+                                    vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
-	const auto  format   = desc.view_info.format;
+	const auto  format   = desc.info.IsDepth()
+	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
+	                           : desc.view_info.format;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
@@ -121,37 +124,6 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return true;
 }
 
-[[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
-                                                              uint64_t slice_stride,
-                                                              vk::ImageAspectFlags aspect) {
-	std::vector<vk::BufferImageCopy> copies(info.resources.layers);
-	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
-		auto& copy             = copies[layer];
-		copy.bufferOffset      = slice_stride * layer;
-		copy.bufferRowLength   = info.pitch;
-		copy.bufferImageHeight = info.extent.height;
-		copy.imageSubresource  = {aspect, 0, layer, 1};
-		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
-	}
-	return copies;
-}
-
-[[nodiscard]] std::vector<GpuTileInfo> BuildDepthTiles(const ImageInfo& info) {
-	TileBlockLayout block {};
-	EXIT_NOT_IMPLEMENTED(
-	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
-	const auto               full_slice_size = info.data.size / info.resources.layers;
-	std::vector<GpuTileInfo> tiles;
-	tiles.reserve(info.resources.layers);
-	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
-		const auto offset = full_slice_size * layer;
-		tiles.push_back({block.family, block.bytes_per_element, offset, full_slice_size, offset,
-		                 full_slice_size, 0, info.extent.width, info.extent.height, 1, info.pitch});
-		tiles.back().surface_z = layer;
-	}
-	return tiles;
-}
-
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -171,9 +143,6 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
-		if (Rev3TextureRetentionEnabled()) {
-			m_trigger_gc_memory = m_pressure_gc_memory;
-		}
 	}
 }
 
@@ -209,6 +178,9 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.tile_mode != requested.tile_mode) {
 		return false;
 	}
+	if (cached.GetColorTransform() != requested.GetColorTransform()) {
+		return false;
+	}
 	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
 	    cached.type != requested.type) {
 		return false;
@@ -236,19 +208,9 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
-bool TextureCache::SafeToDownload(const Image& image) {
-	if (!image.SafeToDownload()) {
-		return false;
-	}
-	const auto range = image.info.data;
-	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
-}
-
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
-	if (!info.data.Empty()) {
-		RegisterImage(id);
-	}
+	RegisterImage(id);
 	return id;
 }
 
@@ -261,9 +223,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
-	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
-		m_image_page_table[page].push_back(id);
-	});
+	ForEachPage(image.info.data.address, image.info.data.size,
+	            [this, id](uint64_t page) { m_image_page_table[page].push_back(id); });
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -299,14 +260,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	if (!image->depth_id) {
-		std::vector<ImageId> associations;
-		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
-			if (associated.depth_id == id) {
-				associations.push_back(candidate);
-			}
-		});
-		for (const auto association: associations) {
+	if (image->depth_id) {
+		std::erase(m_slot_images[image->depth_id].stencil_ids, id);
+	} else {
+		// Detach first: deleting each association also unlinks it from its depth owner.
+		for (const auto association: std::exchange(image->stencil_ids, {})) {
 			FreeImage(association);
 		}
 	}
@@ -314,15 +272,6 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (image->info.HasMetadata()) {
-		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
-		if (metadata != m_surface_metas.end() &&
-		    image->info.metadata.kind == ImageMetadataKind::Htile &&
-		    metadata->second.type == MetaDataInfo::Type::HTile) {
-			// A later binding may have reused this address for another metadata type.
-			m_surface_metas.erase(metadata);
-		}
-	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
@@ -347,9 +296,6 @@ void TextureCache::TouchImage(Image& image) {
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	image.MarkMaybeCpuDirty();
-	if (image.NeedsMaybeCpuHash()) {
-		image.SetMaybeCpuHash(image.HashGuestEdges());
-	}
 	UntrackImage(id);
 }
 
@@ -461,7 +407,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
+	if (m_readback_linear_images && !image.info.IsTiled()) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -503,27 +449,6 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 		});
 	});
 	return result;
-}
-
-ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
-	const auto format = desc.info.pixel_format;
-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
-		return found->second;
-	}
-	ImageInfo info {};
-	info.pixel_format    = desc.info.pixel_format;
-	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
-	info.extent          = {1, 1, 1};
-	info.resources       = {1, 1};
-	info.pitch           = 1;
-	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
-	info.samples         = 1;
-	info.tile_mode       = Prospero::TileMode::kLinear;
-	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
-	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
-	return id;
 }
 
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
@@ -587,25 +512,25 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 	const uint64_t color_slice =
 	    static_cast<uint64_t>(color.info.pitch) * color.info.extent.height * sizeof(uint16_t);
 	EXIT_IF(layers == 0 || depth_slice > UINT64_MAX / layers || color_slice > UINT64_MAX / layers);
-	const auto                       depth_size = depth_slice * layers;
-	const auto                       color_size = color_slice * layers;
-	std::vector<vk::BufferImageCopy> depth_copies(layers);
-	std::vector<vk::BufferImageCopy> color_copies(layers);
-	for (uint32_t layer = 0; layer < layers; layer++) {
-		depth_copies[layer].bufferOffset      = depth_slice * layer;
-		depth_copies[layer].bufferRowLength   = depth.info.pitch;
-		depth_copies[layer].bufferImageHeight = depth.info.extent.height;
-		depth_copies[layer].imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, layer, 1};
-		depth_copies[layer].imageExtent       = depth.info.extent;
-		color_copies[layer].bufferOffset      = color_slice * layer;
-		color_copies[layer].bufferRowLength   = color.info.pitch;
-		color_copies[layer].bufferImageHeight = color.info.extent.height;
-		color_copies[layer].imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, layer, 1};
-		color_copies[layer].imageExtent       = color.info.extent;
-	}
+	const auto       depth_size = depth_slice * layers;
+	const auto       color_size = color_slice * layers;
+	const std::array depth_copies {
+	    vk::BufferImageCopy {0,
+	                         depth.info.pitch,
+	                         depth.info.extent.height,
+	                         {vk::ImageAspectFlagBits::eDepth, 0, 0, layers},
+	                         {},
+	                         depth.info.extent}};
+	const std::array color_copies {
+	    vk::BufferImageCopy {0,
+	                         color.info.pitch,
+	                         color.info.extent.height,
+	                         {vk::ImageAspectFlagBits::eColor, 0, 0, layers},
+	                         {},
+	                         color.info.extent}};
 
-	auto                         depth_buffer = m_tiler.GetScratchBuffer(depth_size);
-	auto                         color_buffer = m_tiler.GetScratchBuffer(color_size);
+	auto depth_buffer = m_tiler.GetScratchBuffer(depth_size);
+	auto color_buffer = m_tiler.GetScratchBuffer(color_size, depth_buffer.buffer);
 	const TileManager::D16Layout promote_layout {
 	    .width               = depth.info.extent.width,
 	    .height              = depth.info.extent.height,
@@ -656,6 +581,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	const bool source_depth = source.info.IsDepth();
 	const bool dest_depth   = destination.info.IsDepth();
 	const bool direct_copy =
+	    source.info.GetColorTransform() == destination.info.GetColorTransform() &&
 	    (source.backing.image_type == destination.backing.image_type ||
 	     (source.backing.image_type != vk::ImageType::e1D &&
 	      destination.backing.image_type != vk::ImageType::e1D)) &&
@@ -669,7 +595,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
 		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
-		destination.CopyImageWithBuffer(source, copy_buffer);
+		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
@@ -680,6 +606,9 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
 	RefreshCopySource(source_id);
+	if (m_slot_images[destination_id].IsBufferModified()) {
+		RefreshImage(destination_id);
+	}
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
@@ -712,7 +641,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    !cached.info.HasMetadata();
-	// PPSA04264
+	// PPSA04264, PPSA04288
+	// A partial view retains the entire matching array layout. HTile belongs to
+	// the depth source, independently of the data slices copied into color storage.
 	const bool retain_cached_layout =
 	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
 	    requested.bytes_per_block == cached.info.bytes_per_block &&
@@ -722,8 +653,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.resources.layers != 0 && cached.info.resources.layers != 0 &&
 	    requested.resources.layers < cached.info.resources.layers &&
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    requested.mip_layout[0].offset == 0 &&
-	    cached.info.mip_layout[0].offset == 0 &&
+	    requested.mip_layout[0].offset == 0 && cached.info.mip_layout[0].offset == 0 &&
 	    requested.mip_layout[0].size == requested.data.size &&
 	    cached.info.mip_layout[0].size == cached.info.data.size &&
 	    requested.data.size % requested.resources.layers == 0 &&
@@ -731,8 +661,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.data.size / requested.resources.layers ==
 	        cached.info.data.size / cached.info.resources.layers &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
-	    !cached.info.HasMetadata();
-	bool recreate = cached.info.resources < requested.resources;
+	    (cached.info.metadata.kind == ImageMetadataKind::None ||
+	     cached.info.metadata.kind == ImageMetadataKind::Htile);
+	bool recreate = cached.info.resources < requested.resources ||
+	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
@@ -752,13 +684,15 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
-		info.data       = cached.info.data;
-		info.resources  = cached.info.resources;
-		info.mip_layout = cached.info.mip_layout;
-	} else {
-		info.resources = std::max(requested.resources, cached.info.resources);
+		info.data                = cached.info.data;
+		info.resources           = cached.info.resources;
+		info.mip_layout          = cached.info.mip_layout;
+		info.tiling              = cached.info.tiling;
+		info.tiled_slice_stride  = cached.info.tiled_slice_stride;
+		info.linear_slice_stride = cached.info.linear_slice_stride;
+		info.first_tail_level    = cached.info.first_tail_level;
 	}
-	info.htile_clear_mask     = 0;
+	info.htile_initial_clear  = false;
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
@@ -790,15 +724,73 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
+	if (info.IsDepth() && info.metadata.kind == ImageMetadataKind::Htile) {
+		// Copied depth supersedes pending clears from the previous native image.
+		const auto metadata = m_surface_metas.find(info.metadata.range.address);
+		if (metadata != m_surface_metas.end()) {
+			metadata->second.clear_mask.reset();
+		}
+	}
 	FreeImage(cached_id);
 	return replacement_id;
 }
+
+namespace BcAlias {
+
+bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
+	return requested.guest_format != cached.guest_format &&
+	       requested.IsBlock() != cached.IsBlock() && requested.tile_mode == cached.tile_mode &&
+	       requested.bytes_per_block == cached.bytes_per_block && requested.samples == 1 &&
+	       cached.samples == 1 &&
+	       (requested.data != cached.data || requested.resources != cached.resources ||
+	        requested.BlockExtent() != cached.BlockExtent()) &&
+	       !TextureCache::SameBacking(cached, requested, false);
+}
+
+bool Publish(TextureCache& cache, Image& image) {
+	if (!cache.CanDownload(image)) {
+		return false;
+	}
+	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
+	auto [buffer, offset] =
+	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
+	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
+	image.ClearGpuModified();
+	image.MarkBufferModified();
+	return true;
+}
+
+void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
+	auto& cached = cache.m_slot_images[cached_id];
+	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
+	// PS5 raw block images can span several packed BC mips. Transfer their complete
+	// guest bytes, including tail padding, before retiring the incompatible backing.
+	if (cached.SafeToDownload()) {
+		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
+			return;
+		}
+		if (!Publish(cache, cached)) {
+			return;
+		}
+		if (merged) {
+			merged->MarkBufferModified();
+		}
+	}
+	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+	cache.FreeImage(cached_id);
+}
+
+} // namespace BcAlias
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
 	auto owner = m_slot_images.try_get(cached_id);
-	if (owner == nullptr) {
+	if (owner == nullptr || !owner->registered) {
+		return {merged_id};
+	}
+	if (BcAlias::Matches(requested, owner->info) && !owner->IsCpuDirty()) {
+		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
 	auto&      cached       = *owner;
@@ -813,22 +805,38 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
-		if (requested.IsBlock() && !cached.info.IsBlock()) {
-			return {ExpandImage(requested, cached_id)};
-		}
-		if (requested.data.size == cached.info.data.size &&
-		    (requested.IsVolume() || cached.info.IsVolume())) {
-			return {ExpandImage(requested, cached_id)};
-		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
-		     requested.mip_layout != cached.info.mip_layout)) {
+		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
+		                 cached.info.mip_layout.begin(),
+		                 [](const ImageMipInfo& left, const ImageMipInfo& right) {
+			                 return left.offset == right.offset && left.size == right.size &&
+			                        left.pitch == right.pitch && left.height == right.height &&
+			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
+			                        left.surface_z == right.surface_z;
+		                 }))) {
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
 			return {merged_id};
+		}
+		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		if (requested.IsBlock() && !cached.info.IsBlock()) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		// Volume depth is not an array-layer count. A larger depth can retain the
+		// same block-slice layout while requiring a larger native image.
+		if ((requested.IsVolume() || cached.info.IsVolume()) &&
+		    (requested.data.size == cached.info.data.size ||
+		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
+		      requested.extent.width == cached.info.extent.width &&
+		      requested.extent.height == cached.info.extent.height &&
+		      requested.extent.depth > cached.info.extent.depth))) {
+			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
 		// A view cannot change the native image type or grow its extent.
@@ -847,10 +855,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
 		    (requested.data.size > cached.info.data.size ||
 		     (requested.data.size == cached.info.data.size &&
-		      requested.extent == cached.info.extent &&
-		      cached.info.resources.levels > 1 &&
+		      requested.extent == cached.info.extent && cached.info.resources.levels > 1 &&
 		      requested.resources.layers == cached.info.resources.layers))) {
 			return {ExpandImage(requested, cached_id)};
+		}
+		if (requested.type != cached.info.type) {
+			return {merged_id};
 		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
@@ -900,14 +910,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
-	auto&      expanded    = m_slot_images[expanded_id];
 	auto&      source      = m_slot_images[source_id];
-	expanded.usage         = source.usage;
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id);
-	const int32_t mip = source.info.MipOf(info);
+	const int32_t mip   = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
 	if (layer >= 0) {
 		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
@@ -919,171 +927,55 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	return expanded_id;
 }
 
-struct TextureCache::TextureTransfer {
-	TextureUploadLayout              layout;
-	std::vector<vk::BufferImageCopy> regions;
-	std::vector<GpuTileInfo>         tiles;
-	bool                             swap_bgra16 = false;
-	bool                             valid       = false;
-
-	[[nodiscard]] uint64_t LinearSize() const {
-		uint64_t size = 0;
-		for (const auto& tile: tiles) {
-			size = std::max(size, tile.linear_offset + tile.linear_size);
-		}
-		return size;
+bool TextureCache::CanDownload(const Image& image) const {
+	const auto& info = image.info;
+	if (info.samples != 1 || image.backing.samples != 1 || info.resources.layers == 0 ||
+	    info.data.size % info.resources.layers != 0) {
+		return false;
 	}
-};
-
-struct TextureCache::ImageDownload {
-	TextureTransfer texture;
-	bool                depth_target = false;
-	bool                valid        = false;
-};
-
-TextureCache::TextureTransfer
-TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
-                                    TransferDirection direction) const {
-	const auto& info             = image.info;
-	const bool  upload           = direction == TransferDirection::Upload;
-	const bool  render_target    = binding == BindingType::RenderTarget;
-	const bool  video_out        = binding == BindingType::VideoOut;
-	auto        format           = info.guest_format;
-	uint32_t    layers           = info.TransferLayers();
-	bool        volume           = info.IsVolume();
-	bool        allow_depth_tile = upload;
-	const char* owner            = "TextureCache readback";
-
-	TextureTransfer transfer;
-	transfer.swap_bgra16 = info.bgra16 && (!upload || render_target || video_out);
-	if (render_target) {
-		format = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
+	if (UploadBinding(image) == BindingType::DepthTarget) {
+		return IsSupportedDepthPlaneReadback(info) &&
+		       Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block;
 	}
-	if (video_out) {
-		allow_depth_tile = false;
-	} else if (render_target || binding == BindingType::Storage) {
-		allow_depth_tile = true;
-	}
-	if (upload) {
-		if ((render_target || video_out) &&
+	return info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       (!info.IsTiled() || !Prospero::IsFmaskTextureFormat(info.guest_format)) &&
+	       info.LinearSize() != 0;
+}
+
+void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	auto&       destination = image.depth_id ? m_slot_images[image.depth_id] : image;
+	const auto& info        = image.info;
+	const auto  binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
+	if (binding != BindingType::DepthTarget) {
+		if ((binding == BindingType::RenderTarget || binding == BindingType::VideoOut) &&
 		    (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 		     info.samples != 1 || image.backing.samples != 1)) {
 			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
-		owner = "TextureCache";
-		if (render_target) {
-			owner = "RenderTarget";
-		} else if (binding == BindingType::Storage) {
-			owner = "StorageTextureCache";
-		} else if (video_out) {
-			if (info.metadata.compression != VideoOutCompression::Uncompressed) {
-				EXIT("TextureCache: invalid color-attachment upload\n");
-			}
-			layers = info.resources.layers;
-			volume = false;
-			owner  = "VideoOut";
+		if (binding == BindingType::VideoOut &&
+		    info.metadata.compression != VideoOutCompression::Uncompressed) {
+			EXIT("TextureCache: invalid video-out upload\n");
 		}
-	}
-
-	transfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
-	                                       info.resources.levels, layers, info.tile_mode,
-	                                       info.data.size, allow_depth_tile, volume, owner);
-	transfer.regions = TextureBuildImageCopies(transfer.layout);
-	if (info.IsDepth()) {
-		for (auto& region: transfer.regions) {
-			region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
-		}
-	}
-	if (transfer.layout.surface.description.tile_mode != Prospero::TileMode::kLinear) {
-		if (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
-		                              info.resources.levels, transfer.tiles)) {
-			return transfer;
-		}
-	}
-	transfer.valid = true;
-	return transfer;
-}
-
-TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) const {
-	const auto&  info    = image.info;
-	const auto   binding = UploadBinding(image);
-	ImageDownload transfer {.depth_target = binding == BindingType::DepthTarget};
-	if (info.samples != 1 || image.backing.samples != 1) {
-		return transfer;
-	}
-	if (transfer.depth_target) {
-		transfer.valid = IsSupportedDepthPlaneReadback(info) && info.resources.layers != 0 &&
-		             info.data.size % info.resources.layers == 0 &&
-		             Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block;
-		return transfer;
-	}
-	if (info.metadata.compression != VideoOutCompression::Uncompressed) {
-		return transfer;
-	}
-	transfer.texture = BuildTextureTransfer(image, binding, TransferDirection::Download);
-	transfer.valid   = transfer.texture.valid;
-	return transfer;
-}
-
-void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
-	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
-	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
-	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
-		for (auto& copy: copies) {
-			copy.bufferOffset += linear.offset;
-		}
+		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
+		const auto copies = info.BufferCopies(linear.offset);
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
-	};
-
-	if (binding != BindingType::DepthTarget) {
-		const auto& info = image.info;
-		auto transfer = BuildTextureTransfer(image, binding, TransferDirection::Upload);
-		if (!transfer.valid) {
-			EXIT("TextureCache: invalid texture upload: binding=%u addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
-			     "pitch=%u levels=%u layers=%u samples=%u\n",
-			     static_cast<uint32_t>(binding), info.data.address, info.data.size,
-			     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
-			     static_cast<uint32_t>(transfer.layout.surface.texture.block.family), info.extent.width,
-			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
-			     info.resources.layers, info.samples);
-		}
-		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
-		if (!transfer.tiles.empty()) {
-			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
-			                        transfer.LinearSize(), transfer.tiles);
-		}
-		if (transfer.swap_bgra16) {
-			linear = m_tiler.SwapBgra16(linear);
-		}
-		upload(transfer.regions, linear);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;
 	}
 
-	// The stencil plane has its own row pitch and shares the native image
-	// with the depth plane.
-	auto info = destination.info;
-	if (image.depth_id) {
-		info.data            = image.info.data;
-		info.guest_format    = Prospero::BufferFormat::k8UInt;
-		info.bytes_per_block = 1;
-		if (info.IsTiled()) info.pitch = TileGetDepthPitch(info.extent.width, 1, 0);
-	}
-	if (info.samples != 1 || destination.backing.samples != 1 ||
-	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
+	if (info.samples != 1 || destination.backing.samples != 1 || info.resources.layers == 0 ||
+	    info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");
 	}
-	const auto          layers          = info.resources.layers;
-	const auto          full_slice_size = info.data.size / layers;
-	auto copies = BuildDepthCopies(info, full_slice_size, image.depth_id
-	                                                        ? vk::ImageAspectFlagBits::eStencil
-	                                                        : vk::ImageAspectFlagBits::eDepth);
-	TileManager::Result linear {source.Handle(), source_offset, source.Size() - source_offset};
-	if (info.IsTiled()) {
-		const auto tiles = BuildDepthTiles(info);
-		linear =
-		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles);
+	const auto layers          = info.resources.layers;
+	const auto full_slice_size = info.linear_slice_stride;
+	auto       linear          = m_tiler.Detile(source.Handle(), source_offset, info);
+	auto       copies          = info.BufferCopies(linear.offset);
+	if (image.depth_id) {
+		for (auto& copy: copies) {
+			copy.imageSubresource.baseArrayLayer += image.stencil_subresources.base_layer;
+		}
 	}
 	const auto transfer_bytes = image.depth_id ? 1u : DepthAspectTransferBytes(info.pixel_format);
 	if (transfer_bytes != info.bytes_per_block) {
@@ -1093,7 +985,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		                     texels_per_slice > UINT64_MAX / transfer_bytes);
 		const uint64_t transfer_slice = texels_per_slice * transfer_bytes;
 		EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
-		auto promoted = m_tiler.GetScratchBuffer(transfer_slice * layers);
+		auto promoted = m_tiler.GetScratchBuffer(transfer_slice * layers, linear.buffer);
 		m_tiler.ConvertD16(
 		    linear, promoted, TileManager::D16Direction::Promote,
 		    info.pixel_format == vk::Format::eD32SfloatS8Uint,
@@ -1105,18 +997,19 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		     .source_slice_stride = full_slice_size,
 		     .target_slice_stride = transfer_slice});
 		linear = promoted;
-		for (uint32_t layer = 0; layer < layers; layer++) {
-			copies[layer].bufferOffset = transfer_slice * layer;
-		}
+		copies.resize(1);
+		copies[0].bufferOffset      = linear.offset;
+		copies[0].bufferRowLength   = info.pitch;
+		copies[0].bufferImageHeight = info.extent.height;
+		copies[0].imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, 0, layers};
+		copies[0].imageExtent       = info.extent;
 	}
-	upload(copies, linear);
+	destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.info.data.Empty()) {
-		return;
-	}
 	TrackImage(id);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (image.IsCpuDirty()) {
@@ -1143,7 +1036,7 @@ void TextureCache::InitializeImage(ImageId id) {
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
-                                       uint32_t metadata_base_layer) {
+                                         uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
@@ -1151,11 +1044,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
-		auto& image         = m_slot_images[id];
-		image.info.metadata = desc.info.metadata;
-		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
+		auto&            image = m_slot_images[id];
+		image.info.metadata    = desc.info.metadata;
+		// Native color metadata must not retain a reused HTile clear flag.
 		m_surface_metas.erase(range.address);
-		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
+		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
 		}
 	}
@@ -1182,7 +1075,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
-		uint8_t code = 0;
+		uint8_t    code    = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
@@ -1194,38 +1087,42 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+		if (!std::all_of(bytes.begin(), bytes.end(),
+		                 [code](uint8_t byte) { return byte == code; })) {
 			continue;
 		}
 		{
 			std::scoped_lock lock {m_lock};
-			ClearImage(m_scheduler.Current(), id, view.format,
-			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
-			            image_first + slice, 1}, clear);
+			const auto&      image = m_slot_images[id];
+			const bool       depth = image.info.IsDepth();
+			if (depth) {
+				const auto value   = clear.color.float32[0];
+				clear.depthStencil = {value, 0u};
+			}
+			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
+			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
+			            view.base_level, view.level_count, image_first + slice, 1},
+			           clear);
 		}
-		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
-		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
+		// Publish the conversion's expanded keys without treating them as guest writes
+		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
-			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			m_buffer_cache.InvalidateMemory(address, slice_size);
+			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
 }
 
 void TextureCache::RefreshImage(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.depth_id &&
-	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
-	     m_slot_images[image.depth_id].info.samples != 1)) {
+	if (image.depth_id && (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
+	                       m_slot_images[image.depth_id].info.samples != 1)) {
 		return;
 	}
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
-		const auto hash = image.HashGuestEdges();
-		if (image.NeedsMaybeCpuHash()) {
-			image.SetMaybeCpuHash(hash);
-			return;
-		}
-		(void)image.ResolveMaybeCpuHash(hash);
+		(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -1265,7 +1162,31 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
-	record.depth_id = depth_id;
+	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
+		ImageInfo plane {};
+		plane.data         = stencil;
+		plane.pixel_format = vk::Format::eS8Uint;
+		plane.guest_format = Prospero::BufferFormat::k8UInt;
+		plane.type         = depth.info.type;
+		plane.extent       = depth.info.extent;
+		plane.resources    = {depth.stencil_subresources.level_count,
+		                      depth.stencil_subresources.layer_count};
+		plane.tile_mode    = depth.info.tile_mode;
+		plane.pitch =
+		    plane.IsTiled() ? TileGetDepthPitch(plane.extent.width, 1, 0) : depth.info.pitch;
+		plane.bytes_per_block = 1;
+		plane.UpdateSize();
+		if (record.depth_id != depth_id) {
+			if (record.depth_id) {
+				std::erase(m_slot_images[record.depth_id].stencil_ids, association);
+			}
+			depth.stencil_ids.push_back(association);
+		}
+		record.info                 = plane;
+		record.depth_id             = depth_id;
+		record.stencil_subresources = depth.stencil_subresources;
+	}
+
 	return association;
 }
 
@@ -1275,10 +1196,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
 	ValidateImageDesc(desc);
-	if (desc.info.data.Empty()) {
-		std::scoped_lock lock {m_lock};
-		return GetNullImage(desc);
-	}
+	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
@@ -1286,11 +1204,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		bool block_alias = false;
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
+			// Stencil descriptors name the associated plane; its depth owner supplies
+			// the native image and the canonical guest tiling.
+			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+			    image.depth_id && image.info.data == desc.info.data &&
+			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
+			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
+			    image.info.resources.levels >= desc.info.resources.levels &&
+			    image.info.resources.layers >= desc.info.resources.layers &&
+			    desc.info.bytes_per_block == 1 &&
+			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+				result = id;
+				break;
+			}
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
+			} else if (image.SafeToDownload() && BcAlias::Matches(desc.info, image.info)) {
+				block_alias = true;
 			}
 		}
 
@@ -1308,9 +1242,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					view_layer = overlap.layer;
 				}
 			}
+		} else if (block_alias) {
+			for (const auto candidate: candidates) {
+				const auto* owner = m_slot_images.try_get(candidate);
+				if (candidate != result && owner != nullptr && owner->registered &&
+				    !owner->IsCpuDirty() &&
+				    BcAlias::Matches(m_slot_images[result].info, owner->info)) {
+					BcAlias::Resolve(*this, candidate, result);
+				}
+			}
 		}
 
-		if (result) {
+		if (result && !m_slot_images[result].depth_id) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
@@ -1341,9 +1284,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};
-		const auto& image = m_slot_images[result];
-		const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
-		const bool native_current =
+		const auto&      image       = m_slot_images[result];
+		const bool       guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
+		const bool       native_current =
 		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
 		if (!native_current) {
 			EXIT("TextureCache: compressed video-out read requires clean native GPU "
@@ -1374,7 +1317,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		if (ensure_valid && owner->depth_id) {
 			owner = m_slot_images.try_get(owner->depth_id);
 		}
-		if (owner == nullptr || (ensure_valid && !SafeToDownload(*owner))) {
+		if (owner == nullptr || (ensure_valid && !owner->SafeToDownload())) {
 			continue;
 		}
 		matches.push_back(id);
@@ -1404,36 +1347,29 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
-	if (!image.info.data.Empty()) {
-		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
-		}
+	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 	}
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
 	}
-	if (!image.info.data.Empty()) {
-		RefreshImage(id);
-		if (image.info.HasStencil() &&
-		    desc.info.data.address >= image.info.stencil.address &&
-		    desc.info.data.End() <= image.info.stencil.End()) {
-			for (const auto stencil_id:
-			     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
-				const auto* stencil = m_slot_images.try_get(stencil_id);
-				if (stencil != nullptr && stencil->depth_id == id &&
-				    stencil->info.data == image.info.stencil) {
-					RefreshImage(stencil_id);
-					break;
-				}
+	RefreshImage(id);
+	if (image.info.HasStencil() && desc.info.data.address >= image.info.stencil.address &&
+	    desc.info.data.End() <= image.info.stencil.End()) {
+		for (const auto stencil_id:
+		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
+			const auto* stencil = m_slot_images.try_get(stencil_id);
+			if (stencil != nullptr && stencil->depth_id == id &&
+			    stencil->info.data == image.info.stencil) {
+				RefreshImage(stencil_id);
+				break;
 			}
 		}
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
-			if (!image.info.data.Empty()) {
-				CommitGpuWrite(image);
-			}
+			CommitGpuWrite(image);
 			TrackImageDownload(id, image);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
@@ -1470,13 +1406,26 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
-	image.usage.depth_target = true;
-	image.info.stencil = desc.info.stencil;
+	if (desc.info.HasStencil()) {
+		const auto layers = image.info.resources.layers;
+		EXIT_IF(layers == 0 || image.info.data.size % layers != 0 ||
+		        desc.info.data.address < image.info.data.address);
+		const auto slice_size = image.info.data.size / layers;
+		const auto offset     = desc.info.data.address - image.info.data.address;
+		EXIT_IF(slice_size == 0 || offset % slice_size != 0 || offset / slice_size >= layers ||
+		        desc.info.resources.layers > layers - offset / slice_size);
+		image.stencil_subresources = {0, desc.info.resources.levels,
+		                              static_cast<uint32_t>(offset / slice_size),
+		                              desc.info.resources.layers};
+	}
+	image.info.stencil  = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		m_surface_metas.emplace(desc.info.metadata.range.address,
-		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		const auto [metadata, inserted] =
+		    m_surface_metas.try_emplace(desc.info.metadata.range.address);
+		if (inserted && image.info.htile_initial_clear) {
+			metadata->second.clear_mask.set();
+		}
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1517,21 +1466,26 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
-	std::scoped_lock     lock {m_lock};
-	ImageId              selected {};
-	vk::ImageAspectFlags aspect {};
+	std::scoped_lock      lock {m_lock};
+	ImageId               selected {};
+	ImageId               stencil_id {};
+	vk::ImageAspectFlags  aspect {};
+	ImageSubresourceRange subresources;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
 			continue;
 		}
-		vk::ImageAspectFlags candidate {};
-		ImageId              candidate_id = id;
+		vk::ImageAspectFlags  candidate {};
+		ImageId               candidate_id = id;
+		ImageSubresourceRange candidate_subresources {0, owner->info.resources.levels, 0,
+		                                              owner->info.TransferLayers()};
 		if (owner->depth_id && owner->info.data.address == address &&
 		    owner->info.data.size == size) {
-			candidate    = vk::ImageAspectFlagBits::eStencil;
-			candidate_id = owner->depth_id;
-			owner        = m_slot_images.try_get(candidate_id);
+			candidate              = vk::ImageAspectFlagBits::eStencil;
+			candidate_id           = owner->depth_id;
+			candidate_subresources = owner->stencil_subresources;
+			owner                  = m_slot_images.try_get(candidate_id);
 			if (owner == nullptr || owner->backing.image == nullptr || !owner->info.HasStencil()) {
 				continue;
 			}
@@ -1543,11 +1497,13 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		if (!candidate) {
 			continue;
 		}
-		if (selected && selected != candidate_id) {
+		if (selected && (selected != candidate_id || subresources != candidate_subresources)) {
 			return false;
 		}
-		selected = candidate_id;
-		aspect   = candidate;
+		selected     = candidate_id;
+		stencil_id   = candidate == vk::ImageAspectFlagBits::eStencil ? id : ImageId {};
+		aspect       = candidate;
+		subresources = candidate_subresources;
 	}
 	if (!selected) {
 		return false;
@@ -1555,13 +1511,14 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, clear.color)) {
+		if (!DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color)) {
 			return false;
 		}
 	} else {
 		uint8_t stencil_clear = 0;
 		if ((aspect == vk::ImageAspectFlagBits::eDepth &&
-		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear, clear.depthStencil.depth)) ||
+		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear,
+		                             clear.depthStencil.depth)) ||
 		    (aspect == vk::ImageAspectFlagBits::eStencil &&
 		     !DecodePackedStencilClear(packed_clear, stencil_clear))) {
 			return false;
@@ -1569,13 +1526,19 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		clear.depthStencil.stencil = stencil_clear;
 	}
 	ClearImage(command, selected, image.backing.format,
-	           {aspect, 0, image.info.resources.levels, 0, image.info.TransferLayers()}, clear);
+	           {aspect, subresources.base_level, subresources.level_count, subresources.base_layer,
+	            subresources.layer_count},
+	           clear);
+	if (stencil_id) {
+		TrackImage(stencil_id);
+		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
 	return true;
 }
 
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
-	auto& image = m_slot_images[id];
+	auto&      image   = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -1590,7 +1553,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	const bool full_subresources = range.baseMipLevel == 0 &&
 	                               range.levelCount == image.info.resources.levels &&
 	                               range.baseArrayLayer == 0 && range.layerCount == layers;
-	const bool full_image = range.aspectMask == aspects && full_subresources;
+	const bool full_image        = range.aspectMask == aspects && full_subresources;
 	TrackImage(id);
 	if (!full_image && (image.IsBufferModified() || image.IsCpuDirty())) {
 		InitializeImage(id);
@@ -1668,7 +1631,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
-	const auto     full_slice_size  = info.data.size / layers;
+	const auto     full_slice_size  = info.linear_slice_stride;
 	const auto     transfer_bytes   = DepthAspectTransferBytes(info.pixel_format);
 	const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
 	EXIT_NOT_IMPLEMENTED(transfer_bytes == 0 || texels_per_slice > UINT32_MAX ||
@@ -1679,31 +1642,31 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
 	const uint64_t transfer_size = transfer_slice * layers;
 	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
-	auto copies = BuildDepthCopies(info, full_slice_size, vk::ImageAspectFlagBits::eDepth);
 	if (transfer_bytes == info.bytes_per_block) {
 		if (!info.IsTiled()) {
-			for (auto& copy: copies) {
-				copy.bufferOffset += destination_offset;
-			}
+			const auto copies = info.BufferCopies(destination_offset);
 			image.Download(copies, destination.Handle(), destination_offset, info.data.size);
-			return;
+		} else {
+			const auto copies = info.BufferCopies();
+			m_tiler.TileImage(image, copies, destination.Handle(), destination_offset,
+			                  info.data.size);
 		}
-		const auto tiles = BuildDepthTiles(info);
-		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, info.data.size,
-		                  info.data.size, tiles);
 		return;
 	}
 	EXIT_NOT_IMPLEMENTED(info.bytes_per_block != sizeof(uint16_t) ||
 	                     transfer_bytes != sizeof(uint32_t));
-	for (uint32_t layer = 0; layer < layers; layer++) {
-		copies[layer].bufferOffset = transfer_slice * layer;
-	}
-	auto host_linear = m_tiler.GetScratchBuffer(transfer_size);
+	const std::array copies {vk::BufferImageCopy {0,
+	                                              info.pitch,
+	                                              info.extent.height,
+	                                              {vk::ImageAspectFlagBits::eDepth, 0, 0, layers},
+	                                              {},
+	                                              info.extent}};
+	auto             host_linear = m_tiler.GetScratchBuffer(transfer_size);
 	image.Download(copies, host_linear.buffer, 0, host_linear.size);
-	const bool tiled        = info.IsTiled();
-	auto       guest_linear = tiled ? m_tiler.GetScratchBuffer(info.data.size)
-	                                : TileManager::Result {destination.Handle(), destination_offset,
-	                                                       destination.Size() - destination_offset};
+	const bool tiled  = info.IsTiled();
+	auto guest_linear = tiled ? m_tiler.GetScratchBuffer(info.LinearSize(), host_linear.buffer)
+	                          : TileManager::Result {destination.Handle(), destination_offset,
+	                                                 destination.Size() - destination_offset};
 	m_tiler.ConvertD16(host_linear, guest_linear, TileManager::D16Direction::Demote,
 	                   DepthAspectTransferFormat(info.pixel_format) == vk::Format::eD32Sfloat,
 	                   {.width               = info.extent.width,
@@ -1713,47 +1676,39 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	                    .target_row_stride   = static_cast<uint64_t>(info.pitch) * sizeof(uint16_t),
 	                    .source_slice_stride = transfer_slice,
 	                    .target_slice_stride = full_slice_size});
-	if (!tiled) {
-		return;
+	if (tiled) {
+		m_tiler.Tile(guest_linear.buffer, guest_linear.offset, guest_linear.size,
+		             destination.Handle(), destination_offset, info.data.size, info);
 	}
-	const auto tiles = BuildDepthTiles(info);
-	m_tiler.Tile(guest_linear.buffer, guest_linear.offset, info.data.size, destination.Handle(),
-	             destination_offset, info.data.size, tiles);
 }
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-                                     uint64_t destination_size, ImageDownload transfer) {
-	if (!transfer.valid) {
-		EXIT("TextureCache: invalid image download transfer\n");
+                                 uint64_t destination_size, uint32_t levels) {
+	if (!CanDownload(image)) {
+		EXIT("TextureCache: invalid image download\n");
 	}
-	if (transfer.depth_target) {
-		if (destination_size != image.info.data.size) {
-			EXIT("TextureCache: partial depth image download is unsupported\n");
-		}
+	if (UploadBinding(image) == BindingType::DepthTarget) {
+		EXIT_IF(destination_size != image.info.data.size || levels != image.info.resources.levels);
 		DownloadDepth(image, destination, destination_offset);
 		return;
 	}
 
-	auto&      texture   = transfer.texture;
-	const auto transform = texture.swap_bgra16 ? TileManager::ColorTransform::SwapBgra16
-	                                           : TileManager::ColorTransform::None;
-	if (texture.tiles.empty()) {
-		if (transform == TileManager::ColorTransform::SwapBgra16) {
-			auto linear = m_tiler.GetScratchBuffer(destination_size);
-			image.Download(texture.regions, linear.buffer, 0, linear.size);
-			m_tiler.SwapBgra16(linear,
-			                   {destination.Handle(), destination_offset, destination_size});
-			return;
-		}
-		for (auto& copy: texture.regions) {
-			copy.bufferOffset += destination_offset;
-		}
-		image.Download(texture.regions, destination.Handle(), destination_offset, destination_size);
-		return;
+	const auto& info      = image.info;
+	const auto  transform = info.GetColorTransform();
+	if (info.IsTiled()) {
+		const auto copies = info.BufferCopies(0, levels);
+		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, destination_size,
+		                  levels);
+	} else if (transform != ColorTransform::None) {
+		auto       linear = m_tiler.GetScratchBuffer(destination_size);
+		const auto copies = info.BufferCopies(0, levels);
+		image.Download(copies, linear.buffer, 0, linear.size);
+		m_tiler.TransformColor(linear, {destination.Handle(), destination_offset, destination_size},
+		                       transform, false);
+	} else {
+		const auto copies = info.BufferCopies(destination_offset, levels);
+		image.Download(copies, destination.Handle(), destination_offset, destination_size);
 	}
-
-	m_tiler.TileImage(image, texture.regions, destination.Handle(), destination_offset,
-	                  destination_size, texture.LinearSize(), texture.tiles, transform);
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -1763,9 +1718,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 
 	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto& image = m_texture_cache.m_slot_images[selected];
+	auto&            image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!m_texture_cache.SafeToDownload(image)) {
+	if (!image.SafeToDownload()) {
 		return false;
 	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
@@ -1775,14 +1730,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	const auto available  = buffer.Size() - buf_offset;
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
-	if (image.info.IsVolume()) {
-		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
-		// every retained slice fits. Keep volume synchronization whole-image only.
-		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
-			return false;
-		}
+	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
 		levels    = image.info.resources.levels;
 		copy_size = image.info.data.size;
+	} else if (image.info.IsVolume() || image.info.resources.layers > 1) {
+		// Array and volume slices are strided across the full mip chain.
+		return false;
 	} else {
 		for (; levels < image.info.resources.levels; ++levels) {
 			const auto& mip = image.info.mip_layout[levels];
@@ -1795,30 +1748,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (copy_size == 0) {
 		return false;
 	}
-	auto transfer = m_texture_cache.BuildDownload(image);
-	if (!transfer.valid) {
+	if (!m_texture_cache.CanDownload(image) ||
+	    (TextureCache::UploadBinding(image) == TextureCache::BindingType::DepthTarget &&
+	     copy_size != image.info.data.size)) {
 		return false;
 	}
-	if (transfer.depth_target && copy_size != image.info.data.size) {
-		return false;
-	}
-	if (!transfer.depth_target && levels < image.info.resources.levels) {
-		auto& texture = transfer.texture;
-		std::erase_if(texture.regions, [levels](const vk::BufferImageCopy& region) {
-			return region.imageSubresource.mipLevel >= levels;
-		});
-		if (texture.regions.empty()) {
-			return false;
-		}
-		if (!texture.tiles.empty()) {
-			texture.tiles.clear();
-			if (!TextureBuildGpuTileInfos(copy_size, texture.regions, texture.layout, levels,
-			                              texture.tiles)) {
-				return false;
-			}
-		}
-	}
-	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
+	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
 	return true;
 }
 
@@ -1827,8 +1762,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (image.depth_id) {
 		return false;
 	}
-	auto transfer = BuildDownload(image);
-	if (!transfer.valid || !SafeToDownload(image)) {
+	if (!image.SafeToDownload() || !CanDownload(image)) {
 		return false;
 	}
 	const auto range    = image.info.data;
@@ -1844,7 +1778,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	}
 	download.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, std::move(transfer));
+	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -1872,7 +1807,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (!image.Overlaps(address, size)) {
+		if (image.info.data.address != address) {
 			continue;
 		}
 		if (image.IsGpuModified()) {
@@ -1880,20 +1815,6 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		}
 		image.MarkBufferModified();
 	}
-}
-
-bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
-	if (!GuestRange {address, size}.Valid()) {
-		return false;
-	}
-	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, false)) {
-		const auto& image = m_slot_images[id];
-		if (!image.depth_id && image.IsGpuModified()) {
-			return true;
-		}
-	}
-	return false;
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
@@ -1905,7 +1826,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
-			owner->InvalidateCpuWrite(address, size);
+			owner->MarkCpuDirty();
 			UntrackImage(id);
 			continue;
 		}
@@ -1930,10 +1851,10 @@ bool TextureCache::IsMeta(uint64_t address) {
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return found->second.clear_mask.test(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -1942,22 +1863,23 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_mask.set();
 	return true;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
 	}
-	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
-	} else {
-		found->second.clear_mask &= ~(1u << slice);
-	}
+	found->second.clear_mask.set(slice, is_clear);
 	return true;
+}
+
+bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return !FindImagesInRegion(address, size, false).empty();
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
@@ -1965,6 +1887,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	// HTILE belongs to guest memory, independently of native image replacements.
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
@@ -1984,16 +1907,18 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
-	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	std::scoped_lock                           lock {m_lock};
+	const uint64_t                             tick = m_gc_tick++;
 	std::optional<MemoryPressurePolicy::Level> live_pressure;
-	if (!Rev3TextureRetentionEnabled() && m_graphics.CanReportMemoryUsage())
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	if (Rev3TextureRetentionEnabled() && m_graphics.CanReportMemoryUsage()) {
-		const auto budget   = m_graphics.GetMemoryBudget();
-		m_total_used_memory = budget.usage;
-		if (budget.budget != 0)
-			live_pressure = m_pressure_policy.Update(budget.usage, budget.budget);
+	if (m_graphics.CanReportMemoryUsage()) {
+		if (Rev3TextureRetentionEnabled()) {
+			const auto budget   = m_graphics.GetMemoryBudget();
+			m_total_used_memory = budget.usage;
+			const auto level    = m_pressure_policy.Update(budget.usage, budget.budget);
+			if (budget.budget != 0) live_pressure = level;
+		} else {
+			m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		}
 	}
 	if (live_pressure ? *live_pressure == MemoryPressurePolicy::Level::None
 	                  : m_total_used_memory < m_trigger_gc_memory) {
@@ -2005,16 +1930,12 @@ void TextureCache::RunGarbageCollector() {
 		bool aggressive = allow_aggressive &&
 		                  (live_pressure ? *live_pressure == MemoryPressurePolicy::Level::Critical
 		                                 : m_total_used_memory >= m_critical_gc_memory);
-		const auto           level = aggressive  ? MemoryPressurePolicy::Level::Critical
-		                             : pressured ? MemoryPressurePolicy::Level::Pressure
-		                                         : MemoryPressurePolicy::Level::Collect;
-		const uint64_t       age = std::min<uint64_t>(Rev3TextureRetentionEnabled()
-		                                                  ? MemoryPressurePolicy::TextureAge(level)
-		                                                  : (aggressive  ? 160
-		                                                     : pressured ? 80
-		                                                                 : 16),
-		                                              tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		const auto     level = aggressive  ? MemoryPressurePolicy::Level::Critical
+		                       : pressured ? MemoryPressurePolicy::Level::Pressure
+		                                   : MemoryPressurePolicy::Level::Collect;
+		const uint64_t age   = std::min<uint64_t>(
+		    MemoryPressurePolicy::TextureAge(level, live_pressure.has_value()), tick);
+		size_t               deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -2033,7 +1954,7 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
-				const bool safe = SafeToDownload(*owner);
+				const bool safe = owner->SafeToDownload();
 				if (safe && owner->info.IsTiled()) {
 					continue;
 				}
@@ -2045,6 +1966,7 @@ void TextureCache::RunGarbageCollector() {
 				}
 			}
 			FreeImage(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (!live_pressure && m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
@@ -2063,6 +1985,9 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	if (!m_readback_linear_images) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);

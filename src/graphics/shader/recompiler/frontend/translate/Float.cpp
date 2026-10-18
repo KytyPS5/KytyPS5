@@ -8,13 +8,13 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadF16LaneAsF32(inst.src0, high, true);
-		const auto rhs = ReadF16LaneAsF32(inst.src1, high, true);
+		const auto lhs = ReadF16LaneAsF32(inst.src0, high);
+		const auto rhs = ReadF16LaneAsF32(inst.src1, high);
 		IR::F32    result;
 		if (accumulator) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high, true)}));
+			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high)}));
 		} else if (inst.src_count == 3u) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src2, high, true)}));
+			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src2, high)}));
 		} else {
 			result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
 		}
@@ -27,7 +27,7 @@ void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 	if (quiet_snan) {
 		const auto quiet_snan_lane = [&](const Decoder::Operand& operand, bool high) {
 			const auto bits     = ReadU16LaneAsU32(operand, high, false);
-			const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7c00u)));
+			const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7e00u)));
 			const auto payload  = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x01ffu)));
 			const auto snan     = ir.LogicalAnd(ir.IEqual(exponent, IR::U32(IR::Value(0x7c00u))),
 			                                    ir.INotEqual(payload, IR::U32(IR::Value(0u))));

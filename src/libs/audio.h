@@ -70,6 +70,9 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 int KYTY_SYSV_ABI AudioOut2GetSystemState(AudioOut2SystemState* state);
 int KYTY_SYSV_ABI AudioOut2UserCreate(uint32_t user_id, AudioOut2UserHandle* handle);
 int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle);
+int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
+                                                       uint32_t* context_attributes,
+                                                       uint32_t* port_attributes);
 size_t KYTY_SYSV_ABI AudioOut2GetSpeakerArrayMemorySize(uint32_t num_speakers, uint8_t is_3d,
                                                         uint8_t is_ambisonics);
 int KYTY_SYSV_ABI    AudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle* handle,

@@ -111,69 +111,7 @@ struct Videodec2FrameBuffer {
 	bool   is_accepted;
 };
 
-struct Videodec2AvcPictureInfo {
-	size_t this_size;
-	bool   is_valid;
-
-	uint64_t pts_data;
-	uint64_t dts_data;
-	uint64_t attached_data;
-
-	uint8_t  idr_picture_flag;
-	uint8_t  profile_idc;
-	uint8_t  level_idc;
-	uint32_t pic_width_in_mbs_minus1;
-	uint32_t pic_height_in_map_units_minus1;
-	uint8_t  frame_mbs_only_flag;
-
-	uint8_t  frame_cropping_flag;
-	uint32_t frame_crop_left_offset;
-	uint32_t frame_crop_right_offset;
-	uint32_t frame_crop_top_offset;
-	uint32_t frame_crop_bottom_offset;
-
-	uint8_t  aspect_ratio_info_present_flag;
-	uint8_t  aspect_ratio_idc;
-	uint16_t sar_width;
-	uint16_t sar_height;
-
-	uint8_t video_signal_type_present_flag;
-	uint8_t video_format;
-	uint8_t video_full_range_flag;
-	uint8_t colour_description_present_flag;
-	uint8_t colour_primaries;
-	uint8_t transfer_characteristics;
-	uint8_t matrix_coefficients;
-
-	uint8_t  timing_info_present_flag;
-	uint32_t num_units_in_tick;
-	uint32_t time_scale;
-	uint8_t  fixed_frame_rate_flag;
-
-	uint8_t bitstream_restriction_flag;
-	uint8_t max_dec_frame_buffering;
-
-	uint8_t pic_struct_present_flag;
-	uint8_t pic_struct;
-	uint8_t field_pic_flag;
-	uint8_t bottom_field_flag;
-
-	uint8_t sequence_parameter_set_present_flag;
-	uint8_t picture_parameter_set_present_flag;
-	uint8_t au_delimiter_present_flag;
-	uint8_t end_of_sequence_present_flag;
-	uint8_t end_of_stream_present_flag;
-	uint8_t filler_data_present_flag;
-	uint8_t picture_timing_sei_present_flag;
-	uint8_t buffering_period_sei_present_flag;
-
-	uint8_t constraint_set0_flag;
-	uint8_t constraint_set1_flag;
-	uint8_t constraint_set2_flag;
-	uint8_t constraint_set3_flag;
-	uint8_t constraint_set4_flag;
-	uint8_t constraint_set5_flag;
-};
+using Videodec2AvcPictureInfo = Decoder::AvcPictureInfo;
 
 struct Videodec2ComputeMemoryInfo {
 	size_t this_size;
@@ -235,6 +173,8 @@ static void FillNoPictureOutput(const Videodec2FrameBuffer* frame_buffer,
 static int32_t MapDecoderResult(Decoder::Result result) {
 	switch (result) {
 		case Decoder::Result::Ok: return OK;
+		case Decoder::Result::InputFull:
+		case Decoder::Result::NoFrame:
 		case Decoder::Result::ApiFail: return VIDEODEC2_ERROR_API_FAIL;
 		case Decoder::Result::AccessUnit: return VIDEODEC2_ERROR_ACCESS_UNIT;
 		case Decoder::Result::FrameBufferSize: return VIDEODEC2_ERROR_FRAME_BUFFER_SIZE;
@@ -599,40 +539,7 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 			return VIDEODEC2_ERROR_STRUCT_SIZE;
 		}
 
-		Videodec2AvcPictureInfo picture {};
-		picture.this_size                      = requested_size;
-		picture.is_valid                       = true;
-		picture.pts_data                       = decoded.pts;
-		picture.dts_data                       = decoded.dts;
-		picture.attached_data                  = decoded.attached_data;
-		picture.idr_picture_flag               = decoded.key_frame ? 1 : 0;
-		picture.profile_idc                    = static_cast<uint8_t>(decoded.profile);
-		picture.level_idc                      = static_cast<uint8_t>(decoded.level);
-		picture.pic_width_in_mbs_minus1        = (decoded.width + 15u) / 16u - 1u;
-		picture.pic_height_in_map_units_minus1 = (decoded.height + 15u) / 16u - 1u;
-		picture.frame_mbs_only_flag            = 1;
-		picture.frame_cropping_flag      = decoded.crop_left != 0 || decoded.crop_right != 0 ||
-		                                           decoded.crop_top != 0 || decoded.crop_bottom != 0
-		                                       ? 1
-		                                       : 0;
-		picture.frame_crop_left_offset   = decoded.crop_left;
-		picture.frame_crop_right_offset  = decoded.crop_right;
-		picture.frame_crop_top_offset    = decoded.crop_top;
-		picture.frame_crop_bottom_offset = decoded.crop_bottom;
-		picture.aspect_ratio_info_present_flag =
-		    decoded.sar_width != 0 && decoded.sar_height != 0 ? 1 : 0;
-		picture.aspect_ratio_idc               = picture.aspect_ratio_info_present_flag ? 255 : 0;
-		picture.sar_width                      = decoded.sar_width;
-		picture.sar_height                     = decoded.sar_height;
-		picture.video_signal_type_present_flag = 1;
-		picture.video_format                   = 5;
-		picture.video_full_range_flag          = decoded.color_range == 2 ? 1 : 0;
-		picture.colour_description_present_flag =
-		    decoded.color_primaries != 0 || decoded.color_trc != 0 || decoded.color_space != 0 ? 1
-		                                                                                       : 0;
-		picture.colour_primaries         = decoded.color_primaries;
-		picture.transfer_characteristics = decoded.color_trc;
-		picture.matrix_coefficients      = decoded.color_space;
+		const auto picture = Decoder::MakeAvcPictureInfo(decoded, requested_size);
 		std::memcpy(first_picture_info, &picture, requested_size);
 	} else {
 		const auto result = fill_common(first_picture_info, true);

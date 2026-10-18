@@ -3,10 +3,10 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
-#include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
@@ -14,20 +14,25 @@
 #include <QFileInfo>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QSlider>
 #include <QSpinBox>
 #include <QStyle>
 #include <QToolButton>
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+
+#include <SDL3/SDL.h>
 
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
@@ -38,7 +43,23 @@
 
 constexpr char SETTINGS_CFG_DIALOG[]               = "ConfigurationEditDialog";
 constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "geometry";
-constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 560;
+constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 400;
+
+static void UpdateControllerColorButton(QPushButton* button, const QString& hex) {
+	const QColor color(hex);
+	if (!color.isValid()) {
+		button->setProperty("controllerColor", QString {});
+		button->setText(QObject::tr("Custom"));
+		button->setStyleSheet({});
+		return;
+	}
+	const auto normalized = color.name(QColor::HexRgb);
+	button->setProperty("controllerColor", normalized);
+	button->setText(normalized.toUpper());
+	button->setStyleSheet(QStringLiteral("background-color: %1; color: %2;")
+	                          .arg(normalized, color.lightness() < 128 ? QStringLiteral("white")
+	                                                                   : QStringLiteral("black")));
+}
 
 const QStringList CONSOLE_LANGUAGE_NAMES = {
     "Japanese",
@@ -105,16 +126,40 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
     : QDialog(parent, Qt::WindowCloseButtonHint), m_ui(new Ui::ConfigurationEditDialog),
       m_info(info) {
 	m_ui->setupUi(this);
+	setMinimumWidth(width());
 	InitGameDirectories();
+	m_ui->controller_group->setVisible(false);
+	m_ui->settings_button->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
+	connect(m_ui->button_controller_color, &QPushButton::clicked, this, [this]() {
+		const auto current = m_ui->button_controller_color->property("controllerColor").toString();
+		const auto initial =
+		    current.isEmpty() ? QColor(QStringLiteral("#0070d1")) : QColor(current);
+		const auto color = QColorDialog::getColor(initial, this, tr("DualSense lightbar color"));
+		if (color.isValid()) {
+			const auto hex = color.name(QColor::HexRgb);
+			UpdateControllerColorButton(m_ui->button_controller_color, hex);
+			emit PreviewControllerColor(hex);
+		}
+	});
+	connect(m_ui->button_controller_color_reset, &QPushButton::clicked, this, [this]() {
+		UpdateControllerColorButton(m_ui->button_controller_color, {});
+		emit PreviewControllerColor({});
+	});
+	connect(m_ui->slider_controller_vibration, &QSlider::valueChanged, this, [this](int value) {
+		m_ui->label_controller_vibration_value->setText(tr("%1%").arg(value));
+	});
+	connect(m_ui->slider_controller_volume, &QSlider::valueChanged, this, [this](int value) {
+		m_ui->label_controller_volume_value->setText(tr("%1%").arg(value));
+	});
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::LogDirection>(text);
-		        m_ui->lineEdit_shader_log_folder->setEnabled(
-		            log == Configuration::LogDirection::File);
+		        m_ui->lineEdit_shader_log_folder->setEnabled(log ==
+		                                                     Configuration::LogDirection::File);
 	        });
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
@@ -124,9 +169,6 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_printf_file->setEnabled(log == Configuration::LogDirection::File);
 	        });
 
-	// Keep the controls at a usable minimum while allowing the settings window
-	// and its expanding fields to use any additional space the user gives them.
-	layout()->setSizeConstraint(QLayout::SetMinimumSize);
 	setSizeGripEnabled(true);
 
 	restoreGeometry(g_last_geometry);
@@ -168,7 +210,19 @@ static void ListInit(QComboBox* combo, T value) {
 void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
+	m_ui->spinBox_user_id->setMaximum(Config::MAX_USER_ID);
 	m_ui->spinBox_user_id->setValue(info.user_id);
+	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
+	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
+	m_ui->slider_controller_volume->setValue(info.controller.speaker_volume);
+	auto* keyboard_player = m_ui->comboBox_keyboard_player;
+	keyboard_player->clear();
+	keyboard_player->addItem(tr("Shared with player 1 (default)"), 0);
+	for (int player = 1; player <= Config::MAX_PLAYERS; player++) {
+		keyboard_player->addItem(tr("Player %1").arg(player), player);
+	}
+	keyboard_player->setCurrentIndex(
+	    qMax(0, keyboard_player->findData(info.controller.keyboard_player)));
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -187,8 +241,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		SDL_free(devices);
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 	} else {
-		microphone->setToolTip(tr("Microphones could not be listed: %1")
-		                           .arg(QString::fromUtf8(SDL_GetError())));
+		microphone->setToolTip(
+		    tr("Microphones could not be listed: %1").arg(QString::fromUtf8(SDL_GetError())));
 	}
 	if (microphone->findData(info.audio_input_device) < 0) {
 		microphone->addItem(tr("%1 (unavailable)").arg(info.audio_input_device),
@@ -230,8 +284,17 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	    info.gpu_index >= 0 && info.gpu_index < m_ui->comboBox_gpu->count() - 1 ? info.gpu_index + 1
 	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
+	m_ui->checkBox_hdr->setChecked(info.hdr_enabled);
+	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
+	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
+	m_ui->checkBox_support_zmask->setChecked(info.support_zmask);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
+	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
+	m_ui->checkBox_network_connected->setChecked(info.network_connected);
+	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
+	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
+	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -298,6 +361,28 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	button_layout->addStretch(1);
 	group_layout->addLayout(button_layout);
 
+	group_layout->addWidget(new QLabel(tr("Add-ons folder"), m_game_dirs_group));
+	auto* addons_layout = new QHBoxLayout;
+	addons_layout->setContentsMargins(0, 0, 0, 0);
+	addons_layout->setSpacing(4);
+	m_addons_dir_edit = new QLineEdit(m_game_dirs_group);
+	m_addons_dir_edit->setPlaceholderText(tr("Folder containing extracted add-on (DLC) packages"));
+	addons_layout->addWidget(m_addons_dir_edit, 1);
+	auto* addons_button = new QToolButton(m_game_dirs_group);
+	addons_button->setIcon(style()->standardIcon(QStyle::SP_DirOpenIcon));
+	addons_button->setToolTip(tr("Select add-ons folder"));
+	addons_button->setAutoRaise(true);
+	addons_layout->addWidget(addons_button);
+	group_layout->addLayout(addons_layout);
+	connect(addons_button, &QToolButton::clicked, this, [this]() {
+		const auto dir = QFileDialog::getExistingDirectory(
+		    this, tr("Select add-ons folder"),
+		    m_addons_dir_edit->text().isEmpty() ? QDir::homePath() : m_addons_dir_edit->text());
+		if (!dir.isEmpty()) {
+			m_addons_dir_edit->setText(QDir::toNativeSeparators(dir));
+		}
+	});
+
 	m_ui->gridLayout->addWidget(m_game_dirs_group, 1, 0, 1, 1);
 	m_game_dirs_group->setVisible(false);
 
@@ -310,8 +395,15 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
-	m_show_game_dirs = true;
+void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs,
+                                                const QString&     addons_dir) {
+	m_global_settings = true;
+	m_addons_dir_edit->setText(QDir::toNativeSeparators(addons_dir));
+	auto* menu = new QMenu(m_ui->settings_button);
+	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
+	menu->addAction(tr("Export..."), this, &ConfigurationEditDialog::ExportGameSettings);
+	m_ui->settings_button->setMenu(menu);
+	m_ui->settings_button->setVisible(true);
 	m_game_dirs_list->clear();
 	m_game_dirs_group->setMinimumWidth(GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH);
 
@@ -320,14 +412,19 @@ void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 	}
 
 	m_game_dirs_group->setVisible(true);
+	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
 	layout()->activate();
 	resize(size().expandedTo(minimumSizeHint()));
 }
 
+QString ConfigurationEditDialog::GetAddonsDirectory() const {
+	return m_global_settings ? m_addons_dir_edit->text().trimmed() : QString();
+}
+
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
 	QStringList dirs;
-	if (!m_show_game_dirs) {
+	if (!m_global_settings) {
 		return dirs;
 	}
 
@@ -367,42 +464,65 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 	g_last_geometry = saveGeometry();
 }
 
-static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
-	info.user_name = ui.lineEdit_user_name->text().trimmed();
-	info.user_id   = ui.spinBox_user_id->value();
+static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
+	info.user_name          = ui.lineEdit_user_name->text().trimmed();
+	info.user_id            = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
+	if (global_settings) {
+		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
+		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
+		info.controller.speaker_volume      = ui.slider_controller_volume->value();
+		info.controller.keyboard_player     = ui.comboBox_keyboard_player->currentData().toInt();
+	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
-	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
-	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
-	info.readback_linear_images    = ui.checkBox_readback->isChecked();
-	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
-	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
-	info.console_language          = ui.comboBox_console_language->currentIndex();
-	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
-	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
-	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
-	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
+	info.gpu_index                      = ui.comboBox_gpu->currentIndex() - 1;
+	info.fullscreen_enabled             = ui.checkBox_fullscreen->isChecked();
+	info.hdr_enabled                    = ui.checkBox_hdr->isChecked();
+	info.hide_cursor_enabled            = ui.checkBox_hide_cursor->isChecked();
+	info.readback_linear_images         = ui.checkBox_readback->isChecked();
+	info.sync_raw_image_buffers         = ui.checkBox_sync_raw_image_buffers->isChecked();
+	info.support_zmask                  = ui.checkBox_support_zmask->isChecked();
+	info.tessellation_enabled           = ui.checkBox_tessellation->isChecked();
+	info.skip_notice_screen             = ui.checkBox_skip_notice_screen->isChecked();
+	info.network_connected              = ui.checkBox_network_connected->isChecked();
+	info.trophy_enabled                 = ui.checkBox_trophy_notifications->isChecked();
+	info.trophy_duration_seconds        = ui.spinBox_trophy_duration->value();
+	info.perf_overlay_enabled           = ui.checkBox_perf_overlay->isChecked();
+	info.vblank_frequency               = ui.spinBox_vblank_frequency->value();
+	info.console_language               = ui.comboBox_console_language->currentIndex();
+	info.vulkan_validation_enabled      = ui.checkBox_vulkan_validation->isChecked();
+	info.shader_validation_enabled      = ui.checkBox_shader_validation->isChecked();
+	info.renderdoc_enabled              = ui.checkBox_renderdoc_capture->isChecked();
+	info.amd_cpu_enabled                = ui.checkBox_amd_cpu->isChecked();
 	info.rev3_texture_retention_enabled = ui.checkBox_rev3_texture_retention->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
 	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
 	    ui.comboBox_shader_optimization_type->currentText());
-	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
-	    ui.comboBox_shader_log_direction->currentText());
+	info.shader_log_direction =
+	    TextToEnum<Configuration::LogDirection>(ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
 	info.command_buffer_dump_enabled = ui.checkBox_cmd_dump->isChecked();
 	info.command_buffer_dump_folder  = ui.lineEdit_cmd_dump_folder->text();
 	info.printf_direction =
 	    TextToEnum<Configuration::LogDirection>(ui.comboBox_printf_direction->currentText());
 	info.printf_output_file = ui.lineEdit_printf_file->text();
-	info.profiler_enabled = ui.checkBox_profiler->isChecked();
+	info.profiler_enabled   = ui.checkBox_profiler->isChecked();
 }
 
 void ConfigurationEditDialog::save() {
+	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
+	                   m_ui->lineEdit_cmd_dump_folder}) {
+		if (field->isEnabled() && field->text().isEmpty()) {
+			m_ui->settings_tabs->setCurrentWidget(m_ui->debug_tab);
+			field->setFocus();
+			break;
+		}
+	}
 	if (MandatoryLineEdit::FindEmpty(this)) {
 		QMessageBox::critical(this, tr("Save failed"), tr("Please fill all mandatory fields"));
 		return;
@@ -421,7 +541,7 @@ void ConfigurationEditDialog::save() {
 		return;
 	}
 
-	UpdateInfo(m_info, *m_ui);
+	UpdateInfo(m_info, *m_ui, m_global_settings);
 
 	emit accept();
 }
@@ -430,7 +550,8 @@ void ConfigurationEditDialog::clear() {
 	Configuration default_info;
 	Init(default_info);
 
-	if (m_show_game_dirs) {
+	if (m_global_settings) {
+		emit PreviewControllerColor({});
 		m_game_dirs_list->clear();
 		update_game_directory_buttons();
 	}

@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -20,6 +21,7 @@ class Value {
 public:
 	Value() = default;
 	explicit Value(Inst* value);
+	explicit Value(const Inst* value) = delete;
 	explicit Value(ScalarReg value);
 	explicit Value(VectorReg value);
 	explicit Value(bool value);
@@ -128,12 +130,17 @@ public:
 		}
 		return evaluation_index;
 	}
+	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
+	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
+	void SetDefinition(uint32_t half, uint32_t definition) const {
+		definitions[half] = definition;
+	}
+	void ResetDefinitions() const { definitions = {}; }
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
-	void ReplaceOpcode(ValueOpcode opcode);
 	void Invalidate();
 
 	template <typename T>
@@ -152,17 +159,30 @@ public:
 	}
 
 private:
+	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
+
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
+	static constexpr uint8_t InlineArity = 4;
+	static constexpr uint8_t PhiArity = UINT8_MAX;
+
 	ValueOpcode         opcode;
+	uint8_t             num_args;
+	bool                live = false;
+	mutable uint32_t    evaluation_index = UINT32_MAX;
+	mutable std::array<uint32_t, 2> definitions {};
 	uint64_t            flags;
 	Block*              parent = nullptr;
-	std::vector<Value>  args;
-	std::vector<Block*> phi_blocks;
+	union {
+		std::array<Value, InlineArity> fixed_args {};
+		std::vector<Value> large_args;
+		std::vector<std::pair<Block*, Value>> phi_args;
+	};
 	std::vector<Use>    uses;
-	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
+
+static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

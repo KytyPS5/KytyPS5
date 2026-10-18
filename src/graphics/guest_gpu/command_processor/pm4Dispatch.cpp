@@ -140,6 +140,8 @@ constexpr auto MakeShaderDispatchTable() {
 	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC3]               = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PACE_ID]                 = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS]  = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] = HwShSetRegisters;
 	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS]  = HwShSetRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShSetRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShSetRegisters;
@@ -229,7 +231,6 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	g_cp_op_custom_func[Pm4::R_WAIT_FLIP_DONE] = CpOpWaitFlipDone;
 	g_cp_op_custom_func[Pm4::R_PUSH_MARKER]    = CpOpPushMarker;
 	g_cp_op_custom_func[Pm4::R_POP_MARKER]     = CpOpPopMarker;
-	g_cp_op_custom_func[Pm4::R_ACQUIRE_MEM]    = CpOpAcquireMem;
 	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
 	g_cp_op_custom_func[Pm4::R_RELEASE_MEM]    = CpOpReleaseMem;
 	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;

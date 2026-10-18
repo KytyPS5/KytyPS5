@@ -217,7 +217,7 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			    2, ActiveAddress(*block, it, it->Arg(2), it->Arg(it->NumArgs() - 1u), resolved));
 		}
 	}
-	ConstantPropagationPass(program.blocks);
+	ConstantPropagationPass(program.blocks, program.wave_size);
 	uint32_t reads = 0, writes = 0, factors = 0;
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
@@ -317,8 +317,8 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			inst.Invalidate();
 		}
 	}
-	ConstantPropagationPass(program.blocks);
-	RemoveIdentities(program.blocks);
+	ConstantPropagationPass(program.blocks, program.wave_size);
+	RemoveIdentities(program);
 	EliminateDeadCode(program.blocks);
 	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u\n",
 	     options.stage == ShaderType::Local                 ? "LS"

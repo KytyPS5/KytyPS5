@@ -29,9 +29,21 @@ class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
+	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+
+	static constexpr uint64_t PageIndex(uint64_t address) {
+		return (address < LOWER_ADDRESS_SIZE
+		            ? address
+		            : address - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE) >>
+		       CACHING_PAGEBITS;
+	}
+	static constexpr uint64_t GuestAddress(uint64_t offset) {
+		return offset < LOWER_ADDRESS_SIZE
+		           ? offset
+		           : offset - LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemoryBase;
+	}
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -68,7 +80,10 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void               SynchronizeBda(const RangeSet& mapped);
+	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.QueueBdaSync(vaddr, size);
+	}
 	void               RunGarbageCollector();
 
 private:
@@ -88,7 +103,7 @@ private:
 		bool                has_stream_leap;
 	};
 
-	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
+	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
@@ -102,10 +117,12 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
+	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
+	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
+	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;

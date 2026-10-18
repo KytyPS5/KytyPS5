@@ -16,7 +16,9 @@ struct Lifecycle {
 
 namespace Net {
 
-struct NetEtherAddr;
+struct NetEtherAddr {
+	uint8_t data[6] = {0};
+};
 
 union NetEpollData {
 	void*    ptr;
@@ -41,6 +43,7 @@ int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
 int KYTY_SYSV_ABI NetPoolDestroy(int memid);
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags);
 int KYTY_SYSV_ABI NetResolverDestroy(int rid);
+int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags);
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags);
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst);
@@ -184,6 +187,7 @@ int KYTY_SYSV_ABI  NpGetOnlineId(int user_id, NpOnlineId* online_id);
 int KYTY_SYSV_ABI  NpGetAccountIdA(int user_id, uint64_t* account_id);
 int KYTY_SYSV_ABI  NpGetAccountCountryA(int user_id, void* country_code);
 int KYTY_SYSV_ABI  NpGetAccountAge(int req_id, int user_id, uint8_t* age);
+int KYTY_SYSV_ABI  NpGetAccountLanguage2(int req_id, int user_id, void* language_code);
 int KYTY_SYSV_ABI  NpCreateRequest();
 int KYTY_SYSV_ABI  NpCreateAsyncRequest(const NpCreateAsyncRequestParameter* param);
 int KYTY_SYSV_ABI  NpDeleteRequest(int req_id);

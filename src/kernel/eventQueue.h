@@ -18,6 +18,7 @@ constexpr int16_t KERNEL_EVFILT_FILE      = -4;
 constexpr int16_t KERNEL_EVFILT_GRAPHICS  = -14;
 constexpr int16_t KERNEL_EVFILT_VIDEO_OUT = -13;
 constexpr int16_t KERNEL_EVFILT_HRTIMER   = -15;
+constexpr int16_t KERNEL_EVFILT_AMPR      = -25;
 
 class KernelEqueuePrivate;
 struct KernelEqueueEvent;
@@ -51,6 +52,7 @@ struct KernelFilter {
 struct KernelEqueueEvent {
 	bool                    triggered   = false;
 	uint64_t                deadline_ns = 0;
+	uint64_t                interval_ns = 0;
 	KernelEvent             event;
 	KernelFilter            filter;
 	std::deque<KernelEvent> pending_events;
@@ -72,6 +74,8 @@ int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata);
 int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata);
 int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id);
+int KYTY_SYSV_ABI KernelAddTimerEvent(KernelEqueue eq, int id, KernelUseconds usec,
+                                      void* udata);
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,
                                         void* udata);
 int KYTY_SYSV_ABI KernelDeleteHRTimerEvent(KernelEqueue eq, int id);

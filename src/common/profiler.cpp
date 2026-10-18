@@ -2,51 +2,12 @@
 
 #include "common/emulatorConfig.h"
 
-#include <algorithm>
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
 #include <cstdio>
 #include <tracy/Tracy.hpp>
-#include <vector>
-
-namespace {
-
-thread_local std::vector<Profiler::ScopedBlock*> g_block_stack;
-
-void RemoveBlock(Profiler::ScopedBlock* block) {
-	auto block_it = std::find(g_block_stack.rbegin(), g_block_stack.rend(), block);
-	if (block_it != g_block_stack.rend()) {
-		g_block_stack.erase(std::next(block_it).base());
-	}
-}
-
-} // namespace
 
 namespace Profiler {
-
-ScopedBlock::ScopedBlock(const tracy::SourceLocationData* source_location) {
-	if (tracy::ProfilerAvailable()) {
-		m_zone.emplace(source_location, TRACY_CALLSTACK, true);
-		g_block_stack.push_back(this);
-	}
-}
-
-ScopedBlock::~ScopedBlock() {
-	End();
-}
-
-void ScopedBlock::End() {
-	if (m_zone.has_value()) {
-		m_zone.reset();
-		RemoveBlock(this);
-	}
-}
-
-void EndBlock() {
-	if (!g_block_stack.empty()) {
-		g_block_stack.back()->End();
-	}
-}
 
 void SetThreadName(const char* name) {
 	if (tracy::ProfilerAvailable() && name != nullptr) {

@@ -512,15 +512,6 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
-static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
-	if (microseconds > 1) {
-		return false;
-	}
-
-	SchedulerBackoffOnce();
-	return true;
-}
-
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -529,9 +520,7 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 	while (microseconds > 0) {
 		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		if (!SleepMicroSchedulerBackoff(step)) {
-			Common::Thread::SleepMicro(step);
-		}
+		Common::Thread::SleepMicro(step);
 		microseconds -= step;
 		KernelDispatchPendingSignalForCurrentThread();
 	}
@@ -3211,6 +3200,15 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	if (!thread->name.empty()) {
+#if defined(__APPLE__)
+		pthread_setname_np(thread->name.substr(0, 63).c_str());
+#else
+		pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+#endif
+	}
+#endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
@@ -3842,28 +3840,16 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
-	Common::Timer t;
-	t.Start();
 	SleepMicroWithSignalPoll(microseconds);
-	// double ts = t.GetTimeS();
-	// LOGF("\tactual: %g microseconds\n", ts * 1000000.0);
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
-	PRINT_NAME();
-	LOGF("\tsleep: %u\n", seconds);
-	Common::Timer t;
-	t.Start();
 	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
-	double ts = t.GetTimeS();
-	LOGF("\tactual: %g seconds\n", ts);
 	return OK;
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-	PRINT_NAME();
-
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
@@ -3880,13 +3866,7 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
-	LOGF("\tnanosleep: %" PRIu64 "\n", nanos);
-
-	Common::Timer t;
-	t.Start();
 	SleepNanoWithSignalPoll(nanos);
-	double ts = t.GetTimeS();
-	LOGF("\tactual: %g nanoseconds\n", ts * 1000000000.0);
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;
@@ -4235,6 +4215,10 @@ int KYTY_SYSV_ABI pthread_attr_setschedpolicy(LibKernel::PthreadAttr* attr, int 
 	// PRINT_NAME();
 
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetschedpolicy(attr, policy));
+}
+
+int KYTY_SYSV_ABI pthread_attr_setstack(LibKernel::PthreadAttr* attr, void* addr, size_t size) {
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetstack(attr, addr, size));
 }
 
 int KYTY_SYSV_ABI pthread_attr_setstacksize(LibKernel::PthreadAttr* attr, size_t stack_size) {

@@ -985,9 +985,8 @@ void WindowContext::CreateVulkan() {
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
-	// falls back to default depth clipping and static color-write masks on macOS. It also
-	// requires VK_KHR_portability_subset per the Vulkan portability spec.
-	device_extensions.push_back("VK_KHR_portability_subset");
+	// falls back to default depth clipping and static color-write masks on macOS. A device that
+	// exposes VK_KHR_portability_subset must have it enabled; that is done after device selection.
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
@@ -1043,6 +1042,13 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+#if defined(__APPLE__)
+		// MoltenVK requires VK_KHR_portability_subset; a conformant driver (KosmicKrisp) does not
+		// expose it, and requesting it there fails vkCreateDevice.
+		if (HasExtension(available_extensions, "VK_KHR_portability_subset")) {
+			device_extensions.push_back("VK_KHR_portability_subset");
+		}
+#endif
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

@@ -7176,6 +7176,178 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  struct BarrierCounter {
+    static inline uint32_t count = 0;
+    static inline PFN_vkCmdPipelineBarrier next = nullptr;
+    static inline PFN_vkCmdPipelineBarrier2 next2 = nullptr;
+
+    static VKAPI_ATTR void VKAPI_CALL
+    Barrier(VkCommandBuffer command, VkPipelineStageFlags src,
+            VkPipelineStageFlags dst, VkDependencyFlags flags,
+            uint32_t memory_count, const VkMemoryBarrier *memory,
+            uint32_t buffer_count, const VkBufferMemoryBarrier *buffers,
+            uint32_t image_count, const VkImageMemoryBarrier *images) {
+      count++;
+      next(command, src, dst, flags, memory_count, memory, buffer_count,
+           buffers, image_count, images);
+    }
+    static VKAPI_ATTR void VKAPI_CALL Barrier2(VkCommandBuffer command,
+                                               const VkDependencyInfo *info) {
+      count++;
+      next2(command, info);
+    }
+  };
+
+  void CheckBufferCacheTransferBatch() {
+    constexpr const char *name = "BufferCacheTransferBatch";
+    constexpr uintptr_t base = 0x0000000218000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t pages = 8;
+    constexpr u32 fill_c = 0xc0c0c0c0u;
+    constexpr u32 fill_a1 = 0x11111111u;
+    constexpr u32 fill_d = 0x66666666u;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "transfer-batch direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "transfer-batch fixed direct-memory mapping failed");
+    const auto pattern = [](uint64_t offset) {
+      return static_cast<u32>(0x5a000000u + offset / sizeof(u32));
+    };
+    auto *words = static_cast<u32 *>(mapped);
+    for (uint64_t offset = 0; offset < pages * page; offset += sizeof(u32)) {
+      words[offset / sizeof(u32)] = pattern(offset);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto id = cache.FindBuffer(base, pages * page);
+      auto &buffer = cache.GetBuffer(id);
+      const auto at = [&](uint64_t page_index) {
+        return buffer.Offset(base + page_index * page);
+      };
+      (void)scheduler.Current().Handle();
+
+      auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+      BarrierCounter::count = 0;
+      BarrierCounter::next = dispatcher.vkCmdPipelineBarrier;
+      BarrierCounter::next2 = dispatcher.vkCmdPipelineBarrier2;
+      dispatcher.vkCmdPipelineBarrier = BarrierCounter::Barrier;
+      if (BarrierCounter::next2 != nullptr) {
+        dispatcher.vkCmdPipelineBarrier2 = BarrierCounter::Barrier2;
+      }
+      const auto step = [&](const char *what, uint32_t expected) {
+        Require(name, what,
+                BarrierCounter::count == expected &&
+                    scheduler.Current().HasTransferBarrier(),
+                "the transfer batch recorded an unexpected barrier count");
+      };
+      // Pages 0-1 and 2-3 upload and page 4 fills: one barrier opens all three.
+      (void)cache.ObtainBuffer(base, 2 * page, false);
+      step("first upload opens", 1);
+      (void)cache.ObtainBuffer(base + 2 * page, 2 * page, false);
+      step("disjoint upload joins", 1);
+      buffer.Fill(at(4), page, fill_c);
+      step("disjoint fill joins", 1);
+      // Reads page 0, which the first upload wrote.
+      buffer.CopyFrom(scheduler.Current(), buffer, at(0), at(6), page);
+      step("read after write orders", 2);
+      // Page 1 was written before that barrier, so it is already ordered.
+      buffer.Fill(at(1), page, fill_a1);
+      step("ordered write joins", 2);
+      // Page 6 was written by the copy after it.
+      buffer.Fill(at(6), page, fill_d);
+      step("write after write orders", 3);
+      (void)scheduler.Current().Handle();
+      const bool closed = BarrierCounter::count == 4 &&
+                          !scheduler.Current().HasTransferBarrier();
+      dispatcher.vkCmdPipelineBarrier = BarrierCounter::next;
+      if (BarrierCounter::next2 != nullptr) {
+        dispatcher.vkCmdPipelineBarrier2 = BarrierCounter::next2;
+      }
+      Require(name, "next command closes", closed,
+              "the transfer batch was not closed by the next command");
+
+      auto readback =
+          CreateHostBuffer(name, pages * page,
+                           vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+      const vk::BufferCopy copy{at(0), 0, pages * page};
+      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer,
+                                              1, &copy);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = readback.buffer;
+      barrier.size = readback.size;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+          nullptr);
+      scheduler.Finish();
+      const auto result =
+          ReadBuffer(name, readback, pages * page / sizeof(u32));
+      DestroyBuffer(&readback);
+      const auto expect = [&](uint64_t offset) -> u32 {
+        switch (offset / page) {
+        case 1:
+          return fill_a1;
+        case 4:
+          return fill_c;
+        case 6:
+          return fill_d;
+        default:
+          return pattern(offset);
+        }
+      };
+      bool contents = true;
+      for (uint64_t offset = 0; offset < pages * page; offset += sizeof(u32)) {
+        const auto index = offset / page;
+        if (index != 5 && index != 7 &&
+            result[offset / sizeof(u32)] != expect(offset)) {
+          contents = false;
+        }
+      }
+      Require(name, "contents", contents,
+              "batched transfers left the wrong bytes in the buffer");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "transfer-batch direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "transfer-batch direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheBdaResidency() {
     constexpr const char *name = "BufferCacheBdaResidency";
     constexpr uintptr_t base = 0x0000000208000000ull;
@@ -63196,6 +63368,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-bda-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheBdaStoreOwnership();
+    vulkan.CheckBufferCacheTransferBatch();
     vulkan.CheckBufferCacheBdaResidency();
     vulkan.CheckBufferCacheSparsePageTable();
     vulkan.CheckBufferCacheFaultParser();
@@ -63524,6 +63697,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheOrderedWrite();
     vulkan.CheckBufferCachePreciseWrites();
     vulkan.CheckBufferCacheBdaStoreOwnership();
+    vulkan.CheckBufferCacheTransferBatch();
     vulkan.CheckBufferCacheBdaResidency();
     vulkan.CheckBufferCacheSparsePageTable();
   } else {

@@ -123,6 +123,12 @@ struct SubmitInfo {
 	}
 };
 
+struct TransferRange {
+	vk::Buffer buffer = nullptr;
+	uint64_t   offset = 0;
+	uint64_t   size   = 0;
+};
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -162,6 +168,11 @@ public:
 	void               FlushDeferredBarrier() const;
 	[[nodiscard]] bool HasDeferredBarrier() const noexcept { return m_deferred_barrier; }
 
+	// Transfers recorded back to back share one barrier pair; Handle() records the closing half.
+	[[nodiscard]] vk::CommandBuffer BeginTransfer(std::span<const TransferRange> reads,
+	                                              std::span<const TransferRange> writes) const;
+	void                            FlushTransferBarrier() const;
+	[[nodiscard]] bool              HasTransferBarrier() const noexcept { return m_transfer_open; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -203,6 +214,8 @@ private:
 	mutable bool           m_deferred_joining       = false;
 	mutable uint32_t       m_deferred_dispatches    = 0;
 	mutable DispatchAccess m_deferred_access;
+	mutable bool           m_transfer_open = false;
+	mutable DispatchAccess m_transfer_access;
 	HW::Context*           m_registers   = nullptr;
 	HW::UserConfig*        m_user_config = nullptr;
 	HW::Shader*            m_shaders     = nullptr;

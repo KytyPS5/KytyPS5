@@ -101,6 +101,23 @@ void ForEachBdaMarkRange(const RangeSet& tracked, const RangeSet& mapped, Mark&&
 	});
 }
 
+void RecordBufferCopies(CommandBuffer& command, vk::Buffer source, vk::Buffer destination,
+                        std::span<const vk::BufferCopy> copies) {
+	TransferRange read {source, UINT64_MAX, 0};
+	TransferRange write {destination, UINT64_MAX, 0};
+	uint64_t      read_end  = 0;
+	uint64_t      write_end = 0;
+	for (const auto& copy: copies) {
+		read.offset  = std::min(read.offset, copy.srcOffset);
+		write.offset = std::min(write.offset, copy.dstOffset);
+		read_end     = std::max(read_end, copy.srcOffset + copy.size);
+		write_end    = std::max(write_end, copy.dstOffset + copy.size);
+	}
+	read.size  = read_end - read.offset;
+	write.size = write_end - write.offset;
+	command.BeginTransfer({&read, 1}, {&write, 1})
+	    .copyBuffer(source, destination, static_cast<uint32_t>(copies.size()), copies.data());
+}
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -134,32 +151,9 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
 		const auto destination_offset = buffer.Offset(address);
 		EXIT_IF(destination_offset > buffer.Size() || chunk > buffer.Size() - destination_offset);
-		m_scheduler.EndRendering();
-		const auto command = m_scheduler.Current().Handle();
-		vk::BufferMemoryBarrier2 before {};
-		before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-		before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-		before.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-		before.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer        = buffer.Handle();
-		before.offset        = destination_offset;
-		before.size          = chunk;
-		vk::DependencyInfo dependency {};
-		dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
-		dependency.bufferMemoryBarrierCount = 1;
-		dependency.pBufferMemoryBarriers    = &before;
-		command.pipelineBarrier2(dependency);
 		const vk::BufferCopy copy {offset, destination_offset, chunk};
-		command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy);
-		auto after          = before;
-		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-		after.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-		after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-		dependency.pBufferMemoryBarriers = &after;
-		command.pipelineBarrier2(dependency);
+		RecordBufferCopies(m_scheduler.Current(), m_staging_buffer.Handle(), buffer.Handle(),
+		                   {&copy, 1});
 		bytes += chunk;
 		address += chunk;
 		size -= chunk;
@@ -1207,22 +1201,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
-		auto& command = m_scheduler.Current();
-		command.EndRendering();
-		vk::BufferMemoryBarrier before {};
-		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-		                       vk::AccessFlagBits::eTransferRead |
-		                       vk::AccessFlagBits::eTransferWrite;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer              = buffer.Handle();
-		before.offset              = 0;
-		before.size                = buffer.Size();
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
-		auto after          = before;
-		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		RecordBufferCopies(m_scheduler.Current(), source, buffer.Handle(), copies);
 	}
 	if ((is_texel_buffer || raw_image_read) && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size, !is_texel_buffer);

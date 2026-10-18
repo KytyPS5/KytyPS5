@@ -34,6 +34,7 @@ constexpr size_t   MaxDeferredRanges     = 256;
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	FlushTransferBarrier();
 	if (m_deferred_barrier && !m_deferred_joining) {
 		FlushDeferredBarrier();
 	}
@@ -87,8 +88,73 @@ void CommandBuffer::FlushDeferredBarrier() const {
 	m_deferred_access.Clear();
 }
 
+vk::CommandBuffer CommandBuffer::BeginTransfer(std::span<const TransferRange> reads,
+                                               std::span<const TransferRange> writes) const {
+	EXIT_IF(m_deferred_joining);
+	EndRendering();
+	const auto key = [](const TransferRange& range) {
+		return reinterpret_cast<uint64_t>(static_cast<VkBuffer>(range.buffer));
+	};
+	const auto overlaps = [&](const TransferRange& range, bool write) {
+		return std::ranges::any_of(m_transfer_access.ranges, [&](const auto& recorded) {
+			return (write || recorded.write) && recorded.key == key(range) &&
+			       recorded.begin < range.offset + range.size && range.offset < recorded.end;
+		});
+	};
+	if (!m_transfer_open) {
+		const auto        native = Handle();
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask =
+		    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+		                       nullptr);
+		m_transfer_open = true;
+		m_transfer_access.Clear();
+	} else {
+		if (std::ranges::any_of(reads, [&](const auto& range) { return overlaps(range, false); }) ||
+		    std::ranges::any_of(writes, [&](const auto& range) { return overlaps(range, true); })) {
+			vk::MemoryBarrier between {};
+			between.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			between.dstAccessMask =
+			    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+			m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &between, 0,
+			                         nullptr, 0, nullptr);
+			m_transfer_access.Clear();
+		}
+		m_handle_requests++;
+	}
+	for (const auto& range: reads) {
+		m_transfer_access.Add(DispatchAccess::Space::HostBuffer, key(range), range.offset,
+		                      range.size, false);
+	}
+	for (const auto& range: writes) {
+		m_transfer_access.Add(DispatchAccess::Space::HostBuffer, key(range), range.offset,
+		                      range.size, true);
+	}
+	return m_buffer;
+}
+
+void CommandBuffer::FlushTransferBarrier() const {
+	if (!m_transfer_open) {
+		return;
+	}
+	m_transfer_open = false;
+	m_transfer_access.Clear();
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                         nullptr);
+}
+
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	m_transfer_open = false;
+	m_transfer_access.Clear();
 	m_indirect_barrier_holds = false;
 	m_deferred_barrier       = false;
 	m_deferred_joining       = false;

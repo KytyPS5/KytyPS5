@@ -305,7 +305,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
 		check_feature(device_features2.features.largePoints, "largePoints");
 		check_feature(device_features2.features.multiViewport, "multiViewport");
+#if defined(__APPLE__)
+		// KosmicKrisp has no fillModeNonSolid; line/point polygon modes fall back to fill.
+		if (device_features2.features.fillModeNonSolid != VK_TRUE) {
+			LOGF("fillModeNonSolid is not supported\n");
+		}
+#else
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
+#endif
 		check_feature(device_features2.features.fragmentStoresAndAtomics,
 		              "fragmentStoresAndAtomics");
 
@@ -605,7 +612,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.shaderCullDistance                   = VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
-	device_features.fillModeNonSolid                      = VK_TRUE;
+	device_features.fillModeNonSolid                      = supported_features2.features.fillModeNonSolid;
+	graphics.fill_mode_non_solid_enabled                 = (device_features.fillModeNonSolid == VK_TRUE);
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;

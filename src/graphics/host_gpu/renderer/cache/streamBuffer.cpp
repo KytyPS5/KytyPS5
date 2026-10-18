@@ -141,7 +141,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
-	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_coherent     = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_device_local = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};

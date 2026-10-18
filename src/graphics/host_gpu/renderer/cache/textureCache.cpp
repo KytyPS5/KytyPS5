@@ -1497,6 +1497,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	auto&       destination  = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info         = image.info;
 	const auto  binding      = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
+	const bool  device_local = source.IsDeviceLocal();
 	if (binding != BindingType::DepthTarget) {
 		if ((binding == BindingType::RenderTarget || binding == BindingType::VideoOut) &&
 		    (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
@@ -2840,6 +2841,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.linear_slice_stride;
 	const auto     transfer_bytes   = DepthAspectTransferBytes(info.pixel_format);
+	const bool     device_local     = destination.IsDeviceLocal();
 	const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
 	EXIT_NOT_IMPLEMENTED(transfer_bytes == 0 || texels_per_slice > UINT32_MAX ||
 	                     texels_per_slice > UINT64_MAX / transfer_bytes ||
@@ -2905,6 +2907,7 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	auto        copies = info.BufferCopies(0, levels);
 	if (info.IsTiled()) {
 		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, destination_size,
+		                  levels, destination.IsDeviceLocal());
 		return;
 	}
 	DownloadColorRegions(image, copies, info.GetColorTransform(), destination, destination_offset,

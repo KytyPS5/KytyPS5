@@ -507,13 +507,24 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #else
 	image_view_min_lod.minLod = VK_TRUE;
 #endif
-	depth_clip_control.pNext  = &image_view_min_lod;
-	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
-	// feature structs from the chain on macOS (the renderer falls back to default depth
-	// clipping and static color-write masks).
+	depth_clip_control.pNext = nullptr;
+	// Chain the minLod feature struct only when its extension is enabled: a
+	// device-creation pNext entry must come from an enabled extension, so on
+	// MoltenVK without VK_EXT_image_view_min_lod the struct is skipped entirely
+	// (setting minLod to FALSE would not make it valid).
+	if (graphics.supports_image_view_min_lod) {
+		depth_clip_control.pNext = &image_view_min_lod;
+		// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop
+		// those feature structs from the chain on macOS (the renderer falls back to default
+		// depth clipping and static color-write masks).
 #if !defined(__APPLE__)
-	image_view_min_lod.pNext = &depth_clip_enable;
+		image_view_min_lod.pNext = &depth_clip_enable;
 #endif
+	} else {
+#if !defined(__APPLE__)
+		depth_clip_control.pNext = &depth_clip_enable;
+#endif
+	}
 	depth_clip_control.depthClipControl = VK_TRUE;
 
 	const bool workgroup_layout_extension =
